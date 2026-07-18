@@ -1,8 +1,11 @@
 //! Startup banner: the plank logo, rendered from `resources/logo.png`.
 //!
 //! Uses the `logo-art` crate to turn the PNG into true-color half-block ANSI
-//! art. The TUI converts that art into styled lines; the plain/piped path
-//! prints the ANSI directly.
+//! art. The near-white background is keyed to transparent first so the
+//! terminal shows through. The TUI converts the art into styled lines; the
+//! plain/piped path prints the ANSI directly.
+
+use std::sync::OnceLock;
 
 /// The logo image, embedded at build time.
 pub const LOGO_PNG: &[u8] = include_bytes!("resources/logo.png");
@@ -10,10 +13,38 @@ pub const LOGO_PNG: &[u8] = include_bytes!("resources/logo.png");
 /// Default render width, in terminal columns.
 pub const DEFAULT_WIDTH: u32 = 36;
 
+/// Pixels with every channel at or above this level are treated as background.
+const BACKGROUND_THRESHOLD: u8 = 232;
+
+/// The logo PNG with its near-white background made transparent (computed once).
+fn transparent_png() -> &'static [u8] {
+    static CACHE: OnceLock<Vec<u8>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let Ok(img) = image::load_from_memory(LOGO_PNG) else {
+            return LOGO_PNG.to_vec();
+        };
+        let mut rgba = img.to_rgba8();
+        for px in rgba.pixels_mut() {
+            let [r, g, b, _] = px.0;
+            if r >= BACKGROUND_THRESHOLD && g >= BACKGROUND_THRESHOLD && b >= BACKGROUND_THRESHOLD {
+                px.0[3] = 0;
+            }
+        }
+        let mut out = Vec::new();
+        if image::DynamicImage::ImageRgba8(rgba)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .is_err()
+        {
+            return LOGO_PNG.to_vec();
+        }
+        out
+    })
+}
+
 /// Renders the logo as true-color ANSI art `width` columns wide.
 #[must_use]
 pub fn art(width: u32) -> String {
-    logo_art::image_to_ansi(LOGO_PNG, width.max(1))
+    logo_art::image_to_ansi(transparent_png(), width.max(1))
 }
 
 /// The logo art at [`DEFAULT_WIDTH`] followed by a version line.

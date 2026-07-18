@@ -278,6 +278,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ansi_to_lines_parses_truecolor_cells() {
+        // Two cells (bg red '▄', bg green ' ') then newline.
+        let art = "\x1b[48;2;255;0;0m▄\x1b[48;2;0;255;0m \x1b[m\n";
+        let lines = ansi_to_lines(art);
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].content.as_ref(), "▄");
+        assert_eq!(spans[0].style.bg, Some(Color::Rgb(255, 0, 0)));
+        assert_eq!(spans[1].style.bg, Some(Color::Rgb(0, 255, 0)));
+    }
+
+    #[test]
     fn append_splits_on_newlines() {
         let mut log = OutputLog::new();
         log.visible_text("hello\nworld");

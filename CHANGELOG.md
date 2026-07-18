@@ -12,6 +12,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   screen buffer so block-based terminals like Warp render plank cleanly. Draws
   a scrollback area, a pinned input line, and a reverse-video status bar, with
   the logo shown inside its own scrollback.
+- **True-color logo** rendered from `resources/logo.png` via the `logo-art`
+  crate. The near-white background is keyed to transparent, and the download
+  splash centers it, sized to the terminal.
 - **Real ds4 inference engine** via FFI (`-m/--model`), built from the
   `ds4-ref` submodule on macOS (Metal backend). Kept behind an `Engine` trait
   with an `EchoEngine` fallback when no model is loaded.

@@ -17,7 +17,10 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Line;
 use ratatui::widgets::{Gauge, Paragraph};
+
+use crate::{logo, tui};
 
 /// Hugging Face repository hosting the GGUF files.
 const REPO: &str = "antirez/deepseek-v4-gguf";
@@ -381,9 +384,25 @@ fn run_ui(
     let start = Instant::now();
     let mut msg = 0usize;
     let mut last_rotate = Instant::now();
+    // Render the logo once (it never changes), sized to fill most of the
+    // splash. The image is portrait, so one output row is ~0.61 columns; pick a
+    // width that fills ~60% of the height and still fits the terminal width.
+    let (rows, cols) = terminal
+        .size()
+        .map_or((24u16, 80u16), |s| (s.height, s.width));
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let logo_width = {
+        let by_height = (f32::from(rows) * 0.6 * 1.63) as u32;
+        by_height.min(u32::from(cols).saturating_sub(2)).max(24)
+    };
+    let logo = tui::ansi_to_lines(&logo::art(logo_width));
     loop {
         if worker.is_finished() {
-            let _ = terminal.draw(|f| draw(f, part, total, msg, start));
+            let _ = terminal.draw(|f| draw(f, &logo, part, total, msg, start));
             // The caller joins the worker and surfaces its error, if any.
             return Ok(());
         }
@@ -402,12 +421,19 @@ fn run_ui(
             msg += 1;
             last_rotate = Instant::now();
         }
-        let _ = terminal.draw(|f| draw(f, part, total, msg, start));
+        let _ = terminal.draw(|f| draw(f, &logo, part, total, msg, start));
     }
 }
 
-/// Draws one download frame: red rotating message, gauge, and stats.
-fn draw(frame: &mut Frame, part: &Path, total: Option<u64>, msg: usize, start: Instant) {
+/// Draws one download frame: centered logo, red rotating message, gauge, stats.
+fn draw(
+    frame: &mut Frame,
+    logo: &[Line<'static>],
+    part: &Path,
+    total: Option<u64>,
+    msg: usize,
+    start: Instant,
+) {
     let current = std::fs::metadata(part).map_or(0, |m| m.len());
     let elapsed = start.elapsed().as_secs_f64();
     #[allow(clippy::cast_precision_loss)]
@@ -418,23 +444,36 @@ fn draw(frame: &mut Frame, part: &Path, total: Option<u64>, msg: usize, start: I
     };
 
     let area = frame.area();
-    // Center the content block vertically.
+    let logo_h = u16::try_from(logo.len()).unwrap_or(0);
+    // Center the logo + progress block vertically.
     let rows = Layout::vertical([
-        Constraint::Percentage(45),
-        Constraint::Length(1), // title
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // gauge
-        Constraint::Length(1), // spacer
-        Constraint::Length(1), // stats
-        Constraint::Percentage(45),
+        Constraint::Fill(1),
+        Constraint::Length(logo_h), // logo
+        Constraint::Length(1),      // spacer
+        Constraint::Length(1),      // message
+        Constraint::Length(1),      // spacer
+        Constraint::Length(1),      // gauge
+        Constraint::Length(1),      // spacer
+        Constraint::Length(1),      // stats
+        Constraint::Fill(1),
     ])
     .split(area);
+
+    // Logo, horizontally centered at its rendered width.
+    let logo_w = u16::try_from(logo.iter().map(Line::width).max().unwrap_or(0)).unwrap_or(0);
+    let logo_area = Layout::horizontal([
+        Constraint::Fill(1),
+        Constraint::Length(logo_w),
+        Constraint::Fill(1),
+    ])
+    .split(rows[1])[1];
+    frame.render_widget(Paragraph::new(logo.to_vec()), logo_area);
 
     let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let message = Paragraph::new(MESSAGES[msg % MESSAGES.len()])
         .style(red)
         .alignment(Alignment::Center);
-    frame.render_widget(message, rows[1]);
+    frame.render_widget(message, rows[3]);
 
     // A centered, fixed-width gauge.
     let gauge_area = Layout::horizontal([
@@ -442,7 +481,7 @@ fn draw(frame: &mut Frame, part: &Path, total: Option<u64>, msg: usize, start: I
         Constraint::Length(48),
         Constraint::Fill(1),
     ])
-    .split(rows[3])[1];
+    .split(rows[5])[1];
     #[allow(clippy::cast_precision_loss)]
     let ratio = match total.filter(|t| *t > 0) {
         Some(t) => (current as f64 / t as f64).clamp(0.0, 1.0),
@@ -465,7 +504,7 @@ fn draw(frame: &mut Frame, part: &Path, total: Option<u64>, msg: usize, start: I
     let stats_line = Paragraph::new(stats)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
-    frame.render_widget(stats_line, rows[5]);
+    frame.render_widget(stats_line, rows[7]);
 }
 
 /// Probes the total download size via a HEAD request.
