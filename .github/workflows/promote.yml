@@ -1,0 +1,145 @@
+name: Promote beta to stable
+
+# Promotes the current beta (the highest major version) to the stable
+# channel, then opens the next major as the new, empty beta:
+#
+#   1. Finds the latest release of the highest major (e.g. v8.3.1).
+#   2. Marks that GitHub release as a full (non-prerelease) release.
+#   3. Points the stable `plank` Homebrew formula at it, reusing the
+#      `plank-*.bottle.tar.gz` assets already built by release.yml
+#      (beta releases upload bottles under both formula names).
+#   4. Bumps Cargo.toml on main to the next major (e.g. 9.0.0), commits,
+#      tags v9.0.0, and publishes it as a prerelease — release.yml then
+#      picks it up and seeds the new `plank-beta` formula.
+#
+# Requires TAP_GITHUB_TOKEN to be a PAT with push access to BOTH
+# aovestdipaperino/homebrew-tap and this repo: releases created with the
+# default GITHUB_TOKEN would not trigger release.yml for the new beta.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: promote
+
+jobs:
+  promote:
+    name: Promote and open next major
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.TAP_GITHUB_TOKEN }}
+
+      - name: Find current beta release
+        id: beta
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          MAX_MAJOR=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1 | sort -n | tail -1)
+          TAG=$(git tag -l "v${MAX_MAJOR}.*" | sed 's/^v//' | sort -V | tail -1)
+          TAG="v${TAG}"
+          VERSION="${TAG#v}"
+          echo "Promoting $TAG (major $MAX_MAJOR) to stable"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "next_version=$((MAX_MAJOR + 1)).0.0" >> "$GITHUB_OUTPUT"
+
+      - name: Download stable-named bottles from the beta release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.beta.outputs.tag }}"
+          VERSION="${{ steps.beta.outputs.version }}"
+          mkdir bottles
+          gh release download "$TAG" --pattern "plank-${VERSION}.*.bottle.tar.gz" --dir bottles
+          for t in arm64_sonoma sequoia; do
+            if [ ! -f "bottles/plank-${VERSION}.${t}.bottle.tar.gz" ]; then
+              echo "::error::bottle plank-${VERSION}.${t}.bottle.tar.gz missing from release $TAG — aborting promotion"
+              exit 1
+            fi
+          done
+          curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz" -o source.tar.gz
+
+      - name: Mark release as stable
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ steps.beta.outputs.tag }}" --prerelease=false --latest
+
+      - name: Update stable formula in tap
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.beta.outputs.version }}"
+          SOURCE_SHA=$(sha256sum source.tar.gz | awk '{print $1}')
+          ARM64_SONOMA_SHA=$(sha256sum "bottles/plank-${VERSION}.arm64_sonoma.bottle.tar.gz" | awk '{print $1}')
+          SEQUOIA_SHA=$(sha256sum "bottles/plank-${VERSION}.sequoia.bottle.tar.gz" | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/aovestdipaperino/homebrew-tap.git" tap
+
+          cat > tap/Formula/plank.rb << EOF
+          class Plank < Formula
+            desc "Interactive coding agent with a terminal REPL (Rust port of ds4)"
+            homepage "https://github.com/aovestdipaperino/plank"
+            url "https://github.com/aovestdipaperino/plank/archive/refs/tags/v${VERSION}.tar.gz"
+            sha256 "${SOURCE_SHA}"
+            license "MIT"
+
+            depends_on :macos
+            depends_on "rust" => :build
+
+            bottle do
+              root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
+              sha256 cellar: :any_skip_relocation, arm64_sonoma: "${ARM64_SONOMA_SHA}"
+              sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
+            end
+
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              system "#{bin}/plank", "--help"
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/plank.rb
+          git diff --cached --quiet || git commit -m "plank ${VERSION} (promoted from beta)"
+          git push
+
+      - name: Open next major beta
+        env:
+          GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          OLD="${{ steps.beta.outputs.version }}"
+          NEW="${{ steps.beta.outputs.next_version }}"
+
+          sed -i "0,/^version = \".*\"/s//version = \"${NEW}\"/" Cargo.toml
+          # Keep Cargo.lock in sync without needing a full toolchain.
+          python3 - << PYEOF
+          import re
+          lock = open("Cargo.lock").read()
+          lock = re.sub(r'(name = "plank"\nversion = )"[^"]+"', r'\g<1>"${NEW}"', lock)
+          open("Cargo.lock", "w").write(lock)
+          PYEOF
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "Open v${NEW} beta channel"
+          git tag "v${NEW}"
+          git push origin main "v${NEW}"
+
+          gh release create "v${NEW}" \
+            --prerelease \
+            --title "v${NEW} (beta)" \
+            --notes "Opens the v${NEW%%.*} beta channel. Promoted v${OLD} to stable." \
+            --repo "${{ github.repository }}"
