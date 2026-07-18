@@ -1,0 +1,3 @@
+[submodule "ds4-ref"]
+	path = ds4-ref
+	url = https://github.com/aovestdipaperino/ds4
