@@ -385,8 +385,9 @@ fn run_ui(
     let mut msg = 0usize;
     let mut last_rotate = Instant::now();
     // Render the logo once (it never changes), sized to fill most of the
-    // splash. The image is portrait, so one output row is ~0.61 columns; pick a
-    // width that fills ~60% of the height and still fits the terminal width.
+    // splash. The image is portrait (~0.87:1), so one output row spans ~0.57
+    // columns; a width of ~1.74x the target row count fills that many rows.
+    // Pick a width that fills ~75% of the height and still fits the width.
     let (rows, cols) = terminal
         .size()
         .map_or((24u16, 80u16), |s| (s.height, s.width));
@@ -396,8 +397,13 @@ fn run_ui(
         clippy::cast_sign_loss
     )]
     let logo_width = {
-        let by_height = (f32::from(rows) * 0.6 * 1.63) as u32;
-        by_height.min(u32::from(cols).saturating_sub(2)).max(24)
+        let by_height = (f32::from(rows) * 0.75 * 1.74) as u32;
+        // Never let the logo crowd out the message/gauge/stats block (6 rows).
+        let fit = (f32::from(rows.saturating_sub(7)) * 1.74) as u32;
+        by_height
+            .min(fit)
+            .min(u32::from(cols).saturating_sub(2))
+            .max(24)
     };
     let logo = tui::ansi_to_lines(&logo::art(logo_width));
     loop {
