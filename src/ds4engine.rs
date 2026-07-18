@@ -61,7 +61,14 @@ unsafe extern "C" fn progress_cb(
     }
     // SAFETY: ud is the ProgressCtx pointer we installed for this sync call.
     let ctx = unsafe { &mut *ud.cast::<ProgressCtx>() };
-    let done = (ctx.base + cur).min(ctx.total);
+    // `base + cur` can overshoot `total` when the backend re-evaluates tokens
+    // the common-prefix probe counted as cached. Grow the estimated total with
+    // ~5% headroom on overshoot so the bar keeps advancing smoothly instead of
+    // parking at 100% while prefill is still going.
+    let done = (ctx.base + cur).max(0);
+    if done >= ctx.total {
+        ctx.total = done + (ctx.total / 20).max(1);
+    }
     let secs = ctx.start.elapsed().as_secs_f64();
     let tps = if secs > 0.0 {
         f64::from(cur) / secs
@@ -305,7 +312,7 @@ impl Engine for Ds4Engine {
         let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
         // Prime the progress bar so it reflects the cached prefix immediately.
         on_event(EngineEvent::Prefill(PrefillProgress {
-            done: cached.clamp(0, prompt_len),
+            done: cached.clamp(0, (prompt_len - 1).max(0)),
             total: prompt_len,
             tps: 0.0,
         }));

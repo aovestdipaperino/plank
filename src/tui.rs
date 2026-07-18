@@ -83,6 +83,11 @@ impl OutputLog {
         self.lines.extend(ansi_to_lines(text));
     }
 
+    /// Removes the most recent completed line (e.g. a transient status note).
+    pub fn pop_line(&mut self) {
+        self.lines.pop();
+    }
+
     /// Ensures the streamed output ends on a fresh line.
     pub fn end_line(&mut self) {
         if !self.current.is_empty() {
@@ -273,21 +278,49 @@ pub fn draw(frame: &mut Frame, log: &OutputLog, input: &str, cursor_col: u16, st
     );
 }
 
-/// Builds the status line, coloring the progress bar's filled arrows magenta.
+/// Pushes spans for `seg`, painting the accent word — `prefill` before the
+/// bar, or the trailing-`…` spinner verb — in the theme color.
+fn push_accented(spans: &mut Vec<Span<'static>>, seg: &str, base: Style, theme: Style) {
+    let range = seg
+        .find("prefill")
+        .map(|i| (i, i + "prefill".len()))
+        .or_else(|| {
+            seg.find('…').map(|e| {
+                let start = seg[..e].rfind(' ').map_or(0, |i| i + 1);
+                (start, e + '…'.len_utf8())
+            })
+        });
+    if let Some((start, end)) = range {
+        spans.push(Span::styled(seg[..start].to_string(), base));
+        spans.push(Span::styled(seg[start..end].to_string(), theme));
+        spans.push(Span::styled(seg[end..].to_string(), base));
+    } else {
+        spans.push(Span::styled(seg.to_string(), base));
+    }
+}
+
+/// Builds the status line, coloring the progress bar's filled arrows and the
+/// accent word (operation name or spinner verb) in the theme color.
 ///
-/// The bar segment lives between `[` and `]`; `▶` cells render bright magenta
-/// (256-color 201, matching the C agent) and `·` cells a dim gray.
+/// The bar segment lives between `[` and `]`; `▶` cells render in the theme
+/// color (military green) and `·` cells a dim gray.
 fn status_bar_line(text: &str, base: Style) -> Line<'static> {
-    let Some(open) = text.find('[') else {
-        return Line::styled(text.to_string(), base);
+    let theme = base
+        .fg(Color::Indexed(crate::status::THEME_COLOR))
+        .add_modifier(Modifier::BOLD);
+    let bar = text
+        .find('[')
+        .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
+    let Some((open, close)) = bar else {
+        let mut spans = Vec::new();
+        push_accented(&mut spans, text, base, theme);
+        return Line::from(spans);
     };
-    let Some(close) = text[open..].find(']').map(|i| open + i) else {
-        return Line::styled(text.to_string(), base);
-    };
-    let mut spans = vec![Span::styled(text[..=open].to_string(), base)];
+    let mut spans = Vec::new();
+    push_accented(&mut spans, &text[..=open], base, theme);
     for ch in text[open + 1..close].chars() {
         let style = match ch {
-            '▶' => base.fg(Color::Indexed(201)).add_modifier(Modifier::BOLD),
+            '▶' => theme,
             '·' => base.fg(Color::Indexed(240)),
             _ => base,
         };

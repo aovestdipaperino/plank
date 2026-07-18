@@ -182,6 +182,8 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
+        let verb = status::random_verb_index();
+        let start = Instant::now();
         let stats = self
             .engine
             .generate(
@@ -201,7 +203,9 @@ impl Agent<'_> {
                             state: WorkerState::Prefill,
                             prefill_done: p.done,
                             prefill_total: p.total,
+                            prefill_label: verb,
                             prefill_tps: p.tps,
+                            elapsed_secs: start.elapsed().as_secs_f64(),
                             ctx_size,
                             power_percent: power,
                             ..Status::default()
@@ -356,12 +360,18 @@ impl Agent<'_> {
     }
 
     /// Renders the `/context` usage breakdown with Claude Code's layout: a
-    /// 10x10 cell grid (one cell per percent) beside the model and totals,
-    /// then the estimated usage per category.
+    /// 20-column cell grid (1k tokens per cell, coarser for large contexts
+    /// so the grid stays within half a typical screen) beside the model and
+    /// totals, then the estimated usage per category.
+    #[allow(clippy::too_many_lines)]
     fn render_context_report(&self, color: bool) -> String {
         use std::fmt::Write as _;
         /// Glyph for an unused context cell in the grid.
         const FREE_CELL: char = '⛶';
+        /// Grid width in cells.
+        const GRID_COLS: usize = 20;
+        /// Maximum grid height in rows.
+        const MAX_GRID_ROWS: usize = 16;
         /// Category colors matching Claude Code: violet, cyan, purple, gray.
         const COL_SYSTEM: &str = "\x1b[38;5;105m";
         const COL_MCP: &str = "\x1b[38;5;44m";
@@ -398,19 +408,30 @@ impl Agent<'_> {
             ("Messages", message_tokens, '⛂', COL_MSG),
         ];
 
-        // Fill 100 cells proportionally; every non-empty category shows at
-        // least one cell, and free space takes whatever remains.
-        let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(100);
+        // Adaptive density: 1k tokens per cell, coarsened (in 1k steps) so the
+        // grid never exceeds half a typical 24-row screen. Every non-empty
+        // category shows at least one cell; free space takes what remains.
+        #[allow(clippy::cast_sign_loss)]
+        let ctx = ctx_size as usize;
+        let tokens_per_cell = ctx
+            .div_ceil(GRID_COLS * MAX_GRID_ROWS)
+            .div_ceil(1000)
+            .max(1)
+            * 1000;
+        let total_cells = ctx.div_ceil(tokens_per_cell);
+        let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(total_cells);
         for &(_, tokens, glyph, col) in &categories {
-            if tokens == 0 {
+            if tokens == 0 || cells.len() == total_cells {
                 continue;
             }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let n = (pct(tokens).round() as usize).clamp(1, 100 - cells.len());
+            #[allow(clippy::cast_sign_loss)]
+            let n = ((tokens as usize + tokens_per_cell / 2) / tokens_per_cell)
+                .clamp(1, total_cells - cells.len());
             cells.extend(std::iter::repeat_n((glyph, col), n));
         }
-        cells.truncate(100);
-        cells.resize(100, (FREE_CELL, COL_FREE));
+        cells.truncate(total_cells);
+        cells.resize(total_cells, (FREE_CELL, COL_FREE));
+        let grid_rows = total_cells.div_ceil(GRID_COLS);
 
         // Right-hand column: model line, totals, then the category legend.
         let model = self.engine.model_name();
@@ -440,20 +461,27 @@ impl Agent<'_> {
             status::format_ctx_size(free),
             pct(free)
         ));
+        right.push(format!(
+            "1 cell = {} tokens",
+            status::format_ctx_size(i32::try_from(tokens_per_cell).unwrap_or(i32::MAX))
+        ));
 
         let mut out = String::from("Context Usage\n");
-        let rows = right.len().max(10);
+        let rows = right.len().max(grid_rows);
         for row in 0..rows {
             out.push_str("  ");
-            if row < 10 {
-                for &(glyph, col) in &cells[row * 10..row * 10 + 10] {
+            if row < grid_rows {
+                let start = row * GRID_COLS;
+                let end = (start + GRID_COLS).min(total_cells);
+                for &(glyph, col) in &cells[start..end] {
                     out.push_str(paint(col));
                     out.push(glyph);
                     out.push_str(reset);
                     out.push(' ');
                 }
+                out.push_str(&" ".repeat(2 * (start + GRID_COLS - end)));
             } else {
-                out.push_str(&" ".repeat(20));
+                out.push_str(&" ".repeat(2 * GRID_COLS));
             }
             if let Some(text) = right.get(row) {
                 let _ = write!(out, "   {text}");
@@ -666,9 +694,10 @@ impl Agent<'_> {
             match key.code {
                 KeyCode::Char('c') if ctrl => {
                     if input.buf.text().is_empty() {
-                        break;
+                        log.push_spans(quit_hint_spans());
+                    } else {
+                        input.buf.clear();
                     }
-                    input.buf.clear();
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
@@ -744,18 +773,25 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let mut announced = false;
+        let verb = status::random_verb_index();
+        let start = Instant::now();
         self.engine
             .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
                     if !announced {
                         announced = true;
-                        log.push_dim("Updating system prompt cache...");
+                        log.push_spans(vec![ratatui::text::Span::styled(
+                            "Updating system prompt cache...",
+                            ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                        )]);
                     }
                     let st = Status {
                         state: WorkerState::Prefill,
                         prefill_done: p.done,
                         prefill_total: p.total,
+                        prefill_label: verb,
                         prefill_tps: p.tps,
+                        elapsed_secs: start.elapsed().as_secs_f64(),
                         ctx_size,
                         power_percent: power,
                         ..Status::default()
@@ -765,6 +801,12 @@ impl Agent<'_> {
                 }
             })
             .map_err(|e| e.to_string())?;
+        // The cache note is transient: remove it once the warm-up finishes.
+        if announced {
+            log.pop_line();
+            let status = self.idle_status_text();
+            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status));
+        }
         Ok(())
     }
 
@@ -773,14 +815,23 @@ impl Agent<'_> {
         let checkpoint = self.sysprompt_checkpoint();
         let system = self.system.clone();
         let mut announced = false;
+        let color = self.color;
         self.engine
             .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
                 if matches!(ev, EngineEvent::Prefill(_)) && !announced {
                     announced = true;
-                    eprintln!("Updating system prompt cache...");
+                    if color {
+                        eprintln!("\x1b[33mUpdating system prompt cache...{ANSI_RESET}");
+                    } else {
+                        eprintln!("Updating system prompt cache...");
+                    }
                 }
             })
             .map_err(|e| e.to_string())?;
+        // Erase the transient cache note once the warm-up finishes.
+        if announced && color {
+            eprint!("\x1b[A\x1b[2K\r");
+        }
         Ok(())
     }
 
@@ -853,6 +904,7 @@ impl Agent<'_> {
         let power = self.power_percent;
         let mut assistant_text = String::new();
         let mut gen_count = 0;
+        let verb = status::random_verb_index();
         let start = Instant::now();
 
         let result = self.engine.generate(
@@ -869,11 +921,13 @@ impl Agent<'_> {
                         Status {
                             state: WorkerState::Generating,
                             generated: gen_count,
+                            prefill_label: verb,
                             gen_tps: if secs > 0.0 {
                                 f64::from(gen_count) / secs
                             } else {
                                 0.0
                             },
+                            elapsed_secs: secs,
                             ctx_size,
                             power_percent: power,
                             ..Status::default()
@@ -883,7 +937,9 @@ impl Agent<'_> {
                         state: WorkerState::Prefill,
                         prefill_done: p.done,
                         prefill_total: p.total,
+                        prefill_label: verb,
                         prefill_tps: p.tps,
+                        elapsed_secs: start.elapsed().as_secs_f64(),
                         ctx_size,
                         power_percent: power,
                         ..Status::default()
@@ -1164,6 +1220,14 @@ pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(),
         }
         run_repl_plain(&mut agent)
     }
+}
+
+/// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
+fn quit_hint_spans() -> Vec<ratatui::text::Span<'static>> {
+    vec![ratatui::text::Span::styled(
+        "Press Ctrl-D to quit.",
+        ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+    )]
 }
 
 /// Plain line-based REPL used when stdin is not a terminal.

@@ -115,6 +115,8 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             Some(Backend::Metal) | None => Ds4Backend::Metal,
         };
         eprintln!("plank: loading model {}...", model.display());
+        // Render the C engine's noisy startup log in place on one row.
+        let replacer = plank::stderrline::StderrLineReplacer::start();
         let engine = Ds4Engine::open(
             &model,
             backend,
@@ -123,6 +125,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             cfg.power_percent,
         )
         .map_err(|e| e.to_string())?;
+        drop(replacer);
         eprintln!("plank: model ready: {}", engine.model_name());
         Ok(Box::new(engine))
     }

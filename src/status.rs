@@ -8,8 +8,11 @@
 pub const STATUS_STYLE_START: &str = "\x1b[48;5;238;38;5;252m";
 /// ANSI style reset.
 pub const STATUS_STYLE_END: &str = "\x1b[0m";
-/// ANSI style for the filled portion of the progress bar.
-pub const STATUS_BAR_FILL: &str = "\x1b[48;5;238;38;5;201;1m";
+/// 256-color index of the theme color (military green) used for accents
+/// such as the filled portion of the progress bar.
+pub const THEME_COLOR: u8 = 106;
+/// ANSI style for the filled portion of the progress bar (theme color).
+pub const STATUS_BAR_FILL: &str = "\x1b[48;5;238;38;5;106;1m";
 /// ANSI style for the queued-prompt preview rows.
 pub const QUEUE_STYLE: &str = "\x1b[38;5;87;1m";
 
@@ -44,8 +47,10 @@ pub struct Status {
     pub prefill_done: i32,
     /// Prefill tokens total.
     pub prefill_total: i32,
-    /// Stable index selecting the playful prefill label.
+    /// Stable index selecting the playful spinner verb for this turn.
     pub prefill_label: u32,
+    /// Seconds elapsed since the current operation started.
+    pub elapsed_secs: f64,
     /// Prefill throughput, tokens per second.
     pub prefill_tps: f64,
     /// Tokens generated so far.
@@ -90,19 +95,246 @@ pub fn format_ctx_size(ctx_size: i32) -> String {
     }
 }
 
-/// Keep each prefill operation on a single playful label so the footer does
-/// not visually churn while progress updates stream in.
+/// Claude-Code-style playful gerunds shown next to the spinner. One is picked
+/// per turn (keyed by `Status::prefill_label`) so the footer does not visually
+/// churn while progress updates stream in.
+pub const SPINNER_VERBS: [&str; 200] = [
+    "Accomplishing",
+    "Actualizing",
+    "Baking",
+    "Bamboozling",
+    "Beaming",
+    "Befriending",
+    "Bewitching",
+    "Bloviating",
+    "Boiling",
+    "Boondoggling",
+    "Bootstrapping",
+    "Brainstorming",
+    "Braising",
+    "Brewing",
+    "Burrowing",
+    "Buzzing",
+    "Calculating",
+    "Calibrating",
+    "Canoodling",
+    "Caramelizing",
+    "Cerebrating",
+    "Channelling",
+    "Churning",
+    "Clauding",
+    "Coalescing",
+    "Cogitating",
+    "Combobulating",
+    "Composing",
+    "Computing",
+    "Concocting",
+    "Conjuring",
+    "Contemplating",
+    "Cooking",
+    "Crafting",
+    "Creating",
+    "Crunching",
+    "Crystallizing",
+    "Curating",
+    "Deciphering",
+    "Decoding",
+    "Deliberating",
+    "Discombobulating",
+    "Distilling",
+    "Divining",
+    "Doodling",
+    "Dreaming",
+    "Effervescing",
+    "Elaborating",
+    "Elucidating",
+    "Embellishing",
+    "Enchanting",
+    "Envisioning",
+    "Extrapolating",
+    "Fermenting",
+    "Fiddling",
+    "Finagling",
+    "Flambéing",
+    "Flourishing",
+    "Fluttering",
+    "Forging",
+    "Formulating",
+    "Frolicking",
+    "Galloping",
+    "Galvanizing",
+    "Germinating",
+    "Gesticulating",
+    "Gitifying",
+    "Grokking",
+    "Guessing",
+    "Gusting",
+    "Hatching",
+    "Herding",
+    "Honking",
+    "Hustling",
+    "Hyperventilating",
+    "Hypothesizing",
+    "Ideating",
+    "Illuminating",
+    "Imagining",
+    "Improvising",
+    "Incubating",
+    "Inferring",
+    "Intuiting",
+    "Jitterbugging",
+    "Jiving",
+    "Juggling",
+    "Kerfuffling",
+    "Kindling",
+    "Kneading",
+    "Levitating",
+    "Lollygagging",
+    "Macerating",
+    "Manifesting",
+    "Marinating",
+    "Meandering",
+    "Meditating",
+    "Metabolizing",
+    "Mind-melding",
+    "Mixing",
+    "Moseying",
+    "Mulling",
+    "Musing",
+    "Mustering",
+    "Mutating",
+    "Nesting",
+    "Noodling",
+    "Normalizing",
+    "Orbiting",
+    "Orchestrating",
+    "Osmosing",
+    "Oxidizing",
+    "Percolating",
+    "Perusing",
+    "Philosophising",
+    "Photosynthesizing",
+    "Pirouetting",
+    "Polishing",
+    "Pontificating",
+    "Pondering",
+    "Prognosticating",
+    "Puttering",
+    "Puzzling",
+    "Quibbling",
+    "Reticulating",
+    "Riffing",
+    "Ruminating",
+    "Rustling",
+    "Sautéing",
+    "Scheming",
+    "Schlepping",
+    "Sculpting",
+    "Searing",
+    "Seasoning",
+    "Shimmering",
+    "Shimmying",
+    "Shucking",
+    "Simmering",
+    "Sizzling",
+    "Sketching",
+    "Skedaddling",
+    "Smooshing",
+    "Snoozing",
+    "Sparkling",
+    "Spelunking",
+    "Spinning",
+    "Sprouting",
+    "Squishing",
+    "Steeping",
+    "Stewing",
+    "Stirring",
+    "Strategizing",
+    "Strutting",
+    "Sublimating",
+    "Summoning",
+    "Swirling",
+    "Swooshing",
+    "Synthesizing",
+    "Tinkering",
+    "Toasting",
+    "Transmuting",
+    "Twirling",
+    "Unfurling",
+    "Unravelling",
+    "Vibing",
+    "Wandering",
+    "Weaving",
+    "Whirring",
+    "Whisking",
+    "Wibbling",
+    "Wizarding",
+    "Wobbling",
+    "Wondering",
+    "Wrangling",
+    "Zesting",
+    "Zigzagging",
+    "Zooming",
+    "Alchemizing",
+    "Amalgamating",
+    "Annealing",
+    "Blossoming",
+    "Bubbling",
+    "Cascading",
+    "Catalyzing",
+    "Chiseling",
+    "Deducing",
+    "Digesting",
+    "Dovetailing",
+    "Etching",
+    "Excavating",
+    "Fathoming",
+    "Gilding",
+    "Harmonizing",
+    "Infusing",
+    "Interpolating",
+    "Lassoing",
+    "Navigating",
+    "Quenching",
+    "Scintillating",
+    "Tessellating",
+    "Vortexing",
+];
+
+/// Keep each operation on a single playful verb so the footer does not
+/// visually churn while progress updates stream in.
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
-    const LABELS: [&str; 6] = [
-        "reading",
-        "absorbing",
-        "studying",
-        "gathering",
-        "crunching",
-        "scrutinizing",
-    ];
-    LABELS[st.prefill_label as usize % LABELS.len()]
+    SPINNER_VERBS[st.prefill_label as usize % SPINNER_VERBS.len()]
+}
+
+/// Picks a stable random verb index for a new turn, seeded from wall-clock.
+#[must_use]
+pub fn random_verb_index() -> u32 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    #[allow(clippy::cast_possible_truncation)]
+    let seed = (ms ^ (ms >> 17)) as u32;
+    seed % u32::try_from(SPINNER_VERBS.len()).unwrap_or(1)
+}
+
+/// Formats elapsed seconds Claude-Code style: `12s`, `1m 2s`, `1h 4m`.
+#[must_use]
+pub fn format_elapsed(secs: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let s = if secs.is_finite() && secs > 0.0 {
+        secs as u64
+    } else {
+        0
+    };
+    if s >= 3600 {
+        format!("{}h {}m", s / 3600, (s % 3600) / 60)
+    } else if s >= 60 {
+        format!("{}m {}s", s / 60, s % 60)
+    } else {
+        format!("{s}s")
+    }
 }
 
 fn power_suffix(st: &Status) -> String {
@@ -126,7 +358,7 @@ pub fn throbber() -> char {
     FRAMES[(ms / 100) as usize % FRAMES.len()]
 }
 
-/// Renders the prefill progress bar with an embedded t/s readout.
+/// Renders the prefill progress bar with a t/s readout after the bar.
 #[must_use]
 pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
     let total = if total <= 0 { 1 } else { total };
@@ -138,13 +370,6 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
     if color && filled == 0 && done < total {
         filled = 1;
     }
-    let rate = if tps > 0.0 && filled < PROGRESS_BAR_WIDTH {
-        format!(" {tps:.0}t/s")
-    } else {
-        String::new()
-    };
-    let rate = rate.as_bytes();
-
     let mut out = String::from("[");
     if color {
         out.push_str(STATUS_BAR_FILL);
@@ -153,16 +378,15 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
         if color && i == filled {
             out.push_str(STATUS_STYLE_START);
         }
-        if i >= filled && i - filled < rate.len() {
-            out.push(rate[i - filled] as char);
-        } else {
-            out.push_str(if i < filled { "▶" } else { "·" });
-        }
+        out.push_str(if i < filled { "▶" } else { "·" });
     }
     if color {
         out.push_str(STATUS_STYLE_START);
     }
     out.push(']');
+    if tps > 0.0 {
+        let _ = std::fmt::Write::write_fmt(&mut out, format_args!(" {tps:.0}t/s"));
+    }
     out
 }
 
@@ -170,8 +394,25 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
 #[must_use]
 pub fn build_status_text(st: &Status, color: bool) -> String {
     let used = format_ctx_size(st.ctx_used);
-    let total_ctx = format_ctx_size(st.ctx_size);
+    let total_ctx = if st.ctx_size > 0 {
+        format!(
+            "{} ({:.0}%)",
+            format_ctx_size(st.ctx_size),
+            100.0 * f64::from(st.ctx_used) / f64::from(st.ctx_size)
+        )
+    } else {
+        format_ctx_size(st.ctx_size)
+    };
     let power = power_suffix(st);
+    // Theme-colored accent text; returns to the footer style (not a full
+    // reset) so the status bar's background survives on color terminals.
+    let theme = |text: &str| {
+        if color {
+            format!("\x1b[38;5;{THEME_COLOR};1m{text}{STATUS_STYLE_START}")
+        } else {
+            text.to_owned()
+        }
+    };
     match st.state {
         WorkerState::Prefill => {
             let total = if st.prefill_total > 0 {
@@ -180,17 +421,20 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
                 1
             };
             let done = st.prefill_done.min(total);
-            let pct = 100.0 * f64::from(done) / f64::from(total);
             let bar = progress_bar(done, total, st.prefill_tps, color);
             format!(
-                "ctx {used}/{total_ctx} | {} {} {bar} {done}/{total} {pct:.1}%{power}",
+                "ctx {used}/{total_ctx} | {} ({}) {} {bar}{power}",
                 throbber(),
-                prefill_label(st)
+                format_elapsed(st.elapsed_secs),
+                theme("prefill")
             )
         }
         WorkerState::Generating => format!(
-            "ctx {used}/{total_ctx} | generation {} tokens{} {:.1} t/s{power}",
-            st.generated,
+            "ctx {used}/{total_ctx} | {} {}… ({} · ↓ {} tokens{} · {:.1} t/s){power}",
+            throbber(),
+            theme(prefill_label(st)),
+            format_elapsed(st.elapsed_secs),
+            format_ctx_size(st.generated),
             if st.greedy_sampling { " ❄️" } else { "" },
             st.gen_tps
         ),
@@ -254,7 +498,7 @@ mod tests {
             ctx_size: 8000,
             ..Status::default()
         };
-        assert_eq!(build_status_text(&st, false), "ctx 1k/8k | idle");
+        assert_eq!(build_status_text(&st, false), "ctx 1k/8k (12%) | idle");
     }
 
     #[test]
@@ -263,14 +507,35 @@ mod tests {
             state: WorkerState::Generating,
             generated: 42,
             gen_tps: 9.5,
+            elapsed_secs: 62.0,
             ctx_used: 1500,
             ctx_size: 8000,
             ..Status::default()
         };
-        assert_eq!(
-            build_status_text(&st, false),
-            "ctx 1.5k/8k | generation 42 tokens 9.5 t/s"
-        );
+        let line = build_status_text(&st, false);
+        assert!(line.starts_with("ctx 1.5k/8k (19%) | "), "{line}");
+        assert!(line.contains("(1m 2s · ↓ 42 tokens · 9.5 t/s)"), "{line}");
+        assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
+    }
+
+    #[test]
+    fn spinner_verbs_are_200_and_unique() {
+        assert_eq!(SPINNER_VERBS.len(), 200);
+        let set: std::collections::HashSet<_> = SPINNER_VERBS.iter().collect();
+        assert_eq!(set.len(), 200);
+    }
+
+    #[test]
+    fn bar_fill_uses_theme_color() {
+        assert!(STATUS_BAR_FILL.contains(&format!(";38;5;{THEME_COLOR};")));
+    }
+
+    #[test]
+    fn elapsed_formatting() {
+        assert_eq!(format_elapsed(0.0), "0s");
+        assert_eq!(format_elapsed(12.4), "12s");
+        assert_eq!(format_elapsed(62.0), "1m 2s");
+        assert_eq!(format_elapsed(3845.0), "1h 4m");
     }
 
     #[test]

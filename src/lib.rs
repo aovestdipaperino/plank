@@ -20,6 +20,7 @@ pub mod render;
 pub mod session;
 pub mod status;
 pub mod statusbar;
+pub mod stderrline;
 pub mod sysprompt;
 pub mod tools;
 pub mod trace;
