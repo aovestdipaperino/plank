@@ -617,17 +617,63 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
     out
 }
 
-/// Loads the config, spawns and handshakes each server, dropping failures.
+/// Global MCP config location: `.mcp.json` inside plank's home directory.
+///
+/// `~/.plank` is the same directory the model and kv-cache live in.
+#[must_use]
+pub fn global_config_path() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(Path::new(&home).join(".plank").join(".mcp.json"))
+}
+
+/// Merges the global and local MCP configs, local overriding by server name.
+///
+/// Hierarchical like Claude Code's user vs project scope: servers from
+/// `~/.plank/.mcp.json` apply everywhere, and a same-named entry in the local
+/// file (`./.mcp.json`, or the `--mcp-config` path when given) replaces the
+/// global definition entirely. Servers only named locally are added.
+#[must_use]
+pub fn config_load_hierarchy(local_path: Option<&Path>) -> Vec<McpServerConfig> {
+    let global = match global_config_path() {
+        Some(path) => config_load(&path),
+        None => Vec::new(),
+    };
+    let default = Path::new(".mcp.json");
+    let local = config_load(local_path.unwrap_or(default));
+    merge_configs(global, local)
+}
+
+/// Overlays `local` server configs onto `global`, matching by server name.
+fn merge_configs(
+    global: Vec<McpServerConfig>,
+    local: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
+    let mut merged = global;
+    for entry in local {
+        match merged.iter_mut().find(|m| m.name == entry.name) {
+            Some(slot) => *slot = entry,
+            None => merged.push(entry),
+        }
+    }
+    merged
+}
+
+/// Loads the config hierarchy, spawns and handshakes each server.
 ///
 /// Mirrors `agent_mcp_load_and_start`: a server that cannot start or
 /// handshake is reported to stderr and skipped rather than aborting the
-/// whole agent. `path` defaults to `./.mcp.json` when `None`.
+/// whole agent. `path` overrides the local config location; the global
+/// `~/.plank/.mcp.json` always applies underneath (see
+/// [`config_load_hierarchy`]).
 #[must_use]
 pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
-    let default = Path::new(".mcp.json");
-    let path = path.unwrap_or(default);
+    start_servers(config_load_hierarchy(path))
+}
+
+/// Spawns and handshakes each configured server, dropping failures.
+fn start_servers(configs: Vec<McpServerConfig>) -> Vec<McpServer> {
     let mut servers = Vec::new();
-    for cfg in config_load(path) {
+    for cfg in configs {
         let started = McpServer::spawn(&cfg).and_then(|mut s| {
             s.handshake(cfg.primary_tools.as_deref())?;
             Ok(s)
@@ -983,6 +1029,30 @@ mod tests {
     }
 
     #[test]
+    fn hierarchy_local_overrides_global_by_server_name() {
+        let global = write_temp_config(
+            "{\"mcpServers\":{\"shared\":{\"command\":\"global-cmd\"},\
+             \"only_global\":{\"command\":\"g\"}}}",
+        );
+        let local = write_temp_config(
+            "{\"mcpServers\":{\"shared\":{\"command\":\"local-cmd\"},\
+             \"only_local\":{\"command\":\"l\"}}}",
+        );
+        let merged = merge_configs(config_load(&global), config_load(&local));
+        let by_name = |n: &str| {
+            merged
+                .iter()
+                .find(|c| c.name == n)
+                .map(|c| c.command.clone())
+        };
+        assert_eq!(by_name("shared").as_deref(), Some("local-cmd"));
+        assert_eq!(by_name("only_global").as_deref(), Some("g"));
+        assert_eq!(by_name("only_local").as_deref(), Some("l"));
+        std::fs::remove_file(global).ok();
+        std::fs::remove_file(local).ok();
+    }
+
+    #[test]
     fn config_load_parses_primary_tools() {
         let path = write_temp_config(
             "{\"mcpServers\":{\"demo\":{\"command\":\"echo\",\
@@ -1063,7 +1133,9 @@ done
                 esc
             }
         ));
-        let mut servers = load_and_start(Some(&path));
+        // start_servers + config_load keeps the test hermetic: the merged
+        // hierarchy would also pick up the user's real ~/.plank/.mcp.json.
+        let mut servers = start_servers(config_load(&path));
         std::fs::remove_file(&path).ok();
         assert_eq!(servers.len(), 1, "server should start and handshake");
         assert_eq!(servers[0].tools.len(), 1);

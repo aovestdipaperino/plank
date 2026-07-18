@@ -116,8 +116,8 @@ Options:
       --think-max          enable maximum thinking effort
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
-      --mcp-config FILE    load MCP servers from a .mcp.json-style file
-                           (default: ./.mcp.json if present)
+      --mcp-config FILE    local MCP server config (default: ./.mcp.json);
+                           overlays the global ~/.plank/.mcp.json by name
 "
     .to_owned()
 }

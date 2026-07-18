@@ -48,7 +48,7 @@ Run with a prompt argument for one-shot headless mode.
 
 ### MCP servers
 
-Plank can load external tools from stdio MCP servers. It reads `./.mcp.json` (or the file given with `--mcp-config`) in the standard `mcpServers` format:
+Plank can load external tools from stdio MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format:
 
 ```json
 {
