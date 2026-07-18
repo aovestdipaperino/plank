@@ -6,6 +6,7 @@
 
 pub mod compact;
 pub mod config;
+pub mod download;
 #[cfg(ds4_engine)]
 pub mod ds4engine;
 pub mod dsml;

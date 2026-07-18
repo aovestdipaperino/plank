@@ -38,6 +38,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Trace logging** (`--trace`), SIGINT-based generation interrupt, and a
   headless mode (`--non-interactive`) with the stdin quiet-window protocol.
 - Default context window of 1M tokens (`1048576`), displayed as `1.0M`.
+- **Automatic model download.** With no `-m`, plank looks for
+  `~/.plank/ds4flash.gguf` and, if missing, offers to fetch the DeepSeek V4
+  Flash GGUF from Hugging Face. The download runs on a Ratatui alternate screen
+  (so it repaints in place everywhere, including Warp) with a red gauge and a
+  rotating series of 200 "downloading alien/genius intelligence" one-liners.
+  Resumable via `curl -C -`; the prompt defaults to yes; curl runs in its own
+  process group so cancelling never touches the parent shell.
+- **RAM guard.** plank refuses to download or load the model on machines with
+  less than 96 GB of physical RAM (the recommended minimum for this quant).
+- **`docs/ARCHITECTURE.md`** describing the module layout and data flows.
 
 ### Notes
 

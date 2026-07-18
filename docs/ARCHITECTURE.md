@@ -1,0 +1,184 @@
+# plank Architecture
+
+plank is a Rust port of the `ds4_agent` reference (a single-file C agent for the
+DeepSeek V4 Flash model). It is a **functionality-by-functionality** port, not a
+line-by-line translation: each C section became an idiomatic Rust module with
+its own tests, while preserving the model-facing behavior (prompt shape, tool
+protocol, output formats) that the model was trained on.
+
+The C reference lives in the `ds4-ref` git submodule and is the source of truth
+for wire formats and prompt text.
+
+## Design principles
+
+- **Narrow engine surface.** All inference sits behind the `Engine` trait, so
+  the agent, UI, and tools never touch model internals. A stub `EchoEngine`
+  keeps the whole app runnable without a model.
+- **Sink-agnostic rendering.** Model output flows through a streaming pipeline
+  whose final destination (stdout, or a Ratatui buffer) is a swappable sink.
+- **Preserve model-facing formats.** Tool output framing, the DSML tool-call
+  syntax, and the system prompt are reproduced verbatim from the C reference.
+- **Correctness before cleverness.** The KV cache reuses only a genuinely
+  matching token prefix; a stale disk checkpoint is rebuilt, never trusted.
+
+## Layers
+
+```mermaid
+flowchart TD
+    main[main.rs<br/>CLI parse, engine selection]
+    subgraph frontend [Front-ends]
+        tui[tui + ui::run_tui<br/>Ratatui full-screen]
+        plain[ui::run_repl_plain<br/>piped / headless]
+    end
+    agent[ui::Agent<br/>turn loop, slash commands]
+    pipeline[viz + render<br/>streaming display]
+    tools[tools<br/>files, edit, search, bash, web]
+    session[session + compact + sysprompt<br/>transcript, persistence]
+    engine[engine::Engine trait]
+    ds4[ds4engine + ffi<br/>real ds4 model]
+    echo[EchoEngine<br/>stub]
+
+    main --> frontend
+    frontend --> agent
+    agent --> pipeline
+    agent --> tools
+    agent --> session
+    agent --> engine
+    engine --> ds4
+    engine --> echo
+    ds4 --> cengine[(ds4-ref C engine<br/>Metal)]
+```
+
+## The turn lifecycle
+
+A "turn" is one user prompt driven to a settled answer. The agent generates,
+runs any tool calls the model emitted, feeds the results back, and repeats until
+a generation produces no tool calls.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant A as Agent
+    participant E as Engine
+    participant V as Stream pipeline
+    participant T as Tools
+
+    U->>A: prompt
+    A->>A: maybe compact / re-inject system reminder
+    loop until no tool calls
+        A->>E: generate(transcript)
+        E-->>V: Prefill progress + Text tokens
+        V-->>U: styled output (banners, gray thinking)
+        E-->>A: stats + parsed tool calls
+        alt tool calls present
+            A->>T: dispatch(calls)
+            T-->>A: observations
+            A->>A: append <tool_result> to transcript
+        else no calls
+            A-->>U: final answer
+        end
+    end
+```
+
+## Module reference
+
+### Agent core (`ui.rs`)
+Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
+turn loop (`run_turn` / `tui_turn`). Hosts the two interactive front-ends and
+the slash-command handlers. Also holds `render_transcript`, which flattens the
+message list into the `[system]`/`[user]`/`[assistant]` text the engine tokenizes.
+
+### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`)
+- `engine.rs` — the `Engine` trait (`generate`, `warm_system_prompt`,
+  `count_tokens`, `ctx_size`), the event types (`EngineEvent::{Prefill, Text}`),
+  options, stats, and the `EchoEngine` stub.
+- `ffi.rs` — raw declarations for the subset of the ds4 C API plank uses
+  (engine open/close, chat-template tokenization, session sync/sample/eval,
+  KV snapshots). Present only under the `ds4_engine` cfg.
+- `ds4engine.rs` — the safe `Ds4Engine` wrapper. Keeps one live session alive
+  across turns so `ds4_session_sync` reuses the cached KV prefix and only
+  prefills the new suffix. Streams `Prefill` events via a display-progress
+  callback and samples with cooperative interrupt.
+
+### Streaming display (`viz.rs`, `render.rs`, `dsml.rs`)
+Model text is fed byte-by-byte through a pipeline:
+1. `viz::StreamRenderer` detects the DSML tool-call marker (in plain text and
+   inside `<think>` blocks), suppresses raw markup, and emits human-friendly
+   tool banners. It routes output to a `RenderSink` (visible vs. thinking).
+2. `render.rs` (stdout path) turns that into ANSI: markdown, syntax
+   highlighting, and gray thinking text.
+3. `dsml.rs` is the strict parser that turns a completed stanza into executable
+   `ToolCall`s.
+
+### Tools (`tools/`)
+`dispatch` maps a `ToolCall` to an implementation, mirroring the C tool table:
+`files.rs` (read/more/write/list), `edit.rs` (edit with `[upto]` anchoring,
+search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`).
+Output framing matches the C byte-for-byte.
+
+### Sessions & context (`session.rs`, `compact.rs`, `sysprompt.rs`)
+- `session.rs` — save/load/list/switch/delete with SHA-1 identities and history
+  rendering under `~/.plank/kvcache`.
+- `compact.rs` — the durable-summary + verbatim-tail rebuild and its pressure
+  thresholds.
+- `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
+  token-distance policy for re-injecting the system-prompt reminder.
+
+### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`)
+- `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`
+  (a `RenderSink`), the frame layout, and the magenta-colored progress bar.
+- `status.rs` — the compact footer text and the prefill progress bar.
+- `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
+- `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
+
+### Support (`config.rs`, `trace.rs`, `interrupt.rs`, `logo.rs`)
+CLI parsing, trace logging (`--trace`), the SIGINT flag for interrupting
+generation, and the startup banner.
+
+## Data flows worth understanding
+
+### System-prompt KV cache
+On startup the agent warms the cache before the first turn:
+
+1. `Ds4Engine::warm_system_prompt` builds system-only chat tokens and computes a
+   fingerprint = `SHA-1(model_name + "\0" + system_prompt)`.
+2. If `sysprompt.kv` exists and its stored fingerprint matches, the snapshot is
+   restored (`ds4_session_load_snapshot`) — no prefill.
+3. Otherwise it shows **"Updating system prompt cache..."**, prefills the system
+   prompt (streaming the progress bar), and saves a fresh checkpoint.
+
+Within a run, the live session then makes each turn reuse the common prefix, so
+only the new user/assistant suffix is evaluated.
+
+### Interruption
+Generation is synchronous. Between tokens the engine polls an `interrupt`
+closure. In the TUI that closure reads a flag set by polling crossterm for
+Ctrl-C/Esc; in the plain path it reads a SIGINT atomic (`interrupt.rs`).
+
+## Front-end selection
+
+`main::run` picks the path from the terminal:
+
+| stdin & stdout are a TTY | `--non-interactive` | Front-end |
+| --- | --- | --- |
+| yes | no | Ratatui TUI (`run_tui`) |
+| no | no | Plain line REPL (`run_repl_plain`) |
+| — | yes | Headless stdin protocol (`run_non_interactive`) |
+
+The TUI uses the alternate screen, so block-based terminals (Warp) render it as
+a proper full-screen app rather than reflowing it.
+
+## Build
+
+`build.rs` compiles the ds4 C engine from the `ds4-ref` submodule on macOS
+(Metal objects → `libds4core.a`), links Foundation + Metal, and emits the
+`ds4_engine` cfg. Off macOS, or without the submodule, the cfg is absent and
+plank builds with the `EchoEngine` only. The Metal kernel directory is baked in
+so the engine can locate its `.metal` sources at runtime.
+
+## Testing
+
+Each module carries unit tests (the DSML parser, renderers, tools, session
+persistence, compaction thresholds, config parsing). The pure logic is testable
+without a model; the `EchoEngine` exercises the turn loop end-to-end. The
+pre-commit hook runs `cargo fmt` and `cargo clippy --workspace --all-targets`.
