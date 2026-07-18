@@ -76,10 +76,18 @@ fn render_transcript(session: &Session, system: &str) -> String {
     out
 }
 
+/// ANSI reset used by the slash-command reports.
+const ANSI_RESET: &str = "\x1b[0m";
+
 /// Renders the `/mcp` server report following Claude Code's layout: a header
 /// with the server count, then one `name · status · N tools` line each.
-fn render_mcp_report(servers: &[crate::tools::mcp::McpServer]) -> String {
+fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color: bool) -> String {
     use std::fmt::Write as _;
+    let (green, red, reset) = if color {
+        ("\x1b[38;5;42m", "\x1b[38;5;204m", ANSI_RESET)
+    } else {
+        ("", "", "")
+    };
     let mut out = String::from("Manage MCP servers\n");
     if servers.is_empty() {
         out.push_str("no servers configured (checked ./.mcp.json and ~/.plank/.mcp.json)\n");
@@ -92,12 +100,12 @@ fn render_mcp_report(servers: &[crate::tools::mcp::McpServer]) -> String {
             let plural = if s.tools.len() == 1 { "" } else { "s" };
             let _ = writeln!(
                 out,
-                "  {} · ✔ connected · {} tool{plural}",
+                "  {} · {green}✔ connected{reset} · {} tool{plural}",
                 s.name,
                 s.tools.len()
             );
         } else {
-            let _ = writeln!(out, "  {} · ✘ failed", s.name);
+            let _ = writeln!(out, "  {} · {red}✘ failed{reset}", s.name);
         }
     }
     out
@@ -127,6 +135,15 @@ const HISTORY_DEFAULT_TURNS: usize = 3;
 const HISTORY_MAX_TURNS: usize = 200;
 
 impl Agent<'_> {
+    /// Wraps a debug/status message in the thinking gray on color terminals.
+    fn debug_line(&self, text: &str) -> String {
+        if self.color {
+            format!("\x1b[38;5;238m{text}{ANSI_RESET}")
+        } else {
+            text.to_owned()
+        }
+    }
+
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
@@ -269,7 +286,10 @@ impl Agent<'_> {
         if !self.reminder.should_remind(pos) {
             return;
         }
-        println!("Re-injecting system prompt reminder...");
+        println!(
+            "{}",
+            self.debug_line("Re-injecting system prompt reminder...")
+        );
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
@@ -331,17 +351,24 @@ impl Agent<'_> {
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
         self.session.transcript.extend(tail);
-        println!("context compacted");
+        println!("{}", self.debug_line("context compacted"));
         Ok(())
     }
 
     /// Renders the `/context` usage breakdown with Claude Code's layout: a
     /// 10x10 cell grid (one cell per percent) beside the model and totals,
     /// then the estimated usage per category.
-    fn render_context_report(&self) -> String {
+    fn render_context_report(&self, color: bool) -> String {
         use std::fmt::Write as _;
         /// Glyph for an unused context cell in the grid.
         const FREE_CELL: char = '⛶';
+        /// Category colors matching Claude Code: violet, cyan, purple, gray.
+        const COL_SYSTEM: &str = "\x1b[38;5;105m";
+        const COL_MCP: &str = "\x1b[38;5;44m";
+        const COL_MSG: &str = "\x1b[38;5;134m";
+        const COL_FREE: &str = "\x1b[38;5;240m";
+        let paint = |col: &'static str| if color { col } else { "" };
+        let reset = if color { ANSI_RESET } else { "" };
         let ctx_size = self.engine.ctx_size().max(1);
         let mut schemas = String::new();
         crate::tools::mcp::append_tool_schemas(&mut schemas, &self.tool_ctx.mcp);
@@ -363,26 +390,27 @@ impl Agent<'_> {
         let free = ctx_size - used;
         let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
 
-        // One glyph per category so the grid stays readable without color.
+        // One glyph per category so the grid stays readable without color;
+        // with color each category also gets its Claude Code hue.
         let categories = [
-            ("System prompt", system_tokens, '⛁'),
-            ("MCP tools", mcp_tokens, '⛃'),
-            ("Messages", message_tokens, '⛂'),
+            ("System prompt", system_tokens, '⛁', COL_SYSTEM),
+            ("MCP tools", mcp_tokens, '⛃', COL_MCP),
+            ("Messages", message_tokens, '⛂', COL_MSG),
         ];
 
         // Fill 100 cells proportionally; every non-empty category shows at
         // least one cell, and free space takes whatever remains.
-        let mut cells: Vec<char> = Vec::with_capacity(100);
-        for &(_, tokens, glyph) in &categories {
+        let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(100);
+        for &(_, tokens, glyph, col) in &categories {
             if tokens == 0 {
                 continue;
             }
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let n = (pct(tokens).round() as usize).clamp(1, 100 - cells.len());
-            cells.extend(std::iter::repeat_n(glyph, n));
+            cells.extend(std::iter::repeat_n((glyph, col), n));
         }
         cells.truncate(100);
-        cells.resize(100, FREE_CELL);
+        cells.resize(100, (FREE_CELL, COL_FREE));
 
         // Right-hand column: model line, totals, then the category legend.
         let model = self.engine.model_name();
@@ -398,15 +426,17 @@ impl Agent<'_> {
         ));
         right.push(String::new());
         right.push("Estimated usage by category".to_owned());
-        for &(label, tokens, glyph) in &categories {
+        for &(label, tokens, glyph, col) in &categories {
             right.push(format!(
-                "{glyph} {label}: {} tokens ({:.1}%)",
+                "{}{glyph}{reset} {label}: {} tokens ({:.1}%)",
+                paint(col),
                 status::format_ctx_size(tokens),
                 pct(tokens)
             ));
         }
         right.push(format!(
-            "{FREE_CELL} Free space: {} ({:.1}%)",
+            "{}{FREE_CELL}{reset} Free space: {} ({:.1}%)",
+            paint(COL_FREE),
             status::format_ctx_size(free),
             pct(free)
         ));
@@ -416,8 +446,10 @@ impl Agent<'_> {
         for row in 0..rows {
             out.push_str("  ");
             if row < 10 {
-                for cell in &cells[row * 10..row * 10 + 10] {
-                    out.push(*cell);
+                for &(glyph, col) in &cells[row * 10..row * 10 + 10] {
+                    out.push_str(paint(col));
+                    out.push(glyph);
+                    out.push_str(reset);
                     out.push(' ');
                 }
             } else {
@@ -507,8 +539,8 @@ impl Agent<'_> {
                     }
                 }
             }
-            "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp)),
-            "/context" => print!("{}", self.render_context_report()),
+            "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
+            "/context" => print!("{}", self.render_context_report(self.color)),
             "/compact" => self.compact("user request")?,
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
             _ => println!("unknown command: {cmd}"),
@@ -716,7 +748,7 @@ impl Agent<'_> {
                 if let EngineEvent::Prefill(p) = ev {
                     if !announced {
                         announced = true;
-                        log.push_plain("Updating system prompt cache...");
+                        log.push_dim("Updating system prompt cache...");
                     }
                     let st = Status {
                         state: WorkerState::Prefill,
@@ -778,7 +810,7 @@ impl Agent<'_> {
             log.end_line();
             if out.interrupted {
                 crate::interrupt::clear();
-                log.push_plain("[interrupted]");
+                log.push_dim("[interrupted]");
                 return Ok(());
             }
             if let Some(err) = out.error {
@@ -793,7 +825,7 @@ impl Agent<'_> {
                     "<tool_result>{observations}</tool_result>"
                 )));
                 for line in observations.lines() {
-                    log.push_plain(line.to_owned());
+                    log.push_dim(line.to_owned());
                 }
                 continue;
             }
@@ -898,7 +930,7 @@ impl Agent<'_> {
 
     /// Performs a compaction pass and rebuilds the transcript, logging progress.
     fn tui_do_compact(&mut self, reason: &str, log: &mut OutputLog) -> Result<(), String> {
-        log.push_plain(format!(
+        log.push_dim(format!(
             "COMPACTING {reason}: summarizing durable task state..."
         ));
         let mut prompt = render_transcript(&self.session, &self.system);
@@ -931,7 +963,7 @@ impl Agent<'_> {
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
         self.session.transcript.extend(tail);
-        log.push_plain("context compacted");
+        log.push_dim("context compacted");
         Ok(())
     }
 
@@ -942,7 +974,7 @@ impl Agent<'_> {
         if !self.reminder.should_remind(pos) {
             return;
         }
-        log.push_plain("Re-injecting system prompt reminder...");
+        log.push_dim("Re-injecting system prompt reminder...");
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
@@ -974,16 +1006,8 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
-            "/mcp" => {
-                for line in render_mcp_report(&self.tool_ctx.mcp).lines() {
-                    log.push_plain(line.to_owned());
-                }
-            }
-            "/context" => {
-                for line in self.render_context_report().lines() {
-                    log.push_plain(line.to_owned());
-                }
-            }
+            "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
+            "/context" => log.push_ansi(&self.render_context_report(true)),
             "/compact" => {
                 if let Err(e) = self.tui_do_compact("user request", log) {
                     log.push_plain(format!("compact failed: {e}"));

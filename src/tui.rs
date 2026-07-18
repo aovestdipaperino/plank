@@ -72,6 +72,17 @@ impl OutputLog {
         self.push_spans(vec![Span::raw(text.into())]);
     }
 
+    /// Appends a line in the thinking gray, for tool and debug output.
+    pub fn push_dim(&mut self, text: impl Into<String>) {
+        self.push_spans(vec![Span::styled(text.into(), think_style())]);
+    }
+
+    /// Appends ANSI-colored text, one log line per input line.
+    pub fn push_ansi(&mut self, text: &str) {
+        self.end_line();
+        self.lines.extend(ansi_to_lines(text));
+    }
+
     /// Ensures the streamed output ends on a fresh line.
     pub fn end_line(&mut self) {
         if !self.current.is_empty() {

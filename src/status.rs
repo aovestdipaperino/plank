@@ -113,6 +113,19 @@ fn power_suffix(st: &Status) -> String {
     }
 }
 
+/// Braille throbber frame derived from wall-clock time, so any footer
+/// repaint advances the animation and a pegged progress bar still shows
+/// the worker is alive.
+#[must_use]
+pub fn throbber() -> char {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    #[allow(clippy::cast_possible_truncation)]
+    FRAMES[(ms / 100) as usize % FRAMES.len()]
+}
+
 /// Renders the prefill progress bar with an embedded t/s readout.
 #[must_use]
 pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
@@ -170,7 +183,8 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
             let pct = 100.0 * f64::from(done) / f64::from(total);
             let bar = progress_bar(done, total, st.prefill_tps, color);
             format!(
-                "ctx {used}/{total_ctx} | {} {bar} {done}/{total} {pct:.1}%{power}",
+                "ctx {used}/{total_ctx} | {} {} {bar} {done}/{total} {pct:.1}%{power}",
+                throbber(),
                 prefill_label(st)
             )
         }
