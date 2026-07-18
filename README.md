@@ -1,5 +1,9 @@
 # plank
 
+<p align="center">
+  <img src="assets/logo.png" alt="Plank logo" width="300">
+</p>
+
 A Rust port of the [ds4](https://github.com/aovestdipaperino/ds4) agent, converted functionality-by-functionality (not line-by-line) from the C reference implementation.
 
 Plank is an interactive coding agent with a terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web). On macOS it can link the original ds4 C inference engine (Metal backend) via the `ds4-ref` submodule; on other platforms it falls back to a built-in echo engine.
