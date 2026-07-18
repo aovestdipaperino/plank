@@ -47,14 +47,26 @@ pub fn art(width: u32) -> String {
     logo_art::image_to_ansi(transparent_png(), width.max(1))
 }
 
+/// Version label like `v0.9.9`, with ` BETA` appended for beta builds.
+///
+/// A build is beta when the version carries a `beta` pre-release identifier or
+/// the release workflow sets `PLANK_CHANNEL=beta` at compile time.
+#[must_use]
+pub fn version_label() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let beta = version.contains("beta")
+        || option_env!("PLANK_CHANNEL").is_some_and(|c| c.eq_ignore_ascii_case("beta"));
+    if beta {
+        format!("v{version} BETA")
+    } else {
+        format!("v{version}")
+    }
+}
+
 /// The logo art at [`DEFAULT_WIDTH`] followed by a version line.
 #[must_use]
 pub fn banner() -> String {
-    format!(
-        "{}      v{}\n",
-        art(DEFAULT_WIDTH),
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("{}      {}\n", art(DEFAULT_WIDTH), version_label())
 }
 
 #[cfg(test)]
@@ -70,5 +82,12 @@ mod tests {
     #[test]
     fn banner_has_version() {
         assert!(super::banner().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn version_label_starts_with_v_and_version() {
+        let label = super::version_label();
+        assert!(label.starts_with('v'));
+        assert!(label.contains(env!("CARGO_PKG_VERSION")));
     }
 }

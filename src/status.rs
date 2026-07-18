@@ -212,10 +212,11 @@ pub fn format_user_prompt_echo(text: &str, color: bool) -> String {
 #[must_use]
 pub fn welcome_banner(ctx_size: i32, color: bool) -> String {
     let ctx = format_ctx_size(ctx_size);
+    let ver = crate::logo::version_label();
     if color {
-        format!("\x1b[1;97mpl\x1b[1;94mank\x1b[0m 🪵 Agent, context {ctx} tokens\n\n")
+        format!("\x1b[1;97mpl\x1b[1;94mank\x1b[0m {ver} 🪵 Agent, context {ctx} tokens\n\n")
     } else {
-        format!("plank Agent, context {ctx} tokens\n\n")
+        format!("plank {ver} Agent, context {ctx} tokens\n\n")
     }
 }
 

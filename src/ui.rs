@@ -471,11 +471,12 @@ impl Agent<'_> {
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
         let mut log = OutputLog::new();
-        for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH)) {
+        for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 144 / 100)) {
             log.push_spans(line.spans);
         }
         log.push_plain(format!(
-            "plank 🪵 Agent, context {} tokens",
+            "plank {} 🪵 Agent, context {} tokens",
+            crate::logo::version_label(),
             status::format_ctx_size(self.engine.ctx_size())
         ));
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
