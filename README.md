@@ -20,7 +20,9 @@ brew install plank         # stable channel
 brew install plank-beta    # beta channel
 ```
 
-Releases follow a two-channel scheme: the highest major version is always the beta. When a beta is promoted to stable, the next major opens as the new (initially empty) beta — e.g. promoting v8.x to stable creates v9.0.0 as the new beta. The two formulas conflict since both install a `plank` binary.
+Or in one step without a prior tap: `brew install aovestdipaperino/tap/plank`. Prebuilt bottles exist for Apple Silicon and Intel Macs; on other setups Homebrew builds from source (requires Rust). Upgrade with `brew upgrade plank`.
+
+Releases follow a two-channel scheme: the highest major version is always the beta. When a beta is promoted to stable, the next major opens as the new (initially empty) beta — e.g. promoting v8.x to stable creates v9.0.0 as the new beta. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank && brew install plank-beta` (or the reverse).
 
 ## Building
 
