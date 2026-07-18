@@ -48,6 +48,20 @@ plank --help     # full option list
 
 Run with a prompt argument for one-shot headless mode.
 
+### Highlights
+
+Assistant replies render as markdown in the TUI, with tree-sitter syntax highlighting for fenced code blocks:
+
+<p align="center">
+  <img src="assets/syntax-highlighting.png" alt="Syntax-highlighted Rust code in the plank TUI" width="700">
+</p>
+
+The `/context` command visualizes context-window usage by category:
+
+<p align="center">
+  <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
+</p>
+
 ### MCP servers
 
 Plank can load external tools from stdio MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format:
