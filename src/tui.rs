@@ -99,6 +99,90 @@ impl RenderSink for OutputLog {
     }
 }
 
+/// Converts true-color ANSI art (from `logo-art`) into styled ratatui lines.
+///
+/// Understands the SGR subset the crate emits: `38;2;r;g;b` / `48;2;r;g;b`
+/// truecolor, `39`/`49` defaults, and `\x1b[m` reset. Other bytes are text.
+#[must_use]
+pub fn ansi_to_lines(art: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut style = Style::default();
+    let mut chars = art.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\x1b' if chars.peek() == Some(&'[') => {
+                chars.next(); // consume '['
+                let mut params = String::new();
+                for pc in chars.by_ref() {
+                    if pc == 'm' {
+                        break;
+                    }
+                    params.push(pc);
+                }
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), style));
+                }
+                style = apply_sgr(style, &params);
+            }
+            '\n' => {
+                if !run.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut run), style));
+                }
+                lines.push(Line::from(std::mem::take(&mut spans)));
+            }
+            other => run.push(other),
+        }
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(run, style));
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+/// Applies one SGR parameter string to a style (truecolor + fg/bg reset only).
+fn apply_sgr(mut style: Style, params: &str) -> Style {
+    if params.is_empty() {
+        return Style::default();
+    }
+    let parts: Vec<&str> = params.split(';').collect();
+    let rgb = |i: usize| -> Color {
+        let c = |k: usize| parts.get(k).and_then(|s| s.parse::<u8>().ok()).unwrap_or(0);
+        Color::Rgb(c(i), c(i + 1), c(i + 2))
+    };
+    let mut i = 0;
+    while i < parts.len() {
+        match parts[i] {
+            "" | "0" => {
+                style = Style::default();
+                i += 1;
+            }
+            "39" => {
+                style = style.fg(Color::Reset);
+                i += 1;
+            }
+            "49" => {
+                style = style.bg(Color::Reset);
+                i += 1;
+            }
+            "38" if parts.get(i + 1) == Some(&"2") => {
+                style = style.fg(rgb(i + 2));
+                i += 5;
+            }
+            "48" if parts.get(i + 1) == Some(&"2") => {
+                style = style.bg(rgb(i + 2));
+                i += 5;
+            }
+            _ => i += 1,
+        }
+    }
+    style
+}
+
 /// Builds the styled user-echo line shown for a submitted prompt.
 #[must_use]
 pub fn user_echo_spans(text: &str) -> Vec<Span<'static>> {

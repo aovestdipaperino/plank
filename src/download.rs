@@ -5,10 +5,12 @@
 //! (`huggingface.co`),
 //! streaming a magenta progress bar with a rotating series of messages.
 
-use std::io::{self, IsTerminal, Write};
-use std::os::unix::process::CommandExt;
+use std::fs::{File, OpenOptions};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
@@ -287,7 +289,7 @@ fn partial_bytes(dest: &Path) -> u64 {
     std::fs::metadata(dest.with_extension("part")).map_or(0, |m| m.len())
 }
 
-/// Downloads `url` to `dest` via curl, showing the animated progress bar.
+/// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -295,38 +297,84 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     let part = dest.with_extension("part");
     let total = content_length(url);
 
-    // curl resumes a partial .part file with `-C -`; we render our own screen.
-    // Put curl in its own process group so a terminal signal (e.g. Ctrl-C)
-    // never cascades to the parent shell — we cancel by killing this child only.
-    let mut child = Command::new("curl")
-        .args(["-fL", "-C", "-", "--silent", "-o"])
-        .arg(&part)
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map_err(|e| format!("failed to start curl: {e}"))?;
+    // A .part that already matches the full size just needs the final rename
+    // (e.g. a previous run died between finishing the body and renaming).
+    if total.is_some_and(|t| t > 0 && partial_bytes(dest) == t) {
+        std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+        eprintln!("Model ready at {}.", dest.display());
+        return Ok(());
+    }
+
+    // The transfer runs on a worker thread appending to the .part file; the
+    // UI thread watches the file size and flips `cancel` to stop the worker.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let worker = spawn_fetch(url.to_string(), part.clone(), Arc::clone(&cancel));
 
     // Drive the progress on a Ratatui alternate screen so it repaints in place
     // in every terminal (including block-based ones like Warp).
     let mut terminal = ratatui::init();
-    let result = run_ui(&mut terminal, &mut child, &part, total);
+    let result = run_ui(&mut terminal, &worker, &cancel, &part, total);
     ratatui::restore();
-    // Never leave curl running if the UI aborted.
-    let _ = child.kill();
-    let _ = child.wait();
+    // Never leave the worker running if the UI aborted.
+    cancel.store(true, Ordering::Relaxed);
+    let joined = worker.join().map_err(|_| "download thread panicked")?;
     result?;
+    joined?;
 
     std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
     eprintln!("Model ready at {}.", dest.display());
     Ok(())
 }
 
-/// Runs the full-screen download UI until curl finishes or the user cancels.
+/// Spawns the worker thread that streams `url` into `part`, resuming if possible.
+fn spawn_fetch(
+    url: String,
+    part: PathBuf,
+    cancel: Arc<AtomicBool>,
+) -> JoinHandle<Result<(), String>> {
+    std::thread::spawn(move || fetch(&url, &part, &cancel))
+}
+
+/// Streams `url` into `part` with an HTTP Range resume of any existing bytes.
+fn fetch(url: &str, part: &Path, cancel: &AtomicBool) -> Result<(), String> {
+    let offset = std::fs::metadata(part).map_or(0, |m| m.len());
+    let mut request = ureq::get(url);
+    if offset > 0 {
+        request = request.header("Range", format!("bytes={offset}-"));
+    }
+    let mut response = request
+        .call()
+        .map_err(|e| format!("download failed: {e}"))?;
+
+    // 206 means the server honored the resume; anything else restarts from zero.
+    let mut file = if offset > 0 && response.status().as_u16() == 206 {
+        OpenOptions::new()
+            .append(true)
+            .open(part)
+            .map_err(|e| e.to_string())?
+    } else {
+        File::create(part).map_err(|e| e.to_string())?
+    };
+
+    let mut reader = response.body_mut().as_reader();
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("download cancelled".to_string());
+        }
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Ok(());
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+    }
+}
+
+/// Runs the full-screen download UI until the worker finishes or the user cancels.
 fn run_ui(
     terminal: &mut ratatui::DefaultTerminal,
-    child: &mut std::process::Child,
+    worker: &JoinHandle<Result<(), String>>,
+    cancel: &AtomicBool,
     part: &Path,
     total: Option<u64>,
 ) -> Result<(), String> {
@@ -334,11 +382,9 @@ fn run_ui(
     let mut msg = 0usize;
     let mut last_rotate = Instant::now();
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+        if worker.is_finished() {
             let _ = terminal.draw(|f| draw(f, part, total, msg, start));
-            if !status.success() {
-                return Err("download failed (curl error)".to_string());
-            }
+            // The caller joins the worker and surfaces its error, if any.
             return Ok(());
         }
         // Ctrl-C / Esc / q cancels; the poll timeout also paces the frames.
@@ -349,7 +395,7 @@ fn run_ui(
                 || (matches!(k.code, KeyCode::Char('c'))
                     && k.modifiers.contains(KeyModifiers::CONTROL)))
         {
-            let _ = child.kill();
+            cancel.store(true, Ordering::Relaxed);
             return Err("download cancelled".to_string());
         }
         if last_rotate.elapsed() >= Duration::from_secs(3) {
@@ -422,20 +468,16 @@ fn draw(frame: &mut Frame, part: &Path, total: Option<u64>, msg: usize, start: I
     frame.render_widget(stats_line, rows[5]);
 }
 
-/// Probes the total download size via a HEAD request (largest Content-Length).
+/// Probes the total download size via a HEAD request.
 fn content_length(url: &str) -> Option<u64> {
-    let out = Command::new("curl").args(["-sIL", url]).output().ok()?;
-    let headers = String::from_utf8_lossy(&out.stdout);
-    headers
-        .lines()
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<u64>().ok())
-                .flatten()
-        })
-        .max()
+    let response = ureq::head(url).call().ok()?;
+    response
+        .headers()
+        .get("content-length")?
+        .to_str()
+        .ok()?
+        .parse()
+        .ok()
 }
 
 #[allow(clippy::cast_precision_loss)]

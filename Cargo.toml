@@ -13,6 +13,8 @@ exclude = ["assets/*", "ds4-ref/*", "*.gguf", "ds4flash.gguf"]
 [dependencies]
 libc = "0.2"
 ratatui = "0.29"
+ureq = "3"
+logo-art = "0.2"
 
 [lints.rust]
 missing_debug_implementations = "warn"

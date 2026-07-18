@@ -471,8 +471,8 @@ impl Agent<'_> {
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
         let mut log = OutputLog::new();
-        for line in crate::logo::LOGO.lines() {
-            log.push_plain(line.to_owned());
+        for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH)) {
+            log.push_spans(line.spans);
         }
         log.push_plain(format!(
             "plank 🪵 Agent, context {} tokens",
