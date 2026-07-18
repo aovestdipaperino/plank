@@ -76,6 +76,33 @@ fn render_transcript(session: &Session, system: &str) -> String {
     out
 }
 
+/// Renders the `/mcp` server report following Claude Code's layout: a header
+/// with the server count, then one `name · status · N tools` line each.
+fn render_mcp_report(servers: &[crate::tools::mcp::McpServer]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::from("Manage MCP servers\n");
+    if servers.is_empty() {
+        out.push_str("no servers configured (checked ./.mcp.json and ~/.plank/.mcp.json)\n");
+        return out;
+    }
+    let plural = if servers.len() == 1 { "" } else { "s" };
+    let _ = writeln!(out, "{} server{plural}\n", servers.len());
+    for s in servers {
+        if s.alive() {
+            let plural = if s.tools.len() == 1 { "" } else { "s" };
+            let _ = writeln!(
+                out,
+                "  {} · ✔ connected · {} tool{plural}",
+                s.name,
+                s.tools.len()
+            );
+        } else {
+            let _ = writeln!(out, "  {} · ✘ failed", s.name);
+        }
+    }
+    out
+}
+
 /// Shared turn state for the interactive and headless front-ends.
 struct Agent<'a> {
     engine: Box<dyn Engine>,
@@ -308,6 +335,102 @@ impl Agent<'_> {
         Ok(())
     }
 
+    /// Renders the `/context` usage breakdown with Claude Code's layout: a
+    /// 10x10 cell grid (one cell per percent) beside the model and totals,
+    /// then the estimated usage per category.
+    fn render_context_report(&self) -> String {
+        use std::fmt::Write as _;
+        /// Glyph for an unused context cell in the grid.
+        const FREE_CELL: char = '⛶';
+        let ctx_size = self.engine.ctx_size().max(1);
+        let mut schemas = String::new();
+        crate::tools::mcp::append_tool_schemas(&mut schemas, &self.tool_ctx.mcp);
+        let mcp_tokens = if schemas.is_empty() {
+            0
+        } else {
+            self.engine.count_tokens(&schemas)
+        };
+        // MCP tool schemas are embedded in the composed system prompt; split
+        // them out so the two categories don't double-count.
+        let system_tokens = (self.engine.count_tokens(&self.system) - mcp_tokens).max(0);
+        let message_tokens: i32 = self
+            .session
+            .transcript
+            .iter()
+            .map(|m| self.engine.count_tokens(&m.text))
+            .sum();
+        let used = (system_tokens + mcp_tokens + message_tokens).min(ctx_size);
+        let free = ctx_size - used;
+        let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
+
+        // One glyph per category so the grid stays readable without color.
+        let categories = [
+            ("System prompt", system_tokens, '⛁'),
+            ("MCP tools", mcp_tokens, '⛃'),
+            ("Messages", message_tokens, '⛂'),
+        ];
+
+        // Fill 100 cells proportionally; every non-empty category shows at
+        // least one cell, and free space takes whatever remains.
+        let mut cells: Vec<char> = Vec::with_capacity(100);
+        for &(_, tokens, glyph) in &categories {
+            if tokens == 0 {
+                continue;
+            }
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let n = (pct(tokens).round() as usize).clamp(1, 100 - cells.len());
+            cells.extend(std::iter::repeat_n(glyph, n));
+        }
+        cells.truncate(100);
+        cells.resize(100, FREE_CELL);
+
+        // Right-hand column: model line, totals, then the category legend.
+        let model = self.engine.model_name();
+        let mut right: Vec<String> = Vec::new();
+        if !model.is_empty() {
+            right.push(model);
+        }
+        right.push(format!(
+            "{}/{} tokens ({:.0}%)",
+            status::format_ctx_size(used),
+            status::format_ctx_size(ctx_size),
+            pct(used)
+        ));
+        right.push(String::new());
+        right.push("Estimated usage by category".to_owned());
+        for &(label, tokens, glyph) in &categories {
+            right.push(format!(
+                "{glyph} {label}: {} tokens ({:.1}%)",
+                status::format_ctx_size(tokens),
+                pct(tokens)
+            ));
+        }
+        right.push(format!(
+            "{FREE_CELL} Free space: {} ({:.1}%)",
+            status::format_ctx_size(free),
+            pct(free)
+        ));
+
+        let mut out = String::from("Context Usage\n");
+        let rows = right.len().max(10);
+        for row in 0..rows {
+            out.push_str("  ");
+            if row < 10 {
+                for cell in &cells[row * 10..row * 10 + 10] {
+                    out.push(*cell);
+                    out.push(' ');
+                }
+            } else {
+                out.push_str(&" ".repeat(20));
+            }
+            if let Some(text) = right.get(row) {
+                let _ = write!(out, "   {text}");
+            }
+            out.push('\n');
+        }
+        out
+    }
+
     /// Handles a slash command; returns false when the REPL should exit.
     fn slash(&mut self, input: &str) -> Result<bool, String> {
         let mut parts = input.splitn(2, char::is_whitespace);
@@ -384,6 +507,8 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp)),
+            "/context" => print!("{}", self.render_context_report()),
             "/compact" => self.compact("user request")?,
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
             _ => println!("unknown command: {cmd}"),
@@ -847,6 +972,16 @@ impl Agent<'_> {
             }
             "/help" => {
                 for line in crate::config::usage().lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/mcp" => {
+                for line in render_mcp_report(&self.tool_ctx.mcp).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/context" => {
+                for line in self.render_context_report().lines() {
                     log.push_plain(line.to_owned());
                 }
             }

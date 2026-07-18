@@ -153,6 +153,11 @@ pub trait Engine: Debug + Send {
 
     /// Context window size in tokens.
     fn ctx_size(&self) -> i32;
+
+    /// Human-readable model name for status displays; empty when unknown.
+    fn model_name(&self) -> String {
+        String::new()
+    }
 }
 
 /// Stub engine that echoes a canned reply; keeps the agent runnable without a model.
