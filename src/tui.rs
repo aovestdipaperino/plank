@@ -232,7 +232,16 @@ pub fn user_echo_spans(text: &str) -> Vec<Span<'static>> {
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
-pub fn draw(frame: &mut Frame, log: &OutputLog, input: &str, cursor_col: u16, status: &str) {
+/// `scroll_back` is how many wrapped lines above the bottom the view sits;
+/// it is clamped in place to the scrollable range.
+pub fn draw(
+    frame: &mut Frame,
+    log: &OutputLog,
+    input: &str,
+    cursor_col: u16,
+    status: &str,
+    scroll_back: &mut usize,
+) {
     let area = frame.area();
     let rows = Layout::vertical([
         Constraint::Min(1),
@@ -241,7 +250,8 @@ pub fn draw(frame: &mut Frame, log: &OutputLog, input: &str, cursor_col: u16, st
     ])
     .split(area);
 
-    // Output area, scrolled so the latest lines stay visible.
+    // Output area, scrolled so the latest lines stay visible unless the user
+    // has wheeled back into the buffer.
     let text = log.to_text();
     let width = rows[0].width.max(1) as usize;
     let total: usize = text
@@ -249,7 +259,9 @@ pub fn draw(frame: &mut Frame, log: &OutputLog, input: &str, cursor_col: u16, st
         .iter()
         .map(|l| l.width().div_ceil(width).max(1))
         .sum();
-    let scroll = u16::try_from(total.saturating_sub(rows[0].height as usize)).unwrap_or(u16::MAX);
+    let max_back = total.saturating_sub(rows[0].height as usize);
+    *scroll_back = (*scroll_back).min(max_back);
+    let scroll = u16::try_from(max_back - *scroll_back).unwrap_or(u16::MAX);
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));

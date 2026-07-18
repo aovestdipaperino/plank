@@ -24,6 +24,23 @@ pub struct Ds4Engine {
     engine: *mut ffi::Ds4Engine,
     session: *mut ffi::Ds4Session,
     ctx_size: i32,
+    last_reply: Option<LastReply>,
+}
+
+/// The most recent generated reply, kept so the next prompt can splice the
+/// exact sampled token sequence for that assistant turn instead of
+/// re-templating its text. Retokenized text is not guaranteed to reproduce
+/// the sampled tokens, and a mismatch invalidates the live KV prefix at the
+/// start of the reply, forcing it to be re-prefilled on the follow-up turn.
+#[derive(Debug)]
+struct LastReply {
+    /// Concatenated token text, trailing-whitespace-trimmed to compare
+    /// against `parse_sections` output.
+    text: String,
+    /// The sampled token IDs, exactly as evaluated into the KV.
+    tokens: Vec<i32>,
+    /// Think mode of the assistant prefix the tokens followed.
+    think: ffi::Ds4ThinkMode,
 }
 
 // SAFETY: the engine is used single-threaded by the agent turn loop; the
@@ -154,6 +171,7 @@ impl Ds4Engine {
             engine,
             session: std::ptr::null_mut(),
             ctx_size,
+            last_reply: None,
         })
     }
 
@@ -244,8 +262,27 @@ impl Ds4Engine {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the whole build.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
-        for (role, content) in parse_sections(transcript) {
-            let (Ok(c_role), Ok(c_content)) = (CString::new(role), CString::new(content)) else {
+        let sections = parse_sections(transcript);
+        // Splice the exact sampled tokens for the reply generated last turn
+        // (the final assistant section, when its text matches) so the KV
+        // common-prefix probe reaches through it instead of diverging on a
+        // retokenization of its text. Earlier assistant turns were prefilled
+        // from re-templated text already, so they stay text-rendered.
+        let splice_idx = self.last_reply.as_ref().and_then(|last| {
+            sections
+                .iter()
+                .rposition(|(role, _)| *role == "assistant")
+                .filter(|&i| sections[i].1 == last.text)
+        });
+        for (i, (role, content)) in sections.iter().enumerate() {
+            if Some(i) == splice_idx
+                && let Some(last) = &self.last_reply
+            {
+                Self::append_reply_tokens(self.engine, &mut tokens, last);
+                continue;
+            }
+            let (Ok(c_role), Ok(c_content)) = (CString::new(*role), CString::new(content.clone()))
+            else {
                 continue;
             };
             // SAFETY: role/content strings outlive the call.
@@ -258,15 +295,36 @@ impl Ds4Engine {
                 );
             }
         }
-        let think_mode = match think {
-            ThinkMode::Off => ffi::Ds4ThinkMode::None,
-            ThinkMode::Auto | ThinkMode::On => ffi::Ds4ThinkMode::High,
-        };
         // SAFETY: engine and tokens valid.
         unsafe {
-            ffi::ds4_chat_append_assistant_prefix(self.engine, tokens.as_mut_ptr(), think_mode);
+            ffi::ds4_chat_append_assistant_prefix(
+                self.engine,
+                tokens.as_mut_ptr(),
+                ds4_think(think),
+            );
         }
         tokens
+    }
+
+    /// Appends the last generated reply as its exact sampled token sequence:
+    /// the assistant prefix it followed, the sampled tokens, and the closing
+    /// EOS (which generation sampled but never evaluated).
+    fn append_reply_tokens(
+        engine: *mut ffi::Ds4Engine,
+        tokens: &mut Ds4TokensGuard,
+        last: &LastReply,
+    ) {
+        // SAFETY: engine and tokens valid; think matches generation.
+        unsafe { ffi::ds4_chat_append_assistant_prefix(engine, tokens.as_mut_ptr(), last.think) };
+        for &t in &last.tokens {
+            // SAFETY: tokens is a valid ds4 token vector.
+            unsafe { ffi::ds4_tokens_push(tokens.as_mut_ptr(), t) };
+        }
+        // SAFETY: engine valid; tokens is a valid ds4 token vector.
+        unsafe {
+            let eos = ffi::ds4_token_eos(engine);
+            ffi::ds4_tokens_push(tokens.as_mut_ptr(), eos);
+        }
     }
 
     fn token_text(&self, token: i32) -> String {
@@ -371,6 +429,8 @@ impl Engine for Ds4Engine {
             0x2545_f491_4f6c_dd1d
         };
         let mut generated = 0;
+        let mut reply_tokens: Vec<i32> = Vec::new();
+        let mut reply_text = String::new();
         let start = std::time::Instant::now();
 
         while generated < max_tokens {
@@ -398,9 +458,26 @@ impl Engine for Ds4Engine {
             if eval_rc != 0 {
                 return Err(EngineError::new(cstr_message(&err, "decode failed")));
             }
-            on_event(EngineEvent::Text(self.token_text(token)));
+            let text = self.token_text(token);
+            reply_tokens.push(token);
+            reply_text.push_str(&text);
+            on_event(EngineEvent::Text(text));
             generated += 1;
         }
+
+        // Remember the sampled reply so the next prompt build can splice these
+        // exact tokens for its assistant section, keeping the live KV prefix
+        // valid through the whole reply (see `build_tokens`).
+        reply_text.truncate(reply_text.trim_end().len());
+        self.last_reply = if reply_tokens.is_empty() {
+            None
+        } else {
+            Some(LastReply {
+                text: reply_text,
+                tokens: reply_tokens,
+                think: ds4_think(opts.think_mode),
+            })
+        };
 
         let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
         let secs = start.elapsed().as_secs_f64();
@@ -576,6 +653,14 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
     // SAFETY: buf is NUL-terminated within its length by the C callee.
     let s = unsafe { CStr::from_ptr(buf.as_ptr()) };
     s.to_string_lossy().into_owned()
+}
+
+/// Maps the engine-agnostic think mode to ds4's.
+fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
+    match think {
+        ThinkMode::Off => ffi::Ds4ThinkMode::None,
+        ThinkMode::Auto | ThinkMode::On => ffi::Ds4ThinkMode::High,
+    }
 }
 
 /// Splits a role-tagged transcript into `(role, content)` chat messages.

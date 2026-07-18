@@ -8,7 +8,10 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
 
 use crate::compact;
 use crate::config::{AgentConfig, slash_command_known};
@@ -646,11 +649,16 @@ impl Agent<'_> {
     /// Returns an error string on unrecoverable terminal or engine failure.
     fn run_tui(&mut self) -> Result<(), String> {
         let mut terminal = ratatui::init();
+        // Capture the mouse so wheel events scroll the output buffer instead
+        // of being translated by the terminal into arrow keys (history moves).
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
         let result = self.tui_loop(&mut terminal);
+        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
         ratatui::restore();
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         let mut input = TuiInput::new();
         let hist_path = default_history_path();
@@ -675,16 +683,35 @@ impl Agent<'_> {
             self.tui_turn(terminal, &mut log)?;
         }
 
+        let mut scroll_back = 0usize;
         loop {
             let status = self.idle_status_text();
             terminal
-                .draw(|f| tui::draw(f, &log, input.buf.text(), input.cursor_col(), &status))
+                .draw(|f| {
+                    tui::draw(
+                        f,
+                        &log,
+                        input.buf.text(),
+                        input.cursor_col(),
+                        &status,
+                        &mut scroll_back,
+                    );
+                })
                 .map_err(|e| e.to_string())?;
 
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
                 continue;
             }
-            let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
+            let ev = event::read().map_err(|e| e.to_string())?;
+            if let Event::Mouse(m) = &ev {
+                match m.kind {
+                    MouseEventKind::ScrollUp => scroll_back = scroll_back.saturating_add(3),
+                    MouseEventKind::ScrollDown => scroll_back = scroll_back.saturating_sub(3),
+                    _ => {}
+                }
+                continue;
+            }
+            let Event::Key(key) = ev else {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
@@ -734,6 +761,7 @@ impl Agent<'_> {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
                     input.hist_idx = None;
+                    scroll_back = 0;
                     if line.is_empty() {
                         continue;
                     }
@@ -797,7 +825,7 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line));
+                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line, &mut 0));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -805,7 +833,7 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status));
+            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status, &mut 0));
         }
         Ok(())
     }
@@ -956,7 +984,7 @@ impl Agent<'_> {
                     interrupt_flag.store(true, Ordering::Relaxed);
                 }
                 let line = status::build_status_text(&status, false);
-                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line));
+                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line, &mut 0));
             },
         );
 
