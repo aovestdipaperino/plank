@@ -155,7 +155,8 @@ pub fn ansi_to_lines(art: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Applies one SGR parameter string to a style (truecolor + fg/bg reset only).
+/// Applies one SGR parameter string to a style (truecolor, 256-color, and
+/// fg/bg reset only).
 fn apply_sgr(mut style: Style, params: &str) -> Style {
     if params.is_empty() {
         return Style::default();
@@ -187,6 +188,18 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
             "48" if parts.get(i + 1) == Some(&"2") => {
                 style = style.bg(rgb(i + 2));
                 i += 5;
+            }
+            "38" if parts.get(i + 1) == Some(&"5") => {
+                if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+                    style = style.fg(Color::Indexed(n));
+                }
+                i += 3;
+            }
+            "48" if parts.get(i + 1) == Some(&"5") => {
+                if let Some(n) = parts.get(i + 2).and_then(|s| s.parse::<u8>().ok()) {
+                    style = style.bg(Color::Indexed(n));
+                }
+                i += 3;
             }
             _ => i += 1,
         }
@@ -298,6 +311,17 @@ mod tests {
         assert_eq!(spans[0].content.as_ref(), "▄");
         assert_eq!(spans[0].style.bg, Some(Color::Rgb(255, 0, 0)));
         assert_eq!(spans[1].style.bg, Some(Color::Rgb(0, 255, 0)));
+    }
+
+    #[test]
+    fn ansi_to_lines_parses_256_color() {
+        let art = "\x1b[38;5;105m⛁\x1b[0m \x1b[48;5;44mx\x1b[m\n";
+        let lines = ansi_to_lines(art);
+        assert_eq!(lines.len(), 1);
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].content.as_ref(), "⛁");
+        assert_eq!(spans[0].style.fg, Some(Color::Indexed(105)));
+        assert_eq!(spans.last().unwrap().style.bg, Some(Color::Indexed(44)));
     }
 
     #[test]
