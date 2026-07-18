@@ -220,7 +220,7 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "-c" | "--ctx" => c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?,
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
-                c.generation.temperature = parse_float_range(need_arg(&mut i)?, arg, 0.0, 100.0)?
+                c.generation.temperature = parse_float_range(need_arg(&mut i)?, arg, 0.0, 100.0)?;
             }
             "--top-p" => c.generation.top_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
             "--min-p" => c.generation.min_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,

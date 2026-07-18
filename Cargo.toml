@@ -9,6 +9,7 @@ license = "MIT"
 
 [dependencies]
 libc = "0.2"
+ratatui = "0.29"
 
 [lints.rust]
 missing_debug_implementations = "warn"

@@ -5,9 +5,15 @@
 //! plank v1 runs the engine inline and streams output as it arrives.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 
 use crate::compact;
 use crate::config::{AgentConfig, slash_command_known};
+use crate::dsml::ToolCall;
+use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
 use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionStore};
@@ -15,6 +21,7 @@ use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
 use crate::tools::{ToolContext, dispatch_all};
 use crate::trace::Trace;
+use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
 
 /// Stdout writer that flushes after every write so tokens appear as streamed.
@@ -385,6 +392,479 @@ impl Agent<'_> {
     }
 }
 
+/// Result of one TUI generation pass.
+struct TurnOutput {
+    interrupted: bool,
+    assistant_text: String,
+    calls: Vec<ToolCall>,
+    error: Option<String>,
+}
+
+/// Interactive input state for the ratatui UI.
+struct TuiInput {
+    buf: LineBuffer,
+    history: History,
+    hist_idx: Option<usize>,
+    stash: String,
+}
+
+impl TuiInput {
+    fn new() -> Self {
+        Self {
+            buf: LineBuffer::new(),
+            history: History::new(512),
+            hist_idx: None,
+            stash: String::new(),
+        }
+    }
+
+    /// Display column of the cursor within the input text.
+    fn cursor_col(&self) -> u16 {
+        let text = self.buf.text();
+        let bytes = self.buf.cursor().min(text.len());
+        u16::try_from(text[..bytes].chars().count()).unwrap_or(u16::MAX)
+    }
+
+    /// Moves through history like the line editor (dir -1 = older).
+    fn history_move(&mut self, dir: i32) {
+        if self.history.is_empty() {
+            return;
+        }
+        let len = self.history.len();
+        let new_index = match (self.hist_idx, dir) {
+            (None, d) if d < 0 => {
+                self.stash = self.buf.text().to_owned();
+                Some(len - 1)
+            }
+            (None, _) => None,
+            (Some(0), d) if d < 0 => Some(0),
+            (Some(i), d) if d < 0 => Some(i - 1),
+            (Some(i), _) if i + 1 < len => Some(i + 1),
+            (Some(_), _) => {
+                self.buf.set_text(std::mem::take(&mut self.stash));
+                self.hist_idx = None;
+                return;
+            }
+        };
+        self.hist_idx = new_index;
+        if let Some(i) = new_index {
+            let entry = self.history.get(i).unwrap_or_default().to_owned();
+            self.buf.set_text(entry);
+        }
+    }
+}
+
+impl Agent<'_> {
+    /// Runs the full-screen ratatui interactive session.
+    ///
+    /// # Errors
+    /// Returns an error string on unrecoverable terminal or engine failure.
+    fn run_tui(&mut self) -> Result<(), String> {
+        let mut terminal = ratatui::init();
+        let result = self.tui_loop(&mut terminal);
+        ratatui::restore();
+        result
+    }
+
+    fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
+        let mut input = TuiInput::new();
+        let hist_path = default_history_path();
+        input.history.load(&hist_path).ok();
+        let mut log = OutputLog::new();
+        for line in crate::logo::LOGO.lines() {
+            log.push_plain(line.to_owned());
+        }
+        log.push_plain(format!(
+            "plank 🪵 Agent, context {} tokens",
+            status::format_ctx_size(self.engine.ctx_size())
+        ));
+        log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
+        log.push_plain(String::new());
+
+        if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
+            log.push_spans(tui::user_echo_spans(initial));
+            self.session.push(Message::user(initial));
+            self.tui_turn(terminal, &mut log)?;
+        }
+
+        loop {
+            let status = self.idle_status_text();
+            terminal
+                .draw(|f| tui::draw(f, &log, input.buf.text(), input.cursor_col(), &status))
+                .map_err(|e| e.to_string())?;
+
+            if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
+                continue;
+            }
+            let Event::Key(key) = event::read().map_err(|e| e.to_string())? else {
+                continue;
+            };
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('c') if ctrl => {
+                    if input.buf.text().is_empty() {
+                        break;
+                    }
+                    input.buf.clear();
+                }
+                KeyCode::Char('d') if ctrl => {
+                    if input.buf.text().is_empty() {
+                        break;
+                    }
+                    input.buf.delete();
+                }
+                KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
+                KeyCode::Char('k') if ctrl => input.buf.kill_to_end(),
+                KeyCode::Char('w') if ctrl => input.buf.delete_prev_word(),
+                KeyCode::Char('a') if ctrl => input.buf.move_home(),
+                KeyCode::Char('e') if ctrl => input.buf.move_end(),
+                KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                    input.hist_idx = None;
+                    input.buf.insert(c.to_string());
+                }
+                KeyCode::Backspace => {
+                    input.buf.backspace();
+                }
+                KeyCode::Delete => {
+                    input.buf.delete();
+                }
+                KeyCode::Left => {
+                    input.buf.move_left();
+                }
+                KeyCode::Right => {
+                    input.buf.move_right();
+                }
+                KeyCode::Home => input.buf.move_home(),
+                KeyCode::End => input.buf.move_end(),
+                KeyCode::Up => input.history_move(-1),
+                KeyCode::Down => input.history_move(1),
+                KeyCode::Enter => {
+                    let line = input.buf.text().trim().to_owned();
+                    input.buf.clear();
+                    input.hist_idx = None;
+                    if line.is_empty() {
+                        continue;
+                    }
+                    input.history.add(&line);
+                    input.history.save(&hist_path).ok();
+                    if line.starts_with('/') {
+                        if !self.tui_slash(&line, &mut log) {
+                            break;
+                        }
+                    } else {
+                        log.push_spans(tui::user_echo_spans(&line));
+                        self.session.push(Message::user(&line));
+                        self.tui_turn(terminal, &mut log)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        input.history.save(&hist_path).ok();
+        Ok(())
+    }
+
+    /// Idle status line (plain text; the TUI styles the bar itself).
+    fn idle_status_text(&mut self) -> String {
+        let rendered = render_transcript(&self.session, &self.system);
+        let st = Status {
+            state: WorkerState::Idle,
+            ctx_used: self.engine.count_tokens(&rendered),
+            ctx_size: self.engine.ctx_size(),
+            power_percent: self.power_percent,
+            ..Status::default()
+        };
+        status::build_status_text(&st, false)
+    }
+
+    /// One TUI turn: generate, run any tool calls, repeat until settled.
+    fn tui_turn(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+    ) -> Result<(), String> {
+        self.tui_maybe_compact(log)?;
+        self.tui_maybe_reminder(log);
+        loop {
+            let prompt = render_transcript(&self.session, &self.system);
+            let out = self.tui_generate(terminal, log, &prompt)?;
+            self.session.push(Message::assistant(out.assistant_text));
+            log.end_line();
+            if out.interrupted {
+                crate::interrupt::clear();
+                log.push_plain("[interrupted]");
+                return Ok(());
+            }
+            if let Some(err) = out.error {
+                self.session.push(Message::user(format!(
+                    "<tool_result>Tool error: {err}</tool_result>"
+                )));
+                continue;
+            }
+            if !out.calls.is_empty() {
+                let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
+                self.session.push(Message::user(format!(
+                    "<tool_result>{observations}</tool_result>"
+                )));
+                for line in observations.lines() {
+                    log.push_plain(line.to_owned());
+                }
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    /// Streams one generation pass into `log`, drawing each update.
+    fn tui_generate(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        prompt: &str,
+    ) -> Result<TurnOutput, String> {
+        let mut stream = StreamRenderer::new(std::mem::take(log));
+        if !matches!(
+            self.cfg.generation.think_mode,
+            crate::engine::ThinkMode::Off
+        ) {
+            stream.begin_in_think();
+        }
+        let interrupt_flag = AtomicBool::new(false);
+        let ctx_size = self.engine.ctx_size();
+        let power = self.power_percent;
+        let mut assistant_text = String::new();
+        let mut gen_count = 0;
+        let start = Instant::now();
+
+        let result = self.engine.generate(
+            prompt,
+            &self.cfg.generation,
+            &|| interrupt_flag.load(Ordering::Relaxed) || crate::interrupt::pending(),
+            &mut |ev| {
+                let status = match ev {
+                    EngineEvent::Text(t) => {
+                        assistant_text.push_str(&t);
+                        stream.push(&t);
+                        gen_count += 1;
+                        let secs = start.elapsed().as_secs_f64();
+                        Status {
+                            state: WorkerState::Generating,
+                            generated: gen_count,
+                            gen_tps: if secs > 0.0 {
+                                f64::from(gen_count) / secs
+                            } else {
+                                0.0
+                            },
+                            ctx_size,
+                            power_percent: power,
+                            ..Status::default()
+                        }
+                    }
+                    EngineEvent::Prefill(p) => Status {
+                        state: WorkerState::Prefill,
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_tps: p.tps,
+                        ctx_size,
+                        power_percent: power,
+                        ..Status::default()
+                    },
+                };
+                // Poll for Ctrl-C / Esc so generation stays interruptible.
+                if event::poll(Duration::ZERO).unwrap_or(false)
+                    && let Ok(Event::Key(k)) = event::read()
+                    && k.kind == KeyEventKind::Press
+                    && (matches!(k.code, KeyCode::Esc)
+                        || (matches!(k.code, KeyCode::Char('c'))
+                            && k.modifiers.contains(KeyModifiers::CONTROL)))
+                {
+                    interrupt_flag.store(true, Ordering::Relaxed);
+                }
+                let line = status::build_status_text(&status, false);
+                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line));
+            },
+        );
+
+        let stats = result.map_err(|e| e.to_string())?;
+        stream.finish();
+        let finished = stream.finished();
+        let calls = finished.calls.to_vec();
+        let error = finished.error.map(str::to_owned);
+        let interrupted = stats.interrupted || interrupt_flag.load(Ordering::Relaxed);
+        *log = stream.into_sink();
+        Ok(TurnOutput {
+            interrupted,
+            assistant_text,
+            calls,
+            error,
+        })
+    }
+
+    /// Compacts before a TUI turn when context is tight, logging progress.
+    fn tui_maybe_compact(&mut self, log: &mut OutputLog) -> Result<(), String> {
+        let rendered = render_transcript(&self.session, &self.system);
+        let used = self.engine.count_tokens(&rendered);
+        if !compact::should_compact(self.engine.ctx_size(), used) {
+            return Ok(());
+        }
+        self.tui_do_compact("low context", log)
+    }
+
+    /// Performs a compaction pass and rebuilds the transcript, logging progress.
+    fn tui_do_compact(&mut self, reason: &str, log: &mut OutputLog) -> Result<(), String> {
+        log.push_plain(format!(
+            "COMPACTING {reason}: summarizing durable task state..."
+        ));
+        let mut prompt = render_transcript(&self.session, &self.system);
+        {
+            use std::fmt::Write as _;
+            let _ = write!(prompt, "[user]\n{}\n", compact::make_prompt(reason));
+        }
+        let mut summary = String::new();
+        self.engine
+            .generate(&prompt, &self.cfg.generation, &|| false, &mut |ev| {
+                if let EngineEvent::Text(t) = ev {
+                    summary.push_str(&t);
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        let budget = compact::tail_budget(self.engine.ctx_size());
+        let mut tail_start = self.session.transcript.len();
+        let mut tail_tokens = 0;
+        while tail_start > 0 {
+            let m = &self.session.transcript[tail_start - 1];
+            tail_tokens += self.engine.count_tokens(&m.text);
+            if tail_tokens > budget {
+                break;
+            }
+            tail_start -= 1;
+        }
+        let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
+        self.session.transcript = Vec::new();
+        self.session.push(Message::user(format!(
+            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
+        )));
+        self.session.transcript.extend(tail);
+        log.push_plain("context compacted");
+        Ok(())
+    }
+
+    /// Re-injects the system-prompt reminder in the TUI when due.
+    fn tui_maybe_reminder(&mut self, log: &mut OutputLog) {
+        let rendered = render_transcript(&self.session, &self.system);
+        let pos = self.engine.count_tokens(&rendered);
+        if !self.reminder.should_remind(pos) {
+            return;
+        }
+        log.push_plain("Re-injecting system prompt reminder...");
+        self.trace.line(&format!(
+            "system prompt reminder injected at transcript={pos}"
+        ));
+        let mut text = sysprompt::build_system_prompt_reminder();
+        if !self.cfg.system.is_empty() {
+            text.push_str("\nAdditional system instructions reminder:\n");
+            text.push_str(&self.cfg.system);
+            text.push_str("\n[End additional system instructions reminder.]\n\n");
+        }
+        self.session.push(Message::user(text));
+    }
+
+    /// Handles a slash command in the TUI; returns false to quit.
+    fn tui_slash(&mut self, input: &str, log: &mut OutputLog) -> bool {
+        let mut parts = input.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or(input);
+        let arg = parts.next().unwrap_or("").trim();
+        match cmd {
+            "/quit" | "/exit" => return false,
+            "/new" => {
+                self.session = Session::new();
+                self.reminder = SystemPromptReminder::new();
+                let datetime = sysprompt::datetime_context_line(std::time::SystemTime::now());
+                self.session.push(Message::user(datetime));
+                log.push_plain("started a new session");
+            }
+            "/help" => {
+                for line in crate::config::usage().lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/compact" => {
+                if let Err(e) = self.tui_do_compact("user request", log) {
+                    log.push_plain(format!("compact failed: {e}"));
+                }
+            }
+            "/save" => match self.store.save(&mut self.session) {
+                Ok(id) => log.push_plain(format!("saved session {}", &id[..8])),
+                Err(e) => log.push_plain(format!("save failed: {e}")),
+            },
+            "/list" => match self.store.list() {
+                Ok(entries) => {
+                    for line in
+                        crate::session::render_session_list(&entries, now_secs(), false).lines()
+                    {
+                        log.push_plain(line.to_owned());
+                    }
+                }
+                Err(e) => log.push_plain(format!("list failed: {e}")),
+            },
+            "/switch" => match self.store.load(arg) {
+                Ok(s) => {
+                    for line in crate::session::render_history(&s.transcript, 6, false).lines() {
+                        log.push_plain(line.to_owned());
+                    }
+                    self.session = s;
+                }
+                Err(e) => log.push_plain(format!("switch failed: {e}")),
+            },
+            "/del" => match self.store.delete(arg) {
+                Ok(id) => log.push_plain(format!("deleted session {}", &id[..8])),
+                Err(e) => log.push_plain(format!("delete failed: {e}")),
+            },
+            "/history" => {
+                let turns = if arg.is_empty() {
+                    HISTORY_DEFAULT_TURNS
+                } else {
+                    arg.parse::<usize>()
+                        .unwrap_or(HISTORY_DEFAULT_TURNS)
+                        .clamp(1, HISTORY_MAX_TURNS)
+                };
+                for line in
+                    crate::session::render_history(&self.session.transcript, turns, false).lines()
+                {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/power" => match crate::config::parse_power_percent(arg) {
+                Some(power) => {
+                    self.power_percent = power;
+                    log.push_plain(format!("power limit set to {power}%"));
+                }
+                None => log.push_plain("usage: /power <1..100>"),
+            },
+            "/strip" => {
+                if arg.is_empty() {
+                    log.push_plain("usage: /strip <sha-prefix>");
+                } else {
+                    match self.store.find(arg) {
+                        Ok((sha, _)) => {
+                            log.push_plain(format!("stripped session {} (0 tokens)", &sha[..8]));
+                        }
+                        Err(e) => log.push_plain(format!("strip failed: {e}")),
+                    }
+                }
+            }
+            _ if slash_command_known(cmd) => {
+                log.push_plain(format!("{cmd}: not implemented yet"));
+            }
+            _ => log.push_plain(format!("unknown command: {cmd}")),
+        }
+        true
+    }
+}
+
 fn print_footer(st: &Status, color: bool) {
     let line = status::build_status_text(st, color);
     if color {
@@ -448,91 +928,19 @@ fn new_agent(
 pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, true)?;
 
-    if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
-        print!("{}", status::format_user_prompt_echo(initial, agent.color));
-        agent.session.push(Message::user(initial));
-        agent.run_turn()?;
-    }
-
-    if std::io::stdin().is_terminal() {
-        run_repl_editor(&mut agent)
+    // A real terminal gets the full-screen ratatui UI (works cleanly in Warp
+    // and other block terminals via the alternate screen). Piped input falls
+    // back to the plain line REPL.
+    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        agent.run_tui()
     } else {
+        if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
+            print!("{}", status::format_user_prompt_echo(initial, agent.color));
+            agent.session.push(Message::user(initial));
+            agent.run_turn()?;
+        }
         run_repl_plain(&mut agent)
     }
-}
-
-/// Idle footer line reflecting current context pressure.
-fn idle_footer(agent: &mut Agent<'_>) -> String {
-    let rendered = render_transcript(&agent.session, &agent.system);
-    let st = Status {
-        state: WorkerState::Idle,
-        ctx_used: agent.engine.count_tokens(&rendered),
-        ctx_size: agent.engine.ctx_size(),
-        power_percent: agent.power_percent,
-        ..Status::default()
-    };
-    status::build_status_text(&st, agent.color)
-}
-
-/// Full-featured REPL over the raw-mode line editor (TTY only).
-fn run_repl_editor(agent: &mut Agent<'_>) -> Result<(), String> {
-    // The editor paints its own resting footer at the prompt, so the turn loop
-    // must not print a second footer after each generation.
-    agent.editor_owns_footer = true;
-    let mut editor = crate::editor::Editor::new();
-    let hist_path = crate::editor::default_history_path();
-    editor.history_mut().load(&hist_path).ok();
-    let cache_dir = agent.store.dir().to_path_buf();
-    editor.set_completion(Box::new(move |line: &str| {
-        if let Some(prefix) = line.strip_prefix("/switch ") {
-            if let Ok(store) = SessionStore::open(&cache_dir) {
-                return store.complete(prefix.trim()).unwrap_or_default();
-            }
-            return Vec::new();
-        }
-        if line.starts_with('/') && !line.contains(' ') {
-            const CMDS: [&str; 12] = [
-                "/help", "/save", "/compact", "/list", "/quit", "/exit", "/new", "/power",
-                "/switch", "/del", "/strip", "/history",
-            ];
-            return CMDS
-                .iter()
-                .filter(|c| c.starts_with(line))
-                .map(|c| (*c).to_string())
-                .collect();
-        }
-        Vec::new()
-    }));
-
-    loop {
-        let footer = idle_footer(agent);
-        let outcome = editor
-            .read_line(status::prompt_text(), &footer)
-            .map_err(|e| e.to_string())?;
-        editor.restore_terminal();
-        let line = match outcome {
-            crate::editor::ReadOutcome::Line(l) => l,
-            crate::editor::ReadOutcome::Interrupted => continue,
-            crate::editor::ReadOutcome::Eof => break,
-        };
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        editor.history_mut().add(input);
-        editor.history().save(&hist_path).ok();
-        if input.starts_with('/') {
-            if !agent.slash(input)? {
-                break;
-            }
-            continue;
-        }
-        print!("{}", status::format_user_prompt_echo(input, agent.color));
-        agent.session.push(Message::user(input));
-        agent.run_turn()?;
-    }
-    editor.restore_terminal();
-    Ok(())
 }
 
 /// Plain line-based REPL used when stdin is not a terminal.

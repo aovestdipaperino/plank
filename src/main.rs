@@ -5,7 +5,7 @@ use std::process::ExitCode;
 
 use plank::config::{AgentConfig, parse_options, usage};
 use plank::engine::{EchoEngine, Engine};
-use plank::status::{self, Status};
+use plank::status;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -85,15 +85,15 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
 fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
-        plank::ui::run_non_interactive(engine, cfg)
-    } else {
+        return plank::ui::run_non_interactive(engine, cfg);
+    }
+    // The full-screen TUI (a real terminal on both ends) draws its own header,
+    // so the banner is only printed for the plain piped fallback.
+    let tui = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !tui {
         print!("{}", plank::logo::banner());
         print!("{}", status::welcome_banner(cfg.generation.ctx_size, color));
-        let _ = Status {
-            ctx_size: cfg.generation.ctx_size,
-            ..Status::default()
-        };
         std::io::stdout().flush().map_err(|e| e.to_string())?;
-        plank::ui::run_interactive(engine, cfg)
     }
+    plank::ui::run_interactive(engine, cfg)
 }

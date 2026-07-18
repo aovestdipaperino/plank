@@ -212,6 +212,7 @@ impl Ds4Engine {
 }
 
 impl Engine for Ds4Engine {
+    #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,
         transcript: &str,
