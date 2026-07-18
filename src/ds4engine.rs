@@ -485,6 +485,10 @@ impl Engine for Ds4Engine {
     fn ctx_size(&self) -> i32 {
         self.ctx_size
     }
+
+    fn model_name(&self) -> String {
+        Ds4Engine::model_name(self)
+    }
 }
 
 impl Drop for Ds4Engine {
