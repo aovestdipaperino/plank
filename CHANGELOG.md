@@ -18,8 +18,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **System-prompt KV cache** reuse across turns: the live session is kept
   alive so only the new suffix is prefilled, and the progress bar reflects the
   cached prefix.
-- **Live progress/status display**: a prefill progress bar and a generation
-  status line (tokens, t/s, context usage).
+- **System-prompt cache warm-up** at startup ("Updating system prompt cache...")
+  with a disk checkpoint (`sysprompt.kv`) fingerprinted by model + system
+  prompt, so a fresh launch restores the prefilled KV instead of recomputing it.
+- **Live progress/status display**: a prefill progress bar (filled arrows in
+  magenta, matching the C agent) and a generation status line (tokens, t/s,
+  context usage).
 - **Context compaction** with the durable-summary + verbatim-tail rebuild, plus
   automatic triggering under context pressure.
 - **Session persistence**: save/load/list/switch/delete with SHA-1 identities

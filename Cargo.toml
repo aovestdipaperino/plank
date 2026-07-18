@@ -4,8 +4,11 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/plank"
-description = "Rust port of the ds4 agent (functionality-by-functionality conversion)"
+description = "Rust port of the ds4 agent (macOS only)"
 license = "MIT"
+keywords = ["agent", "llm", "tui", "macos"]
+categories = ["command-line-utilities"]
+exclude = ["assets/*", "ds4-ref/*", "*.gguf", "ds4flash.gguf"]
 
 [dependencies]
 libc = "0.2"

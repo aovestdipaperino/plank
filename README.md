@@ -6,11 +6,13 @@
 
 A Rust port of the [ds4](https://github.com/aovestdipaperino/ds4) agent, converted functionality-by-functionality (not line-by-line) from the C reference implementation.
 
-Plank is an interactive coding agent with a terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web). On macOS it can link the original ds4 C inference engine (Metal backend) via the `ds4-ref` submodule; on other platforms it falls back to a built-in echo engine.
+Plank is an interactive coding agent with a terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web).
+
+> **macOS only.** Plank targets macOS exclusively: inference uses the original ds4 C engine with the Metal backend, linked via the `ds4-ref` submodule. Other platforms are not supported.
 
 ## Building
 
-Clone with the submodule if you want the ds4 engine:
+Requires macOS (Apple Silicon or Intel) with the Xcode command line tools. Clone with the submodule to get the ds4 engine:
 
 ```sh
 git clone --recurse-submodules https://github.com/aovestdipaperino/plank
@@ -18,8 +20,8 @@ cd plank
 cargo build --release
 ```
 
-- **macOS with `ds4-ref` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
-- **Other platforms or missing submodule:** plank builds without the native engine and uses the echo engine only.
+- **With `ds4-ref` present:** `build.rs` builds `libds4core.a` from the Metal-backend objects and links the required frameworks, enabling the `ds4_engine` cfg.
+- **Missing submodule:** plank still builds, but without the native engine it uses the echo engine only (useful for development/CI).
 
 You will also need a GGUF model file (e.g. `ds4flash.gguf`) for real inference; see the `download_model.sh` script in `ds4-ref`.
 

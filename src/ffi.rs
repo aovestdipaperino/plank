@@ -44,6 +44,25 @@ impl Default for Ds4Tokens {
     }
 }
 
+/// Serialized session KV state, mirroring `ds4_session_snapshot`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Ds4SessionSnapshot {
+    pub ptr: *mut u8,
+    pub len: u64,
+    pub cap: u64,
+}
+
+impl Default for Ds4SessionSnapshot {
+    fn default() -> Self {
+        Self {
+            ptr: std::ptr::null_mut(),
+            len: 0,
+            cap: 0,
+        }
+    }
+}
+
 /// Distributed options, mirroring `ds4_distributed_options` (unused defaults).
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -176,4 +195,17 @@ unsafe extern "C" {
     pub fn ds4_session_ctx(s: *mut Ds4Session) -> c_int;
     pub fn ds4_session_pos(s: *mut Ds4Session) -> c_int;
     pub fn ds4_session_common_prefix(s: *mut Ds4Session, prompt: *const Ds4Tokens) -> c_int;
+    pub fn ds4_session_save_snapshot(
+        s: *mut Ds4Session,
+        snap: *mut Ds4SessionSnapshot,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+    pub fn ds4_session_load_snapshot(
+        s: *mut Ds4Session,
+        snap: *const Ds4SessionSnapshot,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+    pub fn ds4_session_snapshot_free(snap: *mut Ds4SessionSnapshot);
 }

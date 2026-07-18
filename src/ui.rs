@@ -481,6 +481,8 @@ impl Agent<'_> {
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
         log.push_plain(String::new());
 
+        self.tui_warm(terminal, &mut log)?;
+
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
@@ -568,6 +570,62 @@ impl Agent<'_> {
     }
 
     /// Idle status line (plain text; the TUI styles the bar itself).
+    /// Disk checkpoint path for the system-prompt KV cache.
+    fn sysprompt_checkpoint(&self) -> std::path::PathBuf {
+        self.store.dir().join("sysprompt.kv")
+    }
+
+    /// Warms the system-prompt KV cache at startup, drawing prefill progress.
+    fn tui_warm(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+    ) -> Result<(), String> {
+        let checkpoint = self.sysprompt_checkpoint();
+        let system = self.system.clone();
+        let ctx_size = self.engine.ctx_size();
+        let power = self.power_percent;
+        let mut announced = false;
+        self.engine
+            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
+                if let EngineEvent::Prefill(p) = ev {
+                    if !announced {
+                        announced = true;
+                        log.push_plain("Updating system prompt cache...");
+                    }
+                    let st = Status {
+                        state: WorkerState::Prefill,
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_tps: p.tps,
+                        ctx_size,
+                        power_percent: power,
+                        ..Status::default()
+                    };
+                    let line = status::build_status_text(&st, false);
+                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Warms the system-prompt KV cache for non-TUI runs (stderr message).
+    fn warm_plain(&mut self) -> Result<(), String> {
+        let checkpoint = self.sysprompt_checkpoint();
+        let system = self.system.clone();
+        let mut announced = false;
+        self.engine
+            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
+                if matches!(ev, EngineEvent::Prefill(_)) && !announced {
+                    announced = true;
+                    eprintln!("Updating system prompt cache...");
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
     fn idle_status_text(&mut self) -> String {
         let rendered = render_transcript(&self.session, &self.system);
         let st = Status {
@@ -934,6 +992,7 @@ pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(),
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         agent.run_tui()
     } else {
+        agent.warm_plain()?;
         if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             print!("{}", status::format_user_prompt_echo(initial, agent.color));
             agent.session.push(Message::user(initial));
@@ -979,6 +1038,7 @@ fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
 /// Returns an error string on unrecoverable I/O or engine failure.
 pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, false)?;
+    agent.warm_plain()?;
     if let Some(prompt) = cfg.prompt.as_deref() {
         agent.session.push(Message::user(prompt));
         return agent.run_turn();

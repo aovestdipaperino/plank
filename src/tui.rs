@@ -155,14 +155,38 @@ pub fn draw(frame: &mut Frame, log: &OutputLog, input: &str, cursor_col: u16, st
         rows[1].y,
     ));
 
-    // Status bar, reverse-styled across the full width.
+    // Status bar, reverse-styled across the full width, with a magenta bar.
     let status_style = Style::default()
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status.to_string()).style(status_style),
+        Paragraph::new(status_bar_line(status, status_style)).style(status_style),
         rows[2],
     );
+}
+
+/// Builds the status line, coloring the progress bar's filled arrows magenta.
+///
+/// The bar segment lives between `[` and `]`; `▶` cells render bright magenta
+/// (256-color 201, matching the C agent) and `·` cells a dim gray.
+fn status_bar_line(text: &str, base: Style) -> Line<'static> {
+    let Some(open) = text.find('[') else {
+        return Line::styled(text.to_string(), base);
+    };
+    let Some(close) = text[open..].find(']').map(|i| open + i) else {
+        return Line::styled(text.to_string(), base);
+    };
+    let mut spans = vec![Span::styled(text[..=open].to_string(), base)];
+    for ch in text[open + 1..close].chars() {
+        let style = match ch {
+            '▶' => base.fg(Color::Indexed(201)).add_modifier(Modifier::BOLD),
+            '·' => base.fg(Color::Indexed(240)),
+            _ => base,
+        };
+        spans.push(Span::styled(ch.to_string(), style));
+    }
+    spans.push(Span::styled(text[close..].to_string(), base));
+    Line::from(spans)
 }
 
 #[cfg(test)]

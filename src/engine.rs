@@ -131,6 +131,26 @@ pub trait Engine: Debug + Send {
         i32::try_from(text.len() / 4).unwrap_or(i32::MAX)
     }
 
+    /// Warms the KV cache with the system prompt before the first turn.
+    ///
+    /// Restores a disk checkpoint at `checkpoint` when its stored fingerprint
+    /// still matches this model and system prompt; otherwise prefills the
+    /// system prompt (streaming progress via `on_event`) and saves a fresh
+    /// checkpoint. Returns `true` when a prefill happened (cache miss).
+    ///
+    /// The default implementation is a no-op returning `false`.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to prefill.
+    fn warm_system_prompt(
+        &mut self,
+        _system: &str,
+        _checkpoint: Option<&std::path::Path>,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
     /// Context window size in tokens.
     fn ctx_size(&self) -> i32;
 }

@@ -162,6 +162,73 @@ impl Ds4Engine {
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
     }
 
+    /// Builds chat-template tokens for the system prompt alone (no assistant
+    /// prefix), used to warm and checkpoint the KV cache.
+    fn build_system_tokens(&self, system: &str) -> Ds4TokensGuard {
+        let mut tokens = Ds4TokensGuard::new();
+        // SAFETY: engine and tokens are valid for the whole build.
+        unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
+        if let (Ok(role), Ok(content)) = (CString::new("system"), CString::new(system)) {
+            // SAFETY: role/content strings outlive the call.
+            unsafe {
+                ffi::ds4_chat_append_message(
+                    self.engine,
+                    tokens.as_mut_ptr(),
+                    role.as_ptr(),
+                    content.as_ptr(),
+                );
+            }
+        }
+        tokens
+    }
+
+    /// Ensures a live session exists, creating it lazily.
+    fn ensure_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        if self.session.is_null() {
+            let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
+            // SAFETY: engine valid; session is a valid out-ptr.
+            let rc =
+                unsafe { ffi::ds4_session_create(&raw mut session, self.engine, self.ctx_size) };
+            if rc != 0 || session.is_null() {
+                return Err(EngineError::new("failed to create session"));
+            }
+            self.session = session;
+        }
+        Ok(self.session)
+    }
+
+    /// Serializes the session KV to `path`, prefixed by its fingerprint line.
+    ///
+    /// Best-effort: a failure to save just means the next launch re-prefills.
+    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
+        let mut snap = ffi::Ds4SessionSnapshot::default();
+        let mut err = [0_i8; 512];
+        // SAFETY: session valid; snap is a valid out-ptr the engine fills.
+        let rc = unsafe {
+            ffi::ds4_session_save_snapshot(session, &raw mut snap, err.as_mut_ptr(), err.len())
+        };
+        if rc == 0 && !snap.ptr.is_null() {
+            let len = usize::try_from(snap.len).unwrap_or(0);
+            // SAFETY: snap.ptr points to snap.len bytes owned by the engine.
+            let bytes = unsafe { std::slice::from_raw_parts(snap.ptr, len) };
+            let mut file = Vec::with_capacity(bytes.len() + 41);
+            file.extend_from_slice(fingerprint.as_bytes());
+            file.push(b'\n');
+            file.extend_from_slice(bytes);
+            let _ = std::fs::write(path, &file);
+        }
+        // SAFETY: snap was filled by ds4_session_save_snapshot.
+        unsafe { ffi::ds4_session_snapshot_free(&raw mut snap) };
+    }
+
+    /// Fingerprint tying a checkpoint to this exact model and system prompt.
+    fn checkpoint_fingerprint(&self, system: &str) -> String {
+        let mut data = self.model_name().into_bytes();
+        data.push(0);
+        data.extend_from_slice(system.as_bytes());
+        crate::session::sha1_hex(&data)
+    }
+
     /// Builds chat-template tokens from a role-tagged transcript.
     ///
     /// The transcript uses `[system]`/`[user]`/`[assistant]` section markers
@@ -226,17 +293,7 @@ impl Engine for Ds4Engine {
         // Reuse the live session across turns so its cached KV prefix (the
         // constant system prompt and unchanged earlier turns) is not
         // recomputed. Create it lazily on the first turn.
-        if self.session.is_null() {
-            let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
-            // SAFETY: engine valid; session is a valid out-ptr.
-            let rc =
-                unsafe { ffi::ds4_session_create(&raw mut session, self.engine, self.ctx_size) };
-            if rc != 0 || session.is_null() {
-                return Err(EngineError::new("failed to create session"));
-            }
-            self.session = session;
-        }
-        let session = self.session;
+        let session = self.ensure_session()?;
 
         INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
@@ -352,6 +409,77 @@ impl Engine for Ds4Engine {
             ctx_used,
             interrupted,
         })
+    }
+
+    fn warm_system_prompt(
+        &mut self,
+        system: &str,
+        checkpoint: Option<&Path>,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        let tokens = self.build_system_tokens(system);
+        let fingerprint = self.checkpoint_fingerprint(system);
+        let session = self.ensure_session()?;
+
+        // Fast path: restore a matching on-disk checkpoint, skipping prefill.
+        if let Some(path) = checkpoint
+            && let Ok(mut bytes) = std::fs::read(path)
+            && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
+            && bytes[..nl] == *fingerprint.as_bytes()
+        {
+            let mut payload = bytes.split_off(nl + 1);
+            let snap = ffi::Ds4SessionSnapshot {
+                ptr: payload.as_mut_ptr(),
+                len: payload.len() as u64,
+                cap: payload.capacity() as u64,
+            };
+            let mut err = [0_i8; 512];
+            // SAFETY: session valid; snap borrows `payload` which outlives the call.
+            let rc = unsafe {
+                ffi::ds4_session_load_snapshot(
+                    session,
+                    &raw const snap,
+                    err.as_mut_ptr(),
+                    err.len(),
+                )
+            };
+            drop(payload);
+            if rc == 0 {
+                return Ok(false);
+            }
+            // A stale/incompatible snapshot: fall through and rebuild.
+        }
+
+        // Cache miss: prefill the system prompt, streaming progress.
+        let mut progress = ProgressCtx {
+            on_event,
+            start: std::time::Instant::now(),
+            base: 0,
+            total: tokens.len(),
+        };
+        let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
+        // SAFETY: session valid; progress outlives the sync and the callback is cleared after.
+        unsafe {
+            ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+        }
+        let mut err = [0_i8; 512];
+        // SAFETY: session, tokens, and err buffer are valid.
+        let rc =
+            unsafe { ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        // SAFETY: session valid; clearing before ProgressCtx drops.
+        unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "system prompt prefill failed",
+            )));
+        }
+
+        // Persist a fresh checkpoint for the next launch.
+        if let Some(path) = checkpoint {
+            Self::save_checkpoint(session, path, &fingerprint);
+        }
+        Ok(true)
     }
 
     fn ctx_size(&self) -> i32 {
