@@ -57,7 +57,7 @@ jobs:
           VERSION="${{ steps.beta.outputs.version }}"
           mkdir bottles
           gh release download "$TAG" --pattern "plank-${VERSION}.*.bottle.tar.gz" --dir bottles
-          for t in arm64_sonoma sequoia; do
+          for t in arm64_sequoia sequoia; do
             if [ ! -f "bottles/plank-${VERSION}.${t}.bottle.tar.gz" ]; then
               echo "::error::bottle plank-${VERSION}.${t}.bottle.tar.gz missing from release $TAG — aborting promotion"
               exit 1
@@ -76,7 +76,7 @@ jobs:
         run: |
           VERSION="${{ steps.beta.outputs.version }}"
           SOURCE_SHA=$(sha256sum source.tar.gz | awk '{print $1}')
-          ARM64_SONOMA_SHA=$(sha256sum "bottles/plank-${VERSION}.arm64_sonoma.bottle.tar.gz" | awk '{print $1}')
+          ARM64_SEQUOIA_SHA=$(sha256sum "bottles/plank-${VERSION}.arm64_sequoia.bottle.tar.gz" | awk '{print $1}')
           SEQUOIA_SHA=$(sha256sum "bottles/plank-${VERSION}.sequoia.bottle.tar.gz" | awk '{print $1}')
 
           git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/aovestdipaperino/homebrew-tap.git" tap
@@ -94,7 +94,7 @@ jobs:
 
             bottle do
               root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
-              sha256 cellar: :any_skip_relocation, arm64_sonoma: "${ARM64_SONOMA_SHA}"
+              sha256 cellar: :any_skip_relocation, arm64_sequoia: "${ARM64_SEQUOIA_SHA}"
               sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
             end
 

@@ -54,14 +54,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macos-15 runners: the ds4 Metal backend needs the macOS 15 SDK
+          # (MTLResidencySet). cpu_flag overrides the ds4 Makefile's
+          # `-mcpu=native` default with a portable baseline for bottles.
           - name: aarch64-macos
-            runner: macos-14
+            runner: macos-15
             target: aarch64-apple-darwin
-            bottle_tag: arm64_sonoma
+            bottle_tag: arm64_sequoia
+            cpu_flag: "-mcpu=apple-m1"
           - name: x86_64-macos
             runner: macos-15-intel
             target: x86_64-apple-darwin
             bottle_tag: sequoia
+            cpu_flag: "-march=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +77,8 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Build release binary
+        env:
+          NATIVE_CPU_FLAG: ${{ matrix.cpu_flag }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package binary archive
@@ -110,7 +117,7 @@ jobs:
           path: "*.bottle.tar.gz"
 
   update-homebrew:
-    name: Update Homebrew tap (${{ needs.channel.outputs.channel }})
+    name: Update Homebrew tap
     needs: [channel, build]
     runs-on: ubuntu-latest
     steps:
@@ -139,7 +146,7 @@ jobs:
           FORMULA_NAME=$([ "$CHANNEL" = "beta" ] && echo plank-beta || echo plank)
           echo "formula_name=$FORMULA_NAME" >> "$GITHUB_OUTPUT"
           echo "source_sha=$(sha256sum source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          for tag in arm64_sonoma sequoia; do
+          for tag in arm64_sequoia sequoia; do
             sha=$(sha256sum "bottles/$FORMULA_NAME-$VERSION.$tag.bottle.tar.gz" | awk '{print $1}')
             echo "${tag}_sha=$sha" >> "$GITHUB_OUTPUT"
           done
@@ -152,7 +159,7 @@ jobs:
           CHANNEL="${{ needs.channel.outputs.channel }}"
           FORMULA_NAME="${{ steps.hashes.outputs.formula_name }}"
           SOURCE_SHA="${{ steps.hashes.outputs.source_sha }}"
-          ARM64_SONOMA_SHA="${{ steps.hashes.outputs.arm64_sonoma_sha }}"
+          ARM64_SEQUOIA_SHA="${{ steps.hashes.outputs.arm64_sequoia_sha }}"
           SEQUOIA_SHA="${{ steps.hashes.outputs.sequoia_sha }}"
 
           if [ "$CHANNEL" = "beta" ]; then
@@ -180,7 +187,7 @@ jobs:
 
             bottle do
               root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
-              sha256 cellar: :any_skip_relocation, arm64_sonoma: "${ARM64_SONOMA_SHA}"
+              sha256 cellar: :any_skip_relocation, arm64_sequoia: "${ARM64_SEQUOIA_SHA}"
               sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
             end
           ${EXTRA}
