@@ -30,10 +30,14 @@ const THINK_CLOSE: &[u8] = b"</think>";
 /// replaced by tool banners, which always arrive via
 /// [`visible_text`](Self::visible_text).
 pub trait RenderSink {
-    /// Receives ordinary visible output, including tool banners.
+    /// Receives ordinary visible output.
     fn visible_text(&mut self, text: &str);
     /// Receives text produced inside a `<think>` block.
     fn think_text(&mut self, text: &str);
+    /// Receives tool banner output (never markdown); defaults to visible.
+    fn tool_text(&mut self, text: &str) {
+        self.visible_text(text);
+    }
 }
 
 /// Kind of tool parameter, used to select the streaming display style.
@@ -405,7 +409,12 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         self.last_output_newline = bytes.last() == Some(&b'\n');
         self.vis_carry.extend_from_slice(bytes);
-        Self::flush_stream(S::visible_text, &mut self.sink, &mut self.vis_carry);
+        let write = if self.viz.active {
+            S::tool_text as fn(&mut S, &str)
+        } else {
+            S::visible_text
+        };
+        Self::flush_stream(write, &mut self.sink, &mut self.vis_carry);
     }
 
     fn emit_think_bytes(&mut self, bytes: &[u8]) {

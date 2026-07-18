@@ -14,6 +14,12 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use std::sync::{Arc, OnceLock};
+
+use ratatui_markdown::ThemeConfig;
+use ratatui_markdown::highlight::{HighlightHooks, TreeSitterHighlighter};
+use ratatui_markdown::markdown::MarkdownRenderer;
+
 use crate::viz::RenderSink;
 
 /// Style for ordinary assistant/visible output.
@@ -29,11 +35,17 @@ fn think_style() -> Style {
 /// Scrollback of styled lines plus the line currently being streamed.
 ///
 /// Implements [`RenderSink`] so the viz stream renderer appends directly:
-/// visible output in the default style, thinking text in gray.
+/// visible output rendered as markdown (via `ratatui-markdown`, including
+/// code-block syntax highlighting), thinking and tool text in gray/plain.
 #[derive(Debug, Default)]
 pub struct OutputLog {
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
+    /// Raw markdown of the visible segment currently streaming, plus the
+    /// index in `lines` where its rendered form starts. Re-rendered whole on
+    /// each append so partial emphasis/fences resolve as more text arrives.
+    md_buf: String,
+    md_start: Option<usize>,
 }
 
 impl OutputLog {
@@ -59,8 +71,32 @@ impl OutputLog {
             .push(Line::from(std::mem::take(&mut self.current)));
     }
 
+    /// Ends the streaming markdown segment; later appends start a new one.
+    fn md_close(&mut self) {
+        self.md_buf.clear();
+        self.md_start = None;
+    }
+
+    /// Re-renders the whole in-progress markdown segment in place.
+    fn md_render(&mut self) {
+        static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+        let Some(start) = self.md_start else { return };
+        let width = ratatui::crossterm::terminal::size()
+            .map_or(80, |(w, _)| w as usize)
+            .max(20);
+        let hl = HIGHLIGHTER
+            .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+            .clone();
+        let md = MarkdownRenderer::new(width)
+            .with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
+        let blocks = md.parse(&self.md_buf);
+        self.lines.truncate(start);
+        self.lines.extend(md.render(&blocks, &ThemeConfig::new()));
+    }
+
     /// Appends a fully-styled standalone line (e.g. the user echo).
     pub fn push_spans(&mut self, spans: Vec<Span<'static>>) {
+        self.md_close();
         if !self.current.is_empty() {
             self.newline();
         }
@@ -79,12 +115,14 @@ impl OutputLog {
 
     /// Appends ANSI-colored text, one log line per input line.
     pub fn push_ansi(&mut self, text: &str) {
+        self.md_close();
         self.end_line();
         self.lines.extend(ansi_to_lines(text));
     }
 
     /// Removes the most recent completed line (e.g. a transient status note).
     pub fn pop_line(&mut self) {
+        self.md_close();
         self.lines.pop();
     }
 
@@ -108,10 +146,20 @@ impl OutputLog {
 
 impl RenderSink for OutputLog {
     fn visible_text(&mut self, text: &str) {
-        self.append(text, visible_style());
+        if self.md_start.is_none() {
+            self.end_line();
+            self.md_start = Some(self.lines.len());
+        }
+        self.md_buf.push_str(text);
+        self.md_render();
     }
     fn think_text(&mut self, text: &str) {
+        self.md_close();
         self.append(text, think_style());
+    }
+    fn tool_text(&mut self, text: &str) {
+        self.md_close();
+        self.append(text, visible_style());
     }
 }
 
@@ -385,6 +433,63 @@ mod tests {
         log.end_line();
         let spans = &log.lines[0];
         assert_eq!(spans.spans[0].style.fg, Some(Color::Indexed(238)));
+    }
+
+    #[test]
+    fn visible_text_renders_markdown_emphasis() {
+        let mut log = OutputLog::new();
+        log.visible_text("some **bold** words");
+        let spans = &log.lines[0].spans;
+        assert!(
+            spans
+                .iter()
+                .any(|s| s.content.as_ref() == "bold"
+                    && s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn visible_text_highlights_code_blocks() {
+        let mut log = OutputLog::new();
+        log.visible_text("```rust\nfn main() {}\n```\n");
+        // Real highlighting produces multiple distinct colors (keyword vs
+        // identifier), not one flat code color.
+        let mut colors: Vec<String> = log
+            .lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .filter_map(|s| s.style.fg.map(|c| format!("{c:?}")))
+            .collect();
+        colors.sort_unstable();
+        colors.dedup();
+        assert!(
+            colors.len() >= 2,
+            "expected multi-color highlighted code: {:?}",
+            log.lines
+        );
+    }
+
+    #[test]
+    fn tool_text_is_plain_and_closes_markdown_segment() {
+        let mut log = OutputLog::new();
+        log.visible_text("**a**");
+        log.tool_text("\n$ ls **not markdown**\n");
+        log.visible_text("**b**");
+        // The banner line keeps its literal asterisks.
+        assert!(
+            log.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.content.contains("**not markdown**"))
+        );
+        // The second segment re-renders independently as bold "b".
+        assert!(
+            log.lines
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.content.as_ref() == "b"
+                    && s.style.add_modifier.contains(Modifier::BOLD))
+        );
     }
 
     #[test]
