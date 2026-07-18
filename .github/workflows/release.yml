@@ -1,0 +1,202 @@
+name: Release
+
+# Channel model: the highest major version is always the beta channel.
+# A release whose major == the highest major across all tags goes to the
+# `plank-beta` Homebrew formula; anything below that is a stable release
+# and updates the `plank` formula. Promotion (promote.yml) flips the
+# current beta major to stable and opens the next major as the new beta.
+#
+# Homebrew (aovestdipaperino/homebrew-tap) is the ONLY distribution
+# channel — plank is macOS-only and is not published to crates.io.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  channel:
+    name: Determine channel
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.detect.outputs.channel }}
+      version: ${{ steps.detect.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect channel from major version
+        id: detect
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          MAJOR="${VERSION%%.*}"
+          MAX_MAJOR=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1 | sort -n | tail -1)
+          if [ "$MAJOR" -eq "$MAX_MAJOR" ]; then
+            CHANNEL=beta
+          else
+            CHANNEL=stable
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
+          echo "Release $VERSION (major $MAJOR, highest major $MAX_MAJOR) -> $CHANNEL"
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: channel
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64-macos
+            runner: macos-14
+            target: aarch64-apple-darwin
+            bottle_tag: arm64_sonoma
+          - name: x86_64-macos
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            bottle_tag: sequoia
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package binary archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf "../../../plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" plank
+          cd ../../..
+
+      - name: Upload binary archive to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$GITHUB_REF_NAME" "plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" --clobber
+
+      # Bottles are packaged under BOTH formula names on beta releases so
+      # that promote.yml can later publish the stable formula from the same
+      # release assets without rebuilding. (A Homebrew bottle's inner
+      # directory must match the formula name.)
+      - name: Package Homebrew bottles
+        run: |
+          VERSION="${{ needs.channel.outputs.version }}"
+          BOTTLE_TAG="${{ matrix.bottle_tag }}"
+          for NAME in plank plank-beta; do
+            if [ "$NAME" = "plank-beta" ] && [ "${{ needs.channel.outputs.channel }}" != "beta" ]; then
+              continue
+            fi
+            mkdir -p "$NAME/$VERSION/bin"
+            cp target/${{ matrix.target }}/release/plank "$NAME/$VERSION/bin/plank"
+            chmod +x "$NAME/$VERSION/bin/plank"
+            tar czf "$NAME-$VERSION.$BOTTLE_TAG.bottle.tar.gz" "$NAME/"
+          done
+
+      - name: Upload bottle artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: bottle-${{ matrix.bottle_tag }}
+          path: "*.bottle.tar.gz"
+
+  update-homebrew:
+    name: Update Homebrew tap (${{ needs.channel.outputs.channel }})
+    needs: [channel, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download bottle artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: bottles
+          merge-multiple: true
+
+      - name: Upload bottles to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in bottles/*.bottle.tar.gz; do
+            gh release upload "$GITHUB_REF_NAME" "$f" --clobber --repo "$GITHUB_REPOSITORY"
+          done
+
+      - name: Download source tarball
+        run: curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" -o source.tar.gz
+
+      - name: Compute SHA256 hashes
+        id: hashes
+        run: |
+          VERSION="${{ needs.channel.outputs.version }}"
+          CHANNEL="${{ needs.channel.outputs.channel }}"
+          FORMULA_NAME=$([ "$CHANNEL" = "beta" ] && echo plank-beta || echo plank)
+          echo "formula_name=$FORMULA_NAME" >> "$GITHUB_OUTPUT"
+          echo "source_sha=$(sha256sum source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          for tag in arm64_sonoma sequoia; do
+            sha=$(sha256sum "bottles/$FORMULA_NAME-$VERSION.$tag.bottle.tar.gz" | awk '{print $1}')
+            echo "${tag}_sha=$sha" >> "$GITHUB_OUTPUT"
+          done
+
+      - name: Update formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ needs.channel.outputs.version }}"
+          CHANNEL="${{ needs.channel.outputs.channel }}"
+          FORMULA_NAME="${{ steps.hashes.outputs.formula_name }}"
+          SOURCE_SHA="${{ steps.hashes.outputs.source_sha }}"
+          ARM64_SONOMA_SHA="${{ steps.hashes.outputs.arm64_sonoma_sha }}"
+          SEQUOIA_SHA="${{ steps.hashes.outputs.sequoia_sha }}"
+
+          if [ "$CHANNEL" = "beta" ]; then
+            CLASS_NAME=PlankBeta
+            DESC="Interactive coding agent with a terminal REPL (beta channel)"
+            EXTRA='  conflicts_with "plank", because: "both install a plank binary"'
+          else
+            CLASS_NAME=Plank
+            DESC="Interactive coding agent with a terminal REPL (Rust port of ds4)"
+            EXTRA=''
+          fi
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/aovestdipaperino/homebrew-tap.git" tap
+
+          cat > "tap/Formula/$FORMULA_NAME.rb" << EOF
+          class $CLASS_NAME < Formula
+            desc "$DESC"
+            homepage "https://github.com/aovestdipaperino/plank"
+            url "https://github.com/aovestdipaperino/plank/archive/refs/tags/v${VERSION}.tar.gz"
+            sha256 "${SOURCE_SHA}"
+            license "MIT"
+
+            depends_on :macos
+            depends_on "rust" => :build
+
+            bottle do
+              root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
+              sha256 cellar: :any_skip_relocation, arm64_sonoma: "${ARM64_SONOMA_SHA}"
+              sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
+            end
+          ${EXTRA}
+            def install
+              system "cargo", "install", *std_cargo_args
+            end
+
+            test do
+              system "#{bin}/plank", "--help"
+            end
+          end
+          EOF
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "Formula/$FORMULA_NAME.rb"
+          git diff --cached --quiet || git commit -m "$FORMULA_NAME ${VERSION}"
+          git push

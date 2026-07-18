@@ -10,6 +10,18 @@ Plank is an interactive coding agent with a terminal REPL, a one-shot headless m
 
 > **macOS only.** Plank targets macOS exclusively: inference uses the original ds4 C engine with the Metal backend, linked via the `ds4-ref` submodule. Other platforms are not supported.
 
+## Installing
+
+Homebrew is the only distribution channel (plank is not on crates.io):
+
+```sh
+brew tap aovestdipaperino/tap
+brew install plank         # stable channel
+brew install plank-beta    # beta channel
+```
+
+Releases follow a two-channel scheme: the highest major version is always the beta. When a beta is promoted to stable, the next major opens as the new (initially empty) beta — e.g. promoting v8.x to stable creates v9.0.0 as the new beta. The two formulas conflict since both install a `plank` binary.
+
 ## Building
 
 Requires macOS (Apple Silicon or Intel) with the Xcode command line tools. Clone with the submodule to get the ds4 engine:
