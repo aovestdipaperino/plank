@@ -34,6 +34,8 @@ pub struct AgentConfig {
     pub trace_path: Option<PathBuf>,
     /// Working directory supplied with `--chdir`.
     pub chdir_path: Option<PathBuf>,
+    /// MCP server config supplied with `--mcp-config`; `None` = `./.mcp.json`.
+    pub mcp_config_path: Option<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
     /// True when `-h`/`--help` was given; caller should print [`usage`] and exit.
@@ -74,6 +76,7 @@ impl Default for AgentConfig {
             system: DEFAULT_SYSTEM_PROMPT.to_owned(),
             trace_path: None,
             chdir_path: None,
+            mcp_config_path: None,
             non_interactive: false,
             show_help: false,
             help_topic: None,
@@ -113,6 +116,8 @@ Options:
       --think-max          enable maximum thinking effort
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
+      --mcp-config FILE    load MCP servers from a .mcp.json-style file
+                           (default: ./.mcp.json if present)
 "
     .to_owned()
 }
@@ -228,6 +233,7 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--think" | "--think-max" => c.generation.think_mode = ThinkMode::On,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             _ => return Err(format!("unknown option: {arg}")),
         }
         i += 1;

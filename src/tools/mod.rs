@@ -10,6 +10,7 @@
 pub mod bash;
 pub mod edit;
 pub mod files;
+pub mod mcp;
 pub mod web;
 
 use std::fmt::Write as _;
@@ -69,6 +70,8 @@ pub struct ToolContext {
     pub web: web::WebState,
     /// Web access approval hook; `None` auto-denies like non-interactive C.
     pub web_confirm: Option<WebConfirmFn>,
+    /// Live MCP servers started from the `.mcp.json` config, if any.
+    pub mcp: Vec<mcp::McpServer>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -79,6 +82,7 @@ impl std::fmt::Debug for ToolContext {
             .field("bash", &self.bash)
             .field("web", &self.web)
             .field("web_confirm", &self.web_confirm.as_ref().map(|_| "<fn>"))
+            .field("mcp", &self.mcp)
             .finish()
     }
 }
@@ -93,6 +97,7 @@ impl ToolContext {
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
             web_confirm: None,
+            mcp: Vec::new(),
         }
     }
 
@@ -128,6 +133,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "bash_stop" => bash::tool_bash_status_or_stop(ctx, call, true),
         "google_search" => web::tool_google_search(ctx, call),
         "visit_page" => web::tool_visit_page(ctx, call),
+        "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
+        name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         other => format!("Tool error: unknown tool: {other}\n"),
     };
     ToolResult::from_output(output)

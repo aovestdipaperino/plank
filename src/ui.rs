@@ -246,7 +246,7 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder();
+        let mut text = sysprompt::build_system_prompt_reminder(&self.tool_ctx.mcp);
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
@@ -821,7 +821,7 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder();
+        let mut text = sysprompt::build_system_prompt_reminder(&self.tool_ctx.mcp);
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
@@ -950,6 +950,9 @@ fn new_agent(
     trace.text("datetime-context", &datetime);
     session.push(Message::user(datetime));
     let mut tool_ctx = ToolContext::new(cwd);
+    // Start MCP servers before composing the system prompt so their tool
+    // schemas land in it, like agent_worker_init.
+    tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
     if show_footer {
         // Interactive approval for web access, like agent_web_confirm;
         // headless runs keep the auto-deny default.
@@ -963,13 +966,14 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
+    let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
     Ok(Agent {
         engine,
         cfg,
         session,
         store,
         tool_ctx,
-        system: sysprompt::build_system_prompt(&cfg.system),
+        system,
         reminder: SystemPromptReminder::new(),
         power_percent: 0,
         trace,
@@ -1169,7 +1173,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt(""),
+            system: crate::sysprompt::build_system_prompt("", &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),

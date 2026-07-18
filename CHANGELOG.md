@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MCP client** ported from the ds4 `mcp-support` branch: stdio MCP servers
+  listed in `./.mcp.json` (or `--mcp-config FILE`) are spawned at startup and
+  their tools exposed to the model as `mcp__<server>__<tool>`. A server's
+  optional `primaryTools` list keeps the system prompt small: unlisted tools
+  appear only in a compact directory and are described on demand via the new
+  `mcp_describe` tool.
 - **Ratatui full-screen UI** for interactive sessions. Uses the alternate
   screen buffer so block-based terminals like Warp render plank cleanly. Draws
   a scrollback area, a pinned input line, and a reverse-video status bar, with

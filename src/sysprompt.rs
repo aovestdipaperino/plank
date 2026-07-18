@@ -251,18 +251,19 @@ unless explicitly asked otherwise by the user.\n";
 /// Token-estimate distance after which the system prompt reminder is re-injected.
 pub const SYSTEM_PROMPT_REMINDER_TOKENS: i32 = 50_000;
 
-/// Builds the full built-in tools prompt (intro, editing, schemas, rules).
+/// Builds the full tools prompt (intro, editing, schemas, rules, MCP tools).
 ///
-/// Mirrors `agent_build_tools_prompt`: a plain concatenation of the three
-/// verbatim C string constants.
+/// Mirrors `agent_build_tools_prompt`: the three verbatim C string constants
+/// followed by the schemas of any MCP tools loaded at startup.
 #[must_use]
-pub fn build_tools_prompt() -> String {
+pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> String {
     let mut out = String::with_capacity(
         TOOLS_PROMPT_INTRO.len() + TOOLS_PROMPT_EDIT_LINE.len() + TOOLS_PROMPT_AFTER_EDIT.len(),
     );
     out.push_str(TOOLS_PROMPT_INTRO);
     out.push_str(TOOLS_PROMPT_EDIT_LINE);
     out.push_str(TOOLS_PROMPT_AFTER_EDIT);
+    crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     out
 }
 
@@ -282,9 +283,9 @@ pub fn dsml_syntax_reminder() -> &'static str {
 /// Mirrors `agent_build_system_prompt_reminder`: the tools prompt wrapped in
 /// start/end reminder markers.
 #[must_use]
-pub fn build_system_prompt_reminder() -> String {
+pub fn build_system_prompt_reminder(mcp_servers: &[crate::tools::mcp::McpServer]) -> String {
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
-    out.push_str(&build_tools_prompt());
+    out.push_str(&build_tools_prompt(mcp_servers));
     out.push_str("[End system prompt reminder.]\n\n");
     out
 }
@@ -297,8 +298,11 @@ pub fn build_system_prompt_reminder() -> String {
 /// as rendered chat so DSML markers become control tokens, user text as plain
 /// content); here both are returned as one composed string.
 #[must_use]
-pub fn build_system_prompt(user_system: &str) -> String {
-    let mut out = build_tools_prompt();
+pub fn build_system_prompt(
+    user_system: &str,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+) -> String {
+    let mut out = build_tools_prompt(mcp_servers);
     if !user_system.is_empty() {
         out.push_str("\n\n");
         out.push_str(user_system);
@@ -399,7 +403,7 @@ mod tests {
 
     #[test]
     fn tools_prompt_contains_verbatim_phrases() {
-        let p = build_tools_prompt();
+        let p = build_tools_prompt(&[]);
         assert!(p.starts_with("You are a coding agent running in a local workspace."));
         assert!(p.contains("<｜DSML｜tool_calls>"));
         assert!(p.contains("Tool calls are not allowed inside <think></think>"));
@@ -422,7 +426,7 @@ mod tests {
 
     #[test]
     fn system_prompt_reminder_framing() {
-        let r = build_system_prompt_reminder();
+        let r = build_system_prompt_reminder(&[]);
         assert!(r.starts_with("\n\n[System prompt reminder follows.]\n"));
         assert!(r.ends_with("[End system prompt reminder.]\n\n"));
         assert!(r.contains("## Tools"));
@@ -430,9 +434,9 @@ mod tests {
 
     #[test]
     fn system_prompt_composition() {
-        assert_eq!(build_system_prompt(""), build_tools_prompt());
-        let with_extra = build_system_prompt("Be terse.");
-        assert!(with_extra.starts_with(&build_tools_prompt()));
+        assert_eq!(build_system_prompt("", &[]), build_tools_prompt(&[]));
+        let with_extra = build_system_prompt("Be terse.", &[]);
+        assert!(with_extra.starts_with(&build_tools_prompt(&[])));
         assert!(with_extra.ends_with("\n\nBe terse."));
     }
 

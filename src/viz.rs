@@ -69,6 +69,7 @@ fn tool_prefix(name: &str) -> Option<&'static str> {
         "search" => Some("search "),
         "google_search" => Some("google "),
         "visit_page" => Some("visit "),
+        name if name.starts_with("mcp_") => Some("mcp "),
         _ => None,
     }
 }

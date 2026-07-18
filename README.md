@@ -46,13 +46,32 @@ plank --help     # full option list
 
 Run with a prompt argument for one-shot headless mode.
 
+### MCP servers
+
+Plank can load external tools from stdio MCP servers. It reads `./.mcp.json` (or the file given with `--mcp-config`) in the standard `mcpServers` format:
+
+```json
+{
+  "mcpServers": {
+    "demo": {
+      "command": "some-mcp-server",
+      "args": ["--flag"],
+      "env": {"KEY": "value"},
+      "primaryTools": ["tool_a"]
+    }
+  }
+}
+```
+
+Tools are exposed to the model as `mcp__<server>__<tool>`. The optional `primaryTools` list controls prompt size: listed tools get their full schema in the system prompt, the rest appear in a compact directory and are described on demand via the built-in `mcp_describe` tool. Omit the key to make every tool primary.
+
 ## Project layout
 
 Each module in `src/` maps to one functional section of the original `ds4_agent.c`:
 
 - `engine.rs` / `ds4engine.rs` / `ffi.rs` — inference engine abstraction and native ds4 bindings
 - `session.rs`, `compact.rs`, `sysprompt.rs` — conversation state, compaction, system prompt
-- `tools/` — built-in agent tools (bash, edit, files, web)
+- `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
 - `config.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, tracing, signal handling
 
