@@ -28,6 +28,7 @@ Current release line: **v1.3.x**.
 
 - **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine. Design: [`REMOTE-CONTROL-DESIGN.md`](REMOTE-CONTROL-DESIGN.md).
 - **Remote LLM support via llms-sdk** ([#26](https://github.com/aovestdipaperino/plank/issues/26)): remote-hosted ds4 (`plank serve`) and third-party providers (OpenAI-compatible + Anthropic) behind the `Engine` trait (reference checkout at `refs/llms-sdk`). Design: [`REMOTE-ENGINE-DESIGN.md`](REMOTE-ENGINE-DESIGN.md).
+- **Mid-generation /btw suspend** ([#27](https://github.com/aovestdipaperino/plank/issues/27)): freeze an in-flight generation, answer the aside, resume with zero re-prefill via session snapshot/restore. Design: [`BTW-SUSPEND-DESIGN.md`](BTW-SUSPEND-DESIGN.md).
 
 ## Ongoing
 
