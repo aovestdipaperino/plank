@@ -6,6 +6,156 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-19
+
+Opens the v2 beta channel and promotes v1.6.0 to stable. No functional changes.
+
+## [1.6.0] - 2026-07-19
+
+### Added
+
+- **Live `/btw` side panel**: the main task resumes the instant a side answer
+  finishes (it keeps rendering on the left while the finished answer stays on
+  the right). The panel persists across turns and closes only with Esc, and an
+  idle `/btw` uses the same panel.
+- **Memorable session names**: session ids are now `adjective-celebrity` names
+  (e.g. `deadly-einstein`) minted on first save, drawn from 50 adjectives and
+  150 celebrities (75 scientists / 75 historical-pop-sport, ~50% science), with
+  a short guid on filename collision. Legacy 40-hex sessions still load and
+  list.
+- **Resume from the command line**: `plank /resume [name]` resumes a session at
+  startup (a name, prefix, list number, or bare for the most recent), showing
+  the recovered history.
+- **End-of-session dump**: on exit the transcript is saved and plank prints
+  where it landed and how to resume it.
+- **`/repro`**: writes a diagnostic dump (the exact rendered engine input plus
+  the generation knobs) to `~/.plank/repro/` for bug reports.
+- A green rule now separates the scrollback from the resting prompt.
+
+### Fixed
+
+- The "cannot load model" crash when a second instance starts: plank probes the
+  engine's single-instance lock file first and exits cleanly with a clear
+  message instead of the engine's `exit(2)`.
+
+### Changed
+
+- `cargo update`: 12 transitive dependencies refreshed.
+
+## [1.5.0] - 2026-07-19
+
+### Added
+
+- **`/btw` un-gated** (#7): a first-class command, no longer behind the `images`
+  feature flag.
+- **Split-screen `/btw` panel**: while a side answer streams the screen splits
+  (main 60% / side 40%); Esc cancels and restores full width; nothing enters
+  the transcript.
+- **Priority preemption** (#18): a `/btw` submitted mid-generation pauses the
+  running task, answers, then re-runs the interrupted step. Questions typed
+  during tool execution answer at the next boundary; a `/btw` during a streaming
+  answer joins a FIFO queue (cap 20, drop-oldest).
+
+### Changed
+
+- OpenClaw is vendored as a reference submodule (`refs/openclaw`, shallow,
+  CI-skipped) for the side-question design.
+
+## [1.4.0] - 2026-07-19
+
+### Added
+
+- **Worker-thread architecture** (#12): TUI turns run on a worker thread, so the
+  prompt stays live during generation — type and queue the next message; queued
+  lines join between tool rounds or start the next turn.
+- **`/subagent <task>`** (#10): delegates to a sidechain run of the same model
+  with full tool access; only the final report returns, and the sidechain's KV
+  cost is rolled back.
+- **Persistent memory** (#2): `/remember [user] <text>` appends dated notes to
+  project or user `MEMORY.md`, loaded into session-start context.
+- **`/resume` and `/tag`** (#2): a numbered recent-session picker with tags and
+  last prompts, backed by a bounded-read session `meta` trailer (older files
+  still load).
+
+## [1.3.0] - 2026-07-19
+
+### Added
+
+- **`/hooks`** (#8): command hooks (PreToolUse / PostToolUse / Stop) from
+  `~/.plank/hooks.json` + `./.plank/hooks.json`.
+- **Bash sandbox** (#17): opt-in Seatbelt sandboxing for model-initiated shell
+  commands (`--sandbox` or `sandbox.json`), writes limited to cwd/temp plus
+  `writablePaths`, with `[sandbox blocked: ...]` hints on denials.
+- **`/btw`** (#7): first cut, gated behind the experimental `images` flag
+  pending the model-format investigation (#18).
+
+## [1.2.1] - 2026-07-19
+
+### Added
+
+- README "Model download" section with an animated demo of the first-run
+  download UI (resume support, the 96 GB RAM guard, headless behavior).
+
+## [1.2.0] - 2026-07-19
+
+### Added
+
+- **Layered compaction** (#3): microcompact first (clear old tool-result
+  bodies, zero model cost), then structured summarization, with recently read
+  files re-attached across the boundary.
+- **`/skills`** (#9): markdown `SKILL.md` templates become slash commands with
+  `$ARGUMENTS` substitution; `~/.plank/skills` overlaid by `./.plank/skills`.
+
+## [1.1.0] - 2026-07-19
+
+### Added
+
+- **`!` commands** (#4): `!<command>` runs a shell command immediately in both
+  UI paths, no model round-trip, output stays in the UI.
+- **MCP `instructions`** (#14): a server's initialize `instructions` are
+  injected into the system prompt alongside its tool schemas.
+- **Parallel git context** (#13): the five session-start git commands run
+  concurrently.
+- **`docs/SYSTEM-PROMPT.md`** (#5) and a static/volatile prompt-boundary guard
+  (#15) that keeps per-session bytes out of the cached prefix.
+
+## [1.0.1] - 2026-07-19
+
+### Fixed
+
+- **#1** Text selection copies to the clipboard (pbcopy + OSC 52); the copy
+  path had read a cleared frame buffer.
+- **#11** Invalid DSML tool calls no longer leak raw tags; error banners render
+  bold red in both the REPL and TUI.
+- **#6** The TUI output log is scrollable during generation, with a
+  jump-to-bottom hint.
+- Status bar: the context gauge updates live during a turn, and elapsed time
+  counts the whole tool loop.
+
+### Added
+
+- **C-parity** (#12): the streaming `edit` old-selector preflight aborts doomed
+  edits mid-generation with the C's exact error text; malformed and incomplete
+  DSML tool calls feed the C's `invalid DSML tool call:` payload plus the syntax
+  reminder; greedy (argmax) sampling runs inside DSML stanzas (❄️ indicator);
+  and the engine tuning CLI flags are exposed (`--mtp*`, `--prefill-chunk`,
+  `--quality`, `--warm-weights`, `--ssd-streaming*`, `--simulate-used-memory`,
+  `--dir-steering-*`, `--backend`).
+
+## [1.0.0] - 2026-07-19
+
+Opens the v1 beta channel and promotes v0.9.9 to stable. No functional changes.
+
+## [0.9.10] - 2026-07-19
+
+### Fixed
+
+- Homebrew installs could not load any model: the Metal kernel sources were
+  resolved from a compile-time CI path. The kernels now ship in the bottles
+  (`share/plank/metal`) and resolve at runtime (`DS4_METAL_DIR` override, then
+  the build path, then the exe-relative share dir); the engine-open error now
+  reports missing kernels instead of blaming the model file.
+
 ## [0.9.9] - 2026-07-19
 
 ### Added
