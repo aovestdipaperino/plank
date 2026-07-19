@@ -104,6 +104,12 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
 </p>
 
+`/btw` answers a side question in a split panel while the main task keeps its place — here the model counts to 20 on the left while a `/btw what is 2 plus 2?` is answered on the right, with nothing written to the conversation:
+
+<p align="center">
+  <img src="assets/btw-panel.png" alt="The plank TUI split screen: a counting task on the left, a /btw side answer on the right" width="700">
+</p>
+
 ### MCP servers
 
 Plank can load external tools from stdio MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format:
