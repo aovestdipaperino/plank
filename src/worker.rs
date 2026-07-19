@@ -42,6 +42,12 @@ pub enum UiEvent {
     EndLine,
     /// Worker progress snapshot for the status footer.
     Status(Status),
+    /// A `/btw` side answer is starting: the UI splits off a side panel and
+    /// routes subsequent render events there until [`UiEvent::BtwEnd`].
+    BtwBegin,
+    /// The `/btw` drain finished (or was cancelled): the UI removes the side
+    /// panel and resumes rendering into the main log.
+    BtwEnd,
 }
 
 /// [`RenderSink`] forwarding render calls over the worker→UI channel.
@@ -162,7 +168,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),
-        UiEvent::Status(_) => {}
+        UiEvent::Status(_) | UiEvent::BtwBegin | UiEvent::BtwEnd => {}
     }
 }
 

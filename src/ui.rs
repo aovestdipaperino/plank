@@ -1745,8 +1745,16 @@ impl Agent<'_> {
     /// flushes the rest of the queue (the user is saying "stop the asides");
     /// a failed answer is logged and the queue continues — side questions
     /// must never abort the main turn.
+    ///
+    /// While answering, `BtwBegin`/`BtwEnd` bracket the render events so the
+    /// UI splits off a side panel (main conversation 60%, `/btw` 40%) and
+    /// tears it down when the drain finishes or is cancelled.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
-        while let Some(question) = shared.pop_btw() {
+        let Some(mut question) = shared.pop_btw() else {
+            return;
+        };
+        let _ = tx.send(UiEvent::BtwBegin);
+        loop {
             let _ = tx.send(UiEvent::UserEcho(format!("/btw {question}")));
             let _ = tx.send(UiEvent::Dim("[btw]".to_owned()));
             let saved_ctx = self.last_ctx_used;
@@ -1755,38 +1763,41 @@ impl Agent<'_> {
                 use std::fmt::Write as _;
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
-            let out = match self.worker_generate(tx, shared, &prompt, Instant::now()) {
-                Ok(out) => out,
+            match self.worker_generate(tx, shared, &prompt, Instant::now()) {
+                Ok(out) => {
+                    let _ = tx.send(UiEvent::EndLine);
+                    self.last_ctx_used = saved_ctx;
+                    if out.interrupted {
+                        crate::interrupt::clear();
+                        let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
+                        let cleared = shared.clear_btw();
+                        if cleared > 0 {
+                            let _ =
+                                tx.send(UiEvent::Dim(format!("[btw queue cleared: {cleared}]")));
+                        }
+                        break;
+                    }
+                    if !out.calls.is_empty() || out.error.is_some() {
+                        let _ = tx.send(UiEvent::Dim(
+                            "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)"
+                                .to_owned(),
+                        ));
+                    }
+                    let _ = tx.send(UiEvent::Dim(
+                        "[btw — not part of the conversation]".to_owned(),
+                    ));
+                }
                 Err(e) => {
                     let _ = tx.send(UiEvent::Dim(format!("/btw failed: {e}")));
                     self.last_ctx_used = saved_ctx;
-                    continue;
                 }
+            }
+            let Some(next) = shared.pop_btw() else {
+                break;
             };
-            let _ = tx.send(UiEvent::EndLine);
-            self.last_ctx_used = saved_ctx;
-            if out.interrupted {
-                crate::interrupt::clear();
-                let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
-                let cleared = shared.clear_btw();
-                if cleared > 0 {
-                    let _ = tx.send(UiEvent::Dim(format!("[btw queue cleared: {cleared}]")));
-                }
-                let _ = tx.send(UiEvent::Dim(
-                    "[btw — not part of the conversation]".to_owned(),
-                ));
-                return;
-            }
-            if !out.calls.is_empty() || out.error.is_some() {
-                let _ = tx.send(UiEvent::Dim(
-                    "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)"
-                        .to_owned(),
-                ));
-            }
-            let _ = tx.send(UiEvent::Dim(
-                "[btw — not part of the conversation]".to_owned(),
-            ));
+            question = next;
         }
+        let _ = tx.send(UiEvent::BtwEnd);
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -2267,12 +2278,23 @@ fn busy_ui_loop(
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
+    // Present only while a `/btw` side answer streams: render events between
+    // BtwBegin and BtwEnd route here and the screen splits (main 60% / btw
+    // 40%). Torn down on BtwEnd, so the panel is inherently ephemeral.
+    let mut btw: Option<(OutputLog, tui::OutputView)> = None;
     loop {
         while let Ok(ev) = rx.try_recv() {
-            if let UiEvent::Status(st) = ev {
-                status_line = status::build_status_text(&st, false);
-            } else {
-                worker::apply(log, ev);
+            match ev {
+                UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
+                UiEvent::BtwBegin => btw = Some((OutputLog::new(), tui::OutputView::default())),
+                UiEvent::BtwEnd => btw = None,
+                ev => {
+                    if let Some((btw_log, _)) = btw.as_mut() {
+                        worker::apply(btw_log, ev);
+                    } else {
+                        worker::apply(log, ev);
+                    }
+                }
             }
         }
         // Check before drawing: anything sent after this point survives in
@@ -2281,21 +2303,44 @@ fn busy_ui_loop(
         let finished = done();
         terminal
             .draw(|f| {
-                tui::draw(
-                    f,
-                    log,
-                    Some(input.buf.text()),
-                    input.cursor_col(),
-                    &status_line,
-                    view,
-                    None,
-                );
+                if let Some((btw_log, btw_view)) = btw.as_mut() {
+                    tui::draw_btw_split(
+                        f,
+                        log,
+                        btw_log,
+                        btw_view,
+                        Some(input.buf.text()),
+                        input.cursor_col(),
+                        &status_line,
+                        view,
+                    );
+                } else {
+                    tui::draw(
+                        f,
+                        log,
+                        Some(input.buf.text()),
+                        input.cursor_col(),
+                        &status_line,
+                        view,
+                        None,
+                    );
+                }
             })
             .map_err(|e| e.to_string())?;
         if finished {
+            // The panel is torn down when the worker returns; any late render
+            // events (post-BtwEnd trailers) belong in the main log.
             while let Ok(ev) = rx.try_recv() {
-                if !matches!(ev, UiEvent::Status(_)) {
-                    worker::apply(log, ev);
+                match ev {
+                    UiEvent::Status(_) | UiEvent::BtwBegin => {}
+                    UiEvent::BtwEnd => btw = None,
+                    ev => {
+                        if let Some((btw_log, _)) = btw.as_mut() {
+                            worker::apply(btw_log, ev);
+                        } else {
+                            worker::apply(log, ev);
+                        }
+                    }
                 }
             }
             return Ok(());
@@ -2773,6 +2818,35 @@ mod tests {
                 |e| matches!(e, UiEvent::Dim(t) if t.contains("not part of the conversation"))
             )
         );
+        // The panel is bracketed exactly once, BtwBegin before the echo and
+        // BtwEnd after the trailer, so the UI splits and tears down cleanly.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, UiEvent::BtwBegin))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, UiEvent::BtwEnd))
+                .count(),
+            1
+        );
+        let begin = events
+            .iter()
+            .position(|e| matches!(e, UiEvent::BtwBegin))
+            .unwrap();
+        let end = events
+            .iter()
+            .position(|e| matches!(e, UiEvent::BtwEnd))
+            .unwrap();
+        let echo = events
+            .iter()
+            .position(|e| matches!(e, UiEvent::UserEcho(_)))
+            .unwrap();
+        assert!(begin < echo && echo < end, "panel must bracket the answer");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2895,6 +2969,9 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, UiEvent::Dim(t) if t == "[btw queue cleared: 2]"))
         );
+        // The panel is torn down even on the interrupt path, so the split
+        // never lingers after the user cancels.
+        assert!(events.iter().any(|e| matches!(e, UiEvent::BtwEnd)));
         std::fs::remove_dir_all(&dir).ok();
     }
 

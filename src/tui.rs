@@ -443,31 +443,7 @@ pub fn draw(
     ])
     .split(area);
 
-    // Output area, scrolled so the latest lines stay visible unless the user
-    // has wheeled back into the buffer (which pins the viewport in place).
-    let text = log.to_text();
-    let width = rows[0].width.max(1) as usize;
-    let total: usize = text
-        .lines
-        .iter()
-        .map(|l| l.width().div_ceil(width).max(1))
-        .sum();
-    let max_top = total.saturating_sub(rows[0].height as usize);
-    if view.follow || view.top >= max_top {
-        view.top = max_top;
-        view.follow = true;
-    }
-    let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(para, rows[0]);
-    if !view.follow {
-        draw_jump_hint(frame, rows[0]);
-    }
-    if let Some(sel) = selection {
-        highlight_selection(frame.buffer_mut(), rows[0], sel);
-    }
+    render_output(frame, rows[0], log, view, selection);
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
@@ -484,6 +460,107 @@ pub fn draw(
     }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
+    let status_style = Style::default()
+        .bg(Color::Indexed(238))
+        .fg(Color::Indexed(252));
+    frame.render_widget(
+        Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
+        rows[2],
+    );
+}
+
+/// Renders a scrollback log into `area`, clamping `view` to the scrollable
+/// range and following the newest output unless the user has scrolled back.
+fn render_output(
+    frame: &mut Frame,
+    area: Rect,
+    log: &OutputLog,
+    view: &mut OutputView,
+    selection: Option<Selection>,
+) {
+    let text = log.to_text();
+    let width = area.width.max(1) as usize;
+    let total: usize = text
+        .lines
+        .iter()
+        .map(|l| l.width().div_ceil(width).max(1))
+        .sum();
+    let max_top = total.saturating_sub(area.height as usize);
+    if view.follow || view.top >= max_top {
+        view.top = max_top;
+        view.follow = true;
+    }
+    let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
+    let para = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+    frame.render_widget(para, area);
+    if !view.follow {
+        draw_jump_hint(frame, area);
+    }
+    if let Some(sel) = selection {
+        highlight_selection(frame.buffer_mut(), area, sel);
+    }
+}
+
+/// Draws one frame with the output area split into two columns: the main
+/// conversation (60%) on the left and the live `/btw` side answer (40%) on
+/// the right, separated by a labelled left border. The input line and status
+/// bar span the full width below, as in [`draw`]. Used while a `/btw` panel
+/// is active; pressing Esc cancels the side answer and returns to [`draw`].
+#[allow(clippy::too_many_arguments)]
+pub fn draw_btw_split(
+    frame: &mut Frame,
+    log: &OutputLog,
+    btw_log: &OutputLog,
+    btw_view: &mut OutputView,
+    input: Option<&str>,
+    cursor_col: u16,
+    status: &str,
+    view: &mut OutputView,
+) {
+    use ratatui::widgets::{Block, Borders};
+
+    let area = frame.area();
+    let rows = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(rows[0]);
+
+    render_output(frame, cols[0], log, view, None);
+
+    // The btw panel: a left border acts as the vertical separator and carries
+    // a dim "btw (Esc to cancel)" title; the answer streams inside.
+    let block = Block::default()
+        .borders(Borders::LEFT)
+        .border_style(Style::default().fg(Color::Indexed(238)))
+        .title(Span::styled(
+            " btw · Esc cancels ",
+            Style::default()
+                .fg(Color::Indexed(114))
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(cols[1]);
+    frame.render_widget(block, cols[1]);
+    render_output(frame, inner, btw_log, btw_view, None);
+
+    // Input line and status bar span the full width, identical to `draw`.
+    if let Some(input) = input {
+        let prompt = crate::status::prompt_text();
+        let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
+        let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
+        let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
+        frame.render_widget(Paragraph::new(input_line), rows[1]);
+        let cursor_x = rows[1].x + prompt_width + cursor_col;
+        frame.set_cursor_position(Position::new(
+            cursor_x.min(area.right().saturating_sub(1)),
+            rows[1].y,
+        ));
+    }
     let status_style = Style::default()
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));

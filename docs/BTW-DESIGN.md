@@ -11,11 +11,12 @@ Status: **implemented (steps 1–4), still gated.** §4's mechanics landed on th
 the busy UI loop queues `/btw <q>` into `TurnShared` (FIFO cap
 20, drop-oldest — OpenClaw's bounded-buffer policy), and the worker answers at
 generation boundaries via `Agent::drain_btw` (interrupt flushes the queue;
-errors log and continue; `last_ctx_used` restored on every path). Deviations:
-queue depth is a dim notice on push rather than a status-bar field, and plain
-(non-`/btw`) lines typed while busy queue into the *main* conversation — that
-shipped with #12 as the C's `queued_user_drain`, superseding §4.4's
-"stays in the buffer".
+errors log and continue; `last_ctx_used` restored on every path). While an
+answer streams the screen splits into a main (60%) / btw (40%) panel that Esc
+cancels and tears down (§4.5–4.6). Deviations: queue depth is a dim notice on
+push rather than a status-bar field, and plain (non-`/btw`) lines typed while
+busy queue into the *main* conversation — that shipped with #12 as the C's
+`queued_user_drain`, superseding §4.4's "stays in the buffer".
 
 §4.8 as written is impossible: the C reference contains **no** btw framing
 (`btw_user_message` came from Claude Code's pattern, not `ds4_agent.c`), so no
@@ -179,33 +180,50 @@ until the queue is empty.
 - No debounce. OpenClaw debounces because its inbox is fed by chat channels;
   a TUI line editor already debounces by requiring Enter.
 
-### 4.5 Presentation: a distinct side channel
+### 4.5 Presentation: a split-screen side panel
 
 OpenClaw delivers answers via a dedicated `chat.side_result` event so clients
-can render them apart from the conversation. Plank's analogue is a **visually
-distinct block** in the existing sinks, not a new sink:
+can render them apart from the conversation. Plank's analogue is a **live
+split panel**: while a `/btw` answer streams the output area divides into two
+columns — the main conversation keeps **60%** on the left, the side answer
+gets **40%** on the right behind a labelled left border (`btw · Esc cancels`).
+The input line and status bar span the full width below, unchanged.
 
-- **Echo**: `/btw <question>` echoed in the user-echo style, so the exchange
-  reads as a labelled aside.
-- **Body**: streamed through the normal `StreamRenderer` (thinking split,
-  spinner, interrupt handling all inherited), but bracketed by side markers:
-  - opening line `[btw]` in the dim/debug style before the answer starts;
-  - closing trailer `[btw — not part of the conversation]` (existing text).
-- **TUI**: `OutputLog` gains a `push_side_begin/…` styling variant only if the
-  dim style proves insufficient; start with `push_dim` markers — smallest
-  diff, same information.
+Mechanics (implemented on the #12 worker-thread architecture):
+
+- The worker brackets a drain with `UiEvent::BtwBegin` / `BtwEnd`. On
+  `BtwBegin` the busy UI loop (`busy_ui_loop`) allocates a fresh side
+  `OutputLog` + `OutputView` and routes every subsequent render event
+  (`Visible`/`Think`/`Tool`/`Error`/`Dim`/`UserEcho`/`EndLine`) into it
+  instead of the main log; on `BtwEnd` it drops the side log and the split
+  collapses back to the single-column [`tui::draw`]. The side panel is
+  therefore **ephemeral by construction** — its `OutputLog` is never merged
+  into the main scrollback, matching the "never part of the conversation"
+  invariant (§7.2).
+- The panel is drawn by [`tui::draw_btw_split`], which reuses the shared
+  `render_output` helper for both columns so scrolling/markdown/highlighting
+  behave identically; the side column always follows the newest output.
+- **Echo + markers** still stream inside the panel: `/btw <question>` in the
+  user-echo style, an opening `[btw]` dim line, and the closing
+  `[btw — not part of the conversation]` trailer.
+- Multiple queued questions share one panel: `drain_btw` sends `BtwBegin`
+  once, loops answering, and sends `BtwEnd` only when the queue empties, so
+  the split stays up across a run of asides.
 - `/history`, `/context`, session save/load, and `/compact` are unaffected by
   construction, since nothing enters the transcript. A test pins this (§6).
 
 ### 4.6 Interrupt semantics
 
-- Esc / Ctrl-C (on empty editor) during a **side answer** aborts only that
-  answer: print `[interrupted]`, clear the flag, continue draining the queue?
-  No — match OpenClaw/Claude Code intuition: an interrupt during the side
-  channel **flushes the remaining queue** too (the user is saying "stop the
-  asides"), with a one-line `[btw queue cleared: N]` notice. The main turn is
-  unaffected (a mid-turn drain resumes the tool loop; a post-turn drain just
-  returns to the prompt).
+- Esc (or Ctrl-C on an empty editor) **while the split panel is showing**
+  cancels the side answer and **tears the panel down** (the worker still
+  emits `BtwEnd` on the interrupt path, so the split always collapses). It
+  also **flushes the remaining queue** (the user is saying "stop the asides"),
+  with a one-line `[btw queue cleared: N]` notice. Because the panel is only
+  up while `drain_btw` runs — the main turn is paused at a generation
+  boundary — the shared interrupt flag reaches only the side generation;
+  `worker_generate` clears it on return, so the main turn resumes cleanly (a
+  mid-turn drain continues the tool loop; a post-turn drain returns to the
+  prompt). The main turn is never aborted by cancelling a `/btw`.
 - An interrupt during the **main pass** still ends the main turn as today;
   queued questions are then answered (drain point 3) unless the same
   interrupt already cleared them — distinguish by where the flag was raised.
