@@ -4,3 +4,6 @@
 [submodule "refs/openclaw"]
 	path = refs/openclaw
 	url = https://github.com/openclaw/openclaw
+[submodule "refs/llms-sdk"]
+	path = refs/llms-sdk
+	url = https://github.com/AstraBert/llms-sdk
