@@ -842,14 +842,28 @@ impl Agent<'_> {
         // Endpoints of a mouse drag selection over the output area, in screen
         // cells (anchor, current). Copied to the clipboard on button release.
         let mut selection: Option<((u16, u16), (u16, u16))> = None;
+        // Images pasted (clipboard or file path) awaiting the next submit;
+        // attached to the message as file references the model's tools can read.
+        let mut attachments: Vec<crate::imagepaste::PastedImage> = Vec::new();
+        // Clipboard-image hint, re-probed every few seconds (the probe shells
+        // out to osascript, so it must not run on every 200ms poll tick).
+        let mut clip_has_image = crate::imagepaste::clipboard_has_image();
+        let mut clip_checked = Instant::now();
         loop {
-            let status = self.idle_status_text();
+            if clip_checked.elapsed() >= Duration::from_secs(3) {
+                clip_has_image = crate::imagepaste::clipboard_has_image();
+                clip_checked = Instant::now();
+            }
+            let mut status = self.idle_status_text();
+            if clip_has_image {
+                status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
+            }
             terminal
                 .draw(|f| {
                     tui::draw(
                         f,
                         &log,
-                        input.buf.text(),
+                        Some(input.buf.text()),
                         input.cursor_col(),
                         &status,
                         &mut scroll_back,
@@ -892,9 +906,35 @@ impl Agent<'_> {
                 continue;
             }
             if let Event::Paste(pasted) = &ev {
+                input.hist_idx = None;
+                // An empty bracketed paste means the clipboard holds an image
+                // (macOS pastes no text for image content); pasted text that is
+                // an image file path attaches that file.
+                if pasted.trim().is_empty() {
+                    match crate::imagepaste::from_clipboard() {
+                        Some(img) => {
+                            log.push_dim(format!(
+                                "[image #{} attached: {}]",
+                                attachments.len() + 1,
+                                img.describe()
+                            ));
+                            attachments.push(img);
+                        }
+                        None => log.push_dim("[clipboard has no image to paste]"),
+                    }
+                    continue;
+                }
+                if let Some(img) = crate::imagepaste::from_path_text(pasted) {
+                    log.push_dim(format!(
+                        "[image #{} attached: {}]",
+                        attachments.len() + 1,
+                        img.describe()
+                    ));
+                    attachments.push(img);
+                    continue;
+                }
                 // The line editor is single-line; fold pasted newlines into
                 // spaces so the paste stays editable.
-                input.hist_idx = None;
                 input
                     .buf
                     .insert(pasted.replace("\r\n", "\n").replace(['\n', '\r'], " "));
@@ -912,10 +952,13 @@ impl Agent<'_> {
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('c') if ctrl => {
-                    if input.buf.text().is_empty() {
+                    if !input.buf.text().is_empty() {
+                        input.buf.clear();
+                    } else if attachments.is_empty() {
                         log.push_spans(quit_hint_spans());
                     } else {
-                        input.buf.clear();
+                        attachments.clear();
+                        log.push_dim("[image attachments removed]");
                     }
                 }
                 KeyCode::Char('d') if ctrl => {
@@ -954,18 +997,37 @@ impl Agent<'_> {
                     input.buf.clear();
                     input.hist_idx = None;
                     scroll_back = 0;
-                    if line.is_empty() {
+                    if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
-                    input.history.add(&line);
-                    input.history.save(&hist_path).ok();
+                    if !line.is_empty() {
+                        input.history.add(&line);
+                        input.history.save(&hist_path).ok();
+                    }
                     if line.starts_with('/') {
                         if !self.tui_slash(&line, &mut log, terminal) {
                             break;
                         }
                     } else {
-                        log.push_spans(tui::user_echo_spans(&line));
-                        self.session.push(Message::user(&line));
+                        // The engine is text-only: attach pasted images as
+                        // cached-file references the model can open with its
+                        // read/bash tools instead of inline content blocks.
+                        let mut message = line.clone();
+                        for (i, img) in attachments.drain(..).enumerate() {
+                            use std::fmt::Write as _;
+                            let _ = write!(
+                                message,
+                                "\n[Attached image #{}: {}{}. Use your tools to view it.]",
+                                i + 1,
+                                img.describe(),
+                                img.source_path.as_deref().map_or(String::new(), |p| {
+                                    format!(", original: {}", p.display())
+                                })
+                            );
+                        }
+                        let echo = if line.is_empty() { &message } else { &line };
+                        log.push_spans(tui::user_echo_spans(echo));
+                        self.session.push(Message::user(&message));
                         self.tui_turn(terminal, &mut log)?;
                     }
                 }
@@ -1017,7 +1079,7 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line, &mut 0, None));
+                    let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &line, &mut 0, None));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -1025,7 +1087,7 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status, &mut 0, None));
+            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, &mut 0, None));
         }
         Ok(())
     }
@@ -1176,7 +1238,8 @@ impl Agent<'_> {
                     interrupt_flag.store(true, Ordering::Relaxed);
                 }
                 let line = status::build_status_text(&status, false);
-                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line, &mut 0, None));
+                let _ =
+                    terminal.draw(|f| tui::draw(f, stream.sink(), None, 0, &line, &mut 0, None));
             },
         );
 

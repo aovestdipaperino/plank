@@ -57,6 +57,9 @@ Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-f
 - **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
 - **Session-start context** — plank automatically injects git status, recent commits, discovered `AGENTS.md`/`CLAUDE.md` files, and the current date at the start of each session.
 - **`/clear` and `/mcp`** — reset the session in place, and inspect the state of connected MCP servers.
+- **Interruptible everywhere** — Esc or Ctrl-C stops generation *and* prompt prefill; the engine's cancel callback aborts mid-sync instead of making you wait out a long prompt.
+- **Text selection and clipboard** — click-drag selects rendered output (WYSIWYG, wrapped lines included) and copies it to the system clipboard on release via `pbcopy` plus OSC 52 (so copy also works over SSH); Cmd-V pastes into the prompt through bracketed paste.
+- **Image paste** — copy an image and hit Cmd-V, or paste/drag an image file path: plank extracts it from the clipboard (`pngpaste` or `osascript`), downsamples it, dedups it into `~/.plank/image-cache`, and attaches it to your next message as a file reference the model can open with its tools. A 📷 hint appears in the status bar whenever the clipboard holds an image.
 - **Hierarchical MCP configs with `primaryTools`** — user-scope plus project-scope config files, and per-server control over which tool schemas go in the system prompt (see below).
 
 ### Highlights

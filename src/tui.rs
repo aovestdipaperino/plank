@@ -390,12 +390,14 @@ pub fn copy_to_clipboard(text: &str) {
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
+/// `input` is `None` while the agent is busy (prefill/generation): the prompt
+/// line renders empty and the cursor stays hidden until input is accepted again.
 /// `scroll_back` is how many wrapped lines above the bottom the view sits;
 /// it is clamped in place to the scrollable range.
 pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
-    input: &str,
+    input: Option<&str>,
     cursor_col: u16,
     status: &str,
     scroll_back: &mut usize,
@@ -429,18 +431,19 @@ pub fn draw(
         highlight_selection(frame.buffer_mut(), rows[0], sel);
     }
 
-    // Input line.
-    let prompt = "plank> ";
-    let input_line = Line::from(vec![
-        Span::styled(prompt, Style::default().fg(Color::Cyan)),
-        Span::raw(input.to_string()),
-    ]);
-    frame.render_widget(Paragraph::new(input_line), rows[1]);
-    let cursor_x = rows[1].x + u16::try_from(prompt.len()).unwrap_or(0) + cursor_col;
-    frame.set_cursor_position(Position::new(
-        cursor_x.min(area.right().saturating_sub(1)),
-        rows[1].y,
-    ));
+    // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
+    if let Some(input) = input {
+        let prompt = crate::status::prompt_text();
+        let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
+        let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
+        let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
+        frame.render_widget(Paragraph::new(input_line), rows[1]);
+        let cursor_x = rows[1].x + prompt_width + cursor_col;
+        frame.set_cursor_position(Position::new(
+            cursor_x.min(area.right().saturating_sub(1)),
+            rows[1].y,
+        ));
+    }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
     let status_style = Style::default()

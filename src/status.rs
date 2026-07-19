@@ -72,7 +72,7 @@ pub struct Status {
 /// Returns the input prompt text.
 #[must_use]
 pub fn prompt_text() -> &'static str {
-    "plank> "
+    "🪵> "
 }
 
 /// Formats a token count compactly: `8000` becomes `8k`, `2500` becomes `2.5k`.
