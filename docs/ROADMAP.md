@@ -25,9 +25,10 @@ Current release line: **v1.3.x**.
 - **Saving and restoring named sessions** ([#24](https://github.com/aovestdipaperino/plank/issues/24))
 - **Per-session engine KV payloads** ([#12](https://github.com/aovestdipaperino/plank/issues/12), sessions section): persist the engine KV cache alongside transcripts so `/switch` resumes without re-prefilling; unblocks a real **`/strip`**. The session format change means the release that ships it must handle (or discard) payload-less older sessions gracefully.
 
-## v2.0.0 — remote control
+## v2.0.0 — remote
 
 - **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine.
+- **Remote LLM support via llms-sdk** ([#26](https://github.com/aovestdipaperino/plank/issues/26)): a `RemoteEngine` behind the `Engine` trait for OpenAI-compatible and Anthropic APIs (reference checkout at `refs/llms-sdk`).
 
 ## Ongoing
 
