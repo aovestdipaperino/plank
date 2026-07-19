@@ -1094,7 +1094,21 @@ impl Agent<'_> {
                         input.history.add(&line);
                         input.history.save(&hist_path).ok();
                     }
-                    if line.starts_with('/') {
+                    if let Some(cmd) = line.strip_prefix('!') {
+                        let cmd = cmd.trim().to_owned();
+                        if cmd.is_empty() {
+                            log.push_dim("usage: !<shell command>");
+                            continue;
+                        }
+                        log.push_spans(tui::user_echo_spans(&line));
+                        Self::tui_bang(
+                            &self.tool_ctx.cwd.clone(),
+                            &cmd,
+                            &mut log,
+                            terminal,
+                            &mut view,
+                        );
+                    } else if line.starts_with('/') {
                         if !self.tui_slash(&line, &mut log, terminal, &mut view) {
                             break;
                         }
@@ -1126,6 +1140,47 @@ impl Agent<'_> {
         }
         input.history.save(&hist_path).ok();
         Ok(())
+    }
+
+    /// Runs a `!` immediate shell command: output lands only in the TUI log,
+    /// never in the conversation, and the model is not consulted. The frame
+    /// keeps redrawing while the command runs so Esc/Ctrl-C can kill it.
+    fn tui_bang(
+        cwd: &std::path::Path,
+        cmd: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+    ) {
+        let start = Instant::now();
+        let mut interrupt = || {
+            let status = format!("! {cmd} ({}s, Esc to stop)", start.elapsed().as_secs());
+            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, view, None));
+            while event::poll(Duration::ZERO).unwrap_or(false) {
+                if let Ok(Event::Key(k)) = event::read()
+                    && k.kind == KeyEventKind::Press
+                    && (matches!(k.code, KeyCode::Esc)
+                        || (matches!(k.code, KeyCode::Char('c'))
+                            && k.modifiers.contains(KeyModifiers::CONTROL)))
+                {
+                    return true;
+                }
+            }
+            false
+        };
+        match crate::tools::bash::run_immediate(cwd, cmd, &mut interrupt) {
+            Ok(out) => {
+                for line in out.stdout.lines().chain(out.stderr.lines()) {
+                    log.push_dim(line.to_owned());
+                }
+                if out.interrupted {
+                    log.push_dim("[interrupted]");
+                } else if out.exit_code != 0 {
+                    log.push_dim(format!("[exit code: {}]", out.exit_code));
+                }
+            }
+            Err(e) => log.push_dim(format!("!{cmd}: {e}")),
+        }
     }
 
     /// Idle status line (plain text; the TUI styles the bar itself).
@@ -1701,6 +1756,29 @@ fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
         if input.starts_with('/') {
             if !agent.slash(input)? {
                 return Ok(());
+            }
+            continue;
+        }
+        if let Some(cmd) = input.strip_prefix('!') {
+            let cmd = cmd.trim();
+            if cmd.is_empty() {
+                println!("usage: !<shell command>");
+                continue;
+            }
+            match crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut || {
+                crate::interrupt::pending()
+            }) {
+                Ok(out) => {
+                    print!("{}", out.stdout);
+                    eprint!("{}", out.stderr);
+                    if out.interrupted {
+                        crate::interrupt::clear();
+                        println!("[interrupted]");
+                    } else if out.exit_code != 0 {
+                        println!("[exit code: {}]", out.exit_code);
+                    }
+                }
+                Err(e) => println!("!{cmd}: {e}"),
             }
             continue;
         }

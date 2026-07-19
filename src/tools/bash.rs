@@ -501,6 +501,95 @@ pub fn tool_bash_status_or_stop(ctx: &mut ToolContext, call: &ToolCall, stop: bo
     ctx.bash.job_tool_result(idx, stop, refresh, stop, true)
 }
 
+/// Outcome of an immediate (`!`-prefixed) shell command.
+#[derive(Debug)]
+pub struct ImmediateOutput {
+    /// Captured standard output (lossy UTF-8).
+    pub stdout: String,
+    /// Captured standard error (lossy UTF-8).
+    pub stderr: String,
+    /// Exit code; `128 + signal` when signal-killed, like `BashJob`.
+    pub exit_code: i64,
+    /// True when the user interrupted the command before it finished.
+    pub interrupted: bool,
+}
+
+/// Runs a user-typed `!` command to completion in `cwd`, separate from the
+/// model's bash job table: stdout and stderr are captured independently and
+/// `interrupt` is polled so Ctrl-C/Esc can kill a runaway command.
+///
+/// # Errors
+/// Returns an error string when the shell fails to spawn.
+///
+/// # Panics
+/// Panics only if the child's piped stdout/stderr handles are missing, which
+/// cannot happen with `Stdio::piped`.
+pub fn run_immediate(
+    cwd: &std::path::Path,
+    cmd: &str,
+    interrupt: &mut dyn FnMut() -> bool,
+) -> Result<ImmediateOutput, String> {
+    fn collect(stream: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut stream = stream;
+            let mut out = Vec::new();
+            let _ = stream.read_to_end(&mut out);
+            out
+        })
+    }
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("failed to start: {e}"))?;
+
+    // The pipes are always present with Stdio::piped.
+    let out_reader = collect(child.stdout.take().expect("piped stdout"));
+    let err_reader = collect(child.stderr.take().expect("piped stderr"));
+
+    let mut interrupted = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(e) => return Err(format!("wait failed: {e}")),
+        }
+        if interrupt() {
+            interrupted = true;
+            let _ = child.kill();
+            break child.wait().ok();
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    let exit_code = status.map_or(-1, |s| {
+        s.code().map_or_else(
+            || {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    s.signal().map_or(-1, |sig| 128 + i64::from(sig))
+                }
+                #[cfg(not(unix))]
+                {
+                    -1
+                }
+            },
+            i64::from,
+        )
+    });
+    Ok(ImmediateOutput {
+        stdout: String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned(),
+        stderr: String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned(),
+        exit_code,
+        interrupted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +662,33 @@ mod tests {
             tool_bash_status_or_stop(&mut ctx, &test_call("bash_status", &[("job", "1")]), false);
         assert_eq!(out, "Tool error: bash job not found: job=1 pid=0\n");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn immediate_command_captures_streams_and_exit() {
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo out; echo err >&2; exit 3",
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(out.stdout, "out\n");
+        assert_eq!(out.stderr, "err\n");
+        assert_eq!(out.exit_code, 3);
+        assert!(!out.interrupted);
+    }
+
+    #[test]
+    fn immediate_command_interrupt_kills() {
+        let mut polls = 0;
+        let start = Instant::now();
+        let out = run_immediate(std::path::Path::new("/tmp"), "sleep 30", &mut || {
+            polls += 1;
+            polls > 2
+        })
+        .unwrap();
+        assert!(out.interrupted);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
