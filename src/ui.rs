@@ -1128,6 +1128,9 @@ fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::Path
 /// Result of one TUI generation pass.
 struct TurnOutput {
     interrupted: bool,
+    /// A priority `/btw` stopped this main pass; the caller discards the
+    /// partial output, answers the side question, and re-runs the pass.
+    preempted: bool,
     assistant_text: String,
     calls: Vec<ToolCall>,
     error: Option<String>,
@@ -1679,7 +1682,15 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         loop {
             let prompt = render_transcript(&self.session, &self.system);
-            let out = self.worker_generate(tx, shared, &prompt, turn_start)?;
+            let out = self.worker_generate(tx, shared, &prompt, turn_start, true)?;
+            // A priority `/btw` stopped this pass: nothing was committed, so
+            // roll back the partial output, answer the side question(s) now,
+            // and re-run the same step from the last committed boundary.
+            if out.preempted {
+                let _ = tx.send(UiEvent::MainRollback);
+                self.drain_btw(tx, shared);
+                continue;
+            }
             self.session.push(Message::assistant(out.assistant_text));
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
@@ -1761,7 +1772,7 @@ impl Agent<'_> {
                 use std::fmt::Write as _;
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
-            match self.worker_generate(tx, shared, &prompt, Instant::now()) {
+            match self.worker_generate(tx, shared, &prompt, Instant::now(), false) {
                 Ok(out) => {
                     let _ = tx.send(UiEvent::EndLine);
                     self.last_ctx_used = saved_ctx;
@@ -1813,13 +1824,24 @@ impl Agent<'_> {
     /// `turn_start` is when the user submitted the prompt: the status bar's
     /// elapsed time counts the whole turn (all generation passes and tool
     /// runs), not just this pass. Tokens/s stays per-pass.
+    ///
+    /// `is_main` marks a main-task pass (vs. a `/btw` side answer): only main
+    /// passes send a `MainCheckpoint` and honor the priority-`/btw` preempt
+    /// flag, so a side answer is never interrupted by a queued side question.
+    #[allow(clippy::too_many_lines)]
     fn worker_generate(
         &mut self,
         tx: &Sender<UiEvent>,
         shared: &TurnShared,
         prompt: &str,
         turn_start: Instant,
+        is_main: bool,
     ) -> Result<TurnOutput, String> {
+        // Snapshot the main log before streaming so a preempt can roll back
+        // this pass's partial output before it re-runs.
+        if is_main {
+            let _ = tx.send(UiEvent::MainCheckpoint);
+        }
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         if !matches!(
@@ -1849,6 +1871,7 @@ impl Agent<'_> {
             &self.cfg.generation,
             &|| {
                 shared.interrupt.load(Ordering::Relaxed)
+                    || (is_main && shared.preempt.load(Ordering::Relaxed))
                     || preflight_stop.load(Ordering::Relaxed)
                     || crate::interrupt::pending()
             },
@@ -1909,12 +1932,24 @@ impl Agent<'_> {
         let error = preflight_error
             .map(|e| tool_error_payload(true, e))
             .or_else(|| finished.error.map(|e| tool_error_payload(false, e)));
-        let interrupted = (stats.interrupted || shared.interrupt.load(Ordering::Relaxed))
+        let user_interrupt = shared.interrupt.load(Ordering::Relaxed);
+        // A real interrupt (Esc) takes precedence; only otherwise is a stopped
+        // main pass a priority-`/btw` preempt. Preempt is not an error, so a
+        // preflight failure never counts as one.
+        let preempted = is_main
+            && !user_interrupt
+            && shared.preempt.load(Ordering::Relaxed)
             && preflight_error.is_none();
+        if preempted {
+            shared.preempt.store(false, Ordering::Relaxed);
+        }
+        let interrupted =
+            (stats.interrupted || user_interrupt) && !preempted && preflight_error.is_none();
         // Consume the interrupt so a queued follow-up turn starts clean.
         shared.interrupt.store(false, Ordering::Relaxed);
         Ok(TurnOutput {
             interrupted,
+            preempted,
             assistant_text,
             calls,
             error,
@@ -2013,7 +2048,7 @@ impl Agent<'_> {
         let saved_ctx = self.last_ctx_used;
         let shared = TurnShared::default();
         let out = run_worker_ui(terminal, log, view, input, &shared, |tx| {
-            self.worker_generate(&tx, &shared, &prompt, Instant::now())
+            self.worker_generate(&tx, &shared, &prompt, Instant::now(), false)
         })??;
         log.end_line();
         if out.interrupted {
@@ -2278,12 +2313,23 @@ fn busy_ui_loop(
     // BtwBegin and BtwEnd route here and the screen splits (main 60% / btw
     // 40%). Torn down on BtwEnd, so the panel is inherently ephemeral.
     let mut btw: Option<(OutputLog, tui::OutputView)> = None;
+    // Main-log length at the start of the current main pass; a preempting
+    // `/btw` truncates back to it so the discarded partial output does not
+    // duplicate when the pass re-runs.
+    let mut main_checkpoint = 0usize;
     loop {
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
                 UiEvent::BtwBegin => btw = Some((OutputLog::new(), tui::OutputView::default())),
                 UiEvent::BtwEnd => btw = None,
+                // Checkpoint/rollback always act on the main log, regardless
+                // of a live side panel (a preempt fires only in a main pass).
+                UiEvent::MainCheckpoint => main_checkpoint = log.checkpoint(),
+                UiEvent::MainRollback => {
+                    log.truncate_to(main_checkpoint);
+                    view.follow = true;
+                }
                 ev => {
                     if let Some((btw_log, _)) = btw.as_mut() {
                         worker::apply(btw_log, ev);
@@ -2328,7 +2374,8 @@ fn busy_ui_loop(
             // events (post-BtwEnd trailers) belong in the main log.
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    UiEvent::Status(_) | UiEvent::BtwBegin => {}
+                    UiEvent::Status(_) | UiEvent::BtwBegin | UiEvent::MainCheckpoint => {}
+                    UiEvent::MainRollback => log.truncate_to(main_checkpoint),
                     UiEvent::BtwEnd => btw = None,
                     ev => {
                         if let Some((btw_log, _)) = btw.as_mut() {
@@ -2364,8 +2411,11 @@ fn busy_ui_loop(
                         input.hist_idx = None;
                         if line.is_empty() {
                         } else if btw_question(&line).is_some() {
-                            // Side questions queue FIFO and are answered at
-                            // the next generation boundary (BTW-DESIGN §4.4).
+                            // A `/btw` gets priority: it preempts the running
+                            // main pass so the side question is answered now,
+                            // then the pass re-runs. When a side answer is
+                            // already streaming (btw.is_some) the main task is
+                            // paused already, so it only joins the FIFO queue.
                             let question = btw_question(&line).unwrap_or_default().to_owned();
                             input.history.add(&line);
                             if let Some(dropped) = shared.push_btw(question) {
@@ -2373,7 +2423,12 @@ fn busy_ui_loop(
                                     "[btw queue full — dropped oldest: {dropped}]"
                                 ));
                             }
-                            log.push_dim("[/btw queued — answers at the next step]");
+                            if btw.is_none() {
+                                shared.preempt.store(true, Ordering::Relaxed);
+                                log.push_dim("[/btw — pausing the task to answer now]");
+                            } else {
+                                log.push_dim("[/btw queued — answers after the current one]");
+                            }
                             view.follow = true;
                         } else if line.starts_with('/') || line.starts_with('!') {
                             log.push_dim("[commands don't queue — wait for the model to finish]");
@@ -2933,6 +2988,67 @@ mod tests {
             .collect();
         assert!(!flat.contains("what is 3+4?"));
         assert!(!flat.contains("The answer is 7."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn preempting_btw_rolls_back_the_pass_and_reruns_after_answering() {
+        let dir = scratch_dir("btw-preempt");
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                "PARTIAL main output that gets discarded\n".to_string(), // preempted pass
+                "The answer is Rust.\n".to_string(),                     // side answer
+                "Final main answer.\n".to_string(),                      // re-run pass
+            ],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+
+        // A /btw queued with the preempt flag set (as the UI does mid-pass).
+        let shared = TurnShared::default();
+        shared.push_btw("what language?".to_owned());
+        shared.preempt.store(true, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        // Three passes ran: preempted main, side answer, re-run main.
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        // Nothing was committed before the preempt, so the re-run's prompt is
+        // byte-identical to the preempted pass's prompt.
+        assert_eq!(recorded[0], recorded[2]);
+        assert!(recorded[1].contains("side question"));
+        assert!(recorded[1].contains("what language?"));
+
+        // The discarded partial never reached the transcript; only the re-run
+        // answer did, and the side exchange stayed out entirely.
+        assert_eq!(agent.session.transcript.len(), 2);
+        assert_eq!(
+            agent.session.transcript[1].text.trim(),
+            "Final main answer."
+        );
+        let flat: String = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(!flat.contains("PARTIAL"));
+        assert!(!flat.contains("The answer is Rust."));
+        assert!(!flat.contains("what language?"));
+
+        // The UI was told to roll back the main log, and a panel bracketed
+        // the priority answer. The preempt flag is consumed, so the re-run
+        // (and future turns) are not stuck preempting.
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, UiEvent::MainRollback)));
+        assert!(events.iter().any(|e| matches!(e, UiEvent::BtwBegin)));
+        assert!(!shared.preempt.load(Ordering::Relaxed));
         std::fs::remove_dir_all(&dir).ok();
     }
 

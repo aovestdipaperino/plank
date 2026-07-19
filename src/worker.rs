@@ -48,6 +48,14 @@ pub enum UiEvent {
     /// The `/btw` drain finished (or was cancelled): the UI removes the side
     /// panel and resumes rendering into the main log.
     BtwEnd,
+    /// Marks the start of a main generation pass: the UI snapshots the main
+    /// log length so a later [`UiEvent::MainRollback`] can discard a
+    /// preempted pass's partial output.
+    MainCheckpoint,
+    /// A main pass was preempted by a priority `/btw`: the UI truncates the
+    /// main log back to the last [`UiEvent::MainCheckpoint`] so the re-run
+    /// does not duplicate the discarded partial output.
+    MainRollback,
 }
 
 /// [`RenderSink`] forwarding render calls over the worker→UI channel.
@@ -78,6 +86,11 @@ pub struct TurnShared {
     /// Set by the UI (Esc / Ctrl-C / SIGINT) to stop the worker at the next
     /// sampling or prefill checkpoint.
     pub interrupt: AtomicBool,
+    /// Set by the UI when a `/btw` is submitted mid-turn: the current main
+    /// generation pass stops immediately so the side question is answered
+    /// with priority, then the interrupted pass is re-run (nothing is
+    /// committed until a pass completes, so the restart is transcript-safe).
+    pub preempt: AtomicBool,
     /// User lines typed while the worker is busy. The worker drains them into
     /// the transcript between tool rounds (the C's `queued_user_drain`);
     /// lines still queued when the turn ends start a fresh turn.
@@ -168,7 +181,11 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),
-        UiEvent::Status(_) | UiEvent::BtwBegin | UiEvent::BtwEnd => {}
+        UiEvent::Status(_)
+        | UiEvent::BtwBegin
+        | UiEvent::BtwEnd
+        | UiEvent::MainCheckpoint
+        | UiEvent::MainRollback => {}
     }
 }
 

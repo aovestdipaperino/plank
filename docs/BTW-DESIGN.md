@@ -10,13 +10,16 @@ Status: **shipped and un-gated.** §4's mechanics landed on the #12
 worker-thread architecture instead of the reverted `433fcb6` event-drain:
 the busy UI loop queues `/btw <q>` into `TurnShared` (FIFO cap
 20, drop-oldest — OpenClaw's bounded-buffer policy), and the worker answers at
-generation boundaries via `Agent::drain_btw` (interrupt flushes the queue;
-errors log and continue; `last_ctx_used` restored on every path). While an
-answer streams the screen splits into a main (60%) / btw (40%) panel that Esc
-cancels and tears down (§4.5–4.6). Deviations: queue depth is a dim notice on
-push rather than a status-bar field, and plain (non-`/btw`) lines typed while
-busy queue into the *main* conversation — that shipped with #12 as the C's
-`queued_user_drain`, superseding §4.4's "stays in the buffer".
+via `Agent::drain_btw` (interrupt flushes the queue; errors log and continue;
+`last_ctx_used` restored on every path). A `/btw` submitted mid-generation
+**preempts** the running main pass and is answered immediately, then the pass
+re-runs (§4.4a); questions queued during tool execution or after the worker's
+final boundary answer at the boundary. While an answer streams the screen
+splits into a main (60%) / btw (40%) panel that Esc cancels and tears down
+(§4.5–4.6). Deviations: queue depth is a dim notice on push rather than a
+status-bar field, and plain (non-`/btw`) lines typed while busy queue into the
+*main* conversation — that shipped with #12 as the C's `queued_user_drain`,
+superseding §4.4's "stays in the buffer".
 
 §4.8 was revised: the C reference contains **no** btw framing
 (`btw_user_message` came from Claude Code's pattern, not `ds4_agent.c`), so
@@ -165,16 +168,47 @@ Re-land `433fcb6` as the base, with the policy refinements below. Mechanics
 - The in-progress line survives across generation passes within the turn.
 - Status bar shows queue depth: `/btw queued: N`.
 
-Drain points — `tui_drain_btw` runs the queue in FIFO order:
+Drain points — `drain_btw` runs the queue in FIFO order:
 
-1. after each generation pass in `tui_turn`, before the next tool dispatch
-   (mid-turn boundary);
-2. after the turn ends normally;
-3. after an interrupt (`out.interrupted`) — the user asked; answer anyway.
+1. **Priority preempt (default):** submitting a `/btw` while the main task is
+   generating sets `TurnShared::preempt`; the running main pass stops at its
+   next token, and `drain_btw` runs immediately — the side question is
+   answered *now*, not at the next natural boundary. See §4.4a.
+2. after each generation pass in `worker_turn`, before the next tool dispatch
+   (mid-turn boundary — catches questions queued during tool execution);
+3. after the turn ends normally;
+4. after an interrupt (`out.interrupted`) — the user asked; answer anyway.
 
-Because an answer is itself a generation pass with the same event drain, the
+Because an answer is itself a generation pass with the same live prompt, the
 user can queue further questions while an answer streams; the drain loops
 until the queue is empty.
+
+### 4.4a Priority preempt and restart
+
+Queuing a `/btw` only for the *next* boundary is limiting when a single pass
+is long (a big essay, a verbose reasoning block). So a `/btw` submitted while
+the main task is mid-generation **preempts** it:
+
+- The UI Enter handler, when no side panel is up (`btw.is_none()`), sets
+  `TurnShared::preempt` in addition to enqueuing the question.
+- `worker_generate`'s interrupt closure honors `preempt` **only for main
+  passes** (`is_main`), so a side answer is never interrupted by another
+  queued side question — those just join the FIFO and answer after it.
+- A preempted pass returns `TurnOutput::preempted`. `worker_turn` then does
+  **not** commit its partial assistant text (a pass is committed only on
+  completion, so nothing durable is lost), sends `MainRollback` to discard
+  the partial output already streamed into the main log (`OutputLog`
+  checkpoints its line count on `MainCheckpoint` at each main pass start),
+  drains the btw with priority, and `continue`s — re-running the identical
+  step from the last committed boundary.
+- **Cost:** the interrupted pass is regenerated, so its on-screen partial is
+  replaced and the redo is fresh sampling (may differ). The KV prefix is
+  reused (the transcript is unchanged), so only the pass's own tokens are
+  redone. This is the accepted tradeoff for immediacy — the single-session
+  engine cannot pause-and-resume a generation, only stop it.
+- Once a side answer is already streaming (the split panel is up), a further
+  `/btw` does **not** preempt — the main task is paused already — it just
+  joins the queue and is answered after the current one.
 
 **Queue policy** (adopted from OpenClaw's `/queue` defaults, simplified):
 

@@ -139,6 +139,22 @@ impl OutputLog {
         }
     }
 
+    /// Snapshots the current committed line count, for [`truncate_to`]. Ends
+    /// any in-progress line first so the checkpoint sits on a line boundary.
+    pub fn checkpoint(&mut self) -> usize {
+        self.md_close();
+        self.end_line();
+        self.lines.len()
+    }
+
+    /// Rolls the log back to a [`checkpoint`](Self::checkpoint), discarding
+    /// every line appended since (used to drop a preempted generation pass).
+    pub fn truncate_to(&mut self, len: usize) {
+        self.md_close();
+        self.current.clear();
+        self.lines.truncate(len);
+    }
+
     /// Renders the log (including the in-progress line) as ratatui text.
     #[must_use]
     pub fn to_text(&self) -> Text<'static> {
