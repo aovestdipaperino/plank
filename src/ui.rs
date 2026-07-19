@@ -160,6 +160,68 @@ fn render_transcript(session: &Session, system: &str) -> String {
     out
 }
 
+/// Owned buffers backing a [`crate::engine::StructuredTurn`]; kept alive at the
+/// call site so the borrowed `StructuredTurn` outlives the `generate` call.
+struct StructuredBufs {
+    system: String,
+    messages: Vec<crate::engine::ChatMessage>,
+    tools: Vec<crate::engine::ToolSpec>,
+    rendered: String,
+}
+
+/// Removes DSML tool-call stanzas from assistant text so a provider engine
+/// sees only natural language (the DSML is plank-internal framing, §4.4).
+fn strip_dsml(text: &str) -> String {
+    const OPEN: &str = "<｜DSML｜tool_calls>";
+    const CLOSE: &str = "</｜DSML｜tool_calls>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(OPEN) {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find(CLOSE) {
+            rest = &rest[start + end + CLOSE.len()..];
+        } else {
+            rest = "";
+            break;
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// Maps a session transcript to provider chat messages: tool-result pseudo-user
+/// turns become [`ChatRole::Tool`], other user turns stay user, and assistant
+/// turns are stripped of DSML framing (empty ones dropped).
+fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
+    use crate::engine::{ChatMessage, ChatRole};
+    let mut out = Vec::new();
+    for m in &session.transcript {
+        match m.role {
+            crate::session::Role::User => {
+                let t = m.text.trim();
+                let is_tool = t.starts_with("<tool_result>")
+                    || t.starts_with("Tool:")
+                    || t.starts_with("Tool result");
+                if is_tool {
+                    let payload = t.strip_prefix("<tool_result>").map_or(t, |inner| {
+                        inner.strip_suffix("</tool_result>").unwrap_or(inner)
+                    });
+                    out.push(ChatMessage::new(ChatRole::Tool, payload.trim()));
+                } else {
+                    out.push(ChatMessage::new(ChatRole::User, m.text.clone()));
+                }
+            }
+            crate::session::Role::Assistant => {
+                let clean = strip_dsml(&m.text);
+                if !clean.is_empty() {
+                    out.push(ChatMessage::new(ChatRole::Assistant, clean));
+                }
+            }
+        }
+    }
+    out
+}
+
 /// ANSI reset used by the slash-command reports.
 const ANSI_RESET: &str = "\x1b[0m";
 
@@ -241,6 +303,18 @@ const HISTORY_MAX_TURNS: usize = 200;
 const PRE_ROLLBACK_CHECKPOINT: &str = "pre-rollback";
 
 impl Agent<'_> {
+    /// Builds owned structured-turn buffers for a provider engine (§4.4). The
+    /// provider gets a machine-readable tool registry and its own system prompt
+    /// (never the DS4 byte-parity prompt), plus the flat render as a fallback.
+    fn build_structured(&self, rendered: &str) -> StructuredBufs {
+        StructuredBufs {
+            system: sysprompt::provider_system_prompt(&self.cfg.system),
+            messages: session_to_messages(&self.session),
+            tools: sysprompt::provider_tool_registry(&self.tool_ctx.mcp),
+            rendered: rendered.to_string(),
+        }
+    }
+
     /// Wraps a debug/status message in the thinking gray on color terminals.
     fn debug_line(&self, text: &str) -> String {
         if self.color {
@@ -298,10 +372,29 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
+        // Provider engines take a structured turn; local engines keep the flat
+        // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
+        let bufs = self
+            .engine
+            .wants_structured()
+            .then(|| self.build_structured(prompt_text));
+        let st;
+        let prompt = match &bufs {
+            Some(b) => {
+                st = crate::engine::StructuredTurn {
+                    system: &b.system,
+                    messages: &b.messages,
+                    tools: &b.tools,
+                    rendered: &b.rendered,
+                };
+                crate::engine::Prompt::Structured(&st)
+            }
+            None => crate::engine::Prompt::Flat(prompt_text),
+        };
         let stats = self
             .engine
             .generate(
-                prompt_text,
+                prompt,
                 &self.cfg.generation,
                 &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                 &|| greedy.load(Ordering::Relaxed),
@@ -551,7 +644,7 @@ impl Agent<'_> {
         let mut summary = String::new();
         self.engine
             .generate(
-                &prompt_text,
+                crate::engine::Prompt::Flat(&prompt_text),
                 &self.cfg.generation,
                 &|| false,
                 &|| false,
@@ -2202,6 +2295,23 @@ impl Agent<'_> {
             };
             let _ = tx.send(UiEvent::Status(status));
         };
+        // Provider engines take a structured turn; local engines keep the flat
+        // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
+        let bufs =
+            (!aside && self.engine.wants_structured()).then(|| self.build_structured(prompt));
+        let st;
+        let engine_prompt = match &bufs {
+            Some(b) => {
+                st = crate::engine::StructuredTurn {
+                    system: &b.system,
+                    messages: &b.messages,
+                    tools: &b.tools,
+                    rendered: &b.rendered,
+                };
+                crate::engine::Prompt::Structured(&st)
+            }
+            None => crate::engine::Prompt::Flat(prompt),
+        };
         let result = if aside {
             // The aside snapshots/restores the main KV itself and forces greedy
             // off internally, so no greedy sampler is passed.
@@ -2209,7 +2319,7 @@ impl Agent<'_> {
                 .generate_aside(prompt, &self.cfg.generation, &interrupt, &mut on_event)
         } else {
             self.engine.generate(
-                prompt,
+                engine_prompt,
                 &self.cfg.generation,
                 &interrupt,
                 &greedy_fn,
@@ -2288,7 +2398,7 @@ impl Agent<'_> {
         let mut summary = String::new();
         self.engine
             .generate(
-                &prompt,
+                crate::engine::Prompt::Flat(&prompt),
                 &self.cfg.generation,
                 &|| false,
                 &|| false,
@@ -3154,13 +3264,13 @@ mod tests {
     impl Engine for ScriptedEngine {
         fn generate(
             &mut self,
-            transcript: &str,
+            prompt: crate::engine::Prompt<'_>,
             _opts: &crate::engine::GenerationOptions,
             _interrupt: &dyn Fn() -> bool,
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
-            Ok(self.play_next(transcript, on_event))
+            Ok(self.play_next(prompt.flat(), on_event))
         }
         fn generate_aside(
             &mut self,

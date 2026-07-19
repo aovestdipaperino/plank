@@ -151,6 +151,32 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         eprintln!("plank: remote engine ready: {}", engine.model_name());
         return Ok(Box::new(engine));
     }
+    // Provider engine (flavor b, issue #26): third-party LLM APIs behind the
+    // Engine trait, available on every platform (pure Rust + HTTP).
+    if let Some(provider) = cfg.provider {
+        use plank::config::ProviderSelector;
+        use plank::remote::provider::{ProviderEngine, ProviderKind};
+        let kind = match provider {
+            ProviderSelector::OpenAi => ProviderKind::OpenAi,
+            ProviderSelector::Anthropic => ProviderKind::Anthropic,
+        };
+        let model = cfg
+            .provider_model
+            .clone()
+            .ok_or_else(|| "--provider requires --model NAME".to_string())?;
+        let api_key = cfg.provider_api_key.clone().unwrap_or_default();
+        eprintln!("plank: using provider {} model {model}...", kind.label());
+        let engine = ProviderEngine::new(
+            kind,
+            cfg.provider_base_url.clone(),
+            api_key,
+            model,
+            cfg.generation.ctx_size,
+        )
+        .map_err(|e| format!("provider init: {e}"))?;
+        eprintln!("plank: provider engine ready: {}", engine.model_name());
+        return Ok(Box::new(engine));
+    }
     #[cfg(ds4_engine)]
     {
         use plank::config::Backend;

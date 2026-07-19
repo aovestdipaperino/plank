@@ -187,7 +187,7 @@ fn hash_text(text: &str) -> u64 {
 impl Engine for RemoteDs4Engine {
     fn generate(
         &mut self,
-        transcript: &str,
+        prompt: crate::engine::Prompt<'_>,
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
         // The server owns greedy state (it runs the same streaming parser over
@@ -198,7 +198,7 @@ impl Engine for RemoteDs4Engine {
         let session_id = format!("turn-{}", TURN_SEQ.fetch_add(1, Ordering::Relaxed));
         let body = GenerateRequest {
             session_id,
-            transcript: transcript.to_string(),
+            transcript: prompt.flat().to_string(),
             opts: WireOptions::from(opts),
         };
         self.stream_turn(("/generate", &body), interrupt, on_event)

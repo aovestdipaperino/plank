@@ -124,7 +124,7 @@ fn remote_ds4_generate_end_to_end() {
     let mut prefill_seen = false;
     let stats = engine
         .generate(
-            "[system]\nx\n[user]\nhi\n",
+            plank::engine::Prompt::Flat("[system]\nx\n[user]\nhi\n"),
             &GenerationOptions::default(),
             &|| false,
             &|| false,
@@ -149,7 +149,7 @@ fn remote_ds4_interrupt_returns_interrupted() {
     let mut engine = RemoteDs4Engine::connect(&base, None).expect("connect");
     let stats = engine
         .generate(
-            "hi",
+            plank::engine::Prompt::Flat("hi"),
             &GenerationOptions::default(),
             &|| true, // interrupt fires immediately
             &|| false,
@@ -195,7 +195,7 @@ fn client_against_real_serve_with_echo_engine() {
     let mut text = String::new();
     let stats = engine
         .generate(
-            "[user]\nhello\n",
+            plank::engine::Prompt::Flat("[user]\nhello\n"),
             &GenerationOptions::default(),
             &|| false,
             &|| false,

@@ -386,12 +386,13 @@ impl Engine for Ds4Engine {
     #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,
-        transcript: &str,
+        prompt: crate::engine::Prompt<'_>,
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
         greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
+        let transcript = prompt.flat();
         let tokens = self.build_tokens(transcript, opts.think_mode);
         let prompt_len = tokens.len();
 
@@ -572,7 +573,13 @@ impl Engine for Ds4Engine {
         // question, then samples the answer. Greedy is forced off (a constant
         // `false` sampler mode) and tool-call denial is the caller's concern
         // (it drops `finished().calls`); the engine simply streams Text.
-        let result = self.generate(prompt, opts, interrupt, &|| false, on_event);
+        let result = self.generate(
+            crate::engine::Prompt::Flat(prompt),
+            opts,
+            interrupt,
+            &|| false,
+            on_event,
+        );
 
         // Restore the main task's accounting state regardless of the aside's
         // outcome; the KV itself is restored when `_restore` drops next.
@@ -882,11 +889,17 @@ mod tests {
         // Baseline: one uninterrupted seeded run.
         let mut baseline = String::new();
         engine
-            .generate(transcript, &opts, &|| false, &|| false, &mut |e| {
-                if let EngineEvent::Text(t) = e {
-                    baseline.push_str(&t);
-                }
-            })
+            .generate(
+                crate::engine::Prompt::Flat(transcript),
+                &opts,
+                &|| false,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        baseline.push_str(&t);
+                    }
+                },
+            )
             .unwrap();
 
         // A fresh engine, same seed, but with an aside injected before the run.
@@ -904,11 +917,17 @@ mod tests {
 
         let mut after = String::new();
         engine2
-            .generate(transcript, &opts, &|| false, &|| false, &mut |e| {
-                if let EngineEvent::Text(t) = e {
-                    after.push_str(&t);
-                }
-            })
+            .generate(
+                crate::engine::Prompt::Flat(transcript),
+                &opts,
+                &|| false,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        after.push_str(&t);
+                    }
+                },
+            )
             .unwrap();
 
         assert_eq!(

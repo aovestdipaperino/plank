@@ -220,7 +220,7 @@ fn handle_generate(
                 .map(|_| crate::engine::GenerationStats::default())
         } else {
             eng.generate(
-                &gen_req.transcript,
+                crate::engine::Prompt::Flat(&gen_req.transcript),
                 &opts,
                 &interrupt,
                 &greedy,

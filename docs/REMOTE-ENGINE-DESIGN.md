@@ -8,7 +8,14 @@ each maps onto plank's existing invariants: the narrow `Engine` boundary
 byte-parity DS4 system prompt, and the single streaming path through
 `viz::StreamRenderer`.
 
-Status: **flavor (a) implemented** (steps 1–4 of §5); flavor (b) not yet started.
+Status: **flavor (a) implemented** (steps 1–4 of §5); **flavor (b) implemented
+for the OpenAI-compatible provider** (steps 5–6): the `Prompt::{Flat,Structured}`
+input widening, `SystemPrompt::Provider` + a machine-readable tool registry
+(`sysprompt::provider_tool_registry`), and `remote/provider.rs`
+(`ProviderEngine`) with native-tool-call → DSML synthesis, selected via
+`--provider openai --model NAME`. Anthropic is reserved (the translation core is
+provider-shaped to admit it). Transport reuses the sync `ureq` client — no async
+runtime — with `refs/llms-sdk` as the wire-format reference only.
 `make_engine` (`src/main.rs`) now selects `RemoteDs4Engine` when `--remote URL`
 is given (all platforms), and `plank serve` hosts any `Engine` (the Metal
 `Ds4Engine` on a real box, `EchoEngine` elsewhere) over HTTP+SSE. The sync
