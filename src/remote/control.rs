@@ -37,14 +37,19 @@
 //! - Reconnect grace window ([`CONTROL_GRACE`]): a dropped controller's slot is
 //!   held so a brief drop can reclaim it via `resume_from`.
 //!
+//! ## Follow-up (issue #25, done)
+//! - The plain-REPL fallback (piped stdin, no TTY) now interleaves remote input:
+//!   a helper thread turns the blocking `read_line` into channel sends so the
+//!   loop can `select` stdin against the remote queue, draining `pump_remote`
+//!   and echoing the bus to stdout (see `ui::run_repl_plain_remote`).
+//! - The CLI client `plank remote <url>` connects to this server, authenticates,
+//!   mirrors output, and sends `prompt`/`command`/`btw`/`interrupt` frames (see
+//!   [`crate::remote::client`]).
+//!
 //! ## Deferred (documented TODOs)
-//! - The plain-REPL fallback (piped stdin, no TTY) does not interleave remote
-//!   input — its blocking `read_line` cannot be woken by a remote frame. Remote
-//!   drive works in the TUI and headless paths; the plain REPL still mirrors
-//!   nothing (its output goes straight to stdout). TODO(#25).
 //! - The `Origin` allow-list and bounded per-client outbound queues
 //!   (backpressure beyond write-error drop).
-//! - The CLI (`plank remote <url>`) and static web clients. TODO(#25).
+//! - Static web clients. TODO(#25).
 
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
