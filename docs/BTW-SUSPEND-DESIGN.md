@@ -7,8 +7,11 @@ restriction `docs/BTW-DESIGN.md` §4.3 accepted (btw is answered only at
 generation *boundaries*, never mid-pass) now that the engine layer is confirmed
 to support it cheaply.
 
-Status: **proposed, unimplemented.** Depends on the boundary-scheduled `/btw`
-already shipped (BTW-DESIGN steps 1–4).
+Status: **implemented behind `btw.suspend` (default off; `--btw-suspend`).**
+Depends on the boundary-scheduled `/btw` already shipped (BTW-DESIGN steps 1–4).
+Steps 1–3 (engine trait + `Ds4Engine::generate_aside` + snapshot round-trip
+foundation) and steps 4–6 (worker integration, presentation, docs) have landed;
+the real-model snapshot-round-trip smoke test (§5.3) remains Metal-only.
 
 ## 1. Motivation
 

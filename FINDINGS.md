@@ -85,6 +85,22 @@ test` and review the diff before committing.
   idempotent and lossless — the KV, cursor, and any partial reply come back
   byte-identical, which is what makes an unconditional-restore RAII guard
   (`RestoreOnDrop`) safe on the aside interrupt/error path.
+- **Resuming a suspended pass reuses the partial via `last_reply` splicing, not
+  a longer prompt string.** After an in-pass `/btw` suspend (`--btw-suspend`),
+  the worker resumes the frozen main pass by re-invoking `generate` with the
+  prompt `render_transcript(...) + "[assistant]\n" + partial`. That extra
+  assistant section matters: `Ds4Engine::build_tokens` only splices the exact
+  sampled tokens of `last_reply` when the transcript's last assistant section's
+  text *equals* `last_reply.text`. Match, and `ds4_session_common_prefix` reaches
+  through the partial and only the closing EOS + new assistant prefix are
+  prefilled (≈2 tokens); mismatch (e.g. a trailing-whitespace drift, since
+  `last_reply.text` is `trim_end`-ed), and it silently falls back to
+  re-prefilling the partial's text — still correct output, just not free.
+  `generate_aside` preserves `last_reply` across the aside (save/restore) so the
+  splice is available on resume. The worker orchestration is straight-line in
+  `Agent::worker_turn` (`src/ui.rs`): the engine owns the token loop, so
+  "suspend" is `stop-at-boundary → generate_aside → resume`, not a callback
+  interposed mid-loop.
 
 ## Part 2 — Environment & tooling
 

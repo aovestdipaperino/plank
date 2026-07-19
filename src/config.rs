@@ -57,6 +57,19 @@ pub struct AgentConfig {
     pub sandbox_override: Option<bool>,
     /// Native-engine tuning knobs (MTP, SSD streaming, steering, ...).
     pub engine: EngineTuning,
+    /// `/btw` side-question behavior (mid-generation suspend).
+    pub btw: BtwConfig,
+}
+
+/// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BtwConfig {
+    /// Answer an in-pass `/btw` by genuinely freezing the running generation,
+    /// answering the aside via [`crate::engine::Engine::generate_aside`], and
+    /// resuming — instead of the default preempt-and-rerun. Off by default;
+    /// when off (or the engine has no aside support) an in-pass `/btw` falls
+    /// back to the boundary queue exactly as today.
+    pub suspend: bool,
 }
 
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
@@ -156,6 +169,7 @@ impl Default for AgentConfig {
             power_percent: 0,
             sandbox_override: None,
             engine: EngineTuning::default(),
+            btw: BtwConfig::default(),
         }
     }
 }
@@ -211,6 +225,8 @@ Options:
                            (writes limited to cwd/temp; see sandbox.json)
       --no-sandbox         disable the bash sandbox even if sandbox.json
                            enables it
+      --btw-suspend        answer an in-pass /btw by freezing and resuming the
+                           running generation (default: queue at the boundary)
 "
     .to_owned()
 }
@@ -444,6 +460,7 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
+            "--btw-suspend" => c.btw.suspend = true,
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
@@ -491,6 +508,8 @@ mod tests {
         assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(c.generation.think_mode, ThinkMode::On);
         assert!(c.prompt.is_none());
+        // In-pass /btw suspend is off by default (BTW-SUSPEND-DESIGN §4.1).
+        assert!(!c.btw.suspend);
         assert!(!c.non_interactive);
         assert!(!c.show_help);
     }
@@ -534,6 +553,16 @@ mod tests {
         assert_eq!(c.generation.seed, 42);
         assert_eq!(c.generation.think_mode, ThinkMode::Off);
         assert_eq!(c.chdir_path, Some(PathBuf::from("/tmp")));
+    }
+
+    #[test]
+    fn btw_suspend_flag_opts_in() {
+        assert!(
+            parse_options(&args(&["--btw-suspend"]))
+                .unwrap()
+                .btw
+                .suspend
+        );
     }
 
     #[test]

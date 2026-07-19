@@ -138,9 +138,19 @@ finished pass has already been pushed, so the side question naturally sees:
 - **not** the token stream of a pass still in flight.
 
 This is the correct fidelity for a boundary-scheduled answer and requires no
-extra machinery. Answering *about* an in-flight pass would require either a
-transcript snapshot plus a second engine context (§8) or aborting the pass —
-both rejected.
+extra machinery. Answering *about* an in-flight pass was said to require either
+a transcript snapshot plus a second engine context (§8) or aborting the pass —
+both rejected here.
+
+**Deferral lifted (see `docs/BTW-SUSPEND-DESIGN.md`).** The first option turned
+out to be available cheaply through the existing FFI: `ds4_session_save_snapshot`
+/ `load_snapshot` snapshot and restore a single session's KV, so an in-pass
+`/btw` can genuinely freeze the running generation, answer the aside on the same
+session, and resume with zero re-prefill — no second context, no abort. This
+lives behind the `btw.suspend` config flag (default off; `--btw-suspend`) and
+degrades to the boundary queue described above whenever the flag is off or the
+engine has no `generate_aside` support. The boundary-scheduled behavior in this
+section remains the default and the fallback.
 
 One deliberate deviation from a naive boundary drain: when the boundary is
 reached **mid-turn** (more tool passes are still coming), the side question is

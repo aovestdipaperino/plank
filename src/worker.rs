@@ -106,6 +106,15 @@ pub struct TurnShared {
 /// (`OpenClaw`'s bounded-buffer `drop-oldest` overflow policy).
 pub const BTW_QUEUE_CAP: usize = 20;
 
+/// Dim marker shown when a mid-generation `/btw` freezes the main task
+/// (BTW-SUSPEND-DESIGN §4.4). Emitted into the main log before the aside's
+/// side panel opens.
+pub const BTW_SUSPEND_MARKER: &str = "[btw — main task paused]";
+
+/// Dim marker shown when the frozen main task resumes after the aside(s)
+/// (BTW-SUSPEND-DESIGN §4.4).
+pub const BTW_RESUME_MARKER: &str = "[btw — resuming]";
+
 impl TurnShared {
     /// Takes all queued user lines.
     pub fn take_queued(&self) -> Vec<String> {

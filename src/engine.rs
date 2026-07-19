@@ -178,6 +178,14 @@ pub trait Engine: Debug + Send {
         Err(EngineError::unsupported())
     }
 
+    /// Whether [`generate_aside`](Self::generate_aside) is really implemented
+    /// (vs. the default `unsupported` stub). The worker checks this before a
+    /// mid-generation `/btw` suspend so it can fall back to the boundary queue
+    /// synchronously, without a throwaway aside call. Default `false`.
+    fn supports_aside(&self) -> bool {
+        false
+    }
+
     /// Approximate token count of `text` for context accounting.
     fn count_tokens(&self, text: &str) -> i32 {
         // ~4 bytes per token is the usual rough estimate.

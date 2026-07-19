@@ -580,6 +580,10 @@ impl Engine for Ds4Engine {
         result
     }
 
+    fn supports_aside(&self) -> bool {
+        true
+    }
+
     fn warm_system_prompt(
         &mut self,
         system: &str,
