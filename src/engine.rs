@@ -75,6 +75,20 @@ pub enum ChatRole {
     Tool,
 }
 
+/// A tool call reconstructed from an assistant turn, carrying the synthetic
+/// provider-native id that pairs it to its later tool-result message (§4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallRef {
+    /// Provider tool-call id (`tool_call_id` for `OpenAI`, `tool_use.id` for
+    /// Anthropic). Threaded through so multi-turn tool conversations are
+    /// well-formed per each API's schema.
+    pub id: String,
+    /// Tool name as chosen by the model.
+    pub name: String,
+    /// Arguments as a compact JSON **object** string (never a bare scalar).
+    pub arguments: String,
+}
+
 /// One structured message for a provider engine (§4.4).
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
@@ -85,16 +99,21 @@ pub struct ChatMessage {
     /// For [`ChatRole::Tool`] messages: the provider tool-call id being
     /// answered, when one is available.
     pub tool_call_id: Option<String>,
+    /// For [`ChatRole::Assistant`] messages: the tool calls this turn issued,
+    /// each with the id its matching tool-result message echoes. Empty for
+    /// turns that made no tool call.
+    pub tool_calls: Vec<ToolCallRef>,
 }
 
 impl ChatMessage {
-    /// Convenience constructor with no tool-call id.
+    /// Convenience constructor with no tool-call id and no tool calls.
     #[must_use]
     pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
         Self {
             role,
             content: content.into(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
         }
     }
 }
