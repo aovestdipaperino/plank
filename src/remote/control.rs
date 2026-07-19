@@ -25,17 +25,26 @@
 //! - The accept/connection threads: auth, `hello`, `snapshot` replay, live
 //!   mirroring, `status` coalescing, and inbound control into `TurnShared`.
 //!
-//! ## Deferred (documented TODOs, design §5 steps 4/6/7)
-//! - Live wiring of the worker's stream renderer into the bus and of remote
-//!   `prompt`/`command` frames into the two `ui.rs` turn-loop paths (plain REPL
-//!   and TUI) — the largest, dual-path change; the seam (`BroadcastBus` +
-//!   `TurnShared`) is in place and unit-tested, but `ui.rs` does not yet feed it.
-//! - `command` (slash) routing through the shared dispatcher; today a
-//!   `command` frame is treated like a `prompt`.
-//! - Reconnect grace window for controller retention, the `Origin` allow-list,
-//!   and bounded per-client outbound queues (backpressure beyond write-error
-//!   drop). Sequence ids + `resume_from` and status coalescing are implemented.
-//! - The CLI (`plank remote <url>`) and static web clients.
+//! ## Live wiring (issue #25, done)
+//! - The worker's stream events mirror onto the bus and remote
+//!   `prompt`/`command`/`btw`/`interrupt` frames drive the real agent through
+//!   both `ui.rs` turn-loop paths: the TUI mirrors inline in `busy_ui_loop` and
+//!   drives turns from the idle loop; the headless path runs a dedicated
+//!   remote-serve loop (`run_remote_headless`).
+//! - `command` (slash) frames route through the shared slash dispatcher: they
+//!   land in the shared queue and the turn loop sends `/`-prefixed lines through
+//!   the same path the local REPL/TUI uses.
+//! - Reconnect grace window ([`CONTROL_GRACE`]): a dropped controller's slot is
+//!   held so a brief drop can reclaim it via `resume_from`.
+//!
+//! ## Deferred (documented TODOs)
+//! - The plain-REPL fallback (piped stdin, no TTY) does not interleave remote
+//!   input — its blocking `read_line` cannot be woken by a remote frame. Remote
+//!   drive works in the TUI and headless paths; the plain REPL still mirrors
+//!   nothing (its output goes straight to stdout). TODO(#25).
+//! - The `Origin` allow-list and bounded per-client outbound queues
+//!   (backpressure beyond write-error drop).
+//! - The CLI (`plank remote <url>`) and static web clients. TODO(#25).
 
 use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
@@ -456,6 +465,10 @@ pub enum RequestOutcome {
     NeedsLocalGrant,
 }
 
+/// How long a dropped controller's slot is held for reconnection before it is
+/// released to the local user / freed (design §4.8 reconnect grace window).
+pub const CONTROL_GRACE: Duration = Duration::from_secs(15);
+
 /// The single-controller coexistence policy (design §4.4): one controller,
 /// many mirrors. Pure state machine; the server holds it behind a `Mutex`.
 #[derive(Debug)]
@@ -463,6 +476,9 @@ pub struct ControlPolicy {
     holder: Holder,
     local_present: bool,
     allow_control: bool,
+    /// A controller that dropped and whose slot is reserved until the deadline
+    /// for a reconnecting client to reclaim via `resume_from` (design §4.8).
+    grace: Option<(u64, std::time::Instant)>,
 }
 
 impl ControlPolicy {
@@ -479,6 +495,7 @@ impl ControlPolicy {
             },
             local_present,
             allow_control,
+            grace: None,
         }
     }
 
@@ -486,6 +503,51 @@ impl ControlPolicy {
     #[must_use]
     pub fn holder(&self) -> Holder {
         self.holder
+    }
+
+    /// Drops a stale grace reservation once its window has elapsed, releasing
+    /// the reserved slot to the local user (if present) or freeing it. Called
+    /// at the start of every decision so a lapsed reconnect never blocks.
+    fn expire_grace(&mut self) {
+        if let Some((session, deadline)) = self.grace
+            && std::time::Instant::now() >= deadline
+        {
+            self.grace = None;
+            if self.holder == Holder::Remote(session) {
+                self.holder = if self.local_present {
+                    Holder::Local
+                } else {
+                    Holder::Free
+                };
+            }
+        }
+    }
+
+    /// Begins the reconnect grace window for a dropping controller: the slot is
+    /// held (holder unchanged) until [`CONTROL_GRACE`] elapses, letting a
+    /// reconnecting client reclaim it with [`ControlPolicy::reclaim`]. A
+    /// non-controller disconnect just releases as before (design §4.8).
+    pub fn disconnect(&mut self, session: u64) {
+        if self.holder == Holder::Remote(session) {
+            self.grace = Some((session, std::time::Instant::now() + CONTROL_GRACE));
+        } else {
+            self.release(session);
+        }
+    }
+
+    /// A reconnecting client reclaims a slot still inside its grace window,
+    /// transferring control to the new session id. Returns whether control was
+    /// reclaimed (design §4.8).
+    pub fn reclaim(&mut self, new_session: u64) -> bool {
+        self.expire_grace();
+        if let Some((prev, _)) = self.grace
+            && self.holder == Holder::Remote(prev)
+        {
+            self.holder = Holder::Remote(new_session);
+            self.grace = None;
+            return true;
+        }
+        false
     }
 
     /// Whether the given remote session may currently submit control frames.
@@ -496,6 +558,7 @@ impl ControlPolicy {
 
     /// A remote session requests control.
     pub fn request(&mut self, session: u64) -> RequestOutcome {
+        self.expire_grace();
         if self.holder == Holder::Remote(session) {
             return RequestOutcome::Granted;
         }
@@ -649,9 +712,11 @@ fn handle_connection(stream: TcpStream, state: &Arc<RemoteState>) -> Result<(), 
     };
     mirror_loop(&mut ws, state, session_id)?;
 
-    // Release control on disconnect (grace window is a documented TODO, §4.8).
+    // On disconnect a controller's slot is held for the reconnect grace window
+    // (§4.8) so a brief drop can reclaim it via `resume_from`; a non-controller
+    // just releases.
     if let Ok(mut c) = state.control.lock() {
-        c.release(session_id);
+        c.disconnect(session_id);
     }
     let _ = ws.flush();
     Ok(())
@@ -676,11 +741,15 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
 
     let session_id = state.next_session();
 
-    // Headless (no local front-end) auto-requests control for scriptability
-    // (design open-question §8, leaning auto-grant).
+    // A client presenting `resume_from` is reconnecting: reclaim the dropped
+    // controller's slot if it is still inside its grace window (§4.8). Failing
+    // that, headless (no local front-end) auto-requests control for
+    // scriptability (design open-question §8, leaning auto-grant).
     let controller = {
         let mut c = state.control.lock().map_err(|e| e.to_string())?;
-        if matches!(c.holder(), Holder::Free) {
+        if resume_from.is_some() && c.reclaim(session_id) {
+            true
+        } else if matches!(c.holder(), Holder::Free) {
             matches!(c.request(session_id), RequestOutcome::Granted)
         } else {
             c.remote_can_control(session_id)
@@ -849,8 +918,9 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         }
         ClientMsg::Prompt { text } | ClientMsg::Command { text } => {
             if is_controller(state, session_id)? {
-                // TODO(#25): notify the ui.rs turn loop to start a turn when
-                // idle; today it lands in the queue the loop drains.
+                // Both land in the shared queue the turn loop drains: `ui.rs`
+                // starts a turn when idle and routes `/`-prefixed lines (the
+                // `command` frames) through the slash dispatcher (issue #25).
                 state.shared.push_queued(text);
             } else {
                 send(
@@ -1073,6 +1143,59 @@ mod tests {
         let mut p = ControlPolicy::new(true, true);
         assert_eq!(p.request(1), RequestOutcome::Granted);
         assert!(p.remote_can_control(1));
+    }
+
+    #[test]
+    fn disconnect_holds_slot_and_reconnect_reclaims() {
+        let mut p = ControlPolicy::new(false, false);
+        assert_eq!(p.request(1), RequestOutcome::Granted);
+        // A drop keeps the slot reserved (grace window): another client cannot
+        // grab it, but the reconnecting session can reclaim it.
+        p.disconnect(1);
+        assert_eq!(
+            p.request(2),
+            RequestOutcome::Denied("another client holds control".to_owned())
+        );
+        assert!(p.reclaim(3), "reconnect reclaims within grace");
+        assert!(p.remote_can_control(3));
+        assert!(!p.remote_can_control(2));
+    }
+
+    #[test]
+    fn expired_grace_frees_the_slot() {
+        let mut p = ControlPolicy::new(false, false);
+        assert_eq!(p.request(1), RequestOutcome::Granted);
+        p.disconnect(1);
+        // Force the grace deadline into the past, then a new request succeeds
+        // and a stale reclaim fails.
+        p.grace = Some((
+            1,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        ));
+        assert_eq!(p.request(2), RequestOutcome::Granted);
+        assert!(!p.reclaim(3));
+        assert!(p.remote_can_control(2));
+    }
+
+    #[test]
+    fn non_controller_disconnect_just_releases() {
+        let mut p = ControlPolicy::new(true, false);
+        p.grant(1);
+        // A session that is not the holder disconnecting must not reserve a slot.
+        p.disconnect(2);
+        assert!(p.remote_can_control(1));
+        p.disconnect(1);
+        // Holder drop reserves; local user reclaims after expiry.
+        p.grace = Some((
+            1,
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap(),
+        ));
+        p.request(2); // triggers expire_grace
+        assert_eq!(p.holder(), Holder::Local);
     }
 
     // --- integration: a real loopback server + tungstenite client ---
