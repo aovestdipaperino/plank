@@ -1,3 +1,6 @@
 [submodule "ds4-ref"]
 	path = ds4-ref
 	url = https://github.com/aovestdipaperino/ds4
+[submodule "refs/openclaw"]
+	path = refs/openclaw
+	url = https://github.com/openclaw/openclaw

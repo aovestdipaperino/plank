@@ -11,7 +11,7 @@ Current release line: **v1.3.x**.
 
 ## v1.4.0 — concurrency and side channels
 
-- **Model worker thread + event multiplexing** ([#12](https://github.com/aovestdipaperino/plank/issues/12), architecture section): move the engine off the UI thread, matching the C reference's worker design, so the prompt stays live while the model runs and async job output renders mid-turn.
+- ~~Model worker thread + event multiplexing~~ (#12, architecture section) — landed in `76a6428`: TUI turns run on a scoped worker thread, the prompt stays live, and queued lines drain between tool rounds.
 - **/btw side questions, done properly** ([#18](https://github.com/aovestdipaperino/plank/issues/18)): mid-turn live prompt with boundary-scheduled ephemeral answers, per [`BTW-DESIGN.md`](BTW-DESIGN.md); ends with un-gating from the `images` flag.
 - **Agent teams** ([#19](https://github.com/aovestdipaperino/plank/issues/19)): named agent definitions and multi-agent orchestration, building on the `/subagent` sidechain.
 
@@ -23,11 +23,11 @@ Current release line: **v1.3.x**.
   - live output streaming ([#22](https://github.com/aovestdipaperino/plank/issues/22)) — natural follow-on to the worker thread.
 - **Persistent memory across sessions** ([#23](https://github.com/aovestdipaperino/plank/issues/23))
 - **Saving and restoring named sessions** ([#24](https://github.com/aovestdipaperino/plank/issues/24))
-- **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25))
+- **Per-session engine KV payloads** ([#12](https://github.com/aovestdipaperino/plank/issues/12), sessions section): persist the engine KV cache alongside transcripts so `/switch` resumes without re-prefilling; unblocks a real **`/strip`**. The session format change means the release that ships it must handle (or discard) payload-less older sessions gracefully.
 
-## v2.0.0 — session format change
+## v2.0.0 — remote control
 
-- **Per-session engine KV payloads** ([#12](https://github.com/aovestdipaperino/plank/issues/12), sessions section): persist the engine KV cache alongside transcripts so `/switch` resumes without re-prefilling; unblocks a real **`/strip`**. Major bump because the session format changes.
+- **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine.
 
 ## Ongoing
 
