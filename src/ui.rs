@@ -831,7 +831,12 @@ impl Agent<'_> {
             }
             "/help" => print!("{}", crate::config::usage()),
             "/save" => match self.store.save(&mut self.session) {
-                Ok(id) => println!("saved session {}", &id[..8]),
+                Ok(id) => {
+                    println!("saved session {}", &id[..8]);
+                    if let Some(note) = self.save_session_payload() {
+                        println!("{}", self.debug_line(&note));
+                    }
+                }
                 Err(e) => println!("save failed: {e}"),
             },
             "/list" => match self.store.list() {
@@ -847,6 +852,9 @@ impl Agent<'_> {
                         "{}",
                         crate::session::render_history(&s.transcript, 6, self.color)
                     );
+                    if let Some(note) = self.load_session_payload(&s) {
+                        println!("{}", self.debug_line(&note));
+                    }
                     self.session = s;
                     self.last_ctx_used = 0;
                 }
@@ -874,6 +882,9 @@ impl Agent<'_> {
                         "{}",
                         crate::session::render_history(&s.transcript, 6, self.color)
                     );
+                    if let Some(note) = self.load_session_payload(&s) {
+                        println!("{}", self.debug_line(&note));
+                    }
                     self.session = s;
                     self.last_ctx_used = 0;
                 }
@@ -919,11 +930,9 @@ impl Agent<'_> {
                 if arg.is_empty() {
                     println!("usage: /strip <sha-prefix>");
                 } else {
-                    // Plank sessions store no engine KV payload to strip; keep
-                    // the C's success framing with zero tokens reclaimed.
-                    match self.store.find(arg) {
-                        Ok((sha, _)) => {
-                            println!("stripped session {} (0 tokens)", &sha[..8]);
+                    match self.strip_session(arg) {
+                        Ok((sha, tokens)) => {
+                            println!("stripped session {} ({tokens} tokens)", &sha[..8]);
                         }
                         Err(e) => println!("strip failed: {e}"),
                     }
@@ -1007,6 +1016,76 @@ impl Agent<'_> {
                 .map_err(|e| e.to_string());
         }
         self.store.load(arg).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// Fingerprint tying a session's engine KV payload to this exact model,
+    /// system prompt, and the session's rendered transcript — the repo's KV
+    /// discipline rule: any drift makes the payload stale, and stale payloads
+    /// are re-prefilled, never trusted.
+    fn payload_fingerprint_for(&self, session: &Session) -> String {
+        crate::session::payload_fingerprint(
+            &self.engine.model_name(),
+            &self.system,
+            &render_transcript(session, &self.system),
+        )
+    }
+
+    /// After a successful `/save`, snapshots the engine KV state to the
+    /// session's payload sidecar. Returns a user-facing note, or `None` when
+    /// the backend has no KV to persist (echo stub) — saving is best-effort
+    /// and never fails the `/save` itself.
+    fn save_session_payload(&mut self) -> Option<String> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let path = self.store.payload_path(&self.session.id);
+        let fingerprint = self.payload_fingerprint_for(&self.session);
+        match self.engine.save_session_payload(&path, &fingerprint) {
+            Ok(true) => Some(format!(
+                "saved KV payload ({:.2} MB)",
+                crate::session::to_mb(self.store.payload_bytes(&self.session.id))
+            )),
+            Ok(false) => None,
+            Err(e) => Some(format!("KV payload save failed: {e}")),
+        }
+    }
+
+    /// On `/switch` / `/resume`, tries to restore the session's KV payload so
+    /// the next turn skips re-prefilling the transcript. Returns a note when
+    /// there was a payload to consider; a stale or unloadable payload just
+    /// falls back to re-prefill.
+    fn load_session_payload(&mut self, s: &Session) -> Option<String> {
+        if s.id.is_empty() {
+            return None;
+        }
+        let path = self.store.payload_path(&s.id);
+        if !path.exists() {
+            return None;
+        }
+        let fingerprint = self.payload_fingerprint_for(s);
+        match self.engine.load_session_payload(&path, &fingerprint) {
+            Ok(true) => Some("restored KV payload; resume skips re-prefill".to_owned()),
+            Ok(false) => {
+                Some("KV payload is stale; the transcript will be re-prefilled".to_owned())
+            }
+            Err(e) => Some(format!(
+                "KV payload load failed: {e}; the transcript will be re-prefilled"
+            )),
+        }
+    }
+
+    /// `/strip`: deletes the session's KV payload sidecar, keeping the
+    /// transcript, and reports the transcript's token count — the prefill
+    /// cost a later `/switch` pays to rebuild the KV — matching the C's
+    /// `agent_worker_strip_session` report shape.
+    fn strip_session(&mut self, prefix: &str) -> Result<(String, i32), String> {
+        let (id, _had_payload) = self.store.strip(prefix).map_err(|e| e.to_string())?;
+        let s = self.store.load(&id).map_err(|e| e.to_string())?;
+        let tokens = self
+            .engine
+            .count_tokens(&render_transcript(&s, &self.system))
+            .max(0);
+        Ok((id, tokens))
     }
 
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
@@ -1979,7 +2058,12 @@ impl Agent<'_> {
                 }
             }
             "/save" => match self.store.save(&mut self.session) {
-                Ok(id) => log.push_plain(format!("saved session {}", &id[..8])),
+                Ok(id) => {
+                    log.push_plain(format!("saved session {}", &id[..8]));
+                    if let Some(note) = self.save_session_payload() {
+                        log.push_dim(note);
+                    }
+                }
                 Err(e) => log.push_plain(format!("save failed: {e}")),
             },
             "/list" => match self.store.list() {
@@ -1996,6 +2080,9 @@ impl Agent<'_> {
                 Ok(s) => {
                     for line in crate::session::render_history(&s.transcript, 6, false).lines() {
                         log.push_plain(line.to_owned());
+                    }
+                    if let Some(note) = self.load_session_payload(&s) {
+                        log.push_dim(note);
                     }
                     self.session = s;
                     self.last_ctx_used = 0;
@@ -2018,6 +2105,9 @@ impl Agent<'_> {
                 },
                 Ok(Some(s)) => {
                     log.push_ansi(&crate::session::render_history(&s.transcript, 6, true));
+                    if let Some(note) = self.load_session_payload(&s) {
+                        log.push_dim(note);
+                    }
                     self.session = s;
                     self.last_ctx_used = 0;
                 }
@@ -2062,9 +2152,12 @@ impl Agent<'_> {
                 if arg.is_empty() {
                     log.push_plain("usage: /strip <sha-prefix>");
                 } else {
-                    match self.store.find(arg) {
-                        Ok((sha, _)) => {
-                            log.push_plain(format!("stripped session {} (0 tokens)", &sha[..8]));
+                    match self.strip_session(arg) {
+                        Ok((sha, tokens)) => {
+                            log.push_plain(format!(
+                                "stripped session {} ({tokens} tokens)",
+                                &sha[..8]
+                            ));
                         }
                         Err(e) => log.push_plain(format!("strip failed: {e}")),
                     }
@@ -2613,6 +2706,108 @@ mod tests {
             tool_result.contains("DSML syntax reminder:"),
             "got: {tool_result}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Engine stub that snapshots a canned KV payload via the shared
+    /// fingerprinted file helpers, standing in for `Ds4Engine`'s
+    /// save/load-snapshot paths in payload bookkeeping tests.
+    #[derive(Debug)]
+    struct KvEngine;
+
+    impl Engine for KvEngine {
+        fn generate(
+            &mut self,
+            _transcript: &str,
+            _opts: &crate::engine::GenerationOptions,
+            _interrupt: &dyn Fn() -> bool,
+            _greedy: &dyn Fn() -> bool,
+            _on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            Ok(GenerationStats::default())
+        }
+        fn ctx_size(&self) -> i32 {
+            100_000
+        }
+        fn model_name(&self) -> String {
+            "kv-test-model".to_owned()
+        }
+        fn save_session_payload(
+            &mut self,
+            path: &std::path::Path,
+            fingerprint: &str,
+        ) -> Result<bool, EngineError> {
+            crate::session::write_payload(path, fingerprint, b"fake-kv-bytes")
+                .map_err(|e| EngineError::new(e.to_string()))?;
+            Ok(true)
+        }
+        fn load_session_payload(
+            &mut self,
+            path: &std::path::Path,
+            fingerprint: &str,
+        ) -> Result<bool, EngineError> {
+            Ok(crate::session::read_payload(path, fingerprint).is_some())
+        }
+    }
+
+    #[test]
+    fn payload_save_resume_strip_flow() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-kv-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig::default();
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(KvEngine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+        };
+        agent.session.push(Message::user("kv payload flow"));
+        agent.session.push(Message::assistant("ack"));
+        let id = agent.store.save(&mut agent.session).unwrap();
+
+        // /save writes a fingerprinted payload sidecar next to the transcript.
+        let note = agent.save_session_payload().unwrap();
+        assert!(note.starts_with("saved KV payload ("), "got: {note}");
+        assert!(agent.store.payload_bytes(&id) > 0);
+
+        // /switch on an unchanged session restores the payload.
+        let loaded = agent.store.load(&id[..8]).unwrap();
+        assert_eq!(
+            agent.load_session_payload(&loaded).as_deref(),
+            Some("restored KV payload; resume skips re-prefill")
+        );
+
+        // A transcript that grew since the save makes the payload stale:
+        // it is ignored (re-prefill), never trusted.
+        let mut grown = loaded.clone();
+        grown.push(Message::user("one more turn"));
+        assert_eq!(
+            agent.load_session_payload(&grown).as_deref(),
+            Some("KV payload is stale; the transcript will be re-prefilled")
+        );
+
+        // /strip removes the payload and reports the transcript token cost.
+        let (sha, tokens) = agent.strip_session(&id[..8]).unwrap();
+        assert_eq!(sha, id);
+        assert!(tokens > 0, "strip must report the re-prefill token count");
+        assert_eq!(agent.store.payload_bytes(&id), 0);
+        // Without a payload there is nothing to note on resume.
+        assert_eq!(agent.load_session_payload(&loaded), None);
+        // Stripping again still succeeds, like the C's rewrite.
+        assert!(agent.strip_session(&id[..8]).is_ok());
         std::fs::remove_dir_all(&dir).ok();
     }
 

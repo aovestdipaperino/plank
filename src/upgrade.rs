@@ -9,13 +9,18 @@
 //! "maintenance-based versioning" idea):
 //!
 //! - **patch** bump — nothing to do; only the recorded marker advances.
-//! - **minor** bump — drop the sysprompt KV checkpoint so it is rebuilt.
+//! - **minor** bump — drop the sysprompt KV checkpoint and the per-session
+//!   KV payload sidecars (`kvcache/*.payload`) so they are rebuilt.
 //! - **major** bump, downgrade, or unreadable marker — drop the sysprompt
-//!   checkpoint *and* the image cache.
+//!   checkpoint, the payload sidecars, *and* the image cache.
 //!
-//! Session transcripts (`kvcache/*.session`) are user data and are never
-//! touched. Everything removed here is rebuilt automatically on demand, so a
-//! wrong classification costs one warm-up, never data.
+//! Session transcripts (`kvcache/*.kv`) are user data and are never touched.
+//! The payload sidecars are pure caches of prefilling those transcripts:
+//! they are already fingerprint-guarded (a stale payload is detected and
+//! ignored at load time), so deleting them on upgrade only reclaims disk —
+//! trust never depended on it. Everything removed here is rebuilt
+//! automatically on demand, so a wrong classification costs one warm-up,
+//! never data.
 
 use std::path::Path;
 
@@ -97,10 +102,10 @@ pub fn run_startup_maintenance(plank_dir: &Path, current: &str) -> Transition {
     match transition {
         Transition::None | Transition::Patch => {}
         Transition::Minor => {
-            let _ = std::fs::remove_file(plank_dir.join("kvcache").join("sysprompt.kv"));
+            drop_kv_caches(plank_dir);
         }
         Transition::Major => {
-            let _ = std::fs::remove_file(plank_dir.join("kvcache").join("sysprompt.kv"));
+            drop_kv_caches(plank_dir);
             let _ = std::fs::remove_dir_all(plank_dir.join("image-cache"));
         }
     }
@@ -108,6 +113,20 @@ pub fn run_startup_maintenance(plank_dir: &Path, current: &str) -> Transition {
         let _ = std::fs::write(&marker, current);
     }
     transition
+}
+
+/// Removes the rebuildable KV caches: the sysprompt checkpoint and every
+/// per-session payload sidecar. Transcripts (`*.kv` session files) survive.
+fn drop_kv_caches(plank_dir: &Path) {
+    let kvcache = plank_dir.join("kvcache");
+    let _ = std::fs::remove_file(kvcache.join("sysprompt.kv"));
+    if let Ok(entries) = std::fs::read_dir(&kvcache) {
+        for entry in entries.flatten() {
+            if entry.path().extension().is_some_and(|e| e == "payload") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +163,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("image-cache")).unwrap();
         std::fs::write(dir.join("kvcache").join("sysprompt.kv"), b"kv").unwrap();
         std::fs::write(dir.join("kvcache").join("abc.session"), b"s").unwrap();
+        std::fs::write(dir.join("kvcache").join("abc.payload"), b"p").unwrap();
         std::fs::write(dir.join("image-cache").join("img.png"), b"p").unwrap();
         std::fs::write(dir.join(MARKER_FILE), prev).unwrap();
     }
@@ -171,6 +191,7 @@ mod tests {
         setup(&dir, "1.2.3");
         assert_eq!(run_startup_maintenance(&dir, "1.3.0"), Transition::Minor);
         assert!(!dir.join("kvcache").join("sysprompt.kv").exists());
+        assert!(!dir.join("kvcache").join("abc.payload").exists());
         assert!(dir.join("kvcache").join("abc.session").exists());
         assert!(dir.join("image-cache").join("img.png").exists());
         assert_eq!(
@@ -186,6 +207,7 @@ mod tests {
         setup(&dir, "1.2.3");
         assert_eq!(run_startup_maintenance(&dir, "2.0.0"), Transition::Major);
         assert!(!dir.join("kvcache").join("sysprompt.kv").exists());
+        assert!(!dir.join("kvcache").join("abc.payload").exists());
         assert!(!dir.join("image-cache").exists());
         assert!(dir.join("kvcache").join("abc.session").exists());
         let _ = std::fs::remove_dir_all(&dir);
@@ -197,6 +219,7 @@ mod tests {
         setup(&dir, "1.2.3");
         assert_eq!(run_startup_maintenance(&dir, "1.2.4"), Transition::Patch);
         assert!(dir.join("kvcache").join("sysprompt.kv").exists());
+        assert!(dir.join("kvcache").join("abc.payload").exists());
         assert_eq!(
             std::fs::read_to_string(dir.join(MARKER_FILE)).unwrap(),
             "1.2.4"

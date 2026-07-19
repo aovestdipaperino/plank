@@ -269,28 +269,49 @@ impl Ds4Engine {
         Ok(self.session)
     }
 
-    /// Serializes the session KV to `path`, prefixed by its fingerprint line.
+    /// Serializes the session KV to `path`, prefixed by its fingerprint line
+    /// (the shared `session::write_payload` layout). Returns whether a file
+    /// was written.
     ///
     /// Best-effort: a failure to save just means the next launch re-prefills.
-    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
+    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) -> bool {
         let mut snap = ffi::Ds4SessionSnapshot::default();
         let mut err = [0_i8; 512];
         // SAFETY: session valid; snap is a valid out-ptr the engine fills.
         let rc = unsafe {
             ffi::ds4_session_save_snapshot(session, &raw mut snap, err.as_mut_ptr(), err.len())
         };
+        let mut written = false;
         if rc == 0 && !snap.ptr.is_null() {
             let len = usize::try_from(snap.len).unwrap_or(0);
             // SAFETY: snap.ptr points to snap.len bytes owned by the engine.
             let bytes = unsafe { std::slice::from_raw_parts(snap.ptr, len) };
-            let mut file = Vec::with_capacity(bytes.len() + 41);
-            file.extend_from_slice(fingerprint.as_bytes());
-            file.push(b'\n');
-            file.extend_from_slice(bytes);
-            let _ = std::fs::write(path, &file);
+            written = crate::session::write_payload(path, fingerprint, bytes).is_ok();
         }
         // SAFETY: snap was filled by ds4_session_save_snapshot.
         unsafe { ffi::ds4_session_snapshot_free(&raw mut snap) };
+        written
+    }
+
+    /// Restores the live session KV from a fingerprinted payload file.
+    /// Returns `false` (without error) when the file is missing, stale, or
+    /// rejected by the backend, so the caller re-prefills instead.
+    fn load_snapshot_file(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) -> bool {
+        let Some(mut payload) = crate::session::read_payload(path, fingerprint) else {
+            return false;
+        };
+        let snap = ffi::Ds4SessionSnapshot {
+            ptr: payload.as_mut_ptr(),
+            len: payload.len() as u64,
+            cap: payload.capacity() as u64,
+        };
+        let mut err = [0_i8; 512];
+        // SAFETY: session valid; snap borrows `payload` which outlives the call.
+        let rc = unsafe {
+            ffi::ds4_session_load_snapshot(session, &raw const snap, err.as_mut_ptr(), err.len())
+        };
+        drop(payload);
+        rc == 0
     }
 
     /// Fingerprint tying a checkpoint to this exact model and system prompt.
@@ -558,32 +579,11 @@ impl Engine for Ds4Engine {
         let session = self.ensure_session()?;
 
         // Fast path: restore a matching on-disk checkpoint, skipping prefill.
+        // A stale/incompatible snapshot falls through and rebuilds.
         if let Some(path) = checkpoint
-            && let Ok(mut bytes) = std::fs::read(path)
-            && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
-            && bytes[..nl] == *fingerprint.as_bytes()
+            && Self::load_snapshot_file(session, path, &fingerprint)
         {
-            let mut payload = bytes.split_off(nl + 1);
-            let snap = ffi::Ds4SessionSnapshot {
-                ptr: payload.as_mut_ptr(),
-                len: payload.len() as u64,
-                cap: payload.capacity() as u64,
-            };
-            let mut err = [0_i8; 512];
-            // SAFETY: session valid; snap borrows `payload` which outlives the call.
-            let rc = unsafe {
-                ffi::ds4_session_load_snapshot(
-                    session,
-                    &raw const snap,
-                    err.as_mut_ptr(),
-                    err.len(),
-                )
-            };
-            drop(payload);
-            if rc == 0 {
-                return Ok(false);
-            }
-            // A stale/incompatible snapshot: fall through and rebuild.
+            return Ok(false);
         }
 
         // Cache miss: prefill the system prompt, streaming progress.
@@ -614,8 +614,35 @@ impl Engine for Ds4Engine {
 
         // Persist a fresh checkpoint for the next launch.
         if let Some(path) = checkpoint {
-            Self::save_checkpoint(session, path, &fingerprint);
+            let _ = Self::save_checkpoint(session, path, &fingerprint);
         }
+        Ok(true)
+    }
+
+    fn save_session_payload(
+        &mut self,
+        path: &Path,
+        fingerprint: &str,
+    ) -> Result<bool, EngineError> {
+        // Nothing prefilled yet means nothing worth snapshotting.
+        if self.session.is_null() {
+            return Ok(false);
+        }
+        Ok(Self::save_checkpoint(self.session, path, fingerprint))
+    }
+
+    fn load_session_payload(
+        &mut self,
+        path: &Path,
+        fingerprint: &str,
+    ) -> Result<bool, EngineError> {
+        let session = self.ensure_session()?;
+        if !Self::load_snapshot_file(session, path, fingerprint) {
+            return Ok(false);
+        }
+        // The spliced-token cache described the previous conversation's last
+        // reply; after a restore it would splice the wrong tokens.
+        self.last_reply = None;
         Ok(true)
     }
 

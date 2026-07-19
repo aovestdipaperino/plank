@@ -169,6 +169,29 @@ On startup the agent warms the cache before the first turn:
 Within a run, the live session then makes each turn reuse the common prefix, so
 only the new user/assistant suffix is evaluated.
 
+### Per-session KV payloads
+
+`/save` also snapshots the live engine KV to a sidecar next to the transcript
+(`~/.plank/kvcache/<sha>.payload`), via the same two `Engine` trait hooks the
+sysprompt checkpoint uses (`save_session_payload` / `load_session_payload`,
+default no-ops so the echo stub is unaffected). The payload file layout matches
+`sysprompt.kv`: a fingerprint line, then the raw `ds4_session_save_snapshot`
+bytes. The fingerprint is `SHA-1(model_name + "\0" + system_prompt + "\0" +
+rendered_transcript)`, so *any* drift — different model, changed system prompt,
+or a transcript that gained turns or was compacted since the save — makes the
+payload stale.
+
+`/switch` and `/resume` try to restore the payload; on a fingerprint match the
+resumed session skips re-prefilling the transcript entirely. A stale, missing,
+or unloadable payload silently falls back to a full prefill: stale payloads
+are rebuilt, never trusted (the C reference's policy). `/strip <sha>` deletes
+the payload while keeping the transcript, reporting the token count a later
+`/switch` pays to rebuild it; `/list` shows payload size or `stripped`.
+Transcript files stay in the v1 text format — payloads are pure sidecar
+caches, so old session files and old readers are unaffected. Upgrade
+maintenance (`upgrade.rs`) deletes `*.payload` on minor/major bumps purely to
+reclaim disk; correctness never depends on that because of the fingerprint.
+
 ### Interruption
 Between tokens the engine polls an `interrupt` closure. In the TUI the worker
 thread's closure reads `TurnShared::interrupt`, set by the UI thread on

@@ -157,6 +157,46 @@ pub trait Engine: Debug + Send {
         Ok(false)
     }
 
+    /// Saves the live session KV as a fingerprinted payload file at `path`.
+    ///
+    /// The payload is a rebuildable cache of the current KV state; the
+    /// caller computes `fingerprint` from the model, system prompt, and
+    /// rendered transcript (see `session::payload_fingerprint`) so a later
+    /// load can detect staleness. Returns `true` when a payload was written.
+    ///
+    /// The default implementation is a no-op returning `false` (backends
+    /// without KV state, like the echo stub, have nothing to persist).
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to snapshot.
+    fn save_session_payload(
+        &mut self,
+        _path: &std::path::Path,
+        _fingerprint: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
+    /// Restores the live session KV from a payload written by
+    /// [`Engine::save_session_payload`].
+    ///
+    /// Loads only when the file exists and its stored fingerprint matches
+    /// `fingerprint` exactly; anything else returns `false` and the caller
+    /// falls back to re-prefilling the transcript — a stale payload is
+    /// rebuilt, never trusted. Returns `true` when the KV was restored.
+    ///
+    /// The default implementation is a no-op returning `false`.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails while restoring.
+    fn load_session_payload(
+        &mut self,
+        _path: &std::path::Path,
+        _fingerprint: &str,
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
     /// Context window size in tokens.
     fn ctx_size(&self) -> i32;
 
