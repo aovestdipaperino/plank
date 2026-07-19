@@ -49,3 +49,41 @@ because the Metal kernel sources were resolved from a compile time CI path
 that did not exist on your machine. The kernels now ship inside the bottles
 (`share/plank/metal`) and are resolved at runtime, and the engine-open error
 says plainly when they are missing instead of blaming the model file.
+
+## 0.x — the foundation
+
+The pre-1.0 line, where plank became a working local agent. It was ported from
+the `ds4_agent` C reference functionality by functionality, each C section
+becoming an idiomatic Rust module with its own tests, and the wire formats kept
+byte for byte identical to what the model was trained on.
+
+🧠 **Real local inference.** DeepSeek V4 Flash runs on Apple Silicon through
+Metal, wired in over FFI and kept behind an `Engine` trait, with an echo stub
+so the whole app still builds and runs without a model.
+
+🖥️ **A full-screen terminal UI.** A Ratatui interface (with a plain line REPL
+and a headless mode) renders assistant replies as markdown with syntax
+highlighted code, mouse-wheel scrollback, and a live status bar showing tokens,
+throughput, and context usage.
+
+⬇️ **One-keypress model download.** With no model on disk, plank offers to fetch
+the quantized GGUF from Hugging Face. The download is resumable, guarded by a
+RAM check, and keeps you company with a live progress gauge.
+
+⚡ **Fast startup.** The system prompt is prefilled once and snapshotted to a
+fingerprinted checkpoint, so a fresh launch restores the warm KV cache instead
+of recomputing it, and each turn reuses the cached prefix.
+
+🧰 **A real tool suite.** File read and edit (with `[upto]` anchored
+replacements), synchronous and background shell commands, and web search, all
+framed exactly like the C reference, plus a strict DSML tool-call parser with
+on-screen banners.
+
+🔌 **MCP support.** Stdio MCP servers listed in `.mcp.json` are launched at
+startup and their tools exposed to the model, with a `primaryTools` list to
+keep the system prompt small.
+
+💾 **Sessions and context management.** Conversations save, list, and switch;
+context compaction reclaims the window with a durable summary plus a verbatim
+tail; and upgrade-time cache maintenance clears exactly what a new version can
+no longer trust.
