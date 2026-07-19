@@ -881,7 +881,9 @@ impl Agent<'_> {
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
-            "/btw" => {
+            // /btw shares the experimental gate with image pasting until the
+            // model-format investigation lands.
+            "/btw" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
                 } else {
@@ -1850,7 +1852,9 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
-            "/btw" => {
+            // /btw shares the experimental gate with image pasting until the
+            // model-format investigation lands.
+            "/btw" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
                 } else if let Err(e) = self.tui_btw(arg, log, terminal, view) {

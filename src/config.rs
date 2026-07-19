@@ -303,8 +303,9 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/context"
             | "/init"
             | "/skills"
-            | "/hooks"
-    ) || slash_command_with_args(cmd, "/btw")
+            | "/hooks" // /btw is disabled together with image pasting until the model-format
+                       // investigation lands (same experimental gate as IMAGES_ENABLED).
+    ) || (cfg!(feature = "images") && slash_command_with_args(cmd, "/btw"))
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
@@ -679,7 +680,10 @@ mod tests {
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }
-        assert!(slash_command_known("/btw what is this?"));
+        assert_eq!(
+            slash_command_known("/btw what is this?"),
+            cfg!(feature = "images")
+        );
         assert!(slash_command_known("/power 50"));
         assert!(slash_command_known("/power"));
         assert!(slash_command_known("/switch 2"));
