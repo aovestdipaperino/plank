@@ -88,6 +88,9 @@ pub struct GenerationStats {
 #[derive(Debug)]
 pub struct EngineError {
     message: String,
+    /// True when the backend does not implement the requested operation, so
+    /// the caller can fall back rather than treat it as a hard failure.
+    unsupported: bool,
 }
 
 impl EngineError {
@@ -95,7 +98,25 @@ impl EngineError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            unsupported: false,
         }
+    }
+
+    /// Marks an operation the engine does not implement (e.g. an engine
+    /// without [`Engine::generate_aside`]); callers fall back instead of
+    /// surfacing it as a failure.
+    #[must_use]
+    pub fn unsupported() -> Self {
+        Self {
+            message: "operation not supported by this engine".to_string(),
+            unsupported: true,
+        }
+    }
+
+    /// Whether this error signals an unimplemented operation.
+    #[must_use]
+    pub fn is_unsupported(&self) -> bool {
+        self.unsupported
     }
 }
 
@@ -130,6 +151,32 @@ pub trait Engine: Debug + Send {
         greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError>;
+
+    /// Answers a one-shot, tool-free prompt without disturbing the live
+    /// generation state, then restores it exactly. Returns the aside's stats;
+    /// its text is streamed via `on_event` as [`EngineEvent::Text`].
+    ///
+    /// Intended for a mid-generation `/btw` aside: the engine snapshots the
+    /// frozen main-task KV, answers `prompt` destructively on the same
+    /// session (greedy off, tool-call stanzas ignored by the caller), then
+    /// restores the snapshot so the main task resumes with zero re-prefill.
+    /// Restore is unconditional — an interrupted or failed aside still leaves
+    /// the main session valid.
+    ///
+    /// # Errors
+    /// The default implementation returns [`EngineError::unsupported`] so
+    /// [`EchoEngine`] and remote engines need no change; callers detect it and
+    /// fall back to the boundary-scheduled queue. Real engines return
+    /// [`EngineError`] on a backend failure.
+    fn generate_aside(
+        &mut self,
+        _prompt: &str,
+        _opts: &GenerationOptions,
+        _interrupt: &dyn Fn() -> bool,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        Err(EngineError::unsupported())
+    }
 
     /// Approximate token count of `text` for context accounting.
     fn count_tokens(&self, text: &str) -> i32 {
@@ -230,5 +277,41 @@ impl Engine for EchoEngine {
 
     fn ctx_size(&self) -> i32 {
         self.ctx_size
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EchoEngine, Engine, EngineError, GenerationOptions};
+
+    #[test]
+    fn unsupported_error_flag() {
+        assert!(EngineError::unsupported().is_unsupported());
+        assert!(!EngineError::new("boom").is_unsupported());
+    }
+
+    // An engine without a real `generate_aside` (EchoEngine, remote engines)
+    // returns `unsupported`, which the worker uses to fall back to the
+    // boundary-scheduled queue rather than treating it as a failure.
+    #[test]
+    fn aside_unsupported_falls_back() {
+        let mut engine = EchoEngine::new(4096);
+        let transcript = "[user]\nmain task\n".to_string();
+        let mut events = Vec::new();
+        let err = engine
+            .generate_aside(
+                "[user]\nbtw question\n",
+                &GenerationOptions::default(),
+                &|| false,
+                &mut |e| events.push(e),
+            )
+            .expect_err("EchoEngine has no aside support");
+        assert!(
+            err.is_unsupported(),
+            "must signal a fallback, not a failure"
+        );
+        assert!(events.is_empty(), "the default impl streams nothing");
+        // The caller's transcript is untouched — the aside never ran.
+        assert_eq!(transcript, "[user]\nmain task\n");
     }
 }

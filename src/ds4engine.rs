@@ -13,6 +13,7 @@ use crate::engine::{
     ThinkMode,
 };
 use crate::ffi;
+use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 
 /// Loaded ds4 model plus a live session reused across turns.
 ///
@@ -273,24 +274,15 @@ impl Ds4Engine {
     ///
     /// Best-effort: a failure to save just means the next launch re-prefills.
     fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
-        let mut snap = ffi::Ds4SessionSnapshot::default();
-        let mut err = [0_i8; 512];
-        // SAFETY: session valid; snap is a valid out-ptr the engine fills.
-        let rc = unsafe {
-            ffi::ds4_session_save_snapshot(session, &raw mut snap, err.as_mut_ptr(), err.len())
+        let Ok(snap) = SessionSnapshot::capture(session) else {
+            return;
         };
-        if rc == 0 && !snap.ptr.is_null() {
-            let len = usize::try_from(snap.len).unwrap_or(0);
-            // SAFETY: snap.ptr points to snap.len bytes owned by the engine.
-            let bytes = unsafe { std::slice::from_raw_parts(snap.ptr, len) };
-            let mut file = Vec::with_capacity(bytes.len() + 41);
-            file.extend_from_slice(fingerprint.as_bytes());
-            file.push(b'\n');
-            file.extend_from_slice(bytes);
-            let _ = std::fs::write(path, &file);
-        }
-        // SAFETY: snap was filled by ds4_session_save_snapshot.
-        unsafe { ffi::ds4_session_snapshot_free(&raw mut snap) };
+        let bytes = snap.as_bytes();
+        let mut file = Vec::with_capacity(bytes.len() + 41);
+        file.extend_from_slice(fingerprint.as_bytes());
+        file.push(b'\n');
+        file.extend_from_slice(bytes);
+        let _ = std::fs::write(path, &file);
     }
 
     /// Fingerprint tying a checkpoint to this exact model and system prompt.
@@ -547,6 +539,47 @@ impl Engine for Ds4Engine {
         })
     }
 
+    fn generate_aside(
+        &mut self,
+        prompt: &str,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        // Step 1 (§4.2): freeze the live main-task KV — transcript, partial
+        // reply, and cursor — in a snapshot before touching the session.
+        let session = self.ensure_session()?;
+        let snapshot = SessionSnapshot::capture(session)?;
+
+        // Step 3: restore is unconditional. The guard reloads the snapshot on
+        // every exit path (success, `?` error, interrupt) so an aside can
+        // never leave the main task's KV corrupted. Declared before the
+        // destructive run and after `snapshot` so it drops first, while the
+        // snapshot buffer is still alive.
+        let _restore = RestoreOnDrop::new(|| {
+            let _ = snapshot.restore(session);
+        });
+
+        // Step 4: the aside's tokens must not perturb the main context
+        // accounting. `last_reply` is the only mutable splice/accounting state
+        // `generate` touches; take it now and put it back afterwards so the
+        // main task's next prompt build splices its own reply, not the aside's.
+        let saved_reply = self.last_reply.take();
+
+        // Step 2: answer destructively on the same session. `ds4_session_sync`
+        // rolls the cursor back to the common prefix with the frozen KV (the
+        // transcript; the partial reply diverges) and prefills only the framed
+        // question, then samples the answer. Greedy is forced off (a constant
+        // `false` sampler mode) and tool-call denial is the caller's concern
+        // (it drops `finished().calls`); the engine simply streams Text.
+        let result = self.generate(prompt, opts, interrupt, &|| false, on_event);
+
+        // Restore the main task's accounting state regardless of the aside's
+        // outcome; the KV itself is restored when `_restore` drops next.
+        self.last_reply = saved_reply;
+        result
+    }
+
     fn warm_system_prompt(
         &mut self,
         system: &str,
@@ -563,24 +596,8 @@ impl Engine for Ds4Engine {
             && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
             && bytes[..nl] == *fingerprint.as_bytes()
         {
-            let mut payload = bytes.split_off(nl + 1);
-            let snap = ffi::Ds4SessionSnapshot {
-                ptr: payload.as_mut_ptr(),
-                len: payload.len() as u64,
-                cap: payload.capacity() as u64,
-            };
-            let mut err = [0_i8; 512];
-            // SAFETY: session valid; snap borrows `payload` which outlives the call.
-            let rc = unsafe {
-                ffi::ds4_session_load_snapshot(
-                    session,
-                    &raw const snap,
-                    err.as_mut_ptr(),
-                    err.len(),
-                )
-            };
-            drop(payload);
-            if rc == 0 {
+            let payload = bytes.split_off(nl + 1);
+            if SessionSnapshot::restore_bytes(session, &payload).is_ok() {
                 return Ok(false);
             }
             // A stale/incompatible snapshot: fall through and rebuild.
@@ -802,5 +819,72 @@ mod tests {
     fn tool_maps_to_user() {
         let s = parse_sections("[tool]\nresult text\n");
         assert_eq!(s, vec![("user", "result text".to_string())]);
+    }
+
+    // Real-model round-trip proof (BTW-SUSPEND-DESIGN §5.3): snapshot the
+    // session mid-reply, run an aside, restore, and assert the main task's
+    // continuation is byte-identical to an uninterrupted seeded run — i.e. the
+    // snapshot restored the KV losslessly and the aside left it untouched.
+    //
+    // Requires a loaded model, so it is gated on `ds4_engine` and skips unless
+    // PLANK_TEST_MODEL points at a GGUF. It will only run on a Metal box with
+    // the `ds4-ref` submodule built.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn aside_snapshot_roundtrip_lossless() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Engine::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+
+        let opts = GenerationOptions {
+            seed: 42,
+            n_predict: 24,
+            ..GenerationOptions::default()
+        };
+        let transcript = "[user]\nCount slowly from one to twenty.\n";
+
+        // Baseline: one uninterrupted seeded run.
+        let mut baseline = String::new();
+        engine
+            .generate(transcript, &opts, &|| false, &|| false, &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    baseline.push_str(&t);
+                }
+            })
+            .unwrap();
+
+        // A fresh engine, same seed, but with an aside injected before the run.
+        let mut engine2 =
+            super::Ds4Engine::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let mut aside = String::new();
+        engine2
+            .generate_aside("[user]\nWhat is 2 plus 2?\n", &opts, &|| false, &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    aside.push_str(&t);
+                }
+            })
+            .unwrap();
+        assert!(!aside.is_empty(), "aside should have produced text");
+
+        let mut after = String::new();
+        engine2
+            .generate(transcript, &opts, &|| false, &|| false, &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    after.push_str(&t);
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            baseline, after,
+            "post-aside continuation must match the uninterrupted seeded run"
+        );
     }
 }

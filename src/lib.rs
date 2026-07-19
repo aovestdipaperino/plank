@@ -28,6 +28,7 @@ pub mod sandbox;
 pub mod session;
 pub mod singleton;
 pub mod skills;
+pub mod snapshot;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;

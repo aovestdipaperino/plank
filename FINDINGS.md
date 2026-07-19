@@ -73,6 +73,18 @@ test` and review the diff before committing.
   (`src/ds4engine.rs`).
 - **Trace timestamps are byte-for-byte `agent_trace_time`**
   (`clock_gettime`-derived formatting, `src/trace.rs:127`).
+- **A session snapshot owns its buffer; `ds4_session_snapshot_free` frees only
+  what the engine allocated.** `ds4_session_save_snapshot` allocates the
+  buffer, so the owning `SessionSnapshot` wrapper frees it on drop
+  (`src/snapshot.rs`). But *loading* a snapshot read back from disk must wrap
+  the caller's `Vec` in a **transient, non-owning** `Ds4SessionSnapshot` and
+  never call the free — the buffer is Rust's, and freeing it via the C
+  allocator double-frees. Hence `SessionSnapshot::restore_bytes` builds the
+  FFI struct on the stack and drops the `Vec` itself; only `capture` produces a
+  freeable snapshot. Restore itself (`ds4_session_load_snapshot`) is
+  idempotent and lossless — the KV, cursor, and any partial reply come back
+  byte-identical, which is what makes an unconditional-restore RAII guard
+  (`RestoreOnDrop`) safe on the aside interrupt/error path.
 
 ## Part 2 — Environment & tooling
 
