@@ -179,6 +179,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             api_key,
             model,
             cfg.generation.ctx_size,
+            cfg.provider_cache,
         )
         .map_err(|e| format!("provider init: {e}"))?;
         eprintln!("plank: provider engine ready: {}", engine.model_name());
