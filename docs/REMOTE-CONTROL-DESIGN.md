@@ -462,6 +462,29 @@ that the local turn never stalled; verify the printed `ssh` line works verbatim.
 - Whether the CLI client is a `plank remote` subcommand (shared binary, shared
   render code) or a separate crate. Subcommand preferred for code reuse.
 
+### 8.1 Resolved (hardening, issue #25)
+
+- **`Origin` allow-list.** Enforced on the WebSocket upgrade in
+  `control::handle_connection` via `origin_allowed`. Default policy: a missing
+  `Origin` (native `plank remote` clients send none) and any loopback `Origin`
+  (`localhost` / `127.0.0.1` / `::1`, any scheme or port) are allowed; every
+  other browser `Origin` must be listed with `--control-origin <ORIGIN>`
+  (repeatable or comma-separated) or the upgrade is refused with an HTTP 403
+  before the handshake completes. `null` (opaque `file://` origins) is treated
+  as a non-loopback browser origin and must be allow-listed explicitly.
+- **Bounded per-client outbound queue.** Each connection caps its unsent output
+  at `--control-queue-max` bytes (default 1 MiB) via tungstenite's
+  `max_write_buffer_size`. Writes use a short socket write timeout so a stalled
+  client's data accumulates in the buffer rather than blocking the connection
+  thread; once the buffer exceeds the cap the client is evicted (its thread
+  exits and the bus prunes the dropped subscriber on the next broadcast).
+  Healthy clients keep the existing scrollback-replay + live-mirror semantics.
+- **Static web client.** A single self-contained HTML+JS page (no external
+  deps) is served at `GET /` (and `/index.html`) straight from the control
+  server — see `control::WEB_CLIENT_HTML` (`src/remote/web_client.html`). It
+  authenticates with a token, renders mirrored output, and sends typed lines as
+  `prompt` / `command` / `btw` frames at the same `PROTOCOL_VERSION`.
+
 ## 9. Non-goals
 
 - **A backend / claude.ai sync.** No environments, work polling, OAuth, JWT, or
