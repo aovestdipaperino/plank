@@ -639,6 +639,61 @@ impl Engine for Ds4Engine {
     fn model_name(&self) -> String {
         Ds4Engine::model_name(self)
     }
+
+    fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
+        if self.session.is_null() {
+            return None;
+        }
+        let mut snap = ffi::Ds4SessionSnapshot::default();
+        let mut err = [0_i8; 512];
+        // SAFETY: session valid; snap is a valid out-ptr the engine fills.
+        let rc = unsafe {
+            ffi::ds4_session_save_snapshot(self.session, &raw mut snap, err.as_mut_ptr(), err.len())
+        };
+        let out = if rc == 0 && !snap.ptr.is_null() {
+            let len = usize::try_from(snap.len).unwrap_or(0);
+            // SAFETY: snap.ptr points to snap.len bytes owned by the engine;
+            // copied into an owned Vec before the snapshot is freed.
+            let bytes = unsafe { std::slice::from_raw_parts(snap.ptr, len) };
+            Some(bytes.to_vec())
+        } else {
+            None
+        };
+        // SAFETY: snap was filled by ds4_session_save_snapshot.
+        unsafe { ffi::ds4_session_snapshot_free(&raw mut snap) };
+        out
+    }
+
+    fn restore_kv(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let session = self.ensure_session()?;
+        // A snapshot read from our own bytes must be loaded through a
+        // non-owning FFI struct (the engine copies from it and never frees
+        // it); see FINDINGS.md. Keep `payload` alive across the call.
+        let mut payload = bytes.to_vec();
+        let snap = ffi::Ds4SessionSnapshot {
+            ptr: payload.as_mut_ptr(),
+            len: payload.len() as u64,
+            cap: payload.capacity() as u64,
+        };
+        let mut err = [0_i8; 512];
+        // SAFETY: session valid; snap borrows `payload` which outlives the call.
+        let rc = unsafe {
+            ffi::ds4_session_load_snapshot(session, &raw const snap, err.as_mut_ptr(), err.len())
+        };
+        drop(payload);
+        if rc != 0 {
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "failed to restore KV snapshot",
+            )));
+        }
+        // The live session now holds the checkpoint's token state. The last
+        // sampled reply no longer describes the restored tail, so drop it;
+        // the next turn re-templates that final assistant turn from text
+        // (a small re-prefill), while the bulk of the prefix stays cached.
+        self.last_reply = None;
+        Ok(())
+    }
 }
 
 impl Drop for Ds4Engine {

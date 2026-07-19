@@ -157,6 +157,28 @@ pub trait Engine: Debug + Send {
         Ok(false)
     }
 
+    /// Captures the live session KV as serialized bytes for a checkpoint.
+    ///
+    /// Returns `None` when the engine has no snapshot support (the stub echo
+    /// engine) or has no live session yet; callers then fall back to a
+    /// transcript-only checkpoint that re-prefills on rollback.
+    fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restores session KV previously captured by [`Engine::snapshot_kv`],
+    /// so the next turn resumes with (near-)zero re-prefill.
+    ///
+    /// The default implementation reports lack of support; the echo engine and
+    /// any transcript-only rollback rely on it returning an error rather than
+    /// pretending to restore.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the engine cannot restore KV state.
+    fn restore_kv(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
+        Err(EngineError::new("engine does not support KV snapshots"))
+    }
+
     /// Context window size in tokens.
     fn ctx_size(&self) -> i32;
 
