@@ -4,8 +4,7 @@
 //! reference (`ds4-ref/ds4_agent.c`): the `agent_config` struct, option
 //! parsing, numeric parsing helpers, and slash-command recognition. Unlike
 //! the C code, parse failures return `Err` instead of exiting the process.
-//! Engine-backend options (model path, backend, threads, MTP, SSD streaming,
-//! distributed mode) are not ported yet because plank has no native engine.
+//! Distributed-mode options are not ported (plank is single-machine).
 
 use std::path::PathBuf;
 
@@ -50,6 +49,70 @@ pub struct AgentConfig {
     pub n_threads: i32,
     /// GPU power cap percent from `--power`; 0 = unset.
     pub power_percent: i32,
+    /// Native-engine tuning knobs (MTP, SSD streaming, steering, ...).
+    pub engine: EngineTuning,
+}
+
+/// Engine tuning options forwarded to the native ds4 engine, mirroring the
+/// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
+/// keep the engine defaults; the whole struct is ignored by `EchoEngine`.
+// The bools deliberately mirror the C options struct one-to-one.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct EngineTuning {
+    /// Multi-token-prediction draft model from `--mtp`.
+    pub mtp_path: Option<PathBuf>,
+    /// Draft tokens per MTP step from `--mtp-draft` (C default: 1).
+    pub mtp_draft_tokens: i32,
+    /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
+    pub mtp_margin: f32,
+    /// Prefill chunk size from `--prefill-chunk`; 0 = engine default.
+    pub prefill_chunk: u32,
+    /// Quality mode from `--quality`.
+    pub quality: bool,
+    /// Touch all weights at load from `--warm-weights`.
+    pub warm_weights: bool,
+    /// Stream experts from SSD from `--ssd-streaming`.
+    pub ssd_streaming: bool,
+    /// Cold-cache SSD streaming from `--ssd-streaming-cold`.
+    pub ssd_streaming_cold: bool,
+    /// Expert-count cache bound from `--ssd-streaming-cache-experts N`.
+    pub ssd_streaming_cache_experts: u32,
+    /// Byte cache bound from `--ssd-streaming-cache-experts <N>GB`.
+    pub ssd_streaming_cache_bytes: u64,
+    /// Experts preloaded at startup from `--ssd-streaming-preload-experts`.
+    pub ssd_streaming_preload_experts: u32,
+    /// Pretend this much memory is already used, from `--simulate-used-memory`.
+    pub simulate_used_memory_bytes: u64,
+    /// Directional-steering vector file from `--dir-steering-file`.
+    pub dir_steering_file: Option<PathBuf>,
+    /// Attention steering scale from `--dir-steering-attn`.
+    pub dir_steering_attn: f32,
+    /// FFN steering scale from `--dir-steering-ffn`; defaults to 1.0 when a
+    /// steering file is given without an explicit scale, like the C.
+    pub dir_steering_ffn: f32,
+}
+
+impl Default for EngineTuning {
+    fn default() -> Self {
+        Self {
+            mtp_path: None,
+            mtp_draft_tokens: 1,
+            mtp_margin: 3.0,
+            prefill_chunk: 0,
+            quality: false,
+            warm_weights: false,
+            ssd_streaming: false,
+            ssd_streaming_cold: false,
+            ssd_streaming_cache_experts: 0,
+            ssd_streaming_cache_bytes: 0,
+            ssd_streaming_preload_experts: 0,
+            simulate_used_memory_bytes: 0,
+            dir_steering_file: None,
+            dir_steering_attn: 0.0,
+            dir_steering_ffn: 0.0,
+        }
+    }
 }
 
 /// Inference backend selector, mirroring `ds4_backend`.
@@ -84,6 +147,7 @@ impl Default for AgentConfig {
             backend: None,
             n_threads: 0,
             power_percent: 0,
+            engine: EngineTuning::default(),
         }
     }
 }
@@ -98,10 +162,25 @@ Options:
   -h, --help [topic]       show this help and exit
   -m, --model PATH         load a ds4 GGUF model (real inference)
   -t, --threads N          worker thread count (backend default when unset)
+      --backend NAME       select backend by name: metal, cuda, cpu
       --metal              use the Metal backend
       --cuda               use the CUDA backend
       --cpu                use the CPU backend
       --power N            GPU power cap percent (1..100)
+      --mtp PATH           multi-token-prediction draft model (GGUF)
+      --mtp-draft N        draft tokens per MTP step (default 1)
+      --mtp-margin F       MTP acceptance margin (default 3.0)
+      --prefill-chunk N    prefill chunk size in tokens (engine default when unset)
+      --quality            enable quality mode
+      --warm-weights       touch all weights at load
+      --ssd-streaming      stream experts from SSD instead of loading resident
+      --ssd-streaming-cold          assume a cold SSD cache
+      --ssd-streaming-cache-experts N|<N>GB   bound the expert cache
+      --ssd-streaming-preload-experts N       preload N experts at startup
+      --simulate-used-memory <N>GB  pretend N GiB of memory is already used
+      --dir-steering-file PATH      directional steering vectors
+      --dir-steering-ffn F          FFN steering scale (-100..100)
+      --dir-steering-attn F         attention steering scale (-100..100)
   -p, --prompt TEXT        run one prompt and exit after the reply
       --non-interactive    disable the interactive UI
   -sys, --system TEXT      override the system prompt
@@ -155,6 +234,37 @@ pub fn parse_float_range(s: &str, opt: &str, min: f32, max: f32) -> Result<f32, 
         .ok_or_else(|| format!("invalid value for {opt}: {s}"))
 }
 
+/// Parses a positive GiB size like `64` or `64GB` into bytes, mirroring
+/// `ds4_parse_gib_arg`: digits with an optional case-insensitive `gb` suffix.
+#[must_use]
+pub fn parse_gib_arg(s: &str) -> Option<u64> {
+    let digits = s
+        .strip_suffix("gb")
+        .or_else(|| s.strip_suffix("GB"))
+        .or_else(|| s.strip_suffix("Gb"))
+        .or_else(|| s.strip_suffix("gB"))
+        .unwrap_or(s);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v = digits.parse::<u64>().ok().filter(|v| *v != 0)?;
+    v.checked_mul(1024 * 1024 * 1024)
+}
+
+/// Parses `--ssd-streaming-cache-experts`: a positive expert count, or a
+/// `<N>GB` byte bound. Mirrors `ds4_parse_streaming_cache_experts_arg`;
+/// exactly one of the returned pair is nonzero.
+#[must_use]
+pub fn parse_streaming_cache_experts_arg(s: &str) -> Option<(u32, u64)> {
+    if s.len() > 2 && s[s.len() - 2..].eq_ignore_ascii_case("gb") {
+        return parse_gib_arg(s).map(|bytes| (0, bytes));
+    }
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    s.parse::<u32>().ok().filter(|v| *v != 0).map(|v| (v, 0))
+}
+
 /// Parses a power percentage in `1..=100`; returns `None` when invalid.
 #[must_use]
 pub fn parse_power_percent(arg: &str) -> Option<i32> {
@@ -191,6 +301,49 @@ pub fn slash_command_known(cmd: &str) -> bool {
         || slash_command_with_args(cmd, "/history")
 }
 
+/// Parses one engine-tuning option that takes a value (already extracted as
+/// `v`). `steering_scale_set` tracks explicit steering scales so a steering
+/// file alone can default the FFN scale to 1.0, like the C.
+fn parse_engine_option(
+    e: &mut EngineTuning,
+    arg: &str,
+    v: &str,
+    steering_scale_set: &mut bool,
+) -> Result<(), String> {
+    match arg {
+        "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
+        "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
+        "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
+        "--prefill-chunk" => {
+            e.prefill_chunk = u32::try_from(parse_int(v, arg)?).unwrap_or(0);
+        }
+        "--ssd-streaming-cache-experts" => {
+            let (experts, bytes) = parse_streaming_cache_experts_arg(v)
+                .ok_or_else(|| format!("{arg} must be a positive count or <number>GB: {v}"))?;
+            e.ssd_streaming_cache_experts = experts;
+            e.ssd_streaming_cache_bytes = bytes;
+        }
+        "--ssd-streaming-preload-experts" => {
+            e.ssd_streaming_preload_experts = u32::try_from(parse_int(v, arg)?).unwrap_or(0);
+        }
+        "--simulate-used-memory" => {
+            e.simulate_used_memory_bytes = parse_gib_arg(v)
+                .ok_or_else(|| format!("{arg} must be a positive GiB value, e.g. 64GB: {v}"))?;
+        }
+        "--dir-steering-file" => e.dir_steering_file = Some(PathBuf::from(v)),
+        "--dir-steering-ffn" => {
+            e.dir_steering_ffn = parse_float_range(v, arg, -100.0, 100.0)?;
+            *steering_scale_set = true;
+        }
+        "--dir-steering-attn" => {
+            e.dir_steering_attn = parse_float_range(v, arg, -100.0, 100.0)?;
+            *steering_scale_set = true;
+        }
+        _ => return Err(format!("unknown option: {arg}")),
+    }
+    Ok(())
+}
+
 /// Parses command-line arguments (without the program name) into a config.
 ///
 /// # Errors
@@ -198,6 +351,9 @@ pub fn slash_command_known(cmd: &str) -> bool {
 /// out of range, or an option is unknown.
 pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
     let mut c = AgentConfig::default();
+    // Tracks whether a steering scale was given explicitly; a steering file
+    // without one defaults the FFN scale to 1.0, like the C.
+    let mut steering_scale_set = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -220,6 +376,14 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             }
             "-m" | "--model" => c.model_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "-t" | "--threads" => c.n_threads = parse_int(need_arg(&mut i)?, arg)?,
+            "--backend" => {
+                c.backend = Some(match need_arg(&mut i)? {
+                    "metal" => Backend::Metal,
+                    "cuda" => Backend::Cuda,
+                    "cpu" => Backend::Cpu,
+                    other => return Err(format!("invalid backend: {other}")),
+                });
+            }
             "--metal" => c.backend = Some(Backend::Metal),
             "--cuda" => c.backend = Some(Backend::Cuda),
             "--cpu" => c.backend = Some(Backend::Cpu),
@@ -244,9 +408,33 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--quality" => c.engine.quality = true,
+            "--warm-weights" => c.engine.warm_weights = true,
+            "--ssd-streaming" => c.engine.ssd_streaming = true,
+            "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
+            "--mtp"
+            | "--mtp-draft"
+            | "--mtp-margin"
+            | "--prefill-chunk"
+            | "--ssd-streaming-cache-experts"
+            | "--ssd-streaming-preload-experts"
+            | "--simulate-used-memory"
+            | "--dir-steering-file"
+            | "--dir-steering-ffn"
+            | "--dir-steering-attn" => {
+                parse_engine_option(
+                    &mut c.engine,
+                    arg,
+                    need_arg(&mut i)?,
+                    &mut steering_scale_set,
+                )?;
+            }
             _ => return Err(format!("unknown option: {arg}")),
         }
         i += 1;
+    }
+    if c.engine.dir_steering_file.is_some() && !steering_scale_set {
+        c.engine.dir_steering_ffn = 1.0;
     }
     Ok(c)
 }
@@ -366,6 +554,97 @@ mod tests {
     fn unknown_option_errors() {
         let err = parse_options(&args(&["--bogus"])).unwrap_err();
         assert!(err.contains("unknown option: --bogus"));
+    }
+
+    #[test]
+    fn engine_tuning_flags() {
+        let c = parse_options(&args(&[
+            "--mtp",
+            "draft.gguf",
+            "--mtp-draft",
+            "2",
+            "--mtp-margin",
+            "5.5",
+            "--prefill-chunk",
+            "512",
+            "--quality",
+            "--warm-weights",
+            "--ssd-streaming",
+            "--ssd-streaming-cold",
+            "--ssd-streaming-preload-experts",
+            "8",
+            "--simulate-used-memory",
+            "64GB",
+        ]))
+        .unwrap();
+        assert_eq!(c.engine.mtp_path, Some(PathBuf::from("draft.gguf")));
+        assert_eq!(c.engine.mtp_draft_tokens, 2);
+        assert!((c.engine.mtp_margin - 5.5).abs() < 1e-6);
+        assert_eq!(c.engine.prefill_chunk, 512);
+        assert!(c.engine.quality);
+        assert!(c.engine.warm_weights);
+        assert!(c.engine.ssd_streaming);
+        assert!(c.engine.ssd_streaming_cold);
+        assert_eq!(c.engine.ssd_streaming_preload_experts, 8);
+        assert_eq!(c.engine.simulate_used_memory_bytes, 64 << 30);
+    }
+
+    #[test]
+    fn engine_tuning_defaults_mirror_c() {
+        let c = parse_options(&[]).unwrap();
+        assert_eq!(c.engine.mtp_draft_tokens, 1);
+        assert!((c.engine.mtp_margin - 3.0).abs() < 1e-6);
+        assert_eq!(c.engine, EngineTuning::default());
+    }
+
+    #[test]
+    fn backend_by_name() {
+        for (name, want) in [
+            ("metal", Backend::Metal),
+            ("cuda", Backend::Cuda),
+            ("cpu", Backend::Cpu),
+        ] {
+            let c = parse_options(&args(&["--backend", name])).unwrap();
+            assert_eq!(c.backend, Some(want));
+        }
+        let err = parse_options(&args(&["--backend", "tpu"])).unwrap_err();
+        assert!(err.contains("invalid backend: tpu"));
+    }
+
+    #[test]
+    fn steering_file_defaults_ffn_scale() {
+        let c = parse_options(&args(&["--dir-steering-file", "v.bin"])).unwrap();
+        assert!((c.engine.dir_steering_ffn - 1.0).abs() < 1e-6);
+        assert!((c.engine.dir_steering_attn - 0.0).abs() < 1e-6);
+        // An explicit scale suppresses the 1.0 default.
+        let c = parse_options(&args(&[
+            "--dir-steering-file",
+            "v.bin",
+            "--dir-steering-attn",
+            "0.5",
+        ]))
+        .unwrap();
+        assert!((c.engine.dir_steering_ffn - 0.0).abs() < 1e-6);
+        assert!((c.engine.dir_steering_attn - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn gib_and_cache_experts_args() {
+        assert_eq!(parse_gib_arg("64"), Some(64 << 30));
+        assert_eq!(parse_gib_arg("64GB"), Some(64 << 30));
+        assert_eq!(parse_gib_arg("64gb"), Some(64 << 30));
+        assert_eq!(parse_gib_arg("0"), None);
+        assert_eq!(parse_gib_arg(""), None);
+        assert_eq!(parse_gib_arg("GB"), None);
+        assert_eq!(parse_gib_arg("6x4"), None);
+        assert_eq!(parse_streaming_cache_experts_arg("16"), Some((16, 0)));
+        assert_eq!(parse_streaming_cache_experts_arg("4GB"), Some((0, 4 << 30)));
+        assert_eq!(parse_streaming_cache_experts_arg("0"), None);
+        assert_eq!(parse_streaming_cache_experts_arg("x"), None);
+        let err = parse_options(&args(&["--ssd-streaming-cache-experts", "no"])).unwrap_err();
+        assert!(err.contains("positive count or <number>GB"));
+        let err = parse_options(&args(&["--simulate-used-memory", "no"])).unwrap_err();
+        assert!(err.contains("positive GiB value"));
     }
 
     #[test]

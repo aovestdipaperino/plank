@@ -133,6 +133,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             cfg.generation.ctx_size,
             cfg.n_threads,
             cfg.power_percent,
+            &cfg.engine,
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);

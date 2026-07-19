@@ -305,6 +305,28 @@ pub struct StreamRenderer<S> {
     /// never emitted partially.
     vis_carry: Vec<u8>,
     think_carry: Vec<u8>,
+    /// Mid-stream tool preflight hook and its first failure, mirroring the
+    /// C's `agent_stream_preflight_closed_param`: an `edit` call's `old`
+    /// selector is validated the moment that parameter closes, so a doomed
+    /// edit stops generation before `new` is streamed.
+    preflight: Preflight,
+    preflight_error: Option<String>,
+}
+
+/// Hook validating a partially-parsed tool call mid-stream.
+type PreflightFn = Box<dyn FnMut(&ToolCall) -> Result<(), String>>;
+
+#[derive(Default)]
+struct Preflight(Option<PreflightFn>);
+
+impl std::fmt::Debug for Preflight {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "Preflight(set)"
+        } else {
+            "Preflight(unset)"
+        })
+    }
 }
 
 const DSML_START_TAIL_CAP: usize = 64;
@@ -332,7 +354,23 @@ impl<S: RenderSink> StreamRenderer<S> {
             calls: Vec::new(),
             vis_carry: Vec::new(),
             think_carry: Vec::new(),
+            preflight: Preflight(None),
+            preflight_error: None,
         }
+    }
+
+    /// Installs the mid-stream preflight hook: called with the pending call
+    /// each time an `edit` invoke's `old` parameter closes. A returned error
+    /// records [`preflight_error`](Self::preflight_error); the caller is
+    /// expected to stop generation and feed the error back to the model.
+    pub fn set_preflight(&mut self, f: impl FnMut(&ToolCall) -> Result<(), String> + 'static) {
+        self.preflight = Preflight(Some(Box::new(f)));
+    }
+
+    /// The first mid-stream preflight failure, if any (model-facing text).
+    #[must_use]
+    pub fn preflight_error(&self) -> Option<&str> {
+        self.preflight_error.as_deref()
     }
 
     /// Starts the stream already inside a `<think>` block.
@@ -801,9 +839,13 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn feed_dsml_byte(&mut self, c: u8) {
+        let was_param = self.parser.state() == DsmlState::ParamValue;
         self.parser.feed([c]);
         if !self.dsml_ignored {
             self.scan_dsml_byte(c);
+            if was_param && self.parser.state() != DsmlState::ParamValue {
+                self.preflight_closed_param();
+            }
         }
         match self.parser.state() {
             DsmlState::Done => {
@@ -831,6 +873,30 @@ impl<S: RenderSink> StreamRenderer<S> {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Preflights an `edit` call as soon as its `old` parameter closes,
+    /// mirroring `agent_stream_preflight_closed_param`: a selector that
+    /// already fails to match means the pass is doomed, so record the error
+    /// before the model wastes tokens streaming `new`.
+    fn preflight_closed_param(&mut self) {
+        if self.preflight_error.is_some() {
+            return;
+        }
+        let Preflight(Some(check)) = &mut self.preflight else {
+            return;
+        };
+        let Some(call) = self.parser.pending_call() else {
+            return;
+        };
+        if call.name != "edit" || call.args.last().is_none_or(|a| a.name != "old") {
+            return;
+        }
+        if let Err(err) = check(&call) {
+            self.preflight_error = Some(format!(
+                "edit old selector failed before new was generated: {err}"
+            ));
         }
     }
 
@@ -1016,7 +1082,11 @@ impl<S: RenderSink> StreamRenderer<S> {
                 if self.dsml_ignored {
                     self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
                 } else {
-                    self.viz_finish(Some("[tool call interrupted]\n"));
+                    self.viz_finish(Some(if self.preflight_error.is_some() {
+                        "[tool call stopped: edit old selector failed]\n"
+                    } else {
+                        "[tool call interrupted]\n"
+                    }));
                     self.dsml_active = false;
                 }
             }
@@ -1262,6 +1332,57 @@ mod tests {
         assert!(vis.contains("🛠️ $ sleep 1"), "{vis:?}");
         assert!(vis.contains("[tool call interrupted]\n"), "{vis:?}");
         assert!(sr.finished().calls.is_empty());
+    }
+
+    #[test]
+    fn edit_old_preflight_failure_is_reported_midstream() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_preflight(|call| {
+            assert_eq!(call.name, "edit");
+            assert_eq!(call.arg_value("path"), Some("src/a.rs"));
+            Err("old text is not a unique match".to_string())
+        });
+        sr.push(concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"edit\">",
+            "<｜DSML｜parameter name=\"path\">src/a.rs</｜DSML｜parameter｜>",
+            "<｜DSML｜parameter name=\"old\">nope</｜DSML｜parameter｜>",
+        ));
+        // The failure is recorded the moment `old` closes, before `new`.
+        assert_eq!(
+            sr.preflight_error(),
+            Some(
+                "edit old selector failed before new was generated: \
+                 old text is not a unique match"
+            )
+        );
+        sr.finish();
+        assert!(
+            sr.sink()
+                .errors
+                .contains("[tool call stopped: edit old selector failed]"),
+            "{:?}",
+            sr.sink().errors
+        );
+    }
+
+    #[test]
+    fn edit_old_preflight_pass_leaves_stream_clean() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_preflight(|_| Ok(()));
+        sr.push(concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"edit\">",
+            "<｜DSML｜parameter name=\"path\">src/a.rs</｜DSML｜parameter｜>",
+            "<｜DSML｜parameter name=\"old\">a</｜DSML｜parameter｜>",
+            "<｜DSML｜parameter name=\"new\">b</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        ));
+        sr.finish();
+        assert!(sr.preflight_error().is_none());
+        assert_eq!(sr.finished().calls.len(), 1);
+        assert!(sr.finished().error.is_none());
     }
 
     #[test]

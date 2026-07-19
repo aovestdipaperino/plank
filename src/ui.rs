@@ -66,6 +66,18 @@ impl RenderSink for TerminalSink {
     }
 }
 
+/// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
+/// validates an `edit` call's `old` selector against the file on disk the
+/// moment that parameter closes (the C's `agent_stream_preflight_closed_param`).
+/// Captures only the working directory, so the live `ToolContext` stays free
+/// for tool dispatch.
+fn edit_preflight(
+    ctx: &ToolContext,
+) -> impl FnMut(&ToolCall) -> Result<(), String> + 'static + use<> {
+    let ctx = ToolContext::new(ctx.cwd.clone());
+    move |call| crate::tools::edit::preflight_edit_old(&ctx, call)
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -186,6 +198,7 @@ impl Agent<'_> {
             ),
         };
         let mut stream = StreamRenderer::new(sink);
+        stream.set_preflight(edit_preflight(&self.tool_ctx));
         // With thinking enabled, the chat template opens `<think>` in the
         // prefill prefix, so generation streams thinking content first; start
         // the renderer inside the think block so it renders gray until `</think>`.
@@ -201,12 +214,15 @@ impl Agent<'_> {
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
+        // Set when a mid-stream preflight fails: stops the engine early, but
+        // is not a user interrupt — the caller feeds the error to the model.
+        let preflight_stop = AtomicBool::new(false);
         let stats = self
             .engine
             .generate(
                 prompt_text,
                 &self.cfg.generation,
-                &crate::interrupt::pending,
+                &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                 &mut |ev| match ev {
                     EngineEvent::Text(t) => {
                         // Model output has started: drop the prefill bar so the
@@ -214,6 +230,9 @@ impl Agent<'_> {
                         bar.clear();
                         assistant_text.push_str(&t);
                         stream.push(&t);
+                        if stream.preflight_error().is_some() {
+                            preflight_stop.store(true, Ordering::Relaxed);
+                        }
                     }
                     EngineEvent::Prefill(p) => {
                         bar.show(&Status {
@@ -265,7 +284,10 @@ impl Agent<'_> {
                 power_percent: self.power_percent,
                 ..Status::default()
             };
-            if stats.interrupted {
+            // A preflight stop reads as an engine interrupt, but it is a tool
+            // error to feed back to the model, not a user abort.
+            let preflight_error = stream.preflight_error().map(str::to_owned);
+            if stats.interrupted && preflight_error.is_none() {
                 crate::interrupt::clear();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
@@ -278,7 +300,7 @@ impl Agent<'_> {
                 return Ok(());
             }
             let finished = stream.finished();
-            if let Some(err) = finished.error {
+            if let Some(err) = preflight_error.as_deref().or(finished.error) {
                 self.session.push(Message::user(format!(
                     "<tool_result>Tool error: {err}</tool_result>"
                 )));
@@ -1209,6 +1231,7 @@ impl Agent<'_> {
     /// `turn_start` is when the user submitted the prompt: the status bar's
     /// elapsed time counts the whole turn (all generation passes and tool
     /// runs), not just this pass. Tokens/s stays per-pass.
+    #[allow(clippy::too_many_lines)]
     fn tui_generate(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
@@ -1218,6 +1241,7 @@ impl Agent<'_> {
         turn_start: Instant,
     ) -> Result<TurnOutput, String> {
         let mut stream = StreamRenderer::new(std::mem::take(log));
+        stream.set_preflight(edit_preflight(&self.tool_ctx));
         if !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -1225,6 +1249,9 @@ impl Agent<'_> {
             stream.begin_in_think();
         }
         let interrupt_flag = AtomicBool::new(false);
+        // Set when a mid-stream preflight fails: stops the engine early, but
+        // is not a user interrupt — the turn loop feeds the error to the model.
+        let preflight_stop = AtomicBool::new(false);
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         // Prompt tokens already in context; generated tokens add onto this so
@@ -1238,12 +1265,19 @@ impl Agent<'_> {
         let result = self.engine.generate(
             prompt,
             &self.cfg.generation,
-            &|| interrupt_flag.load(Ordering::Relaxed) || crate::interrupt::pending(),
+            &|| {
+                interrupt_flag.load(Ordering::Relaxed)
+                    || preflight_stop.load(Ordering::Relaxed)
+                    || crate::interrupt::pending()
+            },
             &mut |ev| {
                 let status = match ev {
                     EngineEvent::Text(t) => {
                         assistant_text.push_str(&t);
                         stream.push(&t);
+                        if stream.preflight_error().is_some() {
+                            preflight_stop.store(true, Ordering::Relaxed);
+                        }
                         gen_count += 1;
                         let secs = start.elapsed().as_secs_f64();
                         Status {
@@ -1311,8 +1345,14 @@ impl Agent<'_> {
         stream.finish();
         let finished = stream.finished();
         let calls = finished.calls.to_vec();
-        let error = finished.error.map(str::to_owned);
-        let interrupted = stats.interrupted || interrupt_flag.load(Ordering::Relaxed);
+        // A preflight stop reads as an engine interrupt, but it is a tool
+        // error to feed back to the model, not a user abort.
+        let preflight_error = stream.preflight_error().map(str::to_owned);
+        let error = preflight_error
+            .clone()
+            .or_else(|| finished.error.map(str::to_owned));
+        let interrupted = (stats.interrupted || interrupt_flag.load(Ordering::Relaxed))
+            && preflight_error.is_none();
         *log = stream.into_sink();
         Ok(TurnOutput {
             interrupted,

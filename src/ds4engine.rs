@@ -110,7 +110,8 @@ unsafe extern "C" fn progress_cb(
 }
 
 impl Ds4Engine {
-    /// Opens a model file with the given backend and context size.
+    /// Opens a model file with the given backend, context size, and tuning
+    /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
     ///
     /// # Errors
     /// Returns [`EngineError`] if the model fails to load.
@@ -120,32 +121,43 @@ impl Ds4Engine {
         ctx_size: i32,
         n_threads: i32,
         power_percent: i32,
+        tuning: &crate::config::EngineTuning,
     ) -> Result<Self, EngineError> {
         set_metal_source_env();
         let path = model_path.as_ref();
         let c_path = CString::new(path.to_string_lossy().as_bytes())
             .map_err(|_| EngineError::new("model path contains a NUL byte"))?;
+        let c_opt_path = |p: Option<&Path>, what: &str| -> Result<Option<CString>, EngineError> {
+            p.map(|p| {
+                CString::new(p.to_string_lossy().as_bytes())
+                    .map_err(|_| EngineError::new(format!("{what} path contains a NUL byte")))
+            })
+            .transpose()
+        };
+        let c_mtp = c_opt_path(tuning.mtp_path.as_deref(), "mtp model")?;
+        let c_steering = c_opt_path(tuning.dir_steering_file.as_deref(), "dir-steering file")?;
+        let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
-            mtp_path: std::ptr::null(),
+            mtp_path: as_ptr(&c_mtp),
             backend,
             n_threads,
-            prefill_chunk: 0,
-            mtp_draft_tokens: 0,
-            mtp_margin: 0.0,
-            directional_steering_file: std::ptr::null(),
+            prefill_chunk: tuning.prefill_chunk,
+            mtp_draft_tokens: tuning.mtp_draft_tokens,
+            mtp_margin: tuning.mtp_margin,
+            directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
-            directional_steering_attn: 0.0,
-            directional_steering_ffn: 0.0,
+            directional_steering_attn: tuning.dir_steering_attn,
+            directional_steering_ffn: tuning.dir_steering_ffn,
             power_percent,
-            ssd_streaming_cache_experts: 0,
-            ssd_streaming_cache_bytes: 0,
-            ssd_streaming_preload_experts: 0,
-            simulate_used_memory_bytes: 0,
-            warm_weights: false,
-            quality: false,
-            ssd_streaming: false,
-            ssd_streaming_cold: false,
+            ssd_streaming_cache_experts: tuning.ssd_streaming_cache_experts,
+            ssd_streaming_cache_bytes: tuning.ssd_streaming_cache_bytes,
+            ssd_streaming_preload_experts: tuning.ssd_streaming_preload_experts,
+            simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
+            warm_weights: tuning.warm_weights,
+            quality: tuning.quality,
+            ssd_streaming: tuning.ssd_streaming,
+            ssd_streaming_cold: tuning.ssd_streaming_cold,
             inspect_only: false,
             load_slice: false,
             load_layer_start: 0,
@@ -169,7 +181,7 @@ impl Ds4Engine {
             },
         };
         let mut engine: *mut ffi::Ds4Engine = std::ptr::null_mut();
-        // SAFETY: opts and its CString outlive the call; engine is a valid out-ptr.
+        // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
         let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
         if rc != 0 || engine.is_null() {
             let mut msg = format!("failed to open model {}", path.display());

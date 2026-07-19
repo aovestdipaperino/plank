@@ -114,6 +114,16 @@ impl DsmlParser {
         &self.error
     }
 
+    /// Snapshot of the invoke currently being parsed (name plus the
+    /// arguments whose close tags have arrived), for mid-stream preflight.
+    #[must_use]
+    pub fn pending_call(&self) -> Option<ToolCall> {
+        self.current.as_ref().map(|c| ToolCall {
+            name: c.name.clone(),
+            args: c.args.clone(),
+        })
+    }
+
     /// Raw bytes of the stanza accumulated so far, for diagnostics.
     #[must_use]
     pub fn raw(&self) -> &[u8] {
