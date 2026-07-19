@@ -90,6 +90,14 @@ test` and review the diff before committing.
   previous). Session transcripts are never touched. Pick release numbers
   accordingly: bump minor when the sysprompt or engine snapshot format
   moves, major when older caches must not be trusted at all.
+- **Never bake filesystem paths in with `env!` for shipped binaries.** The
+  Metal kernel dir compiled in via `env!("DS4_METAL_DIR")` was the CI
+  runner's checkout, so every brew install failed model load with a
+  misleading "failed to open model" (fixed in v0.9.10). `metal_source_dir`
+  in `src/ds4engine.rs` now resolves at runtime: `DS4_METAL_DIR` env →
+  compile-time path (dev builds) → `../share/plank/metal` next to the
+  executable (bottles ship the kernels there). Keep any new bundled-asset
+  lookup on the same pattern.
 - **The default quant needs ~82 GB resident**, hence the hard 96 GB RAM
   guard before any download or model load (`src/main.rs`).
 - **Download resume trap:** a `.part` file already matching the full
