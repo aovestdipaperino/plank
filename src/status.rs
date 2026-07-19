@@ -11,6 +11,12 @@ pub const STATUS_STYLE_END: &str = "\x1b[0m";
 /// 256-color index of the theme color (military green) used for accents
 /// such as the filled portion of the progress bar.
 pub const THEME_COLOR: u8 = 106;
+
+/// Bright highlight color for the shimmer sweeping across the spinner verb.
+pub const SHIMMER_COLOR: u8 = 231;
+
+/// Milliseconds per shimmer step (one display column of travel).
+pub const SHIMMER_STEP_MS: u64 = 200;
 /// ANSI style for the filled portion of the progress bar (theme color).
 pub const STATUS_BAR_FILL: &str = "\x1b[48;5;238;38;5;106;1m";
 /// ANSI style for the queued-prompt preview rows.

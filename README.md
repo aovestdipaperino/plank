@@ -53,6 +53,7 @@ Run with a prompt argument for one-shot headless mode.
 Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-facing side. Features that exist only in plank:
 
 - **Ratatui TUI** — the C reference is a plain line REPL; plank auto-selects a full-screen TUI when running on a terminal, with markdown rendering of assistant replies, tree-sitter syntax highlighting in code blocks, and mouse-wheel scrollback.
+- **Animated status bar** — the spinner verb in the status bar gets a Claude-Code-style shimmer: a bright highlight sweeps across the word while the model is prefilling or generating. The `🪵>` input prompt hides entirely (cursor included) while the agent is busy, reappearing when it's ready for input.
 - **`/init`** — asks the model to analyze the codebase and generate an `AGENTS.md` for future sessions (build/test commands, architecture, gotchas).
 - **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
 - **Session-start context** — plank automatically injects git status, recent commits, discovered `AGENTS.md`/`CLAUDE.md` files, and the current date at the start of each session.

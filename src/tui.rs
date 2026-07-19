@@ -450,14 +450,63 @@ pub fn draw(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(status, status_style)).style(status_style),
+        Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
         rows[2],
     );
 }
 
+/// Milliseconds since the first frame, driving the shimmer sweep.
+fn anim_tick_ms() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+    u64::try_from(
+        EPOCH
+            .get_or_init(std::time::Instant::now)
+            .elapsed()
+            .as_millis(),
+    )
+    .unwrap_or(0)
+}
+
+/// Pushes the accent word with a shimmer: a 3-column bright highlight sweeps
+/// right-to-left across the word, one column per `SHIMMER_STEP_MS`, over a
+/// cycle of word width + 20 columns (so the highlight rests off-text between
+/// sweeps).
+fn push_shimmered(spans: &mut Vec<Span<'static>>, word: &str, tick_ms: u64, theme: Style) {
+    let shimmer = theme.fg(Color::Indexed(crate::status::SHIMMER_COLOR));
+    let width = i64::try_from(word.chars().count()).unwrap_or(0);
+    let cycle = width + 20;
+    let step = i64::try_from(tick_ms / crate::status::SHIMMER_STEP_MS).unwrap_or(0);
+    let center = width + 10 - step % cycle;
+    // Split into before / shimmer / after segments by char column.
+    let (mut before, mut shim, mut after) = (String::new(), String::new(), String::new());
+    for (col, ch) in word.chars().enumerate() {
+        let col = i64::try_from(col).unwrap_or(i64::MAX);
+        if col < center - 1 {
+            before.push(ch);
+        } else if col <= center + 1 {
+            shim.push(ch);
+        } else {
+            after.push(ch);
+        }
+    }
+    for (text, style) in [(before, theme), (shim, shimmer), (after, theme)] {
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+    }
+}
+
 /// Pushes spans for `seg`, painting the accent word — `prefill` before the
-/// bar, or the trailing-`…` spinner verb — in the theme color.
-fn push_accented(spans: &mut Vec<Span<'static>>, seg: &str, base: Style, theme: Style) {
+/// bar, or the trailing-`…` spinner verb — in the theme color with the
+/// shimmer animation sweeping across it.
+fn push_accented(
+    spans: &mut Vec<Span<'static>>,
+    seg: &str,
+    tick_ms: u64,
+    base: Style,
+    theme: Style,
+) {
     let range = seg
         .find("prefill")
         .map(|i| (i, i + "prefill".len()))
@@ -469,7 +518,7 @@ fn push_accented(spans: &mut Vec<Span<'static>>, seg: &str, base: Style, theme: 
         });
     if let Some((start, end)) = range {
         spans.push(Span::styled(seg[..start].to_string(), base));
-        spans.push(Span::styled(seg[start..end].to_string(), theme));
+        push_shimmered(spans, &seg[start..end], tick_ms, theme);
         spans.push(Span::styled(seg[end..].to_string(), base));
     } else {
         spans.push(Span::styled(seg.to_string(), base));
@@ -481,7 +530,7 @@ fn push_accented(spans: &mut Vec<Span<'static>>, seg: &str, base: Style, theme: 
 ///
 /// The bar segment lives between `[` and `]`; `▶` cells render in the theme
 /// color (military green) and `·` cells a dim gray.
-fn status_bar_line(text: &str, base: Style) -> Line<'static> {
+fn status_bar_line(text: &str, tick_ms: u64, base: Style) -> Line<'static> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
@@ -490,11 +539,11 @@ fn status_bar_line(text: &str, base: Style) -> Line<'static> {
         .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
     let Some((open, close)) = bar else {
         let mut spans = Vec::new();
-        push_accented(&mut spans, text, base, theme);
+        push_accented(&mut spans, text, tick_ms, base, theme);
         return Line::from(spans);
     };
     let mut spans = Vec::new();
-    push_accented(&mut spans, &text[..=open], base, theme);
+    push_accented(&mut spans, &text[..=open], tick_ms, base, theme);
     for ch in text[open + 1..close].chars() {
         let style = match ch {
             '▶' => theme,
@@ -607,6 +656,32 @@ mod tests {
                 .any(|s| s.content.as_ref() == "b"
                     && s.style.add_modifier.contains(Modifier::BOLD))
         );
+    }
+
+    #[test]
+    fn verb_shimmer_sweeps_across_the_word() {
+        let base = Style::default();
+        let shimmer = Color::Indexed(crate::status::SHIMMER_COLOR);
+        // Collect the shimmer segment text at each step of one full cycle.
+        let text = "◆ Pondering… 3s";
+        let mut highlights = Vec::new();
+        for step in 0..40u64 {
+            let line = status_bar_line(text, step * crate::status::SHIMMER_STEP_MS, base);
+            let hit: String = line
+                .spans
+                .iter()
+                .filter(|s| s.style.fg == Some(shimmer))
+                .map(|s| s.content.as_ref())
+                .collect();
+            highlights.push(hit);
+        }
+        // The highlight moves: several distinct segments appear, including
+        // off-text (empty) phases and at least one mid-word slice.
+        highlights.sort_unstable();
+        highlights.dedup();
+        assert!(highlights.len() > 3, "static shimmer: {highlights:?}");
+        assert!(highlights.iter().any(String::is_empty));
+        assert!(highlights.iter().any(|h| h.contains("nde")));
     }
 
     #[test]
