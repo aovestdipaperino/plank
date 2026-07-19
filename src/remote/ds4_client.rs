@@ -66,6 +66,12 @@ impl RemoteDs4Engine {
                 info.protocol_version
             )));
         }
+        // Surface the shared-engine accounting (issue #28, design §9 step 5)
+        // when the server is running one; a single-owner server sends
+        // `shared: None` and this is silently skipped.
+        if let Some(line) = info.shared_status_line() {
+            eprintln!("plank: {line}");
+        }
         Ok(Self {
             base,
             token,

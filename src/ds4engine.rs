@@ -257,11 +257,15 @@ impl Ds4Model {
         Ok(model)
     }
 
-    /// Creates a fresh FFI session over the shared weights.
-    fn create_session(&self) -> Result<*mut ffi::Ds4Session, EngineError> {
+    /// Creates a fresh FFI session over the shared weights with a context
+    /// window of `ctx_size` tokens (design §7, v2 per-client sizing). `ctx_size`
+    /// is clamped to `[1, self.ctx_size]` so a session never over-books the
+    /// model's configured maximum.
+    fn create_session(&self, ctx_size: i32) -> Result<*mut ffi::Ds4Session, EngineError> {
+        let ctx_size = ctx_size.clamp(1, self.ctx_size.max(1));
         let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
         // SAFETY: engine valid; session is a valid out-ptr.
-        let rc = unsafe { ffi::ds4_session_create(&raw mut session, self.engine, self.ctx_size) };
+        let rc = unsafe { ffi::ds4_session_create(&raw mut session, self.engine, ctx_size) };
         if rc != 0 || session.is_null() {
             return Err(EngineError::new("failed to create session"));
         }
@@ -447,10 +451,11 @@ impl Drop for Ds4Model {
 }
 
 impl ModelHandle for Ds4Model {
-    fn spawn(self: Arc<Self>) -> Result<Box<dyn HostSession>, EngineError> {
+    fn spawn(self: Arc<Self>, ctx_size: i32) -> Result<Box<dyn HostSession>, EngineError> {
         // Fresh session over the shared weights, warmed from the captured
-        // system-prompt snapshot so attach never cold-prefills it (§6).
-        let session = self.create_session()?;
+        // system-prompt snapshot so attach never cold-prefills it (§6). The
+        // host clamps `ctx_size` to the model range; `create_session` re-clamps.
+        let session = self.create_session(ctx_size)?;
         if let Some(warm) = self.warm.lock().unwrap().as_ref()
             && let Err(e) = warm.restore(session)
         {
@@ -550,7 +555,8 @@ impl Ds4Session {
     /// Ensures a live session exists, creating it lazily.
     fn ensure_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
         if self.session.is_null() {
-            self.session = self.model.create_session()?;
+            // Single-owner path: the session gets the model's full context.
+            self.session = self.model.create_session(self.model.ctx_size)?;
         }
         Ok(self.session)
     }
@@ -1417,6 +1423,62 @@ mod tests {
         assert!(stats.generated > 0);
     }
 
+    // Per-client ctx sizing over the real engine (design §7, v2). Inspection-
+    // only without a model: a smaller requested ctx_size must be honored by
+    // `ds4_session_create`, surface in host status, and still generate.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn attach_sized_honors_smaller_ctx() {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+            None,
+        )
+        .unwrap();
+        let host = EngineHost::new(model, HostConfig::default());
+        let s = host.attach_sized(Some(1024)).unwrap();
+        // The session's configured ctx is surfaced in status as requested.
+        let mut sized = false;
+        for _ in 0..200 {
+            if host.status().sessions.iter().any(|a| a.ctx_size == 1024) {
+                sized = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(
+            sized,
+            "requested per-session ctx_size is honored + reported"
+        );
+        let stats = s
+            .generate(
+                "[user]\nSay hi.\n",
+                &crate::engine::GenerationOptions {
+                    n_predict: 8,
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(stats.generated > 0);
+    }
+
     #[cfg(ds4_engine)]
     #[test]
     fn two_sessions_no_cross_contamination() {
@@ -1510,6 +1572,7 @@ mod tests {
                 max_sessions: 2,
                 slice_tokens: crate::host::DEFAULT_SLICE_TOKENS,
                 idle_reclaim: Some(Duration::from_millis(200)),
+                ..HostConfig::default()
             },
         );
         let s = host.attach().unwrap();

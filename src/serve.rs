@@ -138,11 +138,14 @@ fn handle_conn_shared(
                     live_sessions: st.live_sessions,
                     max_sessions: st.max_sessions,
                     resident_ctx_tokens: st.resident_ctx_tokens,
+                    kv_bytes: st.kv_bytes,
+                    kv_budget_bytes: st.kv_budget_bytes,
                     sessions: st
                         .sessions
                         .into_iter()
                         .map(|s| SessionStatus {
                             id: s.id,
+                            ctx_size: s.ctx_size,
                             ctx_tokens: s.ctx_tokens,
                             reclaimed: s.reclaimed,
                         })
@@ -204,7 +207,11 @@ fn handle_generate_shared(
         if let Some(h) = map.get(&gen_req.session_id) {
             Arc::clone(h)
         } else {
-            match host.attach() {
+            // Per-client context sizing (design §7, v2): honor a positive
+            // requested `ctx_size` from the client's options, else let the host
+            // apply its configured default. The host clamps to the model max.
+            let requested = (gen_req.opts.ctx_size > 0).then_some(gen_req.opts.ctx_size);
+            match host.attach_sized(requested) {
                 Ok(h) => {
                     let h = Arc::new(h);
                     map.insert(gen_req.session_id.clone(), Arc::clone(&h));

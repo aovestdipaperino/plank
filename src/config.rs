@@ -83,6 +83,18 @@ pub struct AgentConfig {
     /// seconds, restoring transparently on the next request (design §7). `0`
     /// (default) disables reclamation entirely — a strict no-op.
     pub idle_reclaim_secs: u64,
+    /// `--session-ctx-size`: default per-session context window in tokens for
+    /// `--shared-engine` (design §7, v2). `0` (default) means each session gets
+    /// the model's full `ctx_size`; a smaller value fits more clients. A
+    /// per-request `ctx_size` from a client overrides this. Clamped to the model
+    /// maximum.
+    pub session_ctx_size: i32,
+    /// `--kv-budget-bytes`: aggregate KV-bytes admission budget for
+    /// `--shared-engine` (design §7, v2). `0` (default) keeps admission
+    /// count-only; a positive value rejects an `attach` that would push the
+    /// host's estimated resident KV past the budget, bounding RAM instead of
+    /// OOM-ing.
+    pub kv_budget_bytes: u64,
     /// Third-party provider from `--provider openai|anthropic` (flavor b, issue
     /// #26); selects [`crate::remote::provider::ProviderEngine`]. `None` unless
     /// `--provider` was given.
@@ -255,6 +267,8 @@ impl Default for AgentConfig {
             shared_engine: false,
             max_sessions: i32::try_from(crate::host::DEFAULT_MAX_SESSIONS).unwrap_or(8),
             idle_reclaim_secs: 0,
+            session_ctx_size: 0,
+            kv_budget_bytes: 0,
             provider: None,
             provider_model: None,
             provider_base_url: None,
@@ -304,6 +318,12 @@ Options:
       --idle-reclaim-secs S  snapshot & reclaim a session's KV after it is idle S
                            seconds, restoring on next request (--shared-engine;
                            default 0 = off)
+      --session-ctx-size N default per-session context window in tokens for
+                           --shared-engine; fits more clients (default 0 = model
+                           max; a client's own ctx_size request overrides)
+      --kv-budget-bytes B  aggregate KV-bytes admission budget for --shared-engine;
+                           reject an attach past B rather than OOM (default 0 = off,
+                           count-only admission)
       --provider NAME      drive a third-party LLM API: openai (OpenAI-compatible,
                            also vLLM/Ollama/OpenRouter) or anthropic. Use with
                            --model NAME; key from --api-key or $OPENAI_API_KEY /
@@ -611,6 +631,10 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                 c.idle_reclaim_secs =
                     u64::try_from(parse_int(need_arg(&mut i)?, arg)?.max(0)).unwrap_or(0);
             }
+            "--session-ctx-size" => c.session_ctx_size = parse_int(need_arg(&mut i)?, arg)?.max(0),
+            "--kv-budget-bytes" => {
+                c.kv_budget_bytes = parse_u64(need_arg(&mut i)?, arg)?;
+            }
             "--provider" => {
                 c.provider = Some(match need_arg(&mut i)? {
                     "openai" => ProviderSelector::OpenAi,
@@ -761,6 +785,23 @@ mod tests {
         // Reclamation is off by default (strict no-op).
         let d = parse_options(&args(&["--shared-engine"])).unwrap();
         assert_eq!(d.idle_reclaim_secs, 0);
+        // Per-session sizing + KV budget default to off (today's behavior).
+        assert_eq!(d.session_ctx_size, 0);
+        assert_eq!(d.kv_budget_bytes, 0);
+    }
+
+    #[test]
+    fn parses_session_ctx_size_and_kv_budget() {
+        let c = parse_options(&args(&[
+            "--shared-engine",
+            "--session-ctx-size",
+            "2048",
+            "--kv-budget-bytes",
+            "1073741824",
+        ]))
+        .unwrap();
+        assert_eq!(c.session_ctx_size, 2048);
+        assert_eq!(c.kv_budget_bytes, 1_073_741_824);
     }
 
     #[test]

@@ -42,6 +42,14 @@ pub struct SharedStatus {
     pub max_sessions: usize,
     /// Aggregate resident KV, in tokens, summed over non-reclaimed sessions.
     pub resident_ctx_tokens: i64,
+    /// Aggregate estimated KV bytes granted across attached sessions (design
+    /// §7, v2). `#[serde(default)]` so an older server (no KV accounting) still
+    /// round-trips to zero.
+    #[serde(default)]
+    pub kv_bytes: u64,
+    /// Configured aggregate KV-bytes budget, if any (`--kv-budget-bytes`).
+    #[serde(default)]
+    pub kv_budget_bytes: Option<u64>,
     /// Per-session accounting, one entry per attached session.
     pub sessions: Vec<SessionStatus>,
 }
@@ -51,11 +59,65 @@ pub struct SharedStatus {
 pub struct SessionStatus {
     /// Opaque host-assigned session id.
     pub id: u64,
+    /// Configured per-session context window, in tokens (design §7, v2).
+    #[serde(default)]
+    pub ctx_size: i32,
     /// Resident context size, in tokens (0 while reclaimed to disk).
     pub ctx_tokens: i32,
     /// True when this session's KV has been snapshotted to disk and its live
     /// context reclaimed; it restores transparently on the next request.
     pub reclaimed: bool,
+}
+
+/// Formats a byte count as a short human-readable string (B/KiB/MiB/GiB).
+fn human_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    #[allow(clippy::cast_precision_loss)]
+    let bytes = n as f64;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes / KIB)
+    } else {
+        format!("{n} B")
+    }
+}
+
+impl SharedStatus {
+    /// Renders a one-line human-readable summary of the shared-engine state for
+    /// a client status line: live/max sessions, aggregate KV usage against any
+    /// budget, and how many sessions are currently reclaimed to disk (design §9
+    /// step 5).
+    #[must_use]
+    pub fn status_line(&self) -> String {
+        let reclaimed = self.sessions.iter().filter(|s| s.reclaimed).count();
+        let kv = match self.kv_budget_bytes {
+            Some(budget) => format!(
+                "KV {} / {}",
+                human_bytes(self.kv_bytes),
+                human_bytes(budget)
+            ),
+            None => format!("KV {}", human_bytes(self.kv_bytes)),
+        };
+        format!(
+            "shared engine: {}/{} sessions, {kv}, {} resident tokens, {reclaimed} reclaimed",
+            self.live_sessions, self.max_sessions, self.resident_ctx_tokens
+        )
+    }
+}
+
+impl InfoResponse {
+    /// The shared-engine status line, or `None` for a single-owner server (which
+    /// sends `shared: None`) — so a client renders it only when present and
+    /// degrades gracefully otherwise.
+    #[must_use]
+    pub fn shared_status_line(&self) -> Option<String> {
+        self.shared.as_ref().map(SharedStatus::status_line)
+    }
 }
 
 /// Serde mirror of [`ThinkMode`] (the engine enum is not itself serializable).
@@ -276,6 +338,87 @@ mod tests {
             .to_engine_event()
             .is_none()
         );
+    }
+
+    #[test]
+    fn shared_status_renders_and_absent_degrades() {
+        // A shared server: the status line reports sessions, KV vs. budget, and
+        // reclaimed count (design §9 step 5).
+        let info = InfoResponse {
+            model_name: "m".into(),
+            ctx_size: 4096,
+            protocol_version: PROTOCOL_VERSION,
+            shared: Some(SharedStatus {
+                live_sessions: 2,
+                max_sessions: 8,
+                resident_ctx_tokens: 100,
+                kv_bytes: 512 * 1024 * 1024,
+                kv_budget_bytes: Some(1024 * 1024 * 1024),
+                sessions: vec![
+                    SessionStatus {
+                        id: 1,
+                        ctx_size: 4096,
+                        ctx_tokens: 100,
+                        reclaimed: false,
+                    },
+                    SessionStatus {
+                        id: 2,
+                        ctx_size: 2048,
+                        ctx_tokens: 0,
+                        reclaimed: true,
+                    },
+                ],
+            }),
+        };
+        let line = info.shared_status_line().expect("shared present renders");
+        assert!(line.contains("2/8 sessions"));
+        assert!(line.contains("512.0 MiB"));
+        assert!(line.contains("1.0 GiB"));
+        assert!(line.contains("1 reclaimed"));
+
+        // A single-owner server sends `shared: None`; the client degrades to no
+        // status line rather than erroring.
+        let single = InfoResponse {
+            model_name: "m".into(),
+            ctx_size: 4096,
+            protocol_version: PROTOCOL_VERSION,
+            shared: None,
+        };
+        assert!(single.shared_status_line().is_none());
+    }
+
+    #[test]
+    fn info_roundtrips_shared_block_and_old_client_default() {
+        // A newer server's shared block survives a JSON round-trip, and a
+        // payload with no `shared` field parses to None (pre-#28 compatibility).
+        let info = InfoResponse {
+            model_name: "m".into(),
+            ctx_size: 4096,
+            protocol_version: PROTOCOL_VERSION,
+            shared: Some(SharedStatus {
+                live_sessions: 1,
+                max_sessions: 4,
+                resident_ctx_tokens: 42,
+                kv_bytes: 4096,
+                kv_budget_bytes: None,
+                sessions: vec![SessionStatus {
+                    id: 7,
+                    ctx_size: 1024,
+                    ctx_tokens: 42,
+                    reclaimed: false,
+                }],
+            }),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: InfoResponse = serde_json::from_str(&json).unwrap();
+        let s = back.shared.expect("shared round-trips");
+        assert_eq!(s.kv_bytes, 4096);
+        assert_eq!(s.sessions[0].ctx_size, 1024);
+
+        let legacy: InfoResponse =
+            serde_json::from_str(r#"{"model_name":"m","ctx_size":4096,"protocol_version":1}"#)
+                .unwrap();
+        assert!(legacy.shared.is_none());
     }
 
     #[test]

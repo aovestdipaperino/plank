@@ -33,6 +33,13 @@ pub const DEFAULT_SLICE_TOKENS: usize = 12;
 /// Default conservative admission cap on concurrently attached sessions.
 pub const DEFAULT_MAX_SESSIONS: usize = 8;
 
+/// Fallback estimate of resident KV bytes per context token, used by the
+/// KV-bytes admission budget when the model does not supply a better figure
+/// (design §7). Deliberately conservative; the real per-token cost depends on
+/// the model's layer/head geometry and quant. Only used to *size* admission,
+/// never to allocate — over-estimating simply admits fewer sessions.
+pub const DEFAULT_KV_BYTES_PER_TOKEN: u64 = 128 * 1024;
+
 /// Host tuning knobs.
 #[derive(Debug, Clone, Copy)]
 pub struct HostConfig {
@@ -45,6 +52,17 @@ pub struct HostConfig {
     /// longer than `d` has its live KV snapshotted to disk and reclaimed, and is
     /// restored transparently on its next request.
     pub idle_reclaim: Option<Duration>,
+    /// Default per-session context window, in tokens (design §7, v2). `None`
+    /// (default) means each session gets the model's full `ctx_size`; a smaller
+    /// value lets more clients fit. A per-`attach` request overrides this.
+    /// Always clamped to `[1, model ctx_size]`.
+    pub session_ctx_size: Option<i32>,
+    /// Aggregate KV-bytes admission budget (design §7, v2). `None` (default)
+    /// keeps admission count-only. When `Some(b)`, `attach` is rejected with a
+    /// real [`EngineError`] once granting the new session's estimated KV bytes
+    /// would push the host's total past `b` — bounding resident memory instead
+    /// of OOM-ing.
+    pub kv_budget_bytes: Option<u64>,
 }
 
 impl Default for HostConfig {
@@ -53,8 +71,20 @@ impl Default for HostConfig {
             max_sessions: DEFAULT_MAX_SESSIONS,
             slice_tokens: DEFAULT_SLICE_TOKENS,
             idle_reclaim: None,
+            session_ctx_size: None,
+            kv_budget_bytes: None,
         }
     }
+}
+
+/// Clamps a requested per-session context size into `[1, model_ctx]`.
+fn clamp_ctx_size(requested: i32, model_ctx: i32) -> i32 {
+    requested.clamp(1, model_ctx.max(1))
+}
+
+/// Estimated resident KV bytes for a session of `ctx_size` tokens.
+fn est_kv_bytes(ctx_size: i32, per_token: u64) -> u64 {
+    u64::try_from(ctx_size.max(0)).unwrap_or(0) * per_token
 }
 
 /// Per-session KV/context accounting (design §7, §9 step 5).
@@ -62,6 +92,8 @@ impl Default for HostConfig {
 pub struct SessionAccount {
     /// Opaque host-assigned session id.
     pub id: u64,
+    /// Configured per-session context window, in tokens (design §7, v2).
+    pub ctx_size: i32,
     /// Resident context size in tokens (0 while reclaimed to disk).
     pub ctx_tokens: i32,
     /// True when the session's KV is snapshotted to disk and its live context
@@ -82,6 +114,12 @@ pub struct HostStatus {
     pub ctx_size: i32,
     /// Aggregate resident KV in tokens, summed over non-reclaimed sessions.
     pub resident_ctx_tokens: i64,
+    /// Aggregate estimated KV bytes granted across attached sessions, summed
+    /// over their configured `ctx_size` (design §7, v2). Independent of the
+    /// reclaimed/resident distinction: the budget bounds *granted* contexts.
+    pub kv_bytes: u64,
+    /// Configured aggregate KV-bytes budget, if any (`--kv-budget-bytes`).
+    pub kv_budget_bytes: Option<u64>,
     /// Per-session accounting, sorted by id.
     pub sessions: Vec<SessionAccount>,
 }
@@ -94,11 +132,14 @@ pub struct HostStatus {
 /// weights, positioned after the warm system-prompt prefix (§6). It runs on
 /// the GPU worker thread, so implementations may freely touch the engine.
 pub trait ModelHandle: Send + Sync + 'static {
-    /// Creates a fresh session over the shared weights.
+    /// Creates a fresh session over the shared weights with a context window of
+    /// `ctx_size` tokens (design §7, v2 per-client sizing). The host clamps
+    /// `ctx_size` to `[1, self.ctx_size()]` before calling, so implementations
+    /// may pass it straight to `ds4_session_create`.
     ///
     /// # Errors
     /// Returns [`EngineError`] if the session cannot be created.
-    fn spawn(self: Arc<Self>) -> Result<Box<dyn HostSession>, EngineError>;
+    fn spawn(self: Arc<Self>, ctx_size: i32) -> Result<Box<dyn HostSession>, EngineError>;
 
     /// Human-readable model name for status displays.
     fn model_name(&self) -> String {
@@ -107,6 +148,13 @@ pub trait ModelHandle: Send + Sync + 'static {
 
     /// Context window size in tokens.
     fn ctx_size(&self) -> i32;
+
+    /// Estimated resident KV bytes per context token, for the KV-bytes
+    /// admission budget (design §7). The default is a conservative constant;
+    /// a backend that knows its true per-token cost may override it.
+    fn kv_bytes_per_token(&self) -> u64 {
+        DEFAULT_KV_BYTES_PER_TOKEN
+    }
 
     /// Approximate token count of `text` for context accounting. Reads only the
     /// immutable tokenizer, so it may run off the GPU thread (design §3).
@@ -177,6 +225,9 @@ enum Yield {
 /// Work submitted to the GPU worker thread.
 enum Command {
     Attach {
+        /// Requested per-session context size; `None` uses the host default
+        /// (`session_ctx_size`, else the model's full `ctx_size`).
+        ctx_size: Option<i32>,
         reply: Sender<Result<u64, EngineError>>,
     },
     Generate {
@@ -257,15 +308,29 @@ impl EngineHost {
         self.status.lock().unwrap().clone()
     }
 
-    /// Attaches a new session, restoring the warm system-prompt prefix (§6).
+    /// Attaches a new session at the host default context size, restoring the
+    /// warm system-prompt prefix (§6).
     ///
     /// # Errors
     /// Returns a real (non-`unsupported`) [`EngineError`] when the admission
-    /// cap is reached or the session cannot be created (design §7).
+    /// cap or KV-bytes budget is reached or the session cannot be created
+    /// (design §7).
     pub fn attach(&self) -> Result<SessionHandle, EngineError> {
+        self.attach_sized(None)
+    }
+
+    /// Attaches a new session with a requested per-session context size (design
+    /// §7, v2). `None` uses the host default; the value is clamped to
+    /// `[1, ctx_size]`. Smaller contexts let more clients fit under the
+    /// KV-bytes budget.
+    ///
+    /// # Errors
+    /// Returns a real (non-`unsupported`) [`EngineError`] when the admission
+    /// cap or KV-bytes budget is reached or the session cannot be created.
+    pub fn attach_sized(&self, ctx_size: Option<i32>) -> Result<SessionHandle, EngineError> {
         let (reply, reply_rx) = channel();
         self.cmd_tx
-            .send(Command::Attach { reply })
+            .send(Command::Attach { ctx_size, reply })
             .map_err(|_| EngineError::new("engine host stopped"))?;
         let id = reply_rx
             .recv()
@@ -370,16 +435,24 @@ static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 struct SessionSlot {
     session: Option<Box<dyn HostSession>>,
     last_active: Instant,
+    /// Configured per-session context window, in tokens (design §7, v2). Fixed
+    /// at attach; used to re-`spawn` after idle reclamation and to bill the
+    /// KV-bytes budget.
+    ctx_size: i32,
+    /// Estimated KV bytes this session is billed against the budget.
+    kv_bytes: u64,
     ctx_tokens: i32,
     snapshot_path: Option<PathBuf>,
 }
 
 impl SessionSlot {
-    fn new(session: Box<dyn HostSession>) -> Self {
+    fn new(session: Box<dyn HostSession>, ctx_size: i32, kv_bytes: u64) -> Self {
         let ctx_tokens = session.ctx_tokens();
         Self {
             session: Some(session),
             last_active: Instant::now(),
+            ctx_size,
+            kv_bytes,
             ctx_tokens,
             snapshot_path: None,
         }
@@ -406,7 +479,7 @@ fn scheduler_loop(
         if rotation.is_empty() {
             match recv_or_reclaim(cmd_rx, cfg.idle_reclaim) {
                 RecvOutcome::Command(cmd) => {
-                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg.max_sessions) {
+                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
                         return;
                     }
                 }
@@ -417,17 +490,17 @@ fn scheduler_loop(
                 }
                 RecvOutcome::Disconnected => return,
             }
-            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size);
         }
         let mut dirty = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg.max_sessions) {
+            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
                 return;
             }
             dirty = true;
         }
         if dirty {
-            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size);
         }
 
         // One round-robin pass: give each active job a single K-token slice,
@@ -468,7 +541,7 @@ fn scheduler_loop(
             }
         }
         if completed {
-            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size);
         }
     }
 }
@@ -551,13 +624,14 @@ fn idle_snapshot_path(id: u64) -> PathBuf {
 fn publish_status(
     status: &Mutex<HostStatus>,
     sessions: &HashMap<u64, SessionSlot>,
-    max_sessions: usize,
+    cfg: HostConfig,
     ctx_size: i32,
 ) {
     let mut accounts: Vec<SessionAccount> = sessions
         .iter()
         .map(|(id, slot)| SessionAccount {
             id: *id,
+            ctx_size: slot.ctx_size,
             ctx_tokens: slot.ctx_tokens,
             reclaimed: slot.session.is_none(),
         })
@@ -568,11 +642,14 @@ fn publish_status(
         .filter(|s| s.session.is_some())
         .map(|s| i64::from(s.ctx_tokens))
         .sum();
+    let kv_bytes: u64 = sessions.values().map(|s| s.kv_bytes).sum();
     let mut g = status.lock().unwrap();
     g.live_sessions = sessions.len();
-    g.max_sessions = max_sessions;
+    g.max_sessions = cfg.max_sessions;
     g.ctx_size = ctx_size;
     g.resident_ctx_tokens = resident;
+    g.kv_bytes = kv_bytes;
+    g.kv_budget_bytes = cfg.kv_budget_bytes;
     g.sessions = accounts;
 }
 
@@ -582,18 +659,34 @@ fn apply_command(
     model: &Arc<dyn ModelHandle>,
     sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &mut VecDeque<ActiveJob>,
-    max_sessions: usize,
+    cfg: HostConfig,
 ) -> bool {
     match cmd {
-        Command::Attach { reply } => {
-            let result = if sessions.len() >= max_sessions {
+        Command::Attach { ctx_size, reply } => {
+            let model_ctx = model.ctx_size();
+            // Requested size, else the host default, else the model's full ctx;
+            // always clamped into the model's range (design §7, v2).
+            let requested = ctx_size.or(cfg.session_ctx_size).unwrap_or(model_ctx);
+            let ctx = clamp_ctx_size(requested, model_ctx);
+            let new_bytes = est_kv_bytes(ctx, model.kv_bytes_per_token());
+            let current_bytes: u64 = sessions.values().map(|s| s.kv_bytes).sum();
+            let result = if sessions.len() >= cfg.max_sessions {
                 Err(EngineError::new(format!(
-                    "engine host at capacity: {max_sessions} sessions already attached"
+                    "engine host at capacity: {} sessions already attached",
+                    cfg.max_sessions
+                )))
+            } else if let Some(budget) = cfg.kv_budget_bytes
+                && current_bytes.saturating_add(new_bytes) > budget
+            {
+                Err(EngineError::new(format!(
+                    "engine host KV budget exceeded: {current_bytes} + {new_bytes} bytes \
+                     would exceed the {budget}-byte budget ({} sessions attached)",
+                    sessions.len()
                 )))
             } else {
-                Arc::clone(model).spawn().map(|session| {
+                Arc::clone(model).spawn(ctx).map(|session| {
                     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-                    sessions.insert(id, SessionSlot::new(session));
+                    sessions.insert(id, SessionSlot::new(session, ctx, new_bytes));
                     id
                 })
             };
@@ -645,7 +738,7 @@ fn restore_reclaimed(
     model: &Arc<dyn ModelHandle>,
     slot: &mut SessionSlot,
 ) -> Result<(), EngineError> {
-    let mut session = Arc::clone(model).spawn()?;
+    let mut session = Arc::clone(model).spawn(slot.ctx_size)?;
     if let Some(path) = slot.snapshot_path.take() {
         let bytes =
             std::fs::read(&path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
@@ -686,9 +779,9 @@ struct EchoSharedSession {
 }
 
 impl ModelHandle for EchoSharedModel {
-    fn spawn(self: Arc<Self>) -> Result<Box<dyn HostSession>, EngineError> {
+    fn spawn(self: Arc<Self>, ctx_size: i32) -> Result<Box<dyn HostSession>, EngineError> {
         Ok(Box::new(EchoSharedSession {
-            engine: EchoEngine::new(self.ctx_size),
+            engine: EchoEngine::new(ctx_size),
             pending: None,
             ctx_tokens: 0,
         }))
@@ -767,7 +860,7 @@ mod tests {
     }
 
     impl ModelHandle for EchoModel {
-        fn spawn(self: Arc<Self>) -> Result<Box<dyn HostSession>, EngineError> {
+        fn spawn(self: Arc<Self>, _ctx_size: i32) -> Result<Box<dyn HostSession>, EngineError> {
             let id = self.next_session.fetch_add(1, Ordering::Relaxed);
             Ok(Box::new(EchoHostSession {
                 id,
@@ -843,6 +936,8 @@ mod tests {
                 max_sessions,
                 slice_tokens: slice,
                 idle_reclaim: None,
+                session_ctx_size: None,
+                kv_budget_bytes: None,
             },
         );
         (host, trace)
@@ -1059,6 +1154,7 @@ mod tests {
             max_sessions: 3,
             slice_tokens: 8,
             idle_reclaim: None,
+            ..HostConfig::default()
         });
         // Cap is visible immediately; no sessions yet.
         let st = host.status();
@@ -1097,6 +1193,7 @@ mod tests {
             max_sessions: 1,
             slice_tokens: 8,
             idle_reclaim: None,
+            ..HostConfig::default()
         });
         let _a = host.attach().unwrap();
         let st = poll_status(&host, |s| s.live_sessions == 1);
@@ -1108,11 +1205,83 @@ mod tests {
     }
 
     #[test]
+    fn attach_honors_requested_ctx_size_and_reports_it() {
+        // The echo shared model has a 4096-token ctx. A smaller per-session
+        // request is honored and surfaced in status; the default attach gets
+        // the model's full ctx (design §7, v2).
+        let host = shared_host(HostConfig {
+            max_sessions: 4,
+            slice_tokens: 8,
+            ..HostConfig::default()
+        });
+        let _small = host.attach_sized(Some(512)).unwrap();
+        let _big = host.attach().unwrap(); // default → model ctx
+        let st = poll_status(&host, |s| s.sessions.len() == 2);
+        let sizes: Vec<i32> = st.sessions.iter().map(|s| s.ctx_size).collect();
+        assert!(sizes.contains(&512), "requested per-session ctx honored");
+        assert!(sizes.contains(&4096), "default attach gets the model ctx");
+        // An over-large request is clamped to the model max, never exceeds it.
+        let _huge = host.attach_sized(Some(999_999)).unwrap();
+        let st = poll_status(&host, |s| s.sessions.len() == 3);
+        assert!(
+            st.sessions.iter().all(|s| s.ctx_size <= 4096),
+            "requested ctx is clamped to the model maximum"
+        );
+    }
+
+    #[test]
+    fn kv_budget_rejects_before_max_sessions() {
+        // Budget fits exactly two 4096-token sessions; a third is rejected on
+        // the KV-bytes budget even though max_sessions (5) is not reached. The
+        // rejection is a real error, not an `unsupported` fallback, and no OOM.
+        let per_session = est_kv_bytes(4096, DEFAULT_KV_BYTES_PER_TOKEN);
+        let host = shared_host(HostConfig {
+            max_sessions: 5,
+            slice_tokens: 8,
+            kv_budget_bytes: Some(per_session * 2),
+            ..HostConfig::default()
+        });
+        let _a = host.attach().unwrap();
+        let _b = host.attach().unwrap();
+        let st = poll_status(&host, |s| s.live_sessions == 2);
+        assert_eq!(st.kv_bytes, per_session * 2, "aggregate KV bytes tracked");
+        assert_eq!(st.kv_budget_bytes, Some(per_session * 2));
+
+        let err = host
+            .attach()
+            .expect_err("third attach exceeds the KV budget");
+        assert!(!err.is_unsupported(), "budget failure is a real error");
+        assert!(err.to_string().contains("KV budget"));
+        assert!(
+            st.live_sessions < st.max_sessions,
+            "rejected under the session-count cap: it was the KV budget"
+        );
+
+        // Shrinking ctx_size lets more clients in (design §7, v2): a budget
+        // with headroom for two full sessions plus one tiny one admits the
+        // tiny session but would still reject a third full-ctx session.
+        let tiny = est_kv_bytes(1, DEFAULT_KV_BYTES_PER_TOKEN);
+        let host2 = shared_host(HostConfig {
+            max_sessions: 5,
+            slice_tokens: 8,
+            kv_budget_bytes: Some(per_session * 2 + tiny),
+            ..HostConfig::default()
+        });
+        let _x = host2.attach().unwrap();
+        let _y = host2.attach().unwrap();
+        assert!(
+            host2.attach_sized(Some(1)).is_ok(),
+            "a tiny-ctx session still fits the residual budget"
+        );
+    }
+
+    #[test]
     fn idle_reclaim_snapshots_and_restores() {
         let host = shared_host(HostConfig {
             max_sessions: 2,
             slice_tokens: 8,
             idle_reclaim: Some(Duration::from_millis(120)),
+            ..HostConfig::default()
         });
         let a = host.attach().unwrap();
         run_gen(&a);
@@ -1146,6 +1315,7 @@ mod tests {
             max_sessions: 2,
             slice_tokens: 8,
             idle_reclaim: None,
+            ..HostConfig::default()
         });
         let a = host.attach().unwrap();
         run_gen(&a);
