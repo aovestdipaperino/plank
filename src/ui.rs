@@ -943,6 +943,15 @@ impl Agent<'_> {
     }
 }
 
+/// Live `/btw` prompt state while the model is busy: the in-progress input
+/// line (survives across generation passes within a turn) and submitted
+/// questions queued for the next generation boundary.
+#[derive(Default)]
+struct BtwPrompt {
+    input: String,
+    queue: Vec<String>,
+}
+
 /// Result of one TUI generation pass.
 struct TurnOutput {
     interrupted: bool,
@@ -1452,16 +1461,22 @@ impl Agent<'_> {
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
+        // /btw side questions typed while the model streams: the in-progress
+        // line survives across generation passes, submitted questions queue
+        // up and are answered at the next generation boundary.
+        let mut btw = BtwPrompt::default();
         loop {
             let prompt = render_transcript(&self.session, &self.system);
-            let out = self.tui_generate(terminal, log, &prompt, view, turn_start)?;
+            let out = self.tui_generate(terminal, log, &prompt, view, turn_start, &mut btw)?;
             self.session.push(Message::assistant(out.assistant_text));
             log.end_line();
             if out.interrupted {
                 crate::interrupt::clear();
                 log.push_dim("[interrupted]");
+                self.tui_drain_btw(&mut btw, log, terminal, view);
                 return Ok(());
             }
+            self.tui_drain_btw(&mut btw, log, terminal, view);
             if let Some(payload) = out.error {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
@@ -1515,7 +1530,12 @@ impl Agent<'_> {
         prompt: &str,
         view: &mut tui::OutputView,
         turn_start: Instant,
+        btw: &mut BtwPrompt,
     ) -> Result<TurnOutput, String> {
+        let BtwPrompt {
+            input: busy_input,
+            queue: btw_queue,
+        } = btw;
         let mut stream = StreamRenderer::new(std::mem::take(log));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         if !matches!(
@@ -1592,18 +1612,53 @@ impl Agent<'_> {
                     },
                 };
                 // Drain pending input so generation stays interruptible
-                // (Ctrl-C / Esc) and the log stays scrollable while streaming:
-                // wheel events pin the viewport, End resumes following.
+                // (Ctrl-C / Esc), the log stays scrollable while streaming
+                // (wheel pins the viewport, End resumes following), and the
+                // prompt stays live for /btw side questions: a `/btw <q>`
+                // line submitted mid-turn is queued and answered at the next
+                // generation boundary.
                 while event::poll(Duration::ZERO).unwrap_or(false) {
                     match event::read() {
-                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
-                            KeyCode::Esc => interrupt_flag.store(true, Ordering::Relaxed),
-                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                                interrupt_flag.store(true, Ordering::Relaxed);
+                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                            let kctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                            match k.code {
+                                KeyCode::Esc => interrupt_flag.store(true, Ordering::Relaxed),
+                                KeyCode::Char('c') if kctrl => {
+                                    // First Ctrl-C clears a typed line, like
+                                    // the idle editor; on empty it interrupts.
+                                    if busy_input.is_empty() {
+                                        interrupt_flag.store(true, Ordering::Relaxed);
+                                    } else {
+                                        busy_input.clear();
+                                    }
+                                }
+                                KeyCode::Char('u') if kctrl => busy_input.clear(),
+                                KeyCode::End if busy_input.is_empty() => view.follow = true,
+                                KeyCode::Enter => {
+                                    let line = busy_input.trim();
+                                    if let Some(q) = line
+                                        .strip_prefix("/btw")
+                                        .filter(|q| q.starts_with(char::is_whitespace))
+                                        .map(str::trim)
+                                        .filter(|q| !q.is_empty())
+                                    {
+                                        btw_queue.push(q.to_owned());
+                                        busy_input.clear();
+                                    }
+                                    // Anything else stays in the buffer; the
+                                    // status line explains what runs mid-turn.
+                                }
+                                KeyCode::Backspace => {
+                                    busy_input.pop();
+                                }
+                                KeyCode::Char(ch)
+                                    if !kctrl && !k.modifiers.contains(KeyModifiers::ALT) =>
+                                {
+                                    busy_input.push(ch);
+                                }
+                                _ => {}
                             }
-                            KeyCode::End => view.follow = true,
-                            _ => {}
-                        },
+                        }
                         Ok(Event::Mouse(m)) => match m.kind {
                             MouseEventKind::ScrollUp => {
                                 view.follow = false;
@@ -1617,8 +1672,19 @@ impl Agent<'_> {
                         _ => {}
                     }
                 }
-                let line = status::build_status_text(&status, false);
-                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), None, 0, &line, view, None));
+                let mut line = status::build_status_text(&status, false);
+                if !btw_queue.is_empty() {
+                    use std::fmt::Write as _;
+                    let _ = write!(line, " | /btw queued: {}", btw_queue.len());
+                } else if !busy_input.is_empty() && !busy_input.trim_start().starts_with("/btw") {
+                    line.push_str(" | only /btw <question> runs while the agent is working");
+                }
+                // The prompt row stays hidden while busy until the user
+                // starts typing a /btw side question.
+                let typed = (!busy_input.is_empty()).then_some(busy_input.as_str());
+                let cursor = u16::try_from(busy_input.chars().count()).unwrap_or(u16::MAX);
+                let _ = terminal
+                    .draw(|f| tui::draw(f, stream.sink(), typed, cursor, &line, view, None));
             },
         );
 
@@ -1711,15 +1777,34 @@ impl Agent<'_> {
         self.session.push(Message::user(text));
     }
 
+    /// Answers queued mid-turn `/btw` questions in FIFO order. Loops because
+    /// the user can queue another question while an answer streams.
+    fn tui_drain_btw(
+        &mut self,
+        btw: &mut BtwPrompt,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+    ) {
+        while !btw.queue.is_empty() {
+            let question = btw.queue.remove(0);
+            if let Err(e) = self.tui_btw(&question, log, terminal, view, btw) {
+                log.push_plain(format!("/btw failed: {e}"));
+            }
+        }
+    }
+
     /// Runs a `/btw` side question in the TUI: one generation pass over the
     /// shared context plus the framed question, tools denied, nothing pushed
     /// to the session (see `btw_plain` for the KV rollback rationale).
+    /// Questions typed while the answer streams land in `btw_queue`.
     fn tui_btw(
         &mut self,
         question: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        btw: &mut BtwPrompt,
     ) -> Result<(), String> {
         log.push_spans(tui::user_echo_spans(&format!("/btw {question}")));
         let mut prompt = render_transcript(&self.session, &self.system);
@@ -1728,7 +1813,7 @@ impl Agent<'_> {
             let _ = write!(prompt, "[user]\n{}\n", btw_user_message(question));
         }
         let saved_ctx = self.last_ctx_used;
-        let out = self.tui_generate(terminal, log, &prompt, view, Instant::now())?;
+        let out = self.tui_generate(terminal, log, &prompt, view, Instant::now(), btw)?;
         log.end_line();
         if out.interrupted {
             crate::interrupt::clear();
@@ -1853,8 +1938,14 @@ impl Agent<'_> {
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
-                } else if let Err(e) = self.tui_btw(arg, log, terminal, view) {
-                    log.push_plain(format!("/btw failed: {e}"));
+                } else {
+                    // Follow-up /btw questions typed while the answer streams
+                    // queue up and are answered in order.
+                    let mut btw = BtwPrompt {
+                        queue: vec![arg.to_owned()],
+                        ..BtwPrompt::default()
+                    };
+                    self.tui_drain_btw(&mut btw, log, terminal, view);
                 }
             }
             _ if slash_command_known(cmd) => {
