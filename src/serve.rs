@@ -156,8 +156,7 @@ fn handle_conn_shared(
         }
         ("POST", "/tokenize") => {
             let n = serde_json::from_str::<TokenizeRequest>(&req.body)
-                .map(|r| host.count_tokens(&r.text))
-                .unwrap_or(0);
+                .map_or(0, |r| host.count_tokens(&r.text));
             let resp = TokenizeResponse { n_tokens: n };
             write_json(&mut out, &serde_json::to_string(&resp).unwrap_or_default())
         }
@@ -358,8 +357,7 @@ fn handle_conn(
         }
         ("POST", "/tokenize") => {
             let n = serde_json::from_str::<TokenizeRequest>(&req.body)
-                .map(|r| engine.lock().unwrap().count_tokens(&r.text))
-                .unwrap_or(0);
+                .map_or(0, |r| engine.lock().unwrap().count_tokens(&r.text));
             let resp = TokenizeResponse { n_tokens: n };
             write_json(&mut out, &serde_json::to_string(&resp).unwrap_or_default())
         }

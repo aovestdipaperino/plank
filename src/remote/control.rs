@@ -867,10 +867,8 @@ fn parse_request_head(head: &[u8]) -> ParsedRequest {
         let value = value.trim();
         match name.as_str() {
             "origin" => origin = Some(value.to_owned()),
-            "upgrade" => {
-                if value.eq_ignore_ascii_case("websocket") {
-                    upgrade_websocket = true;
-                }
+            "upgrade" if value.eq_ignore_ascii_case("websocket") => {
+                upgrade_websocket = true;
             }
             _ => {}
         }
