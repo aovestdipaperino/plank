@@ -214,14 +214,9 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
 /// plus a ready-to-paste SSH tunnel hint once to stderr (design §4.1/§4.10).
 ///
 /// The returned server must be kept alive for the process lifetime; dropping it
-/// shuts the listener down.
-///
-/// TODO(#25): the returned server owns a fresh `BroadcastBus`/`TurnShared`. The
-/// live turn loop in `ui.rs` does not yet broadcast into this bus nor drain
-/// remote prompts from its `TurnShared` (the dual-path wiring, design §5 step
-/// 4). Until then the server authenticates, mirrors any events broadcast into
-/// its bus, and accepts control frames, but is not connected to the running
-/// agent's output/input.
+/// shuts the listener down. Its `state.bus` / `state.shared` are handed to the
+/// turn loop (`run`), so the running agent mirrors its output onto the bus and
+/// remote `prompt`/`command`/`btw`/`interrupt` frames drive it (issue #25).
 fn start_remote(cfg: &AgentConfig, local_present: bool) -> Option<plank::remote::RemoteServer> {
     use std::sync::Arc;
 
@@ -319,9 +314,13 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
     // A local front-end is present unless we are headless (`--non-interactive`).
     let local_present = !cfg.non_interactive;
-    let _remote = start_remote(cfg, local_present);
+    // Keep the server alive for the whole run (drop shuts the listener down),
+    // and hand its shared bus + turn state to the turn loop so live output
+    // mirrors out and remote frames drive the agent (issue #25).
+    let remote = start_remote(cfg, local_present);
+    let remote_state = remote.as_ref().map(|s| std::sync::Arc::clone(&s.state));
     if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg);
+        return plank::ui::run_non_interactive(engine, cfg, remote_state);
     }
     // The full-screen TUI (a real terminal on both ends) draws its own header,
     // so the banner is only printed for the plain piped fallback.
@@ -331,5 +330,5 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
         print!("{}", status::welcome_banner(cfg.generation.ctx_size, color));
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg)
+    plank::ui::run_interactive(engine, cfg, remote_state)
 }

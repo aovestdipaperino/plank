@@ -8,6 +8,7 @@
 //! multiplex.
 
 use std::io::{BufRead, IsTerminal, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ use crate::context::{ContextContent, ContextTokens};
 use crate::dsml::ToolCall;
 use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
+use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
@@ -31,7 +33,7 @@ use crate::tools::{ToolContext, dispatch_all};
 use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
-use crate::worker::{self, ChannelSink, TurnShared, UiEvent};
+use crate::worker::{self, BroadcastBus, ChannelSink, TurnShared, UiEvent};
 
 /// Stdout writer that flushes after every write so tokens appear as streamed.
 #[derive(Debug)]
@@ -228,6 +230,11 @@ struct Agent<'a> {
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
+    /// Live remote-control bridge (issue #25): the shared [`BroadcastBus`] that
+    /// this agent's turn output mirrors into, plus the shared [`TurnShared`] that
+    /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
+    /// was not given, in which case the turn loops behave exactly as before.
+    remote: Option<Arc<RemoteState>>,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -1476,6 +1483,40 @@ impl Agent<'_> {
                 .map_err(|e| e.to_string())?;
 
             if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
+                // Remote-driven input (issue #25): a remote controller's
+                // `prompt`/`command` frames start a local turn just as if typed
+                // here, so the local screen and the remote mirror stay in sync.
+                if let Some(r) = self.remote.clone() {
+                    let queued = r.shared.take_queued();
+                    let mut run = false;
+                    for line in queued {
+                        let line = line.trim().to_owned();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if line.starts_with('/') {
+                            if !self.tui_slash(
+                                &line,
+                                &mut log,
+                                terminal,
+                                &mut view,
+                                &mut input,
+                                &mut btw_panel,
+                            ) {
+                                input.history.save(&hist_path).ok();
+                                return Ok(());
+                            }
+                        } else {
+                            r.bus.broadcast(UiEvent::UserEcho(line.clone()));
+                            log.push_spans(tui::user_echo_spans(&line));
+                            self.session.push(Message::user(line));
+                            run = true;
+                        }
+                    }
+                    if run {
+                        self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
+                    }
+                }
                 continue;
             }
             let ev = event::read().map_err(|e| e.to_string())?;
@@ -1845,20 +1886,29 @@ impl Agent<'_> {
         // The first iteration runs the main turn; later iterations run either
         // a follow-up turn (leftover queued user lines) or a btw-only drain
         // (side questions queued after the worker's final boundary).
+        // With a remote bridge, share its persistent `TurnShared` so remote
+        // `prompt`/`btw`/`interrupt` frames land in the same queues the local
+        // editor uses, and mirror every event onto its bus (issue #25).
+        let remote = self.remote.clone();
+        let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         let mut run_main = true;
         let mut carry_btw: Vec<String> = Vec::new();
         loop {
-            let shared = TurnShared::default();
+            let local_shared = TurnShared::default();
+            let shared: &TurnShared = remote
+                .as_deref()
+                .map_or(&local_shared, |r| r.shared.as_ref());
             for q in carry_btw.drain(..) {
                 let _ = shared.push_btw(q);
             }
+            let bus_ref = bus.as_deref();
             if run_main {
-                run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
-                    self.worker_turn(&tx, &shared)
+                run_worker_ui(terminal, log, view, input, btw, shared, bus_ref, |tx| {
+                    self.worker_turn(&tx, shared)
                 })??;
             } else {
-                run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
-                    self.drain_btw(&tx, &shared);
+                run_worker_ui(terminal, log, view, input, btw, shared, bus_ref, |tx| {
+                    self.drain_btw(&tx, shared);
                 })?;
             }
             // Lines typed while busy that no tool round drained become the
@@ -1871,6 +1921,85 @@ impl Agent<'_> {
             run_main = !leftover.is_empty();
             for line in leftover {
                 self.session.push(Message::user(line));
+            }
+        }
+    }
+
+    /// Runs one worker turn while mirroring every render/output event onto the
+    /// remote [`BroadcastBus`], driving it from the shared [`TurnShared`] so
+    /// remote `interrupt` / `btw` / queued frames steer this turn directly.
+    /// Falls back to the plain [`run_turn`](Self::run_turn) when no remote
+    /// bridge is present. Used by the headless remote-serve loop; the TUI path
+    /// mirrors inline in [`busy_ui_loop`] so the local screen stays live too.
+    fn run_turn_mirrored(&mut self) -> Result<(), String> {
+        let Some(remote) = self.remote.clone() else {
+            return self.run_turn();
+        };
+        let bus = Arc::clone(&remote.bus);
+        let shared = &remote.shared;
+        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
+        std::thread::scope(|s| {
+            let worker = s.spawn(|| self.worker_turn(&tx, shared));
+            loop {
+                while let Ok(ev) = rx.try_recv() {
+                    bus.broadcast(ev);
+                }
+                if worker.is_finished() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            // Drain anything sent between the last poll and the worker returning.
+            while let Ok(ev) = rx.try_recv() {
+                bus.broadcast(ev);
+            }
+            worker
+                .join()
+                .map_err(|_| "worker thread panicked".to_owned())?
+        })
+    }
+
+    /// Drains the remote controller's pending input once: a mirrored turn for
+    /// each queued `prompt`, and `/`-prefixed lines (remote `command` frames)
+    /// routed through the shared slash dispatcher exactly like the local REPL.
+    /// Returns whether any input was processed. No-op without a remote bridge.
+    fn pump_remote(&mut self) -> Result<bool, String> {
+        let Some(remote) = self.remote.clone() else {
+            return Ok(false);
+        };
+        let queued = remote.shared.take_queued();
+        if queued.is_empty() {
+            return Ok(false);
+        }
+        for line in queued {
+            let line = line.trim().to_owned();
+            if line.is_empty() {
+                continue;
+            }
+            if line.starts_with('/') {
+                // Remote `command` routing: the same slash path the local REPL
+                // uses. Its textual report goes to stdout (the headless sink).
+                let _ = self.slash(&line)?;
+                continue;
+            }
+            remote.bus.broadcast(UiEvent::UserEcho(line.clone()));
+            self.session.push(Message::user(line));
+            self.run_turn_mirrored()?;
+        }
+        Ok(true)
+    }
+
+    /// Headless remote-serve loop: block until a remote controller sends input,
+    /// process it (mirrored onto the bus), and repeat. Exits on a process-level
+    /// interrupt (Ctrl-C); there is no local stdin to read in this mode.
+    fn run_remote_headless(&mut self) -> Result<(), String> {
+        loop {
+            if crate::interrupt::pending() {
+                crate::interrupt::clear();
+                return Ok(());
+            }
+            if !self.pump_remote()? {
+                std::thread::sleep(Duration::from_millis(20));
             }
         }
     }
@@ -2337,11 +2466,22 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
     ) -> Result<(), String> {
+        let remote = self.remote.clone();
+        let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         let shared = TurnShared::default();
         shared.push_btw(question.to_owned());
-        run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
-            self.drain_btw(&tx, &shared);
-        })?;
+        run_worker_ui(
+            terminal,
+            log,
+            view,
+            input,
+            btw,
+            &shared,
+            bus.as_deref(),
+            |tx| {
+                self.drain_btw(&tx, &shared);
+            },
+        )?;
         Ok(())
     }
 
@@ -2579,12 +2719,13 @@ fn run_worker_ui<T: Send>(
     input: &mut TuiInput,
     btw: &mut BtwPanel,
     shared: &TurnShared,
+    bus: Option<&BroadcastBus>,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
         let handle = s.spawn(move || job(tx));
-        let ui = busy_ui_loop(terminal, log, view, input, btw, &rx, shared, || {
+        let ui = busy_ui_loop(terminal, log, view, input, btw, &rx, shared, bus, || {
             handle.is_finished()
         });
         // On a UI error (terminal gone) the worker must still be stopped and
@@ -2635,6 +2776,7 @@ fn busy_ui_loop(
     btw: &mut BtwPanel,
     rx: &Receiver<UiEvent>,
     shared: &TurnShared,
+    bus: Option<&BroadcastBus>,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
@@ -2655,6 +2797,11 @@ fn busy_ui_loop(
     let mut main_checkpoint = 0usize;
     loop {
         while let Ok(ev) = rx.try_recv() {
+            // Mirror every worker event onto the remote bus so remote clients
+            // see the same stream as the local TUI (issue #25, dual-path).
+            if let Some(bus) = bus {
+                bus.broadcast(ev.clone());
+            }
             match ev {
                 UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
                 UiEvent::BtwBegin => {
@@ -2875,6 +3022,7 @@ fn new_agent(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
+    remote: Option<Arc<RemoteState>>,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -2927,6 +3075,7 @@ fn new_agent(
         context_content,
         skills,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
+        remote,
     })
 }
 
@@ -2934,8 +3083,12 @@ fn new_agent(
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true)?;
+pub fn run_interactive(
+    engine: Box<dyn Engine>,
+    cfg: &AgentConfig,
+    remote: Option<Arc<RemoteState>>,
+) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, true, remote)?;
 
     // `plank /resume [prefix]` loads a prior session before the loop starts.
     if let Some(arg) = &cfg.resume {
@@ -3035,12 +3188,22 @@ fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false)?;
+pub fn run_non_interactive(
+    engine: Box<dyn Engine>,
+    cfg: &AgentConfig,
+    remote: Option<Arc<RemoteState>>,
+) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, false, remote)?;
     agent.warm_plain()?;
     if let Some(prompt) = cfg.prompt.as_deref() {
         agent.session.push(Message::user(prompt));
         return agent.run_turn();
+    }
+    // Headless with a remote bridge and no `-p`: instead of the stdin protocol,
+    // serve remote controllers — drive turns from their `prompt` frames and
+    // mirror all output onto the bus (design §5 step 4, headless path).
+    if agent.remote.is_some() {
+        return agent.run_remote_headless();
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
@@ -3205,6 +3368,7 @@ mod tests {
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
         }
     }
 
@@ -3218,6 +3382,86 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// End-to-end (issue #25): a real loopback `RemoteServer` sharing the
+    /// agent's bus + turn state. A remote `prompt` frame lands in the shared
+    /// queue, `pump_remote` drives a real Echo/scripted turn, and the turn's
+    /// output is observed mirrored back onto the bus.
+    #[test]
+    fn remote_prompt_drives_turn_and_mirrors_to_bus() {
+        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer};
+        use tungstenite::Message;
+
+        let dir = scratch_dir("remote-live");
+        let engine = ScriptedEngine {
+            replies: vec!["hello from echo\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        // Headless server; the agent adopts its shared bus + turn state.
+        let server = RemoteServer::start(
+            "127.0.0.1:0",
+            "tok".to_owned(),
+            false,
+            false,
+            Arc::new(BroadcastBus::new()),
+            Arc::new(TurnShared::default()),
+        )
+        .expect("server binds");
+        agent.remote = Some(Arc::clone(&server.state));
+
+        // Observe the bus directly (subscribe before the turn runs).
+        let sub = server.state.bus.subscribe();
+
+        // Connect a controller and send auth + prompt.
+        let addr = server.local_addr;
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (mut ws, _) = tungstenite::client(
+            format!("ws://{addr}/")
+                .parse::<tungstenite::http::Uri>()
+                .unwrap(),
+            stream,
+        )
+        .expect("ws handshake");
+        for m in [
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+            ClientMsg::Prompt { text: "hi".into() },
+        ] {
+            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
+                .unwrap();
+            ws.flush().unwrap();
+        }
+
+        // Wait for the prompt to reach the shared queue, then drive the turn.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !agent.pump_remote().unwrap() {
+            assert!(Instant::now() < deadline, "remote prompt never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The turn's assistant text was mirrored onto the bus, and the user
+        // echo was mirrored too.
+        let mut visible = String::new();
+        let mut echoed = false;
+        while let Ok(seq) = sub.try_recv() {
+            match seq.event {
+                UiEvent::Visible(t) => visible.push_str(&t),
+                UiEvent::UserEcho(t) if t == "hi" => echoed = true,
+                _ => {}
+            }
+        }
+        assert!(echoed, "user echo not mirrored");
+        assert!(
+            visible.contains("hello from echo"),
+            "mirrored assistant output missing: {visible:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -3766,6 +4010,7 @@ mod tests {
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -3819,6 +4064,7 @@ mod tests {
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -3882,6 +4128,7 @@ mod tests {
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -3932,6 +4179,7 @@ mod tests {
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
         };
         agent.session.push(Message::user("run echo"));
 
