@@ -75,6 +75,11 @@ pub struct ToolContext {
     /// Resolved paths of recent successful `read` calls, oldest first, for
     /// post-compaction re-injection (`compact::build_reinjection`).
     pub recent_reads: Vec<PathBuf>,
+    /// Command hooks (PreToolUse/PostToolUse/Stop) from hooks.json configs.
+    pub hooks: crate::hooks::Hooks,
+    /// User-only warnings from non-blocking hook failures, drained by the UI
+    /// after each dispatch.
+    pub hook_warnings: Vec<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -87,7 +92,8 @@ impl std::fmt::Debug for ToolContext {
             .field("web_confirm", &self.web_confirm.as_ref().map(|_| "<fn>"))
             .field("mcp", &self.mcp)
             .field("recent_reads", &self.recent_reads)
-            .finish()
+            .field("hooks", &self.hooks)
+            .finish_non_exhaustive()
     }
 }
 
@@ -103,6 +109,8 @@ impl ToolContext {
             web_confirm: None,
             mcp: Vec::new(),
             recent_reads: Vec::new(),
+            hooks: crate::hooks::Hooks::default(),
+            hook_warnings: Vec::new(),
         }
     }
 
@@ -138,6 +146,24 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
         return ToolResult::from_output("Tool error: missing tool name\n".to_string());
     }
+    // PreToolUse hooks: exit 2 blocks the tool, its stderr becomes the
+    // model-visible tool error.
+    if !ctx.hooks.pre_tool_use.is_empty() {
+        let input = crate::hooks::tool_event_input(
+            "PreToolUse",
+            &call.name,
+            &mcp::args_to_json(call),
+            None,
+            &ctx.cwd,
+        );
+        let pre = crate::hooks::run_event(&ctx.hooks.pre_tool_use, &call.name, &input, &ctx.cwd);
+        ctx.hook_warnings.extend(pre.warnings);
+        if let Some(msg) = pre.block {
+            return ToolResult::from_output(format!(
+                "Tool error: blocked by PreToolUse hook: {msg}\n"
+            ));
+        }
+    }
     let output = match call.name.as_str() {
         "read" => files::tool_read(ctx, call),
         "more" => files::tool_more(ctx, call),
@@ -154,6 +180,25 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         other => format!("Tool error: unknown tool: {other}\n"),
     };
+    // PostToolUse hooks: exit 2 appends stderr to the model's observation.
+    let mut output = output;
+    if !ctx.hooks.post_tool_use.is_empty() {
+        let input = crate::hooks::tool_event_input(
+            "PostToolUse",
+            &call.name,
+            &mcp::args_to_json(call),
+            Some(&output),
+            &ctx.cwd,
+        );
+        let post = crate::hooks::run_event(&ctx.hooks.post_tool_use, &call.name, &input, &ctx.cwd);
+        ctx.hook_warnings.extend(post.warnings);
+        if let Some(msg) = post.block {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "[PostToolUse hook] {msg}");
+        }
+    }
     ToolResult::from_output(output)
 }
 

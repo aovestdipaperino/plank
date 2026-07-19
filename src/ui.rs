@@ -293,6 +293,9 @@ impl Agent<'_> {
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
+        // Stop hooks run at most once per turn, so a hook that always exits 2
+        // cannot loop the model forever.
+        let mut stop_hook_ran = false;
         loop {
             let prompt_text = render_transcript(&self.session, &self.system);
             let (stream, assistant_text, stats) =
@@ -339,6 +342,14 @@ impl Agent<'_> {
                 let observations = dispatch_all(finished.calls, &mut self.tool_ctx);
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
+                for warning in self.tool_ctx.hook_warnings.drain(..) {
+                    let line = if self.color {
+                        format!("\x1b[38;5;238m{warning}{ANSI_RESET}")
+                    } else {
+                        warning
+                    };
+                    println!("{line}");
+                }
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -349,11 +360,37 @@ impl Agent<'_> {
             if !renderer.last_output_newline() {
                 println!();
             }
+            // Stop hooks: exit 2 feeds stderr to the model and the turn
+            // continues (at most once).
+            if !stop_hook_ran && let Some(feedback) = self.run_stop_hooks(&mut |w| println!("{w}"))
+            {
+                stop_hook_ran = true;
+                self.session.push(Message::user(format!(
+                    "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
+                )));
+                continue;
+            }
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
             }
             return Ok(());
         }
+    }
+
+    /// Runs the Stop hooks; returns the model-visible feedback of the first
+    /// exit-2 hook, `None` when the turn may conclude. `warn` receives
+    /// user-only lines from other nonzero exits.
+    fn run_stop_hooks(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
+        if self.tool_ctx.hooks.stop.is_empty() {
+            return None;
+        }
+        let input = crate::hooks::tool_event_input("Stop", "", "{}", None, &self.tool_ctx.cwd);
+        let out =
+            crate::hooks::run_event(&self.tool_ctx.hooks.stop, "", &input, &self.tool_ctx.cwd);
+        for w in out.warnings {
+            warn(w);
+        }
+        out.block
     }
 
     /// Re-injects the trusted system prompt shape after enough context has
@@ -816,6 +853,7 @@ impl Agent<'_> {
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
             _ => {
                 if let Some(message) = self.skill_message(cmd, arg) {
@@ -1345,6 +1383,9 @@ impl Agent<'_> {
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
+        // Stop hooks run at most once per turn, so a hook that always exits 2
+        // cannot loop the model forever.
+        let mut stop_hook_ran = false;
         loop {
             let prompt = render_transcript(&self.session, &self.system);
             let out = self.tui_generate(terminal, log, &prompt, view, turn_start)?;
@@ -1363,6 +1404,9 @@ impl Agent<'_> {
             }
             if !out.calls.is_empty() {
                 let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
+                for warning in self.tool_ctx.hook_warnings.drain(..) {
+                    log.push_dim(warning);
+                }
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -1370,6 +1414,23 @@ impl Agent<'_> {
                     log.push_dim(line.to_owned());
                 }
                 continue;
+            }
+            // Stop hooks: exit 2 feeds stderr to the model and the turn
+            // continues (at most once).
+            if !stop_hook_ran {
+                let mut warnings = Vec::new();
+                let feedback = self.run_stop_hooks(&mut |w| warnings.push(w));
+                for w in warnings {
+                    log.push_dim(w);
+                }
+                if let Some(feedback) = feedback {
+                    stop_hook_ran = true;
+                    log.push_dim("[Stop hook] continuing the turn");
+                    self.session.push(Message::user(format!(
+                        "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
+                    )));
+                    continue;
+                }
             }
             return Ok(());
         }
@@ -1686,6 +1747,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/hooks" => {
+                for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             _ if slash_command_known(cmd) => {
                 log.push_plain(format!("{cmd}: not implemented yet"));
             }
@@ -1737,6 +1803,7 @@ fn new_agent(
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
     tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
+    tool_ctx.hooks = crate::hooks::load_default(&tool_ctx.cwd);
     if show_footer {
         // Interactive approval for web access, like agent_web_confirm;
         // headless runs keep the auto-deny default.
