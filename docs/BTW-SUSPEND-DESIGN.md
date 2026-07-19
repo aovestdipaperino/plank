@@ -221,9 +221,54 @@ above. Additionally:
   task also generates needs mechanism (B) — an ephemeral second session
   (`ds4_session_create`) — and buys only time-sliced, not parallel, compute on
   Metal's single queue. Rejected here for the same cost/complexity reasons as
-  BTW-DESIGN §8; the second-session path is documented so a future version can
-  adopt it without re-deriving the engine facts.
+  BTW-DESIGN §8; §8.1 records what it would take, since it is feasible and shares
+  a prerequisite with other roadmap work.
 - **Suspending across tool dispatch.** Out of scope; boundary scheduling already
   covers the between-passes case.
 - **Snapshotting for session save/resume.** The same FFI powers per-session KV
   payloads (#12); that is a separate feature with its own persistence format.
+
+### 8.1 What concurrent sessions would require (and whether it's worth it)
+
+Feasible — nothing below is blocked by Metal or the engine — but the payoff for
+`/btw` specifically is small. Documented so a later version can adopt it without
+re-deriving the engine facts.
+
+Requirements, in dependency order:
+
+1. **Split "engine" from "session" in the Rust API.** Today `Ds4Engine` owns a
+   single `session: *mut Ds4Session` and `generate(&mut self, …)` conflates the
+   two. The C layer already separates them (`ds4_session_create(out, engine,
+   ctx_size)` against shared, read-only weights; multiple sessions per engine are
+   supported). Make a session a first-class Rust object you can hold two of —
+   weights in one place, KV + cursor in each session. **This is the load-bearing
+   change**; everything else sits on top.
+2. **Thread-safety audit of the C engine + Metal.** The real risk, not memory.
+   The engine and its Metal command queue were written for one worker thread;
+   two threads calling `ds4_session_eval`/`sample` concurrently is almost
+   certainly unsound as-is. Either serialize every GPU-touching call behind a
+   mutex and **interleave at token granularity** (a cooperative scheduler on one
+   thread is cleaner than two threads contending a mutex), or prove concurrent
+   submission is safe (unlikely).
+3. **Cheap bootstrap of the second session.** A fresh session B would re-prefill
+   the whole transcript — the exact cost the single-session design avoids. Fix:
+   `save_snapshot(A)` → `load_snapshot` into a freshly-created B to clone A's KV
+   rather than recompute it, then let B diverge with the framed question. The
+   snapshot primitive from §4.2 is therefore a *dependency* of the concurrent
+   design, not an alternative to it.
+4. **Bounded second KV allocation.** Two live contexts; B must hold transcript +
+   question + answer, so it approaches A's size — memory roughly doubles for the
+   aside's lifetime.
+5. **Two-stream multiplexing.** The split-screen renderer already shipped; the
+   worker loop (`src/worker.rs`) would drive two generation loops over tagged
+   events, with two interrupt flags and two `last_ctx_used` accountings.
+
+**Verdict.** One GPU with one command queue means "concurrent" is *time-sliced,
+not parallel*: the main task does not progress faster while the aside runs. The
+only gain over freeze/answer/unfreeze is that the main task keeps inching forward
+instead of being fully paused for the seconds an aside takes — not worth the
+thread-safety audit and doubled KV for `/btw` alone. However, requirement 1 (the
+session-as-first-class-object refactor) is the **same primitive** that per-session
+KV payloads (#12), instant `/switch` without re-prefill, and subagent sidechains
+with their own KV all need. Justify that refactor by those features; concurrent
+`/btw` then falls out as a near-free consequence.
