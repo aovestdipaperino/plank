@@ -72,14 +72,20 @@ pub struct AgentConfig {
 }
 
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtwConfig {
     /// Answer an in-pass `/btw` by genuinely freezing the running generation,
     /// answering the aside via [`crate::engine::Engine::generate_aside`], and
-    /// resuming — instead of the default preempt-and-rerun. Off by default;
-    /// when off (or the engine has no aside support) an in-pass `/btw` falls
-    /// back to the boundary queue exactly as today.
+    /// resuming — instead of preempt-and-rerun. **On by default**; disable with
+    /// `--disable-btw-suspend`. When off (or the engine has no aside support,
+    /// e.g. `EchoEngine`) an in-pass `/btw` falls back to the boundary queue.
     pub suspend: bool,
+}
+
+impl Default for BtwConfig {
+    fn default() -> Self {
+        Self { suspend: true }
+    }
 }
 
 /// Default remote-control bind address: loopback only, echoing the reference
@@ -272,8 +278,10 @@ Options:
                            (writes limited to cwd/temp; see sandbox.json)
       --no-sandbox         disable the bash sandbox even if sandbox.json
                            enables it
-      --btw-suspend        answer an in-pass /btw by freezing and resuming the
-                           running generation (default: queue at the boundary)
+      --disable-btw-suspend
+                           answer an in-pass /btw by queuing at the next
+                           generation boundary instead of freezing/resuming the
+                           running generation (freeze/resume is the default)
       --control[=ADDR]     start the remote-control WebSocket server, bound to
                            ADDR (default 127.0.0.1:31415, loopback only)
       --control-token TOKEN shared bearer token (else PLANK_REMOTE_TOKEN, else a
@@ -561,6 +569,7 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
+            "--disable-btw-suspend" => c.btw.suspend = false,
             _ if arg.starts_with("--control")
                 && parse_remote_option(&mut c, arg, args, &mut i)? => {}
             "--quality" => c.engine.quality = true,
@@ -632,8 +641,8 @@ mod tests {
         assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(c.generation.think_mode, ThinkMode::On);
         assert!(c.prompt.is_none());
-        // In-pass /btw suspend is off by default (BTW-SUSPEND-DESIGN §4.1).
-        assert!(!c.btw.suspend);
+        // In-pass /btw suspend is on by default; --disable-btw-suspend opts out.
+        assert!(c.btw.suspend);
         assert!(!c.non_interactive);
         assert!(!c.show_help);
     }
@@ -680,9 +689,19 @@ mod tests {
     }
 
     #[test]
-    fn btw_suspend_flag_opts_in() {
+    fn btw_suspend_on_by_default_and_disable_opts_out() {
+        // Default is on.
+        assert!(parse_options(&args(&[])).unwrap().btw.suspend);
+        // Explicit --btw-suspend keeps it on (accepted for compatibility).
         assert!(
             parse_options(&args(&["--btw-suspend"]))
+                .unwrap()
+                .btw
+                .suspend
+        );
+        // --disable-btw-suspend opts out.
+        assert!(
+            !parse_options(&args(&["--disable-btw-suspend"]))
                 .unwrap()
                 .btw
                 .suspend
