@@ -58,6 +58,12 @@ impl RenderSink for TerminalSink {
         self.renderer.set_in_think(true);
         self.renderer.write(text);
     }
+    fn error_text(&mut self, text: &str) {
+        self.renderer.set_in_think(false);
+        self.renderer.color("\x1b[1;31m");
+        self.renderer.plain(text);
+        self.renderer.color(ANSI_RESET);
+    }
 }
 
 fn now_secs() -> u64 {
@@ -160,6 +166,7 @@ impl Agent<'_> {
     fn stream_generation(
         &mut self,
         prompt_text: &str,
+        turn_start: Instant,
     ) -> Result<
         (
             StreamRenderer<TerminalSink>,
@@ -191,9 +198,9 @@ impl Agent<'_> {
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
+        let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
-        let start = Instant::now();
         let stats = self
             .engine
             .generate(
@@ -215,7 +222,8 @@ impl Agent<'_> {
                             prefill_total: p.total,
                             prefill_label: verb,
                             prefill_tps: p.tps,
-                            elapsed_secs: start.elapsed().as_secs_f64(),
+                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                            ctx_used: prompt_tokens,
                             ctx_size,
                             power_percent: power,
                             ..Status::default()
@@ -235,9 +243,13 @@ impl Agent<'_> {
     fn run_turn(&mut self) -> Result<(), String> {
         self.maybe_compact()?;
         self.maybe_append_system_prompt_reminder();
+        // One clock for the whole turn: elapsed time accumulates across the
+        // generate → tools → generate loop instead of restarting per pass.
+        let turn_start = Instant::now();
         loop {
             let prompt_text = render_transcript(&self.session, &self.system);
-            let (stream, assistant_text, stats) = self.stream_generation(&prompt_text)?;
+            let (stream, assistant_text, stats) =
+                self.stream_generation(&prompt_text, turn_start)?;
 
             self.session.push(Message::assistant(assistant_text));
             let st = Status {
@@ -584,7 +596,12 @@ impl Agent<'_> {
     }
 
     /// Runs the /init command in TUI mode.
-    fn tui_run_init(&mut self, log: &mut OutputLog, terminal: &mut ratatui::DefaultTerminal) {
+    fn tui_run_init(
+        &mut self,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+    ) {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
 
@@ -611,7 +628,7 @@ impl Agent<'_> {
 
         log.push_spans(tui::user_echo_spans(prompt));
         self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log) {
+        if let Err(e) = self.tui_turn(terminal, log, view) {
             log.push_plain(format!("/init failed: {e}"));
         }
     }
@@ -797,22 +814,6 @@ impl Agent<'_> {
         result
     }
 
-    /// Copies the drag-selected region of the rendered output area to the
-    /// system clipboard (WYSIWYG: reads the cells as drawn on screen).
-    fn copy_selection(terminal: &mut ratatui::DefaultTerminal, a: (u16, u16), b: (u16, u16)) {
-        let Ok(size) = terminal.size() else { return };
-        // The output area is everything above the input and status rows.
-        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height.saturating_sub(2));
-        let text = tui::selection_text(
-            terminal.current_buffer_mut(),
-            area,
-            tui::normalize_selection(a, b),
-        );
-        if !text.trim().is_empty() {
-            tui::copy_to_clipboard(&text);
-        }
-    }
-
     #[allow(clippy::too_many_lines)]
     fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         let mut input = TuiInput::new();
@@ -832,13 +833,13 @@ impl Agent<'_> {
 
         self.tui_warm(terminal, &mut log)?;
 
+        let mut view = tui::OutputView::default();
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
-            self.tui_turn(terminal, &mut log)?;
+            self.tui_turn(terminal, &mut log, &mut view)?;
         }
 
-        let mut scroll_back = 0usize;
         // Endpoints of a mouse drag selection over the output area, in screen
         // cells (anchor, current). Copied to the clipboard on button release.
         let mut selection: Option<((u16, u16), (u16, u16))> = None;
@@ -866,7 +867,7 @@ impl Agent<'_> {
                         Some(input.buf.text()),
                         input.cursor_col(),
                         &status,
-                        &mut scroll_back,
+                        &mut view,
                         selection.map(|(a, b)| tui::normalize_selection(a, b)),
                     );
                 })
@@ -880,11 +881,13 @@ impl Agent<'_> {
                 match m.kind {
                     MouseEventKind::ScrollUp => {
                         selection = None;
-                        scroll_back = scroll_back.saturating_add(3);
+                        view.follow = false;
+                        view.top = view.top.saturating_sub(3);
                     }
                     MouseEventKind::ScrollDown => {
                         selection = None;
-                        scroll_back = scroll_back.saturating_sub(3);
+                        // Clamped by draw, which re-enters follow mode at the bottom.
+                        view.top = view.top.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         selection = Some(((m.column, m.row), (m.column, m.row)));
@@ -896,7 +899,36 @@ impl Agent<'_> {
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         if let Some((a, b)) = selection.filter(|(a, b)| a != b) {
-                            Self::copy_selection(terminal, a, b);
+                            // Redraw and read the cells inside the same frame:
+                            // after a draw() the terminal's current buffer is
+                            // the cleared next-frame one, so extraction must
+                            // happen while the frame content is still present.
+                            let sel = tui::normalize_selection(a, b);
+                            let mut text = String::new();
+                            let _ = terminal.draw(|f| {
+                                tui::draw(
+                                    f,
+                                    &log,
+                                    Some(input.buf.text()),
+                                    input.cursor_col(),
+                                    &status,
+                                    &mut view,
+                                    Some(sel),
+                                );
+                                // The output area is everything above the
+                                // input and status rows.
+                                let area = f.area();
+                                let area = ratatui::layout::Rect::new(
+                                    0,
+                                    0,
+                                    area.width,
+                                    area.height.saturating_sub(2),
+                                );
+                                text = tui::selection_text(f.buffer_mut(), area, sel);
+                            });
+                            if !text.trim().is_empty() {
+                                tui::copy_to_clipboard(&text);
+                            }
                         } else {
                             selection = None;
                         }
@@ -996,7 +1028,7 @@ impl Agent<'_> {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
                     input.hist_idx = None;
-                    scroll_back = 0;
+                    view.follow = true;
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
@@ -1005,7 +1037,7 @@ impl Agent<'_> {
                         input.history.save(&hist_path).ok();
                     }
                     if line.starts_with('/') {
-                        if !self.tui_slash(&line, &mut log, terminal) {
+                        if !self.tui_slash(&line, &mut log, terminal, &mut view) {
                             break;
                         }
                     } else {
@@ -1028,7 +1060,7 @@ impl Agent<'_> {
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_spans(tui::user_echo_spans(echo));
                         self.session.push(Message::user(&message));
-                        self.tui_turn(terminal, &mut log)?;
+                        self.tui_turn(terminal, &mut log, &mut view)?;
                     }
                 }
                 _ => {}
@@ -1057,6 +1089,7 @@ impl Agent<'_> {
         let mut announced = false;
         let verb = status::random_verb_index();
         let start = Instant::now();
+        let mut view = tui::OutputView::default();
         self.engine
             .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
@@ -1079,7 +1112,7 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &line, &mut 0, None));
+                    let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &line, &mut view, None));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -1087,7 +1120,7 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, &mut 0, None));
+            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, &mut view, None));
         }
         Ok(())
     }
@@ -1134,12 +1167,16 @@ impl Agent<'_> {
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         log: &mut OutputLog,
+        view: &mut tui::OutputView,
     ) -> Result<(), String> {
         self.tui_maybe_compact(log)?;
         self.tui_maybe_reminder(log);
+        // One clock for the whole turn: elapsed time accumulates across the
+        // generate → tools → generate loop instead of restarting per pass.
+        let turn_start = Instant::now();
         loop {
             let prompt = render_transcript(&self.session, &self.system);
-            let out = self.tui_generate(terminal, log, &prompt)?;
+            let out = self.tui_generate(terminal, log, &prompt, view, turn_start)?;
             self.session.push(Message::assistant(out.assistant_text));
             log.end_line();
             if out.interrupted {
@@ -1168,11 +1205,17 @@ impl Agent<'_> {
     }
 
     /// Streams one generation pass into `log`, drawing each update.
+    ///
+    /// `turn_start` is when the user submitted the prompt: the status bar's
+    /// elapsed time counts the whole turn (all generation passes and tool
+    /// runs), not just this pass. Tokens/s stays per-pass.
     fn tui_generate(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         log: &mut OutputLog,
         prompt: &str,
+        view: &mut tui::OutputView,
+        turn_start: Instant,
     ) -> Result<TurnOutput, String> {
         let mut stream = StreamRenderer::new(std::mem::take(log));
         if !matches!(
@@ -1184,6 +1227,9 @@ impl Agent<'_> {
         let interrupt_flag = AtomicBool::new(false);
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
+        // Prompt tokens already in context; generated tokens add onto this so
+        // the ctx gauge moves while the model streams.
+        let prompt_tokens = self.engine.count_tokens(prompt);
         let mut assistant_text = String::new();
         let mut gen_count = 0;
         let verb = status::random_verb_index();
@@ -1209,7 +1255,8 @@ impl Agent<'_> {
                             } else {
                                 0.0
                             },
-                            elapsed_secs: secs,
+                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                            ctx_used: prompt_tokens + gen_count,
                             ctx_size,
                             power_percent: power,
                             ..Status::default()
@@ -1221,25 +1268,41 @@ impl Agent<'_> {
                         prefill_total: p.total,
                         prefill_label: verb,
                         prefill_tps: p.tps,
-                        elapsed_secs: start.elapsed().as_secs_f64(),
+                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                        ctx_used: prompt_tokens,
                         ctx_size,
                         power_percent: power,
                         ..Status::default()
                     },
                 };
-                // Poll for Ctrl-C / Esc so generation stays interruptible.
-                if event::poll(Duration::ZERO).unwrap_or(false)
-                    && let Ok(Event::Key(k)) = event::read()
-                    && k.kind == KeyEventKind::Press
-                    && (matches!(k.code, KeyCode::Esc)
-                        || (matches!(k.code, KeyCode::Char('c'))
-                            && k.modifiers.contains(KeyModifiers::CONTROL)))
-                {
-                    interrupt_flag.store(true, Ordering::Relaxed);
+                // Drain pending input so generation stays interruptible
+                // (Ctrl-C / Esc) and the log stays scrollable while streaming:
+                // wheel events pin the viewport, End resumes following.
+                while event::poll(Duration::ZERO).unwrap_or(false) {
+                    match event::read() {
+                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                            KeyCode::Esc => interrupt_flag.store(true, Ordering::Relaxed),
+                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                                interrupt_flag.store(true, Ordering::Relaxed);
+                            }
+                            KeyCode::End => view.follow = true,
+                            _ => {}
+                        },
+                        Ok(Event::Mouse(m)) => match m.kind {
+                            MouseEventKind::ScrollUp => {
+                                view.follow = false;
+                                view.top = view.top.saturating_sub(3);
+                            }
+                            MouseEventKind::ScrollDown => {
+                                view.top = view.top.saturating_add(3);
+                            }
+                            _ => {}
+                        },
+                        _ => {}
+                    }
                 }
                 let line = status::build_status_text(&status, false);
-                let _ =
-                    terminal.draw(|f| tui::draw(f, stream.sink(), None, 0, &line, &mut 0, None));
+                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), None, 0, &line, view, None));
             },
         );
 
@@ -1335,6 +1398,7 @@ impl Agent<'_> {
         input: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
     ) -> bool {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
@@ -1357,7 +1421,7 @@ impl Agent<'_> {
             }
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
-            "/init" => self.tui_run_init(log, terminal),
+            "/init" => self.tui_run_init(log, terminal, view),
             "/compact" => {
                 if let Err(e) = self.tui_do_compact("user request", log) {
                     log.push_plain(format!("compact failed: {e}"));

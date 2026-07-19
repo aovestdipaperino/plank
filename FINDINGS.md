@@ -110,3 +110,15 @@ test` and review the diff before committing.
   TUI rather than scroll regions; clipboard copy goes through `pbcopy` *and*
   OSC 52; the TUI ANSI parser must handle 256-color `38;5` SGR as well as
   truecolor `38;2`, or `/context` and `/mcp` render monochrome.
+- **Ratatui swaps and clears buffers on every `draw()`.** After a frame is
+  flushed, `terminal.current_buffer_mut()` is the *empty next-frame* buffer,
+  not what's on screen. Reading rendered cells after the fact (the original
+  selection-copy bug, issue #1) silently yields blank text; extract cell
+  content inside the `draw` closure from `frame.buffer_mut()` while the
+  frame is still being composed (`src/ui.rs`, mouse-up handler).
+- **Raw-DSML display is not parity territory.** The C agent dumps the
+  rejected stanza's raw bytes on a parse error; plank deliberately diverges
+  and suppresses them (issue #11) — only the bold-red
+  `[invalid tool call: ...]` banner (which names the offending tag) is shown,
+  routed through `RenderSink::error_text`. Byte-parity applies to what the
+  *model* sees (transcript, tool results), never to the terminal projection.

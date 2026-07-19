@@ -104,7 +104,9 @@ message list into the `[system]`/`[user]`/`[assistant]` text the engine tokenize
 Model text is fed byte-by-byte through a pipeline:
 1. `viz::StreamRenderer` detects the DSML tool-call marker (in plain text and
    inside `<think>` blocks), suppresses raw markup, and emits human-friendly
-   tool banners. It routes output to a `RenderSink` (visible vs. thinking).
+   tool banners. It routes output to a `RenderSink` (visible, thinking, and
+   red-styled error banners; raw DSML never reaches the screen, even on parse
+   failure).
 2. `render.rs` (stdout path) turns that into ANSI: markdown, syntax
    highlighting, and gray thinking text.
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable
@@ -127,6 +129,9 @@ Output framing matches the C byte-for-byte.
 ### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`
   (a `RenderSink`), the frame layout, and the magenta-colored progress bar.
+  `OutputView` tracks the scroll viewport: it follows the newest output by
+  default, pins in place when the user wheels back (also mid-generation),
+  and shows a jump-to-bottom hint until End resumes following.
 - `status.rs` — the compact footer text and the prefill progress bar.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.

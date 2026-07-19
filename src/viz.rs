@@ -38,6 +38,11 @@ pub trait RenderSink {
     fn tool_text(&mut self, text: &str) {
         self.visible_text(text);
     }
+    /// Receives error banners (e.g. `[invalid tool call: ...]`); sinks should
+    /// style these red. Defaults to tool text.
+    fn error_text(&mut self, text: &str) {
+        self.tool_text(text);
+    }
 }
 
 /// Kind of tool parameter, used to select the streaming display style.
@@ -448,6 +453,15 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.emit_visible_bytes(s.as_bytes());
     }
 
+    /// Emits an error banner through the sink's red-styled channel.
+    fn viz_error_puts(&mut self, s: &str) {
+        if s.is_empty() {
+            return;
+        }
+        self.last_output_newline = s.ends_with('\n');
+        self.sink.error_text(s);
+    }
+
     fn viz_newline_if_open(&mut self) {
         if !self.last_output_newline {
             self.viz_puts("\n");
@@ -726,14 +740,17 @@ impl<S: RenderSink> StreamRenderer<S> {
         if let Some(status) = status {
             self.viz_newline_if_open();
             let owned = status.to_string();
-            self.viz_puts(&owned);
+            self.viz_error_puts(&owned);
         }
         self.viz_newline_if_open();
         self.viz.active = false;
     }
 
-    /// Shows the exact rejected DSML bytes so failures are debuggable.
-    fn viz_dump_invalid_dsml(&mut self) {
+    /// Suppresses the rejected stanza's on-screen rendering: only the red
+    /// `[invalid tool call: ...]` banner (which names the offending tag) is
+    /// shown, never the raw DSML bytes. The full raw output still reaches the
+    /// transcript, so failures stay debuggable there.
+    fn viz_drop_invalid_dsml(&mut self) {
         if !self.viz.active {
             return;
         }
@@ -741,13 +758,6 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.viz.param_active = false;
             self.viz.param_end_tail.clear();
             self.viz.param_name.clear();
-        }
-        self.viz_newline_if_open();
-        if self.parser.raw().is_empty() {
-            self.viz_puts("<empty DSML>");
-        } else {
-            let raw = self.parser.raw().to_vec();
-            self.emit_visible_bytes(&raw);
         }
         self.viz_newline_if_open();
     }
@@ -815,7 +825,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                         self.parser.error()
                     };
                     let status = format!("[invalid tool call: {err}]\n");
-                    self.viz_dump_invalid_dsml();
+                    self.viz_drop_invalid_dsml();
                     self.viz_finish(Some(&status));
                     self.dsml_active = false;
                 }
@@ -846,7 +856,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.dsml_in_think_reported = true;
         self.viz_newline_if_open();
         let line = format!("[tool call ignored: {msg}]\n");
-        self.viz_puts(&line);
+        self.viz_error_puts(&line);
         self.parser.reset();
         self.dsml_active = false;
         self.dsml_ignored = false;
@@ -859,7 +869,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.stream_error = Some(msg.to_string());
         self.viz_newline_if_open();
         let line = format!("[invalid tool call: {msg}]\n");
-        self.viz_puts(&line);
+        self.viz_error_puts(&line);
     }
 
     fn output_frozen(&self) -> bool {
@@ -1029,10 +1039,15 @@ mod tests {
     struct Cap {
         visible: String,
         think: String,
+        errors: String,
     }
 
     impl RenderSink for Cap {
         fn visible_text(&mut self, text: &str) {
+            self.visible.push_str(text);
+        }
+        fn error_text(&mut self, text: &str) {
+            self.errors.push_str(text);
             self.visible.push_str(text);
         }
         fn think_text(&mut self, text: &str) {
@@ -1250,12 +1265,19 @@ mod tests {
     }
 
     #[test]
-    fn malformed_stanza_dumps_raw_and_reports_error() {
+    fn malformed_stanza_suppresses_raw_and_reports_error() {
         let sr = run_chunked("<｜DSML｜tool_calls><b>");
         let vis = &sr.sink().visible;
-        assert!(vis.contains("[invalid tool call: "), "{vis:?}");
-        // The rejected raw bytes are shown for debugging.
-        assert!(vis.contains("<b>"), "{vis:?}");
+        // The banner names the offending tag through the error channel...
+        assert!(
+            sr.sink()
+                .errors
+                .contains("[invalid tool call: unexpected DSML tag: <b>]"),
+            "{:?}",
+            sr.sink().errors
+        );
+        // ...but the raw stanza bytes never reach the screen.
+        assert!(!vis.contains("tool_calls"), "{vis:?}");
         assert!(sr.finished().error.is_some());
     }
 

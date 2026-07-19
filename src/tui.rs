@@ -33,6 +33,11 @@ fn think_style() -> Style {
     Style::default().fg(Color::Indexed(238))
 }
 
+/// Bold red for error banners, matching the C renderer's `\x1b[1;31m`.
+fn error_style() -> Style {
+    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+}
+
 /// Scrollback of styled lines plus the line currently being streamed.
 ///
 /// Implements [`RenderSink`] so the viz stream renderer appends directly:
@@ -161,6 +166,10 @@ impl RenderSink for OutputLog {
     fn tool_text(&mut self, text: &str) {
         self.md_close();
         self.append(text, visible_style());
+    }
+    fn error_text(&mut self, text: &str) {
+        self.md_close();
+        self.append(text, error_style());
     }
 }
 
@@ -387,20 +396,43 @@ pub fn copy_to_clipboard(text: &str) {
     let _ = out.flush();
 }
 
+/// Scroll state of the output log viewport.
+///
+/// While `follow` is set the view tracks the bottom of the log (the streaming
+/// default). Scrolling back pins the viewport at wrapped-line offset `top`,
+/// which stays put while new output arrives; `draw` clamps `top` in place and
+/// re-enters follow mode once the view reaches the bottom again.
+#[derive(Debug, Clone, Copy)]
+pub struct OutputView {
+    /// First wrapped log line shown, updated by `draw` every frame.
+    pub top: usize,
+    /// True when the view tracks the newest output.
+    pub follow: bool,
+}
+
+impl Default for OutputView {
+    fn default() -> Self {
+        Self {
+            top: 0,
+            follow: true,
+        }
+    }
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
 /// `input` is `None` while the agent is busy (prefill/generation): the prompt
 /// line renders empty and the cursor stays hidden until input is accepted again.
-/// `scroll_back` is how many wrapped lines above the bottom the view sits;
-/// it is clamped in place to the scrollable range.
+/// `view` is the scroll state; it is clamped in place to the scrollable range
+/// and a jump-to-bottom hint is shown while it is pinned above the bottom.
 pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
     input: Option<&str>,
     cursor_col: u16,
     status: &str,
-    scroll_back: &mut usize,
+    view: &mut OutputView,
     selection: Option<Selection>,
 ) {
     let area = frame.area();
@@ -412,7 +444,7 @@ pub fn draw(
     .split(area);
 
     // Output area, scrolled so the latest lines stay visible unless the user
-    // has wheeled back into the buffer.
+    // has wheeled back into the buffer (which pins the viewport in place).
     let text = log.to_text();
     let width = rows[0].width.max(1) as usize;
     let total: usize = text
@@ -420,13 +452,19 @@ pub fn draw(
         .iter()
         .map(|l| l.width().div_ceil(width).max(1))
         .sum();
-    let max_back = total.saturating_sub(rows[0].height as usize);
-    *scroll_back = (*scroll_back).min(max_back);
-    let scroll = u16::try_from(max_back - *scroll_back).unwrap_or(u16::MAX);
+    let max_top = total.saturating_sub(rows[0].height as usize);
+    if view.follow || view.top >= max_top {
+        view.top = max_top;
+        view.follow = true;
+    }
+    let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
     let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(para, rows[0]);
+    if !view.follow {
+        draw_jump_hint(frame, rows[0]);
+    }
     if let Some(sel) = selection {
         highlight_selection(frame.buffer_mut(), rows[0], sel);
     }
@@ -453,6 +491,22 @@ pub fn draw(
         Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
         rows[2],
     );
+}
+
+/// Overlays the jump-to-bottom affordance on the output area's bottom-right
+/// corner while the view is pinned above the newest output.
+fn draw_jump_hint(frame: &mut Frame, area: Rect) {
+    const HINT: &str = " ↓ End: jump to bottom ";
+    let hint_width = u16::try_from(HINT.chars().count()).unwrap_or(u16::MAX);
+    if area.width < hint_width || area.height == 0 {
+        return;
+    }
+    let rect = Rect::new(area.right() - hint_width, area.bottom() - 1, hint_width, 1);
+    let style = Style::default()
+        .bg(Color::Indexed(238))
+        .fg(Color::Indexed(252))
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(Paragraph::new(Span::styled(HINT, style)), rect);
 }
 
 /// Milliseconds since the first frame, driving the shimmer sweep.
