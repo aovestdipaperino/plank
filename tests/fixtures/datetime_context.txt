@@ -1,0 +1,1 @@
+Current local date and time at session start: «MASK». Use this only when date or time matters.

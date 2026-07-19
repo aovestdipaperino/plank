@@ -1,0 +1,2 @@
+Tool result 1 (nope):
+Tool error: unknown tool: nope

@@ -45,208 +45,24 @@ Example anchored edit:\n\
 <｜DSML｜tool_calls>\n\
 <｜DSML｜invoke name=\"edit\">\n\
 <｜DSML｜parameter name=\"path\" string=\"true\">/tmp/example.c</｜DSML｜parameter>\n\
-<｜DSML｜parameter name=\"old\" string=\"true\">static int parse(void) {\n\
-    int ok = 0;\n\
-[upto]\n\
-    return ok;\n\
+<｜DSML｜parameter name=\"old\" string=\"true\">static int parse(void) {\n    int ok = 0;\n\
+[upto]\n    return ok;\n\
 }</｜DSML｜parameter>\n\
-<｜DSML｜parameter name=\"new\" string=\"true\">static int parse(void) {\n\
-    return parse_impl();\n\
+<｜DSML｜parameter name=\"new\" string=\"true\">static int parse(void) {\n    return parse_impl();\n\
 }</｜DSML｜parameter>\n\
 </｜DSML｜invoke>\n\
 </｜DSML｜tool_calls>\n\
 To insert text, use edit with old set to an exact unique anchor and new set to that anchor plus the added text.\n\
 Use read raw=true only when you need plain file text without line numbers or read annotations.\n\n";
 
-/// Trailing section of the tools prompt: web tools, schemas, rules (verbatim from C).
-const TOOLS_PROMPT_AFTER_EDIT: &str = "For long-running bash commands, pass refresh_sec. If a bash job is still running, use \
-bash_status to check it early or bash_stop to terminate it.\n\n\
-Use google_search to find web pages. Use visit_page to read a known URL with a visible browser. \
-The first web call may ask the user for permission to start Chrome.\n\n\
-### Available Tool Schemas\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"google_search\",\n\
-    \"description\": \"Search Google in a visible browser and return compact Markdown links.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"query\": {\"type\": \"string\"}\n\
-      },\n\
-      \"required\": [\"query\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"visit_page\",\n\
-    \"description\": \"Open a URL in a visible browser and return rendered page Markdown.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"url\": {\"type\": \"string\"}\n\
-      },\n\
-      \"required\": [\"url\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"bash\",\n\
-    \"description\": \"Run a shell command.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"command\": {\"type\": \"string\"},\n\
-        \"timeout_sec\": {\"type\": \"number\"},\n\
-        \"refresh_sec\": {\"type\": \"number\"}\n\
-      },\n\
-      \"required\": [\"command\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"bash_status\",\n\
-    \"description\": \"Report current status and new output for a bash job.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"job\": {\"type\": \"number\"},\n\
-        \"pid\": {\"type\": \"number\"},\n\
-        \"refresh_sec\": {\"type\": \"number\"}\n\
-      },\n\
-      \"required\": [\"job\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"bash_stop\",\n\
-    \"description\": \"Terminate a running bash job and report its final output.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"job\": {\"type\": \"number\"},\n\
-        \"pid\": {\"type\": \"number\"},\n\
-        \"refresh_sec\": {\"type\": \"number\"}\n\
-      },\n\
-      \"required\": [\"job\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"read\",\n\
-    \"description\": \"Read a text file or a range of lines.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"path\": {\"type\": \"string\"},\n\
-        \"start_line\": {\"type\": \"number\"},\n\
-        \"max_lines\": {\"type\": \"number\"},\n\
-        \"whole\": {\"type\": \"boolean\"},\n\
-        \"raw\": {\"type\": \"boolean\"}\n\
-      },\n\
-      \"required\": [\"path\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"more\",\n\
-    \"description\": \"Continue the previous read-like output.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"count\": {\"type\": \"number\"}\n\
-      }\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"write\",\n\
-    \"description\": \"Create or overwrite a text file.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"path\": {\"type\": \"string\"},\n\
-        \"content\": {\"type\": \"string\"}\n\
-      },\n\
-      \"required\": [\"path\", \"content\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"edit\",\n\
-    \"description\": \"Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"path\": {\"type\": \"string\"},\n\
-        \"old\": {\"type\": \"string\"},\n\
-        \"new\": {\"type\": \"string\"}\n\
-      },\n\
-      \"required\": [\"path\", \"old\", \"new\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"search\",\n\
-    \"description\": \"Search files and return compact edit-friendly matches.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"query\": {\"type\": \"string\"},\n\
-        \"path\": {\"type\": \"string\"},\n\
-        \"mode\": {\"type\": \"string\"},\n\
-        \"glob\": {\"type\": \"string\"},\n\
-        \"context\": {\"type\": \"number\"},\n\
-        \"max_results\": {\"type\": \"number\"},\n\
-        \"case_sensitive\": {\"type\": \"boolean\"}\n\
-      },\n\
-      \"required\": [\"query\"]\n\
-    }\n\
-  }\n\
-}\n\n\
-{\n\
-  \"type\": \"function\",\n\
-  \"function\": {\n\
-    \"name\": \"list\",\n\
-    \"description\": \"List one directory compactly.\",\n\
-    \"parameters\": {\n\
-      \"type\": \"object\",\n\
-      \"properties\": {\n\
-        \"path\": {\"type\": \"string\"}\n\
-      },\n\
-      \"required\": [\"path\"]\n\
-    }\n\
-  }\n\
-}\n\
-\n\
-# Rules\n\n\
-- Always use strict syntax for DSML tool stanzas.\n\
-- This system runs on local inference of a few hundred tokens/s of prefill, \
-and a few tens of tokens/s decoding speed. Use read/search to get the \
-anchors you need, then use anchored edit to avoid having to \
-retype large text.\n\
-- Write code that is reliable and works well; always have a mental model of \
-what is going on in complex parts of the code.\n\
-- Work in a way that preserves the current system configuration integrity, \
-unless explicitly asked otherwise by the user.\n";
+/// Trailing section of the tools prompt: web tools, schemas, rules.
+///
+/// Byte-identical to the C `agent_tools_prompt_after_edit`. Kept as a
+/// resource file because a `\`-continued Rust string literal strips the
+/// next line's leading whitespace, silently deleting the indentation the
+/// JSON schemas carry (see FINDINGS.md); `tests/c_parity.rs` enforces the
+/// byte identity.
+const TOOLS_PROMPT_AFTER_EDIT: &str = include_str!("resources/tools_prompt_after_edit.txt");
 
 /// Token-estimate distance after which the system prompt reminder is re-injected.
 pub const SYSTEM_PROMPT_REMINDER_TOKENS: i32 = 50_000;

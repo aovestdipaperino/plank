@@ -28,4 +28,5 @@ pub mod tools;
 pub mod trace;
 pub mod tui;
 pub mod ui;
+pub mod upgrade;
 pub mod viz;

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What plank is
 
-A Rust port of the `ds4_agent` C reference (an interactive coding agent for the DeepSeek V4 Flash model), ported functionality-by-functionality — each C section became an idiomatic Rust module with its own tests. The C reference lives in the `ds4-ref` git submodule and is the **source of truth for wire formats and prompt text**: tool output framing, the DSML tool-call syntax, and the system prompt must stay byte-for-byte identical to the C, because that's what the model was trained on. macOS only for real inference (Metal).
+A Rust port of the `ds4_agent` C reference (an interactive coding agent for the DeepSeek V4 Flash model), ported functionality-by-functionality — each C section became an idiomatic Rust module with its own tests. The C reference lives in the `ds4-ref` git submodule and is the **source of truth for wire formats and prompt text**: tool output framing, the DSML tool-call syntax, and the system prompt must stay byte-for-byte identical to the C, because that's what the model was trained on. `tests/c_parity.rs` enforces this against committed fixtures (and against the C source when the submodule is present); regenerate fixtures with `PLANK_REGEN_FIXTURES=1 cargo test`. Hard-won parity and tooling gotchas are cataloged in `FINDINGS.md` — check it before re-deriving a quirk, and add to it when you pin down a new one. Beware: a `\`-continued Rust string literal strips the next line's leading whitespace — never use continued literals for model-facing text with indentation. macOS only for real inference (Metal).
 
 ## Commands
 

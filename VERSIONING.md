@@ -82,3 +82,20 @@ major. A `concurrency: promote` group prevents overlapping runs.
 Note the two formulas conflict (both install a `plank` binary), so users
 switch channels with `brew uninstall plank && brew install plank-beta` or the
 reverse.
+
+## What a bump means for local caches
+
+Version numbers also drive zero-touch maintenance of `~/.plank` on the first
+launch after an upgrade (`src/upgrade.rs` reads the `~/.plank/version`
+marker, classifies the transition, and cleans up):
+
+| Transition | Maintenance performed automatically |
+| --- | --- |
+| Patch (`x.y.Z`) | Nothing; the marker advances |
+| Minor (`x.Y.0`) | The sysprompt KV checkpoint (`kvcache/sysprompt.kv`) is dropped and rebuilt on the next warm-up |
+| Major (`X.0.0`), downgrade, or missing marker | The sysprompt checkpoint **and** the image cache are dropped |
+
+Session transcripts (`kvcache/*.session`) are user data and are never
+removed. When cutting a release, pick the component accordingly: bump at
+least minor when the sysprompt text or engine snapshot format changes, and
+major when older cached state must not be trusted at all.

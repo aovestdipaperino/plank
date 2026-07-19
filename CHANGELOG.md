@@ -6,7 +6,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-07-19
+
 ### Added
+
+- **C-parity byte-diff tests** (`tests/c_parity.rs`): the tools prompt, DSML
+  syntax reminder, system-prompt reminder framing, tool-result framing, and
+  datetime context line are byte-compared against committed fixtures on every
+  test run, and — when the `ds4-ref` submodule is present — against the string
+  constants decoded straight out of `ds4_agent.c`. Regenerate fixtures with
+  `PLANK_REGEN_FIXTURES=1 cargo test`. The first run caught a real parity
+  break: Rust's `\` string-literal continuation strips the next line's leading
+  whitespace, which had silently deleted the indentation in the anchored-edit
+  example and in every JSON tool schema of the system prompt. The schema
+  section now ships as `src/resources/tools_prompt_after_edit.txt` via
+  `include_str!` so the bytes are what the model was trained on.
+- **`FINDINGS.md`**: a catalog of the wire-format nuances the port must
+  preserve (DSML fullwidth bars, dual system-prompt tokenization, KV splice
+  of sampled reply tokens, …) and the environment gotchas (macOS 15 SDK,
+  Homebrew channel-by-major, download-resume 416 trap, …), so they are
+  discovered once instead of per-session.
+- **Upgrade cache maintenance** (`src/upgrade.rs`): on the first launch after
+  a version change, plank classifies the transition from the version marker
+  in `~/.plank/version` and clears exactly the caches the new binary can no
+  longer trust — a minor bump drops the sysprompt KV checkpoint, a major bump
+  (or downgrade, or missing marker) also drops the image cache. Session
+  transcripts are never touched, and everything removed is rebuilt on demand.
 
 - **MCP client** ported from the ds4 `mcp-support` branch: stdio MCP servers
   listed in `./.mcp.json` (or `--mcp-config FILE`) are spawned at startup and
