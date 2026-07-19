@@ -98,6 +98,11 @@ pub struct TurnShared {
     /// `/btw` side questions queued while the worker is busy, answered FIFO
     /// at generation boundaries (modeled on `OpenClaw`'s side-question queue).
     pub btw: Mutex<Vec<String>>,
+    /// When set (by the interactive UI), the `/btw` side panel stays open
+    /// after an answer finishes — until the user asks another `/btw` or
+    /// presses Esc. Left false in headless/test contexts, where the drain
+    /// simply returns once the queue empties.
+    pub hold_btw_panel: AtomicBool,
 }
 
 /// Cap on queued `/btw` questions; a push beyond it drops the oldest entry

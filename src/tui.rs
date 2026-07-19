@@ -555,7 +555,7 @@ pub fn draw_btw_split(
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(Color::Indexed(238)))
         .title(Span::styled(
-            " btw · Esc cancels ",
+            " btw · Esc closes ",
             Style::default()
                 .fg(Color::Indexed(114))
                 .add_modifier(Modifier::BOLD),

@@ -964,6 +964,13 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            "/repro" => match self.write_repro(arg) {
+                Ok(path) => println!(
+                    "{}",
+                    self.debug_line(&format!("[repro written to {}]", path.display()))
+                ),
+                Err(e) => println!("repro failed: {e}"),
+            },
             "/subagent" => {
                 if arg.is_empty() {
                     println!("usage: /subagent <task>");
@@ -1041,6 +1048,29 @@ impl Agent<'_> {
             msg.push_str(" (saved)");
         }
         Ok(msg)
+    }
+
+    /// Writes a `/repro` diagnostic dump — the exact rendered engine input
+    /// plus the runtime knobs that shape generation — to `~/.plank/repro/`.
+    /// `note` is an optional free-text description of the bug. Read-only: the
+    /// live session is untouched.
+    fn write_repro(&self, note: &str) -> Result<std::path::PathBuf, String> {
+        let rendered = render_transcript(&self.session, &self.system);
+        let version = crate::logo::version_label();
+        let date = crate::context::current_local_iso_date();
+        let meta = crate::repro::Meta {
+            version: &version,
+            date: &date,
+            ctx_size: self.engine.ctx_size(),
+            transcript_tokens: self.engine.count_tokens(&rendered),
+            last_ctx_used: self.last_ctx_used,
+            power_percent: self.power_percent,
+            session_id: &self.session.id,
+            session_tag: &self.session.tag,
+            note: note.trim(),
+        };
+        let report = crate::repro::build_report(&meta, self.cfg, &rendered);
+        crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)
     }
 
     /// Starts a `/subagent` fork: appends the framed task to the live
@@ -1756,13 +1786,21 @@ impl Agent<'_> {
     /// must never abort the main turn.
     ///
     /// While answering, `BtwBegin`/`BtwEnd` bracket the render events so the
-    /// UI splits off a side panel (main conversation 60%, `/btw` 40%) and
-    /// tears it down when the drain finishes or is cancelled.
+    /// UI splits off a side panel (main conversation 60%, `/btw` 40%). With
+    /// [`TurnShared::hold_btw_panel`] set (interactive UI), the panel stays
+    /// open after an answer completes — the worker parks here until the user
+    /// asks another `/btw` or presses Esc — so the answer stays readable
+    /// instead of vanishing the instant it finishes. Esc both cancels an
+    /// in-flight answer and closes an idle panel; either way the main task
+    /// resumes only once the panel is dismissed.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
         let Some(mut question) = shared.pop_btw() else {
             return;
         };
         let _ = tx.send(UiEvent::BtwBegin);
+        // A stale interrupt (e.g. the preempt path) must not close the panel
+        // before the user has seen anything.
+        shared.interrupt.store(false, Ordering::Relaxed);
         loop {
             let _ = tx.send(UiEvent::UserEcho(format!("/btw {question}")));
             let _ = tx.send(UiEvent::Dim("[btw]".to_owned()));
@@ -1777,6 +1815,8 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::EndLine);
                     self.last_ctx_used = saved_ctx;
                     if out.interrupted {
+                        // Esc during a streaming answer: cancel it, flush the
+                        // queue, and close the panel.
                         crate::interrupt::clear();
                         let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                         let cleared = shared.clear_btw();
@@ -1801,12 +1841,53 @@ impl Agent<'_> {
                     self.last_ctx_used = saved_ctx;
                 }
             }
-            let Some(next) = shared.pop_btw() else {
+            // Answer the next queued question right away; otherwise the panel
+            // is idle. In the interactive UI it stays open until the user asks
+            // another `/btw` or dismisses it with Esc (headless: just return).
+            if let Some(next) = shared.pop_btw() {
+                question = next;
+                continue;
+            }
+            if !shared.hold_btw_panel.load(Ordering::Relaxed) {
                 break;
-            };
-            question = next;
+            }
+            let _ = tx.send(UiEvent::Dim(
+                "[answer complete — Esc closes the panel, or type another /btw]".to_owned(),
+            ));
+            match self.wait_for_next_btw(tx, shared) {
+                Some(next) => question = next,
+                None => break,
+            }
         }
+        // Consume the dismissing Esc so the resumed main task is not itself
+        // interrupted by it.
+        shared.interrupt.store(false, Ordering::Relaxed);
+        crate::interrupt::clear();
         let _ = tx.send(UiEvent::BtwEnd);
+    }
+
+    /// Parks the worker while an idle `/btw` panel is held open, publishing an
+    /// Idle footer so the status bar does not show a frozen generation state.
+    /// Returns the next queued question, or `None` when the user dismisses the
+    /// panel with Esc (`shared.interrupt`).
+    fn wait_for_next_btw(&self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Option<String> {
+        let idle = Status {
+            state: WorkerState::Idle,
+            ctx_used: self.last_ctx_used,
+            ctx_size: self.engine.ctx_size(),
+            power_percent: self.power_percent,
+            ..Status::default()
+        };
+        let _ = tx.send(UiEvent::Status(idle));
+        loop {
+            if let Some(next) = shared.pop_btw() {
+                return Some(next);
+            }
+            if shared.interrupt.load(Ordering::Relaxed) || crate::interrupt::pending() {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -2228,6 +2309,10 @@ impl Agent<'_> {
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
                 }
             },
+            "/repro" => match self.write_repro(arg) {
+                Ok(path) => log.push_dim(format!("[repro written to {}]", path.display())),
+                Err(e) => log.push_plain(format!("repro failed: {e}")),
+            },
             "/subagent" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /subagent <task>");
@@ -2276,6 +2361,9 @@ fn run_worker_ui<T: Send>(
     shared: &TurnShared,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
+    // Interactive front-end: a finished `/btw` panel stays open until the
+    // user asks another or presses Esc.
+    shared.hold_btw_panel.store(true, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
         let handle = s.spawn(move || job(tx));
@@ -2427,7 +2515,7 @@ fn busy_ui_loop(
                                 shared.preempt.store(true, Ordering::Relaxed);
                                 log.push_dim("[/btw — pausing the task to answer now]");
                             } else {
-                                log.push_dim("[/btw queued — answers after the current one]");
+                                log.push_dim("[/btw — answers next in the panel]");
                             }
                             view.follow = true;
                         } else if line.starts_with('/') || line.starts_with('!') {
@@ -3049,6 +3137,49 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, UiEvent::MainRollback)));
         assert!(events.iter().any(|e| matches!(e, UiEvent::BtwBegin)));
         assert!(!shared.preempt.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn held_btw_panel_stays_open_until_esc_closes_it() {
+        let dir = scratch_dir("btw-hold");
+        let engine = ScriptedEngine {
+            replies: vec!["It is Rust.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("main"));
+        let before = agent.session.transcript.len();
+
+        let shared = TurnShared::default();
+        shared.hold_btw_panel.store(true, Ordering::Relaxed);
+        shared.push_btw("what language?".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        // The scripted answer is instant, so the panel is parked well before
+        // this delayed "Esc" fires to close it and unblock the worker.
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                shared.interrupt.store(true, Ordering::Relaxed);
+            });
+            agent.drain_btw(&tx, &shared);
+        });
+        drop(tx);
+
+        // Nothing entered the transcript, and the dismissing Esc was consumed
+        // so a resumed main task would not see it.
+        assert_eq!(agent.session.transcript.len(), before);
+        assert!(!shared.interrupt.load(Ordering::Relaxed));
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        // The panel parked (idle-hint emitted) and then tore down on Esc.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("Esc closes the panel")))
+        );
+        assert!(events.iter().any(|e| matches!(e, UiEvent::BtwEnd)));
         std::fs::remove_dir_all(&dir).ok();
     }
 

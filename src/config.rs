@@ -307,6 +307,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
     ) || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")
+        || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/power")
@@ -693,6 +694,9 @@ mod tests {
         assert!(slash_command_known("/del 1"));
         assert!(slash_command_known("/strip"));
         assert!(slash_command_known("/history 10"));
+        assert!(slash_command_known("/repro"));
+        assert!(slash_command_known("/repro looping bug"));
+        assert!(!slash_command_known("/reprox"));
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
         assert!(!slash_command_known("/helpme"));

@@ -22,6 +22,7 @@ pub mod interrupt;
 pub mod logo;
 pub mod memory;
 pub mod render;
+pub mod repro;
 pub mod sandbox;
 pub mod session;
 pub mod skills;

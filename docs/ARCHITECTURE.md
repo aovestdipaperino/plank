@@ -150,9 +150,11 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
 
-### Support (`config.rs`, `trace.rs`, `interrupt.rs`, `logo.rs`)
+### Support (`config.rs`, `trace.rs`, `interrupt.rs`, `logo.rs`, `repro.rs`)
 CLI parsing, trace logging (`--trace`), the SIGINT flag for interrupting
-generation, and the startup banner.
+generation, the startup banner, and `/repro` — a read-only diagnostic dump of
+the exact rendered engine input plus generation knobs, written to
+`~/.plank/repro/` for bug reports.
 
 ## Data flows worth understanding
 
