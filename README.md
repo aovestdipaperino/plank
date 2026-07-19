@@ -48,6 +48,12 @@ plank --help     # full option list
 
 Run with a prompt argument for one-shot headless mode.
 
+On first run with no model present, plank offers to download the default GGUF (~87 GB) and shows live progress:
+
+<p align="center">
+  <img src="assets/model-download.gif" alt="Model download progress UI" width="700">
+</p>
+
 ### Plank-only features
 
 Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-facing side. Features that exist only in plank:
