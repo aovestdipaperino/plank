@@ -49,6 +49,9 @@ pub struct AgentConfig {
     pub n_threads: i32,
     /// GPU power cap percent from `--power`; 0 = unset.
     pub power_percent: i32,
+    /// `--sandbox`/`--no-sandbox` override for the bash write sandbox;
+    /// `None` defers to sandbox.json (default off).
+    pub sandbox_override: Option<bool>,
     /// Native-engine tuning knobs (MTP, SSD streaming, steering, ...).
     pub engine: EngineTuning,
 }
@@ -147,6 +150,7 @@ impl Default for AgentConfig {
             backend: None,
             n_threads: 0,
             power_percent: 0,
+            sandbox_override: None,
             engine: EngineTuning::default(),
         }
     }
@@ -197,6 +201,10 @@ Options:
       --chdir PATH         change working directory before starting
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
+      --sandbox            run model bash commands under sandbox-exec
+                           (writes limited to cwd/temp; see sandbox.json)
+      --no-sandbox         disable the bash sandbox even if sandbox.json
+                           enables it
 "
     .to_owned()
 }
@@ -411,6 +419,8 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--sandbox" => c.sandbox_override = Some(true),
+            "--no-sandbox" => c.sandbox_override = Some(false),
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,

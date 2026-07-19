@@ -39,6 +39,8 @@ struct Shared {
 
 /// One tracked background shell command.
 #[derive(Debug)]
+// running/timed_out/sandboxed are independent process facts, not a state enum.
+#[allow(clippy::struct_excessive_bools)]
 struct BashJob {
     id: i64,
     pid: u32,
@@ -51,6 +53,7 @@ struct BashJob {
     exit_status: i64,
     running: bool,
     timed_out: bool,
+    sandboxed: bool,
 }
 
 /// Table of live and finished asynchronous bash jobs.
@@ -316,6 +319,21 @@ impl BashJob {
             }
             out.push_str("</tail>\n");
         }
+        if self.sandboxed
+            && !self.running
+            && self.exit_status != 0
+            && self
+                .read_tail_lines(BASH_FINAL_TAIL_LINES)
+                .contains("Operation not permitted")
+        {
+            let _ = writeln!(
+                out,
+                "[sandbox blocked: this command ran under plank's write sandbox \
+                 (writes allowed only under the working directory and temp dirs). \
+                 If the failure is a legitimate write elsewhere, ask the user to add \
+                 the path to writablePaths in .plank/sandbox.json.]"
+            );
+        }
         if self.running {
             let _ = writeln!(
                 out,
@@ -369,13 +387,24 @@ impl BashJobs {
         ctx_cwd: &std::path::Path,
         cmd: &str,
         timeout_sec: u64,
+        sandbox: Option<&crate::sandbox::Sandbox>,
     ) -> Result<i64, String> {
         if self.next_id <= 0 {
             self.next_id = 1;
         }
         let id = self.next_id;
         let (path, file) = make_output_file(u64::try_from(id).unwrap_or(0))?;
-        let mut child = Command::new("/bin/sh")
+        // When a sandbox policy applies, wrap the shell in sandbox-exec with
+        // a generated Seatbelt profile (read everywhere, write only under
+        // cwd/temp/configured roots). See src/sandbox.rs.
+        let mut command = if let Some(sb) = sandbox {
+            let mut c = Command::new("/usr/bin/sandbox-exec");
+            c.arg("-p").arg(sb.profile(ctx_cwd)).arg("/bin/sh");
+            c
+        } else {
+            Command::new("/bin/sh")
+        };
+        let mut child = command
             .arg("-c")
             .arg(cmd)
             .current_dir(ctx_cwd)
@@ -410,6 +439,7 @@ impl BashJobs {
             observed_once: false,
             exit_status: -1,
             running: true,
+            sandboxed: sandbox.is_some(),
             timed_out: false,
         });
         Ok(id)
@@ -471,7 +501,8 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
-    if let Err(err) = ctx.bash.start(&ctx.cwd.clone(), cmd, timeout) {
+    let sandbox = ctx.sandbox.should_sandbox(cmd).then_some(&ctx.sandbox);
+    if let Err(err) = ctx.bash.start(&ctx.cwd.clone(), cmd, timeout, sandbox) {
         return format!("Tool error: bash failed to start: {err}\n");
     }
     let idx = ctx.bash.jobs.len() - 1;
@@ -616,6 +647,52 @@ mod tests {
         );
         assert!(out.contains("exit_status=3\n"));
         assert!(out.contains("oops\n"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// End-to-end Seatbelt check: with the sandbox on, a write inside cwd
+    /// succeeds while a write outside it is denied with EPERM and the
+    /// observation carries the `[sandbox blocked: ...]` hint. Requires
+    /// /usr/bin/sandbox-exec, so macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bash_sandbox_blocks_writes_outside_cwd() {
+        let (mut ctx, dir) = test_ctx();
+        ctx.sandbox.enabled = true;
+
+        let ok = tool_bash(
+            &mut ctx,
+            &test_call("bash", &[("command", "echo inside > inside.txt")]),
+        );
+        assert!(ok.contains("exit_status=0\n"), "cwd write failed: {ok}");
+
+        // The scratch dir lives under temp_dir(), which the profile always
+        // allows — the escape target must sit outside both cwd and temp, so
+        // use a scratch dir under $HOME.
+        let home = std::env::var("HOME").expect("HOME set");
+        let outside =
+            std::path::Path::new(&home).join(format!(".plank-sandbox-test-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let cmd = format!("echo escape > '{}/escape.txt'", outside.display());
+        let blocked = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd)]));
+        assert!(
+            !blocked.contains("exit_status=0\n"),
+            "outside write should fail: {blocked}"
+        );
+        assert!(
+            blocked.contains("[sandbox blocked:"),
+            "missing violation hint: {blocked}"
+        );
+        assert!(!outside.join("escape.txt").exists());
+
+        // Excluded commands bypass the sandbox entirely.
+        ctx.sandbox.excluded_commands.push("echo *".to_string());
+        let bypass = tool_bash(&mut ctx, &test_call("bash", &[("command", &cmd)]));
+        assert!(
+            bypass.contains("exit_status=0\n"),
+            "excluded command should bypass sandbox: {bypass}"
+        );
+        std::fs::remove_dir_all(outside).ok();
         std::fs::remove_dir_all(dir).ok();
     }
 

@@ -1909,6 +1909,10 @@ fn new_agent(
     // schemas land in it, like agent_worker_init.
     tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
     tool_ctx.hooks = crate::hooks::load_default(&tool_ctx.cwd);
+    tool_ctx.sandbox = crate::sandbox::load_default(&tool_ctx.cwd);
+    if let Some(enabled) = cfg.sandbox_override {
+        tool_ctx.sandbox.enabled = enabled;
+    }
     if show_footer {
         // Interactive approval for web access, like agent_web_confirm;
         // headless runs keep the auto-deny default.

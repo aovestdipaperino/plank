@@ -77,6 +77,8 @@ pub struct ToolContext {
     pub recent_reads: Vec<PathBuf>,
     /// Command hooks (PreToolUse/PostToolUse/Stop) from hooks.json configs.
     pub hooks: crate::hooks::Hooks,
+    /// Seatbelt sandbox policy for model-initiated bash commands.
+    pub sandbox: crate::sandbox::Sandbox,
     /// User-only warnings from non-blocking hook failures, drained by the UI
     /// after each dispatch.
     pub hook_warnings: Vec<String>,
@@ -93,6 +95,7 @@ impl std::fmt::Debug for ToolContext {
             .field("mcp", &self.mcp)
             .field("recent_reads", &self.recent_reads)
             .field("hooks", &self.hooks)
+            .field("sandbox", &self.sandbox)
             .finish_non_exhaustive()
     }
 }
@@ -110,6 +113,7 @@ impl ToolContext {
             mcp: Vec::new(),
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
+            sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
         }
     }

@@ -20,6 +20,7 @@ pub mod imagepaste;
 pub mod interrupt;
 pub mod logo;
 pub mod render;
+pub mod sandbox;
 pub mod session;
 pub mod skills;
 pub mod status;
