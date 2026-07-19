@@ -5,6 +5,7 @@
 //! section of the original agent.
 
 pub mod agents;
+pub mod checkpoint;
 pub mod compact;
 pub mod config;
 pub mod context;

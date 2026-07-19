@@ -225,6 +225,9 @@ struct Agent<'a> {
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
     skills: Vec<crate::skills::Skill>,
+    /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
+    /// when the session is replaced.
+    checkpoints: crate::checkpoint::CheckpointStore,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -233,6 +236,9 @@ const HISTORY_DEFAULT_TURNS: usize = 3;
 const RESUME_LIST_LIMIT: usize = 10;
 /// Maximum user turns `/history` accepts.
 const HISTORY_MAX_TURNS: usize = 200;
+/// Name of the auto-checkpoint saved before a `/rollback`, so a rollback is
+/// itself undoable via `/rollback pre-rollback`.
+const PRE_ROLLBACK_CHECKPOINT: &str = "pre-rollback";
 
 impl Agent<'_> {
     /// Wraps a debug/status message in the thinking gray on color terminals.
@@ -844,9 +850,30 @@ impl Agent<'_> {
                 let combined = self.context_content.combined();
                 self.session.push(Message::user(combined));
                 self.last_ctx_used = 0;
+                self.checkpoints.clear();
                 println!("started a new session");
             }
             "/help" => print!("{}", crate::config::usage()),
+            "/checkpoint" => {
+                if arg.is_empty() {
+                    print!(
+                        "{}",
+                        crate::checkpoint::render_list(&self.checkpoints, now_secs(), self.color)
+                    );
+                } else {
+                    println!("{}", self.checkpoint_create(arg));
+                }
+            }
+            "/rollback" => {
+                if arg.is_empty() {
+                    println!("usage: /rollback <name> (see /checkpoint for the list)");
+                } else {
+                    match self.rollback_to(arg) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => println!("{e}"),
+                    }
+                }
+            }
             "/save" => match self.store.save(&mut self.session) {
                 Ok(id) => println!("saved session {}", &id[..8]),
                 Err(e) => println!("save failed: {e}"),
@@ -866,6 +893,7 @@ impl Agent<'_> {
                     );
                     self.session = s;
                     self.last_ctx_used = 0;
+                    self.checkpoints.clear();
                 }
                 Err(e) => println!("switch failed: {e}"),
             },
@@ -893,6 +921,7 @@ impl Agent<'_> {
                     );
                     self.session = s;
                     self.last_ctx_used = 0;
+                    self.checkpoints.clear();
                 }
                 Err(e) => println!("resume failed: {e}"),
             },
@@ -1069,6 +1098,46 @@ impl Agent<'_> {
             self.debug_line(&format!("[resumed session {short}]"))
         );
         Some(out)
+    }
+
+    /// Captures a named checkpoint: the current transcript plus the engine KV
+    /// snapshot (when the engine supports it). Returns a status line.
+    fn checkpoint_create(&mut self, name: &str) -> String {
+        let kv = self.engine.snapshot_kv();
+        let had_kv = kv.is_some();
+        let replaced = self.checkpoints.save(name, &self.session, kv);
+        let verb = if replaced { "updated" } else { "saved" };
+        let note = if had_kv {
+            " (with engine KV)"
+        } else {
+            " (transcript only)"
+        };
+        format!("checkpoint {verb}: {name}{note}")
+    }
+
+    /// Rolls back to a named checkpoint: the current tail is saved first as
+    /// `pre-rollback` (so the rollback is undoable), then the transcript is
+    /// restored verbatim and, when the checkpoint carries engine KV, the
+    /// session KV is restored so the next turn skips re-prefill.
+    fn rollback_to(&mut self, name: &str) -> Result<String, String> {
+        let Some(cp) = self.checkpoints.get(name).cloned() else {
+            return Err(format!("no checkpoint named {name} (see /checkpoint)"));
+        };
+        // Snapshot the current tail before discarding it.
+        let tail_kv = self.engine.snapshot_kv();
+        self.checkpoints
+            .save(PRE_ROLLBACK_CHECKPOINT, &self.session, tail_kv);
+        crate::checkpoint::restore_transcript(&mut self.session, &cp);
+        self.last_ctx_used = 0;
+        let note = match &cp.kv {
+            Some(bytes) if self.engine.restore_kv(bytes).is_ok() => {
+                " (engine KV restored, zero re-prefill)"
+            }
+            _ => " (transcript restored, re-prefill on next turn)",
+        };
+        Ok(format!(
+            "rolled back to {name}{note}; tail saved as \"{PRE_ROLLBACK_CHECKPOINT}\""
+        ))
     }
 
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
@@ -2299,7 +2368,29 @@ impl Agent<'_> {
                 let combined = self.context_content.combined();
                 self.session.push(Message::user(combined));
                 self.last_ctx_used = 0;
+                self.checkpoints.clear();
                 log.push_plain("started a new session");
+            }
+            "/checkpoint" => {
+                if arg.is_empty() {
+                    log.push_ansi(&crate::checkpoint::render_list(
+                        &self.checkpoints,
+                        now_secs(),
+                        true,
+                    ));
+                } else {
+                    log.push_plain(self.checkpoint_create(arg));
+                }
+            }
+            "/rollback" => {
+                if arg.is_empty() {
+                    log.push_plain("usage: /rollback <name> (see /checkpoint for the list)");
+                } else {
+                    match self.rollback_to(arg) {
+                        Ok(msg) => log.push_plain(msg),
+                        Err(e) => log.push_plain(e),
+                    }
+                }
             }
             "/help" => {
                 for line in crate::config::usage().lines() {
@@ -2339,6 +2430,7 @@ impl Agent<'_> {
                     }
                     self.session = s;
                     self.last_ctx_used = 0;
+                    self.checkpoints.clear();
                 }
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
@@ -2360,6 +2452,7 @@ impl Agent<'_> {
                     log.push_ansi(&crate::session::render_history(&s.transcript, 6, true));
                     self.session = s;
                     self.last_ctx_used = 0;
+                    self.checkpoints.clear();
                 }
                 Err(e) => log.push_plain(format!("resume failed: {e}")),
             },
@@ -2833,6 +2926,7 @@ fn new_agent(
         last_ctx_used: 0,
         context_content,
         skills,
+        checkpoints: crate::checkpoint::CheckpointStore::new(),
     })
 }
 
@@ -3110,6 +3204,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
         }
     }
 
@@ -3670,6 +3765,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -3722,6 +3818,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -3784,6 +3881,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -3833,6 +3931,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
         };
         agent.session.push(Message::user("run echo"));
 

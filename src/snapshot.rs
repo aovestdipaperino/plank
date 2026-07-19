@@ -70,6 +70,7 @@ mod ds4 {
         ///
         /// # Errors
         /// Returns [`EngineError`] if the engine fails to serialize the state.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)] // FFI boundary; safety documented below.
         pub fn capture(session: *mut ffi::Ds4Session) -> Result<Self, EngineError> {
             let mut inner = ffi::Ds4SessionSnapshot::default();
             let mut err = [0_i8; 512];
@@ -90,6 +91,7 @@ mod ds4 {
         ///
         /// # Errors
         /// Returns [`EngineError`] if the engine rejects the snapshot.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)] // FFI boundary; safety documented below.
         pub fn restore(&self, session: *mut ffi::Ds4Session) -> Result<(), EngineError> {
             let mut err = [0_i8; 512];
             // SAFETY: session valid; inner is a live snapshot we own.
@@ -129,6 +131,7 @@ mod ds4 {
         ///
         /// # Errors
         /// Returns [`EngineError`] if the engine rejects the payload.
+        #[allow(clippy::not_unsafe_ptr_arg_deref)] // FFI boundary; safety documented below.
         pub fn restore_bytes(
             session: *mut ffi::Ds4Session,
             bytes: &[u8],

@@ -660,6 +660,31 @@ impl Engine for Ds4Engine {
     fn model_name(&self) -> String {
         Ds4Engine::model_name(self)
     }
+
+    fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
+        if self.session.is_null() {
+            return None;
+        }
+        // Reuse the single snapshot primitive (src/snapshot.rs) rather than
+        // hand-rolling the FFI: capture owns an engine buffer and frees it on
+        // drop; we copy the payload out for the caller to persist.
+        let snap = SessionSnapshot::capture(self.session).ok()?;
+        Some(snap.as_bytes().to_vec())
+    }
+
+    fn restore_kv(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let session = self.ensure_session()?;
+        // Load our own persisted bytes through the non-owning restore path
+        // (the engine copies from a transient struct and never frees it);
+        // see snapshot.rs / FINDINGS.md.
+        SessionSnapshot::restore_bytes(session, bytes)?;
+        // The live session now holds the checkpoint's token state. The last
+        // sampled reply no longer describes the restored tail, so drop it;
+        // the next turn re-templates that final assistant turn from text
+        // (a small re-prefill), while the bulk of the prefix stays cached.
+        self.last_reply = None;
+        Ok(())
+    }
 }
 
 impl Drop for Ds4Engine {
