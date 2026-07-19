@@ -13,10 +13,10 @@ cargo build                 # debug build (builds the C engine via build.rs when
 cargo test --lib            # unit tests — no model needed, pure logic + EchoEngine
 cargo test --lib <name>     # single test by substring filter
 cargo fmt
-cargo clippy --workspace --all-targets   # pedantic + perf lints are warn-by-default in Cargo.toml
+cargo clippy --workspace --all-targets -- -D warnings   # CI gate; pedantic + perf lints are warn-by-default in Cargo.toml but -D warnings makes them fail
 ```
 
-The pre-commit hook runs `cargo fmt` and the clippy command above; fix warnings rather than allowing them.
+The pre-commit hook runs `cargo fmt` and the clippy command above (with `-D warnings`, same as CI); fix warnings rather than allowing them. Note clippy only re-lints crates it recompiles, so a cached "clean" run can miss warnings in untouched files — CI compiles fresh, so trust the hook/CI over an incremental local run.
 
 - **With the `ds4-ref` submodule present** (macOS): `build.rs` compiles `libds4core.a`, links Foundation/Metal, and emits the `ds4_engine` cfg. Real inference needs a GGUF model (see `download_model.sh` in `ds4-ref`).
 - **Without it**: plank still builds and tests, using only the `EchoEngine` stub — this is the normal dev/CI path. Code touching the native engine must be gated with `#[cfg(ds4_engine)]`.
