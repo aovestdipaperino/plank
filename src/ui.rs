@@ -950,9 +950,7 @@ impl Agent<'_> {
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
-            // /btw shares the experimental gate with image pasting until the
-            // model-format investigation lands.
-            "/btw" if IMAGES_ENABLED => {
+            "/btw" => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
                 } else {
@@ -2181,9 +2179,7 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
-            // /btw shares the experimental gate with image pasting until the
-            // model-format investigation lands.
-            "/btw" if IMAGES_ENABLED => {
+            "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
                 } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input) {
@@ -2367,7 +2363,7 @@ fn busy_ui_loop(
                         input.buf.clear();
                         input.hist_idx = None;
                         if line.is_empty() {
-                        } else if IMAGES_ENABLED && btw_question(&line).is_some() {
+                        } else if btw_question(&line).is_some() {
                             // Side questions queue FIFO and are answered at
                             // the next generation boundary (BTW-DESIGN §4.4).
                             let question = btw_question(&line).unwrap_or_default().to_owned();

@@ -6,8 +6,8 @@ open-source implementation of the pattern. OpenClaw is vendored as a reference
 submodule at `refs/openclaw` (`shallow`/`update=none`: CI skips it; fetch with
 `git submodule update --init --checkout refs/openclaw`).
 
-Status: **implemented (steps 1–4), still gated.** §4's mechanics landed on the
-#12 worker-thread architecture instead of the reverted `433fcb6` event-drain:
+Status: **shipped and un-gated.** §4's mechanics landed on the #12
+worker-thread architecture instead of the reverted `433fcb6` event-drain:
 the busy UI loop queues `/btw <q>` into `TurnShared` (FIFO cap
 20, drop-oldest — OpenClaw's bounded-buffer policy), and the worker answers at
 generation boundaries via `Agent::drain_btw` (interrupt flushes the queue;
@@ -18,10 +18,14 @@ push rather than a status-bar field, and plain (non-`/btw`) lines typed while
 busy queue into the *main* conversation — that shipped with #12 as the C's
 `queued_user_drain`, superseding §4.4's "stays in the buffer".
 
-§4.8 as written is impossible: the C reference contains **no** btw framing
-(`btw_user_message` came from Claude Code's pattern, not `ds4_agent.c`), so no
-parity fixture can settle the model-format question. Un-gating still waits on
-#18's real-engine validation of the framing.
+§4.8 was revised: the C reference contains **no** btw framing
+(`btw_user_message` came from Claude Code's pattern, not `ds4_agent.c`), so
+the planned parity fixture (step 2) was impossible. Un-gating instead rested
+on validating the framing against the real Metal engine, which the
+split-panel smoke test confirmed answers side questions correctly from shared
+context with tools disabled; `/btw` is now in the unconditional arm of
+`slash_command_known` and both slash dispatchers. The `images` feature keeps
+gating image pasting only.
 
 ## 1. Goal
 
@@ -237,18 +241,21 @@ Mechanics (implemented on the #12 worker-thread architecture):
 - `last_ctx_used` restore must run on the error path too (RAII guard or
   explicit restore before `?`).
 
-### 4.8 Un-gating
+### 4.8 Un-gating (done)
 
-`/btw` currently shares the `images` experimental gate "until the
-model-format investigation lands." That investigation concerns the *framing
-text* the model was trained on, not the queueing mechanics. Plan:
+`/btw` shared the `images` experimental gate "until the model-format
+investigation lands." That investigation concerned the *framing text* the
+model was trained on, not the queueing mechanics. What actually happened:
 
-1. Land everything above still behind the gate.
-2. Close the model-format question: verify with the reference C agent that
-   `btw_user_message` matches the reference framing byte-for-byte and add it
-   to the `tests/c_parity.rs` fixture set.
-3. Move `/btw` into the unconditional arm of `slash_command_known`
-   and delete the gate comment. The `images` feature keeps gating images only.
+1. Landed everything above behind the gate.
+2. The planned parity fixture was **impossible**: the C reference has no btw
+   framing to match (`btw_user_message` follows Claude Code's pattern, not
+   `ds4_agent.c`). Instead the framing was validated live — the split-panel
+   smoke test confirmed the model answers side questions from shared context
+   with tools disabled and without derailing the main task.
+3. `/btw` moved into the unconditional arm of `slash_command_known` and both
+   slash dispatchers; the gate comments were deleted. The `images` feature
+   keeps gating image pasting only.
 
 ## 5. Implementation plan
 
