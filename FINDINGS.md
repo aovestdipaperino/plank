@@ -68,6 +68,22 @@ test` and review the diff before committing.
   sampled tokens of the last reply and splices them into the next prompt —
   otherwise the KV common-prefix probe diverges at the start of the reply and
   the whole tail re-prefills (`src/ds4engine.rs`, `build_tokens`).
+- **Per-session KV payloads cannot share the transcript's `.kv` name, and a
+  restored payload must drop the spliced-reply cache.** The C stores the
+  engine payload inside the session `.kv` file; plank's v1 transcript format
+  already owns that name, so payloads live in a `<sha>.payload` sidecar
+  (fingerprint line + `ds4_session_save_snapshot` bytes, same layout as
+  `sysprompt.kv`). The fingerprint covers model ‖ NUL ‖ system prompt ‖ NUL ‖
+  rendered transcript, so a resave after more turns (or compaction) is
+  detected as stale. And because `Ds4Engine` splices the *previous* reply's
+  exact sampled tokens into the next prompt build, restoring a snapshot from
+  another conversation with `last_reply` still set would splice the wrong
+  tokens — `Ds4Session::restore_kv` clears it (`src/ds4engine.rs`), and the
+  payload load path (`Agent::load_session_payload` in `src/ui.rs`) goes
+  through `restore_kv` so it inherits that. The raw KV bytes are the shared
+  `snapshot_kv`/`restore_kv` primitive (`SessionSnapshot::as_bytes` /
+  `restore_bytes`); the `.payload` sidecar and fingerprint only wrap them, so
+  there is no second hand-rolled KV-serialize path.
 - **`count_tokens` must subtract chat-template overhead** so it reports
   text-only counts; the template wrapper is measured once at engine startup
   (`src/ds4engine.rs`).
