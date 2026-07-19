@@ -22,7 +22,7 @@ brew install plank-beta    # beta channel
 
 Or in one step without a prior tap: `brew install aovestdipaperino/tap/plank`. Prebuilt bottles exist for Apple Silicon and Intel Macs; on other setups Homebrew builds from source (requires Rust). Upgrade with `brew upgrade plank`.
 
-Releases follow a two-channel scheme: the highest major version is always the beta. When a beta is promoted to stable, the next major opens as the new (initially empty) beta — e.g. promoting v8.x to stable creates v9.0.0 as the new beta. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank && brew install plank-beta` (or the reverse).
+Releases follow a two-channel scheme: the highest major version is always the beta. When a beta is promoted to stable, the next major opens as the new (initially empty) beta — e.g. promoting v8.x to stable creates v9.0.0 as the new beta. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank && brew install plank-beta` (or the reverse). See [VERSIONING.md](VERSIONING.md) for the channel model and the promote-to-stable process.
 
 ## Building
 
@@ -52,7 +52,8 @@ Run with a prompt argument for one-shot headless mode.
 
 Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-facing side. Features that exist only in plank:
 
-- **Ratatui TUI** — the C reference is a plain line REPL; plank auto-selects a full-screen TUI when running on a terminal, with markdown rendering of assistant replies, tree-sitter syntax highlighting in code blocks, and mouse-wheel scrollback.
+- **Ratatui TUI** — the C reference is a plain line REPL; plank auto-selects a full-screen TUI when running on a terminal, with mouse-wheel scrollback.
+- **Markdown renderer** — assistant replies render as styled markdown in the TUI via [ratatui-markdown](https://crates.io/crates/ratatui-markdown) (headings, emphasis, lists, tables), with tree-sitter syntax highlighting in fenced code blocks. The in-progress segment is re-rendered as tokens stream in, so partial emphasis and unclosed fences resolve live.
 - **Animated status bar** — the spinner verb in the status bar gets a Claude-Code-style shimmer: a bright highlight sweeps across the word while the model is prefilling or generating. The `🪵>` input prompt hides entirely (cursor included) while the agent is busy, reappearing when it's ready for input.
 - **`/init`** — asks the model to analyze the codebase and generate an `AGENTS.md` for future sessions (build/test commands, architecture, gotchas).
 - **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
