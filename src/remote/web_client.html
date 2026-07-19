@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plank remote</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    display: flex; flex-direction: column;
+    background: #111; color: #ddd;
+  }
+  @media (prefers-color-scheme: light) {
+    body { background: #fafafa; color: #222; }
+  }
+  header {
+    display: flex; gap: .5rem; align-items: center;
+    padding: .5rem .75rem; border-bottom: 1px solid #444; flex-wrap: wrap;
+  }
+  header input { flex: 1 1 12rem; min-width: 8rem; padding: .3rem .4rem;
+    font: inherit; background: transparent; color: inherit;
+    border: 1px solid #555; border-radius: 4px; }
+  header button { padding: .3rem .7rem; font: inherit; cursor: pointer; }
+  #status { font-size: .85em; opacity: .8; }
+  #log {
+    flex: 1 1 auto; overflow-y: auto; padding: .75rem;
+    white-space: pre-wrap; word-break: break-word; line-height: 1.35;
+  }
+  #log .think { opacity: .6; font-style: italic; }
+  #log .tool  { color: #4ea1ff; }
+  #log .error { color: #ff6b6b; }
+  #log .dim   { opacity: .55; }
+  #log .echo  { color: #9ad36b; }
+  form.input { display: flex; gap: .5rem; padding: .5rem .75rem;
+    border-top: 1px solid #444; }
+  form.input select { font: inherit; }
+  form.input input { flex: 1 1 auto; padding: .4rem .5rem; font: inherit;
+    background: transparent; color: inherit; border: 1px solid #555;
+    border-radius: 4px; }
+  form.input button { padding: .4rem .9rem; font: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>
+  <strong>plank remote</strong>
+  <input id="url" placeholder="ws://127.0.0.1:31415/" size="24">
+  <input id="token" placeholder="token" type="password">
+  <button id="connect">connect</button>
+  <button id="interrupt" disabled>interrupt</button>
+  <span id="status">disconnected</span>
+</header>
+<div id="log" aria-live="polite"></div>
+<form class="input" id="inputForm">
+  <select id="kind" title="frame kind">
+    <option value="prompt">prompt</option>
+    <option value="command">command</option>
+    <option value="btw">btw</option>
+  </select>
+  <input id="line" placeholder="type a line and press Enter" autocomplete="off">
+  <button type="submit">send</button>
+</form>
+<script>
+"use strict";
+// Wire protocol version this client speaks; must match PROTOCOL_VERSION in
+// src/remote/control.rs.
+const PROTOCOL_VERSION = 1;
+
+const $ = (id) => document.getElementById(id);
+const logEl = $("log");
+let ws = null;
+let highestId = null;
+
+function setStatus(s) { $("status").textContent = s; }
+
+function append(text, cls) {
+  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+  const span = document.createElement("span");
+  if (cls) span.className = cls;
+  span.textContent = text;
+  logEl.appendChild(span);
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function line(text, cls) { append(text + "\n", cls); }
+
+function handleServerMsg(f) {
+  if (typeof f.id === "number") highestId = f.id;
+  switch (f.type) {
+    case "hello":
+      line("[connected: plank " + f.plank_version + ", session " +
+        f.session_id + (f.controller ? ", controller" : ", mirror") + "]", "dim");
+      break;
+    case "snapshot":
+      if (f.highest_id !== null && f.highest_id !== undefined)
+        highestId = f.highest_id;
+      for (const e of (f.scrollback || [])) handleServerMsg(e);
+      break;
+    case "visible":   append(f.text); break;
+    case "think":     append(f.text, "think"); break;
+    case "tool":      append(f.text, "tool"); break;
+    case "error":     append(f.text, "error"); break;
+    case "dim":       append(f.text, "dim"); break;
+    case "plain":     append(f.text); break;
+    case "user_echo": line("> " + f.text, "echo"); break;
+    case "end_line":  append("\n"); break;
+    case "btw_begin": line("[btw]", "dim"); break;
+    case "btw_end":   break;
+    case "main_checkpoint": break;
+    case "main_rollback": break;
+    case "status": {
+      const s = f.status;
+      setStatus(s.state + "  ctx " + s.ctx_used + "/" + s.ctx_size +
+        (s.gen_tps ? "  " + s.gen_tps.toFixed(1) + " tok/s" : ""));
+      break;
+    }
+    case "control_denied": line("[denied: " + f.reason + "]", "error"); break;
+    case "pong": break;
+    case "bye": line("[server: " + f.reason + "]", "dim"); break;
+    default: break;
+  }
+}
+
+function send(msg) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  ws.send(JSON.stringify(Object.assign({ v: PROTOCOL_VERSION }, msg)));
+}
+
+function connect() {
+  const url = $("url").value.trim() || "ws://" + location.host + "/";
+  if (ws) { try { ws.close(); } catch (_) {} }
+  setStatus("connecting…");
+  ws = new WebSocket(url);
+  ws.onopen = () => {
+    setStatus("authenticating…");
+    const auth = { type: "auth", token: $("token").value };
+    if (highestId !== null) auth.resume_from = highestId;
+    send(auth);
+    $("interrupt").disabled = false;
+  };
+  ws.onmessage = (ev) => {
+    let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
+    handleServerMsg(f);
+    if (f.type === "hello") setStatus("connected");
+  };
+  ws.onclose = (ev) => {
+    setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
+    $("interrupt").disabled = true;
+  };
+  ws.onerror = () => setStatus("error");
+}
+
+$("connect").addEventListener("click", connect);
+$("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+$("inputForm").addEventListener("submit", (e) => {
+  e.preventDefault();
+  const el = $("line");
+  const text = el.value;
+  if (!text) return;
+  const kind = $("kind").value; // prompt | command | btw
+  send({ type: kind, text });
+  el.value = "";
+});
+
+// Prefill the URL from the page's own origin for the common tunnel case.
+$("url").value = "ws://" + location.host + "/";
+</script>
+</body>
+</html>

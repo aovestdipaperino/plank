@@ -138,7 +138,21 @@ pub struct RemoteConfig {
     /// When set (or with no local TTY), a remote client may take control
     /// without an explicit local `/grant`.
     pub allow_control: bool,
+    /// Browser `Origin` values allowed on the WebSocket upgrade. Missing and
+    /// loopback Origins are always allowed (native `plank remote` clients send
+    /// none); a non-loopback browser Origin must appear here or the upgrade is
+    /// refused (`docs/REMOTE-CONTROL-DESIGN.md` §8).
+    pub allowed_origins: Vec<String>,
+    /// Per-client outbound queue cap in bytes. A client whose buffered, unsent
+    /// output exceeds this is evicted (slow-consumer backpressure) rather than
+    /// buffered without bound.
+    pub queue_max: usize,
 }
+
+/// Default per-client outbound queue cap (bytes) when `--control-queue-max` is
+/// not given. Generous enough for a healthy client's burst, small enough to
+/// evict a stalled one promptly.
+pub const DEFAULT_CONTROL_QUEUE_MAX: usize = 1 << 20; // 1 MiB
 
 impl Default for RemoteConfig {
     fn default() -> Self {
@@ -146,6 +160,8 @@ impl Default for RemoteConfig {
             addr: DEFAULT_REMOTE_ADDR.to_owned(),
             token: None,
             allow_control: false,
+            allowed_origins: Vec::new(),
+            queue_max: DEFAULT_CONTROL_QUEUE_MAX,
         }
     }
 }
@@ -342,6 +358,14 @@ Options:
                            token is generated and printed once to stderr)
       --control-allow      let a remote client take control without a local
                            /grant (implied in headless server mode)
+      --control-origin ORIGIN
+                           allow this browser Origin on the WebSocket upgrade
+                           (repeatable or comma-separated); missing and loopback
+                           Origins are always allowed, other browser Origins are
+                           refused by default
+      --control-queue-max BYTES
+                           per-client outbound queue cap; a client whose unsent
+                           output exceeds it is evicted (default 1048576)
 "
     .to_owned()
 }
@@ -528,6 +552,21 @@ fn parse_remote_option(
             c.remote
                 .get_or_insert_with(RemoteConfig::default)
                 .allow_control = true;
+        }
+        "--control-origin" => {
+            let raw = value()?.to_owned();
+            let rc = c.remote.get_or_insert_with(RemoteConfig::default);
+            // Repeatable, and each occurrence may be a comma-separated list.
+            for o in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                rc.allowed_origins.push(o.to_owned());
+            }
+        }
+        "--control-queue-max" => {
+            let raw = value()?;
+            let n: usize = raw
+                .parse()
+                .map_err(|_| format!("invalid --control-queue-max value: {raw}"))?;
+            c.remote.get_or_insert_with(RemoteConfig::default).queue_max = n;
         }
         _ if arg == "--control" || arg.starts_with("--control=") => {
             c.remote.get_or_insert_with(RemoteConfig::default).addr = arg
@@ -1131,6 +1170,37 @@ mod tests {
             .unwrap();
         assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
         assert_eq!(r.token.as_deref(), Some("t"));
+        // Origin allow-list: repeatable and comma-separated, and queue cap.
+        let r = parse_options(&args(&[
+            "--control",
+            "--control-origin",
+            "https://a.example.com, https://b.example.com",
+            "--control-origin",
+            "https://c.example.com",
+            "--control-queue-max",
+            "4096",
+        ]))
+        .unwrap()
+        .remote
+        .unwrap();
+        assert_eq!(
+            r.allowed_origins,
+            vec![
+                "https://a.example.com".to_owned(),
+                "https://b.example.com".to_owned(),
+                "https://c.example.com".to_owned(),
+            ]
+        );
+        assert_eq!(r.queue_max, 4096);
+        // Defaults when the hardening flags are absent.
+        let r = parse_options(&args(&["--control"]))
+            .unwrap()
+            .remote
+            .unwrap();
+        assert!(r.allowed_origins.is_empty());
+        assert_eq!(r.queue_max, DEFAULT_CONTROL_QUEUE_MAX);
+        // A non-numeric queue cap is rejected.
+        assert!(parse_options(&args(&["--control-queue-max", "big"])).is_err());
     }
 
     #[test]

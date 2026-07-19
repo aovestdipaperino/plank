@@ -46,12 +46,20 @@
 //!   mirrors output, and sends `prompt`/`command`/`btw`/`interrupt` frames (see
 //!   [`crate::remote::client`]).
 //!
-//! ## Deferred (documented TODOs)
-//! - The `Origin` allow-list and bounded per-client outbound queues
-//!   (backpressure beyond write-error drop).
-//! - Static web clients. TODO(#25).
+//! ## Hardening (issue #25, done)
+//! - `Origin` allow-list on the WebSocket upgrade: missing / loopback Origins
+//!   are always allowed (native clients send none), other browser Origins must
+//!   be allow-listed via `--control-origin` or the upgrade is refused with an
+//!   HTTP 403 (see [`origin_allowed`]).
+//! - Bounded per-client outbound queue: the socket write buffer is capped
+//!   (`--control-queue-max`); a slow/stalled client whose unsent output exceeds
+//!   the cap is evicted (slow-consumer backpressure) instead of buffered
+//!   without bound. The bus prunes the dropped subscriber on the next
+//!   broadcast.
+//! - A minimal self-contained static web client served at `GET /` (see
+//!   [`WEB_CLIENT_HTML`]); it speaks the exact JSON frames below.
 
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -74,6 +82,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Minimum spacing between `status` frames per connection (coalescing, §4.9):
 /// at most ~10/s. Text frames are never coalesced.
 const STATUS_MIN_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The self-contained static web client served at `GET /`. No external deps:
+/// all CSS/JS is inline. It authenticates with a token and speaks the same
+/// [`PROTOCOL_VERSION`] JSON frames as the native client.
+pub const WEB_CLIENT_HTML: &str = include_str!("web_client.html");
 
 // --- Protocol ---------------------------------------------------------------
 
@@ -610,6 +623,10 @@ pub struct RemoteState {
     /// The single-controller policy.
     pub control: Mutex<ControlPolicy>,
     token: String,
+    /// Browser `Origin`s allowed on the WS upgrade (besides missing/loopback).
+    allowed_origins: Vec<String>,
+    /// Per-client outbound queue cap in bytes (slow-consumer eviction).
+    queue_max: usize,
     session_ids: AtomicU64,
     shutdown: AtomicBool,
 }
@@ -631,18 +648,33 @@ pub struct RemoteServer {
     accept: Option<JoinHandle<()>>,
 }
 
+/// Server-side configuration for a [`RemoteServer`]. Groups the bearer token,
+/// control-policy seed, and the hardening knobs (`Origin` allow-list and the
+/// per-client outbound queue cap) so [`RemoteServer::start`] stays a small,
+/// stable signature.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    /// Shared bearer secret every client must present.
+    pub token: String,
+    /// Whether a local front-end is present (seeds the control policy).
+    pub local_present: bool,
+    /// Whether a remote may take control without an explicit local `/grant`.
+    pub allow_control: bool,
+    /// Browser `Origin`s allowed on the WS upgrade (besides missing/loopback).
+    pub allowed_origins: Vec<String>,
+    /// Per-client outbound queue cap in bytes (slow-consumer eviction).
+    pub queue_max: usize,
+}
+
 impl RemoteServer {
-    /// Binds `addr` (loopback expected) and starts the accept thread. `token`
-    /// is the shared bearer secret; `local_present` and `allow_control` seed the
-    /// control policy.
+    /// Binds `addr` (loopback expected) and starts the accept thread. See
+    /// [`ServerConfig`] for the auth / policy / hardening knobs.
     ///
     /// # Errors
     /// Returns an error if the address cannot be bound.
     pub fn start(
         addr: &str,
-        token: String,
-        local_present: bool,
-        allow_control: bool,
+        cfg: ServerConfig,
         bus: Arc<BroadcastBus>,
         shared: Arc<TurnShared>,
     ) -> std::io::Result<Self> {
@@ -653,8 +685,10 @@ impl RemoteServer {
         let state = Arc::new(RemoteState {
             bus,
             shared,
-            control: Mutex::new(ControlPolicy::new(local_present, allow_control)),
-            token,
+            control: Mutex::new(ControlPolicy::new(cfg.local_present, cfg.allow_control)),
+            token: cfg.token,
+            allowed_origins: cfg.allowed_origins,
+            queue_max: cfg.queue_max,
             session_ids: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
         });
@@ -704,27 +738,254 @@ fn accept_loop(listener: &TcpListener, state: &Arc<RemoteState>) {
     }
 }
 
-/// Per-connection handler: WebSocket handshake, auth, then the mirror/control
-/// loop. Runs on its own thread; a slow or dead client only affects itself.
-fn handle_connection(stream: TcpStream, state: &Arc<RemoteState>) -> Result<(), String> {
+/// Per-connection handler: reads the HTTP request head, serves the static web
+/// client for a plain `GET /`, enforces the `Origin` allow-list on a WebSocket
+/// upgrade, then runs auth + the mirror/control loop. Runs on its own thread;
+/// a slow or dead client only affects itself.
+fn handle_connection(mut stream: TcpStream, state: &Arc<RemoteState>) -> Result<(), String> {
     stream
         .set_read_timeout(Some(POLL_INTERVAL))
         .map_err(|e| e.to_string())?;
-    let mut ws = tungstenite::accept(stream).map_err(|e| e.to_string())?;
+    // A bounded write timeout lets the outbound buffer build up (rather than
+    // the thread blocking forever) when a client stops reading, so the queue
+    // cap can evict it.
+    let _ = stream.set_write_timeout(Some(POLL_INTERVAL));
+
+    // Read the request head so we can both serve the static web client and
+    // inspect `Origin` before completing any WebSocket upgrade.
+    let head = read_http_head(&mut stream)?;
+    let req = parse_request_head(&head);
+
+    if !req.is_websocket_upgrade() {
+        // Plain HTTP: serve the web client at `/`, else 404.
+        serve_http(&mut stream, &req);
+        return Ok(());
+    }
+
+    // Origin allow-list: missing / loopback Origins pass (native clients send
+    // none); other browser Origins must be allow-listed or the upgrade is
+    // refused with an HTTP 403 (design §8).
+    if !origin_allowed(req.origin.as_deref(), &state.allowed_origins) {
+        let _ = write_http_response(
+            &mut stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"origin not allowed\n",
+        );
+        return Ok(());
+    }
+
+    // Replay the consumed head bytes so tungstenite can parse the handshake
+    // itself, and cap the outbound buffer for per-client backpressure.
+    let prefixed = PrefixStream::new(head, stream);
+    let config = tungstenite::protocol::WebSocketConfig {
+        write_buffer_size: 0,
+        max_write_buffer_size: state.queue_max.max(1),
+        ..Default::default()
+    };
+    let mut ws =
+        tungstenite::accept_with_config(prefixed, Some(config)).map_err(|e| e.to_string())?;
 
     let Some(session_id) = do_handshake(&mut ws, state)? else {
         return Ok(()); // unauthorized; connection already closed
     };
-    mirror_loop(&mut ws, state, session_id)?;
+    let loop_result = mirror_loop(&mut ws, state, session_id);
 
-    // On disconnect a controller's slot is held for the reconnect grace window
-    // (§4.8) so a brief drop can reclaim it via `resume_from`; a non-controller
-    // just releases.
+    // On disconnect (including slow-consumer eviction) a controller's slot is
+    // held for the reconnect grace window (§4.8) so a brief drop can reclaim it
+    // via `resume_from`; a non-controller just releases.
     if let Ok(mut c) = state.control.lock() {
         c.disconnect(session_id);
     }
     let _ = ws.flush();
-    Ok(())
+    loop_result
+}
+
+/// A minimal parsed HTTP request head: method, path, and the header values the
+/// server cares about.
+struct ParsedRequest {
+    method: String,
+    path: String,
+    origin: Option<String>,
+    upgrade_websocket: bool,
+}
+
+impl ParsedRequest {
+    fn is_websocket_upgrade(&self) -> bool {
+        self.upgrade_websocket
+    }
+}
+
+/// Reads bytes from `stream` until the end of the HTTP header block
+/// (`\r\n\r\n`) or a bounded deadline, tolerating read-timeout wake-ups. The
+/// returned buffer is the raw head, replayed to tungstenite via [`PrefixStream`]
+/// for a WebSocket upgrade.
+fn read_http_head(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 512];
+    loop {
+        if std::time::Instant::now() > deadline {
+            return Err("timed out reading request head".to_owned());
+        }
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+        // Guard against an unbounded head.
+        if buf.len() > 64 * 1024 {
+            return Err("request head too large".to_owned());
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break, // EOF
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(buf)
+}
+
+/// Parses the request line and the headers we care about from a raw head.
+/// Header names are matched case-insensitively (HTTP header names are
+/// case-insensitive).
+fn parse_request_head(head: &[u8]) -> ParsedRequest {
+    let text = String::from_utf8_lossy(head);
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next().unwrap_or("");
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("").to_owned();
+    let path = parts.next().unwrap_or("/").to_owned();
+
+    let mut origin = None;
+    let mut upgrade_websocket = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim().to_ascii_lowercase();
+        let value = value.trim();
+        match name.as_str() {
+            "origin" => origin = Some(value.to_owned()),
+            "upgrade" => {
+                if value.eq_ignore_ascii_case("websocket") {
+                    upgrade_websocket = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    ParsedRequest {
+        method,
+        path,
+        origin,
+        upgrade_websocket,
+    }
+}
+
+/// Decides whether a WebSocket upgrade with the given `Origin` is allowed.
+/// Default policy (design §8): a missing Origin (native clients send none) and
+/// any loopback Origin are allowed; every other browser Origin must appear in
+/// the configured allow-list.
+#[must_use]
+pub fn origin_allowed(origin: Option<&str>, allowed: &[String]) -> bool {
+    match origin {
+        None => true,
+        // Browsers send the literal "null" for opaque origins (e.g. a page
+        // opened from a file:// URL); treat it as a non-loopback browser origin
+        // that must be explicitly allow-listed.
+        Some(o) => is_loopback_origin(o) || allowed.iter().any(|a| a.eq_ignore_ascii_case(o)),
+    }
+}
+
+/// True if an `Origin` value refers to a loopback host (any scheme / port).
+fn is_loopback_origin(origin: &str) -> bool {
+    let after_scheme = origin.split_once("://").map_or(origin, |(_, rest)| rest);
+    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip a trailing :port, taking care not to break an IPv6 literal.
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split(']').next().unwrap_or(stripped)
+    } else {
+        host_port.rsplit_once(':').map_or(host_port, |(h, _)| h)
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
+/// Serves a plain HTTP request: the web client at `/` (or `/index.html`), else
+/// a 404. Best-effort; write errors just drop the connection.
+fn serve_http(stream: &mut TcpStream, req: &ParsedRequest) {
+    let path = req.path.split('?').next().unwrap_or(&req.path);
+    if req.method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/index.html") {
+        let _ = write_http_response(
+            stream,
+            200,
+            "OK",
+            "text/html; charset=utf-8",
+            WEB_CLIENT_HTML.as_bytes(),
+        );
+    } else {
+        let _ = write_http_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+        );
+    }
+}
+
+/// Writes a minimal HTTP/1.1 response and closes (no keep-alive).
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+        len = body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+/// A read/write adapter that replays a consumed byte prefix before delegating
+/// to the underlying stream. Lets us peek the HTTP head (for static serving and
+/// `Origin` inspection) and still hand the full handshake request to
+/// tungstenite.
+struct PrefixStream<S> {
+    prefix: std::io::Cursor<Vec<u8>>,
+    inner: S,
+}
+
+impl<S> PrefixStream<S> {
+    fn new(prefix: Vec<u8>, inner: S) -> Self {
+        Self {
+            prefix: std::io::Cursor::new(prefix),
+            inner,
+        }
+    }
+}
+
+impl<S: Read> Read for PrefixStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.prefix.read(buf)?;
+        if n > 0 {
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
+impl<S: Write> Write for PrefixStream<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// Authenticates, assigns a session id, and sends the `hello` + `snapshot`
@@ -899,6 +1160,8 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
             *last_status_at = Some(now);
         }
     }
+    // Push any buffered data from a prior transient stall; overflow evicts.
+    flush_ws(ws)?;
     Ok(())
 }
 
@@ -996,13 +1259,45 @@ fn is_controller(state: &Arc<RemoteState>, session_id: u64) -> Result<bool, Stri
         .remote_can_control(session_id))
 }
 
+/// Error string used to signal slow-consumer eviction: the client's bounded
+/// outbound queue overflowed. Returned up through the pump so the connection
+/// loop tears down (the bus prunes the dropped subscriber on the next
+/// broadcast).
+const EVICT_SLOW: &str = "outbound queue full (slow consumer evicted)";
+
+/// True for a transient write stall (buffered, retry later), not a hard error.
+fn is_would_block(e: &tungstenite::Error) -> bool {
+    matches!(e, tungstenite::Error::Io(io) if matches!(io.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut))
+}
+
+/// Queues `frame` on the connection's bounded outbound buffer and tries to
+/// flush. A transient write stall keeps the frame buffered (returns `Ok`); an
+/// overflow of the configured cap returns [`EVICT_SLOW`].
 fn send<S: std::io::Read + std::io::Write>(
     ws: &mut tungstenite::WebSocket<S>,
     frame: &ServerFrame,
 ) -> Result<(), String> {
     let json = frame.to_json().map_err(|e| e.to_string())?;
-    ws.send(Message::Text(json)).map_err(|e| e.to_string())?;
-    ws.flush().map_err(|e| e.to_string())
+    match ws.write(Message::Text(json)) {
+        Ok(()) => {}
+        Err(tungstenite::Error::WriteBufferFull(_)) => return Err(EVICT_SLOW.to_owned()),
+        Err(e) if is_would_block(&e) => return Ok(()), // buffered; flush later
+        Err(e) => return Err(e.to_string()),
+    }
+    flush_ws(ws)
+}
+
+/// Flushes buffered outbound data. A transient stall is not an error; a cap
+/// overflow evicts.
+fn flush_ws<S: std::io::Read + std::io::Write>(
+    ws: &mut tungstenite::WebSocket<S>,
+) -> Result<(), String> {
+    match ws.flush() {
+        Ok(()) => Ok(()),
+        Err(tungstenite::Error::WriteBufferFull(_)) => Err(EVICT_SLOW.to_owned()),
+        Err(e) if is_would_block(&e) => Ok(()),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -1206,11 +1501,19 @@ mod tests {
     // --- integration: a real loopback server + tungstenite client ---
 
     fn test_server(local_present: bool, allow_control: bool) -> RemoteServer {
-        RemoteServer::start(
-            "127.0.0.1:0",
-            "tok".to_owned(),
+        test_server_cfg(ServerConfig {
+            token: "tok".to_owned(),
             local_present,
             allow_control,
+            allowed_origins: Vec::new(),
+            queue_max: 1 << 20,
+        })
+    }
+
+    fn test_server_cfg(cfg: ServerConfig) -> RemoteServer {
+        RemoteServer::start(
+            "127.0.0.1:0",
+            cfg,
             Arc::new(BroadcastBus::new()),
             Arc::new(TurnShared::default()),
         )
@@ -1389,5 +1692,197 @@ mod tests {
         send_client(&mut c2, ClientMsg::Ping);
         assert_eq!(read_server(&mut c2).map(|f| f.msg), Some(ServerMsg::Pong));
         assert_eq!(server.state.shared.take_btw(), vec!["why?"]);
+    }
+
+    // --- Origin allow-list ---
+
+    #[test]
+    fn origin_policy_unit() {
+        let allow = vec!["https://app.example.com".to_owned()];
+        // Missing Origin (native clients): allowed.
+        assert!(origin_allowed(None, &allow));
+        // Loopback Origins: always allowed.
+        assert!(origin_allowed(Some("http://localhost:31415"), &allow));
+        assert!(origin_allowed(Some("http://127.0.0.1"), &allow));
+        assert!(origin_allowed(Some("http://[::1]:8080"), &allow));
+        // Allow-listed browser Origin (case-insensitive).
+        assert!(origin_allowed(Some("https://app.example.com"), &allow));
+        assert!(origin_allowed(Some("HTTPS://APP.EXAMPLE.COM"), &allow));
+        // A non-allow-listed browser Origin is refused.
+        assert!(!origin_allowed(Some("https://evil.example.com"), &allow));
+        assert!(!origin_allowed(Some("null"), &allow));
+        // With no allow-list, only missing / loopback pass.
+        assert!(origin_allowed(Some("http://localhost"), &[]));
+        assert!(!origin_allowed(Some("https://app.example.com"), &[]));
+    }
+
+    /// Builds a WS handshake request carrying an optional `Origin` and attempts
+    /// the upgrade. Returns whether the handshake succeeded.
+    fn try_ws_with_origin(addr: std::net::SocketAddr, origin: Option<&str>) -> bool {
+        let stream = TcpStream::connect(addr).unwrap();
+        let key = tungstenite::handshake::client::generate_key();
+        let mut builder = tungstenite::http::Request::builder()
+            .uri(format!("ws://{addr}/"))
+            .header("Host", addr.to_string())
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", key);
+        if let Some(o) = origin {
+            builder = builder.header("Origin", o);
+        }
+        let req = builder.body(()).unwrap();
+        tungstenite::client(req, stream).is_ok()
+    }
+
+    #[test]
+    fn origin_allowlist_accepts_and_rejects_on_upgrade() {
+        let server = test_server_cfg(ServerConfig {
+            token: "tok".to_owned(),
+            local_present: false,
+            allow_control: false,
+            allowed_origins: vec!["https://app.example.com".to_owned()],
+            queue_max: 1 << 20,
+        });
+        let addr = server.local_addr;
+        // No Origin (native client): accepted.
+        assert!(try_ws_with_origin(addr, None));
+        // Loopback Origin: accepted.
+        assert!(try_ws_with_origin(addr, Some("http://127.0.0.1:31415")));
+        // Allow-listed browser Origin: accepted.
+        assert!(try_ws_with_origin(addr, Some("https://app.example.com")));
+        // Non-allow-listed browser Origin: rejected (HTTP 403, no upgrade).
+        assert!(!try_ws_with_origin(addr, Some("https://evil.example.com")));
+    }
+
+    // --- static web client ---
+
+    /// Minimal blocking HTTP GET over a raw socket; returns (status line,
+    /// headers-block, body).
+    fn http_get(addr: std::net::SocketAddr, path: &str) -> (String, String, String) {
+        use std::io::{Read, Write};
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
+        let (status, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+        (status.to_owned(), headers.to_owned(), body.to_owned())
+    }
+
+    #[test]
+    fn serves_web_client_at_root() {
+        let server = test_server(false, false);
+        let addr = server.local_addr;
+        let (status, headers, body) = http_get(addr, "/");
+        assert!(status.contains("200"), "status: {status}");
+        assert!(
+            headers
+                .to_ascii_lowercase()
+                .contains("content-type: text/html"),
+            "headers: {headers}"
+        );
+        assert!(body.contains("plank remote"), "body missing marker");
+        // A bogus path 404s.
+        let (status, _, _) = http_get(addr, "/nope");
+        assert!(status.contains("404"), "status: {status}");
+    }
+
+    // --- bounded outbound queue / slow-consumer eviction ---
+
+    #[test]
+    fn slow_client_is_evicted_while_others_keep_receiving() {
+        // Small per-client cap so a stalled client trips it quickly.
+        let server = test_server_cfg(ServerConfig {
+            token: "tok".to_owned(),
+            local_present: false,
+            allow_control: false,
+            allowed_origins: Vec::new(),
+            queue_max: 64 * 1024,
+        });
+        let addr = server.local_addr;
+
+        // Healthy client: drained continuously on a background thread.
+        let mut healthy = connect(addr);
+        send_client(
+            &mut healthy,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        let _ = read_server(&mut healthy); // hello
+        let _ = read_server(&mut healthy); // snapshot
+        let healthy_count = Arc::new(AtomicU64::new(0));
+        let hc = Arc::clone(&healthy_count);
+        let drain = std::thread::spawn(move || {
+            while let Some(f) = read_server(&mut healthy) {
+                if matches!(f.msg, ServerMsg::Visible { .. }) {
+                    hc.fetch_add(1, Ordering::Relaxed);
+                }
+                if matches!(f.msg, ServerMsg::Bye { .. }) {
+                    break;
+                }
+            }
+        });
+
+        // Slow client: authenticates, then stops reading entirely.
+        let mut slow = connect(addr);
+        send_client(
+            &mut slow,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        // Do NOT read hello/snapshot: its socket buffer fills and the server's
+        // bounded outbound queue for this client overflows.
+
+        // Wait until both connections are registered as subscribers.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while server.state.bus.subscriber_count() < 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "both never subscribed"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // Flood enough data to overflow OS buffers plus the 64 KiB cap.
+        let big = "x".repeat(2048);
+        for _ in 0..2000 {
+            server.state.bus.broadcast(UiEvent::Visible(big.clone()));
+        }
+
+        // The slow client is evicted: subscriber count drops back to just the
+        // healthy one (the bus prunes the dropped subscriber on broadcast).
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // Keep broadcasting so the prune (which happens on send) fires.
+            server.state.bus.broadcast(UiEvent::Visible("tick".into()));
+            if server.state.bus.subscriber_count() <= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "slow client was not evicted"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        // The healthy client kept receiving throughout.
+        assert!(
+            healthy_count.load(Ordering::Relaxed) > 0,
+            "healthy client received nothing"
+        );
+
+        drop(server); // sends Bye, unblocks the drain thread
+        let _ = drain.join();
     }
 }

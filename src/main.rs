@@ -266,14 +266,14 @@ fn start_remote(cfg: &AgentConfig, local_present: bool) -> Option<plank::remote:
     let allow_control = rc.allow_control || !local_present;
     let bus = Arc::new(plank::worker::BroadcastBus::new());
     let shared = Arc::new(plank::worker::TurnShared::default());
-    match plank::remote::RemoteServer::start(
-        &rc.addr,
-        token.clone(),
+    let server_cfg = plank::remote::control::ServerConfig {
+        token: token.clone(),
         local_present,
         allow_control,
-        bus,
-        shared,
-    ) {
+        allowed_origins: rc.allowed_origins.clone(),
+        queue_max: rc.queue_max,
+    };
+    match plank::remote::RemoteServer::start(&rc.addr, server_cfg, bus, shared) {
         Ok(server) => {
             let addr = server.local_addr;
             eprintln!("plank: remote control listening on ws://{addr}/ (loopback only)");

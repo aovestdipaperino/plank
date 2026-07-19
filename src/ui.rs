@@ -3826,7 +3826,7 @@ mod tests {
     /// output is observed mirrored back onto the bus.
     #[test]
     fn remote_prompt_drives_turn_and_mirrors_to_bus() {
-        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer};
+        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer, ServerConfig};
         use tungstenite::Message;
 
         let dir = scratch_dir("remote-live");
@@ -3840,9 +3840,13 @@ mod tests {
         // Headless server; the agent adopts its shared bus + turn state.
         let server = RemoteServer::start(
             "127.0.0.1:0",
-            "tok".to_owned(),
-            false,
-            false,
+            ServerConfig {
+                token: "tok".to_owned(),
+                local_present: false,
+                allow_control: false,
+                allowed_origins: Vec::new(),
+                queue_max: 1 << 20,
+            },
             Arc::new(BroadcastBus::new()),
             Arc::new(TurnShared::default()),
         )
@@ -3907,7 +3911,7 @@ mod tests {
     /// observed mirrored back onto the bus.
     #[test]
     fn plain_repl_handles_local_line_and_remote_drive() {
-        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer};
+        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer, ServerConfig};
         use tungstenite::Message;
 
         let dir = scratch_dir("plain-remote");
@@ -3920,9 +3924,13 @@ mod tests {
 
         let server = RemoteServer::start(
             "127.0.0.1:0",
-            "tok".to_owned(),
-            false,
-            false,
+            ServerConfig {
+                token: "tok".to_owned(),
+                local_present: false,
+                allow_control: false,
+                allowed_origins: Vec::new(),
+                queue_max: 1 << 20,
+            },
             Arc::new(BroadcastBus::new()),
             Arc::new(TurnShared::default()),
         )

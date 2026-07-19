@@ -399,14 +399,18 @@ mod tests {
         use std::sync::atomic::Ordering;
         use std::time::Instant;
 
-        use crate::remote::control::RemoteServer;
+        use crate::remote::control::{RemoteServer, ServerConfig};
         use crate::worker::{BroadcastBus, TurnShared, UiEvent};
 
         let server = RemoteServer::start(
             "127.0.0.1:0",
-            "tok".to_owned(),
-            false,
-            false,
+            ServerConfig {
+                token: "tok".to_owned(),
+                local_present: false,
+                allow_control: false,
+                allowed_origins: Vec::new(),
+                queue_max: 1 << 20,
+            },
             Arc::new(BroadcastBus::new()),
             Arc::new(TurnShared::default()),
         )
