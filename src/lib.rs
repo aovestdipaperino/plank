@@ -18,6 +18,7 @@ pub mod engine;
 #[cfg(ds4_engine)]
 pub mod ffi;
 pub mod hooks;
+pub mod host;
 pub mod imagepaste;
 pub mod interrupt;
 pub mod logo;

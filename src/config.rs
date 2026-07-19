@@ -22,6 +22,7 @@ pub const DEFAULT_CTX_SIZE: i32 = 1_048_576;
 
 /// Parsed agent configuration, mirroring the C `agent_config`.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // flat CLI flags, not a state machine
 pub struct AgentConfig {
     /// Sampling and length options for generation.
     pub generation: GenerationOptions,
@@ -69,6 +70,14 @@ pub struct AgentConfig {
     pub remote_token: Option<String>,
     /// `--insecure`: allow plaintext `http://` to a non-loopback remote host.
     pub insecure: bool,
+    /// `--shared-engine`: route `plank serve` (and the in-process host) through
+    /// the shared reference-counted engine (issue #28) — one model, many
+    /// concurrent sessions on a single GPU thread. Default off; when off, plank
+    /// behaves exactly as before (single owner, no host, no scheduler thread).
+    pub shared_engine: bool,
+    /// `--max-sessions`: admission cap on concurrently attached sessions when
+    /// `shared_engine` is on (design §7). Ignored otherwise.
+    pub max_sessions: i32,
 }
 
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
@@ -212,6 +221,8 @@ impl Default for AgentConfig {
             remote_url: None,
             remote_token: None,
             insecure: false,
+            shared_engine: false,
+            max_sessions: i32::try_from(crate::host::DEFAULT_MAX_SESSIONS).unwrap_or(8),
         }
     }
 }
@@ -250,6 +261,10 @@ Options:
                            --remote-token or $PLANK_REMOTE_TOKEN
       --remote-token TOK   bearer token for --remote
       --insecure           allow plaintext http:// to a non-loopback --remote host
+      --shared-engine      host one model for many concurrent sessions (issue
+                           #28); applies to `plank serve`. Default off — plank
+                           otherwise runs a single owned engine as before
+      --max-sessions N     admission cap for --shared-engine (default 8)
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
@@ -543,6 +558,8 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--remote" => c.remote_url = Some(need_arg(&mut i)?.to_owned()),
             "--remote-token" => c.remote_token = Some(need_arg(&mut i)?.to_owned()),
             "--insecure" => c.insecure = true,
+            "--shared-engine" => c.shared_engine = true,
+            "--max-sessions" => c.max_sessions = parse_int(need_arg(&mut i)?, arg)?,
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -636,6 +653,15 @@ mod tests {
         assert!(!c.btw.suspend);
         assert!(!c.non_interactive);
         assert!(!c.show_help);
+        // Shared engine is opt-in (issue #28); off by default.
+        assert!(!c.shared_engine);
+    }
+
+    #[test]
+    fn parses_shared_engine_flags() {
+        let c = parse_options(&args(&["--shared-engine", "--max-sessions", "4"])).unwrap();
+        assert!(c.shared_engine);
+        assert_eq!(c.max_sessions, 4);
     }
 
     #[test]
