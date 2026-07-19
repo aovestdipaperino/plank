@@ -107,6 +107,18 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
 - `config.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, tracing, signal handling
 
+## Star History
+
+<!-- Chart is rendered in CI by .github/workflows/star-history.yml (the hosted
+     star-history.com embed broke with GitHub's 2026-06-30 stargazers API
+     restriction). The action rewrites everything between these markers. -->
+<!-- star-history:start -->
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/star-history/star-history-dark.svg">
+  <img alt="Star history" src="assets/star-history/star-history-light.svg">
+</picture>
+<!-- star-history:end -->
+
 ## License
 
 [MIT](LICENSE)
