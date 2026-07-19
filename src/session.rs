@@ -2,16 +2,18 @@
 //!
 //! Port of the ds4 agent sections "Agent KV Store And Session Persistence"
 //! and "Session Listing, History Rendering, And Completion". The C agent
-//! persists engine KV state plus a rendered token transcript; plank has no
-//! real engine yet, so this module persists the text transcript instead
-//! while keeping the same user-visible behavior: sessions live under
-//! `~/.plank/kvcache` as `<name>.kv` files. A session id is a memorable
-//! `adjective-celebrity` name minted on first save (e.g. `deadly-einstein`),
-//! disambiguated with a short guid on the rare filename collision; legacy
-//! `<40-hex>.kv` files from earlier versions still load and list. Titles
-//! derive from the first user prompt, listings sort most recent first, and
-//! history replay uses the exact `User:` / `Assistant:` / `Tool result:`
-//! headers of the C agent.
+//! persists engine KV state plus a rendered token transcript in one file;
+//! plank persists the text transcript as the session file and keeps the
+//! engine KV state in a fingerprinted `<name>.payload` sidecar (see
+//! [`write_payload`]), while keeping the same user-visible behavior: sessions
+//! live under `~/.plank/kvcache` as `<name>.kv` files. A session id is a
+//! memorable `adjective-celebrity` name minted on first save (e.g.
+//! `deadly-einstein`), disambiguated with a short guid on the rare filename
+//! collision; legacy `<40-hex>.kv` files from earlier versions still load and
+//! list, and older payload-less sessions load fine (the sidecar is a pure
+//! cache). Titles derive from the first user prompt, listings sort most recent
+//! first, and history replay uses the exact `User:` / `Assistant:` /
+//! `Tool result:` headers of the C agent.
 //!
 //! # On-disk format
 //!
@@ -58,6 +60,16 @@ const HISTORY_TOOL_MAX_BYTES: usize = 3000;
 
 const MAGIC: &str = "plank-session 1";
 const FILE_EXT: &str = ".kv";
+/// Extension of the engine KV payload sidecar written next to a transcript.
+///
+/// The C agent stores the engine payload inside the same `.kv` file as the
+/// rendered text; plank's v1 transcript format predates payloads and must
+/// keep loading, so the payload lives in a sidecar (`<sha>.payload`) instead.
+/// The sidecar is a rebuildable cache: its first line is a fingerprint tying
+/// it to the exact model, system prompt, and rendered transcript, and a
+/// mismatch means the payload is ignored and rebuilt by prefill — never
+/// trusted (see [`read_payload`]).
+const PAYLOAD_EXT: &str = ".payload";
 
 /// Error raised by session store operations.
 ///
@@ -243,6 +255,9 @@ pub struct SessionEntry {
     pub tag: String,
     /// Clipped last user prompt; empty for pre-meta files.
     pub last_prompt: String,
+    /// Size of the engine KV payload sidecar in bytes; 0 when stripped or
+    /// never saved (the C lists `payload_bytes == 0` as "stripped").
+    pub payload_bytes: u64,
     /// Full path of the session file.
     pub path: PathBuf,
 }
@@ -283,6 +298,37 @@ impl SessionStore {
 
     fn path_for_id(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}{FILE_EXT}"))
+    }
+
+    /// Path of the engine KV payload sidecar for a session id.
+    #[must_use]
+    pub fn payload_path(&self, id: &str) -> PathBuf {
+        self.dir.join(format!("{id}{PAYLOAD_EXT}"))
+    }
+
+    /// Size in bytes of a session's KV payload sidecar; 0 when absent.
+    #[must_use]
+    pub fn payload_bytes(&self, id: &str) -> u64 {
+        fs::metadata(self.payload_path(id)).map_or(0, |m| m.len())
+    }
+
+    /// Strips the engine KV payload from the session matching the hex
+    /// prefix, preserving its transcript (`/strip`). Returns the full id and
+    /// whether a payload sidecar actually existed; stripping an already
+    /// stripped session succeeds, like the C's rewrite-with-zero-payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, ambiguous, or unmatched prefix, or
+    /// if the payload file cannot be removed.
+    pub fn strip(&self, prefix: impl AsRef<str>) -> Result<(String, bool)> {
+        let (id, _path) = self.find(prefix.as_ref())?;
+        let payload = self.payload_path(&id);
+        let had_payload = payload.exists();
+        if had_payload {
+            fs::remove_file(&payload)?;
+        }
+        Ok((id, had_payload))
     }
 
     /// Saves the session, assigning title, creation time, and id if missing.
@@ -378,6 +424,8 @@ impl SessionStore {
     pub fn delete(&self, prefix: impl AsRef<str>) -> Result<String> {
         let (id, path) = self.find(prefix.as_ref())?;
         fs::remove_file(&path)?;
+        // The payload sidecar is a cache keyed to the transcript; it goes too.
+        let _ = fs::remove_file(self.payload_path(&id));
         Ok(id)
     }
 
@@ -419,6 +467,7 @@ impl SessionStore {
         let mut entries = Vec::new();
         for (id, path) in self.session_files()? {
             let file_size = fs::metadata(&path).map_or(0, |m| m.len());
+            let payload_bytes = self.payload_bytes(&id);
             // Listing metadata comes from bounded head + tail reads; the
             // transcript itself is never parsed here.
             let entry = match read_head_meta(&path) {
@@ -432,6 +481,7 @@ impl SessionStore {
                         file_size,
                         tag,
                         last_prompt,
+                        payload_bytes,
                         path,
                     }
                 }
@@ -443,6 +493,7 @@ impl SessionStore {
                     file_size,
                     tag: String::new(),
                     last_prompt: String::new(),
+                    payload_bytes,
                     path,
                 },
             };
@@ -573,21 +624,28 @@ pub fn render_session_list(entries: &[SessionEntry], now: u64, color: bool) -> S
         if !e.last_prompt.is_empty() {
             let _ = writeln!(out, "         {dim}> last: {}{reset}", e.last_prompt);
         }
+        // Payload presence mirrors the C listing: a zero-byte payload reads
+        // as ", stripped"; otherwise the sidecar's size is shown.
+        let payload = if e.payload_bytes == 0 {
+            ", stripped".to_owned()
+        } else {
+            format!(", KV {:.2} MB", to_mb(e.payload_bytes))
+        };
         let _ = writeln!(
             out,
-            "         {dim}> {age}, {:.2} MB{reset}\n",
+            "         {dim}> {age}, {:.2} MB{payload}{reset}\n",
             to_mb(e.file_size)
         );
     }
     let _ = writeln!(
         out,
-        "{help_on}Use /switch <id> to select a session, /del <id> to remove.{reset}"
+        "{help_on}Use /switch <id> to select a session, /del <id> to remove, /strip <id> to strip KV cache.{reset}"
     );
     out
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn to_mb(bytes: u64) -> f64 {
+pub(crate) fn to_mb(bytes: u64) -> f64 {
     bytes as f64 / (1024.0 * 1024.0)
 }
 
@@ -676,6 +734,62 @@ pub fn session_identity_sha(title: &str, created_at: u64) -> String {
     bytes.extend_from_slice(title.as_bytes());
     bytes.extend_from_slice(&created_at.to_le_bytes());
     sha1_hex(&bytes)
+}
+
+/// Fingerprint tying an engine KV payload to the exact model, system prompt,
+/// and rendered transcript it was snapshotted from.
+///
+/// This is the repo's KV discipline rule applied to per-session payloads:
+/// a payload is only a cache of prefilling `transcript_render`, so any
+/// difference in model, system prompt, or transcript text (including a
+/// resave after more turns) makes it stale, and a stale payload is rebuilt
+/// by prefill, never trusted. NUL separators keep the fields unambiguous.
+#[must_use]
+pub fn payload_fingerprint(model: &str, system: &str, transcript_render: &str) -> String {
+    let mut data = Vec::with_capacity(model.len() + system.len() + transcript_render.len() + 2);
+    data.extend_from_slice(model.as_bytes());
+    data.push(0);
+    data.extend_from_slice(system.as_bytes());
+    data.push(0);
+    data.extend_from_slice(transcript_render.as_bytes());
+    sha1_hex(&data)
+}
+
+/// Writes an engine KV payload file: the fingerprint line, then raw bytes.
+///
+/// Same layout as the `sysprompt.kv` checkpoint, so both caches share one
+/// staleness rule. Written atomically (temp file + rename) so a crash never
+/// leaves a truncated payload that could be half-loaded.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error; callers treat payload writes as
+/// best-effort (a failure just means the next resume re-prefills).
+pub fn write_payload(path: &Path, fingerprint: &str, bytes: &[u8]) -> io::Result<()> {
+    let mut file = Vec::with_capacity(bytes.len() + fingerprint.len() + 1);
+    file.extend_from_slice(fingerprint.as_bytes());
+    file.push(b'\n');
+    file.extend_from_slice(bytes);
+    let tmp = path.with_extension(format!("payload.tmp.{}", std::process::id()));
+    fs::write(&tmp, &file)?;
+    fs::rename(&tmp, path).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+/// Reads an engine KV payload written by [`write_payload`], returning its
+/// bytes only when the stored fingerprint matches `fingerprint` exactly.
+/// A missing file, malformed header, or fingerprint mismatch returns `None`:
+/// the caller falls back to a full prefill (stale payloads are rebuilt,
+/// never trusted).
+#[must_use]
+pub fn read_payload(path: &Path, fingerprint: &str) -> Option<Vec<u8>> {
+    let mut bytes = fs::read(path).ok()?;
+    let nl = bytes.iter().position(|&b| b == b'\n')?;
+    if bytes[..nl] != *fingerprint.as_bytes() {
+        return None;
+    }
+    Some(bytes.split_off(nl + 1))
 }
 
 /// Renders replayed history for a transcript like the C agent's `/history`.
@@ -1281,6 +1395,7 @@ mod tests {
             file_size: 2048,
             tag: "wip".to_string(),
             last_prompt: "rerun the tests".to_string(),
+            payload_bytes: 0,
             path: PathBuf::new(),
         }];
         let out = render_resume_list(&entries, 100, false, 10);
@@ -1351,6 +1466,66 @@ mod tests {
         assert_eq!(store.delete(&id).unwrap(), id);
         assert!(store.list().unwrap().is_empty());
         assert!(store.load(&id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn payload_round_trip_and_stale_rejection() {
+        let dir = temp_dir("payload");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.payload");
+        let fp = payload_fingerprint("model-a", "sys", "[user]\nhi\n");
+        write_payload(&path, &fp, b"\x00\x01snapshot\nbytes").unwrap();
+        assert_eq!(
+            read_payload(&path, &fp).as_deref(),
+            Some(b"\x00\x01snapshot\nbytes".as_slice())
+        );
+        // Any drift in model, system prompt, or transcript is stale.
+        for stale in [
+            payload_fingerprint("model-b", "sys", "[user]\nhi\n"),
+            payload_fingerprint("model-a", "sys2", "[user]\nhi\n"),
+            payload_fingerprint("model-a", "sys", "[user]\nhi\n[assistant]\nyo\n"),
+        ] {
+            assert_ne!(stale, fp);
+            assert!(read_payload(&path, &stale).is_none());
+        }
+        // Missing file and headerless garbage are also rejected.
+        assert!(read_payload(&dir.join("missing.payload"), &fp).is_none());
+        fs::write(&path, b"no newline header").unwrap();
+        assert!(read_payload(&path, &fp).is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn strip_removes_payload_and_delete_cleans_up() {
+        let dir = temp_dir("strip");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("strip me"));
+        let id = store.save(&mut s).unwrap();
+
+        // No payload yet: listing shows stripped, strip still succeeds.
+        assert_eq!(store.payload_bytes(&id), 0);
+        assert_eq!(store.strip(&id[..8]).unwrap(), (id.clone(), false));
+
+        write_payload(&store.payload_path(&id), "fp", b"payload-bytes").unwrap();
+        assert!(store.payload_bytes(&id) > 0);
+        assert!(store.list().unwrap()[0].payload_bytes > 0);
+        // Payload sidecars must not be listed or matched as sessions.
+        assert_eq!(store.list().unwrap().len(), 1);
+
+        assert_eq!(store.strip(&id[..8]).unwrap(), (id.clone(), true));
+        assert_eq!(store.payload_bytes(&id), 0);
+        assert!(
+            store.load(&id[..8]).is_ok(),
+            "transcript must survive strip"
+        );
+
+        assert!(store.strip("ffffffff").is_err());
+
+        write_payload(&store.payload_path(&id), "fp", b"again").unwrap();
+        store.delete(&id[..8]).unwrap();
+        assert!(!store.payload_path(&id).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1443,12 +1618,19 @@ mod tests {
             file_size: 2048,
             tag: String::new(),
             last_prompt: String::new(),
+            payload_bytes: 0,
             path: PathBuf::from("/x"),
         }];
+        let mut entries = entries;
         let out = render_session_list(&entries, 160, false);
         assert!(out.starts_with("aabbccdd > demo session\n"));
-        assert!(out.contains("> 1m ago, 0.00 MB"));
-        assert!(out.ends_with("Use /switch <id> to select a session, /del <id> to remove.\n"));
+        assert!(out.contains("> 1m ago, 0.00 MB, stripped"));
+        assert!(out.ends_with(
+            "Use /switch <id> to select a session, /del <id> to remove, /strip <id> to strip KV cache.\n"
+        ));
+        entries[0].payload_bytes = 3 * 1024 * 1024;
+        let out = render_session_list(&entries, 160, false);
+        assert!(out.contains("> 1m ago, 0.00 MB, KV 3.00 MB"), "got: {out}");
         assert_eq!(render_session_list(&[], 0, false), "no saved sessions\n");
     }
 
