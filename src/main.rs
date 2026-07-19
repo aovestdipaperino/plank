@@ -19,6 +19,13 @@ fn main() -> ExitCode {
         return run_serve(&args[1..]);
     }
 
+    // `plank remote <url>` runs the interactive remote-control client (issue
+    // #25): it connects to another instance's `--control` WebSocket, mirrors
+    // its output, and drives it. It never loads an engine of its own.
+    if args.first().map(String::as_str) == Some("remote") {
+        return run_remote_client(&args[1..]);
+    }
+
     let cfg = match parse_options(&args) {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -280,6 +287,54 @@ fn start_remote(cfg: &AgentConfig, local_present: bool) -> Option<plank::remote:
         Err(e) => {
             eprintln!("plank: could not start remote control on {}: {e}", rc.addr);
             None
+        }
+    }
+}
+
+/// Parses `plank remote <url> [--token <t>] [--resume-from <id>]` and runs the
+/// interactive remote-control client. The token falls back to
+/// `PLANK_REMOTE_TOKEN`; the URL is `ws://host:port/` (tunnel to loopback for a
+/// remote box, matching the SSH hint the server prints).
+fn run_remote_client(args: &[String]) -> ExitCode {
+    let mut url: Option<String> = None;
+    let mut token: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" if i + 1 < args.len() => {
+                token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "-h" | "--help" => {
+                eprintln!(
+                    "usage: plank remote <ws-url> [--token <token>]\n\
+                     \n\
+                     Connects to a plank instance started with --control, mirrors its\n\
+                     output, and sends typed lines as prompts (slash lines as commands,\n\
+                     \"/btw <q>\" as a side question) and Ctrl-C as an interrupt.\n\
+                     The token defaults to $PLANK_REMOTE_TOKEN."
+                );
+                return ExitCode::SUCCESS;
+            }
+            other if url.is_none() && !other.starts_with('-') => {
+                url = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                eprintln!("plank remote: unexpected argument: {other}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let Some(url) = url else {
+        eprintln!("usage: plank remote <ws-url> [--token <token>]");
+        return ExitCode::from(2);
+    };
+    match plank::remote::client::run(&url, token) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("plank remote: {e}");
+            ExitCode::FAILURE
         }
     }
 }

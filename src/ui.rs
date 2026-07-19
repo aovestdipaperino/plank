@@ -3450,8 +3450,61 @@ fn quit_hint_spans() -> Vec<ratatui::text::Span<'static>> {
     )]
 }
 
-/// Plain line-based REPL used when stdin is not a terminal.
+/// Plain line-based REPL used when stdin is not a terminal. With a remote
+/// bridge attached it also interleaves remote-driven input (issue #25); without
+/// one it keeps the classic blocking read loop, behavior-identical to before.
 fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
+    if agent.remote.is_some() {
+        run_repl_plain_remote(agent)
+    } else {
+        run_repl_plain_local(agent)
+    }
+}
+
+/// Handles one line of plain-REPL input. Returns `Ok(false)` to quit the REPL
+/// (a `/quit`-style slash command); `Ok(true)` to keep looping. Shared by the
+/// local and remote-aware REPL loops so both paths treat slashes, `!`-shell
+/// escapes, and prompts identically (CLAUDE.md: mirror both UI paths).
+fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> {
+    let input = line.trim();
+    if input.is_empty() {
+        return Ok(true);
+    }
+    if input.starts_with('/') {
+        return agent.slash(input);
+    }
+    if let Some(cmd) = input.strip_prefix('!') {
+        let cmd = cmd.trim();
+        if cmd.is_empty() {
+            println!("usage: !<shell command>");
+            return Ok(true);
+        }
+        match crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut || {
+            crate::interrupt::pending()
+        }) {
+            Ok(out) => {
+                print!("{}", out.stdout);
+                eprint!("{}", out.stderr);
+                if out.interrupted {
+                    crate::interrupt::clear();
+                    println!("[interrupted]");
+                } else if out.exit_code != 0 {
+                    println!("[exit code: {}]", out.exit_code);
+                }
+            }
+            Err(e) => println!("!{cmd}: {e}"),
+        }
+        return Ok(true);
+    }
+    print!("{}", status::format_user_prompt_echo(input, agent.color));
+    agent.session.push(Message::user(input));
+    agent.run_turn()?;
+    Ok(true)
+}
+
+/// The classic blocking plain REPL (no remote bridge): read a line, handle it,
+/// repeat until EOF.
+fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     let stdin = std::io::stdin();
     loop {
         print!("{}", status::prompt_text());
@@ -3464,42 +3517,106 @@ fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
         if n == 0 {
             return Ok(()); // EOF
         }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
+        if !handle_plain_line(agent, &line)? {
+            return Ok(());
         }
-        if input.starts_with('/') {
-            if !agent.slash(input)? {
-                return Ok(());
-            }
-            continue;
+    }
+}
+
+/// Interval at which the remote-aware plain REPL wakes to drain the remote
+/// input queue while waiting on stdin.
+const PLAIN_REMOTE_POLL: Duration = Duration::from_millis(50);
+
+/// Echoes one mirrored bus event to local stdout so a plain-REPL operator sees
+/// remote-driven turns. Only text-bearing events are printed; status footers
+/// and structural markers are skipped (the plain REPL has no live footer).
+fn echo_bus_event(ev: &UiEvent) {
+    let mut out = std::io::stdout();
+    match ev {
+        UiEvent::Visible(t)
+        | UiEvent::Think(t)
+        | UiEvent::Tool(t)
+        | UiEvent::Error(t)
+        | UiEvent::Dim(t)
+        | UiEvent::Plain(t)
+        | UiEvent::UserEcho(t) => {
+            let _ = write!(out, "{t}");
         }
-        if let Some(cmd) = input.strip_prefix('!') {
-            let cmd = cmd.trim();
-            if cmd.is_empty() {
-                println!("usage: !<shell command>");
-                continue;
-            }
-            match crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut || {
-                crate::interrupt::pending()
-            }) {
-                Ok(out) => {
-                    print!("{}", out.stdout);
-                    eprint!("{}", out.stderr);
-                    if out.interrupted {
-                        crate::interrupt::clear();
-                        println!("[interrupted]");
-                    } else if out.exit_code != 0 {
-                        println!("[exit code: {}]", out.exit_code);
+        UiEvent::EndLine => {
+            let _ = writeln!(out);
+        }
+        _ => {}
+    }
+    let _ = out.flush();
+}
+
+/// Plain REPL with a remote bridge attached. A dedicated reader thread turns the
+/// blocking `read_line` into channel sends so the main loop can `select` between
+/// local stdin and the remote input queue: on each idle tick it drains
+/// `pump_remote` (mirroring how the TUI idle loop drives remote turns) and
+/// echoes the shared bus to stdout so the local operator sees remote output.
+///
+/// Trade-off: because `read_line` cannot itself be woken, stdin is read on a
+/// helper thread rather than in a true `select`. Remote-driven turns run to
+/// completion inside `pump_remote` before their (batched) output is echoed,
+/// rather than streaming token-by-token as in the TUI; this keeps turn
+/// execution single-threaded and the loop simple.
+fn run_repl_plain_remote(agent: &mut Agent<'_>) -> Result<(), String> {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+
+    // Reader thread: stdin lines → channel. EOF or error drops the sender,
+    // which surfaces as `Disconnected` on the main side.
+    let (line_tx, line_rx) = channel::<String>();
+    std::thread::spawn(move || {
+        let stdin = std::io::stdin();
+        let mut lock = stdin.lock();
+        loop {
+            let mut line = String::new();
+            match lock.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if line_tx.send(line).is_err() {
+                        break;
                     }
                 }
-                Err(e) => println!("!{cmd}: {e}"),
             }
-            continue;
         }
-        print!("{}", status::format_user_prompt_echo(input, agent.color));
-        agent.session.push(Message::user(input));
-        agent.run_turn()?;
+    });
+
+    let sub = agent.remote.as_ref().map(|r| r.bus.subscribe());
+    let drain_bus = |sub: &std::sync::mpsc::Receiver<crate::worker::SeqEvent>| {
+        while let Ok(seq) = sub.try_recv() {
+            echo_bus_event(&seq.event);
+        }
+    };
+
+    loop {
+        print!("{}", status::prompt_text());
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+        // Wait for a typed line or a remote-driven turn; reprint the prompt
+        // once either produces output.
+        loop {
+            if let Some(sub) = &sub {
+                drain_bus(sub);
+            }
+            match line_rx.recv_timeout(PLAIN_REMOTE_POLL) {
+                Ok(line) => {
+                    if !handle_plain_line(agent, &line)? {
+                        return Ok(());
+                    }
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    if agent.pump_remote()? {
+                        if let Some(sub) = &sub {
+                            drain_bus(sub);
+                        }
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return Ok(()), // stdin EOF
+            }
+        }
     }
 }
 
@@ -3779,6 +3896,90 @@ mod tests {
         assert!(
             visible.contains("hello from echo"),
             "mirrored assistant output missing: {visible:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Plain-REPL path (issue #25 follow-up): the shared `handle_plain_line`
+    /// drives a local turn, and a remote `prompt` frame delivered over a real
+    /// loopback `RemoteServer` drives a turn via `pump_remote` (the same call
+    /// the plain-REPL remote loop makes on each idle tick) with its output
+    /// observed mirrored back onto the bus.
+    #[test]
+    fn plain_repl_handles_local_line_and_remote_drive() {
+        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer};
+        use tungstenite::Message;
+
+        let dir = scratch_dir("plain-remote");
+        let engine = ScriptedEngine {
+            replies: vec!["local reply\n".to_string(), "remote reply\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let server = RemoteServer::start(
+            "127.0.0.1:0",
+            "tok".to_owned(),
+            false,
+            false,
+            Arc::new(BroadcastBus::new()),
+            Arc::new(TurnShared::default()),
+        )
+        .expect("server binds");
+        agent.remote = Some(Arc::clone(&server.state));
+        let sub = server.state.bus.subscribe();
+
+        // A locally-typed prompt runs a turn through the shared handler.
+        let before = agent.session.transcript.len();
+        assert!(handle_plain_line(&mut agent, "local ask").unwrap());
+        assert!(
+            agent.session.transcript.len() > before,
+            "local line did not advance the session"
+        );
+
+        // A remote controller's prompt drives a mirrored turn via pump_remote.
+        let addr = server.local_addr;
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (mut ws, _) = tungstenite::client(
+            format!("ws://{addr}/")
+                .parse::<tungstenite::http::Uri>()
+                .unwrap(),
+            stream,
+        )
+        .expect("ws handshake");
+        for m in [
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+            ClientMsg::Prompt {
+                text: "remote ask".into(),
+            },
+        ] {
+            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
+                .unwrap();
+            ws.flush().unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !agent.pump_remote().unwrap() {
+            assert!(Instant::now() < deadline, "remote prompt never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut visible = String::new();
+        let mut echoed = false;
+        while let Ok(seq) = sub.try_recv() {
+            match seq.event {
+                UiEvent::Visible(t) => visible.push_str(&t),
+                UiEvent::UserEcho(t) if t == "remote ask" => echoed = true,
+                _ => {}
+            }
+        }
+        assert!(echoed, "remote user echo not mirrored");
+        assert!(
+            visible.contains("remote reply"),
+            "mirrored remote output missing: {visible:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

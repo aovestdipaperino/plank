@@ -37,6 +37,10 @@ pub mod provider;
 pub mod control;
 pub use control::{RemoteServer, generate_token};
 
+// Remote-control CLI client (issue #25): `plank remote <url>` connects to a
+// running instance's control WebSocket, mirrors its output, and drives it.
+pub mod client;
+
 use std::io::{BufRead, Read};
 
 /// Validates a `--remote` URL: TLS is required for any non-loopback host
