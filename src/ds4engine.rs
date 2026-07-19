@@ -1613,4 +1613,268 @@ mod tests {
             "session is resident again after restore"
         );
     }
+
+    // Test-support: run one generation over a solely-owned `Ds4Session` and
+    // return `(new_prefill, cached)` derived from the *first* `Prefill` event.
+    // `generate` always primes one such event up front with `done == cached`
+    // (tokens reused from the live KV prefix) and `total == prompt_len`, so
+    // `new_prefill = total - done` is the count of tokens actually evaluated
+    // this turn (§KV-cache discipline). This is the reuse signal the
+    // zero-re-prefill assertions below key off of; no production change needed.
+    #[cfg(ds4_engine)]
+    fn gen_capture_prefill(
+        engine: &mut super::Ds4Session,
+        transcript: &str,
+        opts: &crate::engine::GenerationOptions,
+    ) -> (i32, i32) {
+        use crate::engine::{Engine, EngineEvent, Prompt};
+        let mut first: Option<(i32, i32)> = None;
+        engine
+            .generate(
+                Prompt::Flat(transcript),
+                opts,
+                &|| false,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Prefill(p) = e
+                        && first.is_none()
+                    {
+                        first = Some((p.done, p.total));
+                    }
+                },
+            )
+            .unwrap();
+        let (done, total) = first.expect("generate always primes a Prefill event");
+        (total - done, done)
+    }
+
+    // #29 — /checkpoint + /rollback does zero re-prefill. Establish a
+    // conversation, capture its KV via the snapshot path (the /checkpoint
+    // mechanism), diverge onto a different turn, then restore the checkpoint
+    // via `restore_kv` (the /rollback mechanism) and prove the next generation
+    // reuses the checkpoint KV wholesale instead of re-prefilling the
+    // transcript. Runtime signal: the first Prefill event's reused count.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn rollback_checkpoint_zero_reprefill() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 42,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        let transcript1 = "[user]\nName a fruit.\n";
+        let transcript2 = "[user]\nName a planet.\n";
+
+        // Establish the checkpoint conversation, then capture its KV.
+        let _ = gen_capture_prefill(&mut engine, transcript1, &opts);
+        let checkpoint = engine
+            .snapshot_kv()
+            .expect("snapshot_kv yields a checkpoint payload");
+
+        // Diverge onto a different single-user turn: only the system prompt is
+        // reusable, so this turn does real re-prefill (the control).
+        let (np_divergent, _cached_div) = gen_capture_prefill(&mut engine, transcript2, &opts);
+        assert!(
+            np_divergent > 0,
+            "a divergent turn must actually prefill its new suffix (np={np_divergent})"
+        );
+
+        // Roll back to the checkpoint, then re-run the checkpoint's own turn.
+        // The live KV already holds these exact tokens, so re-prefill ~ 0.
+        engine.restore_kv(&checkpoint).unwrap();
+        let (np_restored, _cached_r) = gen_capture_prefill(&mut engine, transcript1, &opts);
+        assert!(
+            np_restored <= 2,
+            "rollback must reuse the checkpoint KV (new prefill ~0, got {np_restored})"
+        );
+        assert!(
+            np_restored < np_divergent,
+            "rollback re-prefill ({np_restored}) must be far below a real prefill ({np_divergent})"
+        );
+    }
+
+    // #12 — /switch payload resume prefills only the new suffix. Capture a
+    // session payload (snapshot_kv bytes), drop the engine, open a *fresh*
+    // engine, restore the bytes, and prove the follow-up generation reuses the
+    // whole restored prefix (system prompt + prior transcript) rather than
+    // re-prefilling it: reused ~ prompt_len, new prefill ~ 0.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn switch_payload_resume_suffix_only() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let opts = GenerationOptions {
+            seed: 42,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+        let transcript = "[user]\nName a fruit.\n";
+
+        // Only ONE live engine per process: each engine lives in its own scope
+        // so its Metal model is fully dropped before the next one opens.
+        let payload = {
+            let mut a =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            let _ = gen_capture_prefill(&mut a, transcript, &opts);
+            a.snapshot_kv().expect("snapshot_kv yields a payload")
+        };
+
+        // Cold-baseline control: a fresh engine with an empty KV must prefill
+        // the whole prompt (nothing reused). This calibrates "full re-prefill".
+        let (np_cold, cached_cold) = {
+            let mut c =
+                super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            gen_capture_prefill(&mut c, transcript, &opts)
+        };
+
+        // Fresh engine: restore the payload and re-run the same turn. It must
+        // reuse the restored prefix instead of re-prefilling it.
+        let mut b =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        b.restore_kv(&payload).unwrap();
+        let (np, cached) = gen_capture_prefill(&mut b, transcript, &opts);
+        assert!(
+            np <= 2,
+            "resumed session prefills only the suffix, not the transcript (np={np})"
+        );
+        // Against the cold baseline: the resumed run re-prefills far less and
+        // reuses far more KV, proving the payload's prefix was NOT recomputed.
+        assert!(
+            np < np_cold,
+            "resume ({np}) must re-prefill far less than a cold start ({np_cold})"
+        );
+        assert!(
+            cached > cached_cold,
+            "resume reuses the payload KV; cold start reuses none \
+             (cached={cached} > cold={cached_cold})"
+        );
+    }
+
+    // #28 — idle-reclaim restore keeps context without a cold re-prefill. Via
+    // the shared EngineHost: attach, generate (recording the system-prompt
+    // reuse baseline), force idle reclamation (KV snapshotted to disk + dropped)
+    // with a short idle window, then a follow-up *continuation* restores from
+    // disk. Proof: the first Prefill event's reused count exceeds the
+    // system-prompt baseline, i.e. the session's own context survived the
+    // reclaim and was not re-prefilled.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn idle_reclaim_restore_no_cold_reprefill() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+            None,
+        )
+        .unwrap();
+        let host = EngineHost::new(
+            model,
+            HostConfig {
+                max_sessions: 2,
+                slice_tokens: crate::host::DEFAULT_SLICE_TOKENS,
+                idle_reclaim: Some(Duration::from_millis(150)),
+                ..HostConfig::default()
+            },
+        );
+        let s = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 7,
+            n_predict: 12,
+            ..GenerationOptions::default()
+        };
+
+        // First turn: record the system-prompt reuse baseline + the reply.
+        let mut reply1 = String::new();
+        let mut first1: Option<(i32, i32)> = None;
+        s.generate(
+            "[user]\nName a fruit.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| match e {
+                EngineEvent::Prefill(p) => {
+                    if first1.is_none() {
+                        first1 = Some((p.done, p.total));
+                    }
+                }
+                EngineEvent::Text(t) => reply1.push_str(&t),
+            },
+        )
+        .unwrap();
+        let (sys_cached, _t1) = first1.expect("first turn primes a Prefill event");
+        assert!(!reply1.is_empty(), "first turn must produce a reply");
+
+        // Force reclamation to disk (short idle window; wait for the scheduler).
+        let reclaimed = (0..600).any(|_| {
+            if host.status().sessions.iter().any(|x| x.reclaimed) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            false
+        });
+        assert!(reclaimed, "idle session must be reclaimed to disk");
+
+        // Follow-up continuation: after restore from disk, the reused prefix
+        // must reach past the system prompt into the prior turn + reply.
+        let transcript2 =
+            format!("[user]\nName a fruit.\n[assistant]\n{reply1}\n[user]\nName a planet.\n");
+        let mut first2: Option<(i32, i32)> = None;
+        let stats = s
+            .generate(
+                &transcript2,
+                &opts,
+                Arc::new(AtomicBool::new(false)),
+                &mut |e| {
+                    if let EngineEvent::Prefill(p) = e
+                        && first2.is_none()
+                    {
+                        first2 = Some((p.done, p.total));
+                    }
+                },
+            )
+            .unwrap();
+        let (cached2, _t2) = first2.expect("restored turn primes a Prefill event");
+        assert!(stats.generated > 0, "restored session generates normally");
+        assert!(
+            cached2 > sys_cached,
+            "restore kept context beyond the system prompt: no cold re-prefill \
+             (cached2={cached2} > sys_baseline={sys_cached})"
+        );
+        assert!(
+            host.status().sessions.iter().all(|x| !x.reclaimed),
+            "session is resident again after restore"
+        );
+    }
 }
