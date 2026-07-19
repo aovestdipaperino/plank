@@ -35,3 +35,4 @@ pub mod tui;
 pub mod ui;
 pub mod upgrade;
 pub mod viz;
+pub mod worker;

@@ -1,11 +1,15 @@
 //! Interactive REPL and headless front-ends over the agent turn loop.
 //!
-//! Port of the "Interactive Runtime Loop" section of `ds4_agent.c`, adapted
-//! to a synchronous turn loop: the C multiplexes a worker thread with `poll()`;
-//! plank v1 runs the engine inline and streams output as it arrives.
+//! Port of the "Interactive Runtime Loop" section of `ds4_agent.c`. Like the
+//! C, the TUI runs each turn on a worker thread (see `crate::worker`) while
+//! the UI thread keeps handling input — the next prompt stays editable and
+//! queueable during generation. The plain line REPL (piped stdin) stays a
+//! synchronous inline loop: without a live terminal there is no input to
+//! multiplex.
 
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -27,6 +31,7 @@ use crate::tools::{ToolContext, dispatch_all};
 use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
+use crate::worker::{self, ChannelSink, TurnShared, UiEvent};
 
 /// Stdout writer that flushes after every write so tokens appear as streamed.
 #[derive(Debug)]
@@ -770,6 +775,7 @@ impl Agent<'_> {
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        input: &mut TuiInput,
     ) {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
@@ -797,7 +803,7 @@ impl Agent<'_> {
 
         log.push_spans(tui::user_echo_spans(prompt));
         self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log, view) {
+        if let Err(e) = self.tui_turn(terminal, log, view, input) {
             log.push_plain(format!("/init failed: {e}"));
         }
     }
@@ -1216,7 +1222,7 @@ impl Agent<'_> {
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
-            self.tui_turn(terminal, &mut log, &mut view)?;
+            self.tui_turn(terminal, &mut log, &mut view, &mut input)?;
         }
 
         // Endpoints of a mouse drag selection over the output area, in screen
@@ -1433,7 +1439,7 @@ impl Agent<'_> {
                             &mut view,
                         );
                     } else if line.starts_with('/') {
-                        if !self.tui_slash(&line, &mut log, terminal, &mut view) {
+                        if !self.tui_slash(&line, &mut log, terminal, &mut view, &mut input) {
                             break;
                         }
                     } else {
@@ -1456,7 +1462,7 @@ impl Agent<'_> {
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_spans(tui::user_echo_spans(echo));
                         self.session.push(Message::user(&message));
-                        self.tui_turn(terminal, &mut log, &mut view)?;
+                        self.tui_turn(terminal, &mut log, &mut view, &mut input)?;
                     }
                 }
                 _ => {}
@@ -1599,15 +1605,42 @@ impl Agent<'_> {
         status::build_status_text(&st, false)
     }
 
-    /// One TUI turn: generate, run any tool calls, repeat until settled.
+    /// One TUI turn: runs the generate → tools loop on a worker thread while
+    /// the UI thread keeps the terminal live (typing, scrolling, interrupts),
+    /// then feeds user lines queued during the turn into follow-up turns.
     fn tui_turn(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         log: &mut OutputLog,
         view: &mut tui::OutputView,
+        input: &mut TuiInput,
     ) -> Result<(), String> {
-        self.tui_maybe_compact(log)?;
-        self.tui_maybe_reminder(log);
+        loop {
+            let shared = TurnShared::default();
+            run_worker_ui(terminal, log, view, input, &shared, |tx| {
+                self.worker_turn(&tx, &shared)
+            })??;
+            // Lines typed while busy that no tool round drained become the
+            // next turn's user message(s), as if resubmitted by hand.
+            let leftover = shared.take_queued();
+            if leftover.is_empty() {
+                return Ok(());
+            }
+            for line in leftover {
+                self.session.push(Message::user(line));
+            }
+        }
+    }
+
+    /// Worker-side turn loop (the C's `worker_run_turn`): generate, dispatch
+    /// tools, drain queued user lines between rounds, repeat until settled.
+    /// Runs on the worker thread and talks to the UI only through `tx`.
+    fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        let mut note = |s: String| {
+            let _ = tx.send(UiEvent::Dim(s));
+        };
+        self.maybe_compact_notify(&mut note)?;
+        self.maybe_reminder_notify(&mut note);
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
@@ -1616,31 +1649,33 @@ impl Agent<'_> {
         let mut stop_hook_ran = false;
         loop {
             let prompt = render_transcript(&self.session, &self.system);
-            let out = self.tui_generate(terminal, log, &prompt, view, turn_start)?;
+            let out = self.worker_generate(tx, shared, &prompt, turn_start)?;
             self.session.push(Message::assistant(out.assistant_text));
-            log.end_line();
+            let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
                 crate::interrupt::clear();
-                log.push_dim("[interrupted]");
+                let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                 return Ok(());
             }
             if let Some(payload) = out.error {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
+                self.drain_queued(shared, tx);
                 continue;
             }
             if !out.calls.is_empty() {
                 let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
-                    log.push_dim(warning);
+                    let _ = tx.send(UiEvent::Dim(warning));
                 }
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
                 for line in observations.lines() {
-                    log.push_dim(line.to_owned());
+                    let _ = tx.send(UiEvent::Dim(line.to_owned()));
                 }
+                self.drain_queued(shared, tx);
                 continue;
             }
             // Stop hooks: exit 2 feeds stderr to the model and the turn
@@ -1649,11 +1684,11 @@ impl Agent<'_> {
                 let mut warnings = Vec::new();
                 let feedback = self.run_stop_hooks(&mut |w| warnings.push(w));
                 for w in warnings {
-                    log.push_dim(w);
+                    let _ = tx.send(UiEvent::Dim(w));
                 }
                 if let Some(feedback) = feedback {
                     stop_hook_ran = true;
-                    log.push_dim("[Stop hook] continuing the turn");
+                    let _ = tx.send(UiEvent::Dim("[Stop hook] continuing the turn".to_owned()));
                     self.session.push(Message::user(format!(
                         "<tool_result>Stop hook feedback:\n{feedback}</tool_result>"
                     )));
@@ -1664,21 +1699,29 @@ impl Agent<'_> {
         }
     }
 
-    /// Streams one generation pass into `log`, drawing each update.
+    /// Moves user lines queued during the turn into the transcript between
+    /// tool rounds, mirroring the C's `queued_user_drain`.
+    fn drain_queued(&mut self, shared: &TurnShared, tx: &Sender<UiEvent>) {
+        for line in shared.take_queued() {
+            let _ = tx.send(UiEvent::Dim("[queued message joined the turn]".to_owned()));
+            self.session.push(Message::user(line));
+        }
+    }
+
+    /// Streams one generation pass on the worker thread, forwarding rendered
+    /// output and status snapshots to the UI over `tx`.
     ///
     /// `turn_start` is when the user submitted the prompt: the status bar's
     /// elapsed time counts the whole turn (all generation passes and tool
     /// runs), not just this pass. Tokens/s stays per-pass.
-    #[allow(clippy::too_many_lines)]
-    fn tui_generate(
+    fn worker_generate(
         &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        log: &mut OutputLog,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
         prompt: &str,
-        view: &mut tui::OutputView,
         turn_start: Instant,
     ) -> Result<TurnOutput, String> {
-        let mut stream = StreamRenderer::new(std::mem::take(log));
+        let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         if !matches!(
             self.cfg.generation.think_mode,
@@ -1686,7 +1729,6 @@ impl Agent<'_> {
         ) {
             stream.begin_in_think();
         }
-        let interrupt_flag = AtomicBool::new(false);
         // Set when a mid-stream preflight fails: stops the engine early, but
         // is not a user interrupt — the turn loop feeds the error to the model.
         let preflight_stop = AtomicBool::new(false);
@@ -1707,7 +1749,7 @@ impl Agent<'_> {
             prompt,
             &self.cfg.generation,
             &|| {
-                interrupt_flag.load(Ordering::Relaxed)
+                shared.interrupt.load(Ordering::Relaxed)
                     || preflight_stop.load(Ordering::Relaxed)
                     || crate::interrupt::pending()
             },
@@ -1753,34 +1795,7 @@ impl Agent<'_> {
                         ..Status::default()
                     },
                 };
-                // Drain pending input so generation stays interruptible
-                // (Ctrl-C / Esc) and the log stays scrollable while streaming:
-                // wheel events pin the viewport, End resumes following.
-                while event::poll(Duration::ZERO).unwrap_or(false) {
-                    match event::read() {
-                        Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
-                            KeyCode::Esc => interrupt_flag.store(true, Ordering::Relaxed),
-                            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                                interrupt_flag.store(true, Ordering::Relaxed);
-                            }
-                            KeyCode::End => view.follow = true,
-                            _ => {}
-                        },
-                        Ok(Event::Mouse(m)) => match m.kind {
-                            MouseEventKind::ScrollUp => {
-                                view.follow = false;
-                                view.top = view.top.saturating_sub(3);
-                            }
-                            MouseEventKind::ScrollDown => {
-                                view.top = view.top.saturating_add(3);
-                            }
-                            _ => {}
-                        },
-                        _ => {}
-                    }
-                }
-                let line = status::build_status_text(&status, false);
-                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), None, 0, &line, view, None));
+                let _ = tx.send(UiEvent::Status(status));
             },
         );
 
@@ -1795,9 +1810,10 @@ impl Agent<'_> {
         let error = preflight_error
             .map(|e| tool_error_payload(true, e))
             .or_else(|| finished.error.map(|e| tool_error_payload(false, e)));
-        let interrupted = (stats.interrupted || interrupt_flag.load(Ordering::Relaxed))
+        let interrupted = (stats.interrupted || shared.interrupt.load(Ordering::Relaxed))
             && preflight_error.is_none();
-        *log = stream.into_sink();
+        // Consume the interrupt so a queued follow-up turn starts clean.
+        shared.interrupt.store(false, Ordering::Relaxed);
         Ok(TurnOutput {
             interrupted,
             assistant_text,
@@ -1806,8 +1822,9 @@ impl Agent<'_> {
         })
     }
 
-    /// Compacts before a TUI turn when context is tight, logging progress.
-    fn tui_maybe_compact(&mut self, log: &mut OutputLog) -> Result<(), String> {
+    /// Compacts before a TUI turn when context is tight; progress lines go to
+    /// `note` (the TUI log, or the worker→UI channel during a turn).
+    fn maybe_compact_notify(&mut self, note: &mut dyn FnMut(String)) -> Result<(), String> {
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
         if !compact::should_compact(self.engine.ctx_size(), used) {
@@ -1816,17 +1833,21 @@ impl Agent<'_> {
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
         if let Some(cleared) = self.try_microcompact() {
-            log.push_dim(format!(
+            note(format!(
                 "microcompacted: cleared {cleared} old tool result(s)"
             ));
             return Ok(());
         }
-        self.tui_do_compact("low context", log)
+        self.do_compact_notify("low context", note)
     }
 
-    /// Performs a compaction pass and rebuilds the transcript, logging progress.
-    fn tui_do_compact(&mut self, reason: &str, log: &mut OutputLog) -> Result<(), String> {
-        log.push_dim(format!(
+    /// Performs a compaction pass and rebuilds the transcript.
+    fn do_compact_notify(
+        &mut self,
+        reason: &str,
+        note: &mut dyn FnMut(String),
+    ) -> Result<(), String> {
+        note(format!(
             "COMPACTING {reason}: summarizing durable task state..."
         ));
         let mut prompt = render_transcript(&self.session, &self.system);
@@ -1849,18 +1870,18 @@ impl Agent<'_> {
             )
             .map_err(|e| e.to_string())?;
         self.rebuild_after_compact(&summary);
-        log.push_dim("context compacted");
+        note("context compacted".to_owned());
         Ok(())
     }
 
     /// Re-injects the system-prompt reminder in the TUI when due.
-    fn tui_maybe_reminder(&mut self, log: &mut OutputLog) {
+    fn maybe_reminder_notify(&mut self, note: &mut dyn FnMut(String)) {
         let rendered = render_transcript(&self.session, &self.system);
         let pos = self.engine.count_tokens(&rendered);
         if !self.reminder.should_remind(pos) {
             return;
         }
-        log.push_dim("Re-injecting system prompt reminder...");
+        note("Re-injecting system prompt reminder...".to_owned());
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
@@ -1882,6 +1903,7 @@ impl Agent<'_> {
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        input: &mut TuiInput,
     ) -> Result<(), String> {
         log.push_spans(tui::user_echo_spans(&format!("/btw {question}")));
         let mut prompt = render_transcript(&self.session, &self.system);
@@ -1890,7 +1912,10 @@ impl Agent<'_> {
             let _ = write!(prompt, "[user]\n{}\n", btw_user_message(question));
         }
         let saved_ctx = self.last_ctx_used;
-        let out = self.tui_generate(terminal, log, &prompt, view, Instant::now())?;
+        let shared = TurnShared::default();
+        let out = run_worker_ui(terminal, log, view, input, &shared, |tx| {
+            self.worker_generate(&tx, &shared, &prompt, Instant::now())
+        })??;
         log.end_line();
         if out.interrupted {
             crate::interrupt::clear();
@@ -1899,6 +1924,13 @@ impl Agent<'_> {
             log.push_dim(
                 "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)",
             );
+        }
+        // A /btw answer is a sidechain: text queued during it has no turn to
+        // join, so hand it back instead of dropping it silently.
+        for line in shared.take_queued() {
+            log.push_dim(format!(
+                "[not queued — /btw is a side question; resend: {line}]"
+            ));
         }
         log.push_dim("[btw — not part of the conversation]");
         self.last_ctx_used = saved_ctx;
@@ -1909,13 +1941,14 @@ impl Agent<'_> {
     #[allow(clippy::too_many_lines)]
     fn tui_slash(
         &mut self,
-        input: &str,
+        line: &str,
         log: &mut OutputLog,
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
+        input: &mut TuiInput,
     ) -> bool {
-        let mut parts = input.splitn(2, char::is_whitespace);
-        let cmd = parts.next().unwrap_or(input);
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let cmd = parts.next().unwrap_or(line);
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/quit" | "/exit" => return false,
@@ -1935,9 +1968,13 @@ impl Agent<'_> {
             }
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
-            "/init" => self.tui_run_init(log, terminal, view),
+            "/init" => self.tui_run_init(log, terminal, view, input),
             "/compact" => {
-                if let Err(e) = self.tui_do_compact("user request", log) {
+                let result = {
+                    let mut note = |s: String| log.push_dim(s);
+                    self.do_compact_notify("user request", &mut note)
+                };
+                if let Err(e) = result {
                     log.push_plain(format!("compact failed: {e}"));
                 }
             }
@@ -2048,7 +2085,7 @@ impl Agent<'_> {
             "/btw" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
-                } else if let Err(e) = self.tui_btw(arg, log, terminal, view) {
+                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input) {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
@@ -2065,7 +2102,7 @@ impl Agent<'_> {
                 } else {
                     log.push_dim("[subagent started]");
                     let fork_at = self.begin_subagent_fork(arg);
-                    if let Err(e) = self.tui_turn(terminal, log, view) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input) {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, arg);
                         log.push_plain(format!("/subagent failed: {e}"));
@@ -2081,9 +2118,9 @@ impl Agent<'_> {
             }
             _ => {
                 if let Some(message) = self.skill_message(cmd, arg) {
-                    log.push_spans(tui::user_echo_spans(input));
+                    log.push_spans(tui::user_echo_spans(line));
                     self.session.push(Message::user(message));
-                    if let Err(e) = self.tui_turn(terminal, log, view) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input) {
                         log.push_plain(format!("{cmd} failed: {e}"));
                     }
                 } else {
@@ -2092,6 +2129,176 @@ impl Agent<'_> {
             }
         }
         true
+    }
+}
+
+/// Runs `job` on a scoped worker thread while the UI thread keeps the
+/// terminal live (the C's worker/UI split). The worker owns the agent for
+/// the duration of the job and reports through the channel; the UI applies
+/// events to the log, redraws, and keeps the prompt editable.
+fn run_worker_ui<T: Send>(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &mut OutputLog,
+    view: &mut tui::OutputView,
+    input: &mut TuiInput,
+    shared: &TurnShared,
+    job: impl FnOnce(Sender<UiEvent>) -> T + Send,
+) -> Result<T, String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::scope(|s| {
+        let handle = s.spawn(move || job(tx));
+        let ui = busy_ui_loop(terminal, log, view, input, &rx, shared, || {
+            handle.is_finished()
+        });
+        // On a UI error (terminal gone) the worker must still be stopped and
+        // joined before the scope can end.
+        if ui.is_err() {
+            shared.interrupt.store(true, Ordering::Relaxed);
+        }
+        let out = handle
+            .join()
+            .map_err(|_| "worker thread panicked".to_owned());
+        ui?;
+        out
+    })
+}
+
+/// UI-thread event loop while a worker job runs: applies streamed render
+/// events to the log, keeps the prompt editable (Enter queues the line for
+/// the worker), scrolls, and maps Esc/Ctrl-C to a worker interrupt.
+#[allow(clippy::too_many_lines)]
+fn busy_ui_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &mut OutputLog,
+    view: &mut tui::OutputView,
+    input: &mut TuiInput,
+    rx: &Receiver<UiEvent>,
+    shared: &TurnShared,
+    done: impl Fn() -> bool,
+) -> Result<(), String> {
+    let mut status_line = String::new();
+    loop {
+        while let Ok(ev) = rx.try_recv() {
+            if let UiEvent::Status(st) = ev {
+                status_line = status::build_status_text(&st, false);
+            } else {
+                worker::apply(log, ev);
+            }
+        }
+        // Check before drawing: anything sent after this point survives in
+        // the channel and is drained below (the sender is gone once the
+        // worker returns).
+        let finished = done();
+        terminal
+            .draw(|f| {
+                tui::draw(
+                    f,
+                    log,
+                    Some(input.buf.text()),
+                    input.cursor_col(),
+                    &status_line,
+                    view,
+                    None,
+                );
+            })
+            .map_err(|e| e.to_string())?;
+        if finished {
+            while let Ok(ev) = rx.try_recv() {
+                if !matches!(ev, UiEvent::Status(_)) {
+                    worker::apply(log, ev);
+                }
+            }
+            return Ok(());
+        }
+        if !event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+            continue;
+        }
+        match event::read().map_err(|e| e.to_string())? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                match key.code {
+                    KeyCode::Esc => shared.interrupt.store(true, Ordering::Relaxed),
+                    KeyCode::Char('c') if ctrl => {
+                        // Ctrl-C clears a partly-typed line first; on an
+                        // empty line it interrupts the model, like Esc.
+                        if input.buf.text().is_empty() {
+                            shared.interrupt.store(true, Ordering::Relaxed);
+                        } else {
+                            input.buf.clear();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let line = input.buf.text().trim().to_owned();
+                        input.buf.clear();
+                        input.hist_idx = None;
+                        if line.is_empty() {
+                        } else if line.starts_with('/') || line.starts_with('!') {
+                            log.push_dim("[commands don't queue — wait for the model to finish]");
+                        } else {
+                            input.history.add(&line);
+                            log.push_spans(tui::user_echo_spans(&line));
+                            log.push_dim("[queued — joins the conversation at the next step]");
+                            shared.push_queued(line);
+                            view.follow = true;
+                        }
+                    }
+                    KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
+                    KeyCode::Char('k') if ctrl => input.buf.kill_to_end(),
+                    KeyCode::Char('w') if ctrl => input.buf.delete_prev_word(),
+                    KeyCode::Char('a') if ctrl => input.buf.move_home(),
+                    KeyCode::Char('e') if ctrl => input.buf.move_end(),
+                    KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                        input.hist_idx = None;
+                        input.buf.insert(c.to_string());
+                    }
+                    KeyCode::Backspace => {
+                        input.buf.backspace();
+                    }
+                    KeyCode::Delete => {
+                        input.buf.delete();
+                    }
+                    KeyCode::Left => {
+                        input.buf.move_left();
+                    }
+                    KeyCode::Right => {
+                        input.buf.move_right();
+                    }
+                    KeyCode::Home => input.buf.move_home(),
+                    // End resumes scroll-follow on an empty line, otherwise
+                    // it is the usual end-of-line motion.
+                    KeyCode::End => {
+                        if input.buf.text().is_empty() {
+                            view.follow = true;
+                        } else {
+                            input.buf.move_end();
+                        }
+                    }
+                    KeyCode::Up => input.history_move(-1),
+                    KeyCode::Down => input.history_move(1),
+                    _ => {}
+                }
+            }
+            Event::Paste(pasted) => {
+                input.hist_idx = None;
+                // The line editor is single-line; fold pasted newlines into
+                // spaces so the paste stays editable.
+                input
+                    .buf
+                    .insert(pasted.replace("\r\n", "\n").replace(['\n', '\r'], " "));
+            }
+            Event::Mouse(m) => match m.kind {
+                MouseEventKind::ScrollUp => {
+                    view.follow = false;
+                    view.top = view.top.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown => {
+                    // Clamped by draw, which re-enters follow mode at the bottom.
+                    view.top = view.top.saturating_add(3);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
     }
 }
 
@@ -2517,6 +2724,84 @@ mod tests {
         assert!(tool_result.starts_with("<tool_result>"));
         let last = &agent.session.transcript[3].text;
         assert!(last.contains("The command printed"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worker_turn_drains_queued_user_between_tool_rounds() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-queue-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stanza = concat!(
+            "Checking.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "Done.\n".to_string()],
+            next: 0,
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+        };
+        agent.session.push(Message::user("run echo"));
+
+        // A line "typed while busy": queued before the turn, so the first
+        // tool round must drain it into the transcript.
+        let shared = TurnShared::default();
+        shared.push_queued("also check the docs".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        // user, assistant(tool call), user(tool result), user(queued),
+        // assistant(final)
+        assert_eq!(agent.session.transcript.len(), 5);
+        assert!(
+            agent.session.transcript[2]
+                .text
+                .starts_with("<tool_result>")
+        );
+        assert_eq!(agent.session.transcript[3].text, "also check the docs");
+        assert!(agent.session.transcript[4].text.contains("Done."));
+        assert!(shared.take_queued().is_empty());
+
+        // The UI channel saw rendered text, the drain notice, and status
+        // snapshots from generation.
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        let visible: String = events
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::Visible(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(visible.contains("Checking"), "got: {visible}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("queued message joined")))
+        );
+        assert!(events.iter().any(|e| matches!(e, UiEvent::Status(_))));
         std::fs::remove_dir_all(&dir).ok();
     }
 }

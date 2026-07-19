@@ -82,11 +82,22 @@ sequenceDiagram
 
 ## Module reference
 
-### Agent core (`ui.rs`)
+### Agent core (`ui.rs`, `worker.rs`)
 Owns the `Agent` struct (engine, session, tools, system prompt, trace) and the
-turn loop (`run_turn` / `tui_turn`). Hosts the two interactive front-ends and
+turn loop (`run_turn` / `worker_turn`). Hosts the two interactive front-ends and
 the slash-command handlers. Also holds `render_transcript`, which flattens the
 message list into the `[system]`/`[user]`/`[assistant]` text the engine tokenizes.
+
+In the TUI, each turn runs on a scoped worker thread (the C's "Model Worker
+Thread" split): the worker owns the agent — generation, tool dispatch,
+compaction — and reports over an mpsc channel of `worker::UiEvent`s (the
+`RenderSink` calls made by its stream renderer, plus log lines and status
+snapshots). The UI thread stays in a real event loop: the next prompt remains
+editable while the model runs, Enter queues it (the worker drains queued lines
+into the transcript between tool rounds, like the C's `queued_user_drain`;
+lines left over when the turn settles start a fresh turn), and Esc/Ctrl-C set
+a shared interrupt flag. The plain line REPL keeps the synchronous inline
+loop — with piped stdin there is no live input to multiplex.
 
 ### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`)
 - `engine.rs` — the `Engine` trait (`generate`, `warm_system_prompt`,
@@ -159,9 +170,10 @@ Within a run, the live session then makes each turn reuse the common prefix, so
 only the new user/assistant suffix is evaluated.
 
 ### Interruption
-Generation is synchronous. Between tokens the engine polls an `interrupt`
-closure. In the TUI that closure reads a flag set by polling crossterm for
-Ctrl-C/Esc; in the plain path it reads a SIGINT atomic (`interrupt.rs`).
+Between tokens the engine polls an `interrupt` closure. In the TUI the worker
+thread's closure reads `TurnShared::interrupt`, set by the UI thread on
+Esc/Ctrl-C (plus the SIGINT atomic); in the plain path it reads the SIGINT
+atomic (`interrupt.rs`) directly.
 
 ## Front-end selection
 
