@@ -119,6 +119,9 @@ search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`)
 Output framing matches the C byte-for-byte.
 
 ### Sessions & context (`session.rs`, `compact.rs`, `sysprompt.rs`)
+
+See `docs/SYSTEM-PROMPT.md` for the full story of how the system prompt is
+built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `session.rs` — save/load/list/switch/delete with SHA-1 identities and history
   rendering under `~/.plank/kvcache`.
 - `compact.rs` — the durable-summary + verbatim-tail rebuild and its pressure
