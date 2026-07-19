@@ -1276,6 +1276,7 @@ mod tests {
     fn aside_snapshot_roundtrip_lossless() {
         use crate::engine::{Engine, EngineEvent, GenerationOptions};
         use crate::ffi::Ds4Backend;
+        use crate::snapshot::SessionSnapshot;
 
         let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
             eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
@@ -1292,27 +1293,31 @@ mod tests {
         };
         let transcript = "[user]\nCount slowly from one to twenty.\n";
 
-        // Baseline: one uninterrupted seeded run.
-        let mut baseline = String::new();
+        // Establish a real conversation KV first — a valid checkpoint. This is
+        // the only state in which an aside can actually fire: `generate_aside`
+        // is invoked from the worker *mid-pass*, after the (non-preemptible)
+        // prefill, so the session always has a committed KV to snapshot.
         engine
             .generate(
                 crate::engine::Prompt::Flat(transcript),
                 &opts,
                 &|| false,
                 &|| false,
-                &mut |e| {
-                    if let EngineEvent::Text(t) = e {
-                        baseline.push_str(&t);
-                    }
-                },
+                &mut |_| {},
             )
             .unwrap();
 
-        // A fresh engine, same seed, but with an aside injected before the run.
-        let mut engine2 =
-            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        // The lossless invariant this method guarantees (§4.5): after an aside,
+        // the session's KV is byte-identical to before it, so resume does zero
+        // re-prefill. Capture the frozen state, run an aside, capture again.
+        let session = engine.ensure_session().unwrap();
+        let before = SessionSnapshot::capture(session)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+
         let mut aside = String::new();
-        engine2
+        engine
             .generate_aside("[user]\nWhat is 2 plus 2?\n", &opts, &|| false, &mut |e| {
                 if let EngineEvent::Text(t) = e {
                     aside.push_str(&t);
@@ -1321,24 +1326,15 @@ mod tests {
             .unwrap();
         assert!(!aside.is_empty(), "aside should have produced text");
 
-        let mut after = String::new();
-        engine2
-            .generate(
-                crate::engine::Prompt::Flat(transcript),
-                &opts,
-                &|| false,
-                &|| false,
-                &mut |e| {
-                    if let EngineEvent::Text(t) = e {
-                        after.push_str(&t);
-                    }
-                },
-            )
-            .unwrap();
+        let session = engine.ensure_session().unwrap();
+        let after = SessionSnapshot::capture(session)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
 
         assert_eq!(
-            baseline, after,
-            "post-aside continuation must match the uninterrupted seeded run"
+            before, after,
+            "aside must restore the main-task KV byte-for-byte (zero-drift resume)"
         );
     }
 
