@@ -23,8 +23,8 @@ use std::sync::{Arc, Mutex};
 use crate::engine::{Engine, EngineEvent, GenerationOptions};
 use crate::host::{EngineHost, SessionHandle};
 use crate::remote::proto::{
-    GenerateRequest, InfoResponse, PROTOCOL_VERSION, TokenizeRequest, TokenizeResponse, WireEvent,
-    WireStats,
+    GenerateRequest, InfoResponse, PROTOCOL_VERSION, SessionStatus, SharedStatus, TokenizeRequest,
+    TokenizeResponse, WireEvent, WireStats,
 };
 
 /// Options for the `serve` subcommand.
@@ -127,10 +127,27 @@ fn handle_conn_shared(
 
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/info") => {
+            // Read the scheduler's published accounting snapshot cheaply (design
+            // §9 step 5): one mutex read, no GPU-thread contention.
+            let st = host.status();
             let info = InfoResponse {
                 model_name: host.model_name(),
                 ctx_size: host.ctx_size(),
                 protocol_version: PROTOCOL_VERSION,
+                shared: Some(SharedStatus {
+                    live_sessions: st.live_sessions,
+                    max_sessions: st.max_sessions,
+                    resident_ctx_tokens: st.resident_ctx_tokens,
+                    sessions: st
+                        .sessions
+                        .into_iter()
+                        .map(|s| SessionStatus {
+                            id: s.id,
+                            ctx_tokens: s.ctx_tokens,
+                            reclaimed: s.reclaimed,
+                        })
+                        .collect(),
+                }),
             };
             write_json(&mut out, &serde_json::to_string(&info).unwrap_or_default())
         }
@@ -327,6 +344,8 @@ fn handle_conn(
                 model_name: eng.model_name(),
                 ctx_size: eng.ctx_size(),
                 protocol_version: PROTOCOL_VERSION,
+                // Single-owner serve has no host/scheduler; no shared accounting.
+                shared: None,
             };
             write_json(&mut out, &serde_json::to_string(&info).unwrap_or_default())
         }
