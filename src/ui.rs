@@ -385,7 +385,64 @@ impl Agent<'_> {
         if !compact::should_compact(self.engine.ctx_size(), used) {
             return Ok(());
         }
+        // Cheapest step first: clear old tool-result bodies (no model
+        // round-trip) and only fall back to full summarization if still tight.
+        if let Some(cleared) = self.try_microcompact() {
+            println!(
+                "{}",
+                self.debug_line(&format!(
+                    "microcompacted: cleared {cleared} old tool result(s)"
+                ))
+            );
+            return Ok(());
+        }
         self.compact("low context")
+    }
+
+    /// Runs microcompact; returns the cleared count when it freed enough
+    /// context to skip full compaction, `None` when full compaction is still
+    /// needed (any clearing done is kept — it only helps the summary pass).
+    fn try_microcompact(&mut self) -> Option<usize> {
+        let cleared = compact::microcompact(&mut self.session.transcript);
+        if cleared == 0 {
+            return None;
+        }
+        self.last_ctx_used = 0;
+        let rendered = render_transcript(&self.session, &self.system);
+        let used = self.engine.count_tokens(&rendered);
+        (!compact::should_compact(self.engine.ctx_size(), used)).then_some(cleared)
+    }
+
+    /// Rebuilds the transcript after a summarization pass: extracted summary
+    /// + verbatim tail + budgeted re-injection of recently read files.
+    fn rebuild_after_compact(&mut self, raw_summary: &str) {
+        let summary = compact::extract_summary(raw_summary);
+        let budget = compact::tail_budget(self.engine.ctx_size());
+        let mut tail_start = self.session.transcript.len();
+        let mut tail_tokens = 0;
+        while tail_start > 0 {
+            let m = &self.session.transcript[tail_start - 1];
+            tail_tokens += self.engine.count_tokens(&m.text);
+            if tail_tokens > budget {
+                break;
+            }
+            tail_start -= 1;
+        }
+        let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
+        self.session.transcript = Vec::new();
+        self.session.push(Message::user(format!(
+            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
+        )));
+        self.session.transcript.extend(tail);
+        let reinject = compact::build_reinjection(
+            &self.tool_ctx.recent_reads,
+            compact::reinject_budget(self.engine.ctx_size()),
+            &mut |s| self.engine.count_tokens(s),
+        );
+        if let Some(block) = reinject {
+            self.session.push(Message::user(block));
+        }
+        self.last_ctx_used = 0;
     }
 
     /// Performs the compaction exchange and rebuilds the transcript as
@@ -415,25 +472,7 @@ impl Agent<'_> {
             print!("\x1b[0m");
         }
 
-        // Keep a verbatim tail within budget, starting at a user boundary.
-        let budget = compact::tail_budget(self.engine.ctx_size());
-        let mut tail_start = self.session.transcript.len();
-        let mut tail_tokens = 0;
-        while tail_start > 0 {
-            let m = &self.session.transcript[tail_start - 1];
-            tail_tokens += self.engine.count_tokens(&m.text);
-            if tail_tokens > budget {
-                break;
-            }
-            tail_start -= 1;
-        }
-        let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
-        self.session.transcript = Vec::new();
-        self.session.push(Message::user(format!(
-            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
-        )));
-        self.session.transcript.extend(tail);
-        self.last_ctx_used = 0;
+        self.rebuild_after_compact(&summary);
         println!("{}", self.debug_line("context compacted"));
         Ok(())
     }
@@ -1466,6 +1505,14 @@ impl Agent<'_> {
         if !compact::should_compact(self.engine.ctx_size(), used) {
             return Ok(());
         }
+        // Cheapest step first: clear old tool-result bodies (no model
+        // round-trip) and only fall back to full summarization if still tight.
+        if let Some(cleared) = self.try_microcompact() {
+            log.push_dim(format!(
+                "microcompacted: cleared {cleared} old tool result(s)"
+            ));
+            return Ok(());
+        }
         self.tui_do_compact("low context", log)
     }
 
@@ -1493,24 +1540,7 @@ impl Agent<'_> {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let budget = compact::tail_budget(self.engine.ctx_size());
-        let mut tail_start = self.session.transcript.len();
-        let mut tail_tokens = 0;
-        while tail_start > 0 {
-            let m = &self.session.transcript[tail_start - 1];
-            tail_tokens += self.engine.count_tokens(&m.text);
-            if tail_tokens > budget {
-                break;
-            }
-            tail_start -= 1;
-        }
-        let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
-        self.session.transcript = Vec::new();
-        self.session.push(Message::user(format!(
-            "<tool_result>Compacted session summary:\n{summary}</tool_result>"
-        )));
-        self.session.transcript.extend(tail);
-        self.last_ctx_used = 0;
+        self.rebuild_after_compact(&summary);
         log.push_dim("context compacted");
         Ok(())
     }

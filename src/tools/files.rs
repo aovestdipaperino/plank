@@ -197,7 +197,7 @@ pub fn tool_read(ctx: &mut ToolContext, call: &ToolCall) -> String {
         i64::MAX,
     );
     let raw = parse_bool_default(call.arg_value("raw"), false);
-    read_range(
+    let out = read_range(
         ctx,
         &path,
         usize::try_from(start).unwrap_or(usize::MAX),
@@ -205,7 +205,12 @@ pub fn tool_read(ctx: &mut ToolContext, call: &ToolCall) -> String {
         whole,
         raw,
         true,
-    )
+    );
+    if !out.starts_with("Tool error:") {
+        let resolved = ctx.resolve(&path);
+        ctx.note_read(resolved);
+    }
+    out
 }
 
 /// Implements the `more` tool: continues the previous truncated read.

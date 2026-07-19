@@ -72,6 +72,9 @@ pub struct ToolContext {
     pub web_confirm: Option<WebConfirmFn>,
     /// Live MCP servers started from the `.mcp.json` config, if any.
     pub mcp: Vec<mcp::McpServer>,
+    /// Resolved paths of recent successful `read` calls, oldest first, for
+    /// post-compaction re-injection (`compact::build_reinjection`).
+    pub recent_reads: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -83,6 +86,7 @@ impl std::fmt::Debug for ToolContext {
             .field("web", &self.web)
             .field("web_confirm", &self.web_confirm.as_ref().map(|_| "<fn>"))
             .field("mcp", &self.mcp)
+            .field("recent_reads", &self.recent_reads)
             .finish()
     }
 }
@@ -98,6 +102,19 @@ impl ToolContext {
             web: web::WebState::default(),
             web_confirm: None,
             mcp: Vec::new(),
+            recent_reads: Vec::new(),
+        }
+    }
+
+    /// Records a successful file read for post-compaction re-injection:
+    /// moves `path` to the newest slot and bounds the list.
+    pub fn note_read(&mut self, path: PathBuf) {
+        const RECENT_READS_CAP: usize = 16;
+        self.recent_reads.retain(|p| *p != path);
+        self.recent_reads.push(path);
+        if self.recent_reads.len() > RECENT_READS_CAP {
+            self.recent_reads
+                .drain(..self.recent_reads.len() - RECENT_READS_CAP);
         }
     }
 
