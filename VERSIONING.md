@@ -83,6 +83,47 @@ Note the two formulas conflict (both install a `plank` binary), so users
 switch channels with `brew uninstall plank && brew install plank-beta` or the
 reverse.
 
+## Hotfixing a stable release
+
+Once a major has been promoted to stable, the beta lives in a higher major, so
+you can ship a fix to stable without touching the beta. `release.yml` routes by
+major automatically: a tag whose major is **below** the highest tagged major
+updates the `plank` (stable) formula; the highest major updates `plank-beta`.
+So a patch or minor tag under the promoted major is a stable-only release. (The
+v0.9.10 release was exactly this: a hotfix cut against stable while the v1 beta
+was already open.)
+
+### Running it
+
+Do the work off `main` — `main` tracks the beta major and its version must stay
+at `<beta-major>.0.0` or higher, so bumping it would not describe a stable
+patch.
+
+1. Branch from the stable tag, not `main`:
+   `git switch -c hotfix/x.y.z vX.Y.Z`.
+2. Commit the fix, keeping it minimal.
+3. Bump `Cargo.toml` (and `Cargo.lock`) to the next patch under the stable
+   major (`X.Y.(Z+1)`, or `X.(Y+1).0` for a larger stable-only change), commit,
+   and tag `vX.Y.(Z+1)`.
+4. Push the branch and the tag, then create a GitHub release for the tag as a
+   normal release (**not** a prerelease). Create it with the `gh` CLI or a PAT,
+   not the automation `GITHUB_TOKEN` — releases made with `GITHUB_TOKEN` do not
+   trigger `release.yml`.
+5. `release.yml` fires, sees the tag's major is below the highest, builds
+   bottles, and rewrites `Formula/plank.rb` for the new version. `plank-beta`
+   is left alone.
+6. **Forward-port the fix to the beta** so it survives the next promotion:
+   cherry-pick the hotfix commit onto `main` and push. Do not carry the hotfix
+   version bump across — `main` keeps its beta version.
+
+### Verifying
+
+- The hotfix release shows as **Latest** (stable releases outrank the beta
+  prerelease), and `homebrew-tap` has one new commit updating
+  `Formula/plank.rb`; `Formula/plank-beta.rb` is unchanged.
+- `brew upgrade plank` picks up the hotfix; `plank-beta` users are unaffected.
+- The fix commit exists on both the hotfix tag and `main`.
+
 ## What a bump means for local caches
 
 Version numbers also drive zero-touch maintenance of `~/.plank` on the first
