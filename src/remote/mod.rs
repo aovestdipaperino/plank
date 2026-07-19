@@ -7,29 +7,28 @@
 //!   the already-vendored blocking `ureq` client, which matches the *synchronous*
 //!   `Engine::generate` contract directly: SSE frames arrive per token, and the
 //!   `interrupt` closure is polled between frames. No async runtime is needed.
-//! - **Flavor (b)** — a provider adapter over `refs/llms-sdk` (OpenAI-compatible
-//!   and Anthropic). That path *is* async and needs a tokio bridge plus the
-//!   structured-input boundary from §4.4 of the design; it is **not yet
-//!   implemented** (see the crate-level TODO below).
+//! - **Flavor (b)** — [`provider::ProviderEngine`], an adapter for third-party
+//!   LLM APIs (OpenAI-compatible in v1; Anthropic reserved). It reads the
+//!   structured-input boundary from §4.4 ([`crate::engine::Prompt::Structured`],
+//!   [`crate::sysprompt::provider_system_prompt`], and the tool registry) and
+//!   re-emits native tool calls as synthesized DSML, so the dispatch/renderer
+//!   stack stays backend-agnostic. It reuses the same blocking `ureq` transport
+//!   and [`read_sse`] reader as flavor (a); no async runtime is pulled in
+//!   (`refs/llms-sdk` is the wire-format reference, not a runtime dependency —
+//!   depending on it would force `tokio`/`reqwest`, which the sync `Engine`
+//!   contract does not need).
 //!
-//! Only flavor (a) ships here — it is the design's Phase 1–4, "the low-risk
-//! flavor [that] ships first" (§4.1), and the primary deliverable of the
-//! hosting note. This module holds the pieces both flavors will share: URL
-//! validation and the SSE frame reader.
-//
-// TODO(#26 flavor b): add `remote/provider.rs` (ProviderEngine over llms-sdk),
-// a tokio current-thread runtime + `pump_stream` bridge, the
-// `Prompt::{Flat,Structured}` engine-input widening (§4.4), the
-// `SystemPrompt::Provider` variant, and a machine-readable tool registry. The
-// translation core (delta -> EngineEvent, native tool-call -> synthesized DSML)
-// is the crux and is unit-testable against scripted `LLMStreamingResponse`
-// vectors without network (§6).
+//! This module holds the pieces both flavors share: URL validation and the SSE
+//! frame reader.
 
 pub mod proto;
 
 // Available on every platform: pure Rust + HTTP, no C engine needed. A Linux or
 // Windows user can drive a remote ds4 box without building the Metal engine.
 pub mod ds4_client;
+
+// Flavor (b): third-party provider engine (OpenAI-compatible / Anthropic).
+pub mod provider;
 
 // Remote-control server (issue #25): the loopback WebSocket mirror/drive
 // interface. Formerly the standalone `src/remote.rs`; folded in here so #25 and

@@ -62,6 +62,94 @@ pub struct PrefillProgress {
     pub tps: f64,
 }
 
+/// Role of a structured chat message handed to a provider engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatRole {
+    /// System / developer instructions.
+    System,
+    /// A human turn.
+    User,
+    /// A model turn.
+    Assistant,
+    /// A tool observation fed back to the model.
+    Tool,
+}
+
+/// One structured message for a provider engine (§4.4).
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    /// Speaker role.
+    pub role: ChatRole,
+    /// Message text.
+    pub content: String,
+    /// For [`ChatRole::Tool`] messages: the provider tool-call id being
+    /// answered, when one is available.
+    pub tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Convenience constructor with no tool-call id.
+    #[must_use]
+    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
+        Self {
+            role,
+            content: content.into(),
+            tool_call_id: None,
+        }
+    }
+}
+
+/// A machine-readable tool definition for a provider engine (§4.3/§4.4).
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    /// Tool name (matches plank's dispatch table).
+    pub name: String,
+    /// Human-readable description sent to the provider.
+    pub description: String,
+    /// JSON Schema (an object schema) for the tool parameters.
+    pub parameters: serde_json::Value,
+}
+
+/// Structured turn input for provider engines that set
+/// [`Engine::wants_structured`]. Borrows the caller's owned buffers.
+#[derive(Debug, Clone, Copy)]
+pub struct StructuredTurn<'a> {
+    /// The provider system prompt (never the DS4 byte-parity prompt, §4.4).
+    pub system: &'a str,
+    /// Conversation messages in order.
+    pub messages: &'a [ChatMessage],
+    /// Tool registry offered to the provider.
+    pub tools: &'a [ToolSpec],
+    /// The flat rendered transcript, as a fallback for engines that ignore
+    /// structure (keeps [`Prompt::flat`] total).
+    pub rendered: &'a str,
+}
+
+/// Engine input, widened for provider backends (design §4.4).
+///
+/// Local engines ([`EchoEngine`], the ds4 engine, the remote ds4 client) only
+/// ever read [`Prompt::Flat`] — the exact `render_transcript` bytes, preserving
+/// byte parity. Provider engines read [`Prompt::Structured`].
+#[derive(Debug, Clone, Copy)]
+pub enum Prompt<'a> {
+    /// The flattened transcript text, as historically passed to `generate`.
+    Flat(&'a str),
+    /// Structured messages + tool registry for a provider backend.
+    Structured(&'a StructuredTurn<'a>),
+}
+
+impl<'a> Prompt<'a> {
+    /// The flat transcript bytes, regardless of variant. For a structured turn
+    /// this is the pre-rendered fallback string.
+    #[must_use]
+    pub fn flat(&self) -> &'a str {
+        match self {
+            Prompt::Flat(s) => s,
+            Prompt::Structured(t) => t.rendered,
+        }
+    }
+}
+
 /// Events streamed by [`Engine::generate`].
 #[derive(Debug, Clone)]
 pub enum EngineEvent {
@@ -145,12 +233,19 @@ pub trait Engine: Debug + Send {
     /// Returns [`EngineError`] when the backend fails.
     fn generate(
         &mut self,
-        transcript: &str,
+        prompt: Prompt<'_>,
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
         greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError>;
+
+    /// Whether this engine wants a [`Prompt::Structured`] input (a provider
+    /// backend) rather than the flat rendered transcript. Local engines return
+    /// `false`, so the agent keeps passing `Prompt::Flat` and byte parity holds.
+    fn wants_structured(&self) -> bool {
+        false
+    }
 
     /// Answers a one-shot, tool-free prompt without disturbing the live
     /// generation state, then restores it exactly. Returns the aside's stats;
@@ -260,12 +355,13 @@ impl EchoEngine {
 impl Engine for EchoEngine {
     fn generate(
         &mut self,
-        transcript: &str,
+        prompt: Prompt<'_>,
         _opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
         _greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
+        let transcript = prompt.flat();
         // Simulate a short prefill so the live progress bar is exercised even
         // without a real model.
         let total = self.count_tokens(transcript).max(1);

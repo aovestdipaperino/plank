@@ -78,6 +78,26 @@ pub struct AgentConfig {
     /// `--max-sessions`: admission cap on concurrently attached sessions when
     /// `shared_engine` is on (design §7). Ignored otherwise.
     pub max_sessions: i32,
+    /// Third-party provider from `--provider openai|anthropic` (flavor b, issue
+    /// #26); selects [`crate::remote::provider::ProviderEngine`]. `None` unless
+    /// `--provider` was given.
+    pub provider: Option<ProviderSelector>,
+    /// Provider model name from `--model NAME` when `--provider` is set.
+    pub provider_model: Option<String>,
+    /// Provider base URL override from `--base-url` (for OpenAI-compatible
+    /// gateways); `None` uses the provider default.
+    pub provider_base_url: Option<String>,
+    /// Provider API key from `--api-key` or the provider's key env var.
+    pub provider_api_key: Option<String>,
+}
+
+/// Third-party provider family selector (`--provider`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderSelector {
+    /// OpenAI-compatible chat completions.
+    OpenAi,
+    /// Anthropic Messages.
+    Anthropic,
 }
 
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
@@ -229,6 +249,10 @@ impl Default for AgentConfig {
             insecure: false,
             shared_engine: false,
             max_sessions: i32::try_from(crate::host::DEFAULT_MAX_SESSIONS).unwrap_or(8),
+            provider: None,
+            provider_model: None,
+            provider_base_url: None,
+            provider_api_key: None,
         }
     }
 }
@@ -271,6 +295,12 @@ Options:
                            #28); applies to `plank serve`. Default off — plank
                            otherwise runs a single owned engine as before
       --max-sessions N     admission cap for --shared-engine (default 8)
+      --provider NAME      drive a third-party LLM API: openai (OpenAI-compatible,
+                           also vLLM/Ollama/OpenRouter) or anthropic. Use with
+                           --model NAME; key from --api-key or $OPENAI_API_KEY /
+                           $ANTHROPIC_API_KEY
+      --base-url URL       base URL for --provider (OpenAI-compatible gateways)
+      --api-key KEY        API key for --provider (prefer the env var)
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
@@ -568,6 +598,15 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--insecure" => c.insecure = true,
             "--shared-engine" => c.shared_engine = true,
             "--max-sessions" => c.max_sessions = parse_int(need_arg(&mut i)?, arg)?,
+            "--provider" => {
+                c.provider = Some(match need_arg(&mut i)? {
+                    "openai" => ProviderSelector::OpenAi,
+                    "anthropic" => ProviderSelector::Anthropic,
+                    other => return Err(format!("invalid provider: {other}")),
+                });
+            }
+            "--base-url" => c.provider_base_url = Some(need_arg(&mut i)?.to_owned()),
+            "--api-key" => c.provider_api_key = Some(need_arg(&mut i)?.to_owned()),
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -623,6 +662,33 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String>
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
     }
+    // --provider (flavor b) selects a third-party API engine. Mutually
+    // exclusive with the local selectors and with --remote (§4.7).
+    if let Some(provider) = c.provider {
+        if c.remote_url.is_some() {
+            return Err("--provider cannot be combined with --remote".to_string());
+        }
+        if c.backend.is_some() {
+            return Err("--provider cannot be combined with --metal/--cuda/--cpu".to_string());
+        }
+        // `--model NAME` names the provider model (not a local GGUF path).
+        if let Some(path) = c.model_path.take() {
+            c.provider_model = Some(path.to_string_lossy().into_owned());
+        }
+        if c.provider_model.is_none() {
+            return Err("--provider requires --model NAME".to_string());
+        }
+        // Keys never live in config; read from the provider's env var when not
+        // given on the command line (§4.7, constraint 6).
+        if c.provider_api_key.is_none() {
+            let env = match provider {
+                ProviderSelector::OpenAi => "OPENAI_API_KEY",
+                ProviderSelector::Anthropic => "ANTHROPIC_API_KEY",
+            };
+            c.provider_api_key = std::env::var(env).ok().filter(|k| !k.is_empty());
+        }
+        return Ok(());
+    }
     let Some(url) = c.remote_url.clone() else {
         return Ok(());
     };
@@ -671,6 +737,51 @@ mod tests {
         let c = parse_options(&args(&["--shared-engine", "--max-sessions", "4"])).unwrap();
         assert!(c.shared_engine);
         assert_eq!(c.max_sessions, 4);
+    }
+
+    #[test]
+    fn provider_flag_takes_model_name_and_key() {
+        let c = parse_options(&args(&[
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-4o",
+            "--base-url",
+            "http://localhost:8000/v1",
+            "--api-key",
+            "sk-test",
+        ]))
+        .unwrap();
+        assert_eq!(c.provider, Some(ProviderSelector::OpenAi));
+        // `--model NAME` is the provider model, not a local GGUF path.
+        assert_eq!(c.provider_model.as_deref(), Some("gpt-4o"));
+        assert!(c.model_path.is_none());
+        assert_eq!(
+            c.provider_base_url.as_deref(),
+            Some("http://localhost:8000/v1")
+        );
+        assert_eq!(c.provider_api_key.as_deref(), Some("sk-test"));
+    }
+
+    #[test]
+    fn provider_requires_model_and_is_exclusive() {
+        // Missing --model.
+        assert!(parse_options(&args(&["--provider", "openai", "--api-key", "k"])).is_err());
+        // Mutually exclusive with --remote.
+        let err = parse_options(&args(&[
+            "--provider",
+            "openai",
+            "--model",
+            "m",
+            "--api-key",
+            "k",
+            "--remote",
+            "https://box:8080",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("cannot be combined"), "got: {err}");
+        // Invalid provider name.
+        assert!(parse_options(&args(&["--provider", "bogus"])).is_err());
     }
 
     #[test]

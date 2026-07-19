@@ -429,9 +429,13 @@ impl HostSession for EchoSharedSession {
             return Ok(Some(GenerationStats::default()));
         };
         let intr = || interrupt.load(Ordering::SeqCst);
-        let stats = self
-            .engine
-            .generate(&transcript, &opts, &intr, &|| false, sink)?;
+        let stats = self.engine.generate(
+            crate::engine::Prompt::Flat(&transcript),
+            &opts,
+            &intr,
+            &|| false,
+            sink,
+        )?;
         Ok(Some(stats))
     }
 }

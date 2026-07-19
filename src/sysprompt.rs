@@ -67,6 +67,126 @@ const TOOLS_PROMPT_AFTER_EDIT: &str = include_str!("resources/tools_prompt_after
 /// Token-estimate distance after which the system prompt reminder is re-injected.
 pub const SYSTEM_PROMPT_REMINDER_TOKENS: i32 = 50_000;
 
+/// Selects which system prompt a backend receives (design §4.4).
+///
+/// The `Ds4` prompt is the byte-parity DS4 prompt (DSML-in-prose tool
+/// instructions the local model was trained on); it must never be sent to a
+/// third-party provider. The `Provider` prompt is plank's own text — the same
+/// behavioral guidance minus the DSML syntax instructions, since native tool
+/// definitions replace them. The `Provider` variant is deliberately *not* under
+/// `tests/c_parity.rs`: it is free to evolve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SystemPrompt {
+    /// The byte-parity DS4 prompt (local / remote-ds4 engines).
+    Ds4,
+    /// The provider-facing prompt (OpenAI-compatible / Anthropic engines).
+    Provider,
+}
+
+/// The provider-facing system prompt (design §4.4).
+///
+/// Same behavioral guidance as the DS4 prompt's prose — role, editing norms,
+/// web-tool norms, the workspace rules — but **without** the DSML tool-call
+/// syntax section (native provider tool definitions replace it) and without the
+/// verbatim DSML JSON-schema dump. Non-empty `-sys` user text is appended.
+#[must_use]
+pub fn provider_system_prompt(user_system: &str) -> String {
+    let mut out = String::from(
+        "You are a coding agent running in a local workspace. Use the provided tools for local \
+file and system work. Avoid printing large file contents or large code blocks as answers; create \
+or edit files with tools, then summarize results briefly.\n\n\
+## Reading files\n\n\
+read defaults to a bounded chunk: a path alone returns the first 500 lines, not the whole file. \
+If read reports more lines are available, call more with count=<lines> for the next chunk. Pass \
+whole=true only when explicitly asked to read a complete file into context.\n\n\
+## Editing files\n\n\
+Use write for new files or deliberate whole-file replacement. Use edit with path, old and new for \
+changes; old must match exactly once. For large replacements prefer anchored old text: the first \
+lines, then [upto], then unique final lines — never close old immediately after [upto].\n\n\
+## Web\n\n\
+Use google_search to find web pages and visit_page to read a known URL. The first web call may \
+ask permission to start a browser.\n\n\
+## Rules\n\n\
+- Prefer read/search to get anchors, then anchored edit to avoid retyping large text.\n\
+- Write code that is reliable; keep a clear mental model of complex parts.\n\
+- Preserve the current system configuration integrity unless explicitly asked otherwise.\n",
+    );
+    if !user_system.is_empty() {
+        out.push('\n');
+        out.push_str(user_system);
+    }
+    out
+}
+
+/// Builds the machine-readable tool registry for a provider engine (§4.3).
+///
+/// The static tool schemas already live as JSON in the DS4 tools prompt
+/// resource (the `### Available Tool Schemas` section, `OpenAI` function shape);
+/// this parses them into structured [`crate::engine::ToolSpec`]s — single
+/// source of truth — and appends any loaded MCP tools.
+#[must_use]
+pub fn provider_tool_registry(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+) -> Vec<crate::engine::ToolSpec> {
+    let mut specs = parse_builtin_tool_schemas();
+    for server in mcp_servers {
+        if !server.alive() {
+            continue;
+        }
+        for tool in &server.tools {
+            let parameters = serde_json::from_str::<serde_json::Value>(&tool.schema_json)
+                .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} }));
+            specs.push(crate::engine::ToolSpec {
+                name: tool.name.clone(),
+                description: tool.description.clone(),
+                parameters,
+            });
+        }
+    }
+    specs
+}
+
+/// Parses the built-in OpenAI-shaped tool schemas out of the DS4 tools prompt
+/// resource into [`crate::engine::ToolSpec`]s.
+fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
+    let text = TOOLS_PROMPT_AFTER_EDIT;
+    let Some(start) = text.find("### Available Tool Schemas") else {
+        return Vec::new();
+    };
+    let rest = &text[start..];
+    // The schema blocks end at the trailing "# Rules" section.
+    let region = rest.split("# Rules").next().unwrap_or(rest);
+    // Skip the header line itself.
+    let region = region.split_once('\n').map_or(region, |(_, body)| body);
+    let mut specs = Vec::new();
+    // Consecutive JSON objects, blank-line separated; a streaming deserializer
+    // tolerates the interspersed whitespace and stops cleanly at the tail.
+    let stream = serde_json::Deserializer::from_str(region).into_iter::<serde_json::Value>();
+    for value in stream.flatten() {
+        let Some(func) = value.get("function") else {
+            continue;
+        };
+        let Some(name) = func.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let description = func
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let parameters = func
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({ "type": "object", "properties": {} }));
+        specs.push(crate::engine::ToolSpec {
+            name: name.to_string(),
+            description,
+            parameters,
+        });
+    }
+    specs
+}
+
 /// Builds the full tools prompt (intro, editing, schemas, rules, MCP tools).
 ///
 /// Mirrors `agent_build_tools_prompt`: the three verbatim C string constants
@@ -267,6 +387,32 @@ mod tests {
                 "volatile marker {marker:?} leaked into the cached prefix"
             );
         }
+    }
+
+    #[test]
+    fn provider_system_prompt_omits_dsml() {
+        let p = provider_system_prompt("Be terse.");
+        // The provider prompt must not teach DSML syntax (native tools replace
+        // it) and must not carry DS4-only framing (design §4.4 / constraint 3).
+        assert!(!p.contains("DSML"));
+        assert!(!p.contains("<｜DSML｜"));
+        assert!(!p.contains("### Available Tool Schemas"));
+        // But it keeps the behavioral guidance and appends user -sys text.
+        assert!(p.contains("Editing files"));
+        assert!(p.ends_with("Be terse."));
+    }
+
+    #[test]
+    fn provider_tool_registry_parses_builtin_schemas() {
+        let specs = provider_tool_registry(&[]);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        for want in ["read", "write", "edit", "bash", "search", "google_search"] {
+            assert!(names.contains(&want), "missing {want} in {names:?}");
+        }
+        let read = specs.iter().find(|s| s.name == "read").unwrap();
+        assert_eq!(read.parameters["type"], "object");
+        assert!(read.parameters["properties"].get("path").is_some());
+        assert!(!read.description.is_empty());
     }
 
     #[test]
