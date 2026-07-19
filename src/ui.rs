@@ -1822,17 +1822,51 @@ impl Agent<'_> {
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
         loop {
-            let prompt = render_transcript(&self.session, &self.system);
-            let out = self.worker_generate(tx, shared, &prompt, turn_start, true)?;
-            // A priority `/btw` stopped this pass: nothing was committed, so
-            // roll back the partial output, answer the side question(s) now,
-            // and re-run the same step from the last committed boundary.
+            let base_prompt = render_transcript(&self.session, &self.system);
+            // Text already streamed for this pass and preserved across in-pass
+            // `/btw` suspensions (BTW-SUSPEND-DESIGN §4.3). Empty unless the
+            // pass was frozen and resumed at least once.
+            let mut resumed_prefix = String::new();
+            let suspend_enabled = self.cfg.btw.suspend && self.engine.supports_aside();
+            let out = loop {
+                // On resume, re-open the assistant turn with the partial reply
+                // so the engine splices its exact tokens (zero re-prefill) and
+                // continues from where it froze; otherwise the plain prompt.
+                let prompt = if resumed_prefix.is_empty() {
+                    base_prompt.clone()
+                } else {
+                    format!("{base_prompt}[assistant]\n{resumed_prefix}")
+                };
+                let out = self.worker_generate(tx, shared, &prompt, turn_start, true)?;
+                if out.preempted && suspend_enabled {
+                    // Freeze: keep the partial on screen, answer the queued
+                    // aside(s) via `generate_aside` (which snapshots/restores
+                    // the main KV), then resume the same pass.
+                    let _ = tx.send(UiEvent::EndLine);
+                    resumed_prefix.push_str(&out.assistant_text);
+                    let _ = tx.send(UiEvent::Dim(worker::BTW_SUSPEND_MARKER.to_owned()));
+                    self.drain_aside(tx, shared);
+                    let _ = tx.send(UiEvent::Dim(worker::BTW_RESUME_MARKER.to_owned()));
+                    continue;
+                }
+                break out;
+            };
+            // A priority `/btw` stopped this pass without suspend support:
+            // nothing was committed, so roll back the partial output, answer
+            // the side question(s) at the boundary, and re-run the same step.
             if out.preempted {
                 let _ = tx.send(UiEvent::MainRollback);
                 self.drain_btw(tx, shared);
                 continue;
             }
-            self.session.push(Message::assistant(out.assistant_text));
+            // Splice any suspended-and-resumed prefix back onto the final
+            // continuation so the transcript holds the whole reply.
+            let assistant_text = if resumed_prefix.is_empty() {
+                out.assistant_text
+            } else {
+                format!("{resumed_prefix}{}", out.assistant_text)
+            };
+            self.session.push(Message::assistant(assistant_text));
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
                 crate::interrupt::clear();
@@ -1903,6 +1937,19 @@ impl Agent<'_> {
     /// the answer is done. `BtwEnd` only stops routing to the panel; the UI
     /// keeps it on screen (frozen, readable) until the user presses Esc.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
+        self.drain_btw_inner(tx, shared, false);
+    }
+
+    /// Suspend-mode drain: answers the queued `/btw` question(s) with
+    /// [`Engine::generate_aside`] so the frozen main-task KV is snapshotted and
+    /// restored around each answer (BTW-SUSPEND-DESIGN §4.3). Used only from
+    /// the in-pass suspend path, where the main pass is paused mid-reply and
+    /// the partial reply must survive the aside.
+    fn drain_aside(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
+        self.drain_btw_inner(tx, shared, true);
+    }
+
+    fn drain_btw_inner(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared, aside: bool) {
         let Some(mut question) = shared.pop_btw() else {
             return;
         };
@@ -1919,7 +1966,7 @@ impl Agent<'_> {
                 use std::fmt::Write as _;
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
-            match self.worker_generate(tx, shared, &prompt, Instant::now(), false) {
+            match self.worker_generate_kind(tx, shared, &prompt, Instant::now(), false, aside) {
                 Ok(out) => {
                     let _ = tx.send(UiEvent::EndLine);
                     self.last_ctx_used = saved_ctx;
@@ -1981,7 +2028,6 @@ impl Agent<'_> {
     /// `is_main` marks a main-task pass (vs. a `/btw` side answer): only main
     /// passes send a `MainCheckpoint` and honor the priority-`/btw` preempt
     /// flag, so a side answer is never interrupted by a queued side question.
-    #[allow(clippy::too_many_lines)]
     fn worker_generate(
         &mut self,
         tx: &Sender<UiEvent>,
@@ -1989,6 +2035,24 @@ impl Agent<'_> {
         prompt: &str,
         turn_start: Instant,
         is_main: bool,
+    ) -> Result<TurnOutput, String> {
+        self.worker_generate_kind(tx, shared, prompt, turn_start, is_main, false)
+    }
+
+    /// As [`worker_generate`](Self::worker_generate), but `aside` selects
+    /// [`Engine::generate_aside`] instead of `generate` so a mid-pass `/btw`
+    /// answer snapshots and restores the frozen main-task KV around itself
+    /// (BTW-SUSPEND-DESIGN §4.2). An aside is never a main pass, so `is_main`
+    /// must be `false` when `aside` is `true`.
+    #[allow(clippy::too_many_lines)]
+    fn worker_generate_kind(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+        prompt: &str,
+        turn_start: Instant,
+        is_main: bool,
+        aside: bool,
     ) -> Result<TurnOutput, String> {
         // Snapshot the main log before streaming so a preempt can roll back
         // this pass's partial output before it re-runs.
@@ -2019,60 +2083,70 @@ impl Agent<'_> {
         let verb = status::random_verb_index();
         let start = Instant::now();
 
-        let result = self.engine.generate(
-            prompt,
-            &self.cfg.generation,
-            &|| {
-                shared.interrupt.load(Ordering::Relaxed)
-                    || (is_main && shared.preempt.load(Ordering::Relaxed))
-                    || preflight_stop.load(Ordering::Relaxed)
-                    || crate::interrupt::pending()
-            },
-            &|| greedy.load(Ordering::Relaxed),
-            &mut |ev| {
-                let status = match ev {
-                    EngineEvent::Text(t) => {
-                        assistant_text.push_str(&t);
-                        stream.push(&t);
-                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-                        if stream.preflight_error().is_some() {
-                            preflight_stop.store(true, Ordering::Relaxed);
-                        }
-                        gen_count += 1;
-                        let secs = start.elapsed().as_secs_f64();
-                        Status {
-                            state: WorkerState::Generating,
-                            generated: gen_count,
-                            prefill_label: verb,
-                            gen_tps: if secs > 0.0 {
-                                f64::from(gen_count) / secs
-                            } else {
-                                0.0
-                            },
-                            elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                            ctx_used: prompt_tokens + gen_count,
-                            ctx_size,
-                            power_percent: power,
-                            greedy_sampling: greedy.load(Ordering::Relaxed),
-                            ..Status::default()
-                        }
+        let interrupt = || {
+            shared.interrupt.load(Ordering::Relaxed)
+                || (is_main && shared.preempt.load(Ordering::Relaxed))
+                || preflight_stop.load(Ordering::Relaxed)
+                || crate::interrupt::pending()
+        };
+        let greedy_fn = || greedy.load(Ordering::Relaxed);
+        let mut on_event = |ev| {
+            let status = match ev {
+                EngineEvent::Text(t) => {
+                    assistant_text.push_str(&t);
+                    stream.push(&t);
+                    greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
+                    if stream.preflight_error().is_some() {
+                        preflight_stop.store(true, Ordering::Relaxed);
                     }
-                    EngineEvent::Prefill(p) => Status {
-                        state: WorkerState::Prefill,
-                        prefill_done: p.done,
-                        prefill_total: p.total,
+                    gen_count += 1;
+                    let secs = start.elapsed().as_secs_f64();
+                    Status {
+                        state: WorkerState::Generating,
+                        generated: gen_count,
                         prefill_label: verb,
-                        prefill_tps: p.tps,
+                        gen_tps: if secs > 0.0 {
+                            f64::from(gen_count) / secs
+                        } else {
+                            0.0
+                        },
                         elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                        ctx_used: prompt_tokens,
+                        ctx_used: prompt_tokens + gen_count,
                         ctx_size,
                         power_percent: power,
+                        greedy_sampling: greedy.load(Ordering::Relaxed),
                         ..Status::default()
-                    },
-                };
-                let _ = tx.send(UiEvent::Status(status));
-            },
-        );
+                    }
+                }
+                EngineEvent::Prefill(p) => Status {
+                    state: WorkerState::Prefill,
+                    prefill_done: p.done,
+                    prefill_total: p.total,
+                    prefill_label: verb,
+                    prefill_tps: p.tps,
+                    elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                    ctx_used: prompt_tokens,
+                    ctx_size,
+                    power_percent: power,
+                    ..Status::default()
+                },
+            };
+            let _ = tx.send(UiEvent::Status(status));
+        };
+        let result = if aside {
+            // The aside snapshots/restores the main KV itself and forces greedy
+            // off internally, so no greedy sampler is passed.
+            self.engine
+                .generate_aside(prompt, &self.cfg.generation, &interrupt, &mut on_event)
+        } else {
+            self.engine.generate(
+                prompt,
+                &self.cfg.generation,
+                &interrupt,
+                &greedy_fn,
+                &mut on_event,
+            )
+        };
 
         let stats = result.map_err(|e| e.to_string())?;
         self.last_ctx_used = stats.ctx_used;
@@ -2949,17 +3023,19 @@ mod tests {
         next: usize,
         prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         interrupt_at: Option<usize>,
+        /// When true, `generate_aside` is implemented (mirrors a real engine's
+        /// snapshot/restore support) so the in-pass `/btw` suspend path runs
+        /// instead of falling back to the boundary queue.
+        aside_support: bool,
     }
 
-    impl Engine for ScriptedEngine {
-        fn generate(
+    impl ScriptedEngine {
+        /// Records the prompt and streams the next scripted reply in chunks.
+        fn play_next(
             &mut self,
             transcript: &str,
-            _opts: &crate::engine::GenerationOptions,
-            _interrupt: &dyn Fn() -> bool,
-            _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
-        ) -> Result<GenerationStats, EngineError> {
+        ) -> GenerationStats {
             self.prompts.lock().unwrap().push(transcript.to_owned());
             let interrupted = self.interrupt_at == Some(self.next);
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
@@ -2974,10 +3050,38 @@ mod tests {
                 on_event(EngineEvent::Text(reply[i..end].to_string()));
                 i = end;
             }
-            Ok(GenerationStats {
+            GenerationStats {
                 interrupted,
                 ..GenerationStats::default()
-            })
+            }
+        }
+    }
+
+    impl Engine for ScriptedEngine {
+        fn generate(
+            &mut self,
+            transcript: &str,
+            _opts: &crate::engine::GenerationOptions,
+            _interrupt: &dyn Fn() -> bool,
+            _greedy: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            Ok(self.play_next(transcript, on_event))
+        }
+        fn generate_aside(
+            &mut self,
+            prompt: &str,
+            _opts: &crate::engine::GenerationOptions,
+            _interrupt: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            if !self.aside_support {
+                return Err(EngineError::unsupported());
+            }
+            Ok(self.play_next(prompt, on_event))
+        }
+        fn supports_aside(&self) -> bool {
+            self.aside_support
         }
         fn ctx_size(&self) -> i32 {
             100_000
@@ -3257,6 +3361,127 @@ mod tests {
         assert!(events.iter().any(|e| matches!(e, UiEvent::MainRollback)));
         assert!(events.iter().any(|e| matches!(e, UiEvent::BtwBegin)));
         assert!(!shared.preempt.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // BTW-SUSPEND-DESIGN §4.3: with `btw.suspend` on and an aside-capable
+    // engine, an in-pass /btw freezes the main pass, answers the aside via
+    // `generate_aside`, and resumes the *same* reply — the partial is kept on
+    // screen and spliced back into the transcript, and the main log is never
+    // rolled back (unlike the preempt fallback above).
+    #[test]
+    fn suspend_freezes_answers_aside_and_resumes_the_same_reply() {
+        let dir = scratch_dir("btw-suspend");
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                "Partial reply so far".to_string(),          // frozen main pass
+                "The answer is Rust.\n".to_string(),         // aside answer
+                " and the rest of the reply.\n".to_string(), // resumed continuation
+            ],
+            prompts: prompts.clone(),
+            aside_support: true,
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = test_cfg();
+        cfg.btw.suspend = true;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+
+        let shared = TurnShared::default();
+        shared.push_btw("what language?".to_owned());
+        shared.preempt.store(true, Ordering::Relaxed);
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        // Three passes: frozen main, aside answer, resumed continuation.
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 3);
+        // The aside sees the framed question but not the partial (nothing is
+        // committed to the transcript).
+        assert!(recorded[1].contains("what language?"));
+        // The resume re-opens the assistant turn with the partial so the
+        // engine can splice its tokens and continue from the freeze point.
+        assert!(recorded[2].contains("[assistant]\nPartial reply so far"));
+
+        // The transcript holds the whole reply (partial + continuation) as one
+        // assistant message; the aside stayed out entirely.
+        assert_eq!(agent.session.transcript.len(), 2);
+        assert_eq!(
+            agent.session.transcript[1].text.trim(),
+            "Partial reply so far and the rest of the reply."
+        );
+        let flat: String = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(!flat.contains("what language?"));
+        assert!(!flat.contains("The answer is Rust."));
+
+        // Suspend markers bracket the aside; the main log is NOT rolled back
+        // (the partial stays on screen), and the preempt flag is consumed.
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t == worker::BTW_SUSPEND_MARKER))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t == worker::BTW_RESUME_MARKER))
+        );
+        assert!(events.iter().any(|e| matches!(e, UiEvent::BtwBegin)));
+        assert!(
+            !events.iter().any(|e| matches!(e, UiEvent::MainRollback)),
+            "suspend keeps the partial on screen; no rollback"
+        );
+        assert!(!shared.preempt.load(Ordering::Relaxed));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // BTW-SUSPEND-DESIGN §6 `aside_fifo_cap`: more than the cap of in-pass /btw
+    // questions drop the oldest with a notice, and the suspend drain answers
+    // the survivors FIFO via `generate_aside`.
+    #[test]
+    fn aside_fifo_cap() {
+        // The queue caps at BTW_QUEUE_CAP, dropping the oldest beyond it and
+        // returning it so the caller can surface a visible drop notice.
+        let shared = TurnShared::default();
+        let mut dropped = Vec::new();
+        for i in 0..(crate::worker::BTW_QUEUE_CAP + 2) {
+            if let Some(old) = shared.push_btw(format!("q{i}")) {
+                dropped.push(old);
+            }
+        }
+        // The two oldest (q0, q1) were dropped; q2..=q21 survive.
+        assert_eq!(dropped, vec!["q0".to_string(), "q1".to_string()]);
+
+        // The suspend drain answers every survivor FIFO through generate_aside.
+        let dir = scratch_dir("btw-aside-cap");
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec!["ok\n".to_string(); crate::worker::BTW_QUEUE_CAP],
+            prompts: prompts.clone(),
+            aside_support: true,
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("main"));
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.drain_aside(&tx, &shared);
+        drop(tx);
+
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), crate::worker::BTW_QUEUE_CAP);
+        // FIFO: the first answered aside is q2 (oldest survivor), the last q21.
+        assert!(recorded[0].contains("q2"));
+        assert!(recorded[crate::worker::BTW_QUEUE_CAP - 1].contains("q21"));
+        assert!(shared.pop_btw().is_none(), "queue fully drained");
         std::fs::remove_dir_all(&dir).ok();
     }
 
