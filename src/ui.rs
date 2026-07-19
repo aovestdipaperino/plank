@@ -191,12 +191,79 @@ fn strip_dsml(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// Reconstructs a JSON-object arguments string for one DSML tool call, so the
+/// provider request carries the same arguments the model chose. String args
+/// become JSON strings; anything flagged non-string is parsed as raw JSON
+/// (falling back to a string when it does not parse).
+fn dsml_args_to_json(call: &crate::dsml::ToolCall) -> String {
+    let mut map = serde_json::Map::new();
+    for arg in &call.args {
+        let value = if arg.is_string {
+            serde_json::Value::String(arg.value.clone())
+        } else {
+            serde_json::from_str::<serde_json::Value>(arg.value.trim())
+                .unwrap_or_else(|_| serde_json::Value::String(arg.value.clone()))
+        };
+        map.insert(arg.name.clone(), value);
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Splits a combined `dispatch_all` tool-result payload into `n` per-call
+/// chunks, using the `Tool result K (name):` headers `dispatch_all` writes so
+/// each chunk can be paired to the call it answers. Returns exactly `n`
+/// chunks (padding with empty strings / folding any overflow into the last)
+/// so every assistant `tool_use`/`tool_call` id gets one — and only one —
+/// result message, keeping both providers' schemas well-formed.
+fn split_tool_results(payload: &str, n: usize) -> Vec<String> {
+    if n <= 1 {
+        return vec![payload.to_string()];
+    }
+    // Header line starts (byte offsets) of each `Tool result K (`.
+    let mut starts = Vec::new();
+    let mut idx = 0;
+    for line in payload.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("Tool result ")
+            && trimmed
+                .trim_start_matches("Tool result ")
+                .starts_with(|c: char| c.is_ascii_digit())
+        {
+            starts.push(idx);
+        }
+        idx += line.len();
+    }
+    if starts.len() != n {
+        // Framing did not line up with the id count: put everything on the
+        // first result and leave the rest empty, still one-per-id.
+        let mut chunks = vec![String::new(); n];
+        chunks[0] = payload.to_string();
+        return chunks;
+    }
+    let mut chunks = Vec::with_capacity(n);
+    for (k, &start) in starts.iter().enumerate() {
+        let end = starts.get(k + 1).copied().unwrap_or(payload.len());
+        chunks.push(payload[start..end].to_string());
+    }
+    chunks
+}
+
 /// Maps a session transcript to provider chat messages: tool-result pseudo-user
 /// turns become [`ChatRole::Tool`], other user turns stay user, and assistant
 /// turns are stripped of DSML framing (empty ones dropped).
+///
+/// Provider-native tool-call ids are threaded across turns (§4.4): each
+/// assistant DSML tool-call is assigned a deterministic id
+/// (`call_{turn}_{i}`), carried on the assistant [`ChatMessage`], and echoed
+/// onto the [`ChatRole::Tool`] message(s) that answer it — so multi-turn tool
+/// conversations are well-formed for both the `OpenAI` and Anthropic schemas.
+/// ds4/echo never see these (they read the flat transcript), so parity holds.
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
-    use crate::engine::{ChatMessage, ChatRole};
+    use crate::engine::{ChatMessage, ChatRole, ToolCallRef};
     let mut out = Vec::new();
+    let mut turn = 0usize;
+    // Ids from the most recent assistant tool-call turn awaiting their result.
+    let mut pending_ids: Vec<String> = Vec::new();
     for m in &session.transcript {
         match m.role {
             crate::session::Role::User => {
@@ -208,15 +275,51 @@ fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
                     let payload = t.strip_prefix("<tool_result>").map_or(t, |inner| {
                         inner.strip_suffix("</tool_result>").unwrap_or(inner)
                     });
-                    out.push(ChatMessage::new(ChatRole::Tool, payload.trim()));
+                    let payload = payload.trim();
+                    if pending_ids.is_empty() {
+                        // A tool result with no prior tool-call turn (compaction
+                        // summary, stop-hook feedback): no id to pair.
+                        out.push(ChatMessage::new(ChatRole::Tool, payload));
+                    } else {
+                        let ids = std::mem::take(&mut pending_ids);
+                        let chunks = split_tool_results(payload, ids.len());
+                        for (id, chunk) in ids.into_iter().zip(chunks) {
+                            let mut msg = ChatMessage::new(ChatRole::Tool, chunk);
+                            msg.tool_call_id = Some(id);
+                            out.push(msg);
+                        }
+                    }
                 } else {
+                    // A genuine user turn ends any pending pairing.
+                    pending_ids.clear();
                     out.push(ChatMessage::new(ChatRole::User, m.text.clone()));
                 }
             }
             crate::session::Role::Assistant => {
+                turn += 1;
+                pending_ids.clear();
                 let clean = strip_dsml(&m.text);
-                if !clean.is_empty() {
-                    out.push(ChatMessage::new(ChatRole::Assistant, clean));
+                // Recover the DSML tool calls this turn issued, assigning
+                // deterministic ids paired to the results that follow.
+                let mut parser = crate::dsml::DsmlParser::new();
+                parser.feed(m.text.as_bytes());
+                let mut tool_calls = Vec::new();
+                for (i, call) in parser.calls().iter().enumerate() {
+                    if call.name.is_empty() {
+                        continue;
+                    }
+                    let id = format!("call_{turn}_{i}");
+                    tool_calls.push(ToolCallRef {
+                        id: id.clone(),
+                        name: call.name.clone(),
+                        arguments: dsml_args_to_json(call),
+                    });
+                    pending_ids.push(id);
+                }
+                if !clean.is_empty() || !tool_calls.is_empty() {
+                    let mut msg = ChatMessage::new(ChatRole::Assistant, clean);
+                    msg.tool_calls = tool_calls;
+                    out.push(msg);
                 }
             }
         }
@@ -3678,6 +3781,52 @@ mod tests {
             "mirrored assistant output missing: {visible:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_to_messages_threads_tool_ids_across_turns() {
+        use crate::engine::ChatRole;
+        use crate::session::Message;
+        let mut session = Session::new();
+        session.push(Message::user("read a.rs and b.rs"));
+        // An assistant turn that issued two tool calls via a DSML stanza.
+        session.push(Message::assistant(concat!(
+            "Sure.\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜invoke name=\"read\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">a.rs</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "<｜DSML｜invoke name=\"read\">\n",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">b.rs</｜DSML｜parameter>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>\n",
+        )));
+        // The combined tool_result dispatch_all produces for that batch.
+        session.push(Message::user(concat!(
+            "<tool_result>",
+            "Tool result 1 (read):\nAAA\n",
+            "Tool result 2 (read):\nBBB\n",
+            "</tool_result>",
+        )));
+
+        let msgs = session_to_messages(&session);
+        // user, assistant(2 tool_calls), tool(id0), tool(id1).
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[1].role, ChatRole::Assistant);
+        assert_eq!(msgs[1].tool_calls.len(), 2);
+        let (id0, id1) = (
+            msgs[1].tool_calls[0].id.clone(),
+            msgs[1].tool_calls[1].id.clone(),
+        );
+        assert_ne!(id0, id1);
+        // Each tool result pairs to its assistant tool-call id, in order.
+        assert_eq!(msgs[2].role, ChatRole::Tool);
+        assert_eq!(msgs[2].tool_call_id.as_deref(), Some(id0.as_str()));
+        assert!(msgs[2].content.contains("AAA"));
+        assert_eq!(msgs[3].tool_call_id.as_deref(), Some(id1.as_str()));
+        assert!(msgs[3].content.contains("BBB"));
+        // Arguments round-trip as JSON the provider can parse.
+        assert_eq!(msgs[1].tool_calls[0].arguments, r#"{"path":"a.rs"}"#);
     }
 
     #[test]

@@ -29,7 +29,7 @@ use crate::remote::read_sse;
 pub enum ProviderKind {
     /// OpenAI-compatible `/chat/completions` (also `vLLM`, `Ollama`, `OpenRouter`...).
     OpenAi,
-    /// Anthropic `/v1/messages` (not yet wired; reserved).
+    /// Anthropic Messages API (`/v1/messages`).
     Anthropic,
 }
 
@@ -314,6 +314,344 @@ fn parse_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared streaming-translator surface
+// ---------------------------------------------------------------------------
+
+/// The SSE→[`EngineEvent`] surface shared by every provider translator, so
+/// [`ProviderEngine::generate`] drives any backend through one code path.
+pub trait SseTranslator {
+    /// Feeds one SSE `data:` payload; returns `false` when the stream is
+    /// complete so the reader can stop.
+    fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool;
+    /// Flushes an open thinking block and the synthesized DSML tool stanza.
+    fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent));
+    /// Usage reported so far, if any.
+    fn usage(&self) -> Option<ProviderUsage>;
+}
+
+impl SseTranslator for OpenAiTranslator {
+    fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
+        OpenAiTranslator::feed(self, payload, on_event)
+    }
+    fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        OpenAiTranslator::finish(self, on_event);
+    }
+    fn usage(&self) -> Option<ProviderUsage> {
+        OpenAiTranslator::usage(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic streaming translation (Messages SSE -> EngineEvent)
+// ---------------------------------------------------------------------------
+
+/// Accumulator that turns an Anthropic Messages SSE stream into the
+/// [`EngineEvent`] shape the renderer expects, with native `tool_use` blocks
+/// re-emitted as synthesized DSML at finalization — the SAME canonical stanza
+/// the `OpenAI` path emits, so `viz`/`dsml`/`dispatch` stay backend-agnostic.
+///
+/// Events dispatch on the JSON `type` field (`content_block_start`,
+/// `content_block_delta`, `message_delta`, …), so the shared [`read_sse`]
+/// reader — which forwards only `data:` payloads — suffices; `event:` lines are
+/// redundant and ignored.
+#[derive(Debug, Default)]
+pub struct AnthropicTranslator {
+    /// Tool calls accumulated, in content-block order.
+    tool_calls: Vec<NativeToolCall>,
+    /// Maps a streamed content-block `index` to its slot in `tool_calls`.
+    block_to_call: std::collections::HashMap<u64, usize>,
+    /// True while a `<think>` block is open (thinking deltas).
+    thinking_open: bool,
+    /// Prompt tokens from `message_start`.
+    input_tokens: i32,
+    /// Cumulative completion tokens from `message_delta`.
+    output_tokens: i32,
+    /// True once a usage figure has been seen.
+    saw_usage: bool,
+    /// True once the DSML tool stanza has been flushed.
+    flushed: bool,
+}
+
+impl AnthropicTranslator {
+    /// Creates an empty translator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Usage reported so far.
+    #[must_use]
+    pub fn usage(&self) -> Option<ProviderUsage> {
+        self.saw_usage.then_some(ProviderUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+        })
+    }
+
+    /// Feeds one SSE `data:` payload. Returns `false` on `message_stop`.
+    pub fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
+        let payload = payload.trim();
+        if payload.is_empty() {
+            return true;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else {
+            return true;
+        };
+        match value.get("type").and_then(|v| v.as_str()) {
+            Some("message_start") => {
+                if let Some(u) = value.pointer("/message/usage") {
+                    self.note_usage(u);
+                }
+            }
+            Some("content_block_start") => self.handle_block_start(&value),
+            Some("content_block_delta") => self.handle_block_delta(&value, on_event),
+            Some("message_delta") => {
+                if let Some(u) = value.get("usage") {
+                    self.note_usage(u);
+                }
+            }
+            Some("message_stop") => return false,
+            _ => {}
+        }
+        true
+    }
+
+    fn note_usage(&mut self, usage: &serde_json::Value) {
+        if let Some(input) = usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_i64)
+        {
+            self.input_tokens = i32::try_from(input).unwrap_or(i32::MAX);
+            self.saw_usage = true;
+        }
+        if let Some(output) = usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_i64)
+        {
+            self.output_tokens = i32::try_from(output).unwrap_or(i32::MAX);
+            self.saw_usage = true;
+        }
+    }
+
+    fn handle_block_start(&mut self, value: &serde_json::Value) {
+        let Some(index) = value.get("index").and_then(serde_json::Value::as_u64) else {
+            return;
+        };
+        let block = value.get("content_block");
+        if block.and_then(|b| b.get("type")).and_then(|t| t.as_str()) == Some("tool_use") {
+            let name = block
+                .and_then(|b| b.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let id = block
+                .and_then(|b| b.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            self.tool_calls.push(NativeToolCall {
+                name,
+                id,
+                arguments: String::new(),
+            });
+            self.block_to_call.insert(index, self.tool_calls.len() - 1);
+        }
+    }
+
+    fn handle_block_delta(
+        &mut self,
+        value: &serde_json::Value,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) {
+        let Some(delta) = value.get("delta") else {
+            return;
+        };
+        match delta.get("type").and_then(|t| t.as_str()) {
+            Some("text_delta") => {
+                if let Some(text) = delta.get("text").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    if self.thinking_open {
+                        on_event(EngineEvent::Text("</think>".to_string()));
+                        self.thinking_open = false;
+                    }
+                    on_event(EngineEvent::Text(text.to_string()));
+                }
+            }
+            Some("thinking_delta") => {
+                if let Some(text) = delta.get("thinking").and_then(|v| v.as_str())
+                    && !text.is_empty()
+                {
+                    if !self.thinking_open {
+                        on_event(EngineEvent::Text("<think>".to_string()));
+                        self.thinking_open = true;
+                    }
+                    on_event(EngineEvent::Text(text.to_string()));
+                }
+            }
+            Some("input_json_delta") => {
+                if let Some(index) = value.get("index").and_then(serde_json::Value::as_u64)
+                    && let Some(&slot) = self.block_to_call.get(&index)
+                    && let Some(fragment) = delta.get("partial_json").and_then(|v| v.as_str())
+                {
+                    self.tool_calls[slot].arguments.push_str(fragment);
+                }
+            }
+            // signature_delta and any future delta kinds carry no visible text.
+            _ => {}
+        }
+    }
+
+    /// Flushes an open thinking block and the synthesized DSML tool stanza.
+    pub fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        if self.flushed {
+            return;
+        }
+        self.flushed = true;
+        if self.thinking_open {
+            on_event(EngineEvent::Text("</think>".to_string()));
+            self.thinking_open = false;
+        }
+        let calls: Vec<NativeToolCall> = self
+            .tool_calls
+            .iter()
+            .filter(|c| !c.name.is_empty())
+            .cloned()
+            .collect();
+        if !calls.is_empty() {
+            on_event(EngineEvent::Text(synthesize_dsml(&calls)));
+        }
+    }
+}
+
+impl SseTranslator for AnthropicTranslator {
+    fn feed(&mut self, payload: &str, on_event: &mut dyn FnMut(EngineEvent)) -> bool {
+        AnthropicTranslator::feed(self, payload, on_event)
+    }
+    fn finish(&mut self, on_event: &mut dyn FnMut(EngineEvent)) {
+        AnthropicTranslator::finish(self, on_event);
+    }
+    fn usage(&self) -> Option<ProviderUsage> {
+        AnthropicTranslator::usage(self)
+    }
+}
+
+/// Builds the Anthropic Messages API request body.
+///
+/// The system prompt is a top-level `system` string (not a message); tool
+/// results are coalesced into a single `user` turn of `tool_result` blocks
+/// paired to the assistant's `tool_use` ids (§4.4). Pure and unit-testable.
+#[must_use]
+pub fn build_anthropic_request(
+    model: &str,
+    system: &str,
+    messages: &[ChatMessage],
+    tools: &[ToolSpec],
+    opts: &GenerationOptions,
+) -> serde_json::Value {
+    let mut sys = system.to_string();
+    let mut wire_messages = Vec::new();
+    let mut i = 0;
+    while i < messages.len() {
+        let m = &messages[i];
+        match m.role {
+            ChatRole::System => {
+                if !sys.is_empty() {
+                    sys.push('\n');
+                }
+                sys.push_str(&m.content);
+                i += 1;
+            }
+            ChatRole::User => {
+                wire_messages.push(serde_json::json!({ "role": "user", "content": m.content }));
+                i += 1;
+            }
+            ChatRole::Assistant => {
+                let mut content = Vec::new();
+                if !m.content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": m.content }));
+                }
+                for tc in &m.tool_calls {
+                    let input = serde_json::from_str::<serde_json::Value>(tc.arguments.trim())
+                        .ok()
+                        .filter(serde_json::Value::is_object)
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    content.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": tc.id,
+                        "name": tc.name,
+                        "input": input,
+                    }));
+                }
+                if content.is_empty() {
+                    content.push(serde_json::json!({ "type": "text", "text": "" }));
+                }
+                wire_messages.push(serde_json::json!({ "role": "assistant", "content": content }));
+                i += 1;
+            }
+            ChatRole::Tool => {
+                // Coalesce a run of tool results into one user turn of blocks;
+                // Anthropic pairs each `tool_result` to a prior `tool_use` id.
+                let mut blocks = Vec::new();
+                while i < messages.len() && messages[i].role == ChatRole::Tool {
+                    let tm = &messages[i];
+                    if let Some(id) = &tm.tool_call_id {
+                        blocks.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": id,
+                            "content": tm.content,
+                        }));
+                    } else {
+                        // No retained id: degrade to plain text so the request
+                        // is still valid (constraint 8 / §4.4).
+                        blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": format!("Tool result:\n{}", tm.content),
+                        }));
+                    }
+                    i += 1;
+                }
+                wire_messages.push(serde_json::json!({ "role": "user", "content": blocks }));
+            }
+        }
+    }
+
+    let max_tokens = if opts.n_predict > 0 {
+        opts.n_predict
+    } else {
+        4096
+    };
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": wire_messages,
+        "stream": true,
+        "max_tokens": max_tokens,
+        "temperature": opts.temperature,
+        "top_p": opts.top_p,
+    });
+    if !sys.is_empty() {
+        body["system"] = serde_json::json!(sys);
+    }
+    if !tools.is_empty() {
+        let wire_tools: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.parameters,
+                })
+            })
+            .collect();
+        body["tools"] = serde_json::json!(wire_tools);
+        // Serial dispatch mirrors the OpenAI path: disable parallel tool use.
+        body["tool_choice"] =
+            serde_json::json!({ "type": "auto", "disable_parallel_tool_use": true });
+    }
+    body
+}
+
+// ---------------------------------------------------------------------------
 // Request building
 // ---------------------------------------------------------------------------
 
@@ -341,8 +679,31 @@ pub fn build_openai_request(
                 wire_messages.push(serde_json::json!({ "role": "user", "content": m.content }));
             }
             ChatRole::Assistant => {
-                wire_messages
-                    .push(serde_json::json!({ "role": "assistant", "content": m.content }));
+                // An assistant turn that issued tool calls carries them as the
+                // OpenAI `tool_calls` array; the matching `tool` messages echo
+                // each id (§4.4). `content` stays present (null when empty) as
+                // the API requires alongside `tool_calls`.
+                let mut msg = serde_json::json!({ "role": "assistant" });
+                msg["content"] = if m.content.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(m.content)
+                };
+                if !m.tool_calls.is_empty() {
+                    let calls: Vec<serde_json::Value> = m
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": { "name": tc.name, "arguments": tc.arguments },
+                            })
+                        })
+                        .collect();
+                    msg["tool_calls"] = serde_json::json!(calls);
+                }
+                wire_messages.push(msg);
             }
             ChatRole::Tool => {
                 // A tool result with a retained id uses the native `tool` role;
@@ -427,12 +788,6 @@ impl ProviderEngine {
         model: String,
         ctx_size: i32,
     ) -> Result<Self, EngineError> {
-        if kind != ProviderKind::OpenAi {
-            return Err(EngineError::new(format!(
-                "provider '{}' is not wired yet; use --provider openai",
-                kind.label()
-            )));
-        }
         if api_key.trim().is_empty() {
             return Err(EngineError::new(format!(
                 "no API key: set ${} or pass --api-key",
@@ -456,14 +811,34 @@ impl ProviderEngine {
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
     /// prompt (e.g. compaction) becomes a single user message with no tools.
     fn request_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
+        let build = match self.kind {
+            ProviderKind::OpenAi => build_openai_request,
+            ProviderKind::Anthropic => build_anthropic_request,
+        };
         match prompt {
             Prompt::Structured(turn) => {
-                build_openai_request(&self.model, turn.system, turn.messages, turn.tools, opts)
+                build(&self.model, turn.system, turn.messages, turn.tools, opts)
             }
             Prompt::Flat(text) => {
                 let messages = [ChatMessage::new(ChatRole::User, text)];
-                build_openai_request(&self.model, "", &messages, &[], opts)
+                build(&self.model, "", &messages, &[], opts)
             }
+        }
+    }
+
+    /// The API endpoint path for this provider's streaming completion.
+    fn endpoint(&self) -> &'static str {
+        match self.kind {
+            ProviderKind::OpenAi => "/chat/completions",
+            ProviderKind::Anthropic => "/messages",
+        }
+    }
+
+    /// A fresh streaming translator for this provider.
+    fn translator(&self) -> Box<dyn SseTranslator> {
+        match self.kind {
+            ProviderKind::OpenAi => Box::new(OpenAiTranslator::new()),
+            ProviderKind::Anthropic => Box::new(AnthropicTranslator::new()),
         }
     }
 }
@@ -494,14 +869,21 @@ impl Engine for ProviderEngine {
             tps: 0.0,
         }));
 
-        let url = format!("{}/chat/completions", self.base_url);
-        let mut resp = ureq::post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", self.api_key))
+        let url = format!("{}{}", self.base_url, self.endpoint());
+        let request = ureq::post(&url).header("Content-Type", "application/json");
+        let request = match self.kind {
+            ProviderKind::OpenAi => {
+                request.header("Authorization", format!("Bearer {}", self.api_key))
+            }
+            ProviderKind::Anthropic => request
+                .header("x-api-key", self.api_key.as_str())
+                .header("anthropic-version", "2023-06-01"),
+        };
+        let mut resp = request
             .send(payload.as_str())
             .map_err(|e| EngineError::new(format!("provider request: {e}")))?;
 
-        let mut translator = OpenAiTranslator::new();
+        let mut translator = self.translator();
         let mut interrupted = false;
         let reader = resp.body_mut().as_reader();
         read_sse(reader, |data| {
@@ -684,11 +1066,13 @@ mod tests {
             role: ChatRole::Tool,
             content: "output".to_string(),
             tool_call_id: Some("call_1".to_string()),
+            tool_calls: Vec::new(),
         };
         let no_id = ChatMessage {
             role: ChatRole::Tool,
             content: "output".to_string(),
             tool_call_id: None,
+            tool_calls: Vec::new(),
         };
         let body = build_openai_request(
             "m",
@@ -703,15 +1087,175 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_provider_and_missing_key() {
-        assert!(
-            ProviderEngine::new(ProviderKind::Anthropic, None, "k".into(), "m".into(), 0).is_err()
-        );
+    fn missing_key_errors_both_providers() {
         assert!(
             ProviderEngine::new(ProviderKind::OpenAi, None, String::new(), "m".into(), 0).is_err()
+        );
+        assert!(
+            ProviderEngine::new(ProviderKind::Anthropic, None, String::new(), "m".into(), 0)
+                .is_err()
         );
         let e =
             ProviderEngine::new(ProviderKind::OpenAi, None, "k".into(), "gpt".into(), 0).unwrap();
         assert_eq!(e.model_name(), "openai:gpt");
+        // Anthropic is now wired end-to-end.
+        let a = ProviderEngine::new(
+            ProviderKind::Anthropic,
+            None,
+            "k".into(),
+            "claude".into(),
+            0,
+        )
+        .unwrap();
+        assert_eq!(a.model_name(), "anthropic:claude");
+        assert_eq!(a.endpoint(), "/messages");
+    }
+
+    fn collect_anthropic(frames: &[&str]) -> String {
+        let mut t = AnthropicTranslator::new();
+        let mut events = Vec::new();
+        for f in frames {
+            t.feed(f, &mut |e| events.push(e));
+        }
+        t.finish(&mut |e| events.push(e));
+        collect_text(&events)
+    }
+
+    #[test]
+    fn anthropic_text_and_thinking() {
+        let text = collect_anthropic(&[
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":50,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"pondering"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"answer"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ]);
+        assert_eq!(text, "<think>pondering</think>answer");
+    }
+
+    #[test]
+    fn anthropic_tooluse_to_dsml() {
+        // A tool_use block with input_json streamed in fragments.
+        let frames = [
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"toolu_1","name":"read","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"src"}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"/main.rs\",\"start_line\":42}"}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let dsml = collect_anthropic(&frames);
+        // The synthesized stanza parses into the exact executable ToolCall.
+        let mut parser = DsmlParser::new();
+        parser.feed(dsml.as_bytes());
+        assert_eq!(parser.state(), DsmlState::Done, "raw: {dsml}");
+        let calls = parser.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[0].arg_value("path"), Some("src/main.rs"));
+        let path_arg = calls[0].args.iter().find(|a| a.name == "path").unwrap();
+        assert!(path_arg.is_string);
+        let line_arg = calls[0]
+            .args
+            .iter()
+            .find(|a| a.name == "start_line")
+            .unwrap();
+        assert!(!line_arg.is_string);
+        assert_eq!(line_arg.value, "42");
+    }
+
+    #[test]
+    fn anthropic_usage_accounting() {
+        let mut t = AnthropicTranslator::new();
+        t.feed(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":120,"output_tokens":1}}}"#,
+            &mut |_| {},
+        );
+        t.feed(
+            r#"{"type":"message_delta","usage":{"output_tokens":8}}"#,
+            &mut |_| {},
+        );
+        assert_eq!(
+            t.usage(),
+            Some(ProviderUsage {
+                input_tokens: 120,
+                output_tokens: 8
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_request_shape() {
+        let tools = vec![ToolSpec {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        }];
+        let messages = vec![ChatMessage::new(ChatRole::User, "hello")];
+        let body = build_anthropic_request(
+            "claude-x",
+            "You are helpful",
+            &messages,
+            &tools,
+            &GenerationOptions::default(),
+        );
+        assert_eq!(body["model"], "claude-x");
+        assert_eq!(body["stream"], true);
+        // System is a top-level field, not a message.
+        assert_eq!(body["system"], "You are helpful");
+        assert!(body["max_tokens"].as_i64().unwrap() > 0);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    #[test]
+    fn anthropic_threads_tool_use_and_result_ids() {
+        // A prior assistant turn issued a tool call with id "call_0_0"; its
+        // result echoes that id. Both wire shapes must carry the same id.
+        let messages = vec![
+            ChatMessage::new(ChatRole::User, "read the file"),
+            ChatMessage {
+                role: ChatRole::Assistant,
+                content: "sure".to_string(),
+                tool_call_id: None,
+                tool_calls: vec![crate::engine::ToolCallRef {
+                    id: "call_0_0".to_string(),
+                    name: "read".to_string(),
+                    arguments: r#"{"path":"a.rs"}"#.to_string(),
+                }],
+            },
+            ChatMessage {
+                role: ChatRole::Tool,
+                content: "file body".to_string(),
+                tool_call_id: Some("call_0_0".to_string()),
+                tool_calls: Vec::new(),
+            },
+        ];
+        let body = build_anthropic_request(
+            "claude-x",
+            "",
+            &messages,
+            &[],
+            &GenerationOptions::default(),
+        );
+        let assistant = &body["messages"][1];
+        assert_eq!(assistant["role"], "assistant");
+        let tool_use = &assistant["content"][1];
+        assert_eq!(tool_use["type"], "tool_use");
+        assert_eq!(tool_use["id"], "call_0_0");
+        assert_eq!(tool_use["name"], "read");
+        assert_eq!(tool_use["input"]["path"], "a.rs");
+        let result = &body["messages"][2];
+        assert_eq!(result["role"], "user");
+        assert_eq!(result["content"][0]["type"], "tool_result");
+        assert_eq!(result["content"][0]["tool_use_id"], "call_0_0");
+
+        // The OpenAI shape threads the same id.
+        let oa = build_openai_request("gpt-x", "", &messages, &[], &GenerationOptions::default());
+        assert_eq!(oa["messages"][1]["tool_calls"][0]["id"], "call_0_0");
+        assert_eq!(oa["messages"][2]["role"], "tool");
+        assert_eq!(oa["messages"][2]["tool_call_id"], "call_0_0");
     }
 }
