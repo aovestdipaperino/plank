@@ -130,10 +130,17 @@ pub fn synthesize_dsml(calls: &[NativeToolCall]) -> String {
 /// Token usage reported by the provider on the terminal chunk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ProviderUsage {
-    /// Prompt tokens consumed.
+    /// Prompt tokens consumed (Anthropic: the *uncached* remainder only —
+    /// cache-write and cache-read tokens are reported separately below).
     pub input_tokens: i32,
     /// Completion tokens generated.
     pub output_tokens: i32,
+    /// Anthropic prompt-cache tokens written this request (`message_start`
+    /// `cache_creation_input_tokens`). Zero for `OpenAI`.
+    pub cache_creation_input_tokens: i32,
+    /// Anthropic prompt-cache tokens served from cache this request
+    /// (`message_start` `cache_read_input_tokens`). Zero for `OpenAI`.
+    pub cache_read_input_tokens: i32,
 }
 
 /// Accumulator that turns an OpenAI-compatible SSE stream into the
@@ -310,6 +317,8 @@ fn parse_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
     Some(ProviderUsage {
         input_tokens: i32::try_from(input).unwrap_or(i32::MAX),
         output_tokens: i32::try_from(output).unwrap_or(i32::MAX),
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
     })
 }
 
@@ -366,6 +375,10 @@ pub struct AnthropicTranslator {
     input_tokens: i32,
     /// Cumulative completion tokens from `message_delta`.
     output_tokens: i32,
+    /// Prompt-cache tokens written this request (`cache_creation_input_tokens`).
+    cache_creation_input_tokens: i32,
+    /// Prompt-cache tokens read this request (`cache_read_input_tokens`).
+    cache_read_input_tokens: i32,
     /// True once a usage figure has been seen.
     saw_usage: bool,
     /// True once the DSML tool stanza has been flushed.
@@ -385,6 +398,8 @@ impl AnthropicTranslator {
         self.saw_usage.then_some(ProviderUsage {
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
         })
     }
 
@@ -429,6 +444,21 @@ impl AnthropicTranslator {
             .and_then(serde_json::Value::as_i64)
         {
             self.output_tokens = i32::try_from(output).unwrap_or(i32::MAX);
+            self.saw_usage = true;
+        }
+        // Cache tokens appear on `message_start`; keep the last non-null figure.
+        if let Some(created) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_i64)
+        {
+            self.cache_creation_input_tokens = i32::try_from(created).unwrap_or(i32::MAX);
+            self.saw_usage = true;
+        }
+        if let Some(read) = usage
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_i64)
+        {
+            self.cache_read_input_tokens = i32::try_from(read).unwrap_or(i32::MAX);
             self.saw_usage = true;
         }
     }
@@ -538,16 +568,30 @@ impl SseTranslator for AnthropicTranslator {
 
 /// Builds the Anthropic Messages API request body.
 ///
-/// The system prompt is a top-level `system` string (not a message); tool
-/// results are coalesced into a single `user` turn of `tool_result` blocks
-/// paired to the assistant's `tool_use` ids (§4.4). Pure and unit-testable.
+/// The system prompt is a top-level `system` block array (not a bare string, so
+/// a `cache_control` breakpoint can attach); tool results are coalesced into a
+/// single `user` turn of `tool_result` blocks paired to the assistant's
+/// `tool_use` ids (§4.4). Pure and unit-testable.
+///
+/// # Prompt caching (`cache`)
+/// When `cache` is true, `cache_control: {type: "ephemeral"}` breakpoints are
+/// placed on the **largest stable prefix** — the last tool definition and the
+/// (single) system block. Anthropic renders `tools` → `system` → `messages`, so
+/// a breakpoint on the system block caches tools+system together, and the
+/// last-tool breakpoint is a second, tools-only fallback that still hits when
+/// only the system text changes. The volatile trailing `messages` are never
+/// marked. This stays within Anthropic's 4-breakpoint limit (at most 2 here) and
+/// makes the FIRST real request establish the cache so every later turn reads
+/// it. Caching is off for a `Flat` prompt (no tools, no reused system).
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn build_anthropic_request(
     model: &str,
     system: &str,
     messages: &[ChatMessage],
     tools: &[ToolSpec],
     opts: &GenerationOptions,
+    cache: bool,
 ) -> serde_json::Value {
     let mut sys = system.to_string();
     let mut wire_messages = Vec::new();
@@ -630,10 +674,15 @@ pub fn build_anthropic_request(
         "top_p": opts.top_p,
     });
     if !sys.is_empty() {
-        body["system"] = serde_json::json!(sys);
+        // System as a one-element block array so a cache breakpoint can attach.
+        let mut sys_block = serde_json::json!({ "type": "text", "text": sys });
+        if cache {
+            sys_block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
+        body["system"] = serde_json::json!([sys_block]);
     }
     if !tools.is_empty() {
-        let wire_tools: Vec<serde_json::Value> = tools
+        let mut wire_tools: Vec<serde_json::Value> = tools
             .iter()
             .map(|t| {
                 serde_json::json!({
@@ -643,6 +692,10 @@ pub fn build_anthropic_request(
                 })
             })
             .collect();
+        // Breakpoint on the last (stable) tool: caches the whole tool prefix.
+        if cache && let Some(last) = wire_tools.last_mut() {
+            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+        }
         body["tools"] = serde_json::json!(wire_tools);
         // Serial dispatch mirrors the OpenAI path: disable parallel tool use.
         body["tool_choice"] =
@@ -772,6 +825,10 @@ pub struct ProviderEngine {
     api_key: String,
     model: String,
     ctx_size: i32,
+    /// Anthropic prompt caching over the stable prefix (tools + system). On by
+    /// default; ignored by the `OpenAi` path (server-side prefix caching there
+    /// is automatic). See [`build_anthropic_request`].
+    cache: bool,
 }
 
 impl ProviderEngine {
@@ -787,6 +844,7 @@ impl ProviderEngine {
         api_key: String,
         model: String,
         ctx_size: i32,
+        cache: bool,
     ) -> Result<Self, EngineError> {
         if api_key.trim().is_empty() {
             return Err(EngineError::new(format!(
@@ -805,23 +863,33 @@ impl ProviderEngine {
             api_key,
             model,
             ctx_size: if ctx_size > 0 { ctx_size } else { 128_000 },
+            cache,
         })
     }
 
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
     /// prompt (e.g. compaction) becomes a single user message with no tools.
     fn request_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
-        let build = match self.kind {
-            ProviderKind::OpenAi => build_openai_request,
-            ProviderKind::Anthropic => build_anthropic_request,
-        };
-        match prompt {
-            Prompt::Structured(turn) => {
-                build(&self.model, turn.system, turn.messages, turn.tools, opts)
+        match (self.kind, prompt) {
+            (ProviderKind::OpenAi, Prompt::Structured(turn)) => {
+                build_openai_request(&self.model, turn.system, turn.messages, turn.tools, opts)
             }
-            Prompt::Flat(text) => {
+            (ProviderKind::OpenAi, Prompt::Flat(text)) => {
                 let messages = [ChatMessage::new(ChatRole::User, text)];
-                build(&self.model, "", &messages, &[], opts)
+                build_openai_request(&self.model, "", &messages, &[], opts)
+            }
+            (ProviderKind::Anthropic, Prompt::Structured(turn)) => build_anthropic_request(
+                &self.model,
+                turn.system,
+                turn.messages,
+                turn.tools,
+                opts,
+                self.cache,
+            ),
+            (ProviderKind::Anthropic, Prompt::Flat(text)) => {
+                // A flat prompt has no reusable prefix — no caching.
+                let messages = [ChatMessage::new(ChatRole::User, text)];
+                build_anthropic_request(&self.model, "", &messages, &[], opts, false)
             }
         }
     }
@@ -907,13 +975,39 @@ impl Engine for ProviderEngine {
         let usage = translator.usage().unwrap_or(ProviderUsage {
             input_tokens: total,
             output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         });
+        // Anthropic reports `input_tokens` as the *uncached* remainder, so the
+        // true prompt size is input + cache-write + cache-read; fold all of them
+        // into ctx_used so cached turns aren't under-counted (OpenAI leaves the
+        // cache figures at 0, so this reduces to input + output there).
+        let prompt_total = usage
+            .input_tokens
+            .saturating_add(usage.cache_creation_input_tokens)
+            .saturating_add(usage.cache_read_input_tokens);
         Ok(GenerationStats {
             generated: usage.output_tokens,
             tps: 0.0,
-            ctx_used: usage.input_tokens + usage.output_tokens,
+            ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
         })
+    }
+
+    /// No-op for providers: there is no client-side KV to prefill (§4.5). The
+    /// Anthropic path relies on **server-side** prompt caching instead — the
+    /// FIRST real [`generate`](Self::generate) request already carries the
+    /// `cache_control` breakpoints (see [`build_anthropic_request`]), so it
+    /// establishes the cache and every subsequent turn reads it. Returning
+    /// `false` (no prefill happened) is correct and matches the trait default;
+    /// this override exists to document the behavior.
+    fn warm_system_prompt(
+        &mut self,
+        _system: &str,
+        _checkpoint: Option<&std::path::Path>,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        Ok(false)
     }
 
     fn ctx_size(&self) -> i32 {
@@ -1019,7 +1113,9 @@ mod tests {
             t.usage(),
             Some(ProviderUsage {
                 input_tokens: 120,
-                output_tokens: 8
+                output_tokens: 8,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
             })
         );
     }
@@ -1089,14 +1185,36 @@ mod tests {
     #[test]
     fn missing_key_errors_both_providers() {
         assert!(
-            ProviderEngine::new(ProviderKind::OpenAi, None, String::new(), "m".into(), 0).is_err()
+            ProviderEngine::new(
+                ProviderKind::OpenAi,
+                None,
+                String::new(),
+                "m".into(),
+                0,
+                true
+            )
+            .is_err()
         );
         assert!(
-            ProviderEngine::new(ProviderKind::Anthropic, None, String::new(), "m".into(), 0)
-                .is_err()
+            ProviderEngine::new(
+                ProviderKind::Anthropic,
+                None,
+                String::new(),
+                "m".into(),
+                0,
+                true
+            )
+            .is_err()
         );
-        let e =
-            ProviderEngine::new(ProviderKind::OpenAi, None, "k".into(), "gpt".into(), 0).unwrap();
+        let e = ProviderEngine::new(
+            ProviderKind::OpenAi,
+            None,
+            "k".into(),
+            "gpt".into(),
+            0,
+            true,
+        )
+        .unwrap();
         assert_eq!(e.model_name(), "openai:gpt");
         // Anthropic is now wired end-to-end.
         let a = ProviderEngine::new(
@@ -1105,6 +1223,7 @@ mod tests {
             "k".into(),
             "claude".into(),
             0,
+            true,
         )
         .unwrap();
         assert_eq!(a.model_name(), "anthropic:claude");
@@ -1178,7 +1297,33 @@ mod tests {
             t.usage(),
             Some(ProviderUsage {
                 input_tokens: 120,
-                output_tokens: 8
+                output_tokens: 8,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn anthropic_cache_token_usage_parses() {
+        // A hand-written message_start frame carrying both cache figures, plus a
+        // message_delta with the running output count — as Anthropic streams it.
+        let mut t = AnthropicTranslator::new();
+        t.feed(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creation_input_tokens":900,"cache_read_input_tokens":4096,"output_tokens":1}}}"#,
+            &mut |_| {},
+        );
+        t.feed(
+            r#"{"type":"message_delta","usage":{"output_tokens":20}}"#,
+            &mut |_| {},
+        );
+        assert_eq!(
+            t.usage(),
+            Some(ProviderUsage {
+                input_tokens: 12,
+                output_tokens: 20,
+                cache_creation_input_tokens: 900,
+                cache_read_input_tokens: 4096,
             })
         );
     }
@@ -1197,17 +1342,86 @@ mod tests {
             &messages,
             &tools,
             &GenerationOptions::default(),
+            true,
         );
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["stream"], true);
-        // System is a top-level field, not a message.
-        assert_eq!(body["system"], "You are helpful");
+        // System is a top-level block array (not a bare string) so a cache
+        // breakpoint can attach; the text is the first block.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "You are helpful");
         assert!(body["max_tokens"].as_i64().unwrap() > 0);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], true);
+    }
+
+    #[test]
+    fn anthropic_cache_control_on_stable_prefix_only() {
+        let tools = vec![
+            ToolSpec {
+                name: "read".to_string(),
+                description: "Read a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+            ToolSpec {
+                name: "write".to_string(),
+                description: "Write a file".to_string(),
+                parameters: serde_json::json!({"type":"object"}),
+            },
+        ];
+        // A volatile trailing user turn — it must NOT be marked.
+        let messages = vec![ChatMessage::new(ChatRole::User, "do the thing")];
+        let body = build_anthropic_request(
+            "claude-x",
+            "You are helpful",
+            &messages,
+            &tools,
+            &GenerationOptions::default(),
+            true,
+        );
+        let eph = serde_json::json!({ "type": "ephemeral" });
+        // End of system prompt (caches tools + system).
+        assert_eq!(body["system"][0]["cache_control"], eph);
+        // Last tool definition (tools-only fallback breakpoint); earlier tools
+        // are unmarked.
+        assert!(body["tools"][0]["cache_control"].is_null());
+        assert_eq!(body["tools"][1]["cache_control"], eph);
+        // At most 2 breakpoints, within Anthropic's limit of 4.
+        let count = serde_json::to_string(&body)
+            .unwrap()
+            .matches("cache_control")
+            .count();
+        assert_eq!(count, 2);
+        // Volatile trailing message carries no breakpoint.
+        assert!(body["messages"][0]["cache_control"].is_null());
+    }
+
+    #[test]
+    fn anthropic_cache_off_omits_control() {
+        let tools = vec![ToolSpec {
+            name: "read".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type":"object"}),
+        }];
+        let messages = vec![ChatMessage::new(ChatRole::User, "hi")];
+        let body = build_anthropic_request(
+            "claude-x",
+            "You are helpful",
+            &messages,
+            &tools,
+            &GenerationOptions::default(),
+            false,
+        );
+        // System is still a block array (needed regardless), but no breakpoints.
+        assert_eq!(body["system"][0]["text"], "You are helpful");
+        assert!(
+            !serde_json::to_string(&body)
+                .unwrap()
+                .contains("cache_control")
+        );
     }
 
     #[test]
@@ -1239,6 +1453,7 @@ mod tests {
             &messages,
             &[],
             &GenerationOptions::default(),
+            true,
         );
         let assistant = &body["messages"][1];
         assert_eq!(assistant["role"], "assistant");

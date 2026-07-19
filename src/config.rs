@@ -106,6 +106,11 @@ pub struct AgentConfig {
     pub provider_base_url: Option<String>,
     /// Provider API key from `--api-key` or the provider's key env var.
     pub provider_api_key: Option<String>,
+    /// Anthropic prompt caching via `cache_control` breakpoints (`--provider-cache
+    /// on|off`). On by default (issue #26 flavor (b)): low-risk, saves cost and
+    /// latency across multi-turn conversations by reusing the cached stable
+    /// prefix (tools + system). Only consulted for `ProviderKind::Anthropic`.
+    pub provider_cache: bool,
 }
 
 /// Third-party provider family selector (`--provider`).
@@ -289,6 +294,7 @@ impl Default for AgentConfig {
             provider_model: None,
             provider_base_url: None,
             provider_api_key: None,
+            provider_cache: true,
         }
     }
 }
@@ -346,6 +352,9 @@ Options:
                            $ANTHROPIC_API_KEY
       --base-url URL       base URL for --provider (OpenAI-compatible gateways)
       --api-key KEY        API key for --provider (prefer the env var)
+      --provider-cache on|off  Anthropic prompt caching over the stable prefix
+                           (tools + system). Default on: low-risk, cuts cost and
+                           latency across turns. Ignored for --provider openai
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
@@ -683,6 +692,17 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             }
             "--base-url" => c.provider_base_url = Some(need_arg(&mut i)?.to_owned()),
             "--api-key" => c.provider_api_key = Some(need_arg(&mut i)?.to_owned()),
+            "--provider-cache" => {
+                c.provider_cache = match need_arg(&mut i)? {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    other => {
+                        return Err(format!(
+                            "invalid --provider-cache value: {other} (use on|off)"
+                        ));
+                    }
+                };
+            }
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
