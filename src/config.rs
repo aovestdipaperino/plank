@@ -296,7 +296,8 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/init"
             | "/skills"
             | "/hooks"
-    ) || slash_command_with_args(cmd, "/power")
+    ) || slash_command_with_args(cmd, "/btw")
+        || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
@@ -668,6 +669,7 @@ mod tests {
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }
+        assert!(slash_command_known("/btw what is this?"));
         assert!(slash_command_known("/power 50"));
         assert!(slash_command_known("/power"));
         assert!(slash_command_known("/switch 2"));

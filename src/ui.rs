@@ -66,6 +66,32 @@ impl RenderSink for TerminalSink {
     }
 }
 
+/// Wraps a `/btw` side question in the reference agent's system-reminder
+/// framing: a separate lightweight answer over the shared context, no tools,
+/// single response, and nothing enters the main conversation.
+fn btw_user_message(question: &str) -> String {
+    format!(
+        "<system-reminder>This is a side question from the user. You must answer this question directly in a single response.\n\
+         \n\
+         IMPORTANT CONTEXT:\n\
+         - You are a separate, lightweight agent spawned to answer this one question\n\
+         - The main conversation is NOT interrupted - this exchange will not become part of it\n\
+         - You share the conversation context but are a completely separate instance\n\
+         - Do NOT reference being interrupted or what you were \"previously doing\" - that framing is incorrect\n\
+         \n\
+         CRITICAL CONSTRAINTS:\n\
+         - You have NO tools available - you cannot read files, run commands, search, or take any actions\n\
+         - This is a one-off response - there will be no follow-up turns\n\
+         - You can ONLY provide information based on what you already know from the conversation context\n\
+         - NEVER say things like \"Let me try...\", \"I'll now...\", \"Let me check...\", or promise to take any action\n\
+         - If you don't know the answer, say so - do not offer to look it up or investigate\n\
+         \n\
+         Simply answer the question with the information you have.</system-reminder>\n\
+         \n\
+         {question}"
+    )
+}
+
 /// Builds the model-visible payload for a failed generation pass, matching
 /// the C worker loop: a preflight failure is fed back verbatim, a DSML parse
 /// failure gets the C's `invalid DSML tool call: ` prefix plus the syntax
@@ -767,6 +793,7 @@ impl Agent<'_> {
     }
 
     /// Handles a slash command; returns false when the REPL should exit.
+    #[allow(clippy::too_many_lines)]
     fn slash(&mut self, input: &str) -> Result<bool, String> {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
@@ -854,6 +881,13 @@ impl Agent<'_> {
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/btw" => {
+                if arg.is_empty() {
+                    println!("usage: /btw <question>");
+                } else {
+                    self.btw_plain(arg)?;
+                }
+            }
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
             _ => {
                 if let Some(message) = self.skill_message(cmd, arg) {
@@ -866,6 +900,38 @@ impl Agent<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// Runs a `/btw` side question in the plain REPL: one generation pass
+    /// over the shared context plus the framed question, tools denied,
+    /// nothing pushed to the session. The next real turn's KV sync reuses
+    /// the still-matching prefix and re-prefills past the divergence, so the
+    /// side question rolls back automatically.
+    fn btw_plain(&mut self, question: &str) -> Result<(), String> {
+        let mut prompt_text = render_transcript(&self.session, &self.system);
+        {
+            use std::fmt::Write as _;
+            let _ = write!(prompt_text, "[user]\n{}\n", btw_user_message(question));
+        }
+        let saved_ctx = self.last_ctx_used;
+        let (stream, _text, _stats) = self.stream_generation(&prompt_text, Instant::now())?;
+        let tried_tool = !stream.finished().calls.is_empty() || stream.finished().error.is_some();
+        let mut renderer = stream.into_sink().renderer;
+        renderer.finish();
+        if !renderer.last_output_newline() {
+            println!();
+        }
+        if tried_tool {
+            println!(
+                "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)"
+            );
+        }
+        println!(
+            "{}",
+            self.debug_line("[btw — not part of the conversation]")
+        );
+        self.last_ctx_used = saved_ctx;
+        Ok(())
     }
 
     /// Resolves `/name args` against the loaded skills, rendering the
@@ -1645,6 +1711,38 @@ impl Agent<'_> {
         self.session.push(Message::user(text));
     }
 
+    /// Runs a `/btw` side question in the TUI: one generation pass over the
+    /// shared context plus the framed question, tools denied, nothing pushed
+    /// to the session (see `btw_plain` for the KV rollback rationale).
+    fn tui_btw(
+        &mut self,
+        question: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+    ) -> Result<(), String> {
+        log.push_spans(tui::user_echo_spans(&format!("/btw {question}")));
+        let mut prompt = render_transcript(&self.session, &self.system);
+        {
+            use std::fmt::Write as _;
+            let _ = write!(prompt, "[user]\n{}\n", btw_user_message(question));
+        }
+        let saved_ctx = self.last_ctx_used;
+        let out = self.tui_generate(terminal, log, &prompt, view, Instant::now())?;
+        log.end_line();
+        if out.interrupted {
+            crate::interrupt::clear();
+        }
+        if !out.calls.is_empty() || out.error.is_some() {
+            log.push_dim(
+                "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)",
+            );
+        }
+        log.push_dim("[btw — not part of the conversation]");
+        self.last_ctx_used = saved_ctx;
+        Ok(())
+    }
+
     /// Handles a slash command in the TUI; returns false to quit.
     #[allow(clippy::too_many_lines)]
     fn tui_slash(
@@ -1750,6 +1848,13 @@ impl Agent<'_> {
             "/hooks" => {
                 for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
                     log.push_plain(line.to_owned());
+                }
+            }
+            "/btw" => {
+                if arg.is_empty() {
+                    log.push_plain("usage: /btw <question>");
+                } else if let Err(e) = self.tui_btw(arg, log, terminal, view) {
+                    log.push_plain(format!("/btw failed: {e}"));
                 }
             }
             _ if slash_command_known(cmd) => {
