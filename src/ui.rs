@@ -890,6 +890,24 @@ impl Agent<'_> {
                     self.btw_plain(arg)?;
                 }
             }
+            "/subagent" => {
+                if arg.is_empty() {
+                    println!("usage: /subagent <task>");
+                } else {
+                    println!("{}", self.debug_line("[subagent started]"));
+                    let fork_at = self.begin_subagent_fork(arg);
+                    // Restore the transcript even when the turn errored.
+                    let turn = self.run_turn();
+                    let reported = self.finish_subagent_fork(fork_at, arg);
+                    turn?;
+                    let trailer = if reported {
+                        "[subagent report added to the conversation]"
+                    } else {
+                        "[subagent produced no report — nothing added]"
+                    };
+                    println!("{}", self.debug_line(trailer));
+                }
+            }
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
             _ => {
                 if let Some(message) = self.skill_message(cmd, arg) {
@@ -909,6 +927,40 @@ impl Agent<'_> {
     /// nothing pushed to the session. The next real turn's KV sync reuses
     /// the still-matching prefix and re-prefills past the divergence, so the
     /// side question rolls back automatically.
+    /// Starts a `/subagent` fork: appends the framed task to the live
+    /// transcript and returns the pre-fork length for later truncation. The
+    /// fork inherits the parent transcript prefix, so the engine's per-turn
+    /// sync reuses the parent KV cache.
+    fn begin_subagent_fork(&mut self, task: &str) -> usize {
+        let fork_at = self.session.transcript.len();
+        self.session
+            .push(Message::user(crate::agents::task_message(task)));
+        fork_at
+    }
+
+    /// Ends a `/subagent` fork: truncates the sidechain back out of the
+    /// transcript and pushes only the framed final report. Returns false when
+    /// the sidechain produced no report (e.g. interrupted before any output);
+    /// the transcript is still restored.
+    fn finish_subagent_fork(&mut self, fork_at: usize, task: &str) -> bool {
+        let report = self.session.transcript[fork_at..]
+            .iter()
+            .rev()
+            .find(|m| {
+                matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty()
+            })
+            .map(|m| m.text.clone());
+        self.session.transcript.truncate(fork_at);
+        match report {
+            Some(report) => {
+                self.session
+                    .push(Message::user(crate::agents::report_message(task, &report)));
+                true
+            }
+            None => false,
+        }
+    }
+
     fn btw_plain(&mut self, question: &str) -> Result<(), String> {
         let mut prompt_text = render_transcript(&self.session, &self.system);
         {
@@ -1861,6 +1913,23 @@ impl Agent<'_> {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
+            "/subagent" => {
+                if arg.is_empty() {
+                    log.push_plain("usage: /subagent <task>");
+                } else {
+                    log.push_dim("[subagent started]");
+                    let fork_at = self.begin_subagent_fork(arg);
+                    if let Err(e) = self.tui_turn(terminal, log, view) {
+                        // Restore the transcript even when the turn errored.
+                        self.finish_subagent_fork(fork_at, arg);
+                        log.push_plain(format!("/subagent failed: {e}"));
+                    } else if self.finish_subagent_fork(fork_at, arg) {
+                        log.push_dim("[subagent report added to the conversation]");
+                    } else {
+                        log.push_dim("[subagent produced no report — nothing added]");
+                    }
+                }
+            }
             _ if slash_command_known(cmd) => {
                 log.push_plain(format!("{cmd}: not implemented yet"));
             }
@@ -2191,6 +2260,66 @@ mod tests {
             tool_result.contains("DSML syntax reminder:"),
             "got: {tool_result}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn subagent_fork_truncates_and_carries_only_the_report() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-sub-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stanza = concat!(
+            "Counting.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo 42</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string(), "There are 42 tests.\n".to_string()],
+            next: 0,
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+        };
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant("hello"));
+
+        let fork_at = agent.begin_subagent_fork("count the tests");
+        assert_eq!(fork_at, 2);
+        agent.run_turn().unwrap();
+        // Fork grew: task, assistant(tool call), tool result, final report.
+        assert!(agent.session.transcript.len() > 4);
+
+        assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
+        // Parent keeps its two messages plus only the framed report.
+        assert_eq!(agent.session.transcript.len(), 3);
+        let report = &agent.session.transcript[2].text;
+        assert!(report.contains("Subagent report:"), "got: {report}");
+        assert!(report.contains("There are 42 tests."), "got: {report}");
+        assert!(!report.contains("echo 42"), "sidechain leaked: {report}");
+
+        // A fork with no assistant output restores the transcript untouched.
+        let fork_at = agent.begin_subagent_fork("noop");
+        assert!(!agent.finish_subagent_fork(fork_at, "noop"));
+        assert_eq!(agent.session.transcript.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
     }
 

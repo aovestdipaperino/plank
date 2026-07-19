@@ -4,6 +4,7 @@
 //! `ds4-ref/ds4_agent.c`, not line-by-line. Each module maps to one functional
 //! section of the original agent.
 
+pub mod agents;
 pub mod compact;
 pub mod config;
 pub mod context;
