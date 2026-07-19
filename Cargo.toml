@@ -1,6 +1,6 @@
 [package]
 name = "plank"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/plank"
