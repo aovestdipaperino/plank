@@ -7,7 +7,7 @@ versions here follow the rules in [`VERSIONING.md`](../VERSIONING.md)
 (minor bump when the sysprompt text or engine snapshot format changes,
 major when older cached state must not be trusted).
 
-Current release line: **v1.3.x**.
+Current release line: **v2.0.0** (beta channel).
 
 ## v1.4.0 — concurrency and side channels
 
@@ -26,9 +26,13 @@ Current release line: **v1.3.x**.
 
 ## v2.0.0 — remote
 
-- **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine. Design: [`REMOTE-CONTROL-DESIGN.md`](REMOTE-CONTROL-DESIGN.md).
-- **Remote LLM support via llms-sdk** ([#26](https://github.com/aovestdipaperino/plank/issues/26)): remote-hosted ds4 (`plank serve`) and third-party providers (OpenAI-compatible + Anthropic) behind the `Engine` trait (reference checkout at `refs/llms-sdk`). Design: [`REMOTE-ENGINE-DESIGN.md`](REMOTE-ENGINE-DESIGN.md).
-- **Mid-generation /btw suspend** ([#27](https://github.com/aovestdipaperino/plank/issues/27)): freeze an in-flight generation, answer the aside, resume with zero re-prefill via session snapshot/restore. Design: [`BTW-SUSPEND-DESIGN.md`](BTW-SUSPEND-DESIGN.md).
+The **session snapshot/restore foundation** (`src/snapshot.rs`: `SessionSnapshot` + the unconditional-restore `RestoreOnDrop` guard, and `Engine::generate_aside`) landed in `3e86c83` and underpins #27, #29, #28, and #12. All items below are on `main` locally. **Runtime behavior of the `cfg(ds4_engine)` paths (snapshot round-trips for #27/#29, the #28 scheduler's token interleaving and per-session KV isolation) is compile/inspection-verified only — it still needs a manual smoke test on a Metal box with a real model.**
+
+- ~~**Mid-generation /btw suspend**~~ ([#27](https://github.com/aovestdipaperino/plank/issues/27)) — landed in `1858635`: freeze an in-flight generation, answer the aside, resume with ~zero re-prefill via `generate_aside`. **On by default**; disable with `--disable-btw-suspend` (`18e79ef`). Falls back to the boundary queue when off or the engine lacks aside support. Design: [`BTW-SUSPEND-DESIGN.md`](BTW-SUSPEND-DESIGN.md).
+- ~~**`/checkpoint` in-session rollback points**~~ ([#29](https://github.com/aovestdipaperino/plank/issues/29)) — landed in `665cfbd`: `/checkpoint [name]` captures/lists, `/rollback <name>` restores transcript + KV (itself undoable via an auto `pre-rollback` snapshot); EchoEngine falls back to transcript-only. Snapshot access is via the `Engine::snapshot_kv`/`restore_kv` methods wrapping `SessionSnapshot`. Design: [`CHECKPOINT-DESIGN.md`](CHECKPOINT-DESIGN.md).
+- ~~**Remote-control interface**~~ ([#25](https://github.com/aovestdipaperino/plank/issues/25)) — drive a running plank instance from another process or machine. Design: [`REMOTE-CONTROL-DESIGN.md`](REMOTE-CONTROL-DESIGN.md). Transport foundation in `c7c37a7` (WebSocket protocol, `BroadcastBus` scrollback replay, token auth, single-controller/many-mirror policy, `--control*` flags); **live wiring landed** in `243ba8a` — the server shares the agent's `TurnShared`/bus, so remote `prompt`/`command`/`btw`/`interrupt` frames drive the real turn loop and output mirrors, with a 15s reconnect grace window. **Remaining:** plain-REPL (non-TTY) remote drive and a `plank remote <url>` CLI client (documented TODOs in `src/remote/control.rs`).
+- ~~**Remote LLM support via llms-sdk**~~ ([#26](https://github.com/aovestdipaperino/plank/issues/26)) — remote-hosted ds4 and third-party providers behind the `Engine` trait. Design: [`REMOTE-ENGINE-DESIGN.md`](REMOTE-ENGINE-DESIGN.md). **Flavor (a)** (`a4da712`): `plank serve` HTTP+SSE host + `RemoteDs4Engine` client (`--remote URL`), sync `ureq`, no async runtime. **Flavor (b)** (`216dd79`): OpenAI-compatible provider end-to-end via `--provider openai` (covers vLLM/Ollama/OpenRouter/Together), through the `Prompt::{Flat,Structured}` engine-input widening, a machine-readable tool registry, and native-tool-call→DSML synthesis. **Remaining:** Anthropic Messages provider (stubbed), cross-turn tool-call-id threading.
+- ~~**Shared reference-counted engine**~~ ([#28](https://github.com/aovestdipaperino/plank/issues/28)) — one long-lived model, many concurrent sessions, amortizing weights/Metal context/warm prefix. Design: [`SHARED-ENGINE-DESIGN.md`](SHARED-ENGINE-DESIGN.md). **Landed** in `1760670`: the `Ds4Engine` → `Ds4Model` + `Ds4Session` split (always on, behavior-preserving; also unblocks #12 and a future `/switch`), `Arc`-refcounted `EngineHost` + admission control, and a cooperative single-GPU-thread round-robin scheduler — behind `--shared-engine` (default off) with `--max-sessions`. v1 uses round-robin K-token slices, non-preemptible prefill, one per-session `ctx_size`. **Remaining:** `/info` live-session accounting and idle-KV reclamation (v2).
 
 ## Ongoing
 
