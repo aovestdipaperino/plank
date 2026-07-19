@@ -6,7 +6,12 @@ plank sessions attach to concurrently — amortizing the model weights, the Meta
 context, and the warm system-prompt prefix across every attached client instead of
 paying them N times.
 
-Status: **proposed, unimplemented.** No code exists yet. This document builds
+Status: **implemented behind the `--shared-engine` flag (default off).** The
+session/model split (§3) is always present and behavior-preserving; the
+`EngineHost`, refcount, cooperative scheduler (§4–§6), and multi-tenant
+`plank serve` wiring (§8) are gated on `--shared-engine`. Steps 1–4 of §9 have
+landed; step 5 (accounting/status surfacing) and idle-KV reclamation remain
+deferred (§10, §12). This document builds
 directly on the concurrent-sessions analysis already recorded in
 [`BTW-SUSPEND-DESIGN.md`](BTW-SUSPEND-DESIGN.md) §8.1 — it does not re-derive the
 engine facts, it turns §8.1's "what it would take" list into a concrete design and

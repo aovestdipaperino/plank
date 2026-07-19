@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{Engine, EngineEvent, GenerationOptions};
+use crate::host::{EngineHost, SessionHandle};
 use crate::remote::proto::{
     GenerateRequest, InfoResponse, PROTOCOL_VERSION, TokenizeRequest, TokenizeResponse, WireEvent,
     WireStats,
@@ -66,6 +67,186 @@ pub fn run(engine: Box<dyn Engine>, cfg: &ServeConfig) -> Result<(), String> {
         });
     }
     Ok(())
+}
+
+/// Runs the server in shared-engine mode (issue #28): one [`EngineHost`] backs
+/// many per-`session_id` [`SessionHandle`]s, all sharing the single model on the
+/// host's one GPU thread. Requests for distinct sessions run concurrently
+/// through the cooperative scheduler instead of serializing behind one mutex.
+///
+/// # Errors
+/// Returns a message when the listen address cannot be bound.
+pub fn run_shared(host: EngineHost, cfg: &ServeConfig) -> Result<(), String> {
+    let listener =
+        TcpListener::bind(&cfg.listen).map_err(|e| format!("serve: bind {}: {e}", cfg.listen))?;
+    eprintln!(
+        "plank serve: listening on {} (shared engine, model: {})",
+        cfg.listen,
+        host.model_name()
+    );
+    let host = Arc::new(host);
+    let sessions: Arc<Mutex<HashMap<String, Arc<SessionHandle>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let cancels: Cancels = Arc::new(Mutex::new(HashMap::new()));
+    let token = cfg.token.clone();
+
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let host = Arc::clone(&host);
+        let sessions = Arc::clone(&sessions);
+        let cancels = Arc::clone(&cancels);
+        let token = token.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = handle_conn_shared(stream, &host, &sessions, &cancels, token.as_deref())
+            {
+                eprintln!("plank serve: connection error: {e}");
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Per-session-id handle registry for shared mode.
+type Sessions = Arc<Mutex<HashMap<String, Arc<SessionHandle>>>>;
+
+fn handle_conn_shared(
+    stream: TcpStream,
+    host: &Arc<EngineHost>,
+    sessions: &Sessions,
+    cancels: &Cancels,
+    token: Option<&str>,
+) -> std::io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut out = stream;
+    let Some(req) = read_request(&mut reader, token)? else {
+        return Ok(());
+    };
+    if !req.authorized {
+        return write_status(&mut out, 401, "unauthorized");
+    }
+
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/info") => {
+            let info = InfoResponse {
+                model_name: host.model_name(),
+                ctx_size: host.ctx_size(),
+                protocol_version: PROTOCOL_VERSION,
+            };
+            write_json(&mut out, &serde_json::to_string(&info).unwrap_or_default())
+        }
+        ("POST", "/tokenize") => {
+            let n = serde_json::from_str::<TokenizeRequest>(&req.body)
+                .map(|r| host.count_tokens(&r.text))
+                .unwrap_or(0);
+            let resp = TokenizeResponse { n_tokens: n };
+            write_json(&mut out, &serde_json::to_string(&resp).unwrap_or_default())
+        }
+        ("POST", "/generate" | "/warm") => {
+            handle_generate_shared(&req, &mut out, host, sessions, cancels, req.path == "/warm")
+        }
+        ("DELETE", path) if path.starts_with("/generate/") => {
+            let id = path.trim_start_matches("/generate/");
+            if let Some(flag) = cancels.lock().unwrap().get(id) {
+                flag.store(true, Ordering::Relaxed);
+            }
+            write_status(&mut out, 200, "cancelled")
+        }
+        _ => write_status(&mut out, 404, "not found"),
+    }
+}
+
+fn handle_generate_shared(
+    req: &Request,
+    out: &mut TcpStream,
+    host: &Arc<EngineHost>,
+    sessions: &Sessions,
+    cancels: &Cancels,
+    warm: bool,
+) -> std::io::Result<()> {
+    let Ok(gen_req) = serde_json::from_str::<GenerateRequest>(&req.body) else {
+        return write_status(out, 400, "bad request");
+    };
+
+    // A `/warm` in shared mode is a no-op: the host warms the shared system
+    // prompt once at startup and each attach restores it (design §6).
+    if warm {
+        out.write_all(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
+        )?;
+        out.flush()?;
+        let terminal = WireEvent::Done {
+            stats: WireStats::from(&crate::engine::GenerationStats::default()),
+        };
+        send_frame(out, &terminal)?;
+        return out.flush();
+    }
+
+    // Get-or-attach the session for this session_id.
+    let handle = {
+        let mut map = sessions.lock().unwrap();
+        if let Some(h) = map.get(&gen_req.session_id) {
+            Arc::clone(h)
+        } else {
+            match host.attach() {
+                Ok(h) => {
+                    let h = Arc::new(h);
+                    map.insert(gen_req.session_id.clone(), Arc::clone(&h));
+                    h
+                }
+                Err(e) => {
+                    drop(map);
+                    return write_status(out, 503, &e.to_string());
+                }
+            }
+        }
+    };
+
+    out.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\nCache-Control: no-cache\r\n\r\n",
+    )?;
+    out.flush()?;
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    cancels
+        .lock()
+        .unwrap()
+        .insert(gen_req.session_id.clone(), Arc::clone(&cancel));
+
+    let opts: GenerationOptions = (&gen_req.opts).into();
+    let mut write_err: Option<std::io::Error> = None;
+    let result = {
+        let mut on_event = |ev: EngineEvent| {
+            if write_err.is_some() {
+                return;
+            }
+            let frame = WireEvent::from_engine_event(&ev);
+            if let Err(e) = send_frame(out, &frame) {
+                write_err = Some(e);
+            }
+        };
+        handle.generate(
+            &gen_req.transcript,
+            &opts,
+            Arc::clone(&cancel),
+            &mut on_event,
+        )
+    };
+
+    cancels.lock().unwrap().remove(&gen_req.session_id);
+    if let Some(e) = write_err {
+        return Err(e);
+    }
+
+    let terminal = match result {
+        Ok(stats) => WireEvent::Done {
+            stats: WireStats::from(&stats),
+        },
+        Err(e) => WireEvent::Error {
+            message: e.to_string(),
+        },
+    };
+    send_frame(out, &terminal)?;
+    out.flush()
 }
 
 /// Parsed HTTP request essentials.

@@ -299,6 +299,27 @@ fn run_serve(args: &[String]) -> ExitCode {
         }
     };
     plank::interrupt::install();
+
+    // Shared-engine mode (issue #28): host one model for many concurrent
+    // per-session_id clients. Off by default; the local single-tenant path is
+    // byte-for-byte unchanged. Not combined with --remote (that is a client).
+    if cfg.shared_engine && cfg.remote_url.is_none() {
+        let host = match make_host(&cfg) {
+            Ok(host) => host,
+            Err(e) => {
+                eprintln!("plank serve: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return match plank::serve::run_shared(host, &ServeConfig { listen, token }) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("plank serve: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let engine = match make_engine(&cfg) {
         Ok(engine) => engine,
         Err(e) => {
@@ -312,6 +333,66 @@ fn run_serve(args: &[String]) -> ExitCode {
             eprintln!("plank serve: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Builds the shared [`EngineHost`](plank::host::EngineHost) for
+/// `plank serve --shared-engine`: the real ds4 model warmed once on macOS, or
+/// the echo stub elsewhere. The host owns the single GPU thread and hands out a
+/// session per network client (design §4, §8).
+fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
+    use plank::host::{DEFAULT_SLICE_TOKENS, EngineHost, HostConfig};
+
+    let host_cfg = HostConfig {
+        max_sessions: usize::try_from(cfg.max_sessions.max(1)).unwrap_or(1),
+        slice_tokens: DEFAULT_SLICE_TOKENS,
+    };
+    #[cfg(ds4_engine)]
+    {
+        use plank::config::Backend;
+        use plank::ds4engine::Ds4Model;
+        use plank::ffi::Ds4Backend;
+
+        require_min_ram()?;
+        acquire_model_lock()?;
+        let model_path = cfg
+            .model_path
+            .clone()
+            .unwrap_or_else(plank::download::default_model_path);
+        plank::download::ensure_model(&model_path)?;
+        let backend = match cfg.backend {
+            Some(Backend::Cuda) => Ds4Backend::Cuda,
+            Some(Backend::Cpu) => Ds4Backend::Cpu,
+            Some(Backend::Metal) | None => Ds4Backend::Metal,
+        };
+        eprintln!("plank: loading shared model {}...", model_path.display());
+        let replacer = plank::stderrline::StderrLineReplacer::start();
+        let model = Ds4Model::open_shared(
+            &model_path,
+            backend,
+            cfg.generation.ctx_size,
+            cfg.n_threads,
+            cfg.power_percent,
+            &cfg.engine,
+            &cfg.system,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        drop(replacer);
+        eprintln!("plank: shared model ready: {}", model.model_name());
+        Ok(EngineHost::new(model, host_cfg))
+    }
+    #[cfg(not(ds4_engine))]
+    {
+        use std::sync::Arc;
+        if let Some(model) = &cfg.model_path {
+            return Err(format!(
+                "-m {} requires the ds4 engine, which is not built on this platform",
+                model.display()
+            ));
+        }
+        let model = Arc::new(plank::host::EchoSharedModel::new(cfg.generation.ctx_size));
+        Ok(EngineHost::new(model, host_cfg))
     }
 }
 

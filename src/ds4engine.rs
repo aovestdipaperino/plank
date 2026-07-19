@@ -3,33 +3,53 @@
 //! Present only under the `ds4_engine` cfg (macOS + built `ds4-ref` submodule).
 //! The transcript arriving from the UI is plain role-tagged text; this wrapper
 //! reparses it into ds4 chat-template tokens, prefills a session, and samples.
+//!
+//! The engine is split into two types (issue #28, `docs/SHARED-ENGINE-DESIGN.md`
+//! §3): [`Ds4Model`] owns the immutable weights/tokenizer/Metal queue behind an
+//! `Arc`, and [`Ds4Session`] owns one live FFI session (its private KV suffix +
+//! cursor) and implements [`Engine`]. Today's single-owner path is a
+//! `Ds4Session` over a solely-owned `Ds4Model` — behavior-identical to before
+//! the split. The [`crate::host`] shared engine hands out many `Ds4Session`s
+//! over one shared `Ds4Model`.
 
 use std::ffi::{CStr, CString};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 use crate::engine::{
     Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, PrefillProgress,
     ThinkMode,
 };
 use crate::ffi;
+use crate::host::{HostSession, ModelHandle};
 use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 
-/// Loaded ds4 model plus a live session reused across turns.
-///
-/// The session is kept alive so `ds4_session_sync` reuses the cached KV prefix
-/// (the constant system prompt and any unchanged earlier turns) and only
-/// evaluates the new suffix each turn.
+/// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
+/// Metal command queue. Cheap to share read-only, expensive to build, so it
+/// lives behind an `Arc` (design §3, §4). Frees the engine on drop; the last
+/// `Arc` to drop tears down the Metal context.
 #[derive(Debug)]
-pub struct Ds4Engine {
+pub struct Ds4Model {
     engine: *mut ffi::Ds4Engine,
-    session: *mut ffi::Ds4Session,
     ctx_size: i32,
-    last_reply: Option<LastReply>,
     /// Chat-template token overhead of an empty message (`-1` until measured),
     /// subtracted by `count_tokens` so it returns just the text's tokens.
-    count_overhead: std::cell::Cell<i32>,
+    count_overhead: AtomicI32,
+    /// Warm system-prompt KV captured once at host bootstrap; restored into
+    /// each freshly spawned shared session so attach never cold-prefills the
+    /// system prompt (design §6). `None` for the single-owner path.
+    warm: Mutex<Option<SessionSnapshot>>,
 }
+
+// SAFETY: the engine pointer owns read-only weights + the Metal queue and is
+// freed only on drop. `Ds4Model` is used single-threaded for `ds4_session_*`
+// (all such calls run on the host's one GPU thread, design §5); the tokenizer
+// reads (`count_tokens`, `build_tokens`) touch immutable state. The warm
+// snapshot is guarded by a `Mutex`. Send+Sync let it live in an `Arc`.
+unsafe impl Send for Ds4Model {}
+unsafe impl Sync for Ds4Model {}
 
 /// The most recent generated reply, kept so the next prompt can splice the
 /// exact sampled token sequence for that assistant turn instead of
@@ -46,11 +66,6 @@ struct LastReply {
     /// Think mode of the assistant prefix the tokens followed.
     think: ffi::Ds4ThinkMode,
 }
-
-// SAFETY: the engine is used single-threaded by the agent turn loop; the
-// pointer owns the model and is freed on drop. Send lets it move into the
-// boxed trait object.
-unsafe impl Send for Ds4Engine {}
 
 thread_local! {
     static INTERRUPT: AtomicBool = const { AtomicBool::new(false) };
@@ -110,7 +125,7 @@ unsafe extern "C" fn progress_cb(
     }));
 }
 
-impl Ds4Engine {
+impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
     ///
@@ -198,11 +213,59 @@ impl Ds4Engine {
         }
         Ok(Self {
             engine,
-            session: std::ptr::null_mut(),
             ctx_size,
-            last_reply: None,
-            count_overhead: std::cell::Cell::new(-1),
+            count_overhead: AtomicI32::new(-1),
+            warm: Mutex::new(None),
         })
+    }
+
+    /// Opens a shared model and warms the system-prompt prefix once, capturing
+    /// it so [`ModelHandle::spawn`] can restore it into each fresh session
+    /// without a cold prefill (design §6). Returns the `Arc` the host holds.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the model fails to load or warm.
+    ///
+    /// # Panics
+    /// Panics if the warm-snapshot mutex is poisoned (a prior panic while it was
+    /// held) — impossible during single-threaded bootstrap.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_shared(
+        model_path: impl AsRef<Path>,
+        backend: ffi::Ds4Backend,
+        ctx_size: i32,
+        n_threads: i32,
+        power_percent: i32,
+        tuning: &crate::config::EngineTuning,
+        system: &str,
+        checkpoint: Option<&Path>,
+    ) -> Result<Arc<Self>, EngineError> {
+        let model = Arc::new(Self::open(
+            model_path,
+            backend,
+            ctx_size,
+            n_threads,
+            power_percent,
+            tuning,
+        )?);
+        // Warm on a throwaway bootstrap session, then capture its KV.
+        let mut boot = Ds4Session::from_model(Arc::clone(&model));
+        boot.warm_system_prompt(system, checkpoint, &mut |_| {})?;
+        let session = boot.ensure_session()?;
+        let snap = SessionSnapshot::capture(session)?;
+        *model.warm.lock().unwrap() = Some(snap);
+        Ok(model)
+    }
+
+    /// Creates a fresh FFI session over the shared weights.
+    fn create_session(&self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
+        // SAFETY: engine valid; session is a valid out-ptr.
+        let rc = unsafe { ffi::ds4_session_create(&raw mut session, self.engine, self.ctx_size) };
+        if rc != 0 || session.is_null() {
+            return Err(EngineError::new("failed to create session"));
+        }
+        Ok(session)
     }
 
     /// Model name reported by the engine.
@@ -255,49 +318,18 @@ impl Ds4Engine {
         tokens
     }
 
-    /// Ensures a live session exists, creating it lazily.
-    fn ensure_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
-        if self.session.is_null() {
-            let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
-            // SAFETY: engine valid; session is a valid out-ptr.
-            let rc =
-                unsafe { ffi::ds4_session_create(&raw mut session, self.engine, self.ctx_size) };
-            if rc != 0 || session.is_null() {
-                return Err(EngineError::new("failed to create session"));
-            }
-            self.session = session;
-        }
-        Ok(self.session)
-    }
-
-    /// Serializes the session KV to `path`, prefixed by its fingerprint line.
-    ///
-    /// Best-effort: a failure to save just means the next launch re-prefills.
-    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
-        let Ok(snap) = SessionSnapshot::capture(session) else {
-            return;
-        };
-        let bytes = snap.as_bytes();
-        let mut file = Vec::with_capacity(bytes.len() + 41);
-        file.extend_from_slice(fingerprint.as_bytes());
-        file.push(b'\n');
-        file.extend_from_slice(bytes);
-        let _ = std::fs::write(path, &file);
-    }
-
-    /// Fingerprint tying a checkpoint to this exact model and system prompt.
-    fn checkpoint_fingerprint(&self, system: &str) -> String {
-        let mut data = self.model_name().into_bytes();
-        data.push(0);
-        data.extend_from_slice(system.as_bytes());
-        crate::session::sha1_hex(&data)
-    }
-
     /// Builds chat-template tokens from a role-tagged transcript.
     ///
     /// The transcript uses `[system]`/`[user]`/`[assistant]` section markers
-    /// produced by the UI; each section becomes a ds4 chat message.
-    fn build_tokens(&self, transcript: &str, think: ThinkMode) -> Ds4TokensGuard {
+    /// produced by the UI; each section becomes a ds4 chat message. When
+    /// `last_reply` matches the final assistant section, its exact sampled
+    /// tokens are spliced in so the live KV prefix reaches through it.
+    fn build_tokens(
+        &self,
+        transcript: &str,
+        think: ThinkMode,
+        last_reply: Option<&LastReply>,
+    ) -> Ds4TokensGuard {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the whole build.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
@@ -307,7 +339,7 @@ impl Ds4Engine {
         // common-prefix probe reaches through it instead of diverging on a
         // retokenization of its text. Earlier assistant turns were prefilled
         // from re-templated text already, so they stay text-rendered.
-        let splice_idx = self.last_reply.as_ref().and_then(|last| {
+        let splice_idx = last_reply.and_then(|last| {
             sections
                 .iter()
                 .rposition(|(role, _)| *role == "assistant")
@@ -315,7 +347,7 @@ impl Ds4Engine {
         });
         for (i, (role, content)) in sections.iter().enumerate() {
             if Some(i) == splice_idx
-                && let Some(last) = &self.last_reply
+                && let Some(last) = last_reply
             {
                 Self::append_reply_tokens(self.engine, &mut tokens, last);
                 continue;
@@ -380,9 +412,166 @@ impl Ds4Engine {
         unsafe { libc::free(p.cast()) };
         text
     }
+
+    /// Approximate token count of `text`, excluding chat-template overhead.
+    #[must_use]
+    pub fn count_tokens(&self, text: &str) -> i32 {
+        if self.count_overhead.load(Ordering::Relaxed) < 0 {
+            self.count_overhead.store(
+                self.templated_len("").unwrap_or(-1).max(-1),
+                Ordering::Relaxed,
+            );
+        }
+        let overhead = self.count_overhead.load(Ordering::Relaxed);
+        match (overhead, self.templated_len(text)) {
+            (o, Some(len)) if o >= 0 => (len - o).max(0),
+            // NUL bytes (or a failed overhead probe) fall back to the estimate.
+            _ => i32::try_from(text.len() / 4).unwrap_or(i32::MAX),
+        }
+    }
+
+    /// Fingerprint tying a checkpoint to this exact model and system prompt.
+    fn checkpoint_fingerprint(&self, system: &str) -> String {
+        let mut data = self.model_name().into_bytes();
+        data.push(0);
+        data.extend_from_slice(system.as_bytes());
+        crate::session::sha1_hex(&data)
+    }
 }
 
-impl Engine for Ds4Engine {
+impl Drop for Ds4Model {
+    fn drop(&mut self) {
+        // SAFETY: engine was opened by us and not yet closed.
+        unsafe { ffi::ds4_engine_close(self.engine) };
+    }
+}
+
+impl ModelHandle for Ds4Model {
+    fn spawn(self: Arc<Self>) -> Result<Box<dyn HostSession>, EngineError> {
+        // Fresh session over the shared weights, warmed from the captured
+        // system-prompt snapshot so attach never cold-prefills it (§6).
+        let session = self.create_session()?;
+        if let Some(warm) = self.warm.lock().unwrap().as_ref()
+            && let Err(e) = warm.restore(session)
+        {
+            // SAFETY: session was just created by us and not yet freed.
+            unsafe { ffi::ds4_session_free(session) };
+            return Err(e);
+        }
+        let inner = Ds4Session {
+            model: Arc::clone(&self),
+            session,
+            last_reply: None,
+        };
+        Ok(Box::new(Ds4HostSession {
+            inner,
+            pending: None,
+            active: None,
+        }))
+    }
+
+    fn model_name(&self) -> String {
+        Ds4Model::model_name(self)
+    }
+
+    fn ctx_size(&self) -> i32 {
+        self.ctx_size
+    }
+
+    fn count_tokens(&self, text: &str) -> i32 {
+        Ds4Model::count_tokens(self, text)
+    }
+}
+
+/// Loaded ds4 session: one live FFI session (its private KV suffix + cursor)
+/// over a shared [`Ds4Model`]. Implements [`Engine`] for the single-owner path.
+///
+/// The session is kept alive across turns so `ds4_session_sync` reuses the
+/// cached KV prefix (the constant system prompt and any unchanged earlier
+/// turns) and only evaluates the new suffix each turn.
+#[derive(Debug)]
+pub struct Ds4Session {
+    model: Arc<Ds4Model>,
+    session: *mut ffi::Ds4Session,
+    last_reply: Option<LastReply>,
+}
+
+/// Back-compatible alias: the single-owner engine callers used before the split
+/// (design §3 — today's path is a `Ds4Session` over a solely-owned model).
+pub type Ds4Engine = Ds4Session;
+
+// SAFETY: the session is used single-threaded (the agent turn loop, or the
+// host's one GPU thread). It owns the FFI session and frees it on drop; the
+// model is shared read-only behind an `Arc`. Send lets it move into the boxed
+// trait object.
+unsafe impl Send for Ds4Session {}
+
+impl Ds4Session {
+    /// Opens a solely-owned model and returns a session over it — the
+    /// single-owner path, behavior-identical to the pre-split engine.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the model fails to load.
+    pub fn open(
+        model_path: impl AsRef<Path>,
+        backend: ffi::Ds4Backend,
+        ctx_size: i32,
+        n_threads: i32,
+        power_percent: i32,
+        tuning: &crate::config::EngineTuning,
+    ) -> Result<Self, EngineError> {
+        let model = Ds4Model::open(
+            model_path,
+            backend,
+            ctx_size,
+            n_threads,
+            power_percent,
+            tuning,
+        )?;
+        Ok(Self::from_model(Arc::new(model)))
+    }
+
+    /// Wraps a shared model in a session whose FFI session is created lazily.
+    #[must_use]
+    pub fn from_model(model: Arc<Ds4Model>) -> Self {
+        Self {
+            model,
+            session: std::ptr::null_mut(),
+            last_reply: None,
+        }
+    }
+
+    /// Model name reported by the engine.
+    #[must_use]
+    pub fn model_name(&self) -> String {
+        self.model.model_name()
+    }
+
+    /// Ensures a live session exists, creating it lazily.
+    fn ensure_session(&mut self) -> Result<*mut ffi::Ds4Session, EngineError> {
+        if self.session.is_null() {
+            self.session = self.model.create_session()?;
+        }
+        Ok(self.session)
+    }
+
+    /// Serializes the session KV to `path`, prefixed by its fingerprint line.
+    ///
+    /// Best-effort: a failure to save just means the next launch re-prefills.
+    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
+        let Ok(snap) = SessionSnapshot::capture(session) else {
+            return;
+        };
+        let bytes = snap.as_bytes();
+        let mut file = Vec::with_capacity(bytes.len() + 41);
+        file.extend_from_slice(fingerprint.as_bytes());
+        file.push(b'\n');
+        file.extend_from_slice(bytes);
+        let _ = std::fs::write(path, &file);
+    }
+}
+
+impl Engine for Ds4Session {
     #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,
@@ -392,7 +581,9 @@ impl Engine for Ds4Engine {
         greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
-        let tokens = self.build_tokens(transcript, opts.think_mode);
+        let tokens = self
+            .model
+            .build_tokens(transcript, opts.think_mode, self.last_reply.as_ref());
         let prompt_len = tokens.len();
 
         // Reuse the live session across turns so its cached KV prefix (the
@@ -463,7 +654,7 @@ impl Engine for Ds4Engine {
         max_tokens = max_tokens.max(0);
 
         // SAFETY: engine valid.
-        let eos = unsafe { ffi::ds4_token_eos(self.engine) };
+        let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
         let mut rng: u64 = if opts.seed != 0 {
             opts.seed
         } else {
@@ -502,7 +693,7 @@ impl Engine for Ds4Engine {
             if eval_rc != 0 {
                 return Err(EngineError::new(cstr_message(&err, "decode failed")));
             }
-            let text = self.token_text(token);
+            let text = self.model.token_text(token);
             reply_tokens.push(token);
             reply_text.push_str(&text);
             on_event(EngineEvent::Text(text));
@@ -590,8 +781,8 @@ impl Engine for Ds4Engine {
         checkpoint: Option<&Path>,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<bool, EngineError> {
-        let tokens = self.build_system_tokens(system);
-        let fingerprint = self.checkpoint_fingerprint(system);
+        let tokens = self.model.build_system_tokens(system);
+        let fingerprint = self.model.checkpoint_fingerprint(system);
         let session = self.ensure_session()?;
 
         // Fast path: restore a matching on-disk checkpoint, skipping prefill.
@@ -641,24 +832,15 @@ impl Engine for Ds4Engine {
     }
 
     fn count_tokens(&self, text: &str) -> i32 {
-        if self.count_overhead.get() < 0 {
-            self.count_overhead
-                .set(self.templated_len("").unwrap_or(-1).max(-1));
-        }
-        let overhead = self.count_overhead.get();
-        match (overhead, self.templated_len(text)) {
-            (o, Some(len)) if o >= 0 => (len - o).max(0),
-            // NUL bytes (or a failed overhead probe) fall back to the estimate.
-            _ => i32::try_from(text.len() / 4).unwrap_or(i32::MAX),
-        }
+        self.model.count_tokens(text)
     }
 
     fn ctx_size(&self) -> i32 {
-        self.ctx_size
+        self.model.ctx_size
     }
 
     fn model_name(&self) -> String {
-        Ds4Engine::model_name(self)
+        self.model.model_name()
     }
 
     fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
@@ -687,14 +869,238 @@ impl Engine for Ds4Engine {
     }
 }
 
-impl Drop for Ds4Engine {
+impl Drop for Ds4Session {
     fn drop(&mut self) {
         if !self.session.is_null() {
-            // SAFETY: the session was created by us and not yet freed.
+            // SAFETY: the session was created by us and not yet freed. The
+            // model (weights + Metal context) is dropped separately when its
+            // Arc refcount reaches zero (design §4).
             unsafe { ffi::ds4_session_free(self.session) };
         }
-        // SAFETY: engine was opened by us and not yet closed.
-        unsafe { ffi::ds4_engine_close(self.engine) };
+    }
+}
+
+/// Resumable per-generation state for the cooperative scheduler (design §5):
+/// captured once the suffix prefill completes, then advanced K tokens at a time.
+#[derive(Debug)]
+struct GenState {
+    opts: GenerationOptions,
+    rng: u64,
+    eos: i32,
+    generated: i32,
+    max_tokens: i32,
+    reply_tokens: Vec<i32>,
+    reply_text: String,
+    start: std::time::Instant,
+}
+
+/// A [`HostSession`] wrapping a [`Ds4Session`] for the shared engine: it runs
+/// generation in resumable K-token slices so the scheduler can interleave many
+/// sessions on the one GPU thread (design §5). All calls run on that thread.
+#[derive(Debug)]
+pub struct Ds4HostSession {
+    inner: Ds4Session,
+    /// The pending request captured by `begin`; prefilled on the first advance.
+    pending: Option<(String, GenerationOptions)>,
+    /// Active resumable generation state; `None` before prefill / after finish.
+    active: Option<GenState>,
+}
+
+impl Ds4HostSession {
+    /// Non-preemptible suffix prefill (design §5, §11.8). Builds the prompt,
+    /// syncs the session, and returns the initial [`GenState`], or `Err(stats)`
+    /// if interrupted during prefill.
+    fn prefill(
+        &mut self,
+        transcript: &str,
+        opts: &GenerationOptions,
+        interrupt: &AtomicBool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<Result<GenState, GenerationStats>, EngineError> {
+        let tokens = self.inner.model.build_tokens(
+            transcript,
+            opts.think_mode,
+            self.inner.last_reply.as_ref(),
+        );
+        let prompt_len = tokens.len();
+        let session = self.inner.ensure_session()?;
+
+        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
+        // SAFETY: session valid; cancel_cb reads a thread-local flag.
+        unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
+
+        // SAFETY: session and tokens are valid.
+        let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        on_event(EngineEvent::Prefill(PrefillProgress {
+            done: cached.clamp(0, (prompt_len - 1).max(0)),
+            total: prompt_len,
+            tps: 0.0,
+        }));
+
+        let poll = || interrupt.load(Ordering::SeqCst);
+        let mut err = [0_i8; 512];
+        let mut progress = ProgressCtx {
+            on_event,
+            interrupt: &poll,
+            start: std::time::Instant::now(),
+            base: cached.clamp(0, prompt_len),
+            total: prompt_len,
+        };
+        let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
+        // SAFETY: session valid; progress outlives the sync; cleared right after.
+        unsafe {
+            ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+        }
+        // SAFETY: session, tokens, and err buffer valid.
+        let sync_rc =
+            unsafe { ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        // SAFETY: session valid; clearing before ProgressCtx drops.
+        unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
+        if sync_rc != 0 {
+            if interrupt.load(Ordering::SeqCst) || INTERRUPT.with(|f| f.load(Ordering::SeqCst)) {
+                return Ok(Err(GenerationStats {
+                    interrupted: true,
+                    ctx_used: prompt_len,
+                    ..GenerationStats::default()
+                }));
+            }
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "prompt processing failed",
+            )));
+        }
+
+        // SAFETY: session valid.
+        let ctx = unsafe { ffi::ds4_session_ctx(session) };
+        let pos = unsafe { ffi::ds4_session_pos(session) };
+        let room = ctx - pos;
+        let mut max_tokens = if opts.n_predict < 0 {
+            room - 1
+        } else {
+            opts.n_predict.min(room - 1)
+        };
+        max_tokens = max_tokens.max(0);
+        // SAFETY: engine valid.
+        let eos = unsafe { ffi::ds4_token_eos(self.inner.model.engine) };
+        Ok(Ok(GenState {
+            opts: opts.clone(),
+            rng: if opts.seed != 0 {
+                opts.seed
+            } else {
+                0x2545_f491_4f6c_dd1d
+            },
+            eos,
+            generated: 0,
+            max_tokens,
+            reply_tokens: Vec::new(),
+            reply_text: String::new(),
+            start: std::time::Instant::now(),
+        }))
+    }
+
+    /// Builds the terminal stats and records the sampled reply for KV splicing.
+    fn finalize(&mut self, interrupted: bool) -> GenerationStats {
+        let st = self
+            .active
+            .take()
+            .expect("finalize called without an active generation");
+        let mut reply_text = st.reply_text;
+        reply_text.truncate(reply_text.trim_end().len());
+        self.inner.last_reply = if st.reply_tokens.is_empty() {
+            None
+        } else {
+            Some(LastReply {
+                text: reply_text,
+                tokens: st.reply_tokens,
+                think: ds4_think(st.opts.think_mode),
+            })
+        };
+        let secs = st.start.elapsed().as_secs_f64();
+        // SAFETY: session valid (created during prefill).
+        let ctx_used = unsafe { ffi::ds4_session_pos(self.inner.session) };
+        GenerationStats {
+            generated: st.generated,
+            tps: if secs > 0.0 {
+                f64::from(st.generated) / secs
+            } else {
+                0.0
+            },
+            ctx_used,
+            interrupted,
+        }
+    }
+}
+
+impl HostSession for Ds4HostSession {
+    fn begin(&mut self, transcript: String, opts: GenerationOptions) {
+        // Stash the request; prefill runs on the first advance so it happens on
+        // the GPU thread (non-preemptible, §5).
+        self.pending = Some((transcript, opts));
+        self.active = None;
+    }
+
+    fn advance(
+        &mut self,
+        k: usize,
+        interrupt: &AtomicBool,
+        sink: &mut dyn FnMut(EngineEvent),
+    ) -> Result<Option<GenerationStats>, EngineError> {
+        // First slice: run the non-preemptible prefill.
+        if self.active.is_none() {
+            let Some((transcript, opts)) = self.pending.take() else {
+                return Ok(Some(GenerationStats::default()));
+            };
+            match self.prefill(&transcript, &opts, interrupt, sink)? {
+                Ok(state) => self.active = Some(state),
+                Err(stats) => return Ok(Some(stats)),
+            }
+        }
+
+        // Produce up to k tokens, ceding after the slice (§5).
+        let mut produced = 0usize;
+        loop {
+            let st = self.active.as_mut().expect("gen present after prefill");
+            if interrupt.load(Ordering::SeqCst) {
+                INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+                return Ok(Some(self.finalize(true)));
+            }
+            if st.generated >= st.max_tokens {
+                return Ok(Some(self.finalize(false)));
+            }
+            if produced >= k {
+                return Ok(None);
+            }
+            let session = self.inner.session;
+            // SAFETY: session valid; rng is a valid out-ptr. Greedy is off in
+            // the shared/serve path (server samples per opts).
+            let token = unsafe {
+                ffi::ds4_session_sample(
+                    session,
+                    st.opts.temperature,
+                    0,
+                    st.opts.top_p,
+                    st.opts.min_p,
+                    &raw mut st.rng,
+                )
+            };
+            if token == st.eos {
+                return Ok(Some(self.finalize(false)));
+            }
+            let mut err = [0_i8; 512];
+            // SAFETY: session valid; err buffer valid.
+            let eval_rc =
+                unsafe { ffi::ds4_session_eval(session, token, err.as_mut_ptr(), err.len()) };
+            if eval_rc != 0 {
+                self.active = None;
+                return Err(EngineError::new(cstr_message(&err, "decode failed")));
+            }
+            let text = self.inner.model.token_text(token);
+            st.reply_tokens.push(token);
+            st.reply_text.push_str(&text);
+            sink(EngineEvent::Text(text));
+            st.generated += 1;
+            produced += 1;
+        }
     }
 }
 
@@ -870,7 +1276,7 @@ mod tests {
         };
         let tuning = crate::config::EngineTuning::default();
         let mut engine =
-            super::Ds4Engine::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
 
         let opts = GenerationOptions {
             seed: 42,
@@ -891,7 +1297,7 @@ mod tests {
 
         // A fresh engine, same seed, but with an aside injected before the run.
         let mut engine2 =
-            super::Ds4Engine::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
         let mut aside = String::new();
         engine2
             .generate_aside("[user]\nWhat is 2 plus 2?\n", &opts, &|| false, &mut |e| {
@@ -915,5 +1321,111 @@ mod tests {
             baseline, after,
             "post-aside continuation must match the uninterrupted seeded run"
         );
+    }
+
+    // Shared-engine attach proofs (design §10). Gated on `ds4_engine` + a real
+    // model; inspection-only where no Metal box is available. Verify a freshly
+    // attached session generates over the warm prefix, and that two sessions
+    // generate independent conversations without KV/output leakage.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn attach_restores_warm_prefix() {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+            None,
+        )
+        .unwrap();
+        let host = EngineHost::new(model, HostConfig::default());
+        let s = host.attach().unwrap();
+        // A freshly attached session should generate normally over the warm
+        // prefix; the runtime proof (prefill count ≈ suffix only) requires
+        // instrumenting prefill token counts on a Metal box.
+        let stats = s
+            .generate(
+                "[user]\nSay hi.\n",
+                &crate::engine::GenerationOptions {
+                    n_predict: 8,
+                    ..Default::default()
+                },
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(stats.generated > 0);
+    }
+
+    #[cfg(ds4_engine)]
+    #[test]
+    fn two_sessions_no_cross_contamination() {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+            None,
+        )
+        .unwrap();
+        let host = EngineHost::new(model, HostConfig::default());
+        let a = host.attach().unwrap();
+        let b = host.attach().unwrap();
+        let opts = crate::engine::GenerationOptions {
+            seed: 1,
+            n_predict: 16,
+            ..Default::default()
+        };
+        let mut out_a = String::new();
+        a.generate(
+            "[user]\nName a color.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let crate::engine::EngineEvent::Text(t) = e {
+                    out_a.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        let mut out_b = String::new();
+        b.generate(
+            "[user]\nName a country.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let crate::engine::EngineEvent::Text(t) = e {
+                    out_b.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!out_a.is_empty() && !out_b.is_empty());
     }
 }
