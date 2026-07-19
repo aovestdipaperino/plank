@@ -124,6 +124,24 @@ fn edit_preflight(
     move |call| crate::tools::edit::preflight_edit_old(&ctx, call)
 }
 
+/// Parses a `/btw <question>` (alias `/side <question>`) line, returning the
+/// question. Accepts a whitespace or `:` separator, mirroring `OpenClaw`'s
+/// `isBtwCommand` matcher; returns `None` for other input or an empty
+/// question.
+fn btw_question(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let rest = t.strip_prefix("/btw").or_else(|| t.strip_prefix("/side"))?;
+    let rest = if let Some(r) = rest.strip_prefix(':') {
+        r
+    } else if rest.starts_with(char::is_whitespace) {
+        rest
+    } else {
+        return None; // "/btwfoo" is not a btw command
+    };
+    let q = rest.trim();
+    if q.is_empty() { None } else { Some(q) }
+}
+
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -936,7 +954,7 @@ impl Agent<'_> {
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             // /btw shares the experimental gate with image pasting until the
             // model-format investigation lands.
-            "/btw" if IMAGES_ENABLED => {
+            "/btw" | "/side" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
                 } else {
@@ -1615,17 +1633,33 @@ impl Agent<'_> {
         view: &mut tui::OutputView,
         input: &mut TuiInput,
     ) -> Result<(), String> {
+        // The first iteration runs the main turn; later iterations run either
+        // a follow-up turn (leftover queued user lines) or a btw-only drain
+        // (side questions queued after the worker's final boundary).
+        let mut run_main = true;
+        let mut carry_btw: Vec<String> = Vec::new();
         loop {
             let shared = TurnShared::default();
-            run_worker_ui(terminal, log, view, input, &shared, |tx| {
-                self.worker_turn(&tx, &shared)
-            })??;
+            for q in carry_btw.drain(..) {
+                let _ = shared.push_btw(q);
+            }
+            if run_main {
+                run_worker_ui(terminal, log, view, input, &shared, |tx| {
+                    self.worker_turn(&tx, &shared)
+                })??;
+            } else {
+                run_worker_ui(terminal, log, view, input, &shared, |tx| {
+                    self.drain_btw(&tx, &shared);
+                })?;
+            }
             // Lines typed while busy that no tool round drained become the
             // next turn's user message(s), as if resubmitted by hand.
             let leftover = shared.take_queued();
-            if leftover.is_empty() {
+            carry_btw = shared.take_btw();
+            if leftover.is_empty() && carry_btw.is_empty() {
                 return Ok(());
             }
+            run_main = !leftover.is_empty();
             for line in leftover {
                 self.session.push(Message::user(line));
             }
@@ -1655,8 +1689,14 @@ impl Agent<'_> {
             if out.interrupted {
                 crate::interrupt::clear();
                 let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
+                // Drain point 3 (BTW-DESIGN §4.4): the user asked mid-turn;
+                // answer even though the main turn was interrupted.
+                self.drain_btw(tx, shared);
                 return Ok(());
             }
+            // Side questions answer at every generation boundary, before the
+            // next tool dispatch (BTW-DESIGN §4.4 drain points 1 and 2).
+            self.drain_btw(tx, shared);
             if let Some(payload) = out.error {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
@@ -1696,6 +1736,58 @@ impl Agent<'_> {
                 }
             }
             return Ok(());
+        }
+    }
+
+    /// Answers queued `/btw` side questions FIFO at a generation boundary
+    /// (worker thread). Each answer is one tool-free pass over the live
+    /// transcript plus the framed question; nothing enters the session and
+    /// `last_ctx_used` is restored, so the side exchange is rolled back by
+    /// the next real pass's prefix sync. An interrupt during an answer
+    /// flushes the rest of the queue (the user is saying "stop the asides");
+    /// a failed answer is logged and the queue continues — side questions
+    /// must never abort the main turn.
+    fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
+        while let Some(question) = shared.pop_btw() {
+            let _ = tx.send(UiEvent::UserEcho(format!("/btw {question}")));
+            let _ = tx.send(UiEvent::Dim("[btw]".to_owned()));
+            let saved_ctx = self.last_ctx_used;
+            let mut prompt = render_transcript(&self.session, &self.system);
+            {
+                use std::fmt::Write as _;
+                let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
+            }
+            let out = match self.worker_generate(tx, shared, &prompt, Instant::now()) {
+                Ok(out) => out,
+                Err(e) => {
+                    let _ = tx.send(UiEvent::Dim(format!("/btw failed: {e}")));
+                    self.last_ctx_used = saved_ctx;
+                    continue;
+                }
+            };
+            let _ = tx.send(UiEvent::EndLine);
+            self.last_ctx_used = saved_ctx;
+            if out.interrupted {
+                crate::interrupt::clear();
+                let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
+                let cleared = shared.clear_btw();
+                if cleared > 0 {
+                    let _ = tx.send(UiEvent::Dim(format!("[btw queue cleared: {cleared}]")));
+                }
+                let _ = tx.send(UiEvent::Dim(
+                    "[btw — not part of the conversation]".to_owned(),
+                ));
+                return;
+            }
+            if !out.calls.is_empty() || out.error.is_some() {
+                let _ = tx.send(UiEvent::Dim(
+                    "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)"
+                        .to_owned(),
+                ));
+            }
+            let _ = tx.send(UiEvent::Dim(
+                "[btw — not part of the conversation]".to_owned(),
+            ));
         }
     }
 
@@ -2082,7 +2174,7 @@ impl Agent<'_> {
             }
             // /btw shares the experimental gate with image pasting until the
             // model-format investigation lands.
-            "/btw" if IMAGES_ENABLED => {
+            "/btw" | "/side" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
                 } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input) {
@@ -2232,6 +2324,18 @@ fn busy_ui_loop(
                         input.buf.clear();
                         input.hist_idx = None;
                         if line.is_empty() {
+                        } else if IMAGES_ENABLED && btw_question(&line).is_some() {
+                            // Side questions queue FIFO and are answered at
+                            // the next generation boundary (BTW-DESIGN §4.4).
+                            let question = btw_question(&line).unwrap_or_default().to_owned();
+                            input.history.add(&line);
+                            if let Some(dropped) = shared.push_btw(question) {
+                                log.push_dim(format!(
+                                    "[btw queue full — dropped oldest: {dropped}]"
+                                ));
+                            }
+                            log.push_dim("[/btw queued — answers at the next step]");
+                            view.follow = true;
                         } else if line.starts_with('/') || line.starts_with('!') {
                             log.push_dim("[commands don't queue — wait for the model to finish]");
                         } else {
@@ -2533,22 +2637,29 @@ mod tests {
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
 
-    /// Engine that plays back canned replies in order.
-    #[derive(Debug)]
+    /// Engine that plays back canned replies in order. Records the prompt of
+    /// every generate call in `prompts` (shared, so tests can inspect it
+    /// after the engine moves into the Agent) and reports the pass at index
+    /// `interrupt_at` as user-interrupted.
+    #[derive(Debug, Default)]
     struct ScriptedEngine {
         replies: Vec<String>,
         next: usize,
+        prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        interrupt_at: Option<usize>,
     }
 
     impl Engine for ScriptedEngine {
         fn generate(
             &mut self,
-            _transcript: &str,
+            transcript: &str,
             _opts: &crate::engine::GenerationOptions,
             _interrupt: &dyn Fn() -> bool,
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            self.prompts.lock().unwrap().push(transcript.to_owned());
+            let interrupted = self.interrupt_at == Some(self.next);
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
             // Stream in small chunks to exercise partial-marker handling.
@@ -2561,11 +2672,231 @@ mod tests {
                 on_event(EngineEvent::Text(reply[i..end].to_string()));
                 i = end;
             }
-            Ok(GenerationStats::default())
+            Ok(GenerationStats {
+                interrupted,
+                ..GenerationStats::default()
+            })
         }
         fn ctx_size(&self) -> i32 {
             100_000
         }
+    }
+
+    /// Builds an Agent over a scripted engine with the standard test fields.
+    fn test_agent<'a>(
+        dir: &std::path::Path,
+        engine: ScriptedEngine,
+        cfg: &'a crate::config::AgentConfig,
+    ) -> Agent<'a> {
+        Agent {
+            engine: Box::new(engine),
+            cfg,
+            session: Session::new(),
+            store: SessionStore::open(dir).unwrap(),
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+        }
+    }
+
+    fn test_cfg() -> crate::config::AgentConfig {
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        cfg
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn btw_question_parses_btw_and_side_with_boundaries() {
+        assert_eq!(btw_question("/btw what is x?"), Some("what is x?"));
+        assert_eq!(btw_question("/side  why?"), Some("why?"));
+        assert_eq!(btw_question("/btw: colon form"), Some("colon form"));
+        assert_eq!(btw_question("/btwfoo nope"), None);
+        assert_eq!(btw_question("/btw"), None);
+        assert_eq!(btw_question("/btw   "), None);
+        assert_eq!(btw_question("plain text"), None);
+    }
+
+    #[test]
+    fn btw_drain_leaves_transcript_untouched() {
+        let dir = scratch_dir("btw-clean");
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec!["It is 42.\n".to_string()],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("main question"));
+        agent.session.push(Message::assistant("main answer"));
+        agent.last_ctx_used = 1234;
+        let before = agent.session.transcript.clone();
+
+        let shared = TurnShared::default();
+        shared.push_btw("what was the answer?".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+        drop(tx);
+
+        assert_eq!(agent.session.transcript.len(), before.len());
+        assert_eq!(agent.last_ctx_used, 1234);
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].contains("side question"), "framing missing");
+        assert!(recorded[0].contains("what was the answer?"));
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::UserEcho(t) if t == "/btw what was the answer?"))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t == "[btw]"))
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, UiEvent::Dim(t) if t.contains("not part of the conversation"))
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn btw_denies_tools() {
+        let dir = scratch_dir("btw-tools");
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo nope</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![stanza.to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("main"));
+        let before = agent.session.transcript.len();
+
+        let shared = TurnShared::default();
+        shared.push_btw("run something".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+        drop(tx);
+
+        // No dispatch and no tool result: transcript untouched.
+        assert_eq!(agent.session.transcript.len(), before);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events.iter().any(
+                |e| matches!(e, UiEvent::Dim(t) if t.contains("tools are disabled during /btw"))
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn btw_answers_at_mid_turn_boundary_and_stays_out_of_main_prompts() {
+        let dir = scratch_dir("btw-boundary");
+        let stanza = concat!(
+            "Working.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                stanza.to_string(),
+                "The answer is 7.\n".to_string(), // side answer at the boundary
+                "Done.\n".to_string(),            // main continuation
+            ],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+
+        let shared = TurnShared::default();
+        shared.push_btw("what is 3+4?".to_owned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(recorded.len(), 3, "main, side, main continuation");
+        // The side prompt sees the completed pass (stanza already in the
+        // transcript) but runs before the tool dispatch.
+        assert!(recorded[1].contains("what is 3+4?"));
+        assert!(recorded[1].contains("Working."));
+        assert!(!recorded[1].contains("<tool_result>"));
+        // The main continuation never sees the side exchange.
+        assert!(recorded[2].contains("<tool_result>"));
+        assert!(!recorded[2].contains("what is 3+4?"));
+        assert!(!recorded[2].contains("The answer is 7."));
+        // Nothing side-channel entered the session.
+        let flat: String = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.as_str())
+            .collect();
+        assert!(!flat.contains("what is 3+4?"));
+        assert!(!flat.contains("The answer is 7."));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn btw_interrupt_flushes_remaining_queue() {
+        let dir = scratch_dir("btw-flush");
+        let engine = ScriptedEngine {
+            replies: vec!["partial".to_string()],
+            interrupt_at: Some(0),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("main"));
+        agent.last_ctx_used = 77;
+
+        let shared = TurnShared::default();
+        shared.push_btw("first".to_owned());
+        shared.push_btw("second".to_owned());
+        shared.push_btw("third".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+        drop(tx);
+
+        assert!(shared.pop_btw().is_none(), "queue must be flushed");
+        assert_eq!(agent.last_ctx_used, 77);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t == "[btw queue cleared: 2]"))
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -2578,7 +2909,7 @@ mod tests {
                 "<｜DSML｜tool_calls><b>".to_string(),
                 "Understood.\n".to_string(),
             ],
-            next: 0,
+            ..ScriptedEngine::default()
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
@@ -2630,7 +2961,7 @@ mod tests {
         );
         let engine = ScriptedEngine {
             replies: vec![stanza.to_string(), "There are 42 tests.\n".to_string()],
-            next: 0,
+            ..ScriptedEngine::default()
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
@@ -2693,7 +3024,7 @@ mod tests {
                 stanza.to_string(),
                 "The command printed plank-e2e.\n".to_string(),
             ],
-            next: 0,
+            ..ScriptedEngine::default()
         };
         let cfg = crate::config::AgentConfig::default();
         let store = SessionStore::open(&dir).unwrap();
@@ -2741,7 +3072,7 @@ mod tests {
         );
         let engine = ScriptedEngine {
             replies: vec![stanza.to_string(), "Done.\n".to_string()],
-            next: 0,
+            ..ScriptedEngine::default()
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;

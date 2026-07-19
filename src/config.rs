@@ -305,7 +305,8 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/skills"
             | "/hooks" // /btw is disabled together with image pasting until the model-format
                        // investigation lands (same experimental gate as IMAGES_ENABLED).
-    ) || (cfg!(feature = "images") && slash_command_with_args(cmd, "/btw"))
+    ) || (cfg!(feature = "images")
+        && (slash_command_with_args(cmd, "/btw") || slash_command_with_args(cmd, "/side")))
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/resume")

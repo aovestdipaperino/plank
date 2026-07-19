@@ -2,10 +2,25 @@
 
 Design document for finishing plank's `/btw` feature, modeled as closely as
 possible on OpenClaw's `/btw` (docs.openclaw.ai/tools/btw), the most complete
-open-source implementation of the pattern. Status: **proposal** — the current
-code ships a synchronous, between-turns-only `/btw` gated behind the `images`
-experimental flag; a mid-turn live-prompt version was landed in `433fcb6` and
-reverted in `bd0adbd`.
+open-source implementation of the pattern. OpenClaw is vendored as a reference
+submodule at `refs/openclaw` (`shallow`/`update=none`: CI skips it; fetch with
+`git submodule update --init --checkout refs/openclaw`).
+
+Status: **implemented (steps 1–4), still gated.** §4's mechanics landed on the
+#12 worker-thread architecture instead of the reverted `433fcb6` event-drain:
+the busy UI loop queues `/btw <q>` / `/side <q>` into `TurnShared` (FIFO cap
+20, drop-oldest — OpenClaw's bounded-buffer policy), and the worker answers at
+generation boundaries via `Agent::drain_btw` (interrupt flushes the queue;
+errors log and continue; `last_ctx_used` restored on every path). Deviations:
+queue depth is a dim notice on push rather than a status-bar field, and plain
+(non-`/btw`) lines typed while busy queue into the *main* conversation — that
+shipped with #12 as the C's `queued_user_drain`, superseding §4.4's
+"stays in the buffer".
+
+§4.8 as written is impossible: the C reference contains **no** btw framing
+(`btw_user_message` came from Claude Code's pattern, not `ds4_agent.c`), so no
+parity fixture can settle the model-format question. Un-gating still waits on
+#18's real-engine validation of the framing.
 
 ## 1. Goal
 
