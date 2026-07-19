@@ -10,6 +10,12 @@ keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
 exclude = ["assets/*", "ds4-ref/*", "*.gguf", "ds4flash.gguf"]
 
+[features]
+# Image pasting (Cmd-V clipboard images, image file paths) is disabled until
+# the model's handling of image-file references is understood; build with
+# `--features images` to re-enable.
+images = []
+
 [dependencies]
 libc = "0.2"
 ratatui = "0.29"
