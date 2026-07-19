@@ -24,9 +24,16 @@
 //! msg <user|assistant> <byte-len>
 //! <message bytes>
 //! ...
+//! meta <tag-byte-len> <last-prompt-byte-len>
+//! <tag bytes>
+//! <last prompt bytes>
 //! ```
 //!
 //! Length prefixes make message bodies unambiguous regardless of content.
+//! The trailing `meta` record duplicates listing metadata (tag, clipped last
+//! user prompt) at the end of the file so `list()` can read it with a
+//! bounded tail read instead of parsing the whole transcript; files written
+//! before it existed simply lack the record.
 
 use std::error::Error;
 use std::fmt::{self, Write as _};
@@ -176,6 +183,8 @@ pub struct Session {
     pub title: String,
     /// Creation time in unix seconds; 0 until the first save.
     pub created_at: u64,
+    /// User-assigned tag shown in listings (`/tag`); empty when unset.
+    pub tag: String,
     /// Alternating role-tagged messages.
     pub transcript: Vec<Message>,
     /// True when the transcript has unsaved changes.
@@ -190,6 +199,7 @@ impl Session {
             id: String::new(),
             title: String::new(),
             created_at: 0,
+            tag: String::new(),
             transcript: Vec::new(),
             dirty: false,
         }
@@ -227,6 +237,10 @@ pub struct SessionEntry {
     pub last_used: u64,
     /// Size of the session file in bytes.
     pub file_size: u64,
+    /// User-assigned tag; empty when unset.
+    pub tag: String,
+    /// Clipped last user prompt; empty for pre-meta files.
+    pub last_prompt: String,
     /// Full path of the session file.
     pub path: PathBuf,
 }
@@ -306,6 +320,12 @@ impl SessionStore {
             body.extend_from_slice(m.text.as_bytes());
             body.push(b'\n');
         }
+        let last_prompt = last_prompt_of(&session.transcript);
+        let _ = writeln!(body, "meta {} {}", session.tag.len(), last_prompt.len());
+        body.extend_from_slice(session.tag.as_bytes());
+        body.push(b'\n');
+        body.extend_from_slice(last_prompt.as_bytes());
+        body.push(b'\n');
 
         let path = self.path_for_id(&id);
         let tmp = self
@@ -390,21 +410,30 @@ impl SessionStore {
         let mut entries = Vec::new();
         for (id, path) in self.session_files()? {
             let file_size = fs::metadata(&path).map_or(0, |m| m.len());
-            let entry = match read_session_file(&path) {
-                Ok(s) => SessionEntry {
-                    id,
-                    title: s.title,
-                    created_at: s.created_at,
-                    last_used: read_last_used(&path).unwrap_or(s.created_at),
-                    file_size,
-                    path,
-                },
-                Err(_) => SessionEntry {
+            // Listing metadata comes from bounded head + tail reads; the
+            // transcript itself is never parsed here.
+            let entry = match read_head_meta(&path) {
+                Some((created_at, last_used, title)) => {
+                    let (tag, last_prompt) = read_meta_tail(&path).unwrap_or_default();
+                    SessionEntry {
+                        id,
+                        title,
+                        created_at,
+                        last_used,
+                        file_size,
+                        tag,
+                        last_prompt,
+                        path,
+                    }
+                }
+                None => SessionEntry {
                     id,
                     title: "(unreadable session)".to_owned(),
                     created_at: 0,
                     last_used: 0,
                     file_size,
+                    tag: String::new(),
+                    last_prompt: String::new(),
                     path,
                 },
             };
@@ -496,11 +525,19 @@ pub fn render_session_list(entries: &[SessionEntry], now: u64, color: bool) -> S
         };
         let age = format_age(when, now);
         let short = &e.id[..8.min(e.id.len())];
+        let tag = if e.tag.is_empty() {
+            String::new()
+        } else {
+            format!(" {dim}[{}{reset}{dim}]{reset}", e.tag)
+        };
         let _ = writeln!(
             out,
-            "{sha_on}{short}{reset} {dim}>{reset} {title_on}{}{reset}",
+            "{sha_on}{short}{reset} {dim}>{reset} {title_on}{}{reset}{tag}",
             e.title
         );
+        if !e.last_prompt.is_empty() {
+            let _ = writeln!(out, "         {dim}> last: {}{reset}", e.last_prompt);
+        }
         let _ = writeln!(
             out,
             "         {dim}> {age}, {:.2} MB{reset}\n",
@@ -801,15 +838,43 @@ fn unix_now() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// Reads only the `used` header of a session file.
-fn read_last_used(path: &Path) -> Option<u64> {
-    let mut buf = [0u8; 128];
+/// Reads (created, last-used, title) with a bounded head read; `None` when
+/// the header is malformed. Titles longer than the read window are clipped —
+/// acceptable for listings, which clip for display anyway.
+fn read_head_meta(path: &Path) -> Option<(u64, u64, String)> {
+    const HEAD_BYTES: usize = 8 * 1024;
+    let mut buf = vec![0u8; HEAD_BYTES];
     let mut f = fs::File::open(path).ok()?;
-    let n = f.read(&mut buf).ok()?;
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.lines()
-        .find_map(|l| l.strip_prefix("used "))
-        .and_then(|v| v.trim().parse().ok())
+    let mut n = 0;
+    while n < buf.len() {
+        match f.read(&mut buf[n..]) {
+            Ok(0) => break,
+            Ok(read) => n += read,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
+    let buf = &buf[..n];
+    let mut lines = buf.split(|&b| b == b'\n');
+    if lines.next().map(String::from_utf8_lossy).as_deref() != Some(MAGIC) {
+        return None;
+    }
+    let field = |lines: &mut std::slice::Split<'_, u8, _>, prefix: &str| -> Option<u64> {
+        let line = String::from_utf8_lossy(lines.next()?).into_owned();
+        line.strip_prefix(prefix)?.trim().parse().ok()
+    };
+    let created = field(&mut lines, "created ")?;
+    let used = field(&mut lines, "used ")?;
+    let title_len = usize::try_from(field(&mut lines, "title ")?).ok()?;
+    // Offset of the title body: the four header lines plus their newlines.
+    let offset = buf
+        .split_inclusive(|&b| b == b'\n')
+        .take(4)
+        .map(<[u8]>::len)
+        .sum::<usize>();
+    let end = (offset + title_len).min(buf.len());
+    let title = String::from_utf8_lossy(&buf[offset..end]).into_owned();
+    Some((created, used, title))
 }
 
 fn corrupt() -> SessionError {
@@ -854,8 +919,19 @@ fn read_session_file(path: &Path) -> Result<Session> {
     let title = take(&data, &mut pos, title_len)?;
 
     let mut transcript = Vec::new();
+    let mut tag = String::new();
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
+        // Trailing metadata record: tag + clipped last prompt (derived, so
+        // only the tag is carried into the session).
+        if let Some(rest) = header.strip_prefix("meta ") {
+            let (tag_len, last_len) = rest.split_once(' ').ok_or_else(corrupt)?;
+            let tag_len: usize = tag_len.parse().map_err(|_| corrupt())?;
+            let last_len: usize = last_len.parse().map_err(|_| corrupt())?;
+            tag = take(&data, &mut pos, tag_len)?;
+            let _last = take(&data, &mut pos, last_len)?;
+            continue;
+        }
         let rest = header.strip_prefix("msg ").ok_or_else(corrupt)?;
         let (role, len) = rest.split_once(' ').ok_or_else(corrupt)?;
         let role = match role {
@@ -872,9 +948,132 @@ fn read_session_file(path: &Path) -> Result<Session> {
         id: String::new(),
         title,
         created_at,
+        tag,
         transcript,
         dirty: false,
     })
+}
+
+/// Clipped, single-line form of the newest real (non-tool-result) user
+/// prompt, for the listing metadata trailer.
+fn last_prompt_of(transcript: &[Message]) -> String {
+    let text = transcript
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User && !m.is_tool_user())
+        .map(|m| m.text.as_str())
+        .unwrap_or_default();
+    let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    title_clip(first_line.trim(), 120)
+}
+
+/// Reads the trailing `meta` record with a bounded tail read; `None` for
+/// files predating the record (or when validation fails).
+///
+/// Message bodies can contain `\nmeta ` lines, so candidates are scanned
+/// from the end and accepted only when their declared lengths land exactly
+/// on end-of-file.
+fn read_meta_tail(path: &Path) -> Option<(String, String)> {
+    const TAIL_BYTES: u64 = 8 * 1024;
+    let mut f = fs::File::open(path).ok()?;
+    let file_len = f.metadata().ok()?.len();
+    let start = file_len.saturating_sub(TAIL_BYTES);
+    let mut buf = Vec::new();
+    {
+        use std::io::Seek as _;
+        f.seek(io::SeekFrom::Start(start)).ok()?;
+        f.read_to_end(&mut buf).ok()?;
+    }
+    let mut search_end = buf.len();
+    while let Some(at) = buf[..search_end].windows(5).rposition(|w| w == b"meta ") {
+        // A candidate at buffer offset 0 is only a real line start when the
+        // read began at the file start.
+        let line_start = if at == 0 {
+            start == 0
+        } else {
+            buf[at - 1] == b'\n'
+        };
+        if line_start && let Some(parsed) = parse_meta_at(&buf, at) {
+            return Some(parsed);
+        }
+        if at == 0 {
+            break;
+        }
+        search_end = at;
+    }
+    None
+}
+
+/// Parses a `meta` record starting at `at`, requiring it to end exactly at
+/// the end of `buf` (which is the end of the file).
+fn parse_meta_at(buf: &[u8], at: usize) -> Option<(String, String)> {
+    let rest = &buf[at..];
+    let nl = rest.iter().position(|&b| b == b'\n')?;
+    let header = std::str::from_utf8(&rest[..nl]).ok()?;
+    let (tag_len, last_len) = header.strip_prefix("meta ")?.split_once(' ')?;
+    let (tag_len, last_len): (usize, usize) = (tag_len.parse().ok()?, last_len.parse().ok()?);
+    let body = &rest[nl + 1..];
+    if body.len() != tag_len + 1 + last_len + 1 {
+        return None;
+    }
+    if body[tag_len] != b'\n' || body[tag_len + 1 + last_len] != b'\n' {
+        return None;
+    }
+    let tag = std::str::from_utf8(&body[..tag_len]).ok()?.to_string();
+    let last = std::str::from_utf8(&body[tag_len + 1..tag_len + 1 + last_len])
+        .ok()?
+        .to_string();
+    Some((tag, last))
+}
+
+/// Renders the `/resume` picker: the most recent sessions, numbered, with
+/// tag and last prompt. `entries` must already be sorted most recent first
+/// (as [`SessionStore::list`] returns them).
+#[must_use]
+pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit: usize) -> String {
+    if entries.is_empty() {
+        return "no saved sessions to resume\n".to_owned();
+    }
+    let (num_on, title_on, help_on, dim, reset) = if color {
+        (
+            "\x1b[1;96m",
+            "\x1b[1;97m",
+            "\x1b[97m",
+            "\x1b[90m",
+            "\x1b[0m",
+        )
+    } else {
+        ("", "", "", "", "")
+    };
+    let mut out = String::new();
+    for (i, e) in entries.iter().take(limit).enumerate() {
+        let when = if e.last_used != 0 {
+            e.last_used
+        } else {
+            e.created_at
+        };
+        let tag = if e.tag.is_empty() {
+            String::new()
+        } else {
+            format!(" {dim}[{}]{reset}", e.tag)
+        };
+        let _ = writeln!(
+            out,
+            "{num_on}{:>2}.{reset} {title_on}{}{reset}{tag} {dim}({}, {}){reset}",
+            i + 1,
+            e.title,
+            format_age(when, now),
+            &e.id[..8.min(e.id.len())]
+        );
+        if !e.last_prompt.is_empty() {
+            let _ = writeln!(out, "     {dim}last: {}{reset}", e.last_prompt);
+        }
+    }
+    let _ = writeln!(
+        out,
+        "{help_on}Use /resume <number> (or a sha prefix) to continue a session.{reset}"
+    );
+    out
 }
 
 /// Hex-encoded SHA-1 of `data` (std-only implementation).
@@ -981,6 +1180,78 @@ mod tests {
         s.push(Message::user("follow-up"));
         assert_eq!(store.save(&mut s).unwrap(), id);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn meta_trailer_round_trips_and_lists_without_full_parse() {
+        let dir = temp_dir("meta");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("Fix the flaky test in ci.rs"));
+        s.push(Message::assistant("Looking.\n"));
+        // Adversarial body: contains a fake meta record that must not be
+        // picked up by the tail reader (it does not end at EOF).
+        s.push(Message::user(
+            "<tool_result>\nmeta 3 4\nabc\nwxyz\n</tool_result>",
+        ));
+        s.push(Message::assistant("Done."));
+        "wip".clone_into(&mut s.tag);
+        let id = store.save(&mut s).unwrap();
+
+        // Tail reader finds the real trailer.
+        let path = store.path_for_id(&id);
+        let (tag, last) = read_meta_tail(&path).unwrap();
+        assert_eq!(tag, "wip");
+        assert_eq!(last, "Fix the flaky test in ci.rs");
+
+        // Head reader agrees with the full parse.
+        let (created, _used, title) = read_head_meta(&path).unwrap();
+        assert_eq!(created, s.created_at);
+        assert_eq!(title, s.title);
+
+        // Loading round-trips the tag and the exact transcript.
+        let loaded = store.load(&id[..8]).unwrap();
+        assert_eq!(loaded.tag, "wip");
+        assert_eq!(loaded.transcript, s.transcript);
+
+        // Listing carries the new metadata.
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tag, "wip");
+        assert_eq!(entries[0].last_prompt, "Fix the flaky test in ci.rs");
+
+        // Pre-meta files (no trailer) still list, with empty metadata.
+        let raw = fs::read_to_string(&path).unwrap();
+        let stripped = raw[..=raw.rfind("\nmeta ").unwrap()].to_string();
+        fs::write(&path, stripped).unwrap();
+        let entries = store.list().unwrap();
+        assert_eq!(entries[0].tag, "");
+        assert_eq!(entries[0].last_prompt, "");
+        assert_eq!(entries[0].title, s.title);
+        assert!(store.load(&id[..8]).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_list_renders_numbers_tags_and_last_prompt() {
+        let entries = vec![SessionEntry {
+            id: "a".repeat(40),
+            title: "Fix CI".to_string(),
+            created_at: 100,
+            last_used: 100,
+            file_size: 2048,
+            tag: "wip".to_string(),
+            last_prompt: "rerun the tests".to_string(),
+            path: PathBuf::new(),
+        }];
+        let out = render_resume_list(&entries, 100, false, 10);
+        assert!(out.contains(" 1. Fix CI [wip]"), "got: {out}");
+        assert!(out.contains("last: rerun the tests"), "got: {out}");
+        assert!(out.contains("Use /resume <number>"), "got: {out}");
+        assert_eq!(
+            render_resume_list(&[], 0, false, 10),
+            "no saved sessions to resume\n"
+        );
     }
 
     #[test]
@@ -1129,6 +1400,8 @@ mod tests {
             created_at: 100,
             last_used: 100,
             file_size: 2048,
+            tag: String::new(),
+            last_prompt: String::new(),
             path: PathBuf::from("/x"),
         }];
         let out = render_session_list(&entries, 160, false);

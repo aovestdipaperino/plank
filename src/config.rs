@@ -307,6 +307,9 @@ pub fn slash_command_known(cmd: &str) -> bool {
                        // investigation lands (same experimental gate as IMAGES_ENABLED).
     ) || (cfg!(feature = "images") && slash_command_with_args(cmd, "/btw"))
         || slash_command_with_args(cmd, "/subagent")
+        || slash_command_with_args(cmd, "/remember")
+        || slash_command_with_args(cmd, "/resume")
+        || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")

@@ -22,6 +22,8 @@ pub struct ContextContent {
     pub git_content: Option<String>,
     /// AGENTS.md content (if found).
     pub agents_md_content: Option<String>,
+    /// Persistent memory section (if any memory file has content).
+    pub memory_content: Option<String>,
     /// Current date context line.
     pub date_content: String,
 }
@@ -32,11 +34,15 @@ impl ContextContent {
     pub fn new() -> Self {
         let git_content = fetch_git_context();
         let agents_md_content = discover_agents_md_files();
+        let memory_content = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::memory::load_default(&cwd));
         let date_content = date_context_line();
 
         Self {
             git_content,
             agents_md_content,
+            memory_content,
             date_content,
         }
     }
@@ -57,6 +63,11 @@ impl ContextContent {
             out.push('\n');
         }
 
+        if let Some(memory) = &self.memory_content {
+            out.push_str(memory);
+            out.push('\n');
+        }
+
         out.push_str(&self.date_content);
 
         out
@@ -70,6 +81,8 @@ pub struct ContextTokens {
     pub git: i32,
     /// Tokens from AGENTS.md files.
     pub agents_md: i32,
+    /// Tokens from persistent memory files.
+    pub memory: i32,
     /// Tokens from date context line.
     pub date: i32,
     /// Total context tokens.
@@ -84,12 +97,14 @@ impl ContextTokens {
     {
         let git = content.git_content.as_deref().map_or(0, &mut counter);
         let agents_md = content.agents_md_content.as_deref().map_or(0, &mut counter);
+        let memory = content.memory_content.as_deref().map_or(0, &mut counter);
         let date = counter(&content.date_content);
-        let total = git + agents_md + date;
+        let total = git + agents_md + memory + date;
 
         Self {
             git,
             agents_md,
+            memory,
             date,
             total,
         }
@@ -339,12 +354,14 @@ mod tests {
         let content = ContextContent {
             git_content: Some("Git info".to_string()),
             agents_md_content: Some("AGENTS.md content".to_string()),
+            memory_content: Some("Persistent memory: prefers tabs".to_string()),
             date_content: "Today's date is 2026-01-01.".to_string(),
         };
 
         let combined = content.combined();
         assert!(combined.contains("Git info"));
         assert!(combined.contains("AGENTS.md content"));
+        assert!(combined.contains("Persistent memory: prefers tabs"));
         assert!(combined.contains("Today's date is 2026-01-01."));
     }
 
@@ -353,14 +370,16 @@ mod tests {
         let content = ContextContent {
             git_content: Some("git".to_string()),
             agents_md_content: Some("agents".to_string()),
+            memory_content: Some("mem".to_string()),
             date_content: "date".to_string(),
         };
 
         let tokens = ContextTokens::count(&content, |s| i32::try_from(s.len()).unwrap());
         assert_eq!(tokens.git, 3);
         assert_eq!(tokens.agents_md, 6);
+        assert_eq!(tokens.memory, 3);
         assert_eq!(tokens.date, 4);
-        assert_eq!(tokens.total, 13);
+        assert_eq!(tokens.total, 16);
     }
 
     #[test]
@@ -368,6 +387,7 @@ mod tests {
         let content = ContextContent {
             git_content: None,
             agents_md_content: None,
+            memory_content: None,
             date_content: "date".to_string(),
         };
 

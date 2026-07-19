@@ -208,6 +208,8 @@ struct Agent<'a> {
 
 /// Default number of user turns replayed by `/history`.
 const HISTORY_DEFAULT_TURNS: usize = 3;
+/// Sessions shown by the /resume picker.
+const RESUME_LIST_LIMIT: usize = 10;
 /// Maximum user turns `/history` accepts.
 const HISTORY_MAX_TURNS: usize = 200;
 
@@ -560,6 +562,7 @@ impl Agent<'_> {
         const COL_MCP: &str = "\x1b[38;5;44m";
         const COL_MSG: &str = "\x1b[38;5;134m";
         const COL_CONTEXT: &str = "\x1b[38;5;208m";
+        const COL_MEMORY: &str = "\x1b[38;5;114m";
         const COL_FREE: &str = "\x1b[38;5;240m";
         let paint = |col: &'static str| if color { col } else { "" };
         let reset = if color { ANSI_RESET } else { "" };
@@ -589,9 +592,11 @@ impl Agent<'_> {
         // AGENTS.md gets its own category; git and date context stay grouped
         // under Messages (they are part of the injected first user message).
         let agents_md_tokens = context_tokens.agents_md;
-        let mut message_tokens = raw_message_tokens - agents_md_tokens;
+        let memory_tokens = context_tokens.memory;
+        let mut message_tokens = raw_message_tokens - agents_md_tokens - memory_tokens;
 
-        let estimated = system_tokens + mcp_tokens + message_tokens + agents_md_tokens;
+        let estimated =
+            system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens;
         if self.last_ctx_used > estimated && estimated > 0 {
             let scale = |t: i32| {
                 i32::try_from(i64::from(t) * i64::from(self.last_ctx_used) / i64::from(estimated))
@@ -602,7 +607,8 @@ impl Agent<'_> {
             message_tokens = scale(message_tokens);
         }
 
-        let used = (system_tokens + mcp_tokens + message_tokens + agents_md_tokens).min(ctx_size);
+        let used = (system_tokens + mcp_tokens + message_tokens + agents_md_tokens + memory_tokens)
+            .min(ctx_size);
         let free = ctx_size - used;
         let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
 
@@ -615,6 +621,10 @@ impl Agent<'_> {
 
         if agents_md_tokens > 0 {
             categories.push(("AGENTS.md", agents_md_tokens, COL_CONTEXT));
+        }
+
+        if memory_tokens > 0 {
+            categories.push(("Memory", memory_tokens, COL_MEMORY));
         }
 
         categories.push(("Messages", message_tokens, COL_MSG));
@@ -840,6 +850,43 @@ impl Agent<'_> {
                 Ok(id) => println!("deleted session {}", &id[..8]),
                 Err(e) => println!("delete failed: {e}"),
             },
+            "/resume" => match self.resume_pick(arg) {
+                Ok(None) => match self.store.list() {
+                    Ok(entries) => print!(
+                        "{}",
+                        crate::session::render_resume_list(
+                            &entries,
+                            now_secs(),
+                            self.color,
+                            RESUME_LIST_LIMIT
+                        )
+                    ),
+                    Err(e) => println!("resume failed: {e}"),
+                },
+                Ok(Some(s)) => {
+                    print!(
+                        "{}",
+                        crate::session::render_history(&s.transcript, 6, self.color)
+                    );
+                    self.session = s;
+                    self.last_ctx_used = 0;
+                }
+                Err(e) => println!("resume failed: {e}"),
+            },
+            "/tag" => {
+                if arg.is_empty() {
+                    if self.session.tag.is_empty() {
+                        println!("no tag set; usage: /tag <text> (\"/tag -\" clears)");
+                    } else {
+                        println!("tag: {}", self.session.tag);
+                    }
+                } else {
+                    match self.set_tag(arg) {
+                        Ok(msg) => println!("{msg}"),
+                        Err(e) => println!("tag failed: {e}"),
+                    }
+                }
+            }
             "/history" => {
                 let turns = if arg.is_empty() {
                     HISTORY_DEFAULT_TURNS
@@ -890,6 +937,13 @@ impl Agent<'_> {
                     self.btw_plain(arg)?;
                 }
             }
+            "/remember" => match remember_from_arg(&self.tool_ctx.cwd, arg) {
+                Ok(path) => println!(
+                    "{}",
+                    self.debug_line(&format!("[saved to {}]", path.display()))
+                ),
+                Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
+            },
             "/subagent" => {
                 if arg.is_empty() {
                     println!("usage: /subagent <task>");
@@ -927,6 +981,48 @@ impl Agent<'_> {
     /// nothing pushed to the session. The next real turn's KV sync reuses
     /// the still-matching prefix and re-prefills past the divergence, so the
     /// side question rolls back automatically.
+    /// Resolves a `/resume` argument: `Ok(None)` for an empty argument (show
+    /// the picker), otherwise the loaded session — a small number picks from
+    /// the recency-sorted listing, anything else is a sha prefix.
+    fn resume_pick(&self, arg: &str) -> Result<Option<Session>, String> {
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(n) = arg.parse::<usize>() {
+            let entries = self.store.list().map_err(|e| e.to_string())?;
+            let entry = entries
+                .get(n.wrapping_sub(1))
+                .ok_or_else(|| format!("no session number {n} (see /resume)"))?;
+            return self
+                .store
+                .load(&entry.id)
+                .map(Some)
+                .map_err(|e| e.to_string());
+        }
+        self.store.load(arg).map(Some).map_err(|e| e.to_string())
+    }
+
+    /// Sets (or with `-` clears) the session tag, re-saving immediately when
+    /// the session was already saved so listings pick it up.
+    fn set_tag(&mut self, arg: &str) -> Result<String, String> {
+        let tag = if arg == "-" { "" } else { arg.trim() };
+        tag.clone_into(&mut self.session.tag);
+        self.session.dirty = true;
+        let mut msg = if tag.is_empty() {
+            "tag cleared".to_string()
+        } else {
+            format!("tag set: {tag}")
+        };
+        if !self.session.id.is_empty() {
+            self.store
+                .save(&mut self.session)
+                .map_err(|e| e.to_string())?;
+            msg.push_str(" (saved)");
+        }
+        Ok(msg)
+    }
+
     /// Starts a `/subagent` fork: appends the framed task to the live
     /// transcript and returns the pre-fork length for later truncation. The
     /// fork inherits the parent transcript prefix, so the engine's per-turn
@@ -995,6 +1091,18 @@ impl Agent<'_> {
         let skill = self.skills.iter().find(|s| s.name == name)?;
         Some(crate::skills::render(skill, arg))
     }
+}
+
+/// Parses `/remember [user] <text>` and appends to the right memory scope:
+/// a leading `user` word selects the user file, everything else lands in the
+/// project file.
+fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::PathBuf, String> {
+    let arg = arg.trim();
+    let (scope, text) = match arg.split_once(char::is_whitespace) {
+        Some(("user", rest)) => (crate::memory::Scope::User, rest),
+        _ => (crate::memory::Scope::Project, arg),
+    };
+    crate::memory::remember(scope, cwd, text, &crate::context::current_local_iso_date())
 }
 
 /// Result of one TUI generation pass.
@@ -1861,6 +1969,37 @@ impl Agent<'_> {
                 Ok(id) => log.push_plain(format!("deleted session {}", &id[..8])),
                 Err(e) => log.push_plain(format!("delete failed: {e}")),
             },
+            "/resume" => match self.resume_pick(arg) {
+                Ok(None) => match self.store.list() {
+                    Ok(entries) => log.push_ansi(&crate::session::render_resume_list(
+                        &entries,
+                        now_secs(),
+                        true,
+                        RESUME_LIST_LIMIT,
+                    )),
+                    Err(e) => log.push_plain(format!("resume failed: {e}")),
+                },
+                Ok(Some(s)) => {
+                    log.push_ansi(&crate::session::render_history(&s.transcript, 6, true));
+                    self.session = s;
+                    self.last_ctx_used = 0;
+                }
+                Err(e) => log.push_plain(format!("resume failed: {e}")),
+            },
+            "/tag" => {
+                if arg.is_empty() {
+                    if self.session.tag.is_empty() {
+                        log.push_plain("no tag set; usage: /tag <text> (\"/tag -\" clears)");
+                    } else {
+                        log.push_plain(format!("tag: {}", self.session.tag));
+                    }
+                } else {
+                    match self.set_tag(arg) {
+                        Ok(msg) => log.push_plain(msg),
+                        Err(e) => log.push_plain(format!("tag failed: {e}")),
+                    }
+                }
+            }
             "/history" => {
                 let turns = if arg.is_empty() {
                     HISTORY_DEFAULT_TURNS
@@ -1913,6 +2052,13 @@ impl Agent<'_> {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
+            "/remember" => match remember_from_arg(&self.tool_ctx.cwd, arg) {
+                Ok(path) => log.push_dim(format!("[saved to {}]", path.display())),
+                Err(e) => {
+                    log.push_plain(e);
+                    log.push_plain("usage: /remember [user] <text> (default scope: project)");
+                }
+            },
             "/subagent" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /subagent <task>");

@@ -20,6 +20,7 @@ pub mod hooks;
 pub mod imagepaste;
 pub mod interrupt;
 pub mod logo;
+pub mod memory;
 pub mod render;
 pub mod sandbox;
 pub mod session;
