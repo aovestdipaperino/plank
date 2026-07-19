@@ -8,8 +8,15 @@ each maps onto plank's existing invariants: the narrow `Engine` boundary
 byte-parity DS4 system prompt, and the single streaming path through
 `viz::StreamRenderer`.
 
-Status: **proposed, unimplemented.** No code exists yet; `make_engine`
-(`src/main.rs:102`) builds only `Ds4Engine` (macOS, cfg-gated) or `EchoEngine`.
+Status: **flavor (a) implemented** (steps 1–4 of §5); flavor (b) not yet started.
+`make_engine` (`src/main.rs`) now selects `RemoteDs4Engine` when `--remote URL`
+is given (all platforms), and `plank serve` hosts any `Engine` (the Metal
+`Ds4Engine` on a real box, `EchoEngine` elsewhere) over HTTP+SSE. The sync
+`ureq` client matches the synchronous `Engine` contract directly, so no async
+runtime is pulled in for flavor (a); the tokio bridge and structured-input
+boundary remain TODO for flavor (b) (see `src/remote/mod.rs`). Modules:
+`src/remote/{mod,proto,ds4_client}.rs`, `src/serve.rs`; tests in
+`tests/remote_ds4.rs` (mock server + real serve↔client round-trip on EchoEngine).
 
 ## 1. Goal
 

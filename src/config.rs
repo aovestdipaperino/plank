@@ -57,6 +57,13 @@ pub struct AgentConfig {
     pub sandbox_override: Option<bool>,
     /// Native-engine tuning knobs (MTP, SSD streaming, steering, ...).
     pub engine: EngineTuning,
+    /// Remote plank host from `--remote URL` (flavor a, issue #26); selects
+    /// [`crate::remote::ds4_client::RemoteDs4Engine`] instead of a local engine.
+    pub remote_url: Option<String>,
+    /// Bearer token for `--remote`, from `--remote-token` or `$PLANK_REMOTE_TOKEN`.
+    pub remote_token: Option<String>,
+    /// `--insecure`: allow plaintext `http://` to a non-loopback remote host.
+    pub insecure: bool,
 }
 
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
@@ -156,6 +163,9 @@ impl Default for AgentConfig {
             power_percent: 0,
             sandbox_override: None,
             engine: EngineTuning::default(),
+            remote_url: None,
+            remote_token: None,
+            insecure: false,
         }
     }
 }
@@ -189,6 +199,11 @@ Options:
       --dir-steering-file PATH      directional steering vectors
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
+      --remote URL         drive a remote `plank serve` host instead of a local
+                           engine (https://, or http:// to localhost); token via
+                           --remote-token or $PLANK_REMOTE_TOKEN
+      --remote-token TOK   bearer token for --remote
+      --insecure           allow plaintext http:// to a non-loopback --remote host
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
@@ -427,6 +442,9 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                 };
                 c.resume = Some(prefix);
             }
+            "--remote" => c.remote_url = Some(need_arg(&mut i)?.to_owned()),
+            "--remote-token" => c.remote_token = Some(need_arg(&mut i)?.to_owned()),
+            "--insecure" => c.insecure = true,
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -469,10 +487,32 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
         }
         i += 1;
     }
+    finalize(&mut c, steering_scale_set)?;
+    Ok(c)
+}
+
+/// Post-parse fixups: the steering-scale default and `--remote` validation.
+fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
     }
-    Ok(c)
+    let Some(url) = c.remote_url.clone() else {
+        return Ok(());
+    };
+    // --remote is mutually exclusive with the local model/backend selectors (§4.7).
+    if c.model_path.is_some() {
+        return Err("--remote cannot be combined with -m/--model".to_string());
+    }
+    if c.backend.is_some() {
+        return Err("--remote cannot be combined with --metal/--cuda/--cpu".to_string());
+    }
+    crate::remote::validate_remote_url(&url, c.insecure)?;
+    if c.remote_token.is_none() {
+        c.remote_token = std::env::var("PLANK_REMOTE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -681,6 +721,36 @@ mod tests {
         assert!(err.contains("positive count or <number>GB"));
         let err = parse_options(&args(&["--simulate-used-memory", "no"])).unwrap_err();
         assert!(err.contains("positive GiB value"));
+    }
+
+    #[test]
+    fn remote_flags_and_mutual_exclusion() {
+        let c = parse_options(&args(&[
+            "--remote",
+            "https://box:8080",
+            "--remote-token",
+            "s3cr",
+        ]))
+        .unwrap();
+        assert_eq!(c.remote_url.as_deref(), Some("https://box:8080"));
+        assert_eq!(c.remote_token.as_deref(), Some("s3cr"));
+        // localhost http is allowed without --insecure.
+        assert!(parse_options(&args(&["--remote", "http://localhost:9000"])).is_ok());
+        // non-loopback http requires --insecure.
+        let err = parse_options(&args(&["--remote", "http://box.example.com"])).unwrap_err();
+        assert!(
+            err.contains("--insecure") || err.contains("plaintext"),
+            "{err}"
+        );
+        assert!(
+            parse_options(&args(&["--remote", "http://box.example.com", "--insecure"])).is_ok()
+        );
+        // mutually exclusive with -m.
+        let err = parse_options(&args(&["--remote", "https://box", "-m", "x.gguf"])).unwrap_err();
+        assert!(err.contains("-m"), "{err}");
+        // mutually exclusive with a backend selector.
+        let err = parse_options(&args(&["--remote", "https://box", "--cpu"])).unwrap_err();
+        assert!(err.contains("--metal"), "{err}");
     }
 
     #[test]

@@ -11,6 +11,14 @@ use plank::status;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `plank serve ...` runs the flavor-(a) host instead of the interactive
+    // agent (issue #26). It reuses `make_engine`, so it hosts the real ds4
+    // engine on a Metal box and the EchoEngine stub elsewhere.
+    if args.first().map(String::as_str) == Some("serve") {
+        return run_serve(&args[1..]);
+    }
+
     let cfg = match parse_options(&args) {
         Ok(cfg) => cfg,
         Err(msg) => {
@@ -133,6 +141,16 @@ fn require_min_ram() -> Result<(), String> {
 /// Builds the inference engine: the real ds4 engine on macOS (from `-m` or the
 /// default `~/.plank/ds4flash.gguf`, downloading it if missing), else the stub.
 fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
+    // Remote engine (flavor a, issue #26) is available on every platform and
+    // takes precedence over the local selectors when `--remote` is given.
+    if let Some(url) = &cfg.remote_url {
+        use plank::remote::ds4_client::RemoteDs4Engine;
+        eprintln!("plank: connecting to remote engine {url}...");
+        let engine = RemoteDs4Engine::connect(url, cfg.remote_token.clone())
+            .map_err(|e| format!("remote connect: {e}"))?;
+        eprintln!("plank: remote engine ready: {}", engine.model_name());
+        return Ok(Box::new(engine));
+    }
     #[cfg(ds4_engine)]
     {
         use plank::config::Backend;
@@ -188,6 +206,58 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             ));
         }
         Ok(Box::new(EchoEngine::new(cfg.generation.ctx_size)))
+    }
+}
+
+/// Parses `plank serve` arguments and runs the host. Model/backend flags are
+/// forwarded to `make_engine` via a normal [`AgentConfig`]; `--listen`/`--token`
+/// are serve-specific.
+fn run_serve(args: &[String]) -> ExitCode {
+    use plank::serve::ServeConfig;
+
+    let mut listen = "127.0.0.1:8080".to_string();
+    let mut token = std::env::var("PLANK_REMOTE_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
+    let mut passthrough: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--listen" | "-l" if i + 1 < args.len() => {
+                listen.clone_from(&args[i + 1]);
+                i += 2;
+            }
+            "--token" if i + 1 < args.len() => {
+                token = Some(args[i + 1].clone());
+                i += 2;
+            }
+            other => {
+                passthrough.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let cfg = match parse_options(&passthrough) {
+        Ok(cfg) => cfg,
+        Err(msg) => {
+            eprintln!("plank serve: {msg}");
+            return ExitCode::from(2);
+        }
+    };
+    plank::interrupt::install();
+    let engine = match make_engine(&cfg) {
+        Ok(engine) => engine,
+        Err(e) => {
+            eprintln!("plank serve: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match plank::serve::run(engine, &ServeConfig { listen, token }) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("plank serve: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
