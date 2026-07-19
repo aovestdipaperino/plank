@@ -468,6 +468,43 @@ fn frame_rows(frame: &mut Frame, area: Rect, has_prompt: bool) -> (Rect, Rect, R
     }
 }
 
+/// Splits the resting-prompt input into styled spans so a valid command is
+/// highlighted live as the user types: a known `/command` token in theme green,
+/// and the `!` shell-escape marker in red. Anything else stays default-styled.
+///
+/// Validity mirrors dispatch: the green highlight appears only when the whole
+/// line parses as a known command ([`crate::config::slash_command_known`]), so
+/// partial (`/hel`) and unknown (`/nope`) inputs stay plain until complete.
+fn input_spans(input: &str) -> Vec<Span<'static>> {
+    // Shell escape (`!cmd`): only the `!` marker is colored, red; the shell
+    // command text after it stays plain (any non-empty command is "valid").
+    if let Some(rest) = input.strip_prefix('!') {
+        let mut spans = vec![Span::styled(
+            "!".to_string(),
+            Style::default().fg(Color::Red),
+        )];
+        if !rest.is_empty() {
+            spans.push(Span::raw(rest.to_string()));
+        }
+        return spans;
+    }
+    // Slash command: highlight the leading command token green, but only when
+    // the line as a whole is a known command invocation.
+    if input.starts_with('/') && crate::config::slash_command_known(input) {
+        let token_len = input.find(char::is_whitespace).unwrap_or(input.len());
+        let (cmd, rest) = input.split_at(token_len);
+        let mut spans = vec![Span::styled(
+            cmd.to_string(),
+            Style::default().fg(THEME_GREEN),
+        )];
+        if !rest.is_empty() {
+            spans.push(Span::raw(rest.to_string()));
+        }
+        return spans;
+    }
+    vec![Span::raw(input.to_string())]
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
@@ -494,7 +531,9 @@ pub fn draw(
         let prompt = crate::status::prompt_text();
         let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
         let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
-        let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
+        let mut spans = vec![prompt_span];
+        spans.extend(input_spans(input));
+        let input_line = Line::from(spans);
         frame.render_widget(Paragraph::new(input_line), input_row);
         let cursor_x = input_row.x + prompt_width + cursor_col;
         frame.set_cursor_position(Position::new(
@@ -592,7 +631,9 @@ pub fn draw_btw_split(
         let prompt = crate::status::prompt_text();
         let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
         let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
-        let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
+        let mut spans = vec![prompt_span];
+        spans.extend(input_spans(input));
+        let input_line = Line::from(spans);
         frame.render_widget(Paragraph::new(input_line), input_row);
         let cursor_x = input_row.x + prompt_width + cursor_col;
         frame.set_cursor_position(Position::new(
@@ -729,6 +770,65 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `(content, fg)` pairs for each span, for terse assertions.
+    fn parts(input: &str) -> Vec<(String, Option<Color>)> {
+        input_spans(input)
+            .into_iter()
+            .map(|s| (s.content.into_owned(), s.style.fg))
+            .collect()
+    }
+
+    #[test]
+    fn input_spans_highlights_known_slash_command_green() {
+        // A bare known command: whole token green.
+        assert_eq!(
+            parts("/help"),
+            vec![("/help".to_owned(), Some(THEME_GREEN))]
+        );
+        // Known command with args: only the token is green, the rest plain.
+        assert_eq!(
+            parts("/btw what is this"),
+            vec![
+                ("/btw".to_owned(), Some(THEME_GREEN)),
+                (" what is this".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            parts("/checkpoint before-refactor"),
+            vec![
+                ("/checkpoint".to_owned(), Some(THEME_GREEN)),
+                (" before-refactor".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_spans_leaves_partial_or_unknown_slash_plain() {
+        // Partial (not yet a full command) and unknown stay default-styled.
+        assert_eq!(parts("/hel"), vec![("/hel".to_owned(), None)]);
+        assert_eq!(parts("/nope"), vec![("/nope".to_owned(), None)]);
+        // A no-arg command given args is not a valid invocation: no highlight.
+        assert_eq!(parts("/help me"), vec![("/help me".to_owned(), None)]);
+    }
+
+    #[test]
+    fn input_spans_colors_only_the_bang_red() {
+        assert_eq!(
+            parts("!ls -la"),
+            vec![
+                ("!".to_owned(), Some(Color::Red)),
+                ("ls -la".to_owned(), None),
+            ]
+        );
+        // A lone `!` still colors the marker.
+        assert_eq!(parts("!"), vec![("!".to_owned(), Some(Color::Red))]);
+    }
+
+    #[test]
+    fn input_spans_plain_text_is_unstyled() {
+        assert_eq!(parts("hello world"), vec![("hello world".to_owned(), None)]);
+    }
 
     #[test]
     fn ansi_to_lines_parses_truecolor_cells() {
