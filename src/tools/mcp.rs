@@ -331,6 +331,9 @@ pub struct McpServer {
     pub name: String,
     /// Tools advertised at handshake time.
     pub tools: Vec<McpTool>,
+    /// Free-text usage instructions from the initialize response; empty when
+    /// the server provided none.
+    pub instructions: String,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -390,6 +393,7 @@ impl McpServer {
         Ok(Self {
             name: cfg.name.clone(),
             tools: Vec::new(),
+            instructions: String::new(),
             child,
             stdin,
             stdout,
@@ -507,7 +511,10 @@ impl McpServer {
     pub fn handshake(&mut self, primary_tools: Option<&[String]>) -> Result<(), String> {
         let init_params = "{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\
              \"clientInfo\":{\"name\":\"plank\",\"version\":\"1.0\"}}";
-        self.request("initialize", init_params)?;
+        let init_result = self.request("initialize", init_params)?;
+        // Servers may declare free-text usage guidance for their tools; it is
+        // injected into the system prompt alongside the schemas.
+        self.instructions = init_result.str_or("instructions", "").trim().to_string();
         if !self.notify("notifications/initialized") {
             return Err("failed to send notifications/initialized".to_string());
         }
@@ -766,6 +773,23 @@ pub fn append_tool_schemas(out: &mut String, servers: &[McpServer]) {
         }
     }
     out.push('\n');
+}
+
+/// Appends the `# MCP Server Instructions` block: one `## <server>` section
+/// per connected server that provided a non-empty `instructions` field in
+/// its initialize response. Emits nothing when no server did.
+pub fn append_server_instructions(out: &mut String, servers: &[McpServer]) {
+    let mut wrote_header = false;
+    for s in servers {
+        if s.instructions.is_empty() {
+            continue;
+        }
+        if !wrote_header {
+            out.push_str("\n# MCP Server Instructions\n\n");
+            wrote_header = true;
+        }
+        let _ = writeln!(out, "## {}\n{}\n", s.name, s.instructions);
+    }
 }
 
 // ============================================================================
@@ -1110,6 +1134,24 @@ mod tests {
     }
 
     #[test]
+    fn server_instructions_render_as_prompt_block() {
+        let mut s = make_split_server();
+        let mut out = String::new();
+        append_server_instructions(&mut out, std::slice::from_ref(&s));
+        assert!(out.is_empty(), "no instructions -> no block: {out:?}");
+        s.instructions = "Use alpha before omega.".to_string();
+        append_server_instructions(&mut out, std::slice::from_ref(&s));
+        assert!(
+            out.starts_with("\n# MCP Server Instructions\n\n"),
+            "{out:?}"
+        );
+        assert!(
+            out.contains("## demo\nUse alpha before omega.\n"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn end_to_end_against_scripted_stdio_server() {
         // A tiny shell MCP server: answers initialize, ignores the
         // notification, lists one echo tool, and echoes tool call arguments.
@@ -1117,7 +1159,7 @@ mod tests {
 while IFS= read -r line; do
   case "$line" in
     *'"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05"}}' ;;
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","instructions":"Prefer the echo tool for text round-trips."}}' ;;
     *'"tools/list"'*)
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo text.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}' ;;
     *'"tools/call"'*)
@@ -1141,6 +1183,10 @@ done
         assert_eq!(servers[0].tools.len(), 1);
         assert_eq!(servers[0].tools[0].name, "echo");
         assert!(servers[0].tools[0].primary);
+        assert_eq!(
+            servers[0].instructions,
+            "Prefer the echo tool for text round-trips."
+        );
 
         let call = ToolCall {
             name: "mcp__demo__echo".to_string(),

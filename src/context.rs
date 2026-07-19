@@ -10,6 +10,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MAX_STATUS_CHARS: usize = 2000;
 
 /// Categorized context with content and token counts.
+///
+/// **Cache-boundary rule** (docs/SYSTEM-PROMPT.md): everything collected here
+/// is per-session volatile and is injected as the session's *first user
+/// message*, never into the system prompt — the system prompt is what the
+/// `sysprompt.kv` KV snapshot fingerprints, and volatile bytes there would
+/// force a rebuild every launch.
 #[derive(Debug, Default, Clone)]
 pub struct ContextContent {
     /// Git context content (if in a git repo).
@@ -96,11 +102,24 @@ fn fetch_git_context() -> Option<String> {
         return None;
     }
 
-    let branch = git_current_branch()?;
-    let main_branch = git_main_branch();
-    let user_name = git_user_name();
-    let status = git_status();
-    let recent_commits = git_recent_commits();
+    // Fan the five independent git commands out in parallel so session-start
+    // latency is the slowest single command, not the sum. The composed block
+    // stays byte-identical to the sequential version.
+    let (branch, main_branch, user_name, status, recent_commits) = std::thread::scope(|s| {
+        let branch = s.spawn(git_current_branch);
+        let main_branch = s.spawn(git_main_branch);
+        let user_name = s.spawn(git_user_name);
+        let status = s.spawn(git_status);
+        let recent_commits = s.spawn(git_recent_commits);
+        (
+            branch.join().ok().flatten(),
+            main_branch.join().ok().flatten(),
+            user_name.join().ok().flatten(),
+            status.join().ok().flatten(),
+            recent_commits.join().ok().flatten(),
+        )
+    });
+    let branch = branch?;
 
     let mut out = String::from(
         "This is the git status at the start of the conversation. Note that this status is a snapshot in time, and will not update during the conversation.\n\n",

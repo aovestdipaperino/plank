@@ -80,6 +80,7 @@ pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> Strin
     out.push_str(TOOLS_PROMPT_EDIT_LINE);
     out.push_str(TOOLS_PROMPT_AFTER_EDIT);
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     out
 }
 
@@ -114,6 +115,12 @@ pub fn build_system_prompt_reminder(mcp_servers: &[crate::tools::mcp::McpServer]
 /// as rendered chat so DSML markers become control tokens, user text as plain
 /// content); here both are returned as one composed string.
 #[must_use]
+/// **Cache-boundary rule** (docs/SYSTEM-PROMPT.md): everything composed here
+/// enters the fingerprinted `sysprompt.kv` KV prefix, so only inputs that are
+/// stable across sessions are allowed — the verbatim tools prompt, MCP
+/// schemas/instructions, and `-sys` text. Per-session data (date, git state,
+/// AGENTS.md) belongs in [`crate::context::ContextContent`] instead; the
+/// `fingerprinted_prompt_contains_no_volatile_bytes` test guards this.
 pub fn build_system_prompt(
     user_system: &str,
     mcp_servers: &[crate::tools::mcp::McpServer],
@@ -230,6 +237,36 @@ mod tests {
         assert!(p.contains("\"name\": \"bash_stop\""));
         assert!(p.contains("- Always use strict syntax for DSML tool stanzas.\n"));
         assert!(p.ends_with("unless explicitly asked otherwise by the user.\n"));
+    }
+
+    /// Guards the static/volatile boundary (docs/SYSTEM-PROMPT.md): the
+    /// composed system prompt is what `sysprompt.kv` fingerprints, so any
+    /// per-session bytes (date, git state, AGENTS.md) sneaking in would make
+    /// the disk snapshot rebuild on every launch. Volatile context belongs in
+    /// the first user turn (`context::ContextContent`), never here.
+    #[test]
+    fn fingerprinted_prompt_contains_no_volatile_bytes() {
+        let a = build_system_prompt("user -sys text", &[]);
+        let b = build_system_prompt("user -sys text", &[]);
+        assert_eq!(a, b, "system prompt must be deterministic");
+        let today = crate::context::current_local_iso_date();
+        assert!(
+            !a.contains(&today),
+            "today's date leaked into the cached prefix"
+        );
+        for marker in [
+            "Today's date",
+            "This is the git status",
+            "Current branch:",
+            "Main branch",
+            "Git user:",
+            "Agent instructions:",
+        ] {
+            assert!(
+                !a.contains(marker),
+                "volatile marker {marker:?} leaked into the cached prefix"
+            );
+        }
     }
 
     #[test]

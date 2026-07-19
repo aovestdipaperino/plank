@@ -11,7 +11,7 @@ session:
 | | Static tools prompt | Dynamic session context |
 | --- | --- | --- |
 | Source | `src/sysprompt.rs` (+ `src/resources/tools_prompt_after_edit.txt`) | `src/context.rs` |
-| Content | Tool descriptions, editing rules, DSML syntax, JSON schemas, MCP tool schemas | git branch/status/commits, discovered AGENTS.md files, current date |
+| Content | Tool descriptions, editing rules, DSML syntax, JSON schemas, MCP tool schemas and server instructions | git branch/status/commits, discovered AGENTS.md files, current date |
 | Stability | Byte-for-byte identical to the C reference (`tests/c_parity.rs`) | Recomputed at every session start |
 | Transcript position | The `[system]` section | The first `[user]` message of the session |
 | Cacheable | Yes — this is what `sysprompt.kv` snapshots | No — deliberately kept out of the cached prefix |
@@ -21,10 +21,12 @@ session:
 `build_system_prompt(user_system, mcp_servers)` composes:
 
 1. `build_tools_prompt` — three verbatim C string constants (intro, editing
-   instructions, and the schemas/rules tail) plus the schemas of any MCP tools
-   loaded at startup. The tail lives in a resource file included via
-   `include_str!` because a `\`-continued Rust string literal would silently
-   strip the JSON schemas' indentation (see FINDINGS.md).
+   instructions, and the schemas/rules tail), the schemas of any MCP tools
+   loaded at startup, and an `# MCP Server Instructions` block for servers
+   whose initialize response carried an `instructions` field. The tail lives
+   in a resource file included via `include_str!` because a `\`-continued
+   Rust string literal would silently strip the JSON schemas' indentation
+   (see FINDINGS.md).
 2. The user's `-sys`/`--system` text, appended after a blank line when
    non-empty.
 
@@ -76,10 +78,24 @@ Warm-up flow (`src/ds4engine.rs`):
 
 The fingerprint is the trust boundary: a checkpoint is *only* restored when
 model name and prompt text both match, so editing `-sys` text, changing MCP
-servers (their schemas are part of the prompt), or swapping models each
-naturally miss the cache and rebuild. A stale checkpoint is never trusted or
-patched — KV-cache discipline is "reuse genuinely matching token prefixes or
-rebuild".
+servers (their schemas and instructions are part of the prompt; servers are
+started *before* the prompt is composed), or swapping models each naturally
+miss the cache and rebuild. A stale checkpoint is never trusted or patched —
+KV-cache discipline is "reuse genuinely matching token prefixes or rebuild".
+
+### The static/volatile boundary, formally
+
+The rule the table above encodes: **an input may enter the composed system
+prompt only if it is stable across sessions on the same machine and config.**
+Anything that changes per session — the date line, git state, AGENTS.md
+contents — must be injected as the session's first *user* message
+(`context::ContextContent`) instead. Violating this doesn't break
+correctness; it silently makes `sysprompt.kv` single-use, rebuilding the
+multi-second prefill on every launch because the fingerprint never matches.
+The `fingerprinted_prompt_contains_no_volatile_bytes` test in
+`src/sysprompt.rs` guards the boundary by asserting the composed prompt is
+deterministic and contains no date- or git-derived markers; both code seams
+carry a "cache-boundary rule" doc comment pointing here.
 
 Within a running session, the same discipline continues past the system
 prompt: the engine keeps one live session, and each turn re-syncs only the
