@@ -22,7 +22,7 @@ use crate::tui::OutputLog;
 use crate::viz::RenderSink;
 
 /// One worker→UI message during a turn.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum UiEvent {
     /// Rendered assistant text ([`RenderSink::visible_text`]).
     Visible(String),
@@ -79,6 +79,119 @@ impl RenderSink for ChannelSink {
     }
     fn error_text(&mut self, text: &str) {
         let _ = self.0.send(UiEvent::Error(text.to_owned()));
+    }
+}
+
+/// A sequenced worker event: a monotonic `id` plus the [`UiEvent`]. The id lets
+/// a reconnecting remote client resume with `resume_from` (see
+/// `docs/REMOTE-CONTROL-DESIGN.md` §4.8) without re-seeing frames it already has.
+#[derive(Debug, Clone)]
+pub struct SeqEvent {
+    /// Monotonic sequence id, unique and increasing per [`BroadcastBus`].
+    pub id: u64,
+    /// The event payload.
+    pub event: UiEvent,
+}
+
+/// Default cap on the scrollback ring, in events. Bounds memory while giving a
+/// late-joining remote client enough recent context to replay a `snapshot`.
+pub const SCROLLBACK_CAP: usize = 4096;
+
+/// Fan-out of [`UiEvent`]s to any number of consumers (the local TUI plus each
+/// remote session), the single structural change remote control needs
+/// (`docs/REMOTE-CONTROL-DESIGN.md` §4.2).
+///
+/// `broadcast` clones each event to every live subscriber and prunes hung-up
+/// ones; a slow or vanished subscriber never blocks the worker, inheriting the
+/// [`ChannelSink`] resilience contract. A bounded scrollback ring with
+/// monotonic sequence ids backs late-join replay and `resume_from`.
+#[derive(Debug, Default)]
+pub struct BroadcastBus {
+    inner: Mutex<BusInner>,
+}
+
+#[derive(Debug, Default)]
+struct BusInner {
+    subscribers: Vec<Sender<SeqEvent>>,
+    scrollback: std::collections::VecDeque<SeqEvent>,
+    next_id: u64,
+}
+
+impl BroadcastBus {
+    /// A new, empty bus.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a new consumer, returning the receiver end. The subscriber is
+    /// pruned automatically on the first `broadcast` after it hangs up.
+    pub fn subscribe(&self) -> std::sync::mpsc::Receiver<SeqEvent> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        Self::lock(&self.inner).subscribers.push(tx);
+        rx
+    }
+
+    /// Assigns the next sequence id, appends to the scrollback ring (evicting
+    /// the oldest beyond [`SCROLLBACK_CAP`]), and fans the event out to every
+    /// live subscriber, dropping any that have hung up.
+    pub fn broadcast(&self, event: UiEvent) {
+        let mut inner = Self::lock(&self.inner);
+        let id = inner.next_id;
+        inner.next_id += 1;
+        let seq = SeqEvent { id, event };
+        inner.scrollback.push_back(seq.clone());
+        while inner.scrollback.len() > SCROLLBACK_CAP {
+            inner.scrollback.pop_front();
+        }
+        inner.subscribers.retain(|tx| tx.send(seq.clone()).is_ok());
+    }
+
+    /// Returns scrollback events with `id > resume_from` for late-join replay.
+    /// A `resume_from` older than the retained tail yields the whole tail
+    /// (best-effort resume, §4.8). Also returns the highest id assigned so far,
+    /// or `None` when nothing has been broadcast yet.
+    #[must_use]
+    pub fn scrollback_since(&self, resume_from: Option<u64>) -> (Vec<SeqEvent>, Option<u64>) {
+        let inner = Self::lock(&self.inner);
+        let highest = inner.next_id.checked_sub(1);
+        let tail = inner
+            .scrollback
+            .iter()
+            .filter(|s| resume_from.is_none_or(|from| s.id > from))
+            .cloned()
+            .collect();
+        (tail, highest)
+    }
+
+    /// Number of currently registered subscribers (test/introspection helper).
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        Self::lock(&self.inner).subscribers.len()
+    }
+
+    fn lock(m: &Mutex<BusInner>) -> std::sync::MutexGuard<'_, BusInner> {
+        m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A [`RenderSink`] that forwards render calls into a [`BroadcastBus`]. Mirrors
+/// [`ChannelSink`] but fans out to every subscriber instead of one channel.
+#[derive(Debug)]
+pub struct BusSink<'a>(pub &'a BroadcastBus);
+
+impl RenderSink for BusSink<'_> {
+    fn visible_text(&mut self, text: &str) {
+        self.0.broadcast(UiEvent::Visible(text.to_owned()));
+    }
+    fn think_text(&mut self, text: &str) {
+        self.0.broadcast(UiEvent::Think(text.to_owned()));
+    }
+    fn tool_text(&mut self, text: &str) {
+        self.0.broadcast(UiEvent::Tool(text.to_owned()));
+    }
+    fn error_text(&mut self, text: &str) {
+        self.0.broadcast(UiEvent::Error(text.to_owned()));
     }
 }
 
@@ -226,6 +339,56 @@ mod tests {
         shared.push_btw("late".to_owned());
         assert_eq!(shared.clear_btw(), 1);
         assert!(shared.pop_btw().is_none());
+    }
+
+    #[test]
+    fn bus_fans_out_to_multiple_subscribers() {
+        let bus = BroadcastBus::new();
+        let a = bus.subscribe();
+        let b = bus.subscribe();
+        bus.broadcast(UiEvent::Visible("hi".into()));
+        for rx in [&a, &b] {
+            let got = rx.try_recv().expect("subscriber received");
+            assert_eq!(got.id, 0);
+            assert!(matches!(got.event, UiEvent::Visible(ref t) if t == "hi"));
+        }
+        // A dropped subscriber is pruned on the next broadcast and does not
+        // stall the survivor.
+        drop(b);
+        bus.broadcast(UiEvent::Visible("again".into()));
+        assert_eq!(bus.subscriber_count(), 1);
+        let got = a.try_recv().expect("survivor still receives");
+        assert_eq!(got.id, 1);
+    }
+
+    #[test]
+    fn bus_scrollback_replays_on_late_join() {
+        let bus = BroadcastBus::new();
+        bus.broadcast(UiEvent::Visible("one".into()));
+        bus.broadcast(UiEvent::Visible("two".into()));
+        // Late joiner replays the full tail...
+        let (tail, highest) = bus.scrollback_since(None);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(highest, Some(1));
+        // ...and a resume_from only sees newer events.
+        let (since, _) = bus.scrollback_since(Some(0));
+        assert_eq!(since.len(), 1);
+        assert_eq!(since[0].id, 1);
+        // Empty bus reports no highest id.
+        assert_eq!(BroadcastBus::new().scrollback_since(None).1, None);
+    }
+
+    #[test]
+    fn bus_scrollback_is_bounded() {
+        let bus = BroadcastBus::new();
+        for _ in 0..(SCROLLBACK_CAP + 10) {
+            bus.broadcast(UiEvent::EndLine);
+        }
+        let (tail, highest) = bus.scrollback_since(None);
+        assert_eq!(tail.len(), SCROLLBACK_CAP);
+        assert_eq!(highest, Some((SCROLLBACK_CAP + 10 - 1) as u64));
+        // Oldest ids were evicted; resume from a rolled-past id yields the tail.
+        assert_eq!(tail.first().unwrap().id, 10);
     }
 
     #[test]
