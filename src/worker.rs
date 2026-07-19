@@ -42,11 +42,13 @@ pub enum UiEvent {
     EndLine,
     /// Worker progress snapshot for the status footer.
     Status(Status),
-    /// A `/btw` side answer is starting: the UI splits off a side panel and
-    /// routes subsequent render events there until [`UiEvent::BtwEnd`].
+    /// A `/btw` side answer is starting: the UI opens the side panel (if not
+    /// already visible) and routes subsequent render events into it.
     BtwBegin,
-    /// The `/btw` drain finished (or was cancelled): the UI removes the side
-    /// panel and resumes rendering into the main log.
+    /// The `/btw` answer finished (or was cancelled): the UI stops routing to
+    /// the panel and resumes rendering into the main log, but leaves the panel
+    /// on screen (frozen) so the answer stays readable while the main task
+    /// continues. The panel is dismissed by the user with Esc, not here.
     BtwEnd,
     /// Marks the start of a main generation pass: the UI snapshots the main
     /// log length so a later [`UiEvent::MainRollback`] can discard a
@@ -98,11 +100,6 @@ pub struct TurnShared {
     /// `/btw` side questions queued while the worker is busy, answered FIFO
     /// at generation boundaries (modeled on `OpenClaw`'s side-question queue).
     pub btw: Mutex<Vec<String>>,
-    /// When set (by the interactive UI), the `/btw` side panel stays open
-    /// after an answer finishes — until the user asks another `/btw` or
-    /// presses Esc. Left false in headless/test contexts, where the drain
-    /// simply returns once the queue empties.
-    pub hold_btw_panel: AtomicBool,
 }
 
 /// Cap on queued `/btw` questions; a push beyond it drops the oldest entry

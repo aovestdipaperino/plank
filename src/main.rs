@@ -79,6 +79,39 @@ fn total_ram_bytes() -> Option<u64> {
     (rc == 0).then_some(mem)
 }
 
+/// Fails fast when another plank/ds4 instance is already running, with a clear
+/// message — instead of the engine's own guard, which calls `exit(2)` deep in
+/// `ds4_engine_open` (`ds4_acquire_instance_lock` in `ds4.c`) and kills the
+/// process before plank can report anything useful.
+///
+/// It probes the *same* lock file the engine uses (`$DS4_LOCK_FILE`, default
+/// `/tmp/ds4.lock`) but only **checks** it — the lock is released immediately
+/// so the engine can acquire it itself moments later. (Holding it here would
+/// make the engine's own in-process acquire fail, since `flock` is keyed to
+/// the open file description, not the process.)
+///
+/// Any inability to probe (unwritable path, non-contention error) is treated
+/// as "no guard" — the engine's own check still backstops it.
+///
+/// # Errors
+/// Returns a clear message when another instance already holds the lock.
+#[cfg(ds4_engine)]
+fn acquire_model_lock() -> Result<(), String> {
+    use plank::singleton::{LockProbe, probe_lock};
+
+    let path = std::env::var_os("DS4_LOCK_FILE")
+        .filter(|p| !p.is_empty())
+        .map_or_else(|| std::path::PathBuf::from("/tmp/ds4.lock"), Into::into);
+    if probe_lock(&path) == LockProbe::Contended {
+        return Err(
+            "another plank (ds4) instance is already running. Only one instance can load the \
+             ~82 GB DeepSeek V4 Flash model at a time — close the other instance and try again."
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 /// Refuses to run when the machine has less than [`MIN_RAM_BYTES`] of RAM.
 ///
 /// # Errors
@@ -109,6 +142,12 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // The default quant needs ~82 GB resident; refuse on machines that
         // cannot hold it, before downloading or loading anything.
         require_min_ram()?;
+
+        // Only one instance can hold the ~82 GB model at a time — a second
+        // would fail deep in the engine while mapping model views, with a
+        // cryptic "insufficient memory / accelerator VM budget" abort. Fail
+        // fast here with a clear message instead.
+        acquire_model_lock()?;
 
         // With no explicit model, fall back to the default location and offer
         // to download it when it is not present.

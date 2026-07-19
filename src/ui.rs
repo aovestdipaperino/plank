@@ -792,6 +792,7 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         input: &mut TuiInput,
+        btw: &mut BtwPanel,
     ) {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
@@ -819,7 +820,7 @@ impl Agent<'_> {
 
         log.push_spans(tui::user_echo_spans(prompt));
         self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log, view, input) {
+        if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
             log.push_plain(format!("/init failed: {e}"));
         }
     }
@@ -1030,6 +1031,46 @@ impl Agent<'_> {
         self.store.load(arg).map(Some).map_err(|e| e.to_string())
     }
 
+    /// Resumes a session named on the command line (`plank /resume [prefix]`)
+    /// before the interactive loop starts. An empty `arg` resumes the most
+    /// recent session; otherwise it is a number from the listing or a sha
+    /// prefix. Only loads the session — each front-end renders the recovered
+    /// history itself (see [`resumed_history`]), since the TUI's alternate
+    /// screen would wipe anything printed here.
+    fn resume_from_cli(&mut self, arg: &str) -> Result<(), String> {
+        let session = if arg.trim().is_empty() {
+            let entries = self.store.list().map_err(|e| e.to_string())?;
+            let entry = entries
+                .first()
+                .ok_or_else(|| "no saved sessions to resume".to_string())?;
+            self.store.load(&entry.id).map_err(|e| e.to_string())?
+        } else {
+            self.resume_pick(arg)?
+                .ok_or_else(|| "no such session".to_string())?
+        };
+        self.session = session;
+        self.last_ctx_used = 0;
+        Ok(())
+    }
+
+    /// Recent-history text for a just-resumed session (empty when the current
+    /// session was not loaded from disk), plus a `[resumed …]` trailer, for a
+    /// front-end to display at startup.
+    fn resumed_history(&self) -> Option<String> {
+        use std::fmt::Write as _;
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let mut out = crate::session::render_history(&self.session.transcript, 6, self.color);
+        let short = crate::session::display_id(&self.session.id);
+        let _ = write!(
+            out,
+            "{}",
+            self.debug_line(&format!("[resumed session {short}]"))
+        );
+        Some(out)
+    }
+
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
     /// the session was already saved so listings pick it up.
     fn set_tag(&mut self, arg: &str) -> Result<String, String> {
@@ -1048,6 +1089,35 @@ impl Agent<'_> {
             msg.push_str(" (saved)");
         }
         Ok(msg)
+    }
+
+    /// Saves the session at exit and returns `(id, path)` so the caller can
+    /// tell the user how to resume it. Returns `None` when there is nothing
+    /// worth saving (no user turn) or the save fails.
+    fn save_for_exit(&mut self) -> Option<(String, std::path::PathBuf)> {
+        let id = self.store.save(&mut self.session).ok()?;
+        let path = self
+            .store
+            .find(&id)
+            .map_or_else(|_| self.store.dir().join(format!("{id}.kv")), |(_, p)| p);
+        Some((id, path))
+    }
+
+    /// At session end, saves the transcript and prints where it landed and how
+    /// to resume it. A session with no user turn is silently skipped.
+    fn report_session_on_exit(&mut self) {
+        let Some((id, path)) = self.save_for_exit() else {
+            return;
+        };
+        let short = crate::session::display_id(&id);
+        let (bold, dim, reset) = if self.color {
+            ("\x1b[1m", "\x1b[38;5;238m", ANSI_RESET)
+        } else {
+            ("", "", "")
+        };
+        println!();
+        println!("{bold}Session saved{reset} {dim}{}{reset}", path.display());
+        println!("Resume it later with:  {bold}plank{reset}  then  {bold}/resume {short}{reset}");
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -1154,6 +1224,11 @@ fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::Path
     };
     crate::memory::remember(scope, cwd, text, &crate::context::current_local_iso_date())
 }
+
+/// The `/btw` side panel: `Some` while it splits the screen (main 60% / btw
+/// 40%). Owned by [`Agent::tui_loop`] so it persists across turn boundaries —
+/// a finished main task never closes it; only Esc does.
+type BtwPanel = Option<(OutputLog, tui::OutputView)>;
 
 /// Result of one TUI generation pass.
 struct TurnOutput {
@@ -1263,13 +1338,22 @@ impl Agent<'_> {
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
         log.push_plain(String::new());
 
+        // A `plank /resume` startup shows the recovered conversation so far.
+        if let Some(history) = self.resumed_history() {
+            log.push_ansi(&history);
+        }
+
         self.tui_warm(terminal, &mut log)?;
 
         let mut view = tui::OutputView::default();
+        // The `/btw` side panel, owned here so it outlives any single turn:
+        // once opened it stays until the user presses Esc, even after the main
+        // task finishes and control returns to this idle loop.
+        let mut btw_panel: BtwPanel = None;
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
-            self.tui_turn(terminal, &mut log, &mut view, &mut input)?;
+            self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
         }
 
         // Endpoints of a mouse drag selection over the output area, in screen
@@ -1294,15 +1378,31 @@ impl Agent<'_> {
             }
             terminal
                 .draw(|f| {
-                    tui::draw(
-                        f,
-                        &log,
-                        Some(input.buf.text()),
-                        input.cursor_col(),
-                        &status,
-                        &mut view,
-                        selection.map(|(a, b)| tui::normalize_selection(a, b)),
-                    );
+                    // A `/btw` panel left open from an earlier turn keeps the
+                    // split view even while idle; text selection falls back to
+                    // the single-column path (no panel).
+                    if let Some((btw_log, btw_view)) = btw_panel.as_mut() {
+                        tui::draw_btw_split(
+                            f,
+                            &log,
+                            btw_log,
+                            btw_view,
+                            Some(input.buf.text()),
+                            input.cursor_col(),
+                            &status,
+                            &mut view,
+                        );
+                    } else {
+                        tui::draw(
+                            f,
+                            &log,
+                            Some(input.buf.text()),
+                            input.cursor_col(),
+                            &status,
+                            &mut view,
+                            selection.map(|(a, b)| tui::normalize_selection(a, b)),
+                        );
+                    }
                 })
                 .map_err(|e| e.to_string())?;
 
@@ -1459,6 +1559,9 @@ impl Agent<'_> {
                 KeyCode::End => input.buf.move_end(),
                 KeyCode::Up => input.history_move(-1),
                 KeyCode::Down => input.history_move(1),
+                // Esc while idle dismisses a `/btw` panel left open from an
+                // earlier turn (the only way it ever closes).
+                KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
                 KeyCode::Enter => {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
@@ -1486,7 +1589,14 @@ impl Agent<'_> {
                             &mut view,
                         );
                     } else if line.starts_with('/') {
-                        if !self.tui_slash(&line, &mut log, terminal, &mut view, &mut input) {
+                        if !self.tui_slash(
+                            &line,
+                            &mut log,
+                            terminal,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                        ) {
                             break;
                         }
                     } else {
@@ -1509,7 +1619,7 @@ impl Agent<'_> {
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_spans(tui::user_echo_spans(echo));
                         self.session.push(Message::user(&message));
-                        self.tui_turn(terminal, &mut log, &mut view, &mut input)?;
+                        self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
                     }
                 }
                 _ => {}
@@ -1661,6 +1771,7 @@ impl Agent<'_> {
         log: &mut OutputLog,
         view: &mut tui::OutputView,
         input: &mut TuiInput,
+        btw: &mut BtwPanel,
     ) -> Result<(), String> {
         // The first iteration runs the main turn; later iterations run either
         // a follow-up turn (leftover queued user lines) or a btw-only drain
@@ -1673,11 +1784,11 @@ impl Agent<'_> {
                 let _ = shared.push_btw(q);
             }
             if run_main {
-                run_worker_ui(terminal, log, view, input, &shared, |tx| {
+                run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
                     self.worker_turn(&tx, &shared)
                 })??;
             } else {
-                run_worker_ui(terminal, log, view, input, &shared, |tx| {
+                run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
                     self.drain_btw(&tx, &shared);
                 })?;
             }
@@ -1786,19 +1897,17 @@ impl Agent<'_> {
     /// must never abort the main turn.
     ///
     /// While answering, `BtwBegin`/`BtwEnd` bracket the render events so the
-    /// UI splits off a side panel (main conversation 60%, `/btw` 40%). With
-    /// [`TurnShared::hold_btw_panel`] set (interactive UI), the panel stays
-    /// open after an answer completes — the worker parks here until the user
-    /// asks another `/btw` or presses Esc — so the answer stays readable
-    /// instead of vanishing the instant it finishes. Esc both cancels an
-    /// in-flight answer and closes an idle panel; either way the main task
-    /// resumes only once the panel is dismissed.
+    /// UI opens a side panel (main conversation 60%, `/btw` 40%). The drain
+    /// answers every queued question FIFO and then **returns** — it does not
+    /// wait for the panel to be dismissed, so the main task resumes as soon as
+    /// the answer is done. `BtwEnd` only stops routing to the panel; the UI
+    /// keeps it on screen (frozen, readable) until the user presses Esc.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
         let Some(mut question) = shared.pop_btw() else {
             return;
         };
         let _ = tx.send(UiEvent::BtwBegin);
-        // A stale interrupt (e.g. the preempt path) must not close the panel
+        // A stale interrupt (e.g. the preempt path) must not cancel the answer
         // before the user has seen anything.
         shared.interrupt.store(false, Ordering::Relaxed);
         loop {
@@ -1815,8 +1924,8 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::EndLine);
                     self.last_ctx_used = saved_ctx;
                     if out.interrupted {
-                        // Esc during a streaming answer: cancel it, flush the
-                        // queue, and close the panel.
+                        // Esc during a streaming answer: cancel it and flush
+                        // the rest of the queue.
                         crate::interrupt::clear();
                         let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                         let cleared = shared.clear_btw();
@@ -1841,53 +1950,16 @@ impl Agent<'_> {
                     self.last_ctx_used = saved_ctx;
                 }
             }
-            // Answer the next queued question right away; otherwise the panel
-            // is idle. In the interactive UI it stays open until the user asks
-            // another `/btw` or dismisses it with Esc (headless: just return).
-            if let Some(next) = shared.pop_btw() {
-                question = next;
-                continue;
-            }
-            if !shared.hold_btw_panel.load(Ordering::Relaxed) {
+            let Some(next) = shared.pop_btw() else {
                 break;
-            }
-            let _ = tx.send(UiEvent::Dim(
-                "[answer complete — Esc closes the panel, or type another /btw]".to_owned(),
-            ));
-            match self.wait_for_next_btw(tx, shared) {
-                Some(next) => question = next,
-                None => break,
-            }
+            };
+            question = next;
         }
-        // Consume the dismissing Esc so the resumed main task is not itself
+        // Consume any cancelling Esc so the resumed main task is not itself
         // interrupted by it.
         shared.interrupt.store(false, Ordering::Relaxed);
         crate::interrupt::clear();
         let _ = tx.send(UiEvent::BtwEnd);
-    }
-
-    /// Parks the worker while an idle `/btw` panel is held open, publishing an
-    /// Idle footer so the status bar does not show a frozen generation state.
-    /// Returns the next queued question, or `None` when the user dismisses the
-    /// panel with Esc (`shared.interrupt`).
-    fn wait_for_next_btw(&self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Option<String> {
-        let idle = Status {
-            state: WorkerState::Idle,
-            ctx_used: self.last_ctx_used,
-            ctx_size: self.engine.ctx_size(),
-            power_percent: self.power_percent,
-            ..Status::default()
-        };
-        let _ = tx.send(UiEvent::Status(idle));
-        loop {
-            if let Some(next) = shared.pop_btw() {
-                return Some(next);
-            }
-            if shared.interrupt.load(Ordering::Relaxed) || crate::interrupt::pending() {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -2109,9 +2181,10 @@ impl Agent<'_> {
         self.session.push(Message::user(text));
     }
 
-    /// Runs a `/btw` side question in the TUI: one generation pass over the
-    /// shared context plus the framed question, tools denied, nothing pushed
-    /// to the session (see `btw_plain` for the KV rollback rationale).
+    /// Runs a `/btw` side question typed while the agent is idle. It reuses
+    /// the same `drain_btw` path as a mid-turn `/btw`, so the answer streams
+    /// into the (persistent) side panel and the panel stays open afterwards —
+    /// dismissed only by Esc — exactly like the busy-time case.
     fn tui_btw(
         &mut self,
         question: &str,
@@ -2119,36 +2192,13 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         input: &mut TuiInput,
+        btw: &mut BtwPanel,
     ) -> Result<(), String> {
-        log.push_spans(tui::user_echo_spans(&format!("/btw {question}")));
-        let mut prompt = render_transcript(&self.session, &self.system);
-        {
-            use std::fmt::Write as _;
-            let _ = write!(prompt, "[user]\n{}\n", btw_user_message(question));
-        }
-        let saved_ctx = self.last_ctx_used;
         let shared = TurnShared::default();
-        let out = run_worker_ui(terminal, log, view, input, &shared, |tx| {
-            self.worker_generate(&tx, &shared, &prompt, Instant::now(), false)
-        })??;
-        log.end_line();
-        if out.interrupted {
-            crate::interrupt::clear();
-        }
-        if !out.calls.is_empty() || out.error.is_some() {
-            log.push_dim(
-                "(the model tried to call a tool; tools are disabled during /btw — ask in the main conversation)",
-            );
-        }
-        // A /btw answer is a sidechain: text queued during it has no turn to
-        // join, so hand it back instead of dropping it silently.
-        for line in shared.take_queued() {
-            log.push_dim(format!(
-                "[not queued — /btw is a side question; resend: {line}]"
-            ));
-        }
-        log.push_dim("[btw — not part of the conversation]");
-        self.last_ctx_used = saved_ctx;
+        shared.push_btw(question.to_owned());
+        run_worker_ui(terminal, log, view, input, btw, &shared, |tx| {
+            self.drain_btw(&tx, &shared);
+        })?;
         Ok(())
     }
 
@@ -2161,6 +2211,7 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
         input: &mut TuiInput,
+        btw: &mut BtwPanel,
     ) -> bool {
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
@@ -2183,7 +2234,7 @@ impl Agent<'_> {
             }
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
-            "/init" => self.tui_run_init(log, terminal, view, input),
+            "/init" => self.tui_run_init(log, terminal, view, input, btw),
             "/compact" => {
                 let result = {
                     let mut note = |s: String| log.push_dim(s);
@@ -2298,7 +2349,7 @@ impl Agent<'_> {
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
-                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input) {
+                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input, btw) {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
@@ -2319,7 +2370,7 @@ impl Agent<'_> {
                 } else {
                     log.push_dim("[subagent started]");
                     let fork_at = self.begin_subagent_fork(arg);
-                    if let Err(e) = self.tui_turn(terminal, log, view, input) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, arg);
                         log.push_plain(format!("/subagent failed: {e}"));
@@ -2337,7 +2388,7 @@ impl Agent<'_> {
                 if let Some(message) = self.skill_message(cmd, arg) {
                     log.push_spans(tui::user_echo_spans(line));
                     self.session.push(Message::user(message));
-                    if let Err(e) = self.tui_turn(terminal, log, view, input) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
                         log.push_plain(format!("{cmd} failed: {e}"));
                     }
                 } else {
@@ -2353,21 +2404,20 @@ impl Agent<'_> {
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
 /// events to the log, redraws, and keeps the prompt editable.
+#[allow(clippy::too_many_arguments)]
 fn run_worker_ui<T: Send>(
     terminal: &mut ratatui::DefaultTerminal,
     log: &mut OutputLog,
     view: &mut tui::OutputView,
     input: &mut TuiInput,
+    btw: &mut BtwPanel,
     shared: &TurnShared,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
-    // Interactive front-end: a finished `/btw` panel stays open until the
-    // user asks another or presses Esc.
-    shared.hold_btw_panel.store(true, Ordering::Relaxed);
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
         let handle = s.spawn(move || job(tx));
-        let ui = busy_ui_loop(terminal, log, view, input, &rx, shared, || {
+        let ui = busy_ui_loop(terminal, log, view, input, btw, &rx, shared, || {
             handle.is_finished()
         });
         // On a UI error (terminal gone) the worker must still be stopped and
@@ -2383,24 +2433,55 @@ fn run_worker_ui<T: Send>(
     })
 }
 
+/// Handles Esc / Ctrl-C during a worker job, with meaning that depends on the
+/// `/btw` panel state:
+/// - a side answer is **streaming** (`btw_active`): cancel it (interrupt) and
+///   flag the panel to close when its `BtwEnd` arrives;
+/// - the panel is **visible but frozen** (main task running behind it): just
+///   dismiss the panel, leaving the main task running;
+/// - **no panel**: interrupt the main task, as before.
+fn close_or_interrupt(
+    shared: &TurnShared,
+    btw: &mut Option<(OutputLog, tui::OutputView)>,
+    btw_active: bool,
+    close_panel_on_end: &mut bool,
+) {
+    if btw_active {
+        shared.interrupt.store(true, Ordering::Relaxed);
+        *close_panel_on_end = true;
+    } else if btw.is_some() {
+        *btw = None;
+    } else {
+        shared.interrupt.store(true, Ordering::Relaxed);
+    }
+}
+
 /// UI-thread event loop while a worker job runs: applies streamed render
 /// events to the log, keeps the prompt editable (Enter queues the line for
 /// the worker), scrolls, and maps Esc/Ctrl-C to a worker interrupt.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn busy_ui_loop(
     terminal: &mut ratatui::DefaultTerminal,
     log: &mut OutputLog,
     view: &mut tui::OutputView,
     input: &mut TuiInput,
+    btw: &mut BtwPanel,
     rx: &Receiver<UiEvent>,
     shared: &TurnShared,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
-    // Present only while a `/btw` side answer streams: render events between
-    // BtwBegin and BtwEnd route here and the screen splits (main 60% / btw
-    // 40%). Torn down on BtwEnd, so the panel is inherently ephemeral.
-    let mut btw: Option<(OutputLog, tui::OutputView)> = None;
+    // The `/btw` side panel (`btw`) is owned by `tui_loop`, so it survives
+    // across turns: it opens on the first BtwBegin and stays up — even after
+    // the answer finishes, the main task resumes, and the whole turn ends —
+    // until the user dismisses it with Esc. `btw_active` is true only while a
+    // side answer is actually streaming: it gates whether render events go to
+    // the panel or to the main log, which is what lets the main task keep
+    // rendering on the left while a finished answer stays frozen on the right.
+    let mut btw_active = false;
+    // Set when Esc is pressed mid-answer: the panel is torn down once the
+    // cancelled answer's BtwEnd arrives (so late btw tokens don't leak).
+    let mut close_panel_on_end = false;
     // Main-log length at the start of the current main pass; a preempting
     // `/btw` truncates back to it so the discarded partial output does not
     // duplicate when the pass re-runs.
@@ -2409,8 +2490,19 @@ fn busy_ui_loop(
         while let Ok(ev) = rx.try_recv() {
             match ev {
                 UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
-                UiEvent::BtwBegin => btw = Some((OutputLog::new(), tui::OutputView::default())),
-                UiEvent::BtwEnd => btw = None,
+                UiEvent::BtwBegin => {
+                    if btw.is_none() {
+                        *btw = Some((OutputLog::new(), tui::OutputView::default()));
+                    }
+                    btw_active = true;
+                }
+                UiEvent::BtwEnd => {
+                    btw_active = false;
+                    if close_panel_on_end {
+                        *btw = None;
+                        close_panel_on_end = false;
+                    }
+                }
                 // Checkpoint/rollback always act on the main log, regardless
                 // of a live side panel (a preempt fires only in a main pass).
                 UiEvent::MainCheckpoint => main_checkpoint = log.checkpoint(),
@@ -2418,8 +2510,11 @@ fn busy_ui_loop(
                     log.truncate_to(main_checkpoint);
                     view.follow = true;
                 }
+                // Route to the panel only while an answer is streaming; once
+                // it finishes the main task's output goes to the main log even
+                // though the (frozen) panel is still visible.
                 ev => {
-                    if let Some((btw_log, _)) = btw.as_mut() {
+                    if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                         worker::apply(btw_log, ev);
                     } else {
                         worker::apply(log, ev);
@@ -2458,15 +2553,17 @@ fn busy_ui_loop(
             })
             .map_err(|e| e.to_string())?;
         if finished {
-            // The panel is torn down when the worker returns; any late render
-            // events (post-BtwEnd trailers) belong in the main log.
+            // The worker is done (turn over); drain the tail in order. The
+            // panel is discarded when this function returns, so late btw
+            // events just stop mattering.
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    UiEvent::Status(_) | UiEvent::BtwBegin | UiEvent::MainCheckpoint => {}
+                    UiEvent::Status(_) | UiEvent::MainCheckpoint => {}
+                    UiEvent::BtwBegin => btw_active = true,
+                    UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
-                    UiEvent::BtwEnd => btw = None,
                     ev => {
-                        if let Some((btw_log, _)) = btw.as_mut() {
+                        if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                             worker::apply(btw_log, ev);
                         } else {
                             worker::apply(log, ev);
@@ -2483,12 +2580,15 @@ fn busy_ui_loop(
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
-                    KeyCode::Esc => shared.interrupt.store(true, Ordering::Relaxed),
+                    KeyCode::Esc => {
+                        close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
+                    }
                     KeyCode::Char('c') if ctrl => {
-                        // Ctrl-C clears a partly-typed line first; on an
-                        // empty line it interrupts the model, like Esc.
+                        // Ctrl-C clears a partly-typed line first; on an empty
+                        // line it acts like Esc (cancel answer / close panel /
+                        // interrupt the model).
                         if input.buf.text().is_empty() {
-                            shared.interrupt.store(true, Ordering::Relaxed);
+                            close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
                         } else {
                             input.buf.clear();
                         }
@@ -2501,9 +2601,12 @@ fn busy_ui_loop(
                         } else if btw_question(&line).is_some() {
                             // A `/btw` gets priority: it preempts the running
                             // main pass so the side question is answered now,
-                            // then the pass re-runs. When a side answer is
-                            // already streaming (btw.is_some) the main task is
-                            // paused already, so it only joins the FIFO queue.
+                            // then the pass re-runs. Only when a side answer is
+                            // already streaming (btw_active) is the main task
+                            // paused already, so the question just joins the
+                            // FIFO queue; a merely-visible frozen panel does
+                            // not — the main task is running behind it, so a
+                            // new `/btw` preempts it.
                             let question = btw_question(&line).unwrap_or_default().to_owned();
                             input.history.add(&line);
                             if let Some(dropped) = shared.push_btw(question) {
@@ -2511,11 +2614,11 @@ fn busy_ui_loop(
                                     "[btw queue full — dropped oldest: {dropped}]"
                                 ));
                             }
-                            if btw.is_none() {
+                            if btw_active {
+                                log.push_dim("[/btw — answers next in the panel]");
+                            } else {
                                 shared.preempt.store(true, Ordering::Relaxed);
                                 log.push_dim("[/btw — pausing the task to answer now]");
-                            } else {
-                                log.push_dim("[/btw — answers next in the panel]");
                             }
                             view.follow = true;
                         } else if line.starts_with('/') || line.starts_with('!') {
@@ -2666,20 +2769,37 @@ fn new_agent(
 pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, true)?;
 
+    // `plank /resume [prefix]` loads a prior session before the loop starts.
+    if let Some(arg) = &cfg.resume {
+        agent.resume_from_cli(arg)?;
+    }
+
     // A real terminal gets the full-screen ratatui UI (works cleanly in Warp
     // and other block terminals via the alternate screen). Piped input falls
     // back to the plain line REPL.
-    if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         agent.run_tui()
     } else {
-        agent.warm_plain()?;
-        if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
-            print!("{}", status::format_user_prompt_echo(initial, agent.color));
-            agent.session.push(Message::user(initial));
-            agent.run_turn()?;
-        }
-        run_repl_plain(&mut agent)
+        run_plain_flow(&mut agent, cfg)
+    };
+    // Whatever happened, save the session and tell the user how to resume it.
+    agent.report_session_on_exit();
+    result
+}
+
+/// Plain-REPL session flow: warm the cache, run the one-shot `-p` prompt if
+/// any, then read lines until EOF.
+fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String> {
+    agent.warm_plain()?;
+    if let Some(history) = agent.resumed_history() {
+        print!("{history}");
     }
+    if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
+        print!("{}", status::format_user_prompt_echo(initial, agent.color));
+        agent.session.push(Message::user(initial));
+        agent.run_turn()?;
+    }
+    run_repl_plain(agent)
 }
 
 /// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
@@ -3141,8 +3261,8 @@ mod tests {
     }
 
     #[test]
-    fn held_btw_panel_stays_open_until_esc_closes_it() {
-        let dir = scratch_dir("btw-hold");
+    fn drain_btw_returns_promptly_so_the_main_task_resumes() {
+        let dir = scratch_dir("btw-nonblock");
         let engine = ScriptedEngine {
             replies: vec!["It is Rust.\n".to_string()],
             ..ScriptedEngine::default()
@@ -3150,37 +3270,113 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("main"));
-        let before = agent.session.transcript.len();
 
         let shared = TurnShared::default();
-        shared.hold_btw_panel.store(true, Ordering::Relaxed);
         shared.push_btw("what language?".to_owned());
         let (tx, rx) = std::sync::mpsc::channel();
-
-        // The scripted answer is instant, so the panel is parked well before
-        // this delayed "Esc" fires to close it and unblock the worker.
-        std::thread::scope(|s| {
-            s.spawn(|| {
-                std::thread::sleep(Duration::from_millis(150));
-                shared.interrupt.store(true, Ordering::Relaxed);
-            });
-            agent.drain_btw(&tx, &shared);
-        });
+        // No external signal is provided: if the drain parked waiting for the
+        // panel to be dismissed, this would hang. It must return on its own.
+        agent.drain_btw(&tx, &shared);
         drop(tx);
 
-        // Nothing entered the transcript, and the dismissing Esc was consumed
-        // so a resumed main task would not see it.
-        assert_eq!(agent.session.transcript.len(), before);
-        assert!(!shared.interrupt.load(Ordering::Relaxed));
+        // BtwEnd only ends the active answer (the UI keeps the panel visible);
+        // the drain still returns, letting the main task resume.
         let events: Vec<UiEvent> = rx.try_iter().collect();
-        // The panel parked (idle-hint emitted) and then tore down on Esc.
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("Esc closes the panel")))
-        );
+        assert!(events.iter().any(|e| matches!(e, UiEvent::BtwBegin)));
         assert!(events.iter().any(|e| matches!(e, UiEvent::BtwEnd)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resume_from_cli_loads_a_saved_session_by_prefix_and_most_recent() {
+        let dir = scratch_dir("resume-cli");
+        let cfg = test_cfg();
+
+        // Save a session, capture its id.
+        let mut a = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        a.session.push(Message::user("remember the alamo"));
+        let id = a.store.save(&mut a.session).unwrap();
+
+        // A fresh agent resumes it by sha prefix.
+        let mut b = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(b.resumed_history().is_none(), "fresh session: no history");
+        b.resume_from_cli(&id[..8]).unwrap();
+        assert_eq!(b.session.id, id);
+        assert!(
+            b.session
+                .transcript
+                .iter()
+                .any(|m| m.text == "remember the alamo")
+        );
+        let history = b.resumed_history().expect("resumed session shows history");
+        assert!(history.contains("resumed session"));
+
+        // A fresh agent with an empty arg resumes the most recent session.
+        let mut c = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        c.resume_from_cli("").unwrap();
+        assert_eq!(c.session.id, id);
+
+        // An unknown prefix is a clean error, not a panic.
+        let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(d.resume_from_cli("nonexistent0").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_for_exit_persists_a_used_session_and_skips_an_empty_one() {
+        let dir = scratch_dir("exit-save");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // An empty session (no user turn) has nothing worth saving.
+        assert!(agent.save_for_exit().is_none());
+
+        // After a real user turn it saves, returns the id + existing path, and
+        // stamps the session id so a resume can find it.
+        agent.session.push(Message::user("hello there"));
+        let (id, path) = agent.save_for_exit().expect("used session should save");
+        assert!(!id.is_empty());
+        assert!(path.exists(), "session file written: {}", path.display());
+        assert_eq!(agent.session.id, id);
+        // The id resolves through the store, which is what `/resume <id>` uses.
+        assert!(agent.store.find(&id[..8]).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn esc_cancels_a_streaming_answer_and_defers_the_panel_close() {
+        let shared = TurnShared::default();
+        let mut p: BtwPanel = Some((OutputLog::new(), tui::OutputView::default()));
+        let mut close_pending = false;
+        close_or_interrupt(&shared, &mut p, true, &mut close_pending);
+        // Cancel the answer now; the panel is torn down later on its BtwEnd.
+        assert!(shared.interrupt.load(Ordering::Relaxed));
+        assert!(close_pending);
+        assert!(p.is_some());
+    }
+
+    #[test]
+    fn esc_on_a_frozen_panel_dismisses_it_without_interrupting_the_task() {
+        let shared = TurnShared::default();
+        let mut p: BtwPanel = Some((OutputLog::new(), tui::OutputView::default()));
+        let mut close_pending = false;
+        close_or_interrupt(&shared, &mut p, false, &mut close_pending);
+        assert!(
+            !shared.interrupt.load(Ordering::Relaxed),
+            "task keeps running"
+        );
+        assert!(p.is_none(), "panel dismissed");
+        assert!(!close_pending);
+    }
+
+    #[test]
+    fn esc_with_no_panel_interrupts_the_task() {
+        let shared = TurnShared::default();
+        let mut p: BtwPanel = None;
+        let mut close_pending = false;
+        close_or_interrupt(&shared, &mut p, false, &mut close_pending);
+        assert!(shared.interrupt.load(Ordering::Relaxed));
+        assert!(p.is_none());
     }
 
     #[test]

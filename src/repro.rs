@@ -17,6 +17,7 @@ use crate::config::AgentConfig;
 
 /// Runtime facts worth recording alongside the transcript, gathered from the
 /// live `Agent` by the caller (which owns the engine and config).
+#[derive(Debug)]
 pub struct Meta<'a> {
     /// plank version string.
     pub version: &'a str,

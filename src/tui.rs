@@ -435,6 +435,39 @@ impl Default for OutputView {
     }
 }
 
+/// Theme green, used for the prompt separator rule and panel accents.
+const THEME_GREEN: Color = Color::Indexed(114);
+
+/// Splits `area` into `(output, input, status)` rows. When `has_prompt`, a
+/// one-row green rule is inserted just above the input line (and drawn here),
+/// separating the scrollback from the resting prompt; while the agent is busy
+/// (no prompt) the rule is omitted.
+fn frame_rows(frame: &mut Frame, area: Rect, has_prompt: bool) -> (Rect, Rect, Rect) {
+    if has_prompt {
+        let r = Layout::vertical([
+            Constraint::Min(1),    // output
+            Constraint::Length(1), // separator rule
+            Constraint::Length(1), // input
+            Constraint::Length(1), // status
+        ])
+        .split(area);
+        let rule = "─".repeat(r[1].width as usize);
+        frame.render_widget(
+            Paragraph::new(Span::styled(rule, Style::default().fg(THEME_GREEN))),
+            r[1],
+        );
+        (r[0], r[2], r[3])
+    } else {
+        let r = Layout::vertical([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+        (r[0], r[1], r[2])
+    }
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
@@ -452,14 +485,9 @@ pub fn draw(
     selection: Option<Selection>,
 ) {
     let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let (output, input_row, status_row) = frame_rows(frame, area, input.is_some());
 
-    render_output(frame, rows[0], log, view, selection);
+    render_output(frame, output, log, view, selection);
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
@@ -467,11 +495,11 @@ pub fn draw(
         let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
         let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
         let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
-        frame.render_widget(Paragraph::new(input_line), rows[1]);
-        let cursor_x = rows[1].x + prompt_width + cursor_col;
+        frame.render_widget(Paragraph::new(input_line), input_row);
+        let cursor_x = input_row.x + prompt_width + cursor_col;
         frame.set_cursor_position(Position::new(
             cursor_x.min(area.right().saturating_sub(1)),
-            rows[1].y,
+            input_row.y,
         ));
     }
 
@@ -481,7 +509,7 @@ pub fn draw(
         .fg(Color::Indexed(252));
     frame.render_widget(
         Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
-        rows[2],
+        status_row,
     );
 }
 
@@ -538,26 +566,21 @@ pub fn draw_btw_split(
     use ratatui::widgets::{Block, Borders};
 
     let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Min(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(area);
+    let (output, input_row, status_row) = frame_rows(frame, area, input.is_some());
     let cols =
-        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(rows[0]);
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(output);
 
     render_output(frame, cols[0], log, view, None);
 
     // The btw panel: a left border acts as the vertical separator and carries
-    // a dim "btw (Esc to cancel)" title; the answer streams inside.
+    // a "btw · Esc closes" title; the answer streams inside.
     let block = Block::default()
         .borders(Borders::LEFT)
         .border_style(Style::default().fg(Color::Indexed(238)))
         .title(Span::styled(
             " btw · Esc closes ",
             Style::default()
-                .fg(Color::Indexed(114))
+                .fg(THEME_GREEN)
                 .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(cols[1]);
@@ -570,11 +593,11 @@ pub fn draw_btw_split(
         let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
         let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
         let input_line = Line::from(vec![prompt_span, Span::raw(input.to_string())]);
-        frame.render_widget(Paragraph::new(input_line), rows[1]);
-        let cursor_x = rows[1].x + prompt_width + cursor_col;
+        frame.render_widget(Paragraph::new(input_line), input_row);
+        let cursor_x = input_row.x + prompt_width + cursor_col;
         frame.set_cursor_position(Position::new(
             cursor_x.min(area.right().saturating_sub(1)),
-            rows[1].y,
+            input_row.y,
         ));
     }
     let status_style = Style::default()
@@ -582,7 +605,7 @@ pub fn draw_btw_split(
         .fg(Color::Indexed(252));
     frame.render_widget(
         Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
-        rows[2],
+        status_row,
     );
 }
 
@@ -835,5 +858,48 @@ mod tests {
     fn user_echo_is_bold() {
         let spans = user_echo_spans("hi");
         assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    /// Row index of the input line (the prompt), found by its cyan prompt glyph.
+    fn input_row(buf: &Buffer) -> Option<u16> {
+        let prompt = crate::status::prompt_text();
+        let head = prompt.chars().next()?;
+        (0..buf.area.height).find(|&y| {
+            let cell = &buf[(0, y)];
+            cell.symbol().starts_with(head) && cell.style().fg == Some(Color::Cyan)
+        })
+    }
+
+    #[test]
+    fn green_rule_separates_output_from_the_visible_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut log = OutputLog::new();
+        log.push_plain("some output");
+        let mut view = OutputView::default();
+
+        // Prompt visible: a green ─ rule sits on the row directly above input.
+        let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw(f, &log, Some("hi"), 2, "idle", &mut view, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let prompt_y = input_row(buf).expect("prompt row present");
+        let rule_y = prompt_y - 1;
+        let rule = &buf[(0, rule_y)];
+        assert_eq!(rule.symbol(), "─");
+        assert_eq!(rule.style().fg, Some(THEME_GREEN));
+
+        // Prompt hidden (agent busy): no rule — the row above the (empty)
+        // input line is ordinary output, never the green ─.
+        let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw(f, &log, None, 0, "generating", &mut view, None))
+            .unwrap();
+        let buf = term.backend().buffer();
+        let has_rule = (0..buf.area.height).any(|y| {
+            let c = &buf[(0, y)];
+            c.symbol() == "─" && c.style().fg == Some(THEME_GREEN)
+        });
+        assert!(!has_rule, "no separator while the prompt is hidden");
     }
 }

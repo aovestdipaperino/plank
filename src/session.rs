@@ -5,11 +5,13 @@
 //! persists engine KV state plus a rendered token transcript; plank has no
 //! real engine yet, so this module persists the text transcript instead
 //! while keeping the same user-visible behavior: sessions live under
-//! `~/.plank/kvcache` as `<sha1>.kv` files, session ids are 40-hex
-//! SHA-1 strings of `title || created_at_le64` (stable across resaves),
-//! titles derive from the first user prompt, listings sort most recent
-//! first, and history replay uses the exact `User:` / `Assistant:` /
-//! `Tool result:` headers of the C agent.
+//! `~/.plank/kvcache` as `<name>.kv` files. A session id is a memorable
+//! `adjective-celebrity` name minted on first save (e.g. `deadly-einstein`),
+//! disambiguated with a short guid on the rare filename collision; legacy
+//! `<40-hex>.kv` files from earlier versions still load and list. Titles
+//! derive from the first user prompt, listings sort most recent first, and
+//! history replay uses the exact `User:` / `Assistant:` / `Tool result:`
+//! headers of the C agent.
 //!
 //! # On-disk format
 //!
@@ -172,12 +174,12 @@ impl Message {
 
 /// A resumable conversation session.
 ///
-/// The id is SHA-1(title bytes || `created_at` as little-endian u64); once a
-/// session has a title and creation time, resaving keeps the same file name
-/// while the transcript evolves.
+/// The id is a memorable `adjective-celebrity` name minted on first save;
+/// resaving keeps the same file name while the transcript evolves.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// 40-hex SHA-1 identity; empty until the first save.
+    /// Memorable `adjective-celebrity` id (or a legacy 40-hex id); empty
+    /// until the first save.
     pub id: String,
     /// Title derived from the first user prompt (or set explicitly).
     pub title: String,
@@ -227,7 +229,7 @@ impl Default for Session {
 /// Lightweight listing record for one saved session.
 #[derive(Debug, Clone)]
 pub struct SessionEntry {
-    /// 40-hex session id.
+    /// Session id (memorable name, or a legacy 40-hex id).
     pub id: String,
     /// Session title (possibly clipped by the caller for display).
     pub title: String,
@@ -306,7 +308,18 @@ impl SessionStore {
         if session.created_at == 0 {
             session.created_at = now;
         }
-        let id = session_identity_sha(&session.title, session.created_at);
+        // First save: mint a memorable `adjective-celebrity` name (e.g.
+        // `deadly-einstein`). On the rare filename collision, append a short
+        // guid. Re-saving an already-named session keeps its name (overwrite).
+        if session.id.is_empty() {
+            let base = crate::names::session_slug();
+            let mut id = base.clone();
+            while self.path_for_id(&id).exists() {
+                id = format!("{base}-{}", crate::names::guid8());
+            }
+            session.id = id;
+        }
+        let id = session.id.clone();
 
         let mut body = Vec::new();
         let _ = writeln!(body, "{MAGIC}");
@@ -350,11 +363,8 @@ impl SessionStore {
     pub fn load(&self, prefix: impl AsRef<str>) -> Result<Session> {
         let (id, path) = self.find(prefix.as_ref())?;
         let mut session = read_session_file(&path)?;
-        if session_identity_sha(&session.title, session.created_at) != id {
-            return Err(SessionError::new(
-                "cached session identity does not match file name",
-            ));
-        }
+        // The filename is the identity; the memorable name (or a legacy sha)
+        // is authoritative, with no separate content cross-check.
         session.id = id;
         Ok(session)
     }
@@ -378,9 +388,8 @@ impl SessionStore {
     /// Uses the C agent's wording: "invalid session SHA prefix",
     /// "no saved session matches ...", "session prefix ... is ambiguous".
     pub fn find(&self, prefix: &str) -> Result<(String, PathBuf)> {
-        if prefix.is_empty() || prefix.len() > 40 || !prefix.bytes().all(|b| b.is_ascii_hexdigit())
-        {
-            return Err(SessionError::new("invalid session SHA prefix"));
+        if !is_valid_id_prefix(prefix) {
+            return Err(SessionError::new("invalid session name"));
         }
         let want = prefix.to_ascii_lowercase();
         let mut matched: Option<(String, PathBuf)> = None;
@@ -463,7 +472,7 @@ impl SessionStore {
     ///
     /// Returns an error if the cache directory cannot be read.
     pub fn complete(&self, prefix: &str) -> Result<Vec<String>> {
-        if prefix.len() > 40 || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if !prefix.is_empty() && !is_valid_id_prefix(prefix) {
             return Ok(Vec::new());
         }
         let want = prefix.to_ascii_lowercase();
@@ -475,8 +484,10 @@ impl SessionStore {
             .collect())
     }
 
-    /// Enumerates `<40-hex>.kv` files; other names (e.g. `sysprompt.kv`,
-    /// temp files) are intentionally ignored, like the C agent.
+    /// Enumerates `<name>.kv` session files: memorable `adjective-celebrity`
+    /// names, plus legacy `<40-hex>.kv` ids. The system prompt checkpoint
+    /// (`sysprompt.kv`) and temp files (`*.kv.tmp.*`, which don't end in
+    /// `.kv`) are skipped.
     fn session_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
@@ -486,12 +497,36 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(FILE_EXT) else {
                 continue;
             };
-            if stem.len() != 40 || !stem.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if stem == SYSPROMPT_STEM || !is_valid_id_prefix(stem) {
                 continue;
             }
             out.push((stem.to_ascii_lowercase(), entry.path()));
         }
         Ok(out)
+    }
+}
+
+/// File stem of the system-prompt KV checkpoint, which shares the cache dir
+/// with session files but is not one.
+const SYSPROMPT_STEM: &str = "sysprompt";
+
+/// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
+/// chars, ASCII alphanumeric or `-`. Covers both memorable names and legacy
+/// 40-hex ids.
+#[must_use]
+pub fn is_valid_id_prefix(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 80 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+/// Display handle for a session id: the full memorable `adjective-celebrity`
+/// name, or the first 8 chars of a legacy 40-hex id (which resume still
+/// accepts as a prefix).
+#[must_use]
+pub fn display_id(id: &str) -> &str {
+    if id.len() == 40 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        &id[..8]
+    } else {
+        id
     }
 }
 
@@ -524,7 +559,7 @@ pub fn render_session_list(entries: &[SessionEntry], now: u64, color: bool) -> S
             e.created_at
         };
         let age = format_age(when, now);
-        let short = &e.id[..8.min(e.id.len())];
+        let short = display_id(&e.id);
         let tag = if e.tag.is_empty() {
             String::new()
         } else {
@@ -1063,7 +1098,7 @@ pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit
             i + 1,
             e.title,
             format_age(when, now),
-            &e.id[..8.min(e.id.len())]
+            display_id(&e.id)
         );
         if !e.last_prompt.is_empty() {
             let _ = writeln!(out, "     {dim}last: {}{reset}", e.last_prompt);
@@ -1163,20 +1198,24 @@ mod tests {
         s.push(Message::assistant("Sure, I can help.\n"));
         assert!(s.dirty);
         let id = store.save(&mut s).unwrap();
-        assert_eq!(id.len(), 40);
-        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+        // A memorable `adjective-celebrity` name is minted on first save.
+        assert!(is_valid_id_prefix(&id));
+        assert!(id.contains('-'), "expected adjective-celebrity: {id}");
         assert!(!s.dirty);
         assert_eq!(s.title, "Hello there, please help me.");
-        assert_eq!(id, session_identity_sha(&s.title, s.created_at));
+        assert_eq!(s.id, id);
 
-        let loaded = store.load(&id[..8]).unwrap();
+        // Loadable by full name and by prefix.
+        let loaded = store.load(&id).unwrap();
         assert_eq!(loaded.id, id);
+        let by_prefix = store.load(id.split_once('-').unwrap().0).unwrap();
+        assert_eq!(by_prefix.id, id);
         assert_eq!(loaded.title, s.title);
         assert_eq!(loaded.created_at, s.created_at);
         assert_eq!(loaded.transcript, s.transcript);
         assert!(!loaded.dirty);
 
-        // Resave keeps the same identity.
+        // Resave keeps the same identity (overwrites the same file).
         s.push(Message::user("follow-up"));
         assert_eq!(store.save(&mut s).unwrap(), id);
         let _ = fs::remove_dir_all(&dir);
@@ -1299,17 +1338,19 @@ mod tests {
         s.push(Message::user("delete me"));
         let id = store.save(&mut s).unwrap();
 
+        // A prefix with illegal characters is rejected outright.
         assert_eq!(
-            store.find("zz").unwrap_err().to_string(),
-            "invalid session SHA prefix"
+            store.find("bad name").unwrap_err().to_string(),
+            "invalid session name"
         );
+        // A well-formed prefix that matches nothing.
         assert_eq!(
-            store.find("ffffffff").unwrap_err().to_string(),
-            "no saved session matches ffffffff"
+            store.find("nomatch").unwrap_err().to_string(),
+            "no saved session matches nomatch"
         );
-        assert_eq!(store.delete(&id[..8]).unwrap(), id);
+        assert_eq!(store.delete(&id).unwrap(), id);
         assert!(store.list().unwrap().is_empty());
-        assert!(store.load(&id[..8]).is_err());
+        assert!(store.load(&id).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

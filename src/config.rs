@@ -27,6 +27,9 @@ pub struct AgentConfig {
     pub generation: GenerationOptions,
     /// One-shot prompt supplied with `-p`/`--prompt`.
     pub prompt: Option<String>,
+    /// Session to resume at startup, from `plank /resume [prefix]`. `Some("")`
+    /// resumes the most recent session; `Some(prefix)` a specific one.
+    pub resume: Option<String>,
     /// System prompt; defaults to [`DEFAULT_SYSTEM_PROMPT`].
     pub system: String,
     /// Trace log path supplied with `--trace`.
@@ -139,6 +142,7 @@ impl Default for AgentConfig {
                 ..GenerationOptions::default()
             },
             prompt: None,
+            resume: None,
             system: DEFAULT_SYSTEM_PROMPT.to_owned(),
             trace_path: None,
             chdir_path: None,
@@ -186,6 +190,8 @@ Options:
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
   -p, --prompt TEXT        run one prompt and exit after the reply
+  /resume [prefix]         resume a saved session at startup (a sha prefix or
+                           list number; omit to resume the most recent)
       --non-interactive    disable the interactive UI
   -sys, --system TEXT      override the system prompt
       --trace PATH         append a trace log to PATH
@@ -409,6 +415,18 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                     .ok_or_else(|| format!("invalid value for {arg}: {v}"))?;
             }
             "-p" | "--prompt" => c.prompt = Some(need_arg(&mut i)?.to_owned()),
+            "/resume" => {
+                // Optional following token is the session prefix/number; a
+                // flag (or nothing) means "most recent".
+                let prefix = match args.get(i + 1) {
+                    Some(next) if !next.starts_with('-') => {
+                        i += 1;
+                        next.clone()
+                    }
+                    _ => String::new(),
+                };
+                c.resume = Some(prefix);
+            }
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -700,6 +718,22 @@ mod tests {
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
         assert!(!slash_command_known("/helpme"));
+    }
+
+    #[test]
+    fn resume_cli_arg() {
+        // `plank /resume deadbeef` selects a specific session.
+        let c = parse_options(&args(&["/resume", "deadbeef"])).unwrap();
+        assert_eq!(c.resume.as_deref(), Some("deadbeef"));
+        // Bare `/resume` means "most recent" (empty prefix).
+        let c = parse_options(&args(&["/resume"])).unwrap();
+        assert_eq!(c.resume.as_deref(), Some(""));
+        // A following flag is not consumed as the prefix.
+        let c = parse_options(&args(&["/resume", "--nothink"])).unwrap();
+        assert_eq!(c.resume.as_deref(), Some(""));
+        assert_eq!(c.generation.think_mode, ThinkMode::Off);
+        // Not given at all.
+        assert!(parse_options(&args(&[])).unwrap().resume.is_none());
     }
 
     #[test]
