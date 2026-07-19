@@ -48,11 +48,22 @@ plank --help     # full option list
 
 Run with a prompt argument for one-shot headless mode.
 
-On first run with no model present, plank offers to download the default GGUF (~87 GB) and shows live progress:
+### Model download
+
+Real inference needs the DeepSeek V4 Flash GGUF. You can point plank at any copy with `-m <path>`, but with no flag it looks in the default location (`~/.plank/ds4flash.gguf`) and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
 
 <p align="center">
   <img src="assets/model-download.gif" alt="Model download progress UI" width="700">
 </p>
+
+Details worth knowing:
+
+- **Resumable.** The download streams to a `.part` file next to the destination; if it's interrupted (Ctrl-C, network drop), the next launch detects the partial file and resumes from where it stopped instead of starting over.
+- **Guarded.** The default quant needs ~82 GB resident, so plank refuses to download or load on machines with less than 96 GB of RAM — you find out before spending hours on the transfer, not after.
+- **Honest about the wait.** An 87 GB download takes a while; the progress bar keeps you company with size/rate counters and a rotation of two hundred status messages ("Almost sentient. Please hold." among them).
+- **Headless-safe.** With stdin not attached to a terminal there is no prompt to answer, so plank exits with instructions instead of hanging a script.
+
+Without a model (or on non-macOS platforms) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
 
 ### Plank-only features
 
