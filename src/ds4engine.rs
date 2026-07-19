@@ -172,10 +172,16 @@ impl Ds4Engine {
         // SAFETY: opts and its CString outlive the call; engine is a valid out-ptr.
         let rc = unsafe { ffi::ds4_engine_open(&raw mut engine, &raw const opts) };
         if rc != 0 || engine.is_null() {
-            return Err(EngineError::new(format!(
-                "failed to open model {}",
-                path.display()
-            )));
+            let mut msg = format!("failed to open model {}", path.display());
+            let kernels_missing = std::env::var_os("DS4_METAL_FLASH_ATTN_SOURCE")
+                .is_none_or(|p| !Path::new(&p).exists());
+            if kernels_missing {
+                msg.push_str(
+                    " (Metal kernel sources not found; set DS4_METAL_DIR to a \
+                     directory containing the .metal files)",
+                );
+            }
+            return Err(EngineError::new(msg));
         }
         Ok(Self {
             engine,
@@ -660,7 +666,6 @@ impl Drop for Ds4TokensGuard {
 /// build, unless the caller already set the overrides. Without this the loader
 /// only searches the current directory and aborts.
 fn set_metal_source_env() {
-    const DIR: &str = env!("DS4_METAL_DIR");
     const KERNELS: [(&str, &str); 19] = [
         ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
         ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
@@ -682,12 +687,39 @@ fn set_metal_source_env() {
         ("DS4_METAL_BIN_SOURCE", "bin.metal"),
         ("DS4_METAL_SET_ROWS_SOURCE", "set_rows.metal"),
     ];
+    let dir = metal_source_dir();
     for (var, file) in KERNELS {
         if std::env::var_os(var).is_none() {
             // SAFETY: called once at startup before any threads are spawned.
-            unsafe { std::env::set_var(var, Path::new(DIR).join(file)) };
+            unsafe { std::env::set_var(var, dir.join(file)) };
         }
     }
+}
+
+/// Resolves the directory holding the bundled `.metal` kernel sources.
+///
+/// Tried in order: the `DS4_METAL_DIR` environment variable, the path baked
+/// in at compile time (valid for local builds), and `../share/plank/metal`
+/// relative to the executable (where Homebrew bottles install the kernels —
+/// the compile-time path is the CI runner's checkout and doesn't exist on
+/// user machines).
+fn metal_source_dir() -> std::path::PathBuf {
+    if let Some(dir) = std::env::var_os("DS4_METAL_DIR") {
+        return dir.into();
+    }
+    let built = Path::new(env!("DS4_METAL_DIR"));
+    if built.is_dir() {
+        return built.to_path_buf();
+    }
+    if let Ok(exe) = std::env::current_exe().and_then(std::fs::canonicalize)
+        && let Some(prefix) = exe.parent().and_then(Path::parent)
+    {
+        let shared = prefix.join("share").join("plank").join("metal");
+        if shared.is_dir() {
+            return shared;
+        }
+    }
+    built.to_path_buf()
 }
 
 fn cstr_message(buf: &[i8], fallback: &str) -> String {
