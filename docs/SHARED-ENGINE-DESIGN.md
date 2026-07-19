@@ -290,14 +290,20 @@ one-time model resident set. This is BTW-SUSPEND-DESIGN §8.1 requirement 4 ("bo
 second KV allocation") generalized from two sessions to N.
 
 - **Admission control.** `EngineHost` tracks live sessions and a configured
-  `max_sessions` (and/or a KV-bytes budget derived from `require_min_ram` headroom,
-  `src/main.rs`). `attach()` past the budget returns an `EngineError` (a real
-  failure, not `unsupported`) rather than OOM-ing the box. Default `max_sessions`
-  conservative; tunable via the `plank serve` config surface (§8).
-- **Right-sized contexts.** A session's `ctx_size` need not be the model max; the
-  host can hand out smaller per-session contexts to fit more clients, since
-  `ds4_session_create` takes `ctx_size` per session (`src/ffi.rs:157`). v1 uses one
-  configured per-session size; per-client sizing is a v2 refinement.
+  `max_sessions` and (v2, built) an aggregate KV-bytes budget
+  (`HostConfig::kv_budget_bytes`, `--kv-budget-bytes`, sized from `require_min_ram`
+  headroom in `src/main.rs`). `attach()` past either the count cap or the KV-bytes
+  budget returns an `EngineError` (a real failure, not `unsupported`) rather than
+  OOM-ing the box — the per-session KV bytes are estimated from its `ctx_size` via
+  `ModelHandle::kv_bytes_per_token`. Both default off/conservative (no budget =
+  count-only), tunable via the `plank serve` config surface (§8).
+- **Right-sized contexts (v2, built).** A session's `ctx_size` need not be the
+  model max; the host hands out smaller per-session contexts to fit more clients,
+  since `ds4_session_create` takes `ctx_size` per session (`src/ffi.rs:157`).
+  `EngineHost::attach_sized` takes a requested per-session `ctx_size` (clamped to
+  the model max), threaded from the client's `WireOptions::ctx_size` on the serve
+  path and/or a `--session-ctx-size` default; unspecified falls back to the model
+  ctx_size, matching v1 behavior.
 - **Idle reclamation (v2, noted).** A detached session frees its KV immediately on
   drop. An *idle-but-attached* session could optionally be snapshotted to disk (the
   same `SessionSnapshot::as_bytes` persistence path, `src/snapshot.rs:113`) and its

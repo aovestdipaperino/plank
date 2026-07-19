@@ -424,6 +424,11 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         slice_tokens: DEFAULT_SLICE_TOKENS,
         idle_reclaim: (cfg.idle_reclaim_secs > 0)
             .then(|| std::time::Duration::from_secs(cfg.idle_reclaim_secs)),
+        // v2 (design §7): default per-session ctx (0 = model max) and an
+        // aggregate KV-bytes budget (0 = count-only admission). Both default to
+        // today's behavior so existing runs are unchanged.
+        session_ctx_size: (cfg.session_ctx_size > 0).then_some(cfg.session_ctx_size),
+        kv_budget_bytes: (cfg.kv_budget_bytes > 0).then_some(cfg.kv_budget_bytes),
     };
     #[cfg(ds4_engine)]
     {
