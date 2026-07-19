@@ -191,8 +191,65 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     }
 }
 
+/// Starts the remote-control server when `--control` is configured, resolving
+/// the token (flag → `PLANK_REMOTE_TOKEN` → generated) and printing the token
+/// plus a ready-to-paste SSH tunnel hint once to stderr (design §4.1/§4.10).
+///
+/// The returned server must be kept alive for the process lifetime; dropping it
+/// shuts the listener down.
+///
+/// TODO(#25): the returned server owns a fresh `BroadcastBus`/`TurnShared`. The
+/// live turn loop in `ui.rs` does not yet broadcast into this bus nor drain
+/// remote prompts from its `TurnShared` (the dual-path wiring, design §5 step
+/// 4). Until then the server authenticates, mirrors any events broadcast into
+/// its bus, and accepts control frames, but is not connected to the running
+/// agent's output/input.
+fn start_remote(cfg: &AgentConfig, local_present: bool) -> Option<plank::remote::RemoteServer> {
+    use std::sync::Arc;
+
+    let rc = cfg.remote.as_ref()?;
+    let token = rc
+        .token
+        .clone()
+        .or_else(|| {
+            std::env::var("PLANK_REMOTE_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+        .unwrap_or_else(plank::remote::generate_token);
+    let allow_control = rc.allow_control || !local_present;
+    let bus = Arc::new(plank::worker::BroadcastBus::new());
+    let shared = Arc::new(plank::worker::TurnShared::default());
+    match plank::remote::RemoteServer::start(
+        &rc.addr,
+        token.clone(),
+        local_present,
+        allow_control,
+        bus,
+        shared,
+    ) {
+        Ok(server) => {
+            let addr = server.local_addr;
+            eprintln!("plank: remote control listening on ws://{addr}/ (loopback only)");
+            eprintln!("plank: remote token: {token}");
+            eprintln!(
+                "plank: tunnel from a client with:  ssh -L {port}:localhost:{port} user@thishost",
+                port = addr.port()
+            );
+            Some(server)
+        }
+        Err(e) => {
+            eprintln!("plank: could not start remote control on {}: {e}", rc.addr);
+            None
+        }
+    }
+}
+
 fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
+    // A local front-end is present unless we are headless (`--non-interactive`).
+    let local_present = !cfg.non_interactive;
+    let _remote = start_remote(cfg, local_present);
     if cfg.non_interactive {
         return plank::ui::run_non_interactive(engine, cfg);
     }

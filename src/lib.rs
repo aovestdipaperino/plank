@@ -23,6 +23,7 @@ pub mod interrupt;
 pub mod logo;
 pub mod memory;
 pub mod names;
+pub mod remote;
 pub mod render;
 pub mod repro;
 pub mod sandbox;

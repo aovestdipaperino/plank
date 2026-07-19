@@ -59,6 +59,9 @@ pub struct AgentConfig {
     pub engine: EngineTuning,
     /// `/btw` side-question behavior (mid-generation suspend).
     pub btw: BtwConfig,
+    /// Remote-control server options (issue #25); `None` when `--control` was
+    /// not given.
+    pub remote: Option<RemoteConfig>,
 }
 
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
@@ -70,6 +73,34 @@ pub struct BtwConfig {
     /// when off (or the engine has no aside support) an in-pass `/btw` falls
     /// back to the boundary queue exactly as today.
     pub suspend: bool,
+}
+
+/// Default remote-control bind address: loopback only, echoing the reference
+/// note's port (`docs/REMOTE-CONTROL-DESIGN.md` §4.1). Off-box reach is the
+/// user's SSH tunnel, never a wider bind.
+pub const DEFAULT_REMOTE_ADDR: &str = "127.0.0.1:31415";
+
+/// Remote-control server configuration from `--control*` flags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConfig {
+    /// Bind address; defaults to [`DEFAULT_REMOTE_ADDR`] (loopback).
+    pub addr: String,
+    /// Shared bearer token. `None` here means "generate one at startup and
+    /// print it once to stderr" — there is no unauthenticated mode.
+    pub token: Option<String>,
+    /// When set (or with no local TTY), a remote client may take control
+    /// without an explicit local `/grant`.
+    pub allow_control: bool,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            addr: DEFAULT_REMOTE_ADDR.to_owned(),
+            token: None,
+            allow_control: false,
+        }
+    }
 }
 
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
@@ -170,6 +201,7 @@ impl Default for AgentConfig {
             sandbox_override: None,
             engine: EngineTuning::default(),
             btw: BtwConfig::default(),
+            remote: None,
         }
     }
 }
@@ -227,6 +259,12 @@ Options:
                            enables it
       --btw-suspend        answer an in-pass /btw by freezing and resuming the
                            running generation (default: queue at the boundary)
+      --control[=ADDR]     start the remote-control WebSocket server, bound to
+                           ADDR (default 127.0.0.1:31415, loopback only)
+      --control-token TOKEN shared bearer token (else PLANK_REMOTE_TOKEN, else a
+                           token is generated and printed once to stderr)
+      --control-allow      let a remote client take control without a local
+                           /grant (implied in headless server mode)
 "
     .to_owned()
 }
@@ -326,6 +364,8 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/init"
             | "/skills"
             | "/hooks"
+            | "/remote"
+            | "/grant"
     ) || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")
@@ -382,6 +422,45 @@ fn parse_engine_option(
         _ => return Err(format!("unknown option: {arg}")),
     }
     Ok(())
+}
+
+/// Parses one `--control*` option, advancing `i` past a consumed value.
+/// Returns `true` if `arg` was a remote option (and was applied), `false`
+/// otherwise so the caller falls through to its unknown-option handling.
+///
+/// # Errors
+/// Returns an error when a required value is missing.
+fn parse_remote_option(
+    c: &mut AgentConfig,
+    arg: &str,
+    args: &[String],
+    i: &mut usize,
+) -> Result<bool, String> {
+    let mut value = || -> Result<&str, String> {
+        if *i + 1 >= args.len() {
+            return Err(format!("missing value for {arg}"));
+        }
+        *i += 1;
+        Ok(args[*i].as_str())
+    };
+    match arg {
+        "--control-token" => {
+            c.remote.get_or_insert_with(RemoteConfig::default).token = Some(value()?.to_owned());
+        }
+        "--control-allow" => {
+            c.remote
+                .get_or_insert_with(RemoteConfig::default)
+                .allow_control = true;
+        }
+        _ if arg == "--control" || arg.starts_with("--control=") => {
+            c.remote.get_or_insert_with(RemoteConfig::default).addr = arg
+                .strip_prefix("--control=")
+                .filter(|s| !s.is_empty())
+                .map_or_else(|| DEFAULT_REMOTE_ADDR.to_owned(), ToOwned::to_owned);
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 /// Parses command-line arguments (without the program name) into a config.
@@ -463,6 +542,8 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
+            _ if arg.starts_with("--control") && parse_remote_option(&mut c, arg, args, &mut i)? => {
+            }
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
@@ -765,6 +846,43 @@ mod tests {
         assert_eq!(c.generation.think_mode, ThinkMode::Off);
         // Not given at all.
         assert!(parse_options(&args(&[])).unwrap().resume.is_none());
+    }
+
+    #[test]
+    fn remote_flags() {
+        // Not given by default.
+        assert!(parse_options(&[]).unwrap().remote.is_none());
+        // Bare --control uses the loopback default.
+        let r = parse_options(&args(&["--control"])).unwrap().remote.unwrap();
+        assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
+        assert!(r.token.is_none());
+        assert!(!r.allow_control);
+        // --control=ADDR overrides the bind, and token/allow compose.
+        let r = parse_options(&args(&[
+            "--control=127.0.0.1:9000",
+            "--control-token",
+            "sekret",
+            "--control-allow",
+        ]))
+        .unwrap()
+        .remote
+        .unwrap();
+        assert_eq!(r.addr, "127.0.0.1:9000");
+        assert_eq!(r.token.as_deref(), Some("sekret"));
+        assert!(r.allow_control);
+        // Token given before --control still enables the server.
+        let r = parse_options(&args(&["--control-token", "t"]))
+            .unwrap()
+            .remote
+            .unwrap();
+        assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
+        assert_eq!(r.token.as_deref(), Some("t"));
+    }
+
+    #[test]
+    fn remote_slash_commands() {
+        assert!(slash_command_known("/remote"));
+        assert!(slash_command_known("/grant"));
     }
 
     #[test]
