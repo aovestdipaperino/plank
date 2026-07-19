@@ -62,6 +62,13 @@ pub struct AgentConfig {
     /// Remote-control server options (issue #25); `None` when `--control` was
     /// not given.
     pub remote: Option<RemoteConfig>,
+    /// Remote plank host from `--remote URL` (flavor a, issue #26); selects
+    /// [`crate::remote::ds4_client::RemoteDs4Engine`] instead of a local engine.
+    pub remote_url: Option<String>,
+    /// Bearer token for `--remote`, from `--remote-token` or `$PLANK_REMOTE_TOKEN`.
+    pub remote_token: Option<String>,
+    /// `--insecure`: allow plaintext `http://` to a non-loopback remote host.
+    pub insecure: bool,
 }
 
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
@@ -202,6 +209,9 @@ impl Default for AgentConfig {
             engine: EngineTuning::default(),
             btw: BtwConfig::default(),
             remote: None,
+            remote_url: None,
+            remote_token: None,
+            insecure: false,
         }
     }
 }
@@ -235,6 +245,11 @@ Options:
       --dir-steering-file PATH      directional steering vectors
       --dir-steering-ffn F          FFN steering scale (-100..100)
       --dir-steering-attn F         attention steering scale (-100..100)
+      --remote URL         drive a remote `plank serve` host instead of a local
+                           engine (https://, or http:// to localhost); token via
+                           --remote-token or $PLANK_REMOTE_TOKEN
+      --remote-token TOK   bearer token for --remote
+      --insecure           allow plaintext http:// to a non-loopback --remote host
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
@@ -468,6 +483,7 @@ fn parse_remote_option(
 /// # Errors
 /// Returns an error naming the offending option when a value is missing,
 /// out of range, or an option is unknown.
+#[allow(clippy::too_many_lines)] // flat flag-dispatch match; splitting hurts readability.
 pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
     let mut c = AgentConfig::default();
     // Tracks whether a steering scale was given explicitly; a steering file
@@ -524,6 +540,9 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                 };
                 c.resume = Some(prefix);
             }
+            "--remote" => c.remote_url = Some(need_arg(&mut i)?.to_owned()),
+            "--remote-token" => c.remote_token = Some(need_arg(&mut i)?.to_owned()),
+            "--insecure" => c.insecure = true,
             "--non-interactive" => c.non_interactive = true,
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -542,8 +561,8 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
-            _ if arg.starts_with("--control") && parse_remote_option(&mut c, arg, args, &mut i)? => {
-            }
+            _ if arg.starts_with("--control")
+                && parse_remote_option(&mut c, arg, args, &mut i)? => {}
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
@@ -569,10 +588,32 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
         }
         i += 1;
     }
+    finalize(&mut c, steering_scale_set)?;
+    Ok(c)
+}
+
+/// Post-parse fixups: the steering-scale default and `--remote` validation.
+fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
     }
-    Ok(c)
+    let Some(url) = c.remote_url.clone() else {
+        return Ok(());
+    };
+    // --remote is mutually exclusive with the local model/backend selectors (§4.7).
+    if c.model_path.is_some() {
+        return Err("--remote cannot be combined with -m/--model".to_string());
+    }
+    if c.backend.is_some() {
+        return Err("--remote cannot be combined with --metal/--cuda/--cpu".to_string());
+    }
+    crate::remote::validate_remote_url(&url, c.insecure)?;
+    if c.remote_token.is_none() {
+        c.remote_token = std::env::var("PLANK_REMOTE_TOKEN")
+            .ok()
+            .filter(|t| !t.is_empty());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -796,6 +837,36 @@ mod tests {
     }
 
     #[test]
+    fn remote_flags_and_mutual_exclusion() {
+        let c = parse_options(&args(&[
+            "--remote",
+            "https://box:8080",
+            "--remote-token",
+            "s3cr",
+        ]))
+        .unwrap();
+        assert_eq!(c.remote_url.as_deref(), Some("https://box:8080"));
+        assert_eq!(c.remote_token.as_deref(), Some("s3cr"));
+        // localhost http is allowed without --insecure.
+        assert!(parse_options(&args(&["--remote", "http://localhost:9000"])).is_ok());
+        // non-loopback http requires --insecure.
+        let err = parse_options(&args(&["--remote", "http://box.example.com"])).unwrap_err();
+        assert!(
+            err.contains("--insecure") || err.contains("plaintext"),
+            "{err}"
+        );
+        assert!(
+            parse_options(&args(&["--remote", "http://box.example.com", "--insecure"])).is_ok()
+        );
+        // mutually exclusive with -m.
+        let err = parse_options(&args(&["--remote", "https://box", "-m", "x.gguf"])).unwrap_err();
+        assert!(err.contains("-m"), "{err}");
+        // mutually exclusive with a backend selector.
+        let err = parse_options(&args(&["--remote", "https://box", "--cpu"])).unwrap_err();
+        assert!(err.contains("--metal"), "{err}");
+    }
+
+    #[test]
     fn power_percent() {
         assert_eq!(parse_power_percent("50"), Some(50));
         assert_eq!(parse_power_percent("1"), Some(1));
@@ -853,7 +924,10 @@ mod tests {
         // Not given by default.
         assert!(parse_options(&[]).unwrap().remote.is_none());
         // Bare --control uses the loopback default.
-        let r = parse_options(&args(&["--control"])).unwrap().remote.unwrap();
+        let r = parse_options(&args(&["--control"]))
+            .unwrap()
+            .remote
+            .unwrap();
         assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
         assert!(r.token.is_none());
         assert!(!r.allow_control);

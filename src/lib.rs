@@ -27,6 +27,7 @@ pub mod remote;
 pub mod render;
 pub mod repro;
 pub mod sandbox;
+pub mod serve;
 pub mod session;
 pub mod singleton;
 pub mod skills;

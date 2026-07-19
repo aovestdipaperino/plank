@@ -23,6 +23,9 @@ ureq = "3"
 logo-art = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui-markdown = { version = "0.3.6", features = ["highlight-lang-all"] }
+# serde JSON is shared by the remote-control protocol (#25) and the
+# remote-engine wire types (#26). The remote-control server uses tungstenite;
+# the sync remote-engine client (flavor a) reuses the ureq client above.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.24"
