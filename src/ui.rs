@@ -124,13 +124,11 @@ fn edit_preflight(
     move |call| crate::tools::edit::preflight_edit_old(&ctx, call)
 }
 
-/// Parses a `/btw <question>` (alias `/side <question>`) line, returning the
-/// question. Accepts a whitespace or `:` separator, mirroring `OpenClaw`'s
-/// `isBtwCommand` matcher; returns `None` for other input or an empty
-/// question.
+/// Parses a `/btw <question>` line, returning the question. Accepts a
+/// whitespace or `:` separator, mirroring `OpenClaw`'s `isBtwCommand`
+/// matcher; returns `None` for other input or an empty question.
 fn btw_question(line: &str) -> Option<&str> {
-    let t = line.trim();
-    let rest = t.strip_prefix("/btw").or_else(|| t.strip_prefix("/side"))?;
+    let rest = line.trim().strip_prefix("/btw")?;
     let rest = if let Some(r) = rest.strip_prefix(':') {
         r
     } else if rest.starts_with(char::is_whitespace) {
@@ -954,7 +952,7 @@ impl Agent<'_> {
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             // /btw shares the experimental gate with image pasting until the
             // model-format investigation lands.
-            "/btw" | "/side" if IMAGES_ENABLED => {
+            "/btw" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
                 } else {
@@ -2174,7 +2172,7 @@ impl Agent<'_> {
             }
             // /btw shares the experimental gate with image pasting until the
             // model-format investigation lands.
-            "/btw" | "/side" if IMAGES_ENABLED => {
+            "/btw" if IMAGES_ENABLED => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
                 } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input) {
@@ -2720,11 +2718,12 @@ mod tests {
     }
 
     #[test]
-    fn btw_question_parses_btw_and_side_with_boundaries() {
+    fn btw_question_parses_with_boundaries() {
         assert_eq!(btw_question("/btw what is x?"), Some("what is x?"));
-        assert_eq!(btw_question("/side  why?"), Some("why?"));
+        assert_eq!(btw_question("/btw  why?"), Some("why?"));
         assert_eq!(btw_question("/btw: colon form"), Some("colon form"));
         assert_eq!(btw_question("/btwfoo nope"), None);
+        assert_eq!(btw_question("/side why?"), None);
         assert_eq!(btw_question("/btw"), None);
         assert_eq!(btw_question("/btw   "), None);
         assert_eq!(btw_question("plain text"), None);

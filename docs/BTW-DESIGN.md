@@ -8,7 +8,7 @@ submodule at `refs/openclaw` (`shallow`/`update=none`: CI skips it; fetch with
 
 Status: **implemented (steps 1–4), still gated.** §4's mechanics landed on the
 #12 worker-thread architecture instead of the reverted `433fcb6` event-drain:
-the busy UI loop queues `/btw <q>` / `/side <q>` into `TurnShared` (FIFO cap
+the busy UI loop queues `/btw <q>` into `TurnShared` (FIFO cap
 20, drop-oldest — OpenClaw's bounded-buffer policy), and the worker answers at
 generation boundaries via `Agent::drain_btw` (interrupt flushes the queue;
 errors log and continue; `last_ctx_used` restored on every path). Deviations:
@@ -83,9 +83,8 @@ semantics for the in-flight pass, and un-gating.
 
 ### 4.1 Command surface
 
-- `/btw <question>` — primary command.
-- `/side <question>` — alias, matching OpenClaw. Registered in
-  `slash_command_known` / `slash_commands` (`src/config.rs`) and `/help`.
+- `/btw <question>` — the only command. (OpenClaw offers a `/side` alias;
+  plank deliberately keeps a single spelling.)
 - `/btw` with no argument prints usage, as today.
 - Available in both front-ends:
   - **TUI**: idle (immediate) and mid-turn (queued, §4.4).
@@ -154,7 +153,7 @@ Re-land `433fcb6` as the base, with the policy refinements below. Mechanics
   line (interrupts only on empty input, preserving today's contract), Esc
   always interrupts. The prompt row is drawn only while `input` is non-empty,
   with the cursor at the end.
-- **Enter** on a line matching `/btw <q>` or `/side <q>` pushes `q` onto
+- **Enter** on a line matching `/btw <q>` pushes `q` onto
   `queue` and clears the editor. Any other submitted line **stays in the
   buffer** with a status-bar hint ("only /btw <question> runs while the agent
   is working") — plank deliberately does not steer (§8).
@@ -230,7 +229,7 @@ text* the model was trained on, not the queueing mechanics. Plan:
 2. Close the model-format question: verify with the reference C agent that
    `btw_user_message` matches the reference framing byte-for-byte and add it
    to the `tests/c_parity.rs` fixture set.
-3. Move `/btw`/`/side` into the unconditional arm of `slash_command_known`
+3. Move `/btw` into the unconditional arm of `slash_command_known`
    and delete the gate comment. The `images` feature keeps gating images only.
 
 ## 5. Implementation plan
@@ -243,12 +242,10 @@ Ordered, each step independently landable:
    gate, nothing in the mechanics needs to change; if a defect was found,
    record it in `FINDINGS.md` and fix it here.
 2. **Queue policy**: cap 20 with drop-oldest notice.
-3. **`/side` alias** in `config.rs` + both slash dispatchers (`slash`,
-   `tui_slash` — remember the two parallel paths) + `/help`.
-4. **Side-channel markers**: `[btw]` opener, interrupt-flushes-queue
+3. **Side-channel markers**: `[btw]` opener, interrupt-flushes-queue
    semantics, error-path `last_ctx_used` guard, mid-turn drain errors logged
    not propagated.
-5. **Parity fixture** for `btw_user_message`, then **un-gate**.
+4. **Parity fixture** for `btw_user_message`, then **un-gate**.
 
 ## 6. Testing
 
@@ -266,7 +263,6 @@ Unit tests (`cargo test --lib`, EchoEngine, no model):
   the side exchange.
 - `btw_interrupt_flushes_queue`: interrupt during a side answer with 2 more
   queued; assert both cleared and the notice logged.
-- `side_alias_dispatch` in both slash paths.
 - Editor-key tests for the busy line editor (Ctrl-C clear vs interrupt,
   buffer survival across passes) — pure-logic extraction of the key handler
   is acceptable if driving crossterm events in tests is awkward.
