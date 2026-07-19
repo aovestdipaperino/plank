@@ -26,8 +26,8 @@ Current release line: **v1.3.x**.
 
 ## v2.0.0 — remote
 
-- **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine.
-- **Remote LLM support via llms-sdk** ([#26](https://github.com/aovestdipaperino/plank/issues/26)): a `RemoteEngine` behind the `Engine` trait for OpenAI-compatible and Anthropic APIs (reference checkout at `refs/llms-sdk`).
+- **Remote-control interface** ([#25](https://github.com/aovestdipaperino/plank/issues/25)): drive a running plank instance from another process or machine. Design: [`REMOTE-CONTROL-DESIGN.md`](REMOTE-CONTROL-DESIGN.md).
+- **Remote LLM support via llms-sdk** ([#26](https://github.com/aovestdipaperino/plank/issues/26)): remote-hosted ds4 (`plank serve`) and third-party providers (OpenAI-compatible + Anthropic) behind the `Engine` trait (reference checkout at `refs/llms-sdk`). Design: [`REMOTE-ENGINE-DESIGN.md`](REMOTE-ENGINE-DESIGN.md).
 
 ## Ongoing
 
