@@ -104,9 +104,13 @@ jobs:
             if [ "$NAME" = "plank-beta" ] && [ "${{ needs.channel.outputs.channel }}" != "beta" ]; then
               continue
             fi
-            mkdir -p "$NAME/$VERSION/bin"
+            mkdir -p "$NAME/$VERSION/bin" "$NAME/$VERSION/share/plank/metal"
             cp target/${{ matrix.target }}/release/plank "$NAME/$VERSION/bin/plank"
             chmod +x "$NAME/$VERSION/bin/plank"
+            # The engine compiles its Metal kernels from source at model load;
+            # the binary falls back to ../share/plank/metal relative to itself
+            # when the compile-time path (the CI checkout) is gone.
+            cp ds4-ref/metal/*.metal "$NAME/$VERSION/share/plank/metal/"
             tar czf "$NAME-$VERSION.$BOTTLE_TAG.bottle.tar.gz" "$NAME/"
           done
 
@@ -193,6 +197,10 @@ jobs:
           ${EXTRA}
             def install
               system "cargo", "install", *std_cargo_args
+              # Metal kernel sources are only present when building from a
+              # checkout with the ds4-ref submodule; the GitHub source tarball
+              # lacks them (EchoEngine-only build).
+              (pkgshare/"metal").install Dir["ds4-ref/metal/*.metal"] unless Dir["ds4-ref/metal/*.metal"].empty?
             end
 
             test do

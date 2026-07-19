@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "plank"
-version = "0.9.9"
+version = "0.9.10"
 dependencies = [
  "image",
  "libc",
