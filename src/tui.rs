@@ -9,7 +9,8 @@
 //! the per-frame layout. The interactive event loop lives in [`crate::ui`].
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position};
+use ratatui::buffer::Buffer;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
@@ -277,6 +278,115 @@ pub fn user_echo_spans(text: &str) -> Vec<Span<'static>> {
     ]
 }
 
+/// A mouse selection over screen cells, in reading order: inclusive
+/// `(x, y)` start and end positions.
+pub type Selection = ((u16, u16), (u16, u16));
+
+/// Orders two drag endpoints into reading order (top-to-bottom, then
+/// left-to-right), returning a normalized [`Selection`].
+#[must_use]
+pub fn normalize_selection(a: (u16, u16), b: (u16, u16)) -> Selection {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Column bounds (inclusive) the selection covers on screen row `y`, clamped
+/// to `area`; `None` when the row is outside the selection or the area.
+fn selection_row_bounds(sel: Selection, area: Rect, y: u16) -> Option<(u16, u16)> {
+    let ((sx, sy), (ex, ey)) = sel;
+    if y < sy || y > ey || y < area.top() || y >= area.bottom() {
+        return None;
+    }
+    let x0 = if y == sy { sx } else { area.left() };
+    let x1 = if y == ey {
+        ex
+    } else {
+        area.right().saturating_sub(1)
+    };
+    let x0 = x0.max(area.left());
+    let x1 = x1.min(area.right().saturating_sub(1));
+    (x0 <= x1).then_some((x0, x1))
+}
+
+/// Paints the selection as reversed video over the rendered cells.
+pub fn highlight_selection(buf: &mut Buffer, area: Rect, sel: Selection) {
+    for y in area.top()..area.bottom() {
+        if let Some((x0, x1)) = selection_row_bounds(sel, area, y) {
+            let row = Rect::new(x0, y, x1 - x0 + 1, 1);
+            buf.set_style(row, Style::default().add_modifier(Modifier::REVERSED));
+        }
+    }
+}
+
+/// Extracts the selected text from the rendered screen buffer, one line per
+/// screen row with trailing whitespace trimmed (WYSIWYG copy).
+#[must_use]
+pub fn selection_text(buf: &Buffer, area: Rect, sel: Selection) -> String {
+    let mut out = Vec::new();
+    for y in area.top()..area.bottom() {
+        let Some((x0, x1)) = selection_row_bounds(sel, area, y) else {
+            continue;
+        };
+        let mut line = String::new();
+        for x in x0..=x1 {
+            if let Some(cell) = buf.cell(ratatui::layout::Position::new(x, y)) {
+                line.push_str(cell.symbol());
+            }
+        }
+        out.push(line.trim_end().to_owned());
+    }
+    out.join("\n")
+}
+
+/// Minimal standard base64 (with padding) for the OSC 52 payload.
+fn base64(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        let n = (u32::from(chunk[0]) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Copies `text` to the system clipboard: `pbcopy` for the local macOS
+/// clipboard, plus an OSC 52 escape so it also works over SSH in terminals
+/// that support it. Best-effort on both paths.
+pub fn copy_to_clipboard(text: &str) {
+    use std::io::Write as _;
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b]52;c;{}\x1b\\", base64(text.as_bytes()));
+    let _ = out.flush();
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor_col` its display column.
@@ -289,6 +399,7 @@ pub fn draw(
     cursor_col: u16,
     status: &str,
     scroll_back: &mut usize,
+    selection: Option<Selection>,
 ) {
     let area = frame.area();
     let rows = Layout::vertical([
@@ -314,6 +425,9 @@ pub fn draw(
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(para, rows[0]);
+    if let Some(sel) = selection {
+        highlight_selection(frame.buffer_mut(), rows[0], sel);
+    }
 
     // Input line.
     let prompt = "plank> ";

@@ -4,9 +4,9 @@
   <img src="assets/logo.png" alt="Plank logo" width="300">
 </p>
 
-A Rust port of the [ds4](https://github.com/aovestdipaperino/ds4) agent, converted functionality-by-functionality (not line-by-line) from the C reference implementation.
+Plank is a fast-moving agent harness built on the [ds4](https://github.com/aovestdipaperino/ds4) C reference (`ds4_agent`). It was ported functionality-by-functionality (not line-by-line), with each C section becoming an idiomatic Rust module, so changes landing in `ds4_agent` stay easy to port over — the upstream remains the source of truth for wire formats and prompt text, while plank iterates quickly on everything around it.
 
-Plank is an interactive coding agent with a terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web).
+Plank is an interactive coding agent with a Ratatui TUI, a plain terminal REPL, a one-shot headless mode, and a set of built-in tools (shell, file read/edit, web).
 
 > **macOS only.** Plank targets macOS exclusively: inference uses the original ds4 C engine with the Metal backend, linked via the `ds4-ref` submodule. Other platforms are not supported.
 
@@ -47,6 +47,17 @@ plank --help     # full option list
 ```
 
 Run with a prompt argument for one-shot headless mode.
+
+### Plank-only features
+
+Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-facing side. Features that exist only in plank:
+
+- **Ratatui TUI** — the C reference is a plain line REPL; plank auto-selects a full-screen TUI when running on a terminal, with markdown rendering of assistant replies, tree-sitter syntax highlighting in code blocks, and mouse-wheel scrollback.
+- **`/init`** — asks the model to analyze the codebase and generate an `AGENTS.md` for future sessions (build/test commands, architecture, gotchas).
+- **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
+- **Session-start context** — plank automatically injects git status, recent commits, discovered `AGENTS.md`/`CLAUDE.md` files, and the current date at the start of each session.
+- **`/clear` and `/mcp`** — reset the session in place, and inspect the state of connected MCP servers.
+- **Hierarchical MCP configs with `primaryTools`** — user-scope plus project-scope config files, and per-server control over which tool schemas go in the system prompt (see below).
 
 ### Highlights
 

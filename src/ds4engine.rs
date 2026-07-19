@@ -25,6 +25,9 @@ pub struct Ds4Engine {
     session: *mut ffi::Ds4Session,
     ctx_size: i32,
     last_reply: Option<LastReply>,
+    /// Chat-template token overhead of an empty message (`-1` until measured),
+    /// subtracted by `count_tokens` so it returns just the text's tokens.
+    count_overhead: std::cell::Cell<i32>,
 }
 
 /// The most recent generated reply, kept so the next prompt can splice the
@@ -62,6 +65,7 @@ unsafe extern "C" fn cancel_cb(_ud: *mut std::os::raw::c_void) -> bool {
 /// progress bar starts partially filled and reflects the whole prompt.
 struct ProgressCtx<'a> {
     on_event: &'a mut dyn FnMut(EngineEvent),
+    interrupt: &'a dyn Fn() -> bool,
     start: std::time::Instant,
     base: i32,
     total: i32,
@@ -78,6 +82,12 @@ unsafe extern "C" fn progress_cb(
     }
     // SAFETY: ud is the ProgressCtx pointer we installed for this sync call.
     let ctx = unsafe { &mut *ud.cast::<ProgressCtx>() };
+    // Prefill runs inside ds4_session_sync, which only observes the cancel
+    // callback's flag; relay the caller's interrupt here so Esc/Ctrl-C can
+    // abort prefill, not just token generation.
+    if (ctx.interrupt)() {
+        INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
+    }
     // `base + cur` can overshoot `total` when the backend re-evaluates tokens
     // the common-prefix probe counted as cached. Grow the estimated total with
     // ~5% headroom on overshoot so the bar keeps advancing smoothly instead of
@@ -172,6 +182,7 @@ impl Ds4Engine {
             session: std::ptr::null_mut(),
             ctx_size,
             last_reply: None,
+            count_overhead: std::cell::Cell::new(-1),
         })
     }
 
@@ -185,6 +196,24 @@ impl Ds4Engine {
         }
         // SAFETY: p is a valid NUL-terminated string owned by the engine.
         unsafe { CStr::from_ptr(p) }.to_string_lossy().into_owned()
+    }
+
+    /// Tokenizes `text` as the content of a single user message, returning the
+    /// full templated length (chat begin + role wrapper + content).
+    fn templated_len(&self, text: &str) -> Option<i32> {
+        let content = CString::new(text).ok()?;
+        let mut tokens = Ds4TokensGuard::new();
+        // SAFETY: engine and tokens are valid; role/content outlive the calls.
+        unsafe {
+            ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr());
+            ffi::ds4_chat_append_message(
+                self.engine,
+                tokens.as_mut_ptr(),
+                c"user".as_ptr(),
+                content.as_ptr(),
+            );
+        }
+        Some(tokens.len())
     }
 
     /// Builds chat-template tokens for the system prompt alone (no assistant
@@ -380,6 +409,7 @@ impl Engine for Ds4Engine {
         let mut err = [0_i8; 512];
         let mut progress = ProgressCtx {
             on_event,
+            interrupt,
             start: std::time::Instant::now(),
             base: cached.clamp(0, prompt_len),
             total: prompt_len,
@@ -537,6 +567,7 @@ impl Engine for Ds4Engine {
         // Cache miss: prefill the system prompt, streaming progress.
         let mut progress = ProgressCtx {
             on_event,
+            interrupt: &|| false,
             start: std::time::Instant::now(),
             base: 0,
             total: tokens.len(),
@@ -564,6 +595,19 @@ impl Engine for Ds4Engine {
             Self::save_checkpoint(session, path, &fingerprint);
         }
         Ok(true)
+    }
+
+    fn count_tokens(&self, text: &str) -> i32 {
+        if self.count_overhead.get() < 0 {
+            self.count_overhead
+                .set(self.templated_len("").unwrap_or(-1).max(-1));
+        }
+        let overhead = self.count_overhead.get();
+        match (overhead, self.templated_len(text)) {
+            (o, Some(len)) if o >= 0 => (len - o).max(0),
+            // NUL bytes (or a failed overhead probe) fall back to the estimate.
+            _ => i32::try_from(text.len() / 4).unwrap_or(i32::MAX),
+        }
     }
 
     fn ctx_size(&self) -> i32 {

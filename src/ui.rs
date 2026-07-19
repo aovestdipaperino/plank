@@ -9,12 +9,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 
 use crate::compact;
 use crate::config::{AgentConfig, slash_command_known};
+use crate::context::{ContextContent, ContextTokens};
 use crate::dsml::ToolCall;
 use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
@@ -130,6 +131,12 @@ struct Agent<'a> {
     /// True when the line editor renders its own resting footer, so the turn
     /// loop must not print a second one after generation.
     editor_owns_footer: bool,
+    /// KV position reported by the engine after the last generation; 0 when
+    /// no generation has run against the current transcript. Anchors the
+    /// `/context` report to the real context usage.
+    last_ctx_used: i32,
+    /// Context content collected at session start (git, AGENTS.md, date).
+    context_content: ContextContent,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -219,6 +226,7 @@ impl Agent<'_> {
             .map_err(|e| e.to_string())?;
         stream.finish();
         bar.clear();
+        self.last_ctx_used = stats.ctx_used;
         Ok((stream, assistant_text, stats))
     }
 
@@ -358,6 +366,7 @@ impl Agent<'_> {
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
         self.session.transcript.extend(tail);
+        self.last_ctx_used = 0;
         println!("{}", self.debug_line("context compacted"));
         Ok(())
     }
@@ -379,6 +388,7 @@ impl Agent<'_> {
         const COL_SYSTEM: &str = "\x1b[38;5;105m";
         const COL_MCP: &str = "\x1b[38;5;44m";
         const COL_MSG: &str = "\x1b[38;5;134m";
+        const COL_CONTEXT: &str = "\x1b[38;5;208m";
         const COL_FREE: &str = "\x1b[38;5;240m";
         let paint = |col: &'static str| if color { col } else { "" };
         let reset = if color { ANSI_RESET } else { "" };
@@ -392,24 +402,64 @@ impl Agent<'_> {
         };
         // MCP tool schemas are embedded in the composed system prompt; split
         // them out so the two categories don't double-count.
-        let system_tokens = (self.engine.count_tokens(&self.system) - mcp_tokens).max(0);
-        let message_tokens: i32 = self
+        // The system prompt includes: tools prompt + user system text
+        let mut system_tokens = (self.engine.count_tokens(&self.system) - mcp_tokens).max(0);
+        let mut mcp_tokens = mcp_tokens;
+        // AGENTS.md tokens from the context collected at session start.
+        let context_tokens =
+            ContextTokens::count(&self.context_content, |s| self.engine.count_tokens(s));
+        // Message tokens: all transcript messages (user and assistant)
+        let raw_message_tokens: i32 = self
             .session
             .transcript
             .iter()
             .map(|m| self.engine.count_tokens(&m.text))
             .sum();
-        let used = (system_tokens + mcp_tokens + message_tokens).min(ctx_size);
+        // AGENTS.md gets its own category; git and date context stay grouped
+        // under Messages (they are part of the injected first user message).
+        let agents_md_tokens = context_tokens.agents_md;
+        let mut message_tokens = raw_message_tokens - agents_md_tokens;
+
+        let estimated = system_tokens + mcp_tokens + message_tokens + agents_md_tokens;
+        if self.last_ctx_used > estimated && estimated > 0 {
+            let scale = |t: i32| {
+                i32::try_from(i64::from(t) * i64::from(self.last_ctx_used) / i64::from(estimated))
+                    .unwrap_or(t)
+            };
+            system_tokens = scale(system_tokens);
+            mcp_tokens = scale(mcp_tokens);
+            message_tokens = scale(message_tokens);
+        }
+
+        let used = (system_tokens + mcp_tokens + message_tokens + agents_md_tokens).min(ctx_size);
         let free = ctx_size - used;
         let pct = |n: i32| f64::from(n) * 100.0 / f64::from(ctx_size);
 
-        // One glyph per category so the grid stays readable without color;
-        // with color each category also gets its Claude Code hue.
-        let categories = [
-            ("System prompt", system_tokens, '⛁', COL_SYSTEM),
-            ("MCP tools", mcp_tokens, '⛃', COL_MCP),
-            ("Messages", message_tokens, '⛂', COL_MSG),
+        // Categories are told apart by color; the glyph of each cell shows
+        // how full that cell is (see `fill_glyph`).
+        let mut categories = vec![
+            ("System prompt", system_tokens, COL_SYSTEM),
+            ("MCP tools", mcp_tokens, COL_MCP),
         ];
+
+        if agents_md_tokens > 0 {
+            categories.push(("AGENTS.md", agents_md_tokens, COL_CONTEXT));
+        }
+
+        categories.push(("Messages", message_tokens, COL_MSG));
+
+        // Glyph for a cell by its fill fraction: <25%, <50%, <75%, full.
+        let fill_glyph = |frac: f64| -> char {
+            if frac < 0.25 {
+                '⛀'
+            } else if frac < 0.5 {
+                '⛂'
+            } else if frac < 0.75 {
+                '⛁'
+            } else {
+                '⛃'
+            }
+        };
 
         // Adaptive density: 1k tokens per cell, coarsened (in 1k steps) so the
         // grid never exceeds half a typical 24-row screen. Every non-empty
@@ -423,14 +473,21 @@ impl Agent<'_> {
             * 1000;
         let total_cells = ctx.div_ceil(tokens_per_cell);
         let mut cells: Vec<(char, &'static str)> = Vec::with_capacity(total_cells);
-        for &(_, tokens, glyph, col) in &categories {
-            if tokens == 0 || cells.len() == total_cells {
+        for &(_, tokens, col) in &categories {
+            if tokens <= 0 || cells.len() == total_cells {
                 continue;
             }
+            // Whole cells render full; the trailing remainder renders with a
+            // glyph matching its fill fraction.
             #[allow(clippy::cast_sign_loss)]
-            let n = ((tokens as usize + tokens_per_cell / 2) / tokens_per_cell)
-                .clamp(1, total_cells - cells.len());
-            cells.extend(std::iter::repeat_n((glyph, col), n));
+            let tokens = tokens as usize;
+            let full = (tokens / tokens_per_cell).min(total_cells - cells.len());
+            cells.extend(std::iter::repeat_n(('⛃', col), full));
+            let rem = tokens % tokens_per_cell;
+            if rem > 0 && cells.len() < total_cells {
+                #[allow(clippy::cast_precision_loss)]
+                cells.push((fill_glyph(rem as f64 / tokens_per_cell as f64), col));
+            }
         }
         cells.truncate(total_cells);
         cells.resize(total_cells, (FREE_CELL, COL_FREE));
@@ -450,9 +507,9 @@ impl Agent<'_> {
         ));
         right.push(String::new());
         right.push("Estimated usage by category".to_owned());
-        for &(label, tokens, glyph, col) in &categories {
+        for &(label, tokens, col) in &categories {
             right.push(format!(
-                "{}{glyph}{reset} {label}: {} tokens ({:.1}%)",
+                "{}⛃{reset} {label}: {} tokens ({:.1}%)",
                 paint(col),
                 status::format_ctx_size(tokens),
                 pct(tokens)
@@ -494,18 +551,89 @@ impl Agent<'_> {
         out
     }
 
+    /// Runs the /init command: prompts the model to create AGENTS.md
+    fn run_init(&mut self) {
+        println!("Initializing AGENTS.md...");
+        println!("The model will now analyze the codebase and generate documentation.\n");
+
+        let prompt = concat!(
+            "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
+            "Include:\n",
+            "1. Build, lint, and test commands (especially non-standard ones)\n",
+            "2. High-level architecture and structure\n",
+            "3. Required setup or environment variables\n",
+            "4. Non-obvious gotchas or workflow quirks\n\n",
+            "Exclude:\n",
+            "- File-by-file listings Claude can discover\n",
+            "- Standard language conventions\n",
+            "- Generic advice\n",
+            "- Information from README unless essential\n\n",
+            "Preface with:\n",
+            "```",
+            "# AGENTS.md\n\n",
+            "This file provides guidance to the agent when working with code in this repository.",
+            "```",
+            "\n\n",
+            "Write the AGENTS.md file to the current directory."
+        );
+
+        self.session.push(Message::user(prompt));
+        if let Err(e) = self.run_turn() {
+            println!("/init failed: {e}");
+        }
+    }
+
+    /// Runs the /init command in TUI mode.
+    fn tui_run_init(&mut self, log: &mut OutputLog, terminal: &mut ratatui::DefaultTerminal) {
+        log.push_plain("Initializing AGENTS.md...");
+        log.push_plain("The model will now analyze the codebase and generate documentation.\n");
+
+        let prompt = concat!(
+            "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
+            "Include:\n",
+            "1. Build, lint, and test commands (especially non-standard ones)\n",
+            "2. High-level architecture and structure\n",
+            "3. Required setup or environment variables\n",
+            "4. Non-obvious gotchas or workflow quirks\n\n",
+            "Exclude:\n",
+            "- File-by-file listings Claude can discover\n",
+            "- Standard language conventions\n",
+            "- Generic advice\n",
+            "- Information from README unless essential\n\n",
+            "Preface with:\n",
+            "```",
+            "# AGENTS.md\n\n",
+            "This file provides guidance to the agent when working with code in this repository.",
+            "```",
+            "\n\n",
+            "Write the AGENTS.md file to the current directory."
+        );
+
+        log.push_spans(tui::user_echo_spans(prompt));
+        self.session.push(Message::user(prompt));
+        if let Err(e) = self.tui_turn(terminal, log) {
+            log.push_plain(format!("/init failed: {e}"));
+        }
+    }
+
     /// Handles a slash command; returns false when the REPL should exit.
     fn slash(&mut self, input: &str) -> Result<bool, String> {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
+            "/init" => {
+                self.run_init();
+                return Ok(true);
+            }
             "/quit" | "/exit" => return Ok(false),
-            "/new" => {
+            "/new" | "/clear" => {
                 self.session = Session::new();
                 self.reminder = SystemPromptReminder::new();
-                let datetime = sysprompt::datetime_context_line(std::time::SystemTime::now());
-                self.session.push(Message::user(datetime));
+                self.context_content = ContextContent::new();
+                let combined = self.context_content.combined();
+                self.session.push(Message::user(combined));
+                self.last_ctx_used = 0;
                 println!("started a new session");
             }
             "/help" => print!("{}", crate::config::usage()),
@@ -527,6 +655,7 @@ impl Agent<'_> {
                         crate::session::render_history(&s.transcript, 6, self.color)
                     );
                     self.session = s;
+                    self.last_ctx_used = 0;
                 }
                 Err(e) => println!("switch failed: {e}"),
             },
@@ -650,12 +779,38 @@ impl Agent<'_> {
     fn run_tui(&mut self) -> Result<(), String> {
         let mut terminal = ratatui::init();
         // Capture the mouse so wheel events scroll the output buffer instead
-        // of being translated by the terminal into arrow keys (history moves).
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+        // of being translated by the terminal into arrow keys (history moves),
+        // and drags select text for copying. Bracketed paste makes Cmd-V
+        // arrive as a single Paste event instead of a burst of key presses.
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste
+        );
         let result = self.tui_loop(&mut terminal);
-        let _ = ratatui::crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+        let _ = ratatui::crossterm::execute!(
+            std::io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture
+        );
         ratatui::restore();
         result
+    }
+
+    /// Copies the drag-selected region of the rendered output area to the
+    /// system clipboard (WYSIWYG: reads the cells as drawn on screen).
+    fn copy_selection(terminal: &mut ratatui::DefaultTerminal, a: (u16, u16), b: (u16, u16)) {
+        let Ok(size) = terminal.size() else { return };
+        // The output area is everything above the input and status rows.
+        let area = ratatui::layout::Rect::new(0, 0, size.width, size.height.saturating_sub(2));
+        let text = tui::selection_text(
+            terminal.current_buffer_mut(),
+            area,
+            tui::normalize_selection(a, b),
+        );
+        if !text.trim().is_empty() {
+            tui::copy_to_clipboard(&text);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -684,6 +839,9 @@ impl Agent<'_> {
         }
 
         let mut scroll_back = 0usize;
+        // Endpoints of a mouse drag selection over the output area, in screen
+        // cells (anchor, current). Copied to the clipboard on button release.
+        let mut selection: Option<((u16, u16), (u16, u16))> = None;
         loop {
             let status = self.idle_status_text();
             terminal
@@ -695,6 +853,7 @@ impl Agent<'_> {
                         input.cursor_col(),
                         &status,
                         &mut scroll_back,
+                        selection.map(|(a, b)| tui::normalize_selection(a, b)),
                     );
                 })
                 .map_err(|e| e.to_string())?;
@@ -705,10 +864,40 @@ impl Agent<'_> {
             let ev = event::read().map_err(|e| e.to_string())?;
             if let Event::Mouse(m) = &ev {
                 match m.kind {
-                    MouseEventKind::ScrollUp => scroll_back = scroll_back.saturating_add(3),
-                    MouseEventKind::ScrollDown => scroll_back = scroll_back.saturating_sub(3),
+                    MouseEventKind::ScrollUp => {
+                        selection = None;
+                        scroll_back = scroll_back.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollDown => {
+                        selection = None;
+                        scroll_back = scroll_back.saturating_sub(3);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        selection = Some(((m.column, m.row), (m.column, m.row)));
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if let Some((_, end)) = &mut selection {
+                            *end = (m.column, m.row);
+                        }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if let Some((a, b)) = selection.filter(|(a, b)| a != b) {
+                            Self::copy_selection(terminal, a, b);
+                        } else {
+                            selection = None;
+                        }
+                    }
                     _ => {}
                 }
+                continue;
+            }
+            if let Event::Paste(pasted) = &ev {
+                // The line editor is single-line; fold pasted newlines into
+                // spaces so the paste stays editable.
+                input.hist_idx = None;
+                input
+                    .buf
+                    .insert(pasted.replace("\r\n", "\n").replace(['\n', '\r'], " "));
                 continue;
             }
             let Event::Key(key) = ev else {
@@ -717,6 +906,9 @@ impl Agent<'_> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // Any keystroke dismisses the mouse selection highlight (the text
+            // was already copied on mouse release).
+            selection = None;
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('c') if ctrl => {
@@ -768,7 +960,7 @@ impl Agent<'_> {
                     input.history.add(&line);
                     input.history.save(&hist_path).ok();
                     if line.starts_with('/') {
-                        if !self.tui_slash(&line, &mut log) {
+                        if !self.tui_slash(&line, &mut log, terminal) {
                             break;
                         }
                     } else {
@@ -825,7 +1017,7 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line, &mut 0));
+                    let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &line, &mut 0, None));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -833,7 +1025,7 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status, &mut 0));
+            let _ = terminal.draw(|f| tui::draw(f, log, "", 0, &status, &mut 0, None));
         }
         Ok(())
     }
@@ -984,11 +1176,12 @@ impl Agent<'_> {
                     interrupt_flag.store(true, Ordering::Relaxed);
                 }
                 let line = status::build_status_text(&status, false);
-                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line, &mut 0));
+                let _ = terminal.draw(|f| tui::draw(f, stream.sink(), "", 0, &line, &mut 0, None));
             },
         );
 
         let stats = result.map_err(|e| e.to_string())?;
+        self.last_ctx_used = stats.ctx_used;
         stream.finish();
         let finished = stream.finished();
         let calls = finished.calls.to_vec();
@@ -1048,6 +1241,7 @@ impl Agent<'_> {
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
         self.session.transcript.extend(tail);
+        self.last_ctx_used = 0;
         log.push_dim("context compacted");
         Ok(())
     }
@@ -1073,17 +1267,24 @@ impl Agent<'_> {
     }
 
     /// Handles a slash command in the TUI; returns false to quit.
-    fn tui_slash(&mut self, input: &str, log: &mut OutputLog) -> bool {
+    fn tui_slash(
+        &mut self,
+        input: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> bool {
         let mut parts = input.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(input);
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/quit" | "/exit" => return false,
-            "/new" => {
+            "/new" | "/clear" => {
                 self.session = Session::new();
                 self.reminder = SystemPromptReminder::new();
-                let datetime = sysprompt::datetime_context_line(std::time::SystemTime::now());
-                self.session.push(Message::user(datetime));
+                self.context_content = ContextContent::new();
+                let combined = self.context_content.combined();
+                self.session.push(Message::user(combined));
+                self.last_ctx_used = 0;
                 log.push_plain("started a new session");
             }
             "/help" => {
@@ -1093,6 +1294,7 @@ impl Agent<'_> {
             }
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
+            "/init" => self.tui_run_init(log, terminal),
             "/compact" => {
                 if let Err(e) = self.tui_do_compact("user request", log) {
                     log.push_plain(format!("compact failed: {e}"));
@@ -1118,6 +1320,7 @@ impl Agent<'_> {
                         log.push_plain(line.to_owned());
                     }
                     self.session = s;
+                    self.last_ctx_used = 0;
                 }
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
@@ -1189,10 +1392,12 @@ fn new_agent(
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut trace = Trace::open(cfg.trace_path.as_deref()).map_err(|e| e.to_string())?;
     let mut session = Session::new();
-    // Inject the session-start datetime context once, like the C worker.
-    let datetime = sysprompt::datetime_context_line(std::time::SystemTime::now());
-    trace.text("datetime-context", &datetime);
-    session.push(Message::user(datetime));
+    // Collect context at session start
+    let context_content = ContextContent::new();
+    // Inject context into the session transcript
+    let combined = context_content.combined();
+    trace.text("context", &combined);
+    session.push(Message::user(combined));
     let mut tool_ctx = ToolContext::new(cwd);
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
@@ -1224,6 +1429,8 @@ fn new_agent(
         color: std::io::stdout().is_terminal(),
         show_footer,
         editor_owns_footer: false,
+        last_ctx_used: 0,
+        context_content,
     })
 }
 
@@ -1432,6 +1639,8 @@ mod tests {
             color: false,
             show_footer: false,
             editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();

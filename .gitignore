@@ -2,3 +2,4 @@
 *.gguf
 .claude/
 /local/
+/vault/
