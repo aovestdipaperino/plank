@@ -59,6 +59,8 @@ Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-f
 - **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
 - **Session-start context** — plank automatically injects git status, recent commits, discovered `AGENTS.md`/`CLAUDE.md` files, and the current date at the start of each session.
 - **`/clear` and `/mcp`** — reset the session in place, and inspect the state of connected MCP servers.
+- **`!` commands** — `!<command>` runs a shell command immediately from the prompt (no model round-trip); output stays in the UI with exit-code display, Esc/Ctrl-C kills it.
+- **`/skills`** — markdown prompt templates in `~/.plank/skills/<name>/SKILL.md` (overlaid by `./.plank/skills`) become slash commands: frontmatter gives `name`/`description`/`argument-hint`, the body is injected as the user turn with `$ARGUMENTS` substituted.
 - **Interruptible everywhere** — Esc or Ctrl-C stops generation *and* prompt prefill; the engine's cancel callback aborts mid-sync instead of making you wait out a long prompt.
 - **Text selection and clipboard** — click-drag selects rendered output (WYSIWYG, wrapped lines included) and copies it to the system clipboard on release via `pbcopy` plus OSC 52 (so copy also works over SSH); Cmd-V pastes into the prompt through bracketed paste.
 - **Hierarchical MCP configs with `primaryTools`** — user-scope plus project-scope config files, and per-server control over which tool schemas go in the system prompt (see below).

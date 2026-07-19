@@ -176,6 +176,8 @@ struct Agent<'a> {
     last_ctx_used: i32,
     /// Context content collected at session start (git, AGENTS.md, date).
     context_content: ContextContent,
+    /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
+    skills: Vec<crate::skills::Skill>,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -813,10 +815,27 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/compact" => self.compact("user request")?,
+            "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
-            _ => println!("unknown command: {cmd}"),
+            _ => {
+                if let Some(message) = self.skill_message(cmd, arg) {
+                    print!("{}", status::format_user_prompt_echo(input, self.color));
+                    self.session.push(Message::user(message));
+                    self.run_turn()?;
+                } else {
+                    println!("unknown command: {cmd}");
+                }
+            }
         }
         Ok(true)
+    }
+
+    /// Resolves `/name args` against the loaded skills, rendering the
+    /// user-turn preamble on a match.
+    fn skill_message(&self, cmd: &str, arg: &str) -> Option<String> {
+        let name = cmd.strip_prefix('/')?;
+        let skill = self.skills.iter().find(|s| s.name == name)?;
+        Some(crate::skills::render(skill, arg))
     }
 }
 
@@ -1566,6 +1585,7 @@ impl Agent<'_> {
     }
 
     /// Handles a slash command in the TUI; returns false to quit.
+    #[allow(clippy::too_many_lines)]
     fn tui_slash(
         &mut self,
         input: &str,
@@ -1661,10 +1681,25 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/skills" => {
+                for line in crate::skills::render_list(&self.skills).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             _ if slash_command_known(cmd) => {
                 log.push_plain(format!("{cmd}: not implemented yet"));
             }
-            _ => log.push_plain(format!("unknown command: {cmd}")),
+            _ => {
+                if let Some(message) = self.skill_message(cmd, arg) {
+                    log.push_spans(tui::user_echo_spans(input));
+                    self.session.push(Message::user(message));
+                    if let Err(e) = self.tui_turn(terminal, log, view) {
+                        log.push_plain(format!("{cmd} failed: {e}"));
+                    }
+                } else {
+                    log.push_plain(format!("unknown command: {cmd}"));
+                }
+            }
         }
         true
     }
@@ -1716,6 +1751,7 @@ fn new_agent(
         }));
     }
     let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
+    let skills = crate::skills::load_default(&tool_ctx.cwd);
     Ok(Agent {
         engine,
         cfg,
@@ -1731,6 +1767,7 @@ fn new_agent(
         editor_owns_footer: false,
         last_ctx_used: 0,
         context_content,
+        skills,
     })
 }
 
@@ -1959,6 +1996,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -2012,6 +2050,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();

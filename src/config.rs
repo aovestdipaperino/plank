@@ -294,6 +294,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/mcp"
             | "/context"
             | "/init"
+            | "/skills"
     ) || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
@@ -662,7 +663,7 @@ mod tests {
     fn slash_commands() {
         for cmd in [
             "/help", "/save", "/compact", "/list", "/quit", "/exit", "/new", "/clear", "/mcp",
-            "/context", "/init",
+            "/context", "/init", "/skills",
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }

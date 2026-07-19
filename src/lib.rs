@@ -20,6 +20,7 @@ pub mod interrupt;
 pub mod logo;
 pub mod render;
 pub mod session;
+pub mod skills;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;
