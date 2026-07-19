@@ -21,8 +21,7 @@ Current release line: **v1.3.x**.
   - feed `!` output into the transcript ([#20](https://github.com/aovestdipaperino/plank/issues/20)) — blocked on the model-format investigation;
   - mode-aware history navigation ([#21](https://github.com/aovestdipaperino/plank/issues/21));
   - live output streaming ([#22](https://github.com/aovestdipaperino/plank/issues/22)) — natural follow-on to the worker thread.
-- **Persistent memory across sessions** ([#23](https://github.com/aovestdipaperino/plank/issues/23))
-- **Saving and restoring named sessions** ([#24](https://github.com/aovestdipaperino/plank/issues/24))
+- ~~Persistent memory across sessions~~ (#23) and ~~named session save/restore~~ (#24) — first cuts landed in `a203a3b` (`/remember` + layered `MEMORY.md`; session `meta` trailer, `/tag`, `/resume` picker).
 - **Per-session engine KV payloads** ([#12](https://github.com/aovestdipaperino/plank/issues/12), sessions section): persist the engine KV cache alongside transcripts so `/switch` resumes without re-prefilling; unblocks a real **`/strip`**. The session format change means the release that ships it must handle (or discard) payload-less older sessions gracefully.
 
 ## v2.0.0 — remote
