@@ -66,6 +66,21 @@ impl RenderSink for TerminalSink {
     }
 }
 
+/// Builds the model-visible payload for a failed generation pass, matching
+/// the C worker loop: a preflight failure is fed back verbatim, a DSML parse
+/// failure gets the C's `invalid DSML tool call: ` prefix plus the syntax
+/// reminder so the model can correct its markup.
+fn tool_error_payload(preflight: bool, err: &str) -> String {
+    if preflight {
+        format!("Tool error: {err}\n")
+    } else {
+        format!(
+            "Tool error: invalid DSML tool call: {err}\n{}",
+            sysprompt::dsml_syntax_reminder()
+        )
+    }
+}
+
 /// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
 /// validates an `edit` call's `old` selector against the file on disk the
 /// moment that parameter closes (the C's `agent_stream_preflight_closed_param`).
@@ -100,6 +115,12 @@ fn render_transcript(session: &Session, system: &str) -> String {
 
 /// ANSI reset used by the slash-command reports.
 const ANSI_RESET: &str = "\x1b[0m";
+
+/// Image pasting is feature-gated off until the model's handling of
+/// image-file references is understood (`--features images` re-enables it).
+/// The code stays compiled either way; this constant kills every runtime
+/// path: clipboard probing, paste capture, and attachment injection.
+const IMAGES_ENABLED: bool = cfg!(feature = "images");
 
 /// Renders the `/mcp` server report following Claude Code's layout: a header
 /// with the server count, then one `name · status · N tools` line each.
@@ -217,12 +238,16 @@ impl Agent<'_> {
         // Set when a mid-stream preflight fails: stops the engine early, but
         // is not a user interrupt — the caller feeds the error to the model.
         let preflight_stop = AtomicBool::new(false);
+        // Mirrors the C's worker greedy flag: argmax sampling while the
+        // stream renderer is inside a DSML tool-call stanza.
+        let greedy = AtomicBool::new(false);
         let stats = self
             .engine
             .generate(
                 prompt_text,
                 &self.cfg.generation,
                 &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                &|| greedy.load(Ordering::Relaxed),
                 &mut |ev| match ev {
                     EngineEvent::Text(t) => {
                         // Model output has started: drop the prefill bar so the
@@ -230,6 +255,7 @@ impl Agent<'_> {
                         bar.clear();
                         assistant_text.push_str(&t);
                         stream.push(&t);
+                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                         if stream.preflight_error().is_some() {
                             preflight_stop.store(true, Ordering::Relaxed);
                         }
@@ -301,8 +327,9 @@ impl Agent<'_> {
             }
             let finished = stream.finished();
             if let Some(err) = preflight_error.as_deref().or(finished.error) {
+                let payload = tool_error_payload(preflight_error.is_some(), err);
                 self.session.push(Message::user(format!(
-                    "<tool_result>Tool error: {err}</tool_result>"
+                    "<tool_result>{payload}</tool_result>"
                 )));
                 continue;
             }
@@ -372,11 +399,17 @@ impl Agent<'_> {
         }
         let mut summary = String::new();
         self.engine
-            .generate(&prompt_text, &self.cfg.generation, &|| false, &mut |ev| {
-                if let EngineEvent::Text(t) = ev {
-                    summary.push_str(&t);
-                }
-            })
+            .generate(
+                &prompt_text,
+                &self.cfg.generation,
+                &|| false,
+                &|| false,
+                &mut |ev| {
+                    if let EngineEvent::Text(t) = ev {
+                        summary.push_str(&t);
+                    }
+                },
+            )
             .map_err(|e| e.to_string())?;
         if self.color {
             print!("\x1b[0m");
@@ -866,14 +899,15 @@ impl Agent<'_> {
         // cells (anchor, current). Copied to the clipboard on button release.
         let mut selection: Option<((u16, u16), (u16, u16))> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
-        // attached to the message as file references the model's tools can read.
+        // attached to the message as file references the model's tools can
+        // read. Always empty while IMAGES_ENABLED is off.
         let mut attachments: Vec<crate::imagepaste::PastedImage> = Vec::new();
         // Clipboard-image hint, re-probed every few seconds (the probe shells
         // out to osascript, so it must not run on every 200ms poll tick).
-        let mut clip_has_image = crate::imagepaste::clipboard_has_image();
+        let mut clip_has_image = IMAGES_ENABLED && crate::imagepaste::clipboard_has_image();
         let mut clip_checked = Instant::now();
         loop {
-            if clip_checked.elapsed() >= Duration::from_secs(3) {
+            if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
                 clip_checked = Instant::now();
             }
@@ -964,28 +998,30 @@ impl Agent<'_> {
                 // An empty bracketed paste means the clipboard holds an image
                 // (macOS pastes no text for image content); pasted text that is
                 // an image file path attaches that file.
-                if pasted.trim().is_empty() {
-                    match crate::imagepaste::from_clipboard() {
-                        Some(img) => {
-                            log.push_dim(format!(
-                                "[image #{} attached: {}]",
-                                attachments.len() + 1,
-                                img.describe()
-                            ));
-                            attachments.push(img);
+                if IMAGES_ENABLED {
+                    if pasted.trim().is_empty() {
+                        match crate::imagepaste::from_clipboard() {
+                            Some(img) => {
+                                log.push_dim(format!(
+                                    "[image #{} attached: {}]",
+                                    attachments.len() + 1,
+                                    img.describe()
+                                ));
+                                attachments.push(img);
+                            }
+                            None => log.push_dim("[clipboard has no image to paste]"),
                         }
-                        None => log.push_dim("[clipboard has no image to paste]"),
+                        continue;
                     }
-                    continue;
-                }
-                if let Some(img) = crate::imagepaste::from_path_text(pasted) {
-                    log.push_dim(format!(
-                        "[image #{} attached: {}]",
-                        attachments.len() + 1,
-                        img.describe()
-                    ));
-                    attachments.push(img);
-                    continue;
+                    if let Some(img) = crate::imagepaste::from_path_text(pasted) {
+                        log.push_dim(format!(
+                            "[image #{} attached: {}]",
+                            attachments.len() + 1,
+                            img.describe()
+                        ));
+                        attachments.push(img);
+                        continue;
+                    }
                 }
                 // The line editor is single-line; fold pasted newlines into
                 // spaces so the paste stays editable.
@@ -1206,9 +1242,9 @@ impl Agent<'_> {
                 log.push_dim("[interrupted]");
                 return Ok(());
             }
-            if let Some(err) = out.error {
+            if let Some(payload) = out.error {
                 self.session.push(Message::user(format!(
-                    "<tool_result>Tool error: {err}</tool_result>"
+                    "<tool_result>{payload}</tool_result>"
                 )));
                 continue;
             }
@@ -1252,6 +1288,9 @@ impl Agent<'_> {
         // Set when a mid-stream preflight fails: stops the engine early, but
         // is not a user interrupt — the turn loop feeds the error to the model.
         let preflight_stop = AtomicBool::new(false);
+        // Mirrors the C's worker greedy flag: argmax sampling while the
+        // stream renderer is inside a DSML tool-call stanza.
+        let greedy = AtomicBool::new(false);
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         // Prompt tokens already in context; generated tokens add onto this so
@@ -1270,11 +1309,13 @@ impl Agent<'_> {
                     || preflight_stop.load(Ordering::Relaxed)
                     || crate::interrupt::pending()
             },
+            &|| greedy.load(Ordering::Relaxed),
             &mut |ev| {
                 let status = match ev {
                     EngineEvent::Text(t) => {
                         assistant_text.push_str(&t);
                         stream.push(&t);
+                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                         if stream.preflight_error().is_some() {
                             preflight_stop.store(true, Ordering::Relaxed);
                         }
@@ -1293,6 +1334,7 @@ impl Agent<'_> {
                             ctx_used: prompt_tokens + gen_count,
                             ctx_size,
                             power_percent: power,
+                            greedy_sampling: greedy.load(Ordering::Relaxed),
                             ..Status::default()
                         }
                     }
@@ -1347,10 +1389,10 @@ impl Agent<'_> {
         let calls = finished.calls.to_vec();
         // A preflight stop reads as an engine interrupt, but it is a tool
         // error to feed back to the model, not a user abort.
-        let preflight_error = stream.preflight_error().map(str::to_owned);
+        let preflight_error = stream.preflight_error();
         let error = preflight_error
-            .clone()
-            .or_else(|| finished.error.map(str::to_owned));
+            .map(|e| tool_error_payload(true, e))
+            .or_else(|| finished.error.map(|e| tool_error_payload(false, e)));
         let interrupted = (stats.interrupted || interrupt_flag.load(Ordering::Relaxed))
             && preflight_error.is_none();
         *log = stream.into_sink();
@@ -1384,11 +1426,17 @@ impl Agent<'_> {
         }
         let mut summary = String::new();
         self.engine
-            .generate(&prompt, &self.cfg.generation, &|| false, &mut |ev| {
-                if let EngineEvent::Text(t) = ev {
-                    summary.push_str(&t);
-                }
-            })
+            .generate(
+                &prompt,
+                &self.cfg.generation,
+                &|| false,
+                &|| false,
+                &mut |ev| {
+                    if let EngineEvent::Text(t) = ev {
+                        summary.push_str(&t);
+                    }
+                },
+            )
             .map_err(|e| e.to_string())?;
         let budget = compact::tail_budget(self.engine.ctx_size());
         let mut tail_start = self.session.transcript.len();
@@ -1751,6 +1799,7 @@ mod tests {
             _transcript: &str,
             _opts: &crate::engine::GenerationOptions,
             _interrupt: &dyn Fn() -> bool,
+            _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
@@ -1770,6 +1819,53 @@ mod tests {
         fn ctx_size(&self) -> i32 {
             100_000
         }
+    }
+
+    #[test]
+    fn malformed_stanza_feeds_c_format_tool_error() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-err-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec![
+                // Legal opener, then a bogus tag the strict parser rejects.
+                "<｜DSML｜tool_calls><b>".to_string(),
+                "Understood.\n".to_string(),
+            ],
+            next: 0,
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+        };
+        agent.session.push(Message::user("go"));
+        agent.run_turn().unwrap();
+
+        // user, assistant(bad stanza), user(tool error), assistant(final)
+        let tool_result = &agent.session.transcript[2].text;
+        assert!(
+            tool_result.contains("Tool error: invalid DSML tool call: unexpected DSML tag: <b>\n"),
+            "got: {tool_result}"
+        );
+        assert!(
+            tool_result.contains("DSML syntax reminder:"),
+            "got: {tool_result}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

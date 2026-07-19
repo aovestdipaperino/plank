@@ -397,6 +397,7 @@ impl Engine for Ds4Engine {
         transcript: &str,
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
+        greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
         let tokens = self.build_tokens(transcript, opts.think_mode);
@@ -486,14 +487,17 @@ impl Engine for Ds4Engine {
                 INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
                 break;
             }
+            // Greedy (argmax) sampling while the caller says so — inside a
+            // DSML stanza — mirroring the C's `worker_sample_with_mode`.
+            let g = greedy();
             // SAFETY: session valid; rng is a valid out-ptr.
             let token = unsafe {
                 ffi::ds4_session_sample(
                     session,
-                    opts.temperature,
+                    if g { 0.0 } else { opts.temperature },
                     0,
-                    opts.top_p,
-                    opts.min_p,
+                    if g { 1.0 } else { opts.top_p },
+                    if g { 0.0 } else { opts.min_p },
                     &raw mut rng,
                 )
             };

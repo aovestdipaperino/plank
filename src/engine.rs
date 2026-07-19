@@ -115,6 +115,11 @@ impl std::error::Error for EngineError {}
 pub trait Engine: Debug + Send {
     /// Runs one generation pass over `transcript`, streaming events.
     ///
+    /// `greedy` is polled before each token sample; while it returns true the
+    /// engine samples argmax (temperature 0) regardless of `opts`, mirroring
+    /// the C's `worker_sample_with_mode`. The caller derives it from the
+    /// streaming parser state so tool-call stanzas are sampled deterministically.
+    ///
     /// # Errors
     /// Returns [`EngineError`] when the backend fails.
     fn generate(
@@ -122,6 +127,7 @@ pub trait Engine: Debug + Send {
         transcript: &str,
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
+        greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError>;
 
@@ -180,6 +186,7 @@ impl Engine for EchoEngine {
         transcript: &str,
         _opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
+        _greedy: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
         // Simulate a short prefill so the live progress bar is exercised even

@@ -397,16 +397,54 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     /// Results after the stream ends: completed calls and error state.
+    ///
+    /// A stream that ends mid-stanza (parser still structural or inside a
+    /// parameter value) reports `incomplete DSML tool call`, like the C's
+    /// worker loop; callers must check user interruption first, since an
+    /// interrupted stanza is not a model error.
     #[must_use]
     pub fn finished(&self) -> Finished<'_> {
         let error = self
             .stream_error
             .as_deref()
-            .or_else(|| (self.parser.state() == DsmlState::Error).then(|| self.parser.error()));
+            .or_else(|| (self.parser.state() == DsmlState::Error).then(|| self.parser.error()))
+            .or_else(|| {
+                matches!(
+                    self.parser.state(),
+                    DsmlState::Structural | DsmlState::ParamValue
+                )
+                .then_some("incomplete DSML tool call")
+            });
         Finished {
             calls: &self.calls,
             error,
             dsml_in_think: self.dsml_in_think,
+        }
+    }
+
+    /// True while the sampler should run greedy (argmax), mirroring
+    /// `agent_stream_wants_greedy_sampling`: inside a tool-call stanza's
+    /// structural markup, while a parameter close tag is streaming, or once
+    /// the start detector holds a DSML-shaped prefix longer than one byte.
+    /// Derived purely from per-round parser state, so EOS, errors, or the
+    /// next turn can never leave sampling stuck greedy.
+    #[must_use]
+    pub fn wants_greedy_sampling(&self) -> bool {
+        if matches!(self.parser.state(), DsmlState::Error | DsmlState::Done) {
+            return false;
+        }
+        // A single '<' is too common in prose/code to justify forcing argmax;
+        // a longer held-back prefix is specifically DSML-shaped.
+        if self.dsml_start_tail.len() > 1 {
+            return true;
+        }
+        if !self.dsml_active {
+            return false;
+        }
+        match self.parser.state() {
+            DsmlState::Structural => true,
+            DsmlState::ParamValue => self.parser.param_close_prefix(),
+            _ => false,
         }
     }
 
@@ -1332,6 +1370,34 @@ mod tests {
         assert!(vis.contains("🛠️ $ sleep 1"), "{vis:?}");
         assert!(vis.contains("[tool call interrupted]\n"), "{vis:?}");
         assert!(sr.finished().calls.is_empty());
+    }
+
+    #[test]
+    fn incomplete_stanza_reports_incomplete_error() {
+        let sr = run_chunked(concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls",
+        ));
+        assert_eq!(sr.finished().error, Some("incomplete DSML tool call"));
+        assert!(sr.finished().calls.is_empty());
+    }
+
+    #[test]
+    fn greedy_sampling_tracks_dsml_state() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("hello ");
+        assert!(!sr.wants_greedy_sampling(), "prose");
+        sr.push("<｜DS");
+        assert!(sr.wants_greedy_sampling(), "DSML-shaped held prefix");
+        sr.push("ML｜tool_calls><｜DSML｜invoke name=\"bash\">");
+        assert!(sr.wants_greedy_sampling(), "structural markup");
+        sr.push("<｜DSML｜parameter name=\"command\">ls -la");
+        assert!(!sr.wants_greedy_sampling(), "free-form parameter value");
+        sr.push("</｜DSML｜parameter");
+        assert!(sr.wants_greedy_sampling(), "close tag streaming");
+        sr.push("｜></｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
+        assert!(!sr.wants_greedy_sampling(), "stanza done");
     }
 
     #[test]
