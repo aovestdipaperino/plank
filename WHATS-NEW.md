@@ -40,16 +40,6 @@ keep their footing.
 crash into a clear message, and a green rule now separates the scrollback from
 the resting prompt.
 
-All local, macOS, open source.
-
-## 0.9.10
-
-🍺 **A Homebrew hotfix.** Installs from the tap could not load any model
-because the Metal kernel sources were resolved from a compile time CI path
-that did not exist on your machine. The kernels now ship inside the bottles
-(`share/plank/metal`) and are resolved at runtime, and the engine-open error
-says plainly when they are missing instead of blaming the model file.
-
 ## 0.x — the foundation
 
 The pre-1.0 line, where plank became a working local agent. It was ported from
@@ -87,3 +77,12 @@ keep the system prompt small.
 context compaction reclaims the window with a durable summary plus a verbatim
 tail; and upgrade-time cache maintenance clears exactly what a new version can
 no longer trust.
+
+🍺 **A Homebrew hotfix (0.9.10).** The last release of the line fixed installs
+from the tap that could not load any model, because the Metal kernel sources
+were resolved from a compile time CI path that did not exist on your machine.
+The kernels now ship inside the bottles (`share/plank/metal`) and are resolved
+at runtime, and the engine-open error says plainly when they are missing
+instead of blaming the model file.
+
+All local, macOS, open source.
