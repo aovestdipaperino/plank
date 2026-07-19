@@ -99,17 +99,44 @@ lines left over when the turn settles start a fresh turn), and Esc/Ctrl-C set
 a shared interrupt flag. The plain line REPL keeps the synchronous inline
 loop — with piped stdin there is no live input to multiplex.
 
-### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`)
-- `engine.rs` — the `Engine` trait (`generate`, `warm_system_prompt`,
-  `count_tokens`, `ctx_size`), the event types (`EngineEvent::{Prefill, Text}`),
-  options, stats, and the `EchoEngine` stub.
+### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`, `snapshot.rs`)
+- `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
+  `warm_system_prompt`, `count_tokens`, `ctx_size`, plus `generate_aside` /
+  `supports_aside` for mid-generation asides and `snapshot_kv` / `restore_kv`
+  for checkpoints), the event types (`EngineEvent::{Prefill, Text}`), options,
+  stats, and the `EchoEngine` stub. Trait methods default to unsupported so
+  non-ds4 engines opt in only to what they support.
 - `ffi.rs` — raw declarations for the subset of the ds4 C API plank uses
   (engine open/close, chat-template tokenization, session sync/sample/eval,
   KV snapshots). Present only under the `ds4_engine` cfg.
-- `ds4engine.rs` — the safe `Ds4Engine` wrapper. Keeps one live session alive
-  across turns so `ds4_session_sync` reuses the cached KV prefix and only
-  prefills the new suffix. Streams `Prefill` events via a display-progress
-  callback and samples with cooperative interrupt.
+- `ds4engine.rs` — the safe wrapper, split (issue #28) into `Ds4Model` (immutable
+  `Arc`-shareable weights / tokenizer / Metal queue) and `Ds4Session` (one live
+  FFI session, its KV suffix + cursor, implements `Engine`). The single-owner
+  path is a `Ds4Session` over a solely-owned `Ds4Model`; it keeps one live session
+  across turns so `ds4_session_sync` reuses the cached KV prefix and only prefills
+  the new suffix.
+- `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
+  (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
+  unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
+  `/checkpoint`, and per-session KV payloads.
+
+### Remote, hosted, and shared engines (`serve.rs`, `host.rs`, `remote/`)
+- `remote/provider.rs` — additional `Engine` impls for hosted providers
+  (OpenAI-compatible and Anthropic Messages) over synchronous `ureq`+SSE.
+  Native provider tool calls are synthesized back into the canonical DSML
+  stanza and fed through the real `dsml.rs` parser, so dispatch is
+  backend-agnostic.
+- `remote/ds4_client.rs` — `RemoteDs4Engine`, a client `Engine` that speaks to a
+  `plank serve` host; `serve.rs` is that HTTP+SSE host, generic over any
+  `Engine`.
+- `host.rs` — `EngineHost`: a refcounted `Ds4Model` shared across many
+  `Ds4Session`s driven by one cooperative GPU thread (round-robin, admission
+  caps, warm-prefix bootstrap, idle KV reclamation). The concurrency layer under
+  `plank serve --shared-engine`.
+- `remote/control.rs`, `remote/client.rs` — the remote-control WebSocket server
+  (mirrors the live turn loop via a `BroadcastBus`, token auth, Origin
+  allow-list, bounded queues, a served web client) and the `plank remote <url>`
+  terminal client.
 
 ### Streaming display (`viz.rs`, `render.rs`, `dsml.rs`)
 Model text is fed byte-by-byte through a pipeline:

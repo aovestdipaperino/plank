@@ -6,6 +6,48 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Remote-control interface** (#25): drive a running instance from another
+  process or machine over a loopback WebSocket. Mirror output and send
+  `prompt`/`command`/`btw`/`interrupt` frames, with single-controller /
+  many-mirror handoff and a reconnect grace window. Ships a `plank remote <url>`
+  terminal client and a self-contained web client served at `/`. Token auth,
+  `--control[=ADDR]`, an `--control-origin` allow-list, and
+  `--control-queue-max` slow-client eviction. Also wired the server into the
+  live turn loop and added plain-REPL remote drive.
+- **Remote and third-party engines** (#26): `plank serve` hosts the local ds4
+  engine over HTTP+SSE and `--remote <url>` selects the remote client (sync,
+  no async runtime). Third-party providers behind the `Engine` trait:
+  `--provider openai` (OpenAI-compatible gateways) and `--provider anthropic`,
+  with native tool calls synthesized back into DSML so tools behave identically.
+  Anthropic prompt caching via `cache_control` (`--provider-cache`, default on)
+  and cross-turn tool-call-id threading.
+- **Shared reference-counted engine** (#28): `--shared-engine` serves many
+  sessions from one model over a single cooperative GPU thread (round-robin,
+  non-preemptible prefill). `--max-sessions` and `--kv-budget-bytes` admission,
+  per-session `--session-ctx-size`, idle KV reclamation (`--idle-reclaim-secs`),
+  and live `/info` accounting.
+- **Mid-generation `/btw` suspend** (#27): an in-pass `/btw` freezes the running
+  generation, answers the aside, and resumes with zero re-prefill. On by
+  default; `--disable-btw-suspend` restores boundary queueing.
+- **`/checkpoint` and `/rollback`** (#29): name a snapshot of the conversation
+  (transcript + engine KV) and roll back to it in-session with no re-prefill; a
+  rollback is itself undoable via an automatic `pre-rollback` snapshot.
+- **Per-session engine KV payloads and `/strip`** (#12): `/save` snapshots the
+  engine KV to a fingerprinted `<sha>.payload` sidecar so `/switch` and
+  `/resume` skip re-prefilling the whole conversation; `/strip <sha>` reclaims
+  the disk. Stale payloads are ignored and rebuilt by a normal prefill.
+- **Live command highlighting** in the TUI prompt: a valid `/command` token is
+  shown green and the `!` shell-escape marker red as the user types.
+
+### Changed
+
+- **In-pass `/btw` now freezes and resumes by default** rather than
+  preempt-and-rerun (see `--disable-btw-suspend` above).
+- The session on-disk format carries an optional KV payload sidecar; older
+  payload-less sessions still load and list.
+
 ## [2.0.0] - 2026-07-19
 
 Opens the v2 beta channel and promotes v1.6.0 to stable. No functional changes.

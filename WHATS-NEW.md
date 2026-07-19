@@ -3,6 +3,57 @@
 A short, human-readable highlight reel per release. For the full change list
 see the GitHub releases and commit history.
 
+## Beta (2.x, unreleased)
+
+The v2 line opens the door past your own machine. plank stays a local agent by
+default, but it can now be driven remotely, serve one model to many sessions at
+once, and talk to hosted models when you want them. Everything here lives on the
+beta channel (`brew install plank-beta`) and is not yet promoted to stable.
+
+🎛️ **Drive plank from anywhere.** A remote-control channel lets another process
+or machine attach to a running instance over a loopback WebSocket: mirror its
+output, send prompts and commands, and take or hand back control. `plank remote
+<url>` is a terminal client, and a small web client is served straight from the
+instance. Loopback only by default, token authenticated, with an Origin
+allow-list for browsers.
+
+🌐 **Remote and hosted models.** `plank serve` turns one machine into an
+inference host over HTTP, and `--remote <url>` points a thin client at it, so
+the heavy Metal box does the work while you drive from a laptop. Behind the same
+engine boundary, `--provider openai` and `--provider anthropic` route turns to
+hosted models, with native tool calls translated back into plank's own tool
+syntax so tools behave the same either way. Anthropic prompt caching is on by
+default.
+
+🧩 **One model, many sessions.** A shared, reference-counted engine
+(`--shared-engine`) loads the weights once and hands out independent sessions
+over a single GPU, fairly time-sliced, each with its own context. Admission caps
+(`--max-sessions` and a KV-memory budget) keep it from oversubscribing the
+machine, and idle sessions can be snapshotted to disk and restored on demand.
+
+⏸️ **Side questions that truly freeze the task.** A mid-generation `/btw` now
+genuinely suspends the running reply, answers the aside, and resumes byte for
+byte where it left off with zero re-prefill, instead of rewinding and re-running
+the step. This is the default now; `--disable-btw-suspend` falls back to the old
+boundary queue.
+
+🔖 **Checkpoints and rollback.** `/checkpoint <name>` snapshots the whole
+conversation, transcript and live KV together, and `/rollback <name>` returns to
+it without leaving the session, so you can explore a risky direction and step
+back cleanly. The KV restore means a rollback resumes with no re-prefill, and it
+is itself undoable.
+
+💾 **Instant resume.** Sessions now persist the engine KV alongside the
+transcript, so `/switch` and `/resume` restore the warm cache instead of
+re-reading the whole conversation, and `/strip` reclaims that disk when you do
+not need it.
+
+⌨️ **Live command highlighting.** As you type, a valid slash command lights up
+green in the prompt and the `!` shell marker turns red, so you can see a command
+is recognized before you press Enter.
+
+All still local first, macOS, open source.
+
 ## 1.6.0
 
 The whole 1.x line, promoted to stable. plank is a terminal coding agent
