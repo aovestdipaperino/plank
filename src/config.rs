@@ -78,6 +78,11 @@ pub struct AgentConfig {
     /// `--max-sessions`: admission cap on concurrently attached sessions when
     /// `shared_engine` is on (design §7). Ignored otherwise.
     pub max_sessions: i32,
+    /// `--idle-reclaim-secs`: when `shared_engine` is on, snapshot a session's
+    /// live KV to disk and reclaim its context after it has been idle this many
+    /// seconds, restoring transparently on the next request (design §7). `0`
+    /// (default) disables reclamation entirely — a strict no-op.
+    pub idle_reclaim_secs: u64,
     /// Third-party provider from `--provider openai|anthropic` (flavor b, issue
     /// #26); selects [`crate::remote::provider::ProviderEngine`]. `None` unless
     /// `--provider` was given.
@@ -249,6 +254,7 @@ impl Default for AgentConfig {
             insecure: false,
             shared_engine: false,
             max_sessions: i32::try_from(crate::host::DEFAULT_MAX_SESSIONS).unwrap_or(8),
+            idle_reclaim_secs: 0,
             provider: None,
             provider_model: None,
             provider_base_url: None,
@@ -295,6 +301,9 @@ Options:
                            #28); applies to `plank serve`. Default off — plank
                            otherwise runs a single owned engine as before
       --max-sessions N     admission cap for --shared-engine (default 8)
+      --idle-reclaim-secs S  snapshot & reclaim a session's KV after it is idle S
+                           seconds, restoring on next request (--shared-engine;
+                           default 0 = off)
       --provider NAME      drive a third-party LLM API: openai (OpenAI-compatible,
                            also vLLM/Ollama/OpenRouter) or anthropic. Use with
                            --model NAME; key from --api-key or $OPENAI_API_KEY /
@@ -598,6 +607,10 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "--insecure" => c.insecure = true,
             "--shared-engine" => c.shared_engine = true,
             "--max-sessions" => c.max_sessions = parse_int(need_arg(&mut i)?, arg)?,
+            "--idle-reclaim-secs" => {
+                c.idle_reclaim_secs =
+                    u64::try_from(parse_int(need_arg(&mut i)?, arg)?.max(0)).unwrap_or(0);
+            }
             "--provider" => {
                 c.provider = Some(match need_arg(&mut i)? {
                     "openai" => ProviderSelector::OpenAi,
@@ -734,9 +747,20 @@ mod tests {
 
     #[test]
     fn parses_shared_engine_flags() {
-        let c = parse_options(&args(&["--shared-engine", "--max-sessions", "4"])).unwrap();
+        let c = parse_options(&args(&[
+            "--shared-engine",
+            "--max-sessions",
+            "4",
+            "--idle-reclaim-secs",
+            "30",
+        ]))
+        .unwrap();
         assert!(c.shared_engine);
         assert_eq!(c.max_sessions, 4);
+        assert_eq!(c.idle_reclaim_secs, 30);
+        // Reclamation is off by default (strict no-op).
+        let d = parse_options(&args(&["--shared-engine"])).unwrap();
+        assert_eq!(d.idle_reclaim_secs, 0);
     }
 
     #[test]

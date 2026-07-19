@@ -24,6 +24,38 @@ pub struct InfoResponse {
     pub ctx_size: i32,
     /// Server protocol version; see [`PROTOCOL_VERSION`].
     pub protocol_version: u32,
+    /// Shared-engine accounting (issue #28, design §9 step 5). All fields are
+    /// `#[serde(default)]` so a pre-#28 client parses a newer server and the
+    /// single-engine `/info` path (which leaves them zero/empty) round-trips.
+    #[serde(default)]
+    pub shared: Option<SharedStatus>,
+}
+
+/// Live shared-engine status: how many sessions are attached against the cap,
+/// and per-session KV/context accounting. Read cheaply off the scheduler thread
+/// (design §7, §9 step 5).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SharedStatus {
+    /// Number of currently attached sessions (resident + idle-reclaimed).
+    pub live_sessions: usize,
+    /// Admission cap on concurrently attached sessions (`--max-sessions`).
+    pub max_sessions: usize,
+    /// Aggregate resident KV, in tokens, summed over non-reclaimed sessions.
+    pub resident_ctx_tokens: i64,
+    /// Per-session accounting, one entry per attached session.
+    pub sessions: Vec<SessionStatus>,
+}
+
+/// Per-session KV/context accounting for the shared engine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionStatus {
+    /// Opaque host-assigned session id.
+    pub id: u64,
+    /// Resident context size, in tokens (0 while reclaimed to disk).
+    pub ctx_tokens: i32,
+    /// True when this session's KV has been snapshotted to disk and its live
+    /// context reclaimed; it restores transparently on the next request.
+    pub reclaimed: bool,
 }
 
 /// Serde mirror of [`ThinkMode`] (the engine enum is not itself serializable).

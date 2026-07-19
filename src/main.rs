@@ -367,6 +367,8 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     let host_cfg = HostConfig {
         max_sessions: usize::try_from(cfg.max_sessions.max(1)).unwrap_or(1),
         slice_tokens: DEFAULT_SLICE_TOKENS,
+        idle_reclaim: (cfg.idle_reclaim_secs > 0)
+            .then(|| std::time::Duration::from_secs(cfg.idle_reclaim_secs)),
     };
     #[cfg(ds4_engine)]
     {

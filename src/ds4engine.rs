@@ -1109,6 +1109,38 @@ impl HostSession for Ds4HostSession {
             produced += 1;
         }
     }
+
+    fn ctx_tokens(&self) -> i32 {
+        if self.inner.session.is_null() {
+            return 0;
+        }
+        // SAFETY: session valid (created in spawn, freed only on drop).
+        unsafe { ffi::ds4_session_pos(self.inner.session) }
+    }
+
+    fn snapshot_bytes(&mut self) -> Option<Vec<u8>> {
+        if self.inner.session.is_null() {
+            return None;
+        }
+        // Reuse the single snapshot primitive; copy out an owned buffer so the
+        // engine-owned snapshot is freed here (the returned Vec is Rust's, and
+        // the disk-read restore path must never free it — FINDINGS double-free).
+        let snap = SessionSnapshot::capture(self.inner.session).ok()?;
+        Some(snap.as_bytes().to_vec())
+    }
+
+    fn restore_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        // Restore into the freshly spawned session (already warmed with the
+        // shared system-prompt prefix). Disk-read bytes use the non-owning FFI
+        // path so the engine never frees Rust's buffer (FINDINGS double-free).
+        let session = self.inner.ensure_session()?;
+        SessionSnapshot::restore_bytes(session, bytes)?;
+        // The restored KV/cursor supersedes any Rust-side splice state.
+        self.inner.last_reply = None;
+        self.pending = None;
+        self.active = None;
+        Ok(())
+    }
 }
 
 /// Owns a `Ds4Tokens` value and frees its buffer on drop.
@@ -1442,5 +1474,80 @@ mod tests {
         )
         .unwrap();
         assert!(!out_a.is_empty() && !out_b.is_empty());
+    }
+
+    // Idle reclamation on real Metal (design §7): a session generates, goes idle
+    // past the threshold so its KV is snapshotted to disk and reclaimed, then
+    // restores transparently on the next request and keeps its context.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn idle_reclaim_restores_on_metal() {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let Some(model_path) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+            None,
+        )
+        .unwrap();
+        let host = EngineHost::new(
+            model,
+            HostConfig {
+                max_sessions: 2,
+                slice_tokens: crate::host::DEFAULT_SLICE_TOKENS,
+                idle_reclaim: Some(Duration::from_millis(200)),
+            },
+        );
+        let s = host.attach().unwrap();
+        let opts = crate::engine::GenerationOptions {
+            n_predict: 8,
+            ..Default::default()
+        };
+        s.generate(
+            "[user]\nSay hi.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        // Wait for the scheduler to reclaim the idle session to disk.
+        let reclaimed = (0..500).any(|_| {
+            if host.status().sessions.iter().any(|x| x.reclaimed) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+            false
+        });
+        assert!(reclaimed, "idle session must be reclaimed to disk");
+
+        // Next request restores the persisted KV and generates normally.
+        let stats = s
+            .generate(
+                "[user]\nSay bye.\n",
+                &opts,
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(stats.generated > 0, "restored session generates normally");
+        assert!(
+            host.status().sessions.iter().all(|x| !x.reclaimed),
+            "session is resident again after restore"
+        );
     }
 }

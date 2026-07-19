@@ -16,10 +16,12 @@
 //! `ds4engine.rs` under the `ds4_engine` cfg.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use crate::engine::{
     EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats,
@@ -38,6 +40,11 @@ pub struct HostConfig {
     pub max_sessions: usize,
     /// Tokens generated per session per round-robin slice (§5).
     pub slice_tokens: usize,
+    /// Idle-session KV reclamation threshold (design §7). `None` (default)
+    /// disables reclamation — a strict no-op. When `Some(d)`, a session idle
+    /// longer than `d` has its live KV snapshotted to disk and reclaimed, and is
+    /// restored transparently on its next request.
+    pub idle_reclaim: Option<Duration>,
 }
 
 impl Default for HostConfig {
@@ -45,8 +52,38 @@ impl Default for HostConfig {
         Self {
             max_sessions: DEFAULT_MAX_SESSIONS,
             slice_tokens: DEFAULT_SLICE_TOKENS,
+            idle_reclaim: None,
         }
     }
+}
+
+/// Per-session KV/context accounting (design §7, §9 step 5).
+#[derive(Debug, Clone, Default)]
+pub struct SessionAccount {
+    /// Opaque host-assigned session id.
+    pub id: u64,
+    /// Resident context size in tokens (0 while reclaimed to disk).
+    pub ctx_tokens: i32,
+    /// True when the session's KV is snapshotted to disk and its live context
+    /// reclaimed; it restores transparently on the next request.
+    pub reclaimed: bool,
+}
+
+/// A cheap snapshot of host-level accounting, published by the scheduler thread
+/// after every session-set change and generation completion, and read by
+/// `/info`/status without touching the GPU thread (design §9 step 5).
+#[derive(Debug, Clone, Default)]
+pub struct HostStatus {
+    /// Currently attached sessions (resident + idle-reclaimed).
+    pub live_sessions: usize,
+    /// Admission cap on concurrently attached sessions.
+    pub max_sessions: usize,
+    /// Per-session context window size in tokens.
+    pub ctx_size: i32,
+    /// Aggregate resident KV in tokens, summed over non-reclaimed sessions.
+    pub resident_ctx_tokens: i64,
+    /// Per-session accounting, sorted by id.
+    pub sessions: Vec<SessionAccount>,
 }
 
 /// The shared, immutable model: weights, tokenizer, and the Metal command
@@ -101,6 +138,32 @@ pub trait HostSession {
         interrupt: &AtomicBool,
         sink: &mut dyn FnMut(EngineEvent),
     ) -> Result<Option<GenerationStats>, EngineError>;
+
+    /// Current resident KV size in tokens, for host accounting (design §7).
+    /// Reads only local session state on the GPU thread; defaults to 0.
+    fn ctx_tokens(&self) -> i32 {
+        0
+    }
+
+    /// Serializes the session's live KV to owned bytes so its context can be
+    /// reclaimed while idle (design §7). Returns `None` when the backend cannot
+    /// snapshot, in which case the scheduler leaves the session live (never
+    /// reclaims it). Runs on the GPU thread.
+    fn snapshot_bytes(&mut self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Restores KV from bytes previously produced by [`snapshot_bytes`], into a
+    /// freshly spawned session, on the next request after reclamation. The bytes
+    /// were read back from disk, so implementations MUST use the non-owning
+    /// `restore_bytes` FFI path (FINDINGS: disk-read snapshots must not be freed
+    /// by the engine). Runs on the GPU thread.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the backend rejects the payload.
+    fn restore_bytes(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
+        Ok(())
+    }
 }
 
 /// One streamed message from the GPU thread to a blocked client: either a
@@ -143,6 +206,7 @@ pub struct EngineHost {
     model: Arc<dyn ModelHandle>,
     cmd_tx: Sender<Command>,
     worker: Option<JoinHandle<()>>,
+    status: Arc<Mutex<HostStatus>>,
 }
 
 impl std::fmt::Debug for EngineHost {
@@ -162,15 +226,35 @@ impl EngineHost {
     pub fn new(model: Arc<dyn ModelHandle>, cfg: HostConfig) -> Self {
         let (cmd_tx, cmd_rx) = channel::<Command>();
         let worker_model = Arc::clone(&model);
+        let ctx_size = model.ctx_size();
+        let status = Arc::new(Mutex::new(HostStatus {
+            max_sessions: cfg.max_sessions,
+            ctx_size,
+            ..HostStatus::default()
+        }));
+        let worker_status = Arc::clone(&status);
         let worker = std::thread::Builder::new()
             .name("plank-gpu".to_string())
-            .spawn(move || scheduler_loop(&worker_model, &cmd_rx, cfg))
+            .spawn(move || scheduler_loop(&worker_model, &cmd_rx, cfg, &worker_status))
             .expect("spawn GPU worker thread");
         Self {
             model,
             cmd_tx,
             worker: Some(worker),
+            status,
         }
+    }
+
+    /// A cheap snapshot of live-session count and per-session KV accounting
+    /// (design §9 step 5). Reads a mutex the scheduler thread refreshes on
+    /// coarse events (attach/detach/reclaim/completion), never per token, so it
+    /// does not contend the GPU hot path.
+    ///
+    /// # Panics
+    /// Panics only if the status mutex was poisoned by a prior panic while held.
+    #[must_use]
+    pub fn status(&self) -> HostStatus {
+        self.status.lock().unwrap().clone()
     }
 
     /// Attaches a new session, restoring the warm system-prompt prefix (§6).
@@ -280,62 +364,223 @@ impl Drop for SessionHandle {
 /// Monotonic session-id source (host-global; ids are opaque handles).
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
+/// One attached session's scheduler-thread state. `session` is `None` while the
+/// session is idle-reclaimed to disk; `snapshot_path` then holds its persisted
+/// KV, restored on the next request (design §7).
+struct SessionSlot {
+    session: Option<Box<dyn HostSession>>,
+    last_active: Instant,
+    ctx_tokens: i32,
+    snapshot_path: Option<PathBuf>,
+}
+
+impl SessionSlot {
+    fn new(session: Box<dyn HostSession>) -> Self {
+        let ctx_tokens = session.ctx_tokens();
+        Self {
+            session: Some(session),
+            last_active: Instant::now(),
+            ctx_tokens,
+            snapshot_path: None,
+        }
+    }
+}
+
 /// The single GPU worker thread: owns every session and interleaves their
 /// generations round-robin at K-token granularity (design §5).
-fn scheduler_loop(model: &Arc<dyn ModelHandle>, cmd_rx: &Receiver<Command>, cfg: HostConfig) {
-    let mut sessions: HashMap<u64, Box<dyn HostSession>> = HashMap::new();
+#[allow(clippy::similar_names)] // `stats`/`status` are both intrinsic here
+fn scheduler_loop(
+    model: &Arc<dyn ModelHandle>,
+    cmd_rx: &Receiver<Command>,
+    cfg: HostConfig,
+    status: &Mutex<HostStatus>,
+) {
+    let mut sessions: HashMap<u64, SessionSlot> = HashMap::new();
     let mut rotation: VecDeque<ActiveJob> = VecDeque::new();
+    let ctx_size = model.ctx_size();
 
     loop {
         // Drain pending commands. Block only when there is no runnable work,
-        // so an idle host does not spin.
+        // so an idle host does not spin. When idle reclamation is enabled, wake
+        // periodically to reclaim sessions that have gone idle (design §7).
         if rotation.is_empty() {
-            match cmd_rx.recv() {
-                Ok(cmd) => {
+            match recv_or_reclaim(cmd_rx, cfg.idle_reclaim) {
+                RecvOutcome::Command(cmd) => {
                     if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg.max_sessions) {
                         return;
                     }
                 }
-                Err(_) => return,
+                RecvOutcome::ReclaimTick => {
+                    if let Some(threshold) = cfg.idle_reclaim {
+                        reclaim_idle_sessions(&mut sessions, &rotation, threshold);
+                    }
+                }
+                RecvOutcome::Disconnected => return,
             }
+            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
         }
+        let mut dirty = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
             if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg.max_sessions) {
                 return;
             }
+            dirty = true;
+        }
+        if dirty {
+            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
         }
 
         // One round-robin pass: give each active job a single K-token slice,
         // then yield to the next (fairness, no full starvation — design §5).
+        let mut completed = false;
         for _ in 0..rotation.len() {
             let Some(job) = rotation.pop_front() else {
                 break;
             };
-            let Some(session) = sessions.get_mut(&job.id) else {
+            let Some(slot) = sessions.get_mut(&job.id) else {
                 // Session detached mid-flight; drop the job.
+                continue;
+            };
+            let Some(session) = slot.session.as_mut() else {
+                // Reclaimed mid-flight (should not happen for a rotating job);
+                // drop the job rather than lose its KV silently.
                 continue;
             };
             let mut sink = |ev: EngineEvent| {
                 let _ = job.out.send(Yield::Event(ev));
             };
             match session.advance(cfg.slice_tokens, &job.interrupt, &mut sink) {
-                Ok(None) => rotation.push_back(job),
+                Ok(None) => {
+                    slot.last_active = Instant::now();
+                    rotation.push_back(job);
+                }
                 Ok(Some(stats)) => {
+                    slot.ctx_tokens = session.ctx_tokens();
+                    slot.last_active = Instant::now();
                     let _ = job.out.send(Yield::Done(Ok(stats)));
+                    completed = true;
                 }
                 Err(e) => {
+                    slot.last_active = Instant::now();
                     let _ = job.out.send(Yield::Done(Err(e)));
+                    completed = true;
                 }
             }
         }
+        if completed {
+            publish_status(status, &sessions, cfg.max_sessions, ctx_size);
+        }
     }
+}
+
+/// The result of waiting for the next command with optional idle-reclaim wakeups.
+enum RecvOutcome {
+    Command(Command),
+    ReclaimTick,
+    Disconnected,
+}
+
+/// Blocks for the next command; when reclamation is enabled, wakes on a poll
+/// interval to let the caller reclaim idle sessions.
+fn recv_or_reclaim(cmd_rx: &Receiver<Command>, idle_reclaim: Option<Duration>) -> RecvOutcome {
+    match idle_reclaim {
+        Some(threshold) => match cmd_rx.recv_timeout(reclaim_poll_interval(threshold)) {
+            Ok(cmd) => RecvOutcome::Command(cmd),
+            Err(RecvTimeoutError::Timeout) => RecvOutcome::ReclaimTick,
+            Err(RecvTimeoutError::Disconnected) => RecvOutcome::Disconnected,
+        },
+        None => match cmd_rx.recv() {
+            Ok(cmd) => RecvOutcome::Command(cmd),
+            Err(_) => RecvOutcome::Disconnected,
+        },
+    }
+}
+
+/// Poll cadence for idle checks: responsive relative to the threshold, but
+/// bounded so we neither miss the deadline badly nor busy-wake.
+fn reclaim_poll_interval(threshold: Duration) -> Duration {
+    (threshold / 4)
+        .max(Duration::from_millis(20))
+        .min(Duration::from_millis(500))
+}
+
+/// Snapshots and reclaims the live KV of every attached session idle past
+/// `threshold` and not currently in the rotation (design §7). A backend that
+/// cannot snapshot (returns `None`) or a failed disk write leaves the session
+/// live — reclamation is always safe to skip.
+fn reclaim_idle_sessions(
+    sessions: &mut HashMap<u64, SessionSlot>,
+    rotation: &VecDeque<ActiveJob>,
+    threshold: Duration,
+) {
+    let now = Instant::now();
+    for (id, slot) in sessions.iter_mut() {
+        if slot.session.is_none() {
+            continue; // already reclaimed
+        }
+        if rotation.iter().any(|j| j.id == *id) {
+            continue; // active; never reclaim a running session
+        }
+        if now.duration_since(slot.last_active) < threshold {
+            continue;
+        }
+        let mut session = slot.session.take().expect("checked is_some above");
+        match session.snapshot_bytes() {
+            Some(bytes) => {
+                let path = idle_snapshot_path(*id);
+                if std::fs::write(&path, &bytes).is_ok() {
+                    // Dropping `session` here frees its live KV (design §7).
+                    slot.snapshot_path = Some(path);
+                } else {
+                    slot.session = Some(session); // keep live on write failure
+                }
+            }
+            None => slot.session = Some(session), // backend can't snapshot
+        }
+    }
+}
+
+/// Disk location for an idle session's persisted KV snapshot. Keyed by pid and
+/// session id so concurrent hosts do not collide.
+fn idle_snapshot_path(id: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("plank-idle-{}-{id}.kv", std::process::id()))
+}
+
+/// Publishes a fresh accounting snapshot. Cheap: one mutex lock on coarse events.
+#[allow(clippy::similar_names)] // `status`/`sessions` are the natural names here
+fn publish_status(
+    status: &Mutex<HostStatus>,
+    sessions: &HashMap<u64, SessionSlot>,
+    max_sessions: usize,
+    ctx_size: i32,
+) {
+    let mut accounts: Vec<SessionAccount> = sessions
+        .iter()
+        .map(|(id, slot)| SessionAccount {
+            id: *id,
+            ctx_tokens: slot.ctx_tokens,
+            reclaimed: slot.session.is_none(),
+        })
+        .collect();
+    accounts.sort_by_key(|a| a.id);
+    let resident: i64 = sessions
+        .values()
+        .filter(|s| s.session.is_some())
+        .map(|s| i64::from(s.ctx_tokens))
+        .sum();
+    let mut g = status.lock().unwrap();
+    g.live_sessions = sessions.len();
+    g.max_sessions = max_sessions;
+    g.ctx_size = ctx_size;
+    g.resident_ctx_tokens = resident;
+    g.sessions = accounts;
 }
 
 /// Applies one command on the GPU thread. Returns `false` to stop the worker.
 fn apply_command(
     cmd: Command,
     model: &Arc<dyn ModelHandle>,
-    sessions: &mut HashMap<u64, Box<dyn HostSession>>,
+    sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &mut VecDeque<ActiveJob>,
     max_sessions: usize,
 ) -> bool {
@@ -348,7 +593,7 @@ fn apply_command(
             } else {
                 Arc::clone(model).spawn().map(|session| {
                     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
-                    sessions.insert(id, session);
+                    sessions.insert(id, SessionSlot::new(session));
                     id
                 })
             };
@@ -361,20 +606,55 @@ fn apply_command(
             interrupt,
             out,
         } => {
-            if let Some(session) = sessions.get_mut(&id) {
-                session.begin(transcript, *opts);
-                rotation.push_back(ActiveJob { id, interrupt, out });
-            } else {
+            let Some(slot) = sessions.get_mut(&id) else {
                 let _ = out.send(Yield::Done(Err(EngineError::new("no such session"))));
+                return true;
+            };
+            // Restore a reclaimed session's KV into a fresh session before use
+            // (design §7). The bytes came from disk, so `restore_bytes` uses the
+            // non-owning FFI path (FINDINGS double-free gotcha).
+            if slot.session.is_none() {
+                match restore_reclaimed(model, slot) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        let _ = out.send(Yield::Done(Err(e)));
+                        return true;
+                    }
+                }
             }
+            let session = slot.session.as_mut().expect("restored above");
+            session.begin(transcript, *opts);
+            slot.last_active = Instant::now();
+            rotation.push_back(ActiveJob { id, interrupt, out });
         }
         Command::Detach { id } => {
-            sessions.remove(&id);
+            if let Some(slot) = sessions.remove(&id)
+                && let Some(path) = slot.snapshot_path
+            {
+                let _ = std::fs::remove_file(path);
+            }
             rotation.retain(|job| job.id != id);
         }
         Command::Shutdown => return false,
     }
     true
+}
+
+/// Spawns a fresh session and restores a reclaimed slot's persisted KV into it.
+fn restore_reclaimed(
+    model: &Arc<dyn ModelHandle>,
+    slot: &mut SessionSlot,
+) -> Result<(), EngineError> {
+    let mut session = Arc::clone(model).spawn()?;
+    if let Some(path) = slot.snapshot_path.take() {
+        let bytes =
+            std::fs::read(&path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
+        session.restore_bytes(&bytes)?;
+        let _ = std::fs::remove_file(&path);
+    }
+    slot.ctx_tokens = session.ctx_tokens();
+    slot.session = Some(session);
+    Ok(())
 }
 
 /// A [`ModelHandle`] over the stub [`EchoEngine`], so the shared engine (and
@@ -399,6 +679,10 @@ impl EchoSharedModel {
 struct EchoSharedSession {
     engine: EchoEngine,
     pending: Option<(String, GenerationOptions)>,
+    /// Running token count, so host accounting and idle reclamation have a
+    /// non-trivial value to carry across a snapshot/restore cycle even without a
+    /// real KV cache.
+    ctx_tokens: i32,
 }
 
 impl ModelHandle for EchoSharedModel {
@@ -406,6 +690,7 @@ impl ModelHandle for EchoSharedModel {
         Ok(Box::new(EchoSharedSession {
             engine: EchoEngine::new(self.ctx_size),
             pending: None,
+            ctx_tokens: 0,
         }))
     }
 
@@ -436,15 +721,31 @@ impl HostSession for EchoSharedSession {
             &|| false,
             sink,
         )?;
+        self.ctx_tokens = self.ctx_tokens.saturating_add(stats.generated);
         Ok(Some(stats))
+    }
+
+    fn ctx_tokens(&self) -> i32 {
+        self.ctx_tokens
+    }
+
+    // The stub has no real KV; a snapshot just round-trips the token count so
+    // the serve-echo path can exercise idle reclamation end to end (design §10).
+    fn snapshot_bytes(&mut self) -> Option<Vec<u8>> {
+        Some(self.ctx_tokens.to_le_bytes().to_vec())
+    }
+
+    fn restore_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        if let Ok(arr) = <[u8; 4]>::try_from(bytes) {
+            self.ctx_tokens = i32::from_le_bytes(arr);
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::time::Duration;
 
     /// A test model over the echo engine: records, on a shared trace, which
     /// session emitted each slice so round-robin ordering can be asserted
@@ -541,6 +842,7 @@ mod tests {
             HostConfig {
                 max_sessions,
                 slice_tokens: slice,
+                idle_reclaim: None,
             },
         );
         (host, trace)
@@ -717,5 +1019,148 @@ mod tests {
         assert_eq!(stats.generated, 16, "returns real GenerationStats");
         assert_eq!(count, 16, "all streamed events were delivered in order");
         assert!(!stats.interrupted);
+    }
+
+    // --- Accounting + idle reclamation (design §7, §9 step 5) ---------------
+
+    /// Builds a host over the real `EchoSharedModel` (which tracks `ctx_tokens`
+    /// and supports snapshot/restore), so accounting and reclamation are
+    /// exercised end to end without a model.
+    fn shared_host(cfg: HostConfig) -> EngineHost {
+        EngineHost::new(Arc::new(EchoSharedModel::new(4096)), cfg)
+    }
+
+    fn run_gen(handle: &SessionHandle) {
+        handle
+            .generate(
+                "[user]\nhi\n",
+                &GenerationOptions::default(),
+                Arc::new(AtomicBool::new(false)),
+                &mut |_| {},
+            )
+            .unwrap();
+    }
+
+    /// Polls `host.status()` until `pred` holds or the budget elapses.
+    fn poll_status(host: &EngineHost, pred: impl Fn(&HostStatus) -> bool) -> HostStatus {
+        for _ in 0..500 {
+            let st = host.status();
+            if pred(&st) {
+                return st;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        host.status()
+    }
+
+    #[test]
+    fn status_reports_live_count_and_accounting() {
+        let host = shared_host(HostConfig {
+            max_sessions: 3,
+            slice_tokens: 8,
+            idle_reclaim: None,
+        });
+        // Cap is visible immediately; no sessions yet.
+        let st = host.status();
+        assert_eq!(st.max_sessions, 3);
+        assert_eq!(st.live_sessions, 0);
+
+        let a = host.attach().unwrap();
+        let b = host.attach().unwrap();
+        let st = poll_status(&host, |s| s.live_sessions == 2);
+        assert_eq!(st.live_sessions, 2, "two attached sessions are counted");
+        assert_eq!(
+            st.resident_ctx_tokens, 0,
+            "no generation yet, no resident KV"
+        );
+
+        // A generation grows that session's resident KV accounting.
+        run_gen(&a);
+        let st = poll_status(&host, |s| s.resident_ctx_tokens > 0);
+        assert!(
+            st.resident_ctx_tokens > 0,
+            "resident KV tracked after a turn"
+        );
+        assert_eq!(st.sessions.len(), 2);
+        assert!(st.sessions.iter().any(|s| s.ctx_tokens > 0 && !s.reclaimed));
+
+        // Detach frees a slot and drops the live count.
+        drop(a);
+        drop(b);
+        let st = poll_status(&host, |s| s.live_sessions == 0);
+        assert_eq!(st.live_sessions, 0, "detach drops the live-session count");
+    }
+
+    #[test]
+    fn admission_cap_surfaced_in_status_and_error() {
+        let host = shared_host(HostConfig {
+            max_sessions: 1,
+            slice_tokens: 8,
+            idle_reclaim: None,
+        });
+        let _a = host.attach().unwrap();
+        let st = poll_status(&host, |s| s.live_sessions == 1);
+        assert_eq!(st.live_sessions, 1);
+        assert_eq!(st.max_sessions, 1);
+        let err = host.attach().expect_err("second attach exceeds the cap");
+        assert!(!err.is_unsupported(), "admission failure is a real error");
+        assert!(err.to_string().contains("capacity"));
+    }
+
+    #[test]
+    fn idle_reclaim_snapshots_and_restores() {
+        let host = shared_host(HostConfig {
+            max_sessions: 2,
+            slice_tokens: 8,
+            idle_reclaim: Some(Duration::from_millis(120)),
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        let before = poll_status(&host, |s| s.resident_ctx_tokens > 0);
+        let tokens = before.resident_ctx_tokens;
+        assert!(tokens > 0);
+
+        // After the idle threshold, the scheduler reclaims the session: it is
+        // still attached (counted) but marked reclaimed with no resident KV.
+        let st = poll_status(&host, |s| s.sessions.iter().any(|x| x.reclaimed));
+        assert_eq!(st.live_sessions, 1, "reclaimed session is still attached");
+        assert!(
+            st.sessions.iter().all(|x| x.reclaimed),
+            "the idle session was reclaimed to disk"
+        );
+        assert_eq!(st.resident_ctx_tokens, 0, "reclaimed KV is not resident");
+
+        // Next activity transparently restores the persisted KV; the carried
+        // token count comes back and the session is resident again.
+        run_gen(&a);
+        let st = poll_status(&host, |s| s.sessions.iter().all(|x| !x.reclaimed));
+        assert!(
+            st.resident_ctx_tokens >= tokens,
+            "restored session's KV accounting is preserved"
+        );
+    }
+
+    #[test]
+    fn idle_reclaim_disabled_is_noop() {
+        let host = shared_host(HostConfig {
+            max_sessions: 2,
+            slice_tokens: 8,
+            idle_reclaim: None,
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        poll_status(&host, |s| s.resident_ctx_tokens > 0);
+        // Well past any plausible threshold: with reclamation off nothing is
+        // ever reclaimed.
+        std::thread::sleep(Duration::from_millis(150));
+        let st = host.status();
+        assert!(
+            st.sessions.iter().all(|x| !x.reclaimed),
+            "reclamation disabled: no session is ever reclaimed"
+        );
+        assert!(
+            st.resident_ctx_tokens > 0,
+            "KV stays resident when disabled"
+        );
     }
 }
