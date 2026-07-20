@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
 /// A `@`-prefixed completion token found to the left of the cursor.
@@ -373,6 +374,106 @@ impl FileIndex {
     }
 }
 
+/// Maximum rows the worker returns for one query.
+pub const MAX_ROWS: usize = 15;
+
+/// A message from the index worker to the UI.
+#[derive(Debug)]
+pub enum IndexMsg {
+    /// Ranked rows for the query stamped `generation`.
+    Results {
+        /// The generation of the query these rows answer.
+        generation: u64,
+        /// Ranked rows, best first.
+        rows: Vec<Match>,
+    },
+    /// The index changed (the untracked fold or a refresh completed).
+    Refreshed,
+}
+
+/// A query sent to the index worker.
+struct QueryMsg {
+    generation: u64,
+    text: String,
+}
+
+/// Owns the file index on its own thread and answers ranked queries.
+///
+/// Dropping the worker closes the request channel, which ends the thread.
+#[derive(Debug)]
+pub struct IndexWorker {
+    tx: Sender<QueryMsg>,
+    rx: Receiver<IndexMsg>,
+}
+
+impl IndexWorker {
+    /// Starts the worker for `root`, mixing `extra` (MCP resources) into every
+    /// ranking pass.
+    #[must_use]
+    pub fn spawn(root: PathBuf, extra: Vec<Candidate>, respect_gitignore: bool) -> Self {
+        let (tx, qrx) = channel::<QueryMsg>();
+        let (mrx_tx, rx) = channel::<IndexMsg>();
+        std::thread::spawn(move || {
+            let mut index = FileIndex::build(&root, respect_gitignore);
+            index.mark_refreshed(Instant::now(), git_index_mtime(&root));
+            // Untracked files are slower to enumerate; fold them in once the
+            // tracked set is already answerable.
+            index.fold_untracked(&root, respect_gitignore);
+            if mrx_tx.send(IndexMsg::Refreshed).is_err() {
+                return;
+            }
+            while let Ok(q) = qrx.recv() {
+                let now = Instant::now();
+                let mtime = git_index_mtime(&root);
+                if index.needs_refresh(now, mtime) {
+                    let fresh = FileIndex::build(&root, respect_gitignore);
+                    // Equal signature means the rebuild is a no-op; keep the
+                    // existing index (which already holds untracked files).
+                    if fresh.signature() == index.signature() {
+                        index.mark_refreshed(now, mtime);
+                    } else {
+                        index = fresh;
+                        index.mark_refreshed(now, mtime);
+                        index.fold_untracked(&root, respect_gitignore);
+                        if mrx_tx.send(IndexMsg::Refreshed).is_err() {
+                            return;
+                        }
+                    }
+                }
+                let mut pool: Vec<Candidate> = index.candidates().to_vec();
+                pool.extend(extra.iter().cloned());
+                let rows = rank(&q.text, &pool, MAX_ROWS);
+                if mrx_tx
+                    .send(IndexMsg::Results {
+                        generation: q.generation,
+                        rows,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+        Self { tx, rx }
+    }
+
+    /// Requests ranked rows for `text`, stamped with `generation`.
+    ///
+    /// A dead worker is ignored; the popup simply shows nothing.
+    pub fn query(&self, generation: u64, text: &str) {
+        let _ = self.tx.send(QueryMsg {
+            generation,
+            text: text.to_string(),
+        });
+    }
+
+    /// Takes one pending message, if any.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<IndexMsg> {
+        self.rx.try_recv().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +752,78 @@ mod tests {
             "{:?}",
             idx.candidates()
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Blocks until the worker sends a message, or panics after 10s.
+    fn recv_blocking(w: &IndexWorker) -> IndexMsg {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(m) = w.try_recv() {
+                return m;
+            }
+            assert!(Instant::now() < deadline, "worker produced nothing");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn worker_answers_a_query_with_a_matching_generation() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let w = IndexWorker::spawn(dir.clone(), Vec::new(), true);
+        w.query(7, "ui");
+        loop {
+            match recv_blocking(&w) {
+                IndexMsg::Results { generation, rows } => {
+                    assert_eq!(generation, 7);
+                    assert!(rows.iter().any(|r| r.text == "src/ui.rs"), "{rows:?}");
+                    break;
+                }
+                IndexMsg::Refreshed => {}
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worker_reports_the_untracked_fold_with_refreshed() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        std::fs::write(dir.join("scratch.txt"), b"x").unwrap();
+        let w = IndexWorker::spawn(dir.clone(), Vec::new(), true);
+        // Await the fold rather than sleeping.
+        loop {
+            if matches!(recv_blocking(&w), IndexMsg::Refreshed) {
+                break;
+            }
+        }
+        w.query(1, "scratch");
+        loop {
+            if let IndexMsg::Results { rows, .. } = recv_blocking(&w) {
+                assert!(rows.iter().any(|r| r.text == "scratch.txt"), "{rows:?}");
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worker_includes_extra_candidates() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let extra = vec![Candidate {
+            text: "tolaria:note://b".to_string(),
+            kind: Kind::Resource,
+        }];
+        let w = IndexWorker::spawn(dir.clone(), extra, true);
+        w.query(1, "tolaria");
+        loop {
+            if let IndexMsg::Results { rows, .. } = recv_blocking(&w) {
+                assert!(
+                    rows.iter().any(|r| r.text == "tolaria:note://b"),
+                    "{rows:?}"
+                );
+                break;
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
