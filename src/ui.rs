@@ -400,6 +400,33 @@ struct Agent<'a> {
     /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
     /// was not given, in which case the turn loops behave exactly as before.
     remote: Option<Arc<RemoteState>>,
+    /// Cumulative billed token usage for online (provider) turns this session,
+    /// surfaced by `/usage`. Stays zero for local engines, which report none.
+    usage: SessionUsage,
+}
+
+/// Formats a non-negative token count with thousands separators (`12345` →
+/// `12,345`) for the `/usage` report.
+fn fmt_int(n: i32) -> String {
+    let s = n.max(0).to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Running tally of provider token usage across a session's turns.
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionUsage {
+    /// Provider turns counted (passes that reported a `usage` block).
+    turns: u32,
+    /// Summed token usage across those turns.
+    total: crate::engine::TokenUsage,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -544,6 +571,7 @@ impl Agent<'_> {
         stream.finish();
         bar.clear();
         self.last_ctx_used = stats.ctx_used;
+        self.record_usage(&stats);
         Ok((stream, assistant_text, stats))
     }
 
@@ -776,6 +804,73 @@ impl Agent<'_> {
         self.rebuild_after_compact(&summary);
         println!("{}", self.debug_line("context compacted"));
         Ok(())
+    }
+
+    /// Folds a completed pass's provider usage into the session tally. A no-op
+    /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
+    /// unless an online provider is driving the turns.
+    fn record_usage(&mut self, stats: &crate::engine::GenerationStats) {
+        if let Some(u) = stats.usage {
+            self.usage.total.add(u);
+            self.usage.turns += 1;
+        }
+    }
+
+    /// Renders the `/usage` report: cumulative billed token usage for online
+    /// (provider) models this session. Prints a short note when no provider
+    /// turn has run (local engine, or nothing generated yet).
+    fn render_usage_report(&self, color: bool) -> String {
+        use std::fmt::Write as _;
+        let dim = |s: &str| {
+            if color {
+                format!("\x1b[38;5;238m{s}{ANSI_RESET}")
+            } else {
+                s.to_owned()
+            }
+        };
+        if self.usage.turns == 0 {
+            let provider = self.cfg.provider.is_some();
+            let msg = if provider {
+                "No provider usage yet this session — run a turn first."
+            } else {
+                "Usage tracking applies to online models (--provider); this session uses a local engine."
+            };
+            return format!("{}\n", dim(msg));
+        }
+        let t = self.usage.total;
+        let model = self
+            .cfg
+            .provider_model
+            .as_deref()
+            .unwrap_or("(unknown model)");
+        let provider = self.cfg.provider.map_or("provider", |p| p.label());
+        let prompt_total = t
+            .input_tokens
+            .saturating_add(t.cache_read_tokens)
+            .saturating_add(t.cache_write_tokens);
+        let grand_total = prompt_total.saturating_add(t.output_tokens);
+        let mut out = String::new();
+        let _ = writeln!(out, "{}", dim(&format!("Usage — {provider}:{model}")));
+        let _ = writeln!(out, "  turns          {}", self.usage.turns);
+        let _ = writeln!(out, "  input tokens   {}", fmt_int(t.input_tokens));
+        let _ = writeln!(out, "  output tokens  {}", fmt_int(t.output_tokens));
+        // Cache figures are only reported by providers that support prompt
+        // caching (Anthropic); omit the section entirely when both are zero.
+        if t.cache_read_tokens > 0 || t.cache_write_tokens > 0 {
+            let _ = writeln!(out, "  cache read     {}", fmt_int(t.cache_read_tokens));
+            let _ = writeln!(out, "  cache write    {}", fmt_int(t.cache_write_tokens));
+            if prompt_total > 0 {
+                let pct = i64::from(t.cache_read_tokens) * 100 / i64::from(prompt_total);
+                let _ = writeln!(out, "  cache hit rate {pct}% of prompt tokens");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "  total tokens   {} {}",
+            fmt_int(grand_total),
+            dim("(prompt + output)")
+        );
+        out
     }
 
     /// Renders the `/context` usage breakdown with Claude Code's layout: a
@@ -1058,6 +1153,7 @@ impl Agent<'_> {
                 self.session.push(Message::user(combined));
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
+                self.usage = SessionUsage::default();
                 println!("started a new session");
             }
             "/help" => print!("{}", crate::config::usage()),
@@ -1109,6 +1205,7 @@ impl Agent<'_> {
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
+                    self.usage = SessionUsage::default();
                 }
                 Err(e) => println!("switch failed: {e}"),
             },
@@ -1140,6 +1237,7 @@ impl Agent<'_> {
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
+                    self.usage = SessionUsage::default();
                 }
                 Err(e) => println!("resume failed: {e}"),
             },
@@ -1193,6 +1291,7 @@ impl Agent<'_> {
             }
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
+            "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
@@ -2661,6 +2760,7 @@ impl Agent<'_> {
 
         let stats = result.map_err(|e| e.to_string())?;
         self.last_ctx_used = stats.ctx_used;
+        self.record_usage(&stats);
         stream.finish();
         let finished = stream.finished();
         let calls = finished.calls.to_vec();
@@ -2822,6 +2922,7 @@ impl Agent<'_> {
                 self.session.push(Message::user(combined));
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
+                self.usage = SessionUsage::default();
                 log.push_plain("started a new session");
             }
             "/checkpoint" => {
@@ -2852,6 +2953,7 @@ impl Agent<'_> {
             }
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
+            "/usage" => log.push_ansi(&self.render_usage_report(true)),
             "/init" => self.tui_run_init(log, terminal, view, input, btw),
             "/compact" => {
                 let result = {
@@ -2892,6 +2994,7 @@ impl Agent<'_> {
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
+                    self.usage = SessionUsage::default();
                 }
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
@@ -2917,6 +3020,7 @@ impl Agent<'_> {
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
+                    self.usage = SessionUsage::default();
                 }
                 Err(e) => log.push_plain(format!("resume failed: {e}")),
             },
@@ -3403,6 +3507,7 @@ fn new_agent(
         skills,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote,
+        usage: SessionUsage::default(),
     })
 }
 
@@ -3813,6 +3918,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         }
     }
 
@@ -4561,6 +4667,98 @@ mod tests {
     }
 
     #[test]
+    fn fmt_int_groups_thousands() {
+        assert_eq!(fmt_int(0), "0");
+        assert_eq!(fmt_int(42), "42");
+        assert_eq!(fmt_int(1_000), "1,000");
+        assert_eq!(fmt_int(17_859), "17,859");
+        assert_eq!(fmt_int(-5), "0");
+    }
+
+    #[test]
+    fn token_usage_add_saturates() {
+        let mut a = crate::engine::TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            cache_read_tokens: 100,
+            cache_write_tokens: 0,
+        };
+        a.add(crate::engine::TokenUsage {
+            input_tokens: i32::MAX,
+            output_tokens: 3,
+            cache_read_tokens: 0,
+            cache_write_tokens: 7,
+        });
+        assert_eq!(a.input_tokens, i32::MAX);
+        assert_eq!(a.output_tokens, 5);
+        assert_eq!(a.cache_read_tokens, 100);
+        assert_eq!(a.cache_write_tokens, 7);
+    }
+
+    #[test]
+    fn usage_report_tallies_provider_turns() {
+        let dir = std::env::temp_dir().join(format!("plank-usage-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig {
+            provider: Some(crate::config::ProviderSelector::OpenAi),
+            provider_model: Some("deepseek-v4-flash:cloud".to_string()),
+            ..crate::config::AgentConfig::default()
+        };
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(crate::engine::EchoEngine::new(64)),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: String::new(),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            usage: SessionUsage::default(),
+        };
+
+        // Empty state: no provider turn recorded yet.
+        assert!(
+            agent
+                .render_usage_report(false)
+                .contains("No provider usage yet")
+        );
+
+        let mk = |input, output| crate::engine::GenerationStats {
+            usage: Some(crate::engine::TokenUsage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        agent.record_usage(&mk(100, 20));
+        agent.record_usage(&mk(50, 5));
+        // A local pass (no usage) must not bump the turn count.
+        agent.record_usage(&crate::engine::GenerationStats::default());
+
+        let report = agent.render_usage_report(false);
+        assert!(report.contains("deepseek-v4-flash:cloud"), "got: {report}");
+        assert!(report.contains("turns          2"), "got: {report}");
+        assert!(report.contains("input tokens   150"), "got: {report}");
+        assert!(report.contains("output tokens  25"), "got: {report}");
+        // No cache traffic on the OpenAI path: the section is omitted.
+        assert!(!report.contains("cache read"), "got: {report}");
+        assert!(report.contains("total tokens   175"), "got: {report}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn malformed_stanza_feeds_c_format_tool_error() {
         let dir = std::env::temp_dir().join(format!("plank-ui-err-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -4593,6 +4791,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -4668,6 +4867,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -4743,6 +4943,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -4807,6 +5008,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -4858,6 +5060,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("run echo"));
 

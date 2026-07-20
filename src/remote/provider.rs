@@ -1038,6 +1038,12 @@ impl Engine for ProviderEngine {
             tps: 0.0,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
+            usage: Some(crate::engine::TokenUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_tokens: usage.cache_read_input_tokens,
+                cache_write_tokens: usage.cache_creation_input_tokens,
+            }),
         })
     }
 

@@ -75,6 +75,7 @@ Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-f
 - **Type while it thinks** — each turn runs on a worker thread (the C reference's model-worker architecture), so the prompt stays live during generation: type the next message and press Enter to queue it. Queued messages join the conversation at the next tool round, or start the next turn when the current one settles. Esc interrupts; Ctrl-C clears the typed line first, then interrupts on an empty line.
 - **`/init`** — asks the model to analyze the codebase and generate an `AGENTS.md` for future sessions (build/test commands, architecture, gotchas).
 - **`/context`** — a visual breakdown of context-window usage by category (system prompt, tools, AGENTS.md, conversation), shown below.
+- **`/usage`** — cumulative billed token usage for online models this session (input, output, and — on providers that cache prompts, like Anthropic — cache read/write with hit rate). Empty on the local engine, which has no billed usage.
 - **Session-start context** — plank automatically injects git status, recent commits, discovered `AGENTS.md`/`CLAUDE.md` files, and the current date at the start of each session.
 - **`/clear` and `/mcp`** — reset the session in place, and inspect the state of connected MCP servers.
 - **`!` commands** — `!<command>` runs a shell command immediately from the prompt (no model round-trip); output stays in the UI with exit-code display, Esc/Ctrl-C kills it.

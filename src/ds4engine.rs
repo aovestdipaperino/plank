@@ -734,6 +734,7 @@ impl Engine for Ds4Session {
             },
             ctx_used,
             interrupted,
+            usage: None,
         })
     }
 
@@ -1040,6 +1041,7 @@ impl Ds4HostSession {
             },
             ctx_used,
             interrupted,
+            usage: None,
         }
     }
 }

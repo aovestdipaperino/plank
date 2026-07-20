@@ -178,6 +178,37 @@ pub enum EngineEvent {
     Text(String),
 }
 
+/// Per-pass token accounting reported by an online provider. Local engines do
+/// not populate this (there is no billed usage to report); providers fill it
+/// from the API's `usage` block so the agent can tally `/usage` across a session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    /// Prompt tokens billed this pass (for Anthropic, the *uncached* remainder;
+    /// the cache figures below are reported separately).
+    pub input_tokens: i32,
+    /// Completion tokens generated this pass.
+    pub output_tokens: i32,
+    /// Prompt tokens served from the provider's cache this pass (0 when the
+    /// provider does not report caching, e.g. OpenAI-compatible gateways).
+    pub cache_read_tokens: i32,
+    /// Prompt tokens written to the provider's cache this pass (0 when none).
+    pub cache_write_tokens: i32,
+}
+
+impl TokenUsage {
+    /// Accumulates another pass's usage into this running total.
+    pub fn add(&mut self, other: TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
+}
+
 /// Outcome of a generation pass.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationStats {
@@ -189,6 +220,8 @@ pub struct GenerationStats {
     pub ctx_used: i32,
     /// True when generation stopped because of an interrupt.
     pub interrupted: bool,
+    /// Billed token usage for this pass, when the engine is an online provider.
+    pub usage: Option<TokenUsage>,
 }
 
 /// Engine error with a human-readable message.
@@ -417,6 +450,7 @@ impl Engine for EchoEngine {
             tps: 0.0,
             ctx_used: self.count_tokens(transcript),
             interrupted: false,
+            usage: None,
         })
     }
 

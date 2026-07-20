@@ -240,6 +240,7 @@ impl From<WireStats> for GenerationStats {
             tps: s.tps,
             ctx_used: s.ctx_used,
             interrupted: s.interrupted,
+            usage: None,
         }
     }
 }

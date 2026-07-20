@@ -122,6 +122,17 @@ pub enum ProviderSelector {
     Anthropic,
 }
 
+impl ProviderSelector {
+    /// Short lowercase label (`openai` / `anthropic`) for reports.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
 /// `/btw` side-question configuration (BTW-SUSPEND-DESIGN §4.1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BtwConfig {
@@ -491,6 +502,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/clear"
             | "/mcp"
             | "/context"
+            | "/usage"
             | "/init"
             | "/skills"
             | "/hooks"
@@ -1161,7 +1173,7 @@ mod tests {
     fn slash_commands() {
         for cmd in [
             "/help", "/save", "/compact", "/list", "/quit", "/exit", "/new", "/clear", "/mcp",
-            "/context", "/init", "/skills", "/hooks",
+            "/context", "/usage", "/init", "/skills", "/hooks",
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }
