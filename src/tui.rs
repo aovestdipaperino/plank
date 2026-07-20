@@ -511,6 +511,56 @@ fn input_spans(input: &str) -> Vec<Span<'static>> {
     vec![Span::raw(input.to_string())]
 }
 
+/// Computes the popup rect: it floats up from the top edge of the input,
+/// overlaying the output pane, so it never reaches the status bar. When fewer
+/// rows fit above the input than requested it shrinks rather than moving down.
+#[must_use]
+pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
+    let space_above = input.y.saturating_sub(output.y);
+    let h = rows
+        .min(space_above)
+        .min(output.height)
+        .min(u16::try_from(crate::complete::MAX_ROWS).unwrap_or(u16::MAX));
+    if h == output.height && output.height < space_above {
+        // The output pane itself is the limiting factor (a tall multi-line
+        // input has squeezed it down): anchor to its top rather than
+        // floating with a gap between the popup and the input above it.
+        Rect::new(output.x, output.y, output.width, h)
+    } else {
+        Rect::new(output.x, input.y.saturating_sub(h), output.width, h)
+    }
+}
+
+/// Draws the `@` suggestion popup over the output pane.
+///
+/// Clears the region first so the scrollback underneath does not bleed
+/// through; the selected row is highlighted in the theme green.
+pub fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
+    use ratatui::widgets::{Clear, List, ListItem, ListState, StatefulWidget};
+    if area.height == 0 || popup.rows().is_empty() {
+        return;
+    }
+    frame.render_widget(Clear, area);
+    let items: Vec<ListItem> = popup
+        .rows()
+        .iter()
+        .map(|m| {
+            let marker = match m.kind {
+                crate::complete::Kind::Dir => "/",
+                crate::complete::Kind::Resource => "@",
+                crate::complete::Kind::File => " ",
+            };
+            ListItem::new(Span::raw(format!("{marker} {}", m.text)))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().fg(THEME_GREEN))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(Some(popup.selected()));
+    StatefulWidget::render(list, area, frame.buffer_mut(), &mut state);
+}
+
 /// Horizontal scroll offset for the input line, in display columns.
 ///
 /// The prompt glyph is always drawn, so the text gets `width - prompt_width`
@@ -1110,5 +1160,46 @@ mod tests {
         assert_eq!(cy, prompt_y + 1);
         let prompt_width = u16::try_from(Span::raw(crate::status::prompt_text()).width()).unwrap();
         assert_eq!(cx, prompt_width + 2);
+    }
+
+    #[test]
+    fn popup_sits_above_the_input_and_never_touches_the_status_bar() {
+        // 24-row screen: output 0..20, input 21, status 23.
+        let output = Rect::new(0, 0, 80, 20);
+        let input = Rect::new(0, 21, 80, 1);
+        let r = popup_rect(output, input, 5);
+        assert_eq!(r.height, 5);
+        assert_eq!(r.y + r.height, input.y, "bottom edge meets the input top");
+        assert!(r.y >= output.y);
+    }
+
+    #[test]
+    fn popup_shrinks_rather_than_moving_down_when_space_is_tight() {
+        // Only 2 rows of output above a tall multi-line input.
+        let output = Rect::new(0, 0, 80, 2);
+        let input = Rect::new(0, 3, 80, 6);
+        let r = popup_rect(output, input, 15);
+        assert_eq!(r.height, 2, "clamped to the output pane");
+        assert_eq!(r.y, output.y);
+        assert!(r.y + r.height <= input.y);
+    }
+
+    #[test]
+    fn popup_is_empty_when_no_rows_fit() {
+        let output = Rect::new(0, 0, 80, 0);
+        let input = Rect::new(0, 0, 80, 1);
+        assert_eq!(popup_rect(output, input, 5).height, 0);
+    }
+
+    #[test]
+    fn popup_never_exceeds_the_row_cap() {
+        let output = Rect::new(0, 0, 80, 40);
+        let input = Rect::new(0, 41, 80, 1);
+        let r = popup_rect(
+            output,
+            input,
+            u16::try_from(crate::complete::MAX_ROWS).unwrap(),
+        );
+        assert_eq!(r.height, 15);
     }
 }
