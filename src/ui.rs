@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
@@ -1715,6 +1715,14 @@ struct TuiInput {
     history: History,
     hist_idx: Option<usize>,
     stash: String,
+    /// Open `@` suggestion popup, when one is showing.
+    popup: Option<crate::complete::Popup>,
+    /// Index worker, started lazily on the first `@`.
+    worker: Option<crate::complete::IndexWorker>,
+    /// MCP resource candidates, snapshotted once by `tui_loop` and handed to
+    /// the worker when it starts. Lives here so the free-function busy loop
+    /// gets identical behavior without threading the agent through.
+    mcp_extra: Vec<crate::complete::Candidate>,
 }
 
 impl TuiInput {
@@ -1724,6 +1732,94 @@ impl TuiInput {
             history: History::new(512),
             hist_idx: None,
             stash: String::new(),
+            popup: None,
+            worker: None,
+            mcp_extra: Vec::new(),
+        }
+    }
+
+    /// Text of the current buffer left of the cursor, used for `@` detection.
+    fn left_of_cursor(&self) -> &str {
+        let text = self.buf.text();
+        &text[..self.buf.cursor().min(text.len())]
+    }
+
+    /// True when the cursor sits at the end of the `@` token it is inside.
+    ///
+    /// [`crate::complete::Popup`] replaces the byte range `token.start ..
+    /// cursor`, which is only the whole token while nothing of it trails the
+    /// cursor. Without this guard, typing `@src`, pressing Left twice and then
+    /// Tab would glue the stale tail onto the completion.
+    fn cursor_at_token_end(&self) -> bool {
+        let text = self.buf.text();
+        let cursor = self.buf.cursor().min(text.len());
+        text[cursor..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
+    }
+
+    /// Opens, retargets, or closes the popup to match the current input text.
+    ///
+    /// Called after every key. Starts the index worker lazily on the first `@`
+    /// so a session that never completes never shells out to git.
+    fn sync_popup(&mut self) {
+        let token = crate::complete::detect_at_token(self.left_of_cursor())
+            .filter(|_| self.cursor_at_token_end());
+        let Some(token) = token else {
+            self.popup = None;
+            return;
+        };
+        if self.worker.is_none() {
+            let root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            self.worker = Some(crate::complete::IndexWorker::spawn(
+                root,
+                self.mcp_extra.clone(),
+                crate::complete::respect_gitignore_setting(),
+            ));
+        }
+        let query = token.query.clone();
+        let popup = self
+            .popup
+            .get_or_insert_with(|| crate::complete::Popup::new(token.clone()));
+        let generation = popup.bump_generation(token);
+        if let Some(w) = &self.worker {
+            w.query(generation, &query);
+        }
+    }
+
+    /// Drains worker messages into the popup. Call once per event-loop tick.
+    fn pump_popup(&mut self) {
+        let Some(w) = &self.worker else { return };
+        while let Some(msg) = w.try_recv() {
+            if let Some(p) = &mut self.popup {
+                p.accept_msg(msg);
+            }
+        }
+    }
+
+    /// Offers `key` to an open popup, the single entry point both TUI key
+    /// loops share so they cannot drift.
+    ///
+    /// Returns true when the popup consumed the key and the caller must skip
+    /// its own binding for it.
+    fn popup_key(&mut self, key: KeyEvent) -> bool {
+        use crate::complete::PopupAction;
+        let Some(popup) = self.popup.as_mut() else {
+            return false;
+        };
+        match popup.handle_key(key, &mut self.buf) {
+            PopupAction::Passthrough => false,
+            PopupAction::Dismissed => {
+                // Esc (and an empty accept) closes without re-syncing, so the
+                // popup stays shut until the next edit.
+                self.popup = None;
+                true
+            }
+            PopupAction::Consumed => {
+                self.sync_popup();
+                true
+            }
         }
     }
 
@@ -1797,6 +1893,7 @@ impl Agent<'_> {
     #[allow(clippy::too_many_lines)]
     fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         let mut input = TuiInput::new();
+        input.mcp_extra = crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp);
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
         let mut log = OutputLog::new();
@@ -1845,6 +1942,7 @@ impl Agent<'_> {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
                 clip_checked = Instant::now();
             }
+            input.pump_popup();
             let mut status = self.idle_status_text();
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
@@ -1875,6 +1973,9 @@ impl Agent<'_> {
                             &mut view,
                             selection.map(|(a, b)| tui::normalize_selection(a, b)),
                         );
+                    }
+                    if let Some(p) = &input.popup {
+                        tui::draw_popup(f, input.buf.text(), p);
                     }
                 })
                 .map_err(|e| e.to_string())?;
@@ -2012,6 +2113,7 @@ impl Agent<'_> {
                 input
                     .buf
                     .insert(pasted.replace("\r\n", "\n").replace(['\n', '\r'], " "));
+                input.sync_popup();
                 continue;
             }
             let Event::Key(key) = ev else {
@@ -2023,6 +2125,11 @@ impl Agent<'_> {
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
             selection = None;
+            // The popup sees keys first: Esc closes it before the `/btw`
+            // panel, and Tab/Enter/Up/Down drive the suggestion list.
+            if input.popup_key(key) {
+                continue;
+            }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             match key.code {
                 KeyCode::Char('c') if ctrl => {
@@ -2086,6 +2193,7 @@ impl Agent<'_> {
                 KeyCode::Enter => {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
+                    input.popup = None;
                     input.hist_idx = None;
                     view.follow = true;
                     if line.is_empty() && attachments.is_empty() {
@@ -2096,6 +2204,9 @@ impl Agent<'_> {
                         input.history.save(&hist_path).ok();
                     }
                     if let Some(cmd) = line.strip_prefix('!') {
+                        // ! prefix is for user-only shell execution — output goes to TUI log
+                        // but NOT into the session transcript. This is intentional and matches
+                        // Claude Code's behavior. See issue #20 for discussion.
                         let cmd = cmd.trim().to_owned();
                         if cmd.is_empty() {
                             log.push_dim("usage: !<shell command>");
@@ -2145,6 +2256,8 @@ impl Agent<'_> {
                 }
                 _ => {}
             }
+            // Retarget (or close) the popup after every edit and cursor move.
+            input.sync_popup();
         }
         input.history.save(&hist_path).ok();
         Ok(())
@@ -2153,6 +2266,23 @@ impl Agent<'_> {
     /// Runs a `!` immediate shell command: output lands only in the TUI log,
     /// never in the conversation, and the model is not consulted. The frame
     /// keeps redrawing while the command runs so Esc/Ctrl-C can kill it.
+    ///
+    /// # Behavior is intentional
+    ///
+    /// The `!` prefix is for **user-only** shell execution — output is displayed
+    /// but NOT fed to the model. This matches Claude Code's behavior and is
+    /// by design, not a bug.
+    ///
+    /// See: <https://github.com/aovestdipaperino/plank/issues/20>
+    ///
+    /// ## Why output should not go to the model
+    ///
+    /// - `!` commands are for the human operator's convenience (checking status,
+    ///   running diagnostics, manual file operations)
+    /// - The model should not incorporate this output into its reasoning unless
+    ///   the user explicitly shares it
+    /// - If you want the model to see command output, use a regular turn with
+    ///   the `bash` tool instead
     fn tui_bang(
         cwd: &std::path::Path,
         cmd: &str,
@@ -3292,6 +3422,7 @@ fn busy_ui_loop(
         // the channel and is drained below (the sender is gone once the
         // worker returns).
         let finished = done();
+        input.pump_popup();
         terminal
             .draw(|f| {
                 if let Some((btw_log, btw_view)) = btw.as_mut() {
@@ -3315,6 +3446,9 @@ fn busy_ui_loop(
                         view,
                         None,
                     );
+                }
+                if let Some(p) = &input.popup {
+                    tui::draw_popup(f, input.buf.text(), p);
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -3344,6 +3478,11 @@ fn busy_ui_loop(
         }
         match event::read().map_err(|e| e.to_string())? {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
+                // Same precedence as `tui_loop`: the popup sees keys first, so
+                // Esc closes it before it can interrupt the worker.
+                if input.popup_key(key) {
+                    continue;
+                }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                 match key.code {
                     KeyCode::Esc => {
@@ -3446,6 +3585,8 @@ fn busy_ui_loop(
                     KeyCode::Down => input.history_move(1),
                     _ => {}
                 }
+                // Retarget (or close) the popup after every edit and cursor move.
+                input.sync_popup();
             }
             Event::Paste(pasted) => {
                 input.hist_idx = None;
@@ -3454,6 +3595,7 @@ fn busy_ui_loop(
                 input
                     .buf
                     .insert(pasted.replace("\r\n", "\n").replace(['\n', '\r'], " "));
+                input.sync_popup();
             }
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::ScrollUp => {
@@ -3622,6 +3764,9 @@ fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> 
         return agent.slash(input);
     }
     if let Some(cmd) = input.strip_prefix('!') {
+        // ! prefix is for user-only shell execution — output goes to console
+        // but NOT into the session transcript. This is intentional and matches
+        // Claude Code's behavior. See issue #20 for discussion.
         let cmd = cmd.trim();
         if cmd.is_empty() {
             println!("usage: !<shell command>");
@@ -3853,6 +3998,55 @@ fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
+
+    /// Builds a `TuiInput` whose popup is open with one canned row.
+    fn input_with_popup(text: &str, cursor_back: usize) -> TuiInput {
+        use crate::complete::{IndexMsg, Kind, Match, Popup, detect_at_token};
+        let mut input = TuiInput::new();
+        input.buf.set_text(text);
+        input.buf.move_end();
+        for _ in 0..cursor_back {
+            input.buf.move_left();
+        }
+        let token = detect_at_token(text).expect("token");
+        let mut p = Popup::new(token);
+        let generation = p.generation();
+        p.accept_msg(IndexMsg::Results {
+            generation,
+            rows: vec![Match {
+                text: "source.rs".to_owned(),
+                kind: Kind::File,
+                score: 0,
+            }],
+        });
+        input.popup = Some(p);
+        input
+    }
+
+    #[test]
+    fn popup_closes_when_the_cursor_moves_off_the_token_end() {
+        // `@src` with the cursor moved two left sits mid-token: accepting there
+        // would splice the completion in front of the stale `rc` tail.
+        let mut input = input_with_popup("@src", 2);
+        input.sync_popup();
+        assert!(
+            input.popup.is_none(),
+            "popup must not survive a cursor move into the token"
+        );
+        // And the key is no longer consumed, so no mangled text can be written.
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(!input.popup_key(enter));
+        assert_eq!(input.buf.text(), "@src");
+    }
+
+    #[test]
+    fn popup_survives_while_the_cursor_stays_at_the_token_end() {
+        let mut input = input_with_popup("@src", 0);
+        assert!(input.popup.is_some());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(input.popup_key(enter));
+        assert_eq!(input.buf.text(), "source.rs ");
+    }
 
     /// Engine that plays back canned replies in order. Records the prompt of
     /// every generate call in `prompts` (shared, so tests can inspect it

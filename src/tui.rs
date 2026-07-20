@@ -449,6 +449,22 @@ fn frame_rows(
     has_prompt: bool,
     input_rows: u16,
 ) -> (Rect, Rect, Rect) {
+    let (output, input, status, rule) = frame_geom(area, has_prompt, input_rows);
+    if let Some(rule) = rule {
+        let text = "─".repeat(rule.width as usize);
+        frame.render_widget(
+            Paragraph::new(Span::styled(text, Style::default().fg(THEME_GREEN))),
+            rule,
+        );
+    }
+    (output, input, status)
+}
+
+/// Pure geometry behind [`frame_rows`]: returns `(output, input, status, rule)`
+/// where `rule` is the separator row, present only when `has_prompt`.
+///
+/// Split out so layout can be computed (and tested) without a `Frame`.
+fn frame_geom(area: Rect, has_prompt: bool, input_rows: u16) -> (Rect, Rect, Rect, Option<Rect>) {
     if has_prompt {
         let r = Layout::vertical([
             Constraint::Min(1),             // output
@@ -457,12 +473,7 @@ fn frame_rows(
             Constraint::Length(1),          // status
         ])
         .split(area);
-        let rule = "─".repeat(r[1].width as usize);
-        frame.render_widget(
-            Paragraph::new(Span::styled(rule, Style::default().fg(THEME_GREEN))),
-            r[1],
-        );
-        (r[0], r[2], r[3])
+        (r[0], r[2], r[3], Some(r[1]))
     } else {
         let r = Layout::vertical([
             Constraint::Min(1),
@@ -470,7 +481,7 @@ fn frame_rows(
             Constraint::Length(1),
         ])
         .split(area);
-        (r[0], r[1], r[2])
+        (r[0], r[1], r[2], None)
     }
 }
 
@@ -514,6 +525,11 @@ fn input_spans(input: &str) -> Vec<Span<'static>> {
 /// Computes the popup rect: it floats up from the top edge of the input,
 /// overlaying the output pane, so it never reaches the status bar. When fewer
 /// rows fit above the input than requested it shrinks rather than moving down.
+///
+/// The bottom row deliberately overlays the green separator rule drawn by
+/// [`frame_rows`]: the popup then sits flush against the prompt it is completing
+/// (leaving a blank gap instead reads as a detached, floating box), and the rule
+/// is redrawn the moment the popup closes.
 #[must_use]
 pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
     let space_above = input.y.saturating_sub(output.y);
@@ -559,6 +575,18 @@ pub fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popu
     let mut state = ListState::default();
     state.select(Some(popup.selected()));
     StatefulWidget::render(list, area, frame.buffer_mut(), &mut state);
+}
+
+/// Draws the `@` popup over the frame just rendered by [`draw`] or
+/// [`draw_btw_split`], recomputing the same layout those use so the popup lands
+/// directly above the input line.
+///
+/// `input_text` must be the same prompt text passed to the draw call, so the
+/// input's height (and therefore the popup's anchor) matches.
+pub fn draw_popup(frame: &mut Frame, input_text: &str, popup: &crate::complete::Popup) {
+    let (output, input, _, _) = frame_geom(frame.area(), true, input_height(input_text));
+    let rows = u16::try_from(popup.rows().len()).unwrap_or(u16::MAX);
+    render_popup(frame, popup_rect(output, input, rows), popup);
 }
 
 /// Horizontal scroll offset for the input line, in display columns.
@@ -1189,6 +1217,31 @@ mod tests {
         let output = Rect::new(0, 0, 80, 0);
         let input = Rect::new(0, 0, 80, 1);
         assert_eq!(popup_rect(output, input, 5).height, 0);
+    }
+
+    #[test]
+    fn popup_geometry_matches_the_real_frame_layout() {
+        // Drive popup_rect with the actual frame_geom split rather than
+        // hand-made rects, for a one-row and a tall multi-row input.
+        for (input_text, rows) in [("@src", 5u16), ("a\nb\nc\n@src", 15)] {
+            let screen = Rect::new(0, 0, 80, 24);
+            let (output, input, status, rule) = frame_geom(screen, true, input_height(input_text));
+            let rule = rule.expect("prompt showing means a rule row");
+            let r = popup_rect(output, input, rows);
+            assert!(r.y >= output.y, "popup starts inside the output pane");
+            assert!(
+                r.y + r.height <= input.y,
+                "popup never reaches the input line"
+            );
+            assert!(
+                r.y + r.height <= status.y,
+                "popup never touches the status bar"
+            );
+            // Deliberate: the bottom-anchored popup overlays the separator rule
+            // (see popup_rect docs); it must never spill past it.
+            assert!(r.y + r.height <= rule.y + 1);
+            assert!(r.height > 0, "some rows fit on a 24-row screen");
+        }
     }
 
     #[test]
