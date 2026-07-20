@@ -599,9 +599,16 @@ impl McpServer {
                 });
             }
         }
-        // Resources are optional; a server without them errors here and that
-        // is fine — it simply contributes no completion candidates.
-        if let Ok(res) = self.request("resources/list", "{}") {
+        // Resources are optional. Only ask a server that advertised the
+        // capability: one that silently ignores unknown methods (rather than
+        // replying -32601) would stall the whole handshake for
+        // `MCP_TIMEOUT_SEC` and then be marked dead, costing us all of its
+        // tools for a mere completion nicety.
+        let advertises_resources = init_result
+            .get("capabilities")
+            .and_then(|c| c.get("resources"))
+            .is_some();
+        if advertises_resources && let Ok(res) = self.request("resources/list", "{}") {
             self.resources = parse_resources(&res);
         }
         Ok(())
@@ -1270,6 +1277,58 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn a_server_without_a_resources_capability_is_never_asked_for_resources() {
+        // Regression: a server that silently ignores unknown methods would
+        // stall the handshake for the full 30s timeout on `resources/list` and
+        // then be marked dead, losing every one of its tools.
+        let log = std::env::temp_dir().join(format!("plank-mcp-methods-{}", std::process::id()));
+        std::fs::remove_file(&log).ok();
+        let script = format!(
+            r#"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> {log}
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}}}}}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id:-0}},\"result\":{{\"tools\":[{{\"name\":\"echo\",\"description\":\"Echo.\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}" ;;
+    *)
+      : ;;  # silently ignore anything else
+  esac
+done
+"#,
+            log = log.display()
+        );
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"quiet\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, &script);
+                esc
+            }
+        ));
+        let started = Instant::now();
+        let servers = start_servers(config_load(&path));
+        let elapsed = started.elapsed();
+        std::fs::remove_file(&path).ok();
+        let seen = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::remove_file(&log).ok();
+
+        assert!(
+            elapsed < Duration::from_secs(MCP_TIMEOUT_SEC),
+            "handshake must not stall on resources/list: {elapsed:?}"
+        );
+        assert!(
+            !seen.contains("resources/list"),
+            "resources/list must not be sent: {seen}"
+        );
+        assert_eq!(servers.len(), 1, "the server must survive");
+        assert_eq!(servers[0].tools.len(), 1, "its tools must survive");
+        assert!(servers[0].resources.is_empty());
     }
 
     #[test]
