@@ -1,5 +1,10 @@
 //! `@` typeahead completion for the Ratatui TUI prompt.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant, SystemTime};
+
 /// A `@`-prefixed completion token found to the left of the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtToken {
@@ -170,6 +175,204 @@ pub fn longest_common_prefix(matches: &[Match]) -> String {
     prefix.into_iter().collect()
 }
 
+/// How long a built index is trusted before a refresh is allowed.
+const REFRESH_THROTTLE: Duration = Duration::from_secs(5);
+/// Every Nth path feeds the change-detection signature.
+const SIGNATURE_STRIDE: usize = 16;
+
+/// Runs a command in `root` and returns its stdout split on newlines.
+///
+/// Returns an empty vector when the command cannot be run or exits non-zero,
+/// so a missing `git` or `rg` degrades to "no suggestions" rather than an error.
+fn lines_from(root: &Path, program: &str, args: &[&str]) -> Vec<String> {
+    let Ok(out) = Command::new(program).args(args).current_dir(root).output() else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// True when `root` is inside a git working tree.
+fn is_git_repo(root: &Path) -> bool {
+    !lines_from(root, "git", &["rev-parse", "--is-inside-work-tree"]).is_empty()
+}
+
+/// FNV-1a over the path count and every [`SIGNATURE_STRIDE`]th path.
+fn signature_of(paths: &BTreeSet<String>) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut feed = |bytes: &[u8]| {
+        for &b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+    };
+    feed(&paths.len().to_le_bytes());
+    for p in paths.iter().step_by(SIGNATURE_STRIDE) {
+        feed(p.as_bytes());
+    }
+    h
+}
+
+/// Modification time of `root/.git/index`, when it exists.
+#[must_use]
+pub fn git_index_mtime(root: &Path) -> Option<SystemTime> {
+    std::fs::metadata(root.join(".git").join("index"))
+        .ok()?
+        .modified()
+        .ok()
+}
+
+/// Reads `respectGitignore` from `~/.plank/settings.json` then
+/// `<cwd>/.plank/settings.json`, later file winning. Defaults to `true`.
+#[must_use]
+pub fn respect_gitignore_setting() -> bool {
+    use crate::tools::mcp::json_parse;
+    let mut value = true;
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        paths.push(PathBuf::from(home).join(".plank").join("settings.json"));
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        paths.push(cwd.join(".plank").join("settings.json"));
+    }
+    for p in paths {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        if let Some(root) = json_parse(&text)
+            && let Some(crate::tools::mcp::Json::Bool(b)) = root.get("respectGitignore")
+        {
+            value = *b;
+        }
+    }
+    value
+}
+
+/// An index of completable paths under one root.
+#[derive(Debug)]
+pub struct FileIndex {
+    paths: BTreeSet<String>,
+    cands: Vec<Candidate>,
+    signature: u64,
+    last_refresh: Option<Instant>,
+    last_git_mtime: Option<SystemTime>,
+}
+
+impl FileIndex {
+    /// Builds an index of tracked files under `root`.
+    ///
+    /// Uses `git ls-files --recurse-submodules` inside a git tree and
+    /// `rg --files` outside one. Untracked files are folded in separately by
+    /// [`FileIndex::fold_untracked`].
+    #[must_use]
+    pub fn build(root: &Path, respect_gitignore: bool) -> Self {
+        let paths: BTreeSet<String> = if is_git_repo(root) {
+            lines_from(root, "git", &["ls-files", "--recurse-submodules"])
+                .into_iter()
+                .collect()
+        } else {
+            let mut args = vec!["--files"];
+            if !respect_gitignore {
+                args.push("--no-ignore");
+            }
+            lines_from(root, "rg", &args)
+                .into_iter()
+                .map(|p| p.trim_start_matches("./").to_string())
+                .collect()
+        };
+        let mut idx = Self {
+            paths,
+            cands: Vec::new(),
+            signature: 0,
+            last_refresh: None,
+            last_git_mtime: None,
+        };
+        idx.rebuild_candidates();
+        idx
+    }
+
+    /// Folds untracked files into an already-built index.
+    ///
+    /// Honours `.gitignore` when `respect_gitignore` is set.
+    pub fn fold_untracked(&mut self, root: &Path, respect_gitignore: bool) {
+        if !is_git_repo(root) {
+            return;
+        }
+        let mut args = vec!["ls-files", "--others"];
+        if respect_gitignore {
+            args.push("--exclude-standard");
+        }
+        for p in lines_from(root, "git", &args) {
+            self.paths.insert(p);
+        }
+        self.rebuild_candidates();
+    }
+
+    /// Recomputes candidates and the signature from `self.paths`.
+    ///
+    /// Drops anything under `.git/` and synthesises every parent directory as
+    /// its own entry with a trailing `/`.
+    fn rebuild_candidates(&mut self) {
+        self.paths
+            .retain(|p| !p.starts_with(".git/") && p != ".git");
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        for p in &self.paths {
+            let mut cut = 0usize;
+            while let Some(i) = p[cut..].find('/') {
+                cut += i + 1;
+                dirs.insert(p[..cut].to_string());
+            }
+        }
+        self.cands = dirs
+            .into_iter()
+            .map(|text| Candidate {
+                text,
+                kind: Kind::Dir,
+            })
+            .chain(self.paths.iter().map(|p| Candidate {
+                text: p.clone(),
+                kind: Kind::File,
+            }))
+            .collect();
+        self.signature = signature_of(&self.paths);
+    }
+
+    /// The candidates this index offers.
+    #[must_use]
+    pub fn candidates(&self) -> &[Candidate] {
+        &self.cands
+    }
+
+    /// Change-detection hash; an equal signature means a rebuild is a no-op.
+    #[must_use]
+    pub fn signature(&self) -> u64 {
+        self.signature
+    }
+
+    /// True when the index may be rebuilt: the throttle has expired, or
+    /// `.git/index` moved since the last refresh.
+    #[must_use]
+    pub fn needs_refresh(&self, now: Instant, git_index_mtime: Option<SystemTime>) -> bool {
+        if git_index_mtime.is_some() && git_index_mtime != self.last_git_mtime {
+            return true;
+        }
+        self.last_refresh
+            .is_none_or(|t| now.duration_since(t) >= REFRESH_THROTTLE)
+    }
+
+    /// Records that a refresh just happened.
+    pub fn mark_refreshed(&mut self, now: Instant, git_index_mtime: Option<SystemTime>) {
+        self.last_refresh = Some(now);
+        self.last_git_mtime = git_index_mtime;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,5 +502,155 @@ mod tests {
     fn no_token_without_at() {
         assert!(detect_at_token("plain text").is_none());
         assert!(detect_at_token("").is_none());
+    }
+
+    /// Creates a git repo under a unique temp dir with the given files.
+    fn temp_repo(files: &[&str]) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-complete-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            let p = dir.join(f);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, b"x").unwrap();
+        }
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@example.com"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "init"],
+        ] {
+            Command::new("git")
+                .args(&args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn indexes_tracked_files_and_parent_dirs() {
+        let dir = temp_repo(&["src/ui.rs", "Cargo.toml"]);
+        let idx = FileIndex::build(&dir, true);
+        let texts: Vec<&str> = idx.candidates().iter().map(|c| c.text.as_str()).collect();
+        assert!(texts.contains(&"src/ui.rs"), "{texts:?}");
+        assert!(texts.contains(&"Cargo.toml"), "{texts:?}");
+        assert!(texts.contains(&"src/"), "parent dir indexed: {texts:?}");
+        let dirs: Vec<&Candidate> = idx
+            .candidates()
+            .iter()
+            .filter(|c| c.kind == Kind::Dir)
+            .collect();
+        assert!(dirs.iter().all(|d| d.text.ends_with('/')));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn never_indexes_dot_git() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let idx = FileIndex::build(&dir, true);
+        assert!(
+            !idx.candidates().iter().any(|c| c.text.starts_with(".git/")),
+            "no .git entries"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn untracked_file_appears_after_the_background_fold() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        std::fs::write(dir.join("scratch.txt"), b"x").unwrap();
+        let mut idx = FileIndex::build(&dir, true);
+        assert!(!idx.candidates().iter().any(|c| c.text == "scratch.txt"));
+        idx.fold_untracked(&dir, true);
+        assert!(idx.candidates().iter().any(|c| c.text == "scratch.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn respect_gitignore_hides_ignored_files() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        std::fs::write(dir.join(".gitignore"), b"ignored.txt\n").unwrap();
+        std::fs::write(dir.join("ignored.txt"), b"x").unwrap();
+
+        let mut on = FileIndex::build(&dir, true);
+        on.fold_untracked(&dir, true);
+        assert!(!on.candidates().iter().any(|c| c.text == "ignored.txt"));
+
+        let mut off = FileIndex::build(&dir, false);
+        off.fold_untracked(&dir, false);
+        assert!(off.candidates().iter().any(|c| c.text == "ignored.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn identical_file_lists_produce_identical_signatures() {
+        let dir = temp_repo(&["src/ui.rs", "Cargo.toml"]);
+        let a = FileIndex::build(&dir, true);
+        let b = FileIndex::build(&dir, true);
+        assert_eq!(a.signature(), b.signature());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn signature_changes_when_the_file_list_changes() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let a = FileIndex::build(&dir, true);
+        std::fs::write(dir.join("new.rs"), b"x").unwrap();
+        Command::new("git")
+            .args(["add", "-A"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let b = FileIndex::build(&dir, true);
+        assert_ne!(a.signature(), b.signature());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn throttle_blocks_a_refresh_before_five_seconds() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let now = Instant::now();
+        let mut idx = FileIndex::build(&dir, true);
+        let mtime = git_index_mtime(&dir);
+        idx.mark_refreshed(now, mtime);
+        assert!(!idx.needs_refresh(now + Duration::from_secs(1), mtime));
+        assert!(idx.needs_refresh(now + Duration::from_secs(6), mtime));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_changed_git_index_mtime_bypasses_the_throttle() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let now = Instant::now();
+        let mut idx = FileIndex::build(&dir, true);
+        idx.mark_refreshed(now, git_index_mtime(&dir));
+        let moved = Some(std::time::SystemTime::now() + Duration::from_secs(60));
+        assert!(idx.needs_refresh(now + Duration::from_millis(10), moved));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn falls_back_to_ripgrep_outside_a_git_repo() {
+        let dir = std::env::temp_dir().join(format!("plank-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/loose.txt"), b"x").unwrap();
+        let idx = FileIndex::build(&dir, true);
+        assert!(
+            idx.candidates().iter().any(|c| c.text == "sub/loose.txt"),
+            "{:?}",
+            idx.candidates()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
