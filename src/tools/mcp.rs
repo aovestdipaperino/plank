@@ -310,6 +310,58 @@ pub struct McpTool {
     pub primary: bool,
 }
 
+/// A resource advertised by an MCP server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpResource {
+    /// The resource URI, used verbatim in the `{server}:{uri}` token.
+    pub uri: String,
+    /// Human-readable label; empty when the server gave none.
+    pub name: String,
+}
+
+/// Extracts the `resources` array from a `resources/list` result.
+fn parse_resources(root: &Json) -> Vec<McpResource> {
+    let Some(Json::Arr(list)) = root.get("resources") else {
+        return Vec::new();
+    };
+    list.iter()
+        .filter_map(|r| {
+            let uri = r.str_or("uri", "");
+            if uri.is_empty() {
+                return None;
+            }
+            Some(McpResource {
+                uri: uri.to_string(),
+                name: r.str_or("name", "").to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Builds `{server}:{uri}` completion candidates for one server's resources.
+fn resource_candidates_from(
+    server: &str,
+    resources: &[McpResource],
+) -> Vec<crate::complete::Candidate> {
+    resources
+        .iter()
+        .map(|r| crate::complete::Candidate {
+            text: format!("{server}:{}", r.uri),
+            kind: crate::complete::Kind::Resource,
+        })
+        .collect()
+}
+
+/// Collects completion candidates for every live server's resources.
+#[must_use]
+pub fn resource_candidates(servers: &[McpServer]) -> Vec<crate::complete::Candidate> {
+    servers
+        .iter()
+        .filter(|s| s.alive())
+        .flat_map(|s| resource_candidates_from(&s.name, s.resources()))
+        .collect()
+}
+
 /// Config for one server parsed from `.mcp.json`, before it is started.
 #[derive(Debug, Clone)]
 pub struct McpServerConfig {
@@ -334,6 +386,8 @@ pub struct McpServer {
     /// Free-text usage instructions from the initialize response; empty when
     /// the server provided none.
     pub instructions: String,
+    /// Resources advertised at handshake time.
+    resources: Vec<McpResource>,
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
@@ -394,6 +448,7 @@ impl McpServer {
             name: cfg.name.clone(),
             tools: Vec::new(),
             instructions: String::new(),
+            resources: Vec::new(),
             child,
             stdin,
             stdout,
@@ -407,6 +462,12 @@ impl McpServer {
     #[must_use]
     pub fn alive(&self) -> bool {
         self.alive
+    }
+
+    /// Resources advertised at handshake time.
+    #[must_use]
+    pub fn resources(&self) -> &[McpResource] {
+        &self.resources
     }
 
     /// Reads one newline-delimited message, blocking up to `deadline`.
@@ -537,6 +598,11 @@ impl McpServer {
                     primary,
                 });
             }
+        }
+        // Resources are optional; a server without them errors here and that
+        // is fine — it simply contributes no completion candidates.
+        if let Ok(res) = self.request("resources/list", "{}") {
+            self.resources = parse_resources(&res);
         }
         Ok(())
     }
@@ -1157,13 +1223,19 @@ mod tests {
         // notification, lists one echo tool, and echoes tool call arguments.
         let script = r#"
 while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
   case "$line" in
     *'"initialize"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","instructions":"Prefer the echo tool for text round-trips."}}' ;;
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\",\"instructions\":\"Prefer the echo tool for text round-trips.\"}}" ;;
     *'"tools/list"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"echo","description":"Echo text.","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}' ;;
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo text.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}}}}]}}" ;;
     *'"tools/call"'*)
-      printf '%s\n' '{"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"echoed: hi"}]}}' ;;
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"echoed: hi\"}]}}" ;;
+    *)
+      # Unknown methods (e.g. resources/list) get a JSON-RPC error reply,
+      # matching a real server that doesn't implement the method — this
+      # must not hang or take down the connection.
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
   esac
 done
 "#;
@@ -1198,5 +1270,37 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn parses_a_resources_list_response() {
+        let json = r#"{"resources":[
+            {"uri":"file:///a.txt","name":"A"},
+            {"uri":"note://b","name":"B"}
+        ]}"#;
+        let root = json_parse(json).expect("parses");
+        let got = parse_resources(&root);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].uri, "file:///a.txt");
+        assert_eq!(got[0].name, "A");
+        assert_eq!(got[1].uri, "note://b");
+    }
+
+    #[test]
+    fn a_missing_resources_key_yields_none() {
+        let root = json_parse("{}").expect("parses");
+        assert!(parse_resources(&root).is_empty());
+    }
+
+    #[test]
+    fn resource_candidates_are_server_qualified() {
+        let r = vec![McpResource {
+            uri: "note://b".to_string(),
+            name: "B".to_string(),
+        }];
+        let c = resource_candidates_from("tolaria", &r);
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].text, "tolaria:note://b");
+        assert_eq!(c[0].kind, crate::complete::Kind::Resource);
     }
 }
