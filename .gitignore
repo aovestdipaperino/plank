@@ -3,3 +3,5 @@
 .claude/
 /local/
 /vault/
+# local launch scripts may embed API keys (e.g. scripts/plank-z.sh)
+/scripts/

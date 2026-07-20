@@ -585,6 +585,17 @@ impl SseTranslator for AnthropicTranslator {
 /// it. Caching is off for a `Flat` prompt (no tools, no reused system).
 #[must_use]
 #[allow(clippy::too_many_lines)]
+/// Rounds a sampling parameter to two decimals as a clean JSON number.
+///
+/// An `f32` like `0.6` widens to the noisy `f64` `0.6000000238…`, which
+/// `serde_json` prints in full. Some Anthropic-compatible gateways (e.g. z.ai)
+/// reject more than two decimal places, so we round and emit a tidy value.
+/// Two decimals is ample precision for `temperature`/`top_p`.
+fn round2(x: f32) -> serde_json::Value {
+    let v = (f64::from(x) * 100.0).round() / 100.0;
+    serde_json::json!(v)
+}
+
 pub fn build_anthropic_request(
     model: &str,
     system: &str,
@@ -660,18 +671,13 @@ pub fn build_anthropic_request(
         }
     }
 
-    let max_tokens = if opts.n_predict > 0 {
-        opts.n_predict
-    } else {
-        4096
-    };
     let mut body = serde_json::json!({
         "model": model,
         "messages": wire_messages,
         "stream": true,
-        "max_tokens": max_tokens,
-        "temperature": opts.temperature,
-        "top_p": opts.top_p,
+        "max_tokens": if opts.n_predict > 0 { opts.n_predict } else { 4096 },
+        "temperature": round2(opts.temperature),
+        "top_p": round2(opts.top_p),
     });
     if !sys.is_empty() {
         // System as a one-element block array so a cache breakpoint can attach.
@@ -783,8 +789,8 @@ pub fn build_openai_request(
         "messages": wire_messages,
         "stream": true,
         "stream_options": { "include_usage": true },
-        "temperature": opts.temperature,
-        "top_p": opts.top_p,
+        "temperature": round2(opts.temperature),
+        "top_p": round2(opts.top_p),
     });
     if opts.n_predict > 0 {
         body["max_tokens"] = serde_json::json!(opts.n_predict);

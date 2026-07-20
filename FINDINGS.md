@@ -160,6 +160,14 @@ test` and review the diff before committing.
   selection-copy bug, issue #1) silently yields blank text; extract cell
   content inside the `draw` closure from `frame.buffer_mut()` while the
   frame is still being composed (`src/ui.rs`, mouse-up handler).
+- **Strict provider gateways reject noisy float params.** plank's sampling
+  knobs are `f32`, and serde_json widens e.g. `temperature: 0.6` to the noisy
+  `f64` `0.6000000238…`, printing every digit. z.ai's Anthropic-compatible
+  gateway rejects any `temperature`/`top_p` with more than two decimals
+  (`400 … "temperature parameter is illegal"`). `build_anthropic_request` /
+  `build_openai_request` now route both through `round2()` (`src/remote/provider.rs`).
+  Also note z.ai's base URL is `https://api.z.ai/api/anthropic/**v1**` — plank
+  appends `/messages` itself, so the `/v1` segment must be in `--base-url`.
 - **Raw-DSML display is not parity territory.** The C agent dumps the
   rejected stanza's raw bytes on a parse error; plank deliberately diverges
   and suppresses them (issue #11) — only the bold-red
