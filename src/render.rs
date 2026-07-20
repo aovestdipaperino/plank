@@ -1,6 +1,6 @@
 //! Assistant markdown rendering: streaming terminal renderer for model output.
 //!
-//! Port of the "Assistant Markdown Rendering" section of `ds4-ref/ds4_agent.c`.
+//! Port of the "Assistant Markdown Rendering" section of `refs/ds4/ds4_agent.c`.
 //! The renderer handles only the cheap markdown cues that make terminal output
 //! readable: `**bold**`, `*italic*`, inline code, and fenced code blocks with a
 //! kilo-style keyword highlighter. It is a streaming parser, so it buffers only

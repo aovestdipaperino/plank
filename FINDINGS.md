@@ -12,7 +12,7 @@ parts:
 
 The enforcement mechanism for part 1 is `tests/c_parity.rs`: committed
 fixtures under `tests/fixtures/` are byte-compared on every `cargo test`, and
-when the `ds4-ref` submodule is checked out the C string constants are decoded
+when the `refs/ds4` submodule is checked out the C string constants are decoded
 straight out of `ds4_agent.c` and compared too, so the fixtures cannot drift
 from the reference. Regenerate fixtures with `PLANK_REGEN_FIXTURES=1 cargo
 test` and review the diff before committing.

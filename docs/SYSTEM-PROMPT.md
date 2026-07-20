@@ -37,7 +37,7 @@ plain content — which is why they must stay separable (see the
 
 The bytes matter because the DeepSeek V4 Flash model was trained on the C
 agent's exact prompt. `tests/c_parity.rs` compares the Rust constants against
-committed fixtures and, when the `ds4-ref` submodule is present, against the C
+committed fixtures and, when the `refs/ds4` submodule is present, against the C
 source itself.
 
 ### The dynamic context (`context.rs`)

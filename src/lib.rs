@@ -1,7 +1,7 @@
 //! Plank: a Rust port of the ds4 agent.
 //!
 //! The port proceeds functionality-by-functionality from the C reference in
-//! `ds4-ref/ds4_agent.c`, not line-by-line. Each module maps to one functional
+//! `refs/ds4/ds4_agent.c`, not line-by-line. Each module maps to one functional
 //! section of the original agent.
 
 pub mod agents;

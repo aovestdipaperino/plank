@@ -1,7 +1,7 @@
 //! Terminal line editor with a status footer, ported from the ds4 agent.
 //!
 //! This is a faithful-but-tractable port of the linenoise-derived editor in
-//! `ds4-ref/ds4_agent.c` ("Terminal Prompt, Status Footer, And Async Output
+//! `refs/ds4/ds4_agent.c` ("Terminal Prompt, Status Footer, And Async Output
 //! Rendering"). The pure pieces (line buffer, history ring, completion
 //! cycling, paste-marker stripping) are plain data structures testable
 //! without a TTY; only [`Editor`] touches the terminal.

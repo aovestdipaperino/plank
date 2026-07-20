@@ -1,7 +1,7 @@
 //! Agent configuration and command-line parsing.
 //!
 //! Ports the "Small Utilities And Command-Line Parsing" section of the C
-//! reference (`ds4-ref/ds4_agent.c`): the `agent_config` struct, option
+//! reference (`refs/ds4/ds4_agent.c`): the `agent_config` struct, option
 //! parsing, numeric parsing helpers, and slash-command recognition. Unlike
 //! the C code, parse failures return `Err` instead of exiting the process.
 //! Distributed-mode options are not ported (plank is single-machine).

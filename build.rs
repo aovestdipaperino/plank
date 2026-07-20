@@ -1,4 +1,4 @@
-//! Builds the ds4 C engine from the `ds4-ref` submodule on macOS.
+//! Builds the ds4 C engine from the `refs/ds4` submodule on macOS.
 //!
 //! Produces `libds4core.a` from the Metal-backend objects and links the
 //! required frameworks. On other platforms (or if the submodule is missing)
@@ -14,9 +14,9 @@ fn main() {
         return;
     }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let ds4 = Path::new(&manifest).join("ds4-ref");
+    let ds4 = Path::new(&manifest).join("refs/ds4");
     if !ds4.join("ds4.c").exists() {
-        println!("cargo:warning=ds4-ref submodule missing; building without the ds4 engine");
+        println!("cargo:warning=refs/ds4 submodule missing; building without the ds4 engine");
         return;
     }
     let objs = ["ds4.o", "ds4_distributed.o", "ds4_ssd.o", "ds4_metal.o"];

@@ -110,7 +110,7 @@ jobs:
             # The engine compiles its Metal kernels from source at model load;
             # the binary falls back to ../share/plank/metal relative to itself
             # when the compile-time path (the CI checkout) is gone.
-            cp ds4-ref/metal/*.metal "$NAME/$VERSION/share/plank/metal/"
+            cp refs/ds4/metal/*.metal "$NAME/$VERSION/share/plank/metal/"
             tar czf "$NAME-$VERSION.$BOTTLE_TAG.bottle.tar.gz" "$NAME/"
           done
 
@@ -198,9 +198,9 @@ jobs:
             def install
               system "cargo", "install", *std_cargo_args
               # Metal kernel sources are only present when building from a
-              # checkout with the ds4-ref submodule; the GitHub source tarball
+              # checkout with the refs/ds4 submodule; the GitHub source tarball
               # lacks them (EchoEngine-only build).
-              (pkgshare/"metal").install Dir["ds4-ref/metal/*.metal"] unless Dir["ds4-ref/metal/*.metal"].empty?
+              (pkgshare/"metal").install Dir["refs/ds4/metal/*.metal"] unless Dir["refs/ds4/metal/*.metal"].empty?
             end
 
             test do

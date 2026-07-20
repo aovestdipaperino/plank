@@ -6,7 +6,7 @@ line-by-line translation: each C section became an idiomatic Rust module with
 its own tests, while preserving the model-facing behavior (prompt shape, tool
 protocol, output formats) that the model was trained on.
 
-The C reference lives in the `ds4-ref` git submodule and is the source of truth
+The C reference lives in the `refs/ds4` git submodule and is the source of truth
 for wire formats and prompt text.
 
 ## Design principles
@@ -46,7 +46,7 @@ flowchart TD
     agent --> engine
     engine --> ds4
     engine --> echo
-    ds4 --> cengine[(ds4-ref C engine<br/>Metal)]
+    ds4 --> cengine[(refs/ds4 C engine<br/>Metal)]
 ```
 
 ## The turn lifecycle
@@ -247,7 +247,7 @@ a proper full-screen app rather than reflowing it.
 
 ## Build
 
-`build.rs` compiles the ds4 C engine from the `ds4-ref` submodule on macOS
+`build.rs` compiles the ds4 C engine from the `refs/ds4` submodule on macOS
 (Metal objects → `libds4core.a`), links Foundation + Metal, and emits the
 `ds4_engine` cfg. Off macOS, or without the submodule, the cfg is absent and
 plank builds with the `EchoEngine` only. The Metal kernel directory is baked in

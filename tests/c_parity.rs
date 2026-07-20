@@ -1,14 +1,14 @@
-//! Byte-diff parity tests against the `ds4-ref` C reference.
+//! Byte-diff parity tests against the `refs/ds4` C reference.
 //!
 //! The model was trained on the C agent's exact bytes, so the wire-facing
 //! text (tools prompt, DSML syntax, tool-result framing) must stay
-//! byte-for-byte identical to `ds4-ref/ds4_agent.c`. Two layers enforce it:
+//! byte-for-byte identical to `refs/ds4/ds4_agent.c`. Two layers enforce it:
 //!
 //! 1. **Fixtures** (`tests/fixtures/`): committed snapshots of the reference
 //!    bytes, compared on every `cargo test` — including CI checkouts without
 //!    the submodule. Regenerate with `PLANK_REGEN_FIXTURES=1 cargo test`,
 //!    then review the diff before committing.
-//! 2. **The C source itself**: when the `ds4-ref` submodule is present, the
+//! 2. **The C source itself**: when the `refs/ds4` submodule is present, the
 //!    named C string constants are decoded straight out of `ds4_agent.c` and
 //!    compared, so the fixtures cannot silently drift from the reference.
 //!
@@ -184,7 +184,7 @@ fn tool_result_framing_matches_reference() {
 
 fn c_source() -> Option<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("ds4-ref")
+        .join("refs/ds4")
         .join("ds4_agent.c");
     std::fs::read_to_string(path).ok()
 }
@@ -251,7 +251,7 @@ fn extract_c_string_constant(src: &str, name: &str) -> String {
 #[test]
 fn tools_prompt_matches_c_source() {
     let Some(src) = c_source() else {
-        eprintln!("ds4-ref submodule absent; skipping source-layer parity check");
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
         return;
     };
     let mut expected = extract_c_string_constant(&src, "agent_tools_prompt_intro");
@@ -273,7 +273,7 @@ fn tools_prompt_matches_c_source() {
 #[test]
 fn dsml_reminder_matches_c_source() {
     let Some(src) = c_source() else {
-        eprintln!("ds4-ref submodule absent; skipping source-layer parity check");
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
         return;
     };
     let expected = extract_c_string_constant(&src, "agent_dsml_syntax_reminder");
@@ -287,7 +287,7 @@ fn dsml_reminder_matches_c_source() {
 #[test]
 fn tool_result_header_format_matches_c_source() {
     let Some(src) = c_source() else {
-        eprintln!("ds4-ref submodule absent; skipping source-layer parity check");
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
         return;
     };
     // The C frames each result with snprintf("Tool result %d (%s):\n", …) and

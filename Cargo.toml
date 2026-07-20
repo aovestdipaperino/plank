@@ -8,7 +8,7 @@ description = "Rust port of the ds4 agent (macOS only)"
 license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
-exclude = ["assets/*", "ds4-ref/*", "*.gguf", "ds4flash.gguf"]
+exclude = ["assets/*", "refs/ds4/*", "*.gguf", "ds4flash.gguf"]
 
 [features]
 # Image pasting (Cmd-V clipboard images, image file paths) is disabled until

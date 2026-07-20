@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What plank is
 
-A Rust port of the `ds4_agent` C reference (an interactive coding agent for the DeepSeek V4 Flash model), ported functionality-by-functionality — each C section became an idiomatic Rust module with its own tests. The C reference lives in the `ds4-ref` git submodule and is the **source of truth for wire formats and prompt text**: tool output framing, the DSML tool-call syntax, and the system prompt must stay byte-for-byte identical to the C, because that's what the model was trained on. `tests/c_parity.rs` enforces this against committed fixtures (and against the C source when the submodule is present); regenerate fixtures with `PLANK_REGEN_FIXTURES=1 cargo test`. Hard-won parity and tooling gotchas are cataloged in `FINDINGS.md` — check it before re-deriving a quirk, and add to it when you pin down a new one. Beware: a `\`-continued Rust string literal strips the next line's leading whitespace — never use continued literals for model-facing text with indentation. macOS only for real inference (Metal).
+A Rust port of the `ds4_agent` C reference (an interactive coding agent for the DeepSeek V4 Flash model), ported functionality-by-functionality — each C section became an idiomatic Rust module with its own tests. The C reference lives in the `refs/ds4` git submodule and is the **source of truth for wire formats and prompt text**: tool output framing, the DSML tool-call syntax, and the system prompt must stay byte-for-byte identical to the C, because that's what the model was trained on. `tests/c_parity.rs` enforces this against committed fixtures (and against the C source when the submodule is present); regenerate fixtures with `PLANK_REGEN_FIXTURES=1 cargo test`. Hard-won parity and tooling gotchas are cataloged in `FINDINGS.md` — check it before re-deriving a quirk, and add to it when you pin down a new one. Beware: a `\`-continued Rust string literal strips the next line's leading whitespace — never use continued literals for model-facing text with indentation. macOS only for real inference (Metal).
 
 ## Commands
 
 ```sh
-cargo build                 # debug build (builds the C engine via build.rs when ds4-ref is present)
+cargo build                 # debug build (builds the C engine via build.rs when refs/ds4 is present)
 cargo test --lib            # unit tests — no model needed, pure logic + EchoEngine
 cargo test --lib <name>     # single test by substring filter
 cargo fmt
@@ -18,7 +18,7 @@ cargo clippy --workspace --all-targets -- -D warnings   # CI gate; pedantic + pe
 
 The pre-commit hook runs `cargo fmt` and the clippy command above (with `-D warnings`, same as CI); fix warnings rather than allowing them. Note clippy only re-lints crates it recompiles, so a cached "clean" run can miss warnings in untouched files — CI compiles fresh, so trust the hook/CI over an incremental local run.
 
-- **With the `ds4-ref` submodule present** (macOS): `build.rs` compiles `libds4core.a`, links Foundation/Metal, and emits the `ds4_engine` cfg. Real inference needs a GGUF model (see `download_model.sh` in `ds4-ref`).
+- **With the `refs/ds4` submodule present** (macOS): `build.rs` compiles `libds4core.a`, links Foundation/Metal, and emits the `ds4_engine` cfg. Real inference needs a GGUF model (see `download_model.sh` in `refs/ds4`).
 - **Without it**: plank still builds and tests, using only the `EchoEngine` stub — this is the normal dev/CI path. Code touching the native engine must be gated with `#[cfg(ds4_engine)]`.
 
 ## Architecture

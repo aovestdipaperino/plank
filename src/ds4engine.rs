@@ -1,6 +1,6 @@
 //! Safe wrapper around the ds4 C engine implementing [`Engine`].
 //!
-//! Present only under the `ds4_engine` cfg (macOS + built `ds4-ref` submodule).
+//! Present only under the `ds4_engine` cfg (macOS + built `refs/ds4` submodule).
 //! The transcript arriving from the UI is plain role-tagged text; this wrapper
 //! reparses it into ds4 chat-template tokens, prefills a session, and samples.
 //!
@@ -1310,7 +1310,7 @@ mod tests {
     //
     // Requires a loaded model, so it is gated on `ds4_engine` and skips unless
     // PLANK_TEST_MODEL points at a GGUF. It will only run on a Metal box with
-    // the `ds4-ref` submodule built.
+    // the `refs/ds4` submodule built.
     #[cfg(ds4_engine)]
     #[test]
     fn aside_snapshot_roundtrip_lossless() {
