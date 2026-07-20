@@ -27,7 +27,10 @@ pub struct AtToken {
 /// (a shell escape, not a prompt) or when no such `@` is present.
 #[must_use]
 pub fn detect_at_token(left: &str) -> Option<AtToken> {
-    if left.starts_with('!') {
+    // Only the *current* line matters: with the multiline prompt, a first line
+    // starting `!` must not suppress completion on every later line.
+    let line = left.rsplit('\n').next().unwrap_or(left);
+    if line.starts_with('!') {
         return None;
     }
     let at = left.rfind('@')?;
@@ -135,9 +138,39 @@ fn score_one(query: &str, text: &str) -> Option<i32> {
     Some(score)
 }
 
+/// Normalises a user-typed path query against the repo-relative index.
+///
+/// The index stores repo-relative paths, so an explicit `./` or `~/` prefix
+/// would otherwise fail the subsequence test and empty the popup. `./` is
+/// stripped. `~/` is expanded against `$HOME`; when the expansion cannot be
+/// made relative to the current directory (the only frame the index shares),
+/// it degrades to the repo-relative remainder rather than matching nothing.
+#[must_use]
+pub fn normalize_query(query: &str) -> String {
+    if let Some(rest) = query.strip_prefix("./") {
+        return rest.to_string();
+    }
+    if query == "." || query == "~" {
+        return String::new();
+    }
+    let Some(rest) = query.strip_prefix("~/") else {
+        return query.to_string();
+    };
+    if let Some(home) = std::env::var_os("HOME") {
+        let abs = PathBuf::from(home).join(rest);
+        if let Ok(cwd) = std::env::current_dir()
+            && let Ok(rel) = abs.strip_prefix(&cwd)
+        {
+            return rel.to_string_lossy().into_owned();
+        }
+    }
+    rest.to_string()
+}
+
 /// Ranks `cands` against `query`, best first, truncated to `limit`.
 #[must_use]
 pub fn rank(query: &str, cands: &[Candidate], limit: usize) -> Vec<Match> {
+    let query = &normalize_query(query);
     let mut out: Vec<Match> = cands
         .iter()
         .filter_map(|c| {
@@ -266,6 +299,8 @@ pub struct FileIndex {
     signature: u64,
     last_refresh: Option<Instant>,
     last_git_mtime: Option<SystemTime>,
+    /// Cached `is_git_repo(root)`; probing it costs a subprocess per call.
+    is_git: bool,
 }
 
 impl FileIndex {
@@ -276,7 +311,8 @@ impl FileIndex {
     /// [`FileIndex::fold_untracked`].
     #[must_use]
     pub fn build(root: &Path, respect_gitignore: bool) -> Self {
-        let paths: BTreeSet<String> = if is_git_repo(root) {
+        let is_git = is_git_repo(root);
+        let paths: BTreeSet<String> = if is_git {
             lines_from(root, "git", &["ls-files", "--recurse-submodules"])
                 .into_iter()
                 .collect()
@@ -296,6 +332,7 @@ impl FileIndex {
             signature: 0,
             last_refresh: None,
             last_git_mtime: None,
+            is_git,
         };
         idx.rebuild_candidates();
         idx
@@ -305,7 +342,7 @@ impl FileIndex {
     ///
     /// Honours `.gitignore` when `respect_gitignore` is set.
     pub fn fold_untracked(&mut self, root: &Path, respect_gitignore: bool) {
-        if !is_git_repo(root) {
+        if !self.is_git {
             return;
         }
         let mut args = vec!["ls-files", "--others"];
@@ -889,6 +926,39 @@ mod tests {
         assert_eq!(t.start, 5);
         assert_eq!(t.query, "two wor");
         assert!(t.quoted);
+    }
+
+    #[test]
+    fn shell_escape_only_suppresses_its_own_line() {
+        // Multiline prompt: a first line starting `!` must not disable `@`
+        // completion for every later line.
+        let t = detect_at_token("!ls\n@src").expect("second line completes");
+        assert_eq!(t.query, "src");
+        assert!(detect_at_token("hello\n!ls @src").is_none());
+    }
+
+    #[test]
+    fn a_dot_slash_query_matches_repo_relative_paths() {
+        let c = vec![file("src/complete.rs"), file("Cargo.toml")];
+        let m = rank("./src", &c, 15);
+        assert!(
+            m.iter().any(|r| r.text == "src/complete.rs"),
+            "`@./src` must not return an empty popup: {m:?}"
+        );
+    }
+
+    #[test]
+    fn a_tilde_query_expands_against_home() {
+        // Expansion lands outside the index root here, so it degrades to the
+        // repo-relative remainder rather than matching nothing.
+        let c = vec![file("src/complete.rs")];
+        let m = rank("~/src/complete.rs", &c, 15);
+        assert!(
+            m.iter().any(|r| r.text == "src/complete.rs"),
+            "`@~/` must not return an empty popup: {m:?}"
+        );
+        assert_eq!(normalize_query("~/"), "");
+        assert_eq!(normalize_query("./a/b"), "a/b");
     }
 
     #[test]
