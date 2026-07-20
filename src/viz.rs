@@ -1202,6 +1202,29 @@ mod tests {
     }
 
     #[test]
+    fn provider_explicit_think_tags_route_correctly() {
+        // Provider engines do NOT begin_in_think: their translator emits its own
+        // <think>/</think> tags around reasoning. A turn that opens, reasons, and
+        // closes must route cleanly, and — the regression that turned visible
+        // output gray — a turn with NO reasoning must stay fully visible.
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<think>reasoning here</think>");
+        sr.push("visible answer");
+        sr.finish();
+        assert!(sr.sink().think.contains("reasoning here"));
+        assert!(!sr.sink().think.contains("visible answer"));
+        assert!(sr.sink().visible.contains("visible answer"));
+
+        // No reasoning at all: content is emitted directly and stays visible
+        // (with begin_in_think this would have been misclassified as thinking).
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("just an answer, no thinking");
+        sr.finish();
+        assert_eq!(sr.sink().visible, "just an answer, no thinking");
+        assert_eq!(sr.sink().think, "");
+    }
+
+    #[test]
     fn prose_passes_through() {
         for sr in [run_chunked("Hello, world."), run_charwise("Hello, world.")] {
             assert_eq!(sr.sink().visible, "Hello, world.");

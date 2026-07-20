@@ -591,6 +591,23 @@ impl SseTranslator for AnthropicTranslator {
 /// `serde_json` prints in full. Some Anthropic-compatible gateways (e.g. z.ai)
 /// reject more than two decimal places, so we round and emit a tidy value.
 /// Two decimals is ample precision for `temperature`/`top_p`.
+/// Whether a `ureq` send error is a transient connection-setup failure worth
+/// retrying (a stale pooled socket dropped by the server before any response).
+/// A real HTTP status (`Error::StatusCode`) or any other class is not retried.
+fn is_transient_send_error(e: &ureq::Error) -> bool {
+    match e {
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::UnexpectedEof
+        ),
+        _ => false,
+    }
+}
+
 fn round2(x: f32) -> serde_json::Value {
     let v = (f64::from(x) * 100.0).round() / 100.0;
     serde_json::json!(v)
@@ -944,18 +961,42 @@ impl Engine for ProviderEngine {
         }));
 
         let url = format!("{}{}", self.base_url, self.endpoint());
-        let request = ureq::post(&url).header("Content-Type", "application/json");
-        let request = match self.kind {
-            ProviderKind::OpenAi => {
-                request.header("Authorization", format!("Bearer {}", self.api_key))
+        // A pooled keep-alive connection can be closed by the server between
+        // turns; the reuse then fails on write with a broken pipe / reset before
+        // any response is read. The write never reached the server, so retrying
+        // on a fresh connection is safe (and only these connection-setup errors
+        // are retried — never a real HTTP status or a mid-stream failure).
+        let mut resp = None;
+        let mut last_err = None;
+        for attempt in 0..=2 {
+            let request = ureq::post(&url).header("Content-Type", "application/json");
+            let request = match self.kind {
+                ProviderKind::OpenAi => {
+                    request.header("Authorization", format!("Bearer {}", self.api_key))
+                }
+                ProviderKind::Anthropic => request
+                    .header("x-api-key", self.api_key.as_str())
+                    .header("anthropic-version", "2023-06-01"),
+            };
+            match request.send(payload.as_str()) {
+                Ok(r) => {
+                    resp = Some(r);
+                    break;
+                }
+                Err(e) if attempt < 2 && is_transient_send_error(&e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                }
+                Err(e) => return Err(EngineError::new(format!("provider request: {e}"))),
             }
-            ProviderKind::Anthropic => request
-                .header("x-api-key", self.api_key.as_str())
-                .header("anthropic-version", "2023-06-01"),
+        }
+        let Some(mut resp) = resp else {
+            let msg = last_err.map_or_else(
+                || "provider request: connection failed".to_string(),
+                |e| format!("provider request: {e}"),
+            );
+            return Err(EngineError::new(msg));
         };
-        let mut resp = request
-            .send(payload.as_str())
-            .map_err(|e| EngineError::new(format!("provider request: {e}")))?;
 
         let mut translator = self.translator();
         let mut interrupted = false;

@@ -461,13 +461,17 @@ impl Agent<'_> {
         };
         let mut stream = StreamRenderer::new(sink);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
-        // With thinking enabled, the chat template opens `<think>` in the
-        // prefill prefix, so generation streams thinking content first; start
-        // the renderer inside the think block so it renders gray until `</think>`.
+        // With thinking enabled, the *local* chat template opens `<think>` in
+        // the prefill prefix, so generation streams thinking content first
+        // without a leading tag; start the renderer inside the think block so it
+        // renders gray until `</think>`. Provider engines are excluded: their
+        // translator emits explicit `<think>`/`</think>` tags, so pre-opening
+        // here would mis-color any output not preceded by a reasoning delta.
         if !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
-        ) {
+        ) && !self.engine.wants_structured()
+        {
             stream.begin_in_think();
         }
         let mut assistant_text = String::new();
@@ -2547,10 +2551,14 @@ impl Agent<'_> {
         }
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
+        // Local engines open `<think>` implicitly in the prefill; provider
+        // engines emit explicit tags, so only pre-open for local ones (see the
+        // matching note in the plain-REPL path).
         if !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
-        ) {
+        ) && !self.engine.wants_structured()
+        {
             stream.begin_in_think();
         }
         // Set when a mid-stream preflight fails: stops the engine early, but
