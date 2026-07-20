@@ -438,17 +438,23 @@ impl Default for OutputView {
 /// Theme green, used for the prompt separator rule and panel accents.
 const THEME_GREEN: Color = Color::Indexed(114);
 
-/// Splits `area` into `(output, input, status)` rows. When `has_prompt`, a
+/// Splits `area` into `(output, input, status)` rows, giving the input
+/// `input_rows` rows. When `has_prompt`, a
 /// one-row green rule is inserted just above the input line (and drawn here),
 /// separating the scrollback from the resting prompt; while the agent is busy
 /// (no prompt) the rule is omitted.
-fn frame_rows(frame: &mut Frame, area: Rect, has_prompt: bool) -> (Rect, Rect, Rect) {
+fn frame_rows(
+    frame: &mut Frame,
+    area: Rect,
+    has_prompt: bool,
+    input_rows: u16,
+) -> (Rect, Rect, Rect) {
     if has_prompt {
         let r = Layout::vertical([
-            Constraint::Min(1),    // output
-            Constraint::Length(1), // separator rule
-            Constraint::Length(1), // input
-            Constraint::Length(1), // status
+            Constraint::Min(1),             // output
+            Constraint::Length(1),          // separator rule
+            Constraint::Length(input_rows), // input
+            Constraint::Length(1),          // status
         ])
         .split(area);
         let rule = "─".repeat(r[1].width as usize);
@@ -505,9 +511,77 @@ fn input_spans(input: &str) -> Vec<Span<'static>> {
     vec![Span::raw(input.to_string())]
 }
 
+/// Horizontal scroll offset for the input line, in display columns.
+///
+/// The prompt glyph is always drawn, so the text gets `width - prompt_width`
+/// cells. When the cursor would fall past the last usable column, the view
+/// scrolls just far enough to keep the cursor (and thus the freshly typed
+/// character) on screen.
+fn input_scroll(cursor_col: u16, row_width: u16, prompt_width: u16) -> u16 {
+    let avail = row_width.saturating_sub(prompt_width);
+    if avail == 0 {
+        return cursor_col;
+    }
+    cursor_col.saturating_sub(avail.saturating_sub(1))
+}
+
+/// Number of rows the prompt needs for `input` — one per embedded newline.
+///
+/// The input area grows with the text, taking rows away from the scrollback.
+#[must_use]
+pub fn input_height(input: &str) -> u16 {
+    u16::try_from(input.matches('\n').count() + 1).unwrap_or(u16::MAX)
+}
+
+/// Draws the prompt glyph and the (possibly multi-line) input text into
+/// `input_area`, placing the terminal cursor at `cursor` = `(row, col)`.
+///
+/// Rows after the first are indented under the prompt, and every row shares
+/// the cursor row's horizontal scroll so a long line stays visible.
+fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, u16)) {
+    let prompt = crate::status::prompt_text();
+    let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
+    let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
+    let prompt_row = Rect {
+        height: 1,
+        ..input_area
+    };
+    frame.render_widget(Paragraph::new(Line::from(vec![prompt_span])), prompt_row);
+
+    // Only the first line can be a slash command or a `!` shell escape, so the
+    // continuation lines render plain.
+    let lines: Vec<Line<'static>> = input
+        .split('\n')
+        .enumerate()
+        .map(|(i, l)| {
+            if i == 0 {
+                Line::from(input_spans(l))
+            } else {
+                Line::raw(l.to_string())
+            }
+        })
+        .collect();
+
+    let (cursor_row, cursor_col) = cursor;
+    let scroll = input_scroll(cursor_col, input_area.width, prompt_width);
+    let text_area = Rect {
+        x: input_area.x + prompt_width,
+        y: input_area.y,
+        width: input_area.width.saturating_sub(prompt_width),
+        height: input_area.height,
+    };
+    frame.render_widget(Paragraph::new(lines).scroll((0, scroll)), text_area);
+
+    let cursor_x = text_area.x + cursor_col.saturating_sub(scroll);
+    frame.set_cursor_position(Position::new(
+        cursor_x.min(input_area.right().saturating_sub(1)),
+        input_area.y + cursor_row.min(input_area.height.saturating_sub(1)),
+    ));
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
-/// `input` is the current prompt text and `cursor_col` its display column.
+/// `input` is the current prompt text and `cursor` its `(row, col)` position.
 /// `input` is `None` while the agent is busy (prefill/generation): the prompt
 /// line renders empty and the cursor stays hidden until input is accepted again.
 /// `view` is the scroll state; it is clamped in place to the scrollable range
@@ -516,30 +590,20 @@ pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
     input: Option<&str>,
-    cursor_col: u16,
+    cursor: (u16, u16),
     status: &str,
     view: &mut OutputView,
     selection: Option<Selection>,
 ) {
     let area = frame.area();
-    let (output, input_row, status_row) = frame_rows(frame, area, input.is_some());
+    let (output, input_row, status_row) =
+        frame_rows(frame, area, input.is_some(), input.map_or(1, input_height));
 
     render_output(frame, output, log, view, selection);
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
-        let prompt = crate::status::prompt_text();
-        let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
-        let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
-        let mut spans = vec![prompt_span];
-        spans.extend(input_spans(input));
-        let input_line = Line::from(spans);
-        frame.render_widget(Paragraph::new(input_line), input_row);
-        let cursor_x = input_row.x + prompt_width + cursor_col;
-        frame.set_cursor_position(Position::new(
-            cursor_x.min(area.right().saturating_sub(1)),
-            input_row.y,
-        ));
+        render_input(frame, input_row, input, cursor);
     }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
@@ -598,14 +662,15 @@ pub fn draw_btw_split(
     btw_log: &OutputLog,
     btw_view: &mut OutputView,
     input: Option<&str>,
-    cursor_col: u16,
+    cursor: (u16, u16),
     status: &str,
     view: &mut OutputView,
 ) {
     use ratatui::widgets::{Block, Borders};
 
     let area = frame.area();
-    let (output, input_row, status_row) = frame_rows(frame, area, input.is_some());
+    let (output, input_row, status_row) =
+        frame_rows(frame, area, input.is_some(), input.map_or(1, input_height));
     let cols =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(output);
 
@@ -628,18 +693,7 @@ pub fn draw_btw_split(
 
     // Input line and status bar span the full width, identical to `draw`.
     if let Some(input) = input {
-        let prompt = crate::status::prompt_text();
-        let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
-        let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
-        let mut spans = vec![prompt_span];
-        spans.extend(input_spans(input));
-        let input_line = Line::from(spans);
-        frame.render_widget(Paragraph::new(input_line), input_row);
-        let cursor_x = input_row.x + prompt_width + cursor_col;
-        frame.set_cursor_position(Position::new(
-            cursor_x.min(area.right().saturating_sub(1)),
-            input_row.y,
-        ));
+        render_input(frame, input_row, input, cursor);
     }
     let status_style = Style::default()
         .bg(Color::Indexed(238))
@@ -831,6 +885,24 @@ mod tests {
     }
 
     #[test]
+    fn input_height_is_one_row_per_line() {
+        assert_eq!(input_height(""), 1);
+        assert_eq!(input_height("one line"), 1);
+        assert_eq!(input_height("two\nlines"), 2);
+        // A trailing newline opens a new (empty) row to type on.
+        assert_eq!(input_height("trailing\n"), 2);
+    }
+
+    #[test]
+    fn input_scroll_holds_still_until_the_cursor_leaves_the_row() {
+        // 20 columns, a 2-wide prompt: 18 usable, last is column 17.
+        assert_eq!(input_scroll(0, 20, 2), 0);
+        assert_eq!(input_scroll(17, 20, 2), 0);
+        assert_eq!(input_scroll(18, 20, 2), 1);
+        assert_eq!(input_scroll(30, 20, 2), 13);
+    }
+
+    #[test]
     fn ansi_to_lines_parses_truecolor_cells() {
         // Two cells (bg red '▄', bg green ' ') then newline.
         let art = "\x1b[48;2;255;0;0m▄\x1b[48;2;0;255;0m \x1b[m\n";
@@ -981,7 +1053,7 @@ mod tests {
 
         // Prompt visible: a green ─ rule sits on the row directly above input.
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
-        term.draw(|f| draw(f, &log, Some("hi"), 2, "idle", &mut view, None))
+        term.draw(|f| draw(f, &log, Some("hi"), (0, 2), "idle", &mut view, None))
             .unwrap();
         let buf = term.backend().buffer();
         let prompt_y = input_row(buf).expect("prompt row present");
@@ -993,7 +1065,7 @@ mod tests {
         // Prompt hidden (agent busy): no rule — the row above the (empty)
         // input line is ordinary output, never the green ─.
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
-        term.draw(|f| draw(f, &log, None, 0, "generating", &mut view, None))
+        term.draw(|f| draw(f, &log, None, (0, 0), "generating", &mut view, None))
             .unwrap();
         let buf = term.backend().buffer();
         let has_rule = (0..buf.area.height).any(|y| {
@@ -1001,5 +1073,42 @@ mod tests {
             c.symbol() == "─" && c.style().fg == Some(THEME_GREEN)
         });
         assert!(!has_rule, "no separator while the prompt is hidden");
+    }
+
+    #[test]
+    fn multiline_input_renders_every_row_and_places_the_cursor() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        // Cursor sits at the end of the second line ("bb").
+        term.draw(|f| draw(f, &log, Some("aa\nbb"), (1, 2), "idle", &mut view, None))
+            .unwrap();
+
+        let buf = term.backend().buffer();
+        let prompt_y = input_row(buf).expect("prompt row present");
+        let row = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            row(prompt_y).contains("aa"),
+            "first line: {}",
+            row(prompt_y)
+        );
+        assert!(
+            row(prompt_y + 1).contains("bb"),
+            "second line: {}",
+            row(prompt_y + 1)
+        );
+        // The status bar was pushed down to make room; the cursor is on row 2
+        // of the input, indented past the prompt.
+        let (cx, cy) = term.get_cursor_position().unwrap().into();
+        assert_eq!(cy, prompt_y + 1);
+        let prompt_width = u16::try_from(Span::raw(crate::status::prompt_text()).width()).unwrap();
+        assert_eq!(cx, prompt_width + 2);
     }
 }

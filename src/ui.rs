@@ -15,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 
 use crate::compact;
@@ -1726,11 +1727,14 @@ impl TuiInput {
         }
     }
 
-    /// Display column of the cursor within the input text.
-    fn cursor_col(&self) -> u16 {
+    /// Cursor position within the input text as `(row, col)`, where `row`
+    /// counts embedded newlines and `col` is the display column on that row.
+    fn cursor_pos(&self) -> (u16, u16) {
         let text = self.buf.text();
-        let bytes = self.buf.cursor().min(text.len());
-        u16::try_from(text[..bytes].chars().count()).unwrap_or(u16::MAX)
+        let before = &text[..self.buf.cursor().min(text.len())];
+        let row = u16::try_from(before.matches('\n').count()).unwrap_or(u16::MAX);
+        let line = before.rsplit('\n').next().unwrap_or(before);
+        (row, u16::try_from(line.chars().count()).unwrap_or(u16::MAX))
     }
 
     /// Moves through history like the line editor (dir -1 = older).
@@ -1776,11 +1780,13 @@ impl Agent<'_> {
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             EnableMouseCapture,
-            EnableBracketedPaste
+            EnableBracketedPaste,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
         let result = self.tui_loop(&mut terminal);
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
+            PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             DisableMouseCapture
         );
@@ -1855,7 +1861,7 @@ impl Agent<'_> {
                             btw_log,
                             btw_view,
                             Some(input.buf.text()),
-                            input.cursor_col(),
+                            input.cursor_pos(),
                             &status,
                             &mut view,
                         );
@@ -1864,7 +1870,7 @@ impl Agent<'_> {
                             f,
                             &log,
                             Some(input.buf.text()),
-                            input.cursor_col(),
+                            input.cursor_pos(),
                             &status,
                             &mut view,
                             selection.map(|(a, b)| tui::normalize_selection(a, b)),
@@ -1944,7 +1950,7 @@ impl Agent<'_> {
                                     f,
                                     &log,
                                     Some(input.buf.text()),
-                                    input.cursor_col(),
+                                    input.cursor_pos(),
                                     &status,
                                     &mut view,
                                     Some(sel),
@@ -2063,6 +2069,20 @@ impl Agent<'_> {
                 // Esc while idle dismisses a `/btw` panel left open from an
                 // earlier turn (the only way it ever closes).
                 KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
+                // Shift+Enter inserts a newline instead of submitting.
+                // Terminals without the kitty keyboard protocol cannot
+                // report it, so Alt+Enter and Ctrl-J work everywhere.
+                KeyCode::Enter
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        || key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    input.hist_idx = None;
+                    input.buf.insert("\n");
+                }
+                KeyCode::Char('j') if ctrl => {
+                    input.hist_idx = None;
+                    input.buf.insert("\n");
+                }
                 KeyCode::Enter => {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
@@ -2071,7 +2091,7 @@ impl Agent<'_> {
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
-                    if !line.is_empty() {
+                    if !line.is_empty() && !line.contains('\n') {
                         input.history.add(&line);
                         input.history.save(&hist_path).ok();
                     }
@@ -2143,7 +2163,7 @@ impl Agent<'_> {
         let start = Instant::now();
         let mut interrupt = || {
             let status = format!("! {cmd} ({}s, Esc to stop)", start.elapsed().as_secs());
-            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, view, None));
+            let _ = terminal.draw(|f| tui::draw(f, log, None, (0, 0), &status, view, None));
             while event::poll(Duration::ZERO).unwrap_or(false) {
                 if let Ok(Event::Key(k)) = event::read()
                     && k.kind == KeyEventKind::Press
@@ -2213,7 +2233,8 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &line, &mut view, None));
+                    let _ =
+                        terminal.draw(|f| tui::draw(f, log, None, (0, 0), &line, &mut view, None));
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -2221,7 +2242,7 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, None, 0, &status, &mut view, None));
+            let _ = terminal.draw(|f| tui::draw(f, log, None, (0, 0), &status, &mut view, None));
         }
         Ok(())
     }
@@ -3280,7 +3301,7 @@ fn busy_ui_loop(
                         btw_log,
                         btw_view,
                         Some(input.buf.text()),
-                        input.cursor_col(),
+                        input.cursor_pos(),
                         &status_line,
                         view,
                     );
@@ -3289,7 +3310,7 @@ fn busy_ui_loop(
                         f,
                         log,
                         Some(input.buf.text()),
-                        input.cursor_col(),
+                        input.cursor_pos(),
                         &status_line,
                         view,
                         None,
@@ -3337,6 +3358,20 @@ fn busy_ui_loop(
                         } else {
                             input.buf.clear();
                         }
+                    }
+                    // Shift+Enter inserts a newline instead of submitting.
+                    // Terminals without the kitty keyboard protocol cannot
+                    // report it, so Alt+Enter and Ctrl-J work everywhere.
+                    KeyCode::Enter
+                        if key.modifiers.contains(KeyModifiers::SHIFT)
+                            || key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        input.hist_idx = None;
+                        input.buf.insert("\n");
+                    }
+                    KeyCode::Char('j') if ctrl => {
+                        input.hist_idx = None;
+                        input.buf.insert("\n");
                     }
                     KeyCode::Enter => {
                         let line = input.buf.text().trim().to_owned();
