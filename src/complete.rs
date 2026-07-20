@@ -6,6 +6,9 @@ use std::process::Command;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::editor::LineBuffer;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+
 /// A `@`-prefixed completion token found to the left of the cursor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AtToken {
@@ -474,9 +477,298 @@ impl IndexWorker {
     }
 }
 
+/// Wraps `text` in double quotes when it contains whitespace.
+#[must_use]
+pub fn quote_if_needed(text: &str) -> String {
+    if text.contains(char::is_whitespace) {
+        format!("\"{text}\"")
+    } else {
+        text.to_string()
+    }
+}
+
+/// What the caller should do after [`Popup::handle_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopupAction {
+    /// The popup handled the key and stays open.
+    Consumed,
+    /// The popup handled the key and should now be closed.
+    Dismissed,
+    /// Not a popup key; run the caller's normal binding.
+    Passthrough,
+}
+
+/// Open suggestion popup state.
+#[derive(Debug)]
+pub struct Popup {
+    token: AtToken,
+    rows: Vec<Match>,
+    selected: usize,
+    generation: u64,
+}
+
+impl Popup {
+    /// Opens a popup for `token` with no rows yet.
+    #[must_use]
+    pub fn new(token: AtToken) -> Self {
+        Self {
+            token,
+            rows: Vec::new(),
+            selected: 0,
+            generation: 1,
+        }
+    }
+
+    /// The generation of the query currently in flight.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Retargets the popup at `token` and returns the new generation to query
+    /// with. Results stamped with any earlier generation are then discarded.
+    pub fn bump_generation(&mut self, token: AtToken) -> u64 {
+        self.token = token;
+        self.generation = self.generation.wrapping_add(1);
+        self.generation
+    }
+
+    /// Applies a worker message. Returns false when the message was stale (or
+    /// not results) and nothing changed.
+    pub fn accept_msg(&mut self, msg: IndexMsg) -> bool {
+        let IndexMsg::Results { generation, rows } = msg else {
+            return false;
+        };
+        if generation != self.generation {
+            return false;
+        }
+        self.rows = rows;
+        self.selected = 0;
+        true
+    }
+
+    /// The rows currently displayed, capped at [`MAX_ROWS`] by the worker.
+    #[must_use]
+    pub fn rows(&self) -> &[Match] {
+        &self.rows
+    }
+
+    /// Index of the highlighted row.
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Replaces the `@` token in `buf` with `text`, plus `suffix`.
+    fn replace_token(&self, buf: &mut LineBuffer, text: &str, suffix: &str) {
+        let end = buf.cursor();
+        buf.replace_range(self.token.start, end, format!("{text}{suffix}"));
+    }
+
+    /// Handles one key while the popup is open.
+    ///
+    /// Tab inserts the longest common prefix and keeps the popup open. Enter
+    /// accepts the selection, replacing the whole token including the `@`; a
+    /// directory keeps the popup open for drill-down, anything else closes it
+    /// with exactly one trailing space. Esc dismisses without touching `buf`.
+    pub fn handle_key(&mut self, key: KeyEvent, buf: &mut LineBuffer) -> PopupAction {
+        match key.code {
+            KeyCode::Esc => PopupAction::Dismissed,
+            KeyCode::Up => {
+                self.selected = self.selected.saturating_sub(1);
+                PopupAction::Consumed
+            }
+            KeyCode::Down => {
+                if self.selected + 1 < self.rows.len() {
+                    self.selected += 1;
+                }
+                PopupAction::Consumed
+            }
+            KeyCode::Tab => {
+                let lcp = longest_common_prefix(&self.rows);
+                if lcp.is_empty() {
+                    return PopupAction::Consumed;
+                }
+                let quote = if self.token.quoted { "\"" } else { "" };
+                self.replace_token(buf, &format!("@{quote}{lcp}"), "");
+                PopupAction::Consumed
+            }
+            KeyCode::Enter => {
+                let Some(sel) = self.rows.get(self.selected) else {
+                    return PopupAction::Dismissed;
+                };
+                let (text, kind) = (sel.text.clone(), sel.kind);
+                if kind == Kind::Dir {
+                    // Keep the `@` and the popup so the user can drill down.
+                    let quote = if self.token.quoted { "\"" } else { "" };
+                    self.replace_token(buf, &format!("@{quote}{text}"), "");
+                    return PopupAction::Consumed;
+                }
+                self.replace_token(buf, &quote_if_needed(&text), " ");
+                PopupAction::Dismissed
+            }
+            _ => PopupAction::Passthrough,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::editor::LineBuffer;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn popup_with(rows: &[(&str, Kind)], token_text: &str) -> Popup {
+        let token = detect_at_token(token_text).expect("token");
+        let mut p = Popup::new(token);
+        let r#gen = p.generation();
+        p.accept_msg(IndexMsg::Results {
+            generation: r#gen,
+            rows: rows
+                .iter()
+                .map(|(t, k)| Match {
+                    text: (*t).to_string(),
+                    kind: *k,
+                    score: 0,
+                })
+                .collect(),
+        });
+        p
+    }
+
+    #[test]
+    fn stale_generation_results_are_dropped() {
+        let mut p = popup_with(&[("src/ui.rs", Kind::File)], "@ui");
+        let stale = p.generation().wrapping_sub(1);
+        let accepted = p.accept_msg(IndexMsg::Results {
+            generation: stale,
+            rows: vec![Match {
+                text: "STALE".to_string(),
+                kind: Kind::File,
+                score: 0,
+            }],
+        });
+        assert!(!accepted, "stale results must be rejected");
+        assert_eq!(p.rows()[0].text, "src/ui.rs");
+    }
+
+    #[test]
+    fn up_and_down_move_the_selection() {
+        let mut p = popup_with(
+            &[("a", Kind::File), ("b", Kind::File), ("c", Kind::File)],
+            "@x",
+        );
+        let mut buf = LineBuffer::new();
+        assert_eq!(p.selected(), 0);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Down), &mut buf),
+            PopupAction::Consumed
+        ));
+        assert_eq!(p.selected(), 1);
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Up), &mut buf),
+            PopupAction::Consumed
+        ));
+        assert_eq!(p.selected(), 0);
+        // Up at the top stays at the top.
+        p.handle_key(key(KeyCode::Up), &mut buf);
+        assert_eq!(p.selected(), 0);
+    }
+
+    #[test]
+    fn tab_inserts_the_longest_common_prefix_and_keeps_the_popup_open() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("@src/uti");
+        buf.move_end();
+        let mut p = popup_with(
+            &[("src/utils", Kind::File), ("src/utilities", Kind::File)],
+            "@src/uti",
+        );
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Tab), &mut buf),
+            PopupAction::Consumed
+        ));
+        assert_eq!(buf.text(), "@src/util");
+    }
+
+    #[test]
+    fn enter_replaces_the_token_including_the_at_and_adds_one_space() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("look at @ui");
+        buf.move_end();
+        let mut p = popup_with(&[("src/ui.rs", Kind::File)], "look at @ui");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter), &mut buf),
+            PopupAction::Dismissed
+        ));
+        assert_eq!(buf.text(), "look at src/ui.rs ");
+    }
+
+    #[test]
+    fn enter_on_a_directory_keeps_the_popup_open_with_a_trailing_slash() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("@src");
+        buf.move_end();
+        let mut p = popup_with(&[("src/", Kind::Dir)], "@src");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Enter), &mut buf),
+            PopupAction::Consumed
+        ));
+        assert_eq!(buf.text(), "@src/");
+    }
+
+    #[test]
+    fn enter_on_a_path_with_spaces_quotes_the_result() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("@\"two wor");
+        buf.move_end();
+        let mut p = popup_with(&[("two words.txt", Kind::File)], "@\"two wor");
+        p.handle_key(key(KeyCode::Enter), &mut buf);
+        assert_eq!(buf.text(), "\"two words.txt\" ");
+    }
+
+    #[test]
+    fn enter_inserts_an_mcp_resource_token_verbatim() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("@tolaria");
+        buf.move_end();
+        let mut p = popup_with(&[("tolaria:note://b", Kind::Resource)], "@tolaria");
+        p.handle_key(key(KeyCode::Enter), &mut buf);
+        assert_eq!(buf.text(), "tolaria:note://b ");
+    }
+
+    #[test]
+    fn esc_dismisses_and_leaves_the_text_untouched() {
+        let mut buf = LineBuffer::new();
+        buf.set_text("@src/ui");
+        buf.move_end();
+        let mut p = popup_with(&[("src/ui.rs", Kind::File)], "@src/ui");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Esc), &mut buf),
+            PopupAction::Dismissed
+        ));
+        assert_eq!(buf.text(), "@src/ui");
+    }
+
+    #[test]
+    fn other_keys_pass_through() {
+        let mut buf = LineBuffer::new();
+        let mut p = popup_with(&[("a", Kind::File)], "@a");
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char('x')), &mut buf),
+            PopupAction::Passthrough
+        ));
+    }
+
+    #[test]
+    fn quotes_only_when_the_path_has_a_space() {
+        assert_eq!(quote_if_needed("src/ui.rs"), "src/ui.rs");
+        assert_eq!(quote_if_needed("two words.txt"), "\"two words.txt\"");
+    }
 
     fn file(t: &str) -> Candidate {
         Candidate {
