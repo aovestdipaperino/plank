@@ -1722,6 +1722,11 @@ struct TuiInput {
     /// MCP resource candidates, snapshotted once by `tui_loop` and handed to
     /// the worker when it starts. Lives here so the free-function busy loop
     /// gets identical behavior without threading the agent through.
+    ///
+    /// NOTE: this is a snapshot frozen when the index worker starts (the first
+    /// `@` of the session) and is never refreshed — an MCP server that
+    /// connects later contributes no completion candidates for the rest of the
+    /// session.
     mcp_extra: Vec<crate::complete::Candidate>,
 }
 
@@ -1791,10 +1796,24 @@ impl TuiInput {
     /// Drains worker messages into the popup. Call once per event-loop tick.
     fn pump_popup(&mut self) {
         let Some(w) = &self.worker else { return };
+        let mut msgs = Vec::new();
         while let Some(msg) = w.try_recv() {
+            msgs.push(msg);
+        }
+        let mut refreshed = false;
+        for msg in msgs {
+            if matches!(msg, crate::complete::IndexMsg::Refreshed) {
+                refreshed = true;
+            }
             if let Some(p) = &mut self.popup {
                 p.accept_msg(msg);
             }
+        }
+        // The index changed under an open popup (the untracked fold or a
+        // rebuild landed): re-issue the current query so the list is not stale
+        // until the user happens to type another character.
+        if refreshed && self.popup.is_some() {
+            self.sync_popup();
         }
     }
 
@@ -1805,6 +1824,10 @@ impl TuiInput {
     /// its own binding for it.
     fn popup_key(&mut self, key: KeyEvent) -> bool {
         use crate::complete::PopupAction;
+        if self.popup.is_none() {
+            return false;
+        }
+        let before = self.buf.text().to_owned();
         let Some(popup) = self.popup.as_mut() else {
             return false;
         };
@@ -1817,7 +1840,13 @@ impl TuiInput {
                 true
             }
             PopupAction::Consumed => {
-                self.sync_popup();
+                // Re-sync only when the key actually edited the buffer (Tab,
+                // Enter-on-directory). Re-syncing after a pure selection key
+                // would re-issue the same query, and the worker's reply resets
+                // `selected` to 0 — cancelling the user's Up/Down.
+                if self.buf.text() != before {
+                    self.sync_popup();
+                }
                 true
             }
         }
@@ -4021,6 +4050,88 @@ mod tests {
         });
         input.popup = Some(p);
         input
+    }
+
+    /// Builds a `TuiInput` whose popup is open with several canned rows.
+    fn input_with_rows(text: &str, rows: &[&str]) -> TuiInput {
+        use crate::complete::{IndexMsg, Kind, Match, Popup, detect_at_token};
+        let mut input = TuiInput::new();
+        input.buf.set_text(text);
+        input.buf.move_end();
+        let mut p = Popup::new(detect_at_token(text).expect("token"));
+        let generation = p.generation();
+        p.accept_msg(IndexMsg::Results {
+            generation,
+            rows: rows
+                .iter()
+                .map(|t| Match {
+                    text: (*t).to_owned(),
+                    kind: Kind::File,
+                    score: 0,
+                })
+                .collect(),
+        });
+        input.popup = Some(p);
+        input
+    }
+
+    #[test]
+    fn arrow_selection_is_not_cancelled_by_a_re_query() {
+        // Regression: `popup_key` used to call `sync_popup()` for every
+        // Consumed key, re-issuing an identical query whose reply reset
+        // `selected` to 0 within one tick.
+        let mut input = input_with_rows("@a", &["a1.rs", "a2.rs", "a3.rs"]);
+        let before_gen = input.popup.as_ref().unwrap().generation();
+        assert!(input.popup_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+        assert_eq!(input.popup.as_ref().unwrap().selected(), 1);
+        assert_eq!(
+            input.popup.as_ref().unwrap().generation(),
+            before_gen,
+            "a pure selection key must not re-query"
+        );
+        assert!(input.worker.is_none(), "no worker started for Down");
+        input.pump_popup();
+        assert_eq!(
+            input.popup.as_ref().unwrap().selected(),
+            1,
+            "selection must survive a pump"
+        );
+    }
+
+    #[test]
+    fn a_buffer_mutating_popup_key_still_re_queries() {
+        // Tab rewrites the token, so the query genuinely changed.
+        let mut input = input_with_rows("@a", &["a1.rs", "a1x.rs"]);
+        let before_gen = input.popup.as_ref().unwrap().generation();
+        assert!(input.popup_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(input.buf.text(), "@a1");
+        assert!(input.popup.as_ref().unwrap().generation() > before_gen);
+        input.worker = None;
+    }
+
+    #[test]
+    fn a_refreshed_message_re_queries_the_open_popup() {
+        use crate::complete::IndexWorker;
+        let dir = std::env::temp_dir().join(format!("plank-ui-refresh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("ui.rs"), b"x").unwrap();
+        let mut input = input_with_rows("@ui", &["stale.rs"]);
+        let before_gen = input.popup.as_ref().unwrap().generation();
+        // The worker emits `Refreshed` once its untracked fold completes.
+        input.worker = Some(IndexWorker::spawn(dir.clone(), Vec::new(), true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            input.pump_popup();
+            if input.popup.as_ref().unwrap().generation() > before_gen {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Refreshed never triggered a re-query"
+            );
+            std::thread::yield_now();
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

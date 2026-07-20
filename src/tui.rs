@@ -551,7 +551,7 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
 ///
 /// Clears the region first so the scrollback underneath does not bleed
 /// through; the selected row is highlighted in the theme green.
-pub fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
+fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
     use ratatui::widgets::{Clear, List, ListItem, ListState, StatefulWidget};
     if area.height == 0 || popup.rows().is_empty() {
         return;
