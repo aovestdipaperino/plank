@@ -7,6 +7,7 @@
 pub mod agents;
 pub mod checkpoint;
 pub mod compact;
+pub mod complete;
 pub mod config;
 pub mod context;
 pub mod download;
