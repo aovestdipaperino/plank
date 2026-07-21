@@ -1947,7 +1947,7 @@ impl TuiInput {
     fn new() -> Self {
         Self {
             buf: LineBuffer::new(),
-            history: History::new(512),
+            history: History::new(crate::settings::active().ui.history_size),
             hist_idx: None,
             stash: String::new(),
             popup: None,
@@ -1993,7 +1993,7 @@ impl TuiInput {
             self.worker = Some(crate::complete::IndexWorker::spawn(
                 root,
                 self.mcp_extra.clone(),
-                crate::complete::respect_gitignore_setting(),
+                crate::settings::active().ui.respect_gitignore,
             ));
         }
         let query = token.query.clone();

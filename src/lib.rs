@@ -31,6 +31,7 @@ pub mod repro;
 pub mod sandbox;
 pub mod serve;
 pub mod session;
+pub mod settings;
 pub mod singleton;
 pub mod skills;
 pub mod snapshot;

@@ -314,8 +314,50 @@ impl Default for AgentConfig {
     }
 }
 
+impl AgentConfig {
+    /// Builds a config whose defaults come from `settings.json`.
+    ///
+    /// Only the keys the file is allowed to hold are consulted; an
+    /// unrecognised `engine.backend` is ignored rather than rejected, since a
+    /// settings file must never stop plank from starting.
+    #[must_use]
+    pub fn from_settings(s: &crate::settings::Settings) -> Self {
+        let mut c = Self::default();
+        c.model_path.clone_from(&s.engine.model);
+        if let Some(t) = s.engine.threads {
+            c.n_threads = t;
+        }
+        if let Some(b) = s.engine.backend.as_deref().and_then(parse_backend) {
+            c.backend = Some(b);
+        }
+        if let Some(p) = s.engine.power {
+            c.power_percent = p;
+        }
+        if let Some(ctx) = s.engine.ctx {
+            c.generation.ctx_size = ctx;
+        }
+        c.sandbox_override = s.safety.sandbox;
+        if let Some(b) = s.safety.btw_suspend {
+            c.btw.suspend = b;
+        }
+        c
+    }
+}
+
+/// Parses a backend name; `None` for anything unrecognised.
+#[must_use]
+pub fn parse_backend(name: &str) -> Option<Backend> {
+    match name {
+        "metal" => Some(Backend::Metal),
+        "cuda" => Some(Backend::Cuda),
+        "cpu" => Some(Backend::Cpu),
+        _ => None,
+    }
+}
+
 /// Returns the usage help text, close to the C agent's `-h` output.
 #[must_use]
+#[allow(clippy::too_many_lines)] // one long string literal
 pub fn usage() -> String {
     "\
 Usage: plank [options]
@@ -412,6 +454,22 @@ Options:
       --control-queue-max BYTES
                            per-client outbound queue cap; a client whose unsent
                            output exceeds it is evicted (default 1048576)
+
+Settings file:
+      ~/.plank/settings.json, then ./.plank/settings.json (later wins), holds
+      defaults for preferences rather than per-run choices. Flags override it.
+
+        {
+          \"engine\": { \"model\": \"~/models/ds4.gguf\", \"threads\": 8,
+                      \"backend\": \"metal\", \"power\": 80, \"ctx\": 262144 },
+          \"ui\":     { \"respectGitignore\": true, \"popupRows\": 15,
+                      \"indexRefreshSecs\": 5, \"historySize\": 512 },
+          \"safety\": { \"sandbox\": true, \"btwSuspend\": true },
+          \"mcp\":    { \"timeoutSecs\": 30 }
+        }
+
+      No secrets: keep the provider API key on --api-key or the environment,
+      since ./.plank/settings.json is inside the working tree.
 "
     .to_owned()
 }
@@ -633,7 +691,24 @@ fn parse_remote_option(
 /// out of range, or an option is unknown.
 #[allow(clippy::too_many_lines)] // flat flag-dispatch match; splitting hurts readability.
 pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
-    let mut c = AgentConfig::default();
+    parse_options_with(&crate::settings::Settings::default(), args)
+}
+
+/// Parses command-line options over `settings` as the starting defaults.
+///
+/// A flag always wins over the settings file, because `settings` only seeds
+/// the initial config and every flag assigns over it. Values the file cannot
+/// hold (`--prompt`, `--trace`, the serve options) are unaffected.
+///
+/// # Errors
+/// Returns an error naming the offending option when a value is missing,
+/// out of range, or an option is unknown.
+#[allow(clippy::too_many_lines)] // flat flag-dispatch match; splitting hurts readability.
+pub fn parse_options_with(
+    settings: &crate::settings::Settings,
+    args: &[String],
+) -> Result<AgentConfig, String> {
+    let mut c = AgentConfig::from_settings(settings);
     // Tracks whether a steering scale was given explicitly; a steering file
     // without one defaults the FFN scale to 1.0, like the C.
     let mut steering_scale_set = false;
@@ -660,12 +735,8 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
             "-m" | "--model" => c.model_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "-t" | "--threads" => c.n_threads = parse_int(need_arg(&mut i)?, arg)?,
             "--backend" => {
-                c.backend = Some(match need_arg(&mut i)? {
-                    "metal" => Backend::Metal,
-                    "cuda" => Backend::Cuda,
-                    "cpu" => Backend::Cpu,
-                    other => return Err(format!("invalid backend: {other}")),
-                });
+                let v = need_arg(&mut i)?;
+                c.backend = Some(parse_backend(v).ok_or_else(|| format!("invalid backend: {v}"))?);
             }
             "--metal" => c.backend = Some(Backend::Metal),
             "--cuda" => c.backend = Some(Backend::Cuda),
@@ -848,6 +919,89 @@ mod tests {
 
     fn args(list: &[&str]) -> Vec<String> {
         list.iter().map(ToString::to_string).collect()
+    }
+
+    /// Settings with every engine and safety key set, for override tests.
+    fn full_settings() -> crate::settings::Settings {
+        crate::settings::Settings {
+            engine: crate::settings::EngineSettings {
+                model: Some(PathBuf::from("/from/settings.gguf")),
+                threads: Some(4),
+                backend: Some("cpu".to_string()),
+                power: Some(50),
+                ctx: Some(4096),
+            },
+            safety: crate::settings::SafetySettings {
+                sandbox: Some(true),
+                btw_suspend: Some(true),
+            },
+            ..crate::settings::Settings::default()
+        }
+    }
+
+    #[test]
+    fn settings_seed_the_engine_and_safety_defaults() {
+        let c = parse_options_with(&full_settings(), &[]).unwrap();
+        assert_eq!(c.model_path, Some(PathBuf::from("/from/settings.gguf")));
+        assert_eq!(c.n_threads, 4);
+        assert_eq!(c.backend, Some(Backend::Cpu));
+        assert_eq!(c.power_percent, 50);
+        assert_eq!(c.generation.ctx_size, 4096);
+        assert_eq!(c.sandbox_override, Some(true));
+        assert!(c.btw.suspend);
+    }
+
+    #[test]
+    fn every_flag_overrides_the_settings_file() {
+        let c = parse_options_with(
+            &full_settings(),
+            &args(&[
+                "-m",
+                "/from/flag.gguf",
+                "-t",
+                "16",
+                "--metal",
+                "--power",
+                "90",
+                "-c",
+                "8192",
+                "--no-sandbox",
+                "--disable-btw-suspend",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.model_path, Some(PathBuf::from("/from/flag.gguf")));
+        assert_eq!(c.n_threads, 16);
+        assert_eq!(c.backend, Some(Backend::Metal));
+        assert_eq!(c.power_percent, 90);
+        assert_eq!(c.generation.ctx_size, 8192);
+        assert_eq!(c.sandbox_override, Some(false));
+        assert!(!c.btw.suspend);
+    }
+
+    #[test]
+    fn an_unrecognised_backend_in_settings_is_ignored_not_fatal() {
+        // A typo in settings.json must never stop plank from starting; the
+        // same text on `--backend` is still an error.
+        let s = crate::settings::Settings {
+            engine: crate::settings::EngineSettings {
+                backend: Some("quantum".to_string()),
+                ..crate::settings::EngineSettings::default()
+            },
+            ..crate::settings::Settings::default()
+        };
+        assert_eq!(parse_options_with(&s, &[]).unwrap().backend, None);
+        assert!(parse_options(&args(&["--backend", "quantum"])).is_err());
+    }
+
+    #[test]
+    fn parse_options_ignores_the_users_real_settings_file() {
+        // `parse_options` must stay hermetic: it is what the tests and library
+        // consumers call, and it may not read whatever is on this machine.
+        assert_eq!(
+            parse_options(&[]).unwrap().model_path,
+            AgentConfig::default().model_path
+        );
     }
 
     #[test]

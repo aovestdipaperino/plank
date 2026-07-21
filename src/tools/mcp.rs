@@ -23,7 +23,13 @@ use std::time::{Duration, Instant};
 use crate::dsml::ToolCall;
 
 /// Timeout for one MCP request round trip, in seconds.
-const MCP_TIMEOUT_SEC: u64 = 30;
+///
+/// From `mcp.timeoutSecs`; see [`crate::settings`]. A server that ignores a
+/// request burns this whole budget and is then marked dead, dropping all of
+/// its tools, so a slow-starting server is a reason to raise it.
+fn mcp_timeout_sec() -> u64 {
+    crate::settings::active().mcp.timeout_secs
+}
 
 // ============================================================================
 // Minimal JSON value (port of agent_json)
@@ -538,7 +544,7 @@ impl McpServer {
 
         // The deadline covers the whole exchange, not each line: a server
         // that streams notifications forever must still answer in time.
-        let deadline = Instant::now() + Duration::from_secs(MCP_TIMEOUT_SEC);
+        let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
         loop {
             let Some(line) = self.read_line(deadline) else {
                 return Err("no response from server (timeout or closed pipe)".to_string());
@@ -603,7 +609,7 @@ impl McpServer {
         // Resources are optional. Only ask a server that advertised the
         // capability: one that silently ignores unknown methods (rather than
         // replying -32601) would stall the whole handshake for
-        // `MCP_TIMEOUT_SEC` and then be marked dead, costing us all of its
+        // the whole request timeout and then be marked dead, costing us all of its
         // tools for a mere completion nicety.
         let advertises_resources = init_result
             .get("capabilities")
@@ -1320,7 +1326,7 @@ done
         std::fs::remove_file(&log).ok();
 
         assert!(
-            elapsed < Duration::from_secs(MCP_TIMEOUT_SEC),
+            elapsed < Duration::from_secs(mcp_timeout_sec()),
             "handshake must not stall on resources/list: {elapsed:?}"
         );
         assert!(

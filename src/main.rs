@@ -3,7 +3,7 @@
 use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 
-use plank::config::{AgentConfig, parse_options, usage};
+use plank::config::{AgentConfig, usage};
 #[cfg(not(ds4_engine))]
 use plank::engine::EchoEngine;
 use plank::engine::Engine;
@@ -26,7 +26,12 @@ fn main() -> ExitCode {
         return run_remote_client(&args[1..]);
     }
 
-    let cfg = match parse_options(&args) {
+    // Settings seed the config; every CLI flag then overrides them. Read from
+    // the launch directory: `--chdir` is parsed here and so cannot yet be
+    // known, which is a documented limitation of project-scoped settings.
+    let settings = plank::settings::Settings::load();
+    plank::settings::install(settings.clone());
+    let cfg = match plank::config::parse_options_with(&settings, &args) {
         Ok(cfg) => cfg,
         Err(msg) => {
             eprintln!("plank: {msg}");
@@ -36,6 +41,11 @@ fn main() -> ExitCode {
     if cfg.show_help {
         print!("{}", usage());
         return ExitCode::SUCCESS;
+    }
+    // Settings can move plank off Metal or shrink the context, and both are
+    // invisible once the UI is up — you just notice it got slow. Say so.
+    if let Some(note) = plank::settings::startup_note(&settings, &cfg) {
+        eprintln!("{note}");
     }
     if let Some(dir) = &cfg.chdir_path
         && let Err(e) = std::env::set_current_dir(dir)
@@ -145,8 +155,9 @@ fn require_min_ram() -> Result<(), String> {
     Ok(())
 }
 
-/// Builds the inference engine: the real ds4 engine on macOS (from `-m` or the
-/// default `~/.plank/ds4flash.gguf`, downloading it if missing), else the stub.
+/// Builds the inference engine: the real ds4 engine on macOS (from `-m`, else
+/// `engine.model` in settings.json, else the default `~/.plank/ds4flash.gguf`,
+/// downloading it if missing), else the stub.
 fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     // Remote engine (flavor a, issue #26) is available on every platform and
     // takes precedence over the local selectors when `--remote` is given.
@@ -368,7 +379,9 @@ fn run_serve(args: &[String]) -> ExitCode {
             }
         }
     }
-    let cfg = match parse_options(&passthrough) {
+    let settings = plank::settings::Settings::load();
+    plank::settings::install(settings.clone());
+    let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
         Ok(cfg) => cfg,
         Err(msg) => {
             eprintln!("plank serve: {msg}");

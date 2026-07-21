@@ -546,7 +546,7 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
     let h = rows
         .min(space_above)
         .min(output.height)
-        .min(u16::try_from(crate::complete::MAX_ROWS).unwrap_or(u16::MAX));
+        .min(u16::try_from(crate::complete::max_rows()).unwrap_or(u16::MAX));
     if h == output.height && output.height < space_above {
         // The output pane itself is the limiting factor (a tall multi-line
         // input has squeezed it down): anchor to its top rather than
@@ -1424,7 +1424,7 @@ mod tests {
         let r = popup_rect(
             output,
             input,
-            u16::try_from(crate::complete::MAX_ROWS).unwrap(),
+            u16::try_from(crate::complete::max_rows()).unwrap(),
         );
         assert_eq!(r.height, 15);
     }

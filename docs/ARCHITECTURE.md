@@ -234,6 +234,51 @@ generation, the startup banner, and `/repro` — a read-only diagnostic dump of
 the exact rendered engine input plus generation knobs, written to
 `~/.plank/repro/` for bug reports.
 
+### Settings (`settings.rs`)
+Persistent user preferences, read from `~/.plank/settings.json` then
+`./.plank/settings.json` with the later file winning key by key. The precedence
+chain is:
+
+```text
+built-in defaults < ~/.plank/settings.json < ./.plank/settings.json < env < CLI flags
+```
+
+The file holds only *stable preferences*, never per-run choices — `--prompt`,
+`--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and the
+serve/control options deliberately have no key. Four groups:
+
+| Group | Keys | Replaces |
+|---|---|---|
+| `engine` | `model`, `threads`, `backend`, `power`, `ctx` | `-m`/`-t`/`--backend`/`--power`/`-c`, and the hardcoded `~/.plank/ds4flash.gguf` fallback |
+| `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize` | magic numbers in `complete.rs` and `ui.rs` |
+| `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
+| `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
+
+Two rules govern the implementation. **A broken settings file never stops plank
+from starting**: malformed JSON, a wrongly-typed value, an unknown key, or an
+unrecognised `engine.backend` all fall back to the default for that key (the
+same text passed to `--backend` is still a hard error, because a flag is an
+explicit instruction). **No secrets**: `./.plank/settings.json` sits inside the
+working tree and is easy to commit by accident, so the provider API key stays
+on `--api-key` and the environment.
+
+`main` calls `Settings::load()` once and hands it to
+`config::parse_options_with`, which seeds `AgentConfig` before flag parsing, so
+flags override the file simply by assigning over it. `parse_options` (no
+settings argument) stays hermetic on the built-in defaults — that is what tests
+and library consumers get. Non-CLI settings reach their consumers through
+`settings::active()`, a process-global installed at startup that returns the
+built-in defaults until `install` runs.
+
+`settings::startup_note` prints one stderr line naming the settings actually in
+force, because a file that quietly selects the CPU backend or shrinks the
+context is otherwise invisible — it shows up only as "plank got slow". The note
+consults the parsed `AgentConfig`, so a setting a flag overrode is *not*
+reported: it describes what is in force, never what a file asked for.
+
+One limitation: settings are read from the launch directory, because `--chdir`
+is parsed from the very arguments the settings seed.
+
 ## Data flows worth understanding
 
 ### System-prompt KV cache

@@ -232,7 +232,11 @@ pub fn longest_common_prefix(matches: &[Match]) -> String {
 }
 
 /// How long a built index is trusted before a refresh is allowed.
-const REFRESH_THROTTLE: Duration = Duration::from_secs(5);
+///
+/// From `ui.indexRefreshSecs`; see [`crate::settings`].
+fn refresh_throttle() -> Duration {
+    Duration::from_secs(crate::settings::active().ui.index_refresh_secs)
+}
 /// Every Nth path feeds the change-detection signature.
 const SIGNATURE_STRIDE: usize = 16;
 
@@ -282,32 +286,6 @@ pub fn git_index_mtime(root: &Path) -> Option<SystemTime> {
         .ok()?
         .modified()
         .ok()
-}
-
-/// Reads `respectGitignore` from `~/.plank/settings.json` then
-/// `<cwd>/.plank/settings.json`, later file winning. Defaults to `true`.
-#[must_use]
-pub fn respect_gitignore_setting() -> bool {
-    use crate::tools::mcp::json_parse;
-    let mut value = true;
-    let mut paths = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        paths.push(PathBuf::from(home).join(".plank").join("settings.json"));
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        paths.push(cwd.join(".plank").join("settings.json"));
-    }
-    for p in paths {
-        let Ok(text) = std::fs::read_to_string(&p) else {
-            continue;
-        };
-        if let Some(root) = json_parse(&text)
-            && let Some(crate::tools::mcp::Json::Bool(b)) = root.get("respectGitignore")
-        {
-            value = *b;
-        }
-    }
-    value
 }
 
 /// An index of completable paths under one root.
@@ -447,7 +425,7 @@ impl FileIndex {
             return true;
         }
         self.last_refresh
-            .is_none_or(|t| now.duration_since(t) >= REFRESH_THROTTLE)
+            .is_none_or(|t| now.duration_since(t) >= refresh_throttle())
     }
 
     /// Records that a refresh just happened.
@@ -458,7 +436,12 @@ impl FileIndex {
 }
 
 /// Maximum rows the worker returns for one query.
-pub const MAX_ROWS: usize = 15;
+///
+/// From `ui.popupRows`; see [`crate::settings`].
+#[must_use]
+pub fn max_rows() -> usize {
+    crate::settings::active().ui.popup_rows
+}
 
 /// A message from the index worker to the UI.
 #[derive(Debug)]
@@ -543,7 +526,7 @@ impl IndexWorker {
                 }
                 let mut pool: Vec<Candidate> = index.candidates().to_vec();
                 pool.extend(extra.iter().cloned());
-                let rows = rank(&q.text, &pool, MAX_ROWS);
+                let rows = rank(&q.text, &pool, max_rows());
                 if mrx_tx
                     .send(IndexMsg::Results {
                         generation: q.generation,
@@ -654,7 +637,7 @@ impl Popup {
         true
     }
 
-    /// The rows currently displayed, capped at [`MAX_ROWS`] by the worker.
+    /// The rows currently displayed, capped at [`max_rows`] by the worker.
     #[must_use]
     pub fn rows(&self) -> &[Match] {
         &self.rows

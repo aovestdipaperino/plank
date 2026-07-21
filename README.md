@@ -113,6 +113,57 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/btw-panel.png" alt="The plank TUI split screen: a counting task on the left, a /btw side answer on the right" width="700">
 </p>
 
+### Settings file
+
+Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works.
+
+```json
+{
+  "engine": { "model": "~/models/ds4.gguf", "threads": 8,
+              "backend": "metal", "power": 80, "ctx": 262144 },
+  "ui":     { "respectGitignore": true, "popupRows": 15,
+              "indexRefreshSecs": 5, "historySize": 512 },
+  "safety": { "sandbox": true, "btwSuspend": true },
+  "mcp":    { "timeoutSecs": 30 }
+}
+```
+
+| Group | Key | Default | What it does |
+|---|---|---|---|
+| `engine` | `model` | `~/.plank/ds4flash.gguf` | Model file to load (`~` expanded). Same as `-m`. |
+| | `threads` | engine default | Worker threads. Same as `-t`. |
+| | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. |
+| | `power` | unset | GPU power cap percent. Same as `--power`. |
+| | `ctx` | 1048576 | Context window in tokens. Same as `-c`. |
+| `ui` | `respectGitignore` | `true` | Whether `@` completion honours `.gitignore` for untracked files. |
+| | `popupRows` | 15 | Rows the `@` completion popup offers. |
+| | `indexRefreshSecs` | 5 | How long the file index is trusted before a rebuild. |
+| | `historySize` | 512 | Prompt history entries retained. |
+| `safety` | `sandbox` | off | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
+| | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
+| `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
+
+Precedence runs left to right, each layer overriding the one before:
+
+```text
+built-in defaults → ~/.plank/settings.json → ./.plank/settings.json → environment → command-line flags
+```
+
+Because a settings file can move you off Metal or shrink the context — and both are invisible once the UI is up, showing only as "plank got slow" — plank prints one line at startup naming what is in force:
+
+```text
+plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cpu, ctx=65536
+```
+
+It lists only settings actually in effect: a value a command-line flag overrode is not mentioned, and with no settings file (or one that changes nothing) there is no line at all.
+
+Two things the file deliberately does **not** do:
+
+- **It holds no secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting — keep it on `--api-key` or the provider's environment variable.
+- **It holds no per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and the serve/control options describe one invocation rather than a preference, so they have no settings key.
+
+A broken settings file never stops plank from starting: malformed JSON, a wrongly-typed value, an unknown key, or an unrecognised backend name each fall back to that key's default. (The same unrecognised name passed to `--backend` is still an error — a flag is an explicit instruction, a config file is a preference.) One limitation: settings are read from the directory plank launches in, so project-scoped settings do not follow `--chdir`.
+
 ### MCP servers
 
 Plank can load external tools from stdio MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format:
@@ -150,7 +201,7 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `session.rs`, `compact.rs`, `sysprompt.rs` — conversation state, compaction, system prompt
 - `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
-- `config.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, tracing, signal handling
+- `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
 
 ## Star History
 
