@@ -1098,7 +1098,7 @@ mod tests {
         let now = Instant::now();
         let mut idx = FileIndex::build(&dir, true);
         idx.mark_refreshed(now, git_index_mtime(&dir));
-        let moved = Some(std::time::SystemTime::now() + Duration::from_secs(60));
+        let moved = Some(std::time::SystemTime::now() + Duration::from_mins(1));
         assert!(idx.needs_refresh(now + Duration::from_millis(10), moved));
         std::fs::remove_dir_all(&dir).ok();
     }
