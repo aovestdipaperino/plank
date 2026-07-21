@@ -75,6 +75,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
 - **`@` file completion, `glob`, and a model-visible task list** that survives compaction.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
+- **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
 
 See **[docs/FEATURES.md](docs/FEATURES.md)** for the complete list.
 
