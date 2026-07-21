@@ -25,8 +25,8 @@
 //! {
 //!   "engine": { "model": "~/models/ds4.gguf", "threads": 8, "backend": "metal",
 //!               "power": 80, "ctx": 262144 },
-//!   "ui":     { "respectGitignore": true, "popupRows": 15,
-//!               "indexRefreshSecs": 5, "historySize": 512 },
+//!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
+//!               "historySize": 512, "showToolCalls": false, "showToolResults": false },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 }
@@ -81,6 +81,12 @@ pub struct UiSettings {
     pub index_refresh_secs: u64,
     /// Prompt history entries retained.
     pub history_size: usize,
+    /// Show the model's tool-call banners (`🛠️ …`). Off by default so the UI
+    /// stays uncluttered; the DSML is always parsed regardless.
+    pub show_tool_calls: bool,
+    /// Echo tool result text (observations) into the scrollback. Off by
+    /// default; the model always receives the results either way.
+    pub show_tool_results: bool,
 }
 
 impl Default for UiSettings {
@@ -90,6 +96,8 @@ impl Default for UiSettings {
             popup_rows: DEFAULT_POPUP_ROWS,
             index_refresh_secs: DEFAULT_INDEX_REFRESH_SECS,
             history_size: DEFAULT_HISTORY_SIZE,
+            show_tool_calls: false,
+            show_tool_results: false,
         }
     }
 }
@@ -221,6 +229,12 @@ impl Settings {
         if let Some(v) = num::<usize>(ui, "historySize").filter(|v| *v > 0) {
             self.ui.history_size = v;
         }
+        if let Some(v) = boolean(ui, "showToolCalls") {
+            self.ui.show_tool_calls = v;
+        }
+        if let Some(v) = boolean(ui, "showToolResults") {
+            self.ui.show_tool_results = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -338,6 +352,12 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.ui.history_size != d.ui.history_size {
         parts.push(format!("historySize={}", s.ui.history_size));
     }
+    if s.ui.show_tool_calls != d.ui.show_tool_calls {
+        parts.push(format!("showToolCalls={}", s.ui.show_tool_calls));
+    }
+    if s.ui.show_tool_results != d.ui.show_tool_results {
+        parts.push(format!("showToolResults={}", s.ui.show_tool_results));
+    }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
     }
@@ -437,6 +457,21 @@ mod tests {
         assert_eq!(s.safety.sandbox, Some(true));
         assert_eq!(s.safety.btw_suspend, Some(false));
         assert_eq!(s.mcp.timeout_secs, 90);
+    }
+
+    #[test]
+    fn tool_display_is_off_by_default_and_opt_in() {
+        let d = Settings::default();
+        assert!(!d.ui.show_tool_calls, "tool calls hidden by default");
+        assert!(!d.ui.show_tool_results, "tool results hidden by default");
+        let s = from_json(r#"{"ui":{"showToolCalls":true,"showToolResults":true}}"#);
+        assert!(s.ui.show_tool_calls);
+        assert!(s.ui.show_tool_results);
+        // Surfaced in the startup note only when turned on.
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("showToolCalls=true"), "{note}");
+        assert!(note.contains("showToolResults=true"), "{note}");
+        assert_eq!(note_for(&Settings::default(), &[]), None);
     }
 
     #[test]

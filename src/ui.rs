@@ -718,6 +718,7 @@ impl Agent<'_> {
             ),
         };
         let mut stream = StreamRenderer::new(sink);
+        stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
@@ -3262,8 +3263,10 @@ impl Agent<'_> {
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
-                for line in observations.lines() {
-                    let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                if crate::settings::active().ui.show_tool_results {
+                    for line in observations.lines() {
+                        let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                    }
                 }
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
@@ -3433,6 +3436,7 @@ impl Agent<'_> {
             let _ = tx.send(UiEvent::MainCheckpoint);
         }
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
+        stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the

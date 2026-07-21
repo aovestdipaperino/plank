@@ -311,6 +311,11 @@ pub struct StreamRenderer<S> {
     /// edit stops generation before `new` is streamed.
     preflight: Preflight,
     preflight_error: Option<String>,
+    /// When false, tool-call visualization (banners, params, read/diff lines)
+    /// is dropped — the DSML is still parsed and hidden, just not shown. Gated
+    /// by `ui.showToolCalls`; defaults true so tests and callers that don't set
+    /// it keep the banners. See [`StreamRenderer::set_show_tool_calls`].
+    show_tool_calls: bool,
 }
 
 /// Hook validating a partially-parsed tool call mid-stream.
@@ -356,7 +361,15 @@ impl<S: RenderSink> StreamRenderer<S> {
             think_carry: Vec::new(),
             preflight: Preflight(None),
             preflight_error: None,
+            show_tool_calls: true,
         }
+    }
+
+    /// Sets whether tool-call visualization is shown (default true). Production
+    /// wires this from `ui.showToolCalls`; when false the DSML is still parsed
+    /// and hidden but no banner, param, read, or diff line is emitted.
+    pub fn set_show_tool_calls(&mut self, show: bool) {
+        self.show_tool_calls = show;
     }
 
     /// Installs the mid-stream preflight hook: called with the pending call
@@ -486,6 +499,12 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     fn emit_visible_bytes(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
+            return;
+        }
+        // Tool-call visualization goes through the tool_text channel (that is
+        // what `self.viz.active` selects below). When banners are off, drop it
+        // entirely — parsing and DSML hiding are unaffected.
+        if self.viz.active && !self.show_tool_calls {
             return;
         }
         self.last_output_newline = bytes.last() == Some(&b'\n');
@@ -1168,6 +1187,37 @@ mod tests {
         sr.push(text);
         sr.finish();
         sr
+    }
+
+    #[test]
+    fn show_tool_calls_false_suppresses_the_banner_but_keeps_visible_text() {
+        let stanza = concat!(
+            "answer before. ",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls -la</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        // Default: banner shows.
+        let shown = run_chunked(stanza);
+        assert!(
+            shown.sink().visible.contains("🛠️"),
+            "{:?}",
+            shown.sink().visible
+        );
+
+        // Gated off: no banner, no `ls -la`, but the model's prose survives and
+        // the tool call is still parsed (so it would still execute).
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let vis = &sr.sink().visible;
+        assert!(vis.contains("answer before."), "prose kept: {vis:?}");
+        assert!(!vis.contains("🛠️"), "banner suppressed: {vis:?}");
+        assert!(!vis.contains("ls -la"), "params suppressed: {vis:?}");
+        assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
     }
 
     fn run_charwise(text: &str) -> StreamRenderer<Cap> {

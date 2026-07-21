@@ -107,8 +107,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 {
   "engine": { "model": "~/models/ds4.gguf", "threads": 8,
               "backend": "metal", "power": 80, "ctx": 262144 },
-  "ui":     { "respectGitignore": true, "popupRows": 15,
-              "indexRefreshSecs": 5, "historySize": 512 },
+  "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
+              "historySize": 512, "showToolCalls": false, "showToolResults": false },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 }
@@ -126,6 +126,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `popupRows` | 15 | Rows the `@` completion popup offers. |
 | | `indexRefreshSecs` | 5 | How long the file index is trusted before a rebuild. |
 | | `historySize` | 512 | Prompt history entries retained. |
+| | `showToolCalls` | `false` | Show the model's `🛠️` tool-call banners. Off keeps the UI uncluttered; the tools still run. |
+| | `showToolResults` | `false` | Echo tool result text into the scrollback. Off keeps the UI clean; the model still receives the results. |
 | `safety` | `sandbox` | off | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
