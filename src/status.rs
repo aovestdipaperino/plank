@@ -22,6 +22,10 @@ pub const STATUS_BAR_FILL: &str = "\x1b[48;5;238;38;5;106;1m";
 /// ANSI style for the queued-prompt preview rows.
 pub const QUEUE_STYLE: &str = "\x1b[38;5;87;1m";
 
+/// Powerline branch glyph (U+E0A0), shown before the git branch name. Requires
+/// a Powerline-patched or Nerd Font to render.
+pub const POWERLINE_BRANCH: char = '\u{e0a0}';
+
 const PROGRESS_BAR_WIDTH: usize = 32;
 
 /// Worker lifecycle state mirrored from `agent_worker_state`.
@@ -79,6 +83,47 @@ pub struct Status {
 #[must_use]
 pub fn prompt_text() -> &'static str {
     "🪵> "
+}
+
+/// Collapses `home` at the front of `path` to `~` (e.g. `/Users/x/Code` with
+/// home `/Users/x` becomes `~/Code`). Returns `path` unchanged otherwise.
+#[must_use]
+fn collapse_home(path: &str, home: &str) -> String {
+    if !home.is_empty() {
+        if path == home {
+            return "~".to_owned();
+        }
+        if let Some(rest) = path.strip_prefix(&format!("{home}/")) {
+            return format!("~/{rest}");
+        }
+    }
+    path.to_owned()
+}
+
+/// Current working directory with the home prefix collapsed to `~`; empty if
+/// the cwd cannot be determined.
+#[must_use]
+pub fn cwd_label() -> String {
+    let Ok(cwd) = std::env::current_dir() else {
+        return String::new();
+    };
+    let home = std::env::var("HOME").unwrap_or_default();
+    collapse_home(&cwd.to_string_lossy(), &home)
+}
+
+/// Current git branch, discovered from the cwd via `git2`. Returns the branch
+/// name for a symbolic HEAD, a short commit hash for a detached HEAD, or
+/// `None` when not inside a repo.
+#[must_use]
+pub fn git_branch_label() -> Option<String> {
+    let repo = git2::Repository::discover(".").ok()?;
+    let head = repo.head().ok()?;
+    if head.is_branch() {
+        return head.shorthand().ok().map(str::to_owned);
+    }
+    // Detached HEAD: fall back to the short commit hash.
+    let oid = head.target()?;
+    Some(oid.to_string().chars().take(7).collect())
 }
 
 /// Formats a token count compactly: `8000` becomes `8k`, `2500` becomes `2.5k`.
@@ -419,7 +464,15 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
             text.to_owned()
         }
     };
-    match st.state {
+    let cwd = cwd_label();
+    let dir = if cwd.is_empty() {
+        String::new()
+    } else if let Some(branch) = git_branch_label() {
+        format!("{} {POWERLINE_BRANCH} {} | ", theme(&cwd), theme(&branch))
+    } else {
+        format!("{} | ", theme(&cwd))
+    };
+    let body = match st.state {
         WorkerState::Prefill => {
             let total = if st.prefill_total > 0 {
                 st.prefill_total
@@ -427,12 +480,14 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
                 1
             };
             let done = st.prefill_done.min(total);
-            let bar = progress_bar(done, total, st.prefill_tps, color);
             format!(
-                "ctx {used}/{total_ctx} | {} ({}) {} {bar}{power}",
+                "ctx {used}/{total_ctx} | {} {}… ({} · ↑ {}/{} tokens · {:.1} t/s){power}",
                 throbber(),
+                theme(prefill_label(st)),
                 format_elapsed(st.elapsed_secs),
-                theme("prefill")
+                format_ctx_size(done),
+                format_ctx_size(total),
+                st.prefill_tps
             )
         }
         WorkerState::Generating => format!(
@@ -459,7 +514,8 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
         ),
         WorkerState::Stopped => format!("ctx {used}/{total_ctx} | interrupted{power}"),
         WorkerState::Idle => format!("ctx {used}/{total_ctx} | idle{power}"),
-    }
+    };
+    format!("{dir}{body}")
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -504,7 +560,26 @@ mod tests {
             ctx_size: 8000,
             ..Status::default()
         };
-        assert_eq!(build_status_text(&st, false), "ctx 1k/8k (12%) | idle");
+        assert!(
+            build_status_text(&st, false).ends_with("ctx 1k/8k (12%) | idle"),
+            "{}",
+            build_status_text(&st, false)
+        );
+    }
+
+    #[test]
+    fn git_branch_label_reads_current_repo() {
+        // Running under cargo, the cwd is inside the plank repo.
+        let branch = git_branch_label();
+        assert!(branch.is_some(), "expected a branch inside the repo");
+    }
+
+    #[test]
+    fn collapse_home_variants() {
+        assert_eq!(collapse_home("/Users/x/Code", "/Users/x"), "~/Code");
+        assert_eq!(collapse_home("/Users/x", "/Users/x"), "~");
+        assert_eq!(collapse_home("/opt/tool", "/Users/x"), "/opt/tool");
+        assert_eq!(collapse_home("/Users/x", ""), "/Users/x");
     }
 
     #[test]
@@ -519,8 +594,29 @@ mod tests {
             ..Status::default()
         };
         let line = build_status_text(&st, false);
-        assert!(line.starts_with("ctx 1.5k/8k (19%) | "), "{line}");
+        assert!(line.contains("ctx 1.5k/8k (19%) | "), "{line}");
         assert!(line.contains("(1m 2s · ↓ 42 tokens · 9.5 t/s)"), "{line}");
+        assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
+    }
+
+    #[test]
+    fn prefill_status_line() {
+        let st = Status {
+            state: WorkerState::Prefill,
+            prefill_done: 500,
+            prefill_total: 2000,
+            prefill_tps: 120.0,
+            elapsed_secs: 5.0,
+            ctx_used: 1500,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false);
+        assert!(line.contains("ctx 1.5k/8k (19%) | "), "{line}");
+        assert!(
+            line.contains("(5s · ↑ 500/2k tokens · 120.0 t/s)"),
+            "{line}"
+        );
         assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
     }
 

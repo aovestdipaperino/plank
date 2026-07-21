@@ -1,6 +1,6 @@
 [package]
 name = "plank"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2024"
 authors = ["Enzo Lombardi <enzinol@gmail.com>"]
 repository = "https://github.com/aovestdipaperino/plank"
@@ -18,7 +18,10 @@ images = []
 
 [dependencies]
 libc = "0.2"
-ratatui = "0.29"
+# unstable-rendered-line-info exposes Paragraph::line_count for exact
+# wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
+# produces more rows than a char-packing estimate).
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 unicode-width = "0.2"
 ureq = "3"
 logo-art = "0.2"
@@ -31,6 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = "0.24"
 nucleo-matcher = "0.3"
+git2 = { version = "0.21.0", default-features = false }
 
 [lints.rust]
 missing_debug_implementations = "warn"

@@ -168,13 +168,13 @@ impl Message {
     }
 
     /// Tool results are stored as user turns; detect them like the C agent.
-    fn is_tool_user(&self) -> bool {
+    pub(crate) fn is_tool_user(&self) -> bool {
         let t = self.text.trim();
         t.starts_with("<tool_result>") || t.starts_with("Tool:") || t.starts_with("Tool result")
     }
 
     /// Strips a `<tool_result>` wrapper, returning the inner payload.
-    fn tool_result_payload(&self) -> &str {
+    pub(crate) fn tool_result_payload(&self) -> &str {
         let t = self.text.trim();
         if let Some(inner) = t.strip_prefix("<tool_result>") {
             inner.strip_suffix("</tool_result>").unwrap_or(inner)
@@ -816,19 +816,14 @@ pub fn read_payload(path: &Path, fingerprint: &str) -> Option<Vec<u8>> {
     Some(bytes.split_off(nl + 1))
 }
 
-/// Renders replayed history for a transcript like the C agent's `/history`.
-///
-/// Shows the last `user_turns` human turns (clamped to
-/// [`HISTORY_MAX_TURNS`]) with `User:` / `Assistant:` / `Tool result:`
-/// headers, per-section tail truncation, and the `--- session history ---`
-/// framing. Tool-result pseudo-user turns are skipped when counting human
-/// turns; a transcript tail of only tool turns falls back to recent
-/// tool/assistant events. `color` enables the C agent's ANSI styling.
+/// Selects the transcript index at which recent-history replay should begin,
+/// showing the last `user_turns` human turns. Returns `(start, tool_only)`
+/// where `tool_only` means no human turn was found and the window falls back to
+/// raw user (tool-result) messages. `None` when there is nothing to replay.
 #[must_use]
-#[allow(clippy::too_many_lines)]
-pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) -> String {
+pub fn history_window(transcript: &[Message], user_turns: usize) -> Option<(usize, bool)> {
     if user_turns == 0 {
-        return String::new();
+        return None;
     }
     let user_turns = user_turns.min(HISTORY_MAX_TURNS);
 
@@ -845,21 +840,19 @@ pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) ->
         .map(|(i, _)| i)
         .collect();
 
-    let mut tool_only = false;
-    let start = if let Some(&i) = human_idx
+    if let Some(&i) = human_idx
         .len()
         .checked_sub(user_turns)
         .and_then(|k| human_idx.get(k))
         .or(human_idx.first())
     {
-        i
+        Some((i, false))
     } else if let Some(&i) = all_user_idx
         .len()
         .checked_sub(user_turns)
         .and_then(|k| all_user_idx.get(k))
         .or(all_user_idx.first())
     {
-        tool_only = true;
         // Include the assistant turn that produced the leading tool result,
         // so replay shows the call and not just its output.
         let mut start = i;
@@ -868,8 +861,27 @@ pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) ->
         {
             start = j;
         }
-        start
+        Some((start, true))
     } else {
+        None
+    }
+}
+
+/// Renders replayed history for a transcript like the C agent's `/history`.
+///
+/// Shows the last `user_turns` human turns (clamped to
+/// [`HISTORY_MAX_TURNS`]) with `User:` / `Assistant:` / `Tool result:`
+/// headers, per-section tail truncation, and the `--- session history ---`
+/// framing. Tool-result pseudo-user turns are skipped when counting human
+/// turns; a transcript tail of only tool turns falls back to recent
+/// tool/assistant events. `color` enables the C agent's ANSI styling.
+#[must_use]
+pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) -> String {
+    if user_turns == 0 {
+        return String::new();
+    }
+
+    let Some((start, tool_only)) = history_window(transcript, user_turns) else {
         return "\n(no user history)\n".to_owned();
     };
 

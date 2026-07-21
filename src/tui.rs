@@ -991,21 +991,19 @@ fn render_output(
     selection: Option<Selection>,
 ) {
     let text = log.to_text();
-    let width = area.width.max(1) as usize;
-    let total: usize = text
-        .lines
-        .iter()
-        .map(|l| l.width().div_ceil(width).max(1))
-        .sum();
+    let width = area.width.max(1);
+    let para = Paragraph::new(text).wrap(Wrap { trim: false });
+    // Exact wrapped-line count from ratatui itself: a char-packing estimate
+    // undercounts word-wrapped rows, leaving the view unable to reach the
+    // bottom (e.g. the long `/context` report).
+    let total = para.line_count(width);
     let max_top = total.saturating_sub(area.height as usize);
     if view.follow || view.top >= max_top {
         view.top = max_top;
         view.follow = true;
     }
     let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let para = para.scroll((scroll, 0));
     frame.render_widget(para, area);
     if !view.follow {
         draw_jump_hint(frame, area);
@@ -1142,6 +1140,27 @@ fn push_shimmered(spans: &mut Vec<Span<'static>>, word: &str, tick_ms: u64, them
 /// Pushes spans for `seg`, painting the accent word — `prefill` before the
 /// bar, or the trailing-`…` spinner verb — in the theme color with the
 /// shimmer animation sweeping across it.
+/// Themes the leading directory segment of the status line. `prefix` looks like
+/// `"<path> | "` or `"<path> ⎇ <branch> | "`; the path and branch render in the
+/// theme green while the powerline glyph, spaces, and `|` separators stay plain.
+fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, theme: Style) {
+    let glyph = crate::status::POWERLINE_BRANCH;
+    // Trailing " | " separator that hands off to the "ctx …" body.
+    let (segment, sep) = prefix
+        .rfind(" | ")
+        .map_or((prefix, ""), |i| (&prefix[..i], &prefix[i..]));
+    if let Some(gi) = segment.find(glyph) {
+        let path = segment[..gi].trim_end();
+        let branch = segment[gi + glyph.len_utf8()..].trim();
+        spans.push(Span::styled(path.to_string(), theme));
+        spans.push(Span::styled(format!(" {glyph} "), base));
+        spans.push(Span::styled(branch.to_string(), theme));
+    } else {
+        spans.push(Span::styled(segment.trim_end().to_string(), theme));
+    }
+    spans.push(Span::styled(sep.to_string(), base));
+}
+
 fn push_accented(
     spans: &mut Vec<Span<'static>>,
     seg: &str,
@@ -1187,10 +1206,18 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    // Peel the leading "<path> ⎇ <branch> | " directory segment and theme the
+    // path and branch green; the powerline glyph and separators stay plain.
+    let text = if let Some(idx) = text.find("ctx ").filter(|&i| i > 0) {
+        push_dir_prefix(&mut spans, &text[..idx], base, theme);
+        &text[idx..]
+    } else {
+        text
+    };
     let bar = text
         .find('[')
         .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
-    let mut spans = Vec::new();
     if let Some((open, close)) = bar {
         push_accented(&mut spans, &text[..=open], tick_ms, base, theme);
         for ch in text[open + 1..close].chars() {
@@ -1467,6 +1494,37 @@ mod tests {
             .find(|s| s.content.contains("1/1"))
             .unwrap();
         assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
+    }
+
+    #[test]
+    fn status_bar_themes_path_and_branch_but_not_the_powerline_glyph() {
+        let base = Style::default();
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let text = format!("~/Code/plank {glyph} main | ctx 1k/8k (12%) | idle");
+        let line = status_bar_line(&text, 0, base, &TaskView::default());
+
+        let path = line
+            .spans
+            .iter()
+            .find(|s| s.content == "~/Code/plank")
+            .expect("path span");
+        assert_eq!(path.style.fg, Some(theme));
+
+        let branch = line
+            .spans
+            .iter()
+            .find(|s| s.content == "main")
+            .expect("branch span");
+        assert_eq!(branch.style.fg, Some(theme));
+
+        // The powerline glyph is not themed green.
+        let glyph_span = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains(glyph))
+            .expect("glyph span");
+        assert_ne!(glyph_span.style.fg, Some(theme));
     }
 
     #[test]

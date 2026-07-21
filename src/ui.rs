@@ -1904,6 +1904,70 @@ impl Agent<'_> {
         Some(out)
     }
 
+    /// Replays a just-resumed session's recent history into the TUI output log,
+    /// rendering each message the way the live stream does: assistant text
+    /// through the markdown renderer (with thinking dimmed and tool-call banners
+    /// restored), user turns as prompt echoes, and tool results in gray. The
+    /// plain REPL uses [`resumed_history`] instead; the TUI needs structured
+    /// spans, not an ANSI string.
+    fn replay_history_into_log(&self, log: &mut OutputLog) {
+        use crate::session::Role;
+        if self.session.id.is_empty() {
+            return;
+        }
+        let transcript = &self.session.transcript;
+        let Some((start, _tool_only)) =
+            crate::session::history_window(transcript, HISTORY_DEFAULT_TURNS)
+        else {
+            return;
+        };
+
+        log.push_dim("--- session history ---");
+        let show_tool_calls = crate::settings::active().ui.show_tool_calls;
+        let pre_open_think = !matches!(
+            self.cfg.generation.think_mode,
+            crate::engine::ThinkMode::Off
+        ) && !self.engine.wants_structured();
+
+        for m in &transcript[start..] {
+            match m.role {
+                Role::User if m.is_tool_user() => {
+                    log.push_dim("Tool result:");
+                    for line in m.tool_result_payload().lines().take(12) {
+                        log.push_dim(line.to_string());
+                    }
+                }
+                Role::User => {
+                    let text = m.text.trim();
+                    if !text.is_empty() {
+                        log.push_spans(tui::user_echo_spans(text));
+                    }
+                }
+                Role::Assistant => {
+                    let text = m.text.trim();
+                    if text.is_empty() {
+                        continue;
+                    }
+                    // Stream the stored text through the same renderer the live
+                    // turn uses, so markdown, thinking gray, and tool-call
+                    // banners come back exactly as they were shown.
+                    let mut stream = StreamRenderer::new(std::mem::take(log));
+                    stream.set_show_tool_calls(show_tool_calls);
+                    if pre_open_think {
+                        stream.begin_in_think();
+                    }
+                    stream.push(text);
+                    stream.finish();
+                    *log = stream.into_sink();
+                    log.end_line();
+                }
+            }
+        }
+
+        let short = crate::session::display_id(&self.session.id);
+        log.push_dim(format!("[resumed session {short}]"));
+    }
+
     /// Captures a named checkpoint: the current transcript plus the engine KV
     /// snapshot (when the engine supports it). Returns a status line.
     fn checkpoint_create(&mut self, name: &str) -> String {
@@ -2528,10 +2592,9 @@ impl Agent<'_> {
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
         log.push_plain(String::new());
 
-        // A `plank /resume` startup shows the recovered conversation so far.
-        if let Some(history) = self.resumed_history() {
-            log.push_ansi(&history);
-        }
+        // A `plank /resume` startup shows the recovered conversation so far,
+        // rendered like the live stream (markdown + thinking gray).
+        self.replay_history_into_log(&mut log);
 
         self.tui_warm(terminal, &mut log)?;
 
@@ -3881,16 +3944,15 @@ impl Agent<'_> {
             },
             "/switch" => match self.store.load(arg) {
                 Ok(s) => {
-                    for line in crate::session::render_history(&s.transcript, 6, false).lines() {
-                        log.push_plain(line.to_owned());
-                    }
-                    if let Some(note) = self.load_session_payload(&s) {
-                        log.push_dim(note);
-                    }
+                    let note = self.load_session_payload(&s);
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
+                    self.replay_history_into_log(log);
+                    if let Some(note) = note {
+                        log.push_dim(note);
+                    }
                 }
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
@@ -3909,14 +3971,15 @@ impl Agent<'_> {
                     Err(e) => log.push_plain(format!("resume failed: {e}")),
                 },
                 Ok(Some(s)) => {
-                    log.push_ansi(&crate::session::render_history(&s.transcript, 6, true));
-                    if let Some(note) = self.load_session_payload(&s) {
-                        log.push_dim(note);
-                    }
+                    let note = self.load_session_payload(&s);
                     self.session = s;
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
+                    self.replay_history_into_log(log);
+                    if let Some(note) = note {
+                        log.push_dim(note);
+                    }
                 }
                 Err(e) => log.push_plain(format!("resume failed: {e}")),
             },
@@ -6043,6 +6106,62 @@ mod tests {
         // An unknown prefix is a clean error, not a panic.
         let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert!(d.resume_from_cli("nonexistent0").is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_history_renders_markdown_and_thinking_not_plain() {
+        let dir = scratch_dir("resume-replay");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = "deadbeef".repeat(5);
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant(
+            "<think>pondering</think>Here is **bold** text.\n",
+        ));
+
+        let mut log = OutputLog::new();
+        agent.replay_history_into_log(&mut log);
+        let text = log.to_text();
+        // Concatenated text per line, for whole-word assertions (think text is
+        // emitted one char per span).
+        let line_text = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+
+        // The thinking text renders in the dim gray, not the default style: the
+        // line containing "pondering" is entirely dim.
+        let dim = ratatui::style::Color::Indexed(238);
+        let think_line = text
+            .lines
+            .iter()
+            .find(|l| line_text(l).contains("pondering"))
+            .expect("thinking text present");
+        assert!(
+            think_line
+                .spans
+                .iter()
+                .all(|s| s.content.trim().is_empty() || s.style.fg == Some(dim)),
+            "thinking text should be dimmed"
+        );
+
+        // The `<think>` tags themselves are consumed, never shown literally.
+        assert!(
+            !text.lines.iter().any(|l| line_text(l).contains("<think>")),
+            "think tags must not appear literally"
+        );
+
+        // The visible markdown is styled (bold), i.e. it went through the
+        // markdown renderer rather than being pushed as plain text.
+        let has_bold = text.lines.iter().any(|l| {
+            l.spans.iter().any(|s| {
+                s.content.contains("bold")
+                    && s.style
+                        .add_modifier
+                        .contains(ratatui::style::Modifier::BOLD)
+            })
+        });
+        assert!(has_bold, "visible markdown should be rendered (bold)");
         std::fs::remove_dir_all(&dir).ok();
     }
 
