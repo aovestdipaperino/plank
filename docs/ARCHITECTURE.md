@@ -216,7 +216,11 @@ can spend well over ten seconds in — a harness should retry until its first
 `snapshot` succeeds instead of assuming the port is broken. The second is a
 running `!` shell command: `tui_bang` draws and polls the terminal on its own,
 so injected keys cannot interrupt one and a snapshot taken during one will
-time out.
+time out. Nothing observed through `--ui-remote` can therefore say anything
+about what the screen looked like *while* a `!` command ran — a poll loop just
+gets every frame at once when the command ends, which reads exactly like output
+that never streamed. Verifying mid-command behaviour needs an observer outside
+plank's event loop, such as a terminal screenshot.
 
 `uitree` reflects only draw sites that call `uiremote::region(name, rect,
 state)` — an uninstrumented widget is simply invisible to it, not an empty

@@ -545,6 +545,69 @@ pub struct ImmediateOutput {
     pub interrupted: bool,
 }
 
+/// Which stream a line of `!` output arrived on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    /// Standard output.
+    Stdout,
+    /// Standard error.
+    Stderr,
+}
+
+/// Receives a running `!` command's output and drives the caller's redraw.
+///
+/// One trait rather than two closures because both halves need `&mut` access
+/// to the same UI state — the output log — which two closures cannot share.
+pub trait ImmediateSink {
+    /// One complete line of output, newline already stripped.
+    fn line(&mut self, stream: Stream, text: &str);
+    /// Called on each poll tick; return `true` to interrupt the command.
+    fn tick(&mut self) -> bool;
+}
+
+/// An [`ImmediateSink`] that only reports interrupts, discarding lines as they
+/// stream (they are still accumulated into [`ImmediateOutput`]).
+#[derive(Debug)]
+pub struct InterruptOnly<F: FnMut() -> bool>(pub F);
+
+impl<F: FnMut() -> bool> ImmediateSink for InterruptOnly<F> {
+    fn line(&mut self, _stream: Stream, _text: &str) {}
+    fn tick(&mut self) -> bool {
+        (self.0)()
+    }
+}
+
+/// Splits a byte stream into complete lines, holding any partial trailing line
+/// until the newline arrives (or the stream ends).
+#[derive(Default)]
+struct LineSplitter {
+    /// Everything seen so far, for `ImmediateOutput`.
+    full: String,
+    /// Bytes after the last newline, not yet a complete line.
+    pending: String,
+}
+
+impl LineSplitter {
+    /// Absorbs a chunk, handing every newly completed line to `emit`.
+    fn push(&mut self, chunk: &[u8], mut emit: impl FnMut(&str)) {
+        let text = String::from_utf8_lossy(chunk);
+        self.full.push_str(&text);
+        self.pending.push_str(&text);
+        while let Some(nl) = self.pending.find('\n') {
+            let line: String = self.pending.drain(..=nl).collect();
+            emit(line.trim_end_matches(['\n', '\r']));
+        }
+    }
+
+    /// Emits any trailing line that never got its newline.
+    fn flush(&mut self, mut emit: impl FnMut(&str)) {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            emit(&line);
+        }
+    }
+}
+
 /// Runs a user-typed `!` command to completion in `cwd`, separate from the
 /// model's bash job table: stdout and stderr are captured independently and
 /// `interrupt` is polled so Ctrl-C/Esc can kill a runaway command.
@@ -558,16 +621,34 @@ pub struct ImmediateOutput {
 pub fn run_immediate(
     cwd: &std::path::Path,
     cmd: &str,
-    interrupt: &mut dyn FnMut() -> bool,
+    sink: &mut dyn ImmediateSink,
 ) -> Result<ImmediateOutput, String> {
-    fn collect(stream: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    use std::sync::mpsc::{Sender, channel};
+
+    /// Reads a stream in chunks, forwarding each to the collector as it
+    /// arrives. `read_to_end` would deliver everything only at exit, which is
+    /// exactly what issue #22 was about.
+    fn pump(
+        stream: impl std::io::Read + Send + 'static,
+        which: Stream,
+        tx: Sender<(Stream, Vec<u8>)>,
+    ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let mut stream = stream;
-            let mut out = Vec::new();
-            let _ = stream.read_to_end(&mut out);
-            out
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send((which, buf[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
         })
     }
+
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(cmd)
@@ -578,24 +659,53 @@ pub fn run_immediate(
         .spawn()
         .map_err(|e| format!("failed to start: {e}"))?;
 
+    let (tx, rx) = channel::<(Stream, Vec<u8>)>();
     // The pipes are always present with Stdio::piped.
-    let out_reader = collect(child.stdout.take().expect("piped stdout"));
-    let err_reader = collect(child.stderr.take().expect("piped stderr"));
+    let out_reader = pump(
+        child.stdout.take().expect("piped stdout"),
+        Stream::Stdout,
+        tx.clone(),
+    );
+    let err_reader = pump(
+        child.stderr.take().expect("piped stderr"),
+        Stream::Stderr,
+        tx,
+    );
+
+    let mut out = LineSplitter::default();
+    let mut err = LineSplitter::default();
+    let drain = |out: &mut LineSplitter, err: &mut LineSplitter, sink: &mut dyn ImmediateSink| {
+        while let Ok((which, chunk)) = rx.try_recv() {
+            match which {
+                Stream::Stdout => out.push(&chunk, |l| sink.line(Stream::Stdout, l)),
+                Stream::Stderr => err.push(&chunk, |l| sink.line(Stream::Stderr, l)),
+            }
+        }
+    };
 
     let mut interrupted = false;
     let status = loop {
+        drain(&mut out, &mut err, sink);
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {}
             Err(e) => return Err(format!("wait failed: {e}")),
         }
-        if interrupt() {
+        if sink.tick() {
             interrupted = true;
             let _ = child.kill();
             break child.wait().ok();
         }
         std::thread::sleep(Duration::from_millis(25));
     };
+
+    // The readers end when their pipes close, which the child's exit
+    // guarantees; joining first makes the final drain see every last byte.
+    let _ = out_reader.join();
+    let _ = err_reader.join();
+    drain(&mut out, &mut err, sink);
+    out.flush(|l| sink.line(Stream::Stdout, l));
+    err.flush(|l| sink.line(Stream::Stderr, l));
 
     let exit_code = status.map_or(-1, |s| {
         s.code().map_or_else(
@@ -614,8 +724,8 @@ pub fn run_immediate(
         )
     });
     Ok(ImmediateOutput {
-        stdout: String::from_utf8_lossy(&out_reader.join().unwrap_or_default()).into_owned(),
-        stderr: String::from_utf8_lossy(&err_reader.join().unwrap_or_default()).into_owned(),
+        stdout: out.full,
+        stderr: err.full,
         exit_code,
         interrupted,
     })
@@ -746,7 +856,7 @@ mod tests {
         let out = run_immediate(
             std::path::Path::new("/tmp"),
             "echo out; echo err >&2; exit 3",
-            &mut || false,
+            &mut InterruptOnly(|| false),
         )
         .unwrap();
         assert_eq!(out.stdout, "out\n");
@@ -755,14 +865,119 @@ mod tests {
         assert!(!out.interrupted);
     }
 
+    /// Records each line with the moment it arrived, for the streaming tests.
+    struct Recorder {
+        lines: Vec<(Stream, String, Instant)>,
+        ticks: usize,
+    }
+
+    impl ImmediateSink for Recorder {
+        fn line(&mut self, stream: Stream, text: &str) {
+            self.lines.push((stream, text.to_owned(), Instant::now()));
+        }
+        fn tick(&mut self) -> bool {
+            self.ticks += 1;
+            false
+        }
+    }
+
+    #[test]
+    fn immediate_output_streams_before_the_command_exits() {
+        // The regression #22 fixed: `read_to_end` delivered everything only at
+        // exit. The first line must arrive well before the process ends.
+        let mut rec = Recorder {
+            lines: Vec::new(),
+            ticks: 0,
+        };
+        let start = Instant::now();
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo first; sleep 1; echo second",
+            &mut rec,
+        )
+        .unwrap();
+        let total = start.elapsed();
+
+        assert_eq!(rec.lines.len(), 2, "{:?}", rec.lines);
+        assert_eq!(rec.lines[0].1, "first");
+        assert_eq!(rec.lines[1].1, "second");
+        let first_at = rec.lines[0].2.duration_since(start);
+        assert!(
+            first_at < total / 2,
+            "first line arrived at {first_at:?} of {total:?} - not streaming"
+        );
+        assert_eq!(out.stdout, "first\nsecond\n", "accumulation still works");
+    }
+
+    #[test]
+    fn immediate_output_separates_the_two_streams() {
+        let mut rec = Recorder {
+            lines: Vec::new(),
+            ticks: 0,
+        };
+        run_immediate(
+            std::path::Path::new("/tmp"),
+            "echo out; echo err 1>&2",
+            &mut rec,
+        )
+        .unwrap();
+        let by_stream: Vec<(Stream, &str)> =
+            rec.lines.iter().map(|(s, t, _)| (*s, t.as_str())).collect();
+        assert!(
+            by_stream.contains(&(Stream::Stdout, "out")),
+            "{by_stream:?}"
+        );
+        assert!(
+            by_stream.contains(&(Stream::Stderr, "err")),
+            "{by_stream:?}"
+        );
+    }
+
+    #[test]
+    fn a_trailing_line_without_a_newline_is_still_emitted() {
+        let mut rec = Recorder {
+            lines: Vec::new(),
+            ticks: 0,
+        };
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "printf 'no-newline'",
+            &mut rec,
+        )
+        .unwrap();
+        assert_eq!(rec.lines.len(), 1, "{:?}", rec.lines);
+        assert_eq!(rec.lines[0].1, "no-newline");
+        assert_eq!(out.stdout, "no-newline");
+    }
+
+    #[test]
+    fn crlf_is_stripped_from_streamed_lines() {
+        let mut rec = Recorder {
+            lines: Vec::new(),
+            ticks: 0,
+        };
+        run_immediate(
+            std::path::Path::new("/tmp"),
+            "printf 'a\\r\\nb\\n'",
+            &mut rec,
+        )
+        .unwrap();
+        assert_eq!(rec.lines[0].1, "a");
+        assert_eq!(rec.lines[1].1, "b");
+    }
+
     #[test]
     fn immediate_command_interrupt_kills() {
         let mut polls = 0;
         let start = Instant::now();
-        let out = run_immediate(std::path::Path::new("/tmp"), "sleep 30", &mut || {
-            polls += 1;
-            polls > 2
-        })
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "sleep 30",
+            &mut InterruptOnly(|| {
+                polls += 1;
+                polls > 2
+            }),
+        )
         .unwrap();
         assert!(out.interrupted);
         assert!(start.elapsed() < Duration::from_secs(5));

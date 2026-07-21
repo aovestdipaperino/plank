@@ -2592,27 +2592,59 @@ impl Agent<'_> {
         terminal: &mut ratatui::DefaultTerminal,
         view: &mut tui::OutputView,
     ) {
-        let start = Instant::now();
-        let mut interrupt = || {
-            let status = format!("! {cmd} ({}s, Esc to stop)", start.elapsed().as_secs());
-            let _ = terminal.draw(|f| tui::draw(f, log, None, (0, 0), &status, view, None));
-            while event::poll(Duration::ZERO).unwrap_or(false) {
-                if let Ok(Event::Key(k)) = event::read()
-                    && k.kind == KeyEventKind::Press
-                    && (matches!(k.code, KeyCode::Esc)
-                        || (matches!(k.code, KeyCode::Char('c'))
-                            && k.modifiers.contains(KeyModifiers::CONTROL)))
-                {
-                    return true;
-                }
+        // Output streams into the log as it arrives (issue #22): the sink's
+        // `line` appends and `tick` redraws, so a long-running command shows
+        // progress instead of dumping everything at exit. Both halves need
+        // `&mut log`, which is why this is one sink and not two closures.
+        struct Sink<'a, 'b> {
+            log: &'a mut OutputLog,
+            terminal: &'a mut ratatui::DefaultTerminal,
+            view: &'a mut tui::OutputView,
+            cmd: &'b str,
+            start: Instant,
+            dirty: bool,
+        }
+        impl crate::tools::bash::ImmediateSink for Sink<'_, '_> {
+            fn line(&mut self, _stream: crate::tools::bash::Stream, text: &str) {
+                self.log.push_dim(text.to_owned());
+                self.dirty = true;
             }
-            false
-        };
-        match crate::tools::bash::run_immediate(cwd, cmd, &mut interrupt) {
-            Ok(out) => {
-                for line in out.stdout.lines().chain(out.stderr.lines()) {
-                    log.push_dim(line.to_owned());
+            fn tick(&mut self) -> bool {
+                let status = format!(
+                    "! {} ({}s, Esc to stop)",
+                    self.cmd,
+                    self.start.elapsed().as_secs()
+                );
+                let (log, view) = (&*self.log, &mut *self.view);
+                let _ = self
+                    .terminal
+                    .draw(|f| tui::draw(f, log, None, (0, 0), &status, view, None));
+                self.dirty = false;
+                while event::poll(Duration::ZERO).unwrap_or(false) {
+                    if let Ok(Event::Key(k)) = event::read()
+                        && k.kind == KeyEventKind::Press
+                        && (matches!(k.code, KeyCode::Esc)
+                            || (matches!(k.code, KeyCode::Char('c'))
+                                && k.modifiers.contains(KeyModifiers::CONTROL)))
+                    {
+                        return true;
+                    }
                 }
+                false
+            }
+        }
+        let start = Instant::now();
+        let mut sink = Sink {
+            log,
+            terminal,
+            view,
+            cmd,
+            start,
+            dirty: false,
+        };
+        let result = crate::tools::bash::run_immediate(cwd, cmd, &mut sink);
+        match result {
+            Ok(out) => {
                 if out.interrupted {
                     log.push_dim("[interrupted]");
                 } else if out.exit_code != 0 {
@@ -4095,6 +4127,23 @@ fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
 /// Handles one line of plain-REPL input. Returns `Ok(false)` to quit the REPL
 /// (a `/quit`-style slash command); `Ok(true)` to keep looping. Shared by the
 /// local and remote-aware REPL loops so both paths treat slashes, `!`-shell
+/// Streams a plain-REPL `!` command's output to the console as it arrives
+/// rather than at exit (issue #22), keeping stdout and stderr on their own
+/// console streams.
+struct BangConsoleSink;
+
+impl crate::tools::bash::ImmediateSink for BangConsoleSink {
+    fn line(&mut self, stream: crate::tools::bash::Stream, text: &str) {
+        match stream {
+            crate::tools::bash::Stream::Stdout => println!("{text}"),
+            crate::tools::bash::Stream::Stderr => eprintln!("{text}"),
+        }
+    }
+    fn tick(&mut self) -> bool {
+        crate::interrupt::pending()
+    }
+}
+
 /// escapes, and prompts identically (CLAUDE.md: mirror both UI paths).
 fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> {
     let input = line.trim();
@@ -4113,12 +4162,8 @@ fn handle_plain_line(agent: &mut Agent<'_>, line: &str) -> Result<bool, String> 
             println!("usage: !<shell command>");
             return Ok(true);
         }
-        match crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut || {
-            crate::interrupt::pending()
-        }) {
+        match crate::tools::bash::run_immediate(&agent.tool_ctx.cwd, cmd, &mut BangConsoleSink) {
             Ok(out) => {
-                print!("{}", out.stdout);
-                eprint!("{}", out.stderr);
                 if out.interrupted {
                     crate::interrupt::clear();
                     println!("[interrupted]");
