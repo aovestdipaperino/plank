@@ -421,6 +421,126 @@ pub fn frame_tree() -> String {
     })
 }
 
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::time::Duration;
+
+/// How long `serve_conn` waits for the UI thread to answer a pending command
+/// before giving up and replying with an error itself.
+///
+/// The UI thread is expected to drain [`RemoteHandle`] every tick (Task 5),
+/// so a healthy round trip is well under a second. If the UI thread is wedged
+/// (or the whole handle was dropped without the receiver's `Sender` half
+/// being dropped first — see [`RemoteHandle`]'s `Drop` behaviour below) a
+/// client blocked on `rrx.recv()` with no timeout would hang forever with no
+/// way to notice, let alone recover. A generous bound turns that into a
+/// bounded stall and a diagnosable error reply instead.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A command waiting for the UI thread, with the channel to answer on.
+#[derive(Debug)]
+pub struct Pending {
+    /// What the client asked for.
+    pub cmd: RemoteCmd,
+    /// Send exactly one reply line here.
+    pub reply: Sender<String>,
+}
+
+/// Handle held by the UI thread while remote control is active.
+#[derive(Debug)]
+pub struct RemoteHandle {
+    /// The bound port; resolved even when 0 was requested.
+    pub port: u16,
+    rx: Receiver<Pending>,
+}
+
+impl RemoteHandle {
+    /// Takes one pending command, if any.
+    #[must_use]
+    pub fn try_recv(&self) -> Option<Pending> {
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Starts the remote-control listener on `127.0.0.1:port`.
+///
+/// Passing 0 binds an ephemeral port, reported in [`RemoteHandle::port`].
+/// Binding is loopback-only by construction: the address is not
+/// configurable, and only the port is caller-supplied. This is a
+/// keystroke-injection port into an agent that can run shell commands, so it
+/// must never be reachable from anything but the local machine.
+///
+/// Connections are served one at a time, sequentially, on the listener's own
+/// thread: a second client that connects while the first is still being
+/// served does not get an immediate error — it simply waits in the kernel's
+/// accept backlog until the first connection closes, then is served in turn.
+/// (An earlier sketch of this function tracked a `busy` flag to reject a
+/// second concurrent client outright; because accept and serve both happen
+/// on the same single thread, that flag could never be observed as `true` by
+/// anyone — there is no second thread to race it — so it was dead code and
+/// has been removed rather than kept as a misleading no-op.)
+///
+/// # Errors
+/// Returns a message when the port cannot be bound.
+pub fn start(port: u16) -> Result<RemoteHandle, String> {
+    let listener = TcpListener::bind(("127.0.0.1", port))
+        .map_err(|e| format!("ui-remote: bind 127.0.0.1:{port}: {e}"))?;
+    let bound = listener
+        .local_addr()
+        .map_err(|e| format!("ui-remote: local_addr: {e}"))?
+        .port();
+    let (tx, rx) = channel::<Pending>();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            serve_conn(&mut stream, &tx);
+        }
+    });
+    Ok(RemoteHandle { port: bound, rx })
+}
+
+/// Serves one client until it disconnects.
+fn serve_conn(stream: &mut std::net::TcpStream, tx: &Sender<Pending>) {
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let reply = match parse_command(trimmed) {
+            Err(e) => error_reply(&e),
+            Ok(cmd) => {
+                let (rtx, rrx) = channel::<String>();
+                // If `tx.send` fails, the UI thread's `RemoteHandle` (and its
+                // `Receiver`) has been dropped — nothing will ever answer, so
+                // give up on this connection immediately rather than waiting
+                // out the timeout for nothing.
+                if tx.send(Pending { cmd, reply: rtx }).is_err() {
+                    return;
+                }
+                // The UI thread answers on its next tick; block until it
+                // does, but only up to REPLY_TIMEOUT so a wedged UI thread
+                // stalls the client instead of hanging it forever.
+                rrx.recv_timeout(REPLY_TIMEOUT)
+                    .unwrap_or_else(|_| error_reply("ui thread timed out"))
+            }
+        };
+        if writeln!(stream, "{reply}").is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -688,5 +808,88 @@ mod tests {
         assert!(!tree.contains("stale"), "{tree}");
         assert!(tree.contains("fresh"), "{tree}");
         set_recording(false);
+    }
+
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+
+    /// Sends one line and returns the one-line reply.
+    fn roundtrip(port: u16, line: &str) -> String {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.write_all(line.as_bytes()).unwrap();
+        s.write_all(b"\n").unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s);
+        let mut out = String::new();
+        reader.read_line(&mut out).expect("reply");
+        out.trim_end().to_string()
+    }
+
+    #[test]
+    fn binds_an_ephemeral_port_and_serves_a_command() {
+        let h = start(0).expect("start");
+        assert_ne!(h.port, 0, "ephemeral port must be reported");
+        let port = h.port;
+
+        // The UI thread answers; emulate it on this thread. It returns as
+        // soon as it has served the one command the test sends, so it never
+        // outlives the test.
+        let handle = std::thread::spawn(move || {
+            loop {
+                if let Some(p) = h.try_recv() {
+                    assert!(matches!(p.cmd, RemoteCmd::Snapshot));
+                    let _ = p.reply.send(ok_reply(&[("cols", Json::Num(80.0))]));
+                    return;
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let reply = roundtrip(port, r#"{"cmd":"snapshot"}"#);
+        assert!(reply.contains(r#""cols":80"#), "{reply}");
+        handle.join().expect("ui thread");
+    }
+
+    #[test]
+    fn rejects_a_malformed_line_without_closing_the_connection() {
+        let h = start(0).expect("start");
+        let port = h.port;
+
+        // The fake UI thread must not spin forever after the test is done:
+        // it exits once `stop` is set below.
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_thread = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            while !stop_thread.load(Ordering::Relaxed) {
+                if let Some(p) = h.try_recv() {
+                    let _ = p.reply.send(ok_reply(&[]));
+                }
+                std::thread::yield_now();
+            }
+        });
+
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.write_all(b"not json\n").unwrap();
+        s.flush().unwrap();
+        let mut reader = BufReader::new(s.try_clone().unwrap());
+        let mut first = String::new();
+        reader.read_line(&mut first).unwrap();
+        assert!(first.contains(r#""ok":false"#), "{first}");
+        // Connection stays usable.
+        s.write_all(b"{\"cmd\":\"snapshot\"}\n").unwrap();
+        s.flush().unwrap();
+        let mut second = String::new();
+        reader.read_line(&mut second).unwrap();
+        assert!(second.contains(r#""ok":true"#), "{second}");
+
+        stop.store(true, Ordering::Relaxed);
+        handle.join().expect("ui thread");
+    }
+
+    #[test]
+    fn binds_loopback_only() {
+        let h = start(0).expect("start");
+        // Connecting via loopback works; the bound address must be 127.0.0.1.
+        assert!(TcpStream::connect(("127.0.0.1", h.port)).is_ok());
     }
 }
