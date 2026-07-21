@@ -71,7 +71,26 @@ anything in force, so a file that quietly picks the CPU backend can't hide as
 
 🐚 **Better `!` shell commands.** Output now streams into the view as the command
 runs instead of arriving all at once at the end, and arrow-key history on a `!`
-line cycles through past shell commands only.
+line cycles through past shell commands only. History is also scoped to the
+directory you are in, so one project's commands stay out of another's.
+
+✅ **A task list that survives compaction.** The model keeps a structured,
+visible task list as working memory: it shows as a counter in the status bar
+and a short strip of the active and upcoming tasks, `/tasks` prints the whole
+thing, and — the point — it persists through compaction, `/resume`, and
+checkpoint rollback, so a long task's plan is not the first thing lost when the
+window fills.
+
+🧑‍🔧 **Named agents.** Define specialized subagents as markdown files in
+`~/.plank/agents/`, list them with `/agent`, and dispatch one with `/subagent
+<name> <task>`. Skills also became something the model can reach for on its own
+mid-task, not just a command you type.
+
+🪝 **More hooks.** Hooks now fire on prompt submission, session start and end,
+before and after compaction, and on tool failure — several able to inject
+context into the turn. A JSON response can halt a turn, warn without blocking,
+or run a hook asynchronously, and matchers can key on a command's arguments
+(`bash(git *)`).
 
 All still local first, macOS, open source.
 
