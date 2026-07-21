@@ -203,6 +203,47 @@ The v2 beta channel extends plank past a single local process. All of it is off 
 - **Remote control** — `plank --control[=ADDR]` opens a loopback WebSocket so another process, a browser, or the `plank remote <url>` terminal client can attach to a running instance: it mirrors the output, sends prompts/commands/`/btw`/interrupts, and takes or hands back control (single controller, many mirrors, with a reconnect grace window). A self-contained web client is served at `/`. Auth is a bearer token (`--control-token`), with an `--control-origin` allow-list for browsers and `--control-queue-max` slow-client eviction.
 - **`--ui-remote[=PORT]`** — for driving the TUI from a test harness: opens a `127.0.0.1`-only listener (bare form picks an ephemeral port, `=PORT` a fixed one) accepting line-delimited JSON `keypress`/`snapshot`/`uitree` commands. `snapshot`/`uitree` replies are held until the screen reflects any keys sent first, so a harness can assert without sleeping. One client at a time; a second simply queues.
 
+### Using OpenAI or Anthropic providers
+
+plank can drive a hosted model instead of the local one. The provider sits behind the same `Engine` trait as the Metal backend, so tools, sessions, `/btw`, compaction, and the rest of the agent loop behave identically — native provider tool calls are translated back into plank's own tool protocol on the way through.
+
+Pick a provider with `--provider` and name the model with `--model`. The API key is read from the provider's environment variable, so you normally do not pass it on the command line:
+
+```sh
+# OpenAI
+export OPENAI_API_KEY=sk-...
+plank --provider openai --model gpt-4o
+
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+plank --provider anthropic --model claude-sonnet-4-5
+```
+
+Both providers work with a one-shot prompt too: `plank --provider anthropic --model <name> -p "..."`.
+
+**Flags**
+
+| Flag | Meaning |
+|---|---|
+| `--provider openai\|anthropic` | Selects the provider family. `openai` speaks the OpenAI-compatible Chat Completions API; `anthropic` speaks the Anthropic Messages API. |
+| `--model NAME` | The provider's model name (not a local GGUF path). Required with `--provider`. |
+| `--api-key KEY` | The key, if you would rather not use the environment variable. Prefer the env var — a key on the command line lands in your shell history. |
+| `--base-url URL` | Overrides the endpoint. Defaults to `https://api.openai.com/v1` and `https://api.anthropic.com/v1`. |
+| `--provider-cache on\|off` | Anthropic prompt caching over the stable prefix (tools + system). On by default; ignored for `--provider openai`. |
+
+**Key resolution** — `--api-key` wins if given, otherwise `$OPENAI_API_KEY` (openai) or `$ANTHROPIC_API_KEY` (anthropic). With neither set, startup fails with a clear message rather than a confusing API error.
+
+**OpenAI-compatible gateways** — `--provider openai` plus `--base-url` reaches anything that speaks the OpenAI Chat Completions shape: vLLM, Ollama, OpenRouter, Together, LM Studio, and similar. For example, a local Ollama:
+
+```sh
+plank --provider openai --model llama3.3 \
+      --base-url http://localhost:11434/v1 --api-key ollama
+```
+
+**What stays the same** — every plank tool (`read`/`edit`/`bash`/`glob`/`search`/…), the MCP tools, `@` completion, sessions and `/resume`, `/btw`, and compaction all work unchanged against a provider. The one difference is the system prompt: a provider gets plank's own prompt with native tool definitions, never the byte-parity DeepSeek prompt (which is meant only for the local model it was trained on).
+
+**Notes** — `--provider` cannot be combined with `--remote` or the local backend selectors (`--metal`/`--cuda`/`--cpu`); it *is* the engine for that run. `/usage` reports billed token counts for the session, including Anthropic cache read/write and hit rate. The key is never written to `settings.json` — it stays on the environment or `--api-key` by design.
+
 ## Project layout
 
 Each module in `src/` maps to one functional section of the original `ds4_agent.c`:
