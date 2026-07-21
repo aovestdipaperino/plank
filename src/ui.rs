@@ -2003,7 +2003,7 @@ impl Agent<'_> {
         };
         println!();
         println!("{bold}Session saved{reset} {dim}{}{reset}", path.display());
-        println!("Resume it later with:  {bold}plank{reset}  then  {bold}/resume {short}{reset}");
+        println!("Resume it later with:  {bold}plank /resume {short}{reset}");
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
