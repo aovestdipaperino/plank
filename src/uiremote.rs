@@ -1,6 +1,10 @@
 //! `--ui-remote`: remote control of the TUI for testing.
 
+use std::fmt::Write as _;
+
+use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Modifier, Style};
 
 use crate::tools::mcp::{Json, json_escape, json_parse, json_write};
 
@@ -118,6 +122,134 @@ pub fn ok_reply(fields: &[(&str, Json)]) -> String {
     out
 }
 
+/// Maps a colour to its SGR foreground parameter, or `None` when it is the
+/// default (unstyled) colour.
+fn sgr_fg(c: Color) -> Option<String> {
+    Some(match c {
+        Color::Reset => return None,
+        Color::Black => "30".into(),
+        Color::Red => "31".into(),
+        Color::Green => "32".into(),
+        Color::Yellow => "33".into(),
+        Color::Blue => "34".into(),
+        Color::Magenta => "35".into(),
+        Color::Cyan => "36".into(),
+        Color::Gray => "37".into(),
+        Color::DarkGray => "90".into(),
+        Color::LightRed => "91".into(),
+        Color::LightGreen => "92".into(),
+        Color::LightYellow => "93".into(),
+        Color::LightBlue => "94".into(),
+        Color::LightMagenta => "95".into(),
+        Color::LightCyan => "96".into(),
+        Color::White => "97".into(),
+        Color::Indexed(i) => format!("38;5;{i}"),
+        Color::Rgb(r, g, b) => format!("38;2;{r};{g};{b}"),
+    })
+}
+
+/// Same as [`sgr_fg`] but for background colours.
+fn sgr_bg(c: Color) -> Option<String> {
+    let fg = sgr_fg(c)?;
+    // Background codes are the foreground codes shifted by 10 (bright
+    // 90-97 -> 100-107), and the extended forms swap their `38` introducer
+    // for `48` rather than being numerically shifted.
+    Some(if let Some(rest) = fg.strip_prefix("38;") {
+        format!("48;{rest}")
+    } else {
+        let n: u32 = fg.parse().unwrap_or(30);
+        (n + 10).to_string()
+    })
+}
+
+/// Normalises a style so `Color::Reset` and `None` compare equal.
+///
+/// `Cell::style()` always reports `fg`/`bg` as `Some(Color::Reset)` rather
+/// than `None`, so comparing the raw style against `Style::default()` (or
+/// another cell's raw style) would treat every unstyled cell as styled, and
+/// two unstyled cells as different. This collapses that distinction before
+/// comparing.
+fn normalize(mut style: Style) -> Style {
+    if matches!(style.fg, Some(Color::Reset)) {
+        style.fg = None;
+    }
+    if matches!(style.bg, Some(Color::Reset)) {
+        style.bg = None;
+    }
+    if matches!(style.underline_color, Some(Color::Reset)) {
+        style.underline_color = None;
+    }
+    style
+}
+
+/// Whether `style` renders identically to an unstyled cell.
+fn is_plain(style: Style) -> bool {
+    normalize(style) == Style::default()
+}
+
+/// Serialises `buf` as ANSI text: one line per row, with SGR codes emitted
+/// only where the style changes from the previous cell (starting from
+/// [`Style::default`] at the start of each row), and a `\x1b[0m` reset
+/// closing any row that ends mid-style.
+///
+/// Trailing blanks are preserved so rows stay column-aligned and snapshots
+/// diff cleanly.
+#[must_use]
+pub fn buffer_to_ansi(buf: &Buffer) -> String {
+    let area = *buf.area();
+    let mut out = String::new();
+    for y in area.top()..area.bottom() {
+        if y > area.top() {
+            out.push('\n');
+        }
+        let mut active = Style::default();
+        for x in area.left()..area.right() {
+            let cell = &buf[(x, y)];
+            let style = normalize(cell.style());
+            if style != active {
+                if !is_plain(active) {
+                    // Clear whatever the previous style left active before
+                    // applying the next one (or nothing, if plain).
+                    out.push_str("\u{1b}[0m");
+                }
+                if !is_plain(style) {
+                    let mut params: Vec<String> = Vec::new();
+                    if let Some(p) = sgr_fg(style.fg.unwrap_or(Color::Reset)) {
+                        params.push(p);
+                    }
+                    if let Some(p) = sgr_bg(style.bg.unwrap_or(Color::Reset)) {
+                        params.push(p);
+                    }
+                    if style.add_modifier.contains(Modifier::BOLD) {
+                        params.push("1".to_string());
+                    }
+                    if style.add_modifier.contains(Modifier::DIM) {
+                        params.push("2".to_string());
+                    }
+                    if style.add_modifier.contains(Modifier::ITALIC) {
+                        params.push("3".to_string());
+                    }
+                    if style.add_modifier.contains(Modifier::UNDERLINED) {
+                        params.push("4".to_string());
+                    }
+                    if style.add_modifier.contains(Modifier::REVERSED) {
+                        params.push("7".to_string());
+                    }
+                    let _ = write!(out, "\u{1b}[{}m", params.join(";"));
+                }
+                active = style;
+            }
+            if !cell.skip {
+                out.push_str(cell.symbol());
+            }
+        }
+        if !is_plain(active) {
+            out.push_str("\u{1b}[0m");
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +335,76 @@ mod tests {
     #[test]
     fn error_replies_escape_their_message() {
         assert!(error_reply(r#"bad "quote""#).contains(r#"\"quote\""#));
+    }
+
+    #[test]
+    fn ctrl_modifier_composes_with_multi_byte_utf8_char() {
+        let k = parse_key("ctrl+é").expect("ctrl+é");
+        assert_eq!(k.code, KeyCode::Char('é'));
+        assert!(k.modifiers.contains(KeyModifiers::CONTROL));
+    }
+
+    #[test]
+    fn keypress_rejects_non_string_key_element() {
+        assert!(parse_command(r#"{"cmd":"keypress","keys":[5]}"#).is_err());
+    }
+
+    #[test]
+    fn stacked_modifiers_compose() {
+        let k = parse_key("ctrl+shift+a").expect("ctrl+shift+a");
+        assert_eq!(k.code, KeyCode::Char('a'));
+        assert!(k.modifiers.contains(KeyModifiers::CONTROL));
+        assert!(k.modifiers.contains(KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn dangling_modifier_prefix_is_an_error_but_bare_plus_is_a_char() {
+        assert!(parse_key("ctrl+").is_err());
+        assert_eq!(parse_key("+").unwrap().code, KeyCode::Char('+'));
+    }
+
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn plain_buffer_serialises_to_plain_rows() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
+        buf.set_string(0, 0, "abc", Style::default());
+        buf.set_string(0, 1, "def", Style::default());
+        assert_eq!(buffer_to_ansi(&buf), "abc\ndef");
+    }
+
+    #[test]
+    fn styled_runs_emit_sgr_once_and_reset_at_end_of_row() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "ab", Style::default().fg(Color::Green));
+        buf.set_string(2, 0, "cd", Style::default());
+        let out = buffer_to_ansi(&buf);
+        // One green introducer, not one per cell.
+        assert_eq!(out.matches("\u{1b}[32m").count(), 1, "{out:?}");
+        assert!(out.contains("ab"), "{out:?}");
+        assert!(out.ends_with("\u{1b}[0m") || out.ends_with("cd"), "{out:?}");
+    }
+
+    #[test]
+    fn trailing_blanks_are_preserved_so_rows_align() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
+        buf.set_string(0, 0, "hi", Style::default());
+        let row = buffer_to_ansi(&buf);
+        assert!(row.starts_with("hi"), "{row:?}");
+        assert_eq!(row.chars().filter(|c| *c == ' ').count(), 3, "{row:?}");
+    }
+
+    #[test]
+    fn output_is_deterministic_for_the_same_buffer() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 2));
+        buf.set_string(0, 0, "one", Style::default().fg(Color::Red));
+        buf.set_string(0, 1, "two", Style::default());
+        assert_eq!(buffer_to_ansi(&buf), buffer_to_ansi(&buf));
+    }
+
+    #[test]
+    fn an_empty_buffer_is_an_empty_string() {
+        let buf = Buffer::empty(Rect::new(0, 0, 0, 0));
+        assert_eq!(buffer_to_ansi(&buf), "");
     }
 }
