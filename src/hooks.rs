@@ -59,13 +59,72 @@ pub struct HookMatcher {
 }
 
 impl HookMatcher {
-    /// True when this group applies to `target` (a tool name; Stop hooks use
-    /// an empty target and match everything).
+    /// True when this group applies to `target` (a tool name; Stop and
+    /// lifecycle hooks use an empty target and match everything).
+    ///
+    /// Each `|`-separated alternative is either a bare tool name (`bash`) or a
+    /// name with an argument glob in parentheses (`bash(git *)`, `write(*.md)`).
+    /// An argument alternative matches when the name matches *and* the glob
+    /// matches at least one of `arg_values` (the tool call's argument values).
     #[must_use]
-    pub fn matches(&self, target: &str) -> bool {
+    pub fn matches(&self, target: &str, arg_values: &[&str]) -> bool {
         let m = self.matcher.trim();
-        m.is_empty() || m.split('|').any(|p| p.trim() == target)
+        if m.is_empty() {
+            return true;
+        }
+        m.split('|').any(|alt| {
+            let alt = alt.trim();
+            if let Some((name, pat)) = split_arg_matcher(alt) {
+                name == target && arg_values.iter().any(|v| glob_match(pat, v))
+            } else {
+                alt == target
+            }
+        })
     }
+}
+
+/// Splits a `name(pattern)` matcher alternative into its parts. Returns `None`
+/// for a bare name (no parentheses), so callers fall back to name-only matching.
+fn split_arg_matcher(alt: &str) -> Option<(&str, &str)> {
+    let open = alt.find('(')?;
+    let close = alt.strip_suffix(')')?.len();
+    if close < open {
+        return None;
+    }
+    Some((alt[..open].trim(), alt[open + 1..close].trim()))
+}
+
+/// Minimal shell-style glob: `*` matches any run (including empty), `?` matches
+/// one character; every other character is literal. Used for argument matchers
+/// like `git *` or `*.md`. Operates on bytes, which is fine for the ASCII-ish
+/// command and path fragments these patterns target.
+#[must_use]
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let (p, t) = (pattern.as_bytes(), text.as_bytes());
+    // Iterative backtracking matcher: `star` remembers the last `*` position so
+    // a later mismatch can retry consuming one more text byte.
+    let (mut pi, mut ti) = (0, 0);
+    let (mut star, mut star_ti): (Option<usize>, usize) = (None, 0);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == b'*' {
+            star = Some(pi);
+            star_ti = ti;
+            pi += 1;
+        } else if let Some(sp) = star {
+            pi = sp + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == b'*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Every event name plank recognizes in a hooks config. A config naming any
@@ -386,7 +445,20 @@ fn read_all<R: std::io::Read>(pipe: Option<R>) -> String {
 /// user-visible warnings.
 #[must_use]
 pub fn run_event(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) -> HookOutcome {
-    run_event_inner(groups, target, input, cwd, false)
+    run_event_inner(groups, target, &[], input, cwd, false)
+}
+
+/// Like [`run_event`], but `arg_values` (the tool call's argument values) are
+/// available to argument matchers such as `bash(git *)`.
+#[must_use]
+pub fn run_event_args(
+    groups: &[HookMatcher],
+    target: &str,
+    arg_values: &[&str],
+    input: &str,
+    cwd: &Path,
+) -> HookOutcome {
+    run_event_inner(groups, target, arg_values, input, cwd, false)
 }
 
 /// Like [`run_event`], but exit-0 stdout of each matching hook is collected as
@@ -395,19 +467,20 @@ pub fn run_event(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) 
 /// `PostCompact`).
 #[must_use]
 pub fn run_event_ctx(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) -> HookOutcome {
-    run_event_inner(groups, target, input, cwd, true)
+    run_event_inner(groups, target, &[], input, cwd, true)
 }
 
 fn run_event_inner(
     groups: &[HookMatcher],
     target: &str,
+    arg_values: &[&str],
     input: &str,
     cwd: &Path,
     capture_context: bool,
 ) -> HookOutcome {
     let mut outcome = HookOutcome::default();
     let mut context = String::new();
-    for group in groups.iter().filter(|g| g.matches(target)) {
+    for group in groups.iter().filter(|g| g.matches(target, arg_values)) {
         for def in &group.hooks {
             // async hooks are fire-and-forget: spawn, ignore result, never block.
             if def.is_async {
@@ -727,14 +800,54 @@ mod tests {
             matcher: "bash | edit".to_string(),
             hooks: Vec::new(),
         };
-        assert!(m.matches("bash"));
-        assert!(m.matches("edit"));
-        assert!(!m.matches("read"));
+        assert!(m.matches("bash", &[]));
+        assert!(m.matches("edit", &[]));
+        assert!(!m.matches("read", &[]));
         let all = HookMatcher {
             matcher: String::new(),
             hooks: Vec::new(),
         };
-        assert!(all.matches("anything"));
+        assert!(all.matches("anything", &[]));
+    }
+
+    #[test]
+    fn argument_matchers() {
+        let bash_git = HookMatcher {
+            matcher: "bash(git *)".to_string(),
+            hooks: Vec::new(),
+        };
+        assert!(bash_git.matches("bash", &["git status"]));
+        assert!(!bash_git.matches("bash", &["ls -la"]));
+        // Name mismatch never matches, whatever the args.
+        assert!(!bash_git.matches("edit", &["git status"]));
+
+        let write_md = HookMatcher {
+            matcher: "write(*.md)".to_string(),
+            hooks: Vec::new(),
+        };
+        assert!(write_md.matches("write", &["notes.md"]));
+        assert!(!write_md.matches("write", &["main.rs"]));
+
+        // Mixed alternation: a bare name and an argument matcher together.
+        let mixed = HookMatcher {
+            matcher: "read | bash(rm *)".to_string(),
+            hooks: Vec::new(),
+        };
+        assert!(mixed.matches("read", &["anything"]));
+        assert!(mixed.matches("bash", &["rm -rf x"]));
+        assert!(!mixed.matches("bash", &["ls"]));
+    }
+
+    #[test]
+    fn glob_match_basics() {
+        assert!(glob_match("git *", "git status"));
+        assert!(glob_match("*.md", "a/b/c.md"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac"));
+        assert!(!glob_match("git *", "gito"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("exact", "exactly"));
     }
 
     fn one(cmd: &str, matcher: &str) -> Vec<HookMatcher> {

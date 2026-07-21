@@ -154,6 +154,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
         return ToolResult::from_output("Tool error: missing tool name\n".to_string());
     }
+    // Argument values feed argument matchers like `bash(git *)`.
+    let arg_values: Vec<&str> = call.args.iter().map(|a| a.value.as_str()).collect();
     // PreToolUse hooks: exit 2 blocks the tool, its stderr becomes the
     // model-visible tool error.
     if !ctx.hooks.pre_tool_use.is_empty() {
@@ -164,7 +166,13 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             None,
             &ctx.cwd,
         );
-        let pre = crate::hooks::run_event(&ctx.hooks.pre_tool_use, &call.name, &input, &ctx.cwd);
+        let pre = crate::hooks::run_event_args(
+            &ctx.hooks.pre_tool_use,
+            &call.name,
+            &arg_values,
+            &input,
+            &ctx.cwd,
+        );
         ctx.hook_warnings.extend(pre.warnings);
         ctx.hook_warnings.extend(pre.system_messages);
         if ctx.hook_stop.is_none() {
@@ -205,7 +213,13 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             Some(&output),
             &ctx.cwd,
         );
-        let post = crate::hooks::run_event(&ctx.hooks.post_tool_use, &call.name, &input, &ctx.cwd);
+        let post = crate::hooks::run_event_args(
+            &ctx.hooks.post_tool_use,
+            &call.name,
+            &arg_values,
+            &input,
+            &ctx.cwd,
+        );
         ctx.hook_warnings.extend(post.warnings);
         ctx.hook_warnings.extend(post.system_messages);
         if ctx.hook_stop.is_none() {
@@ -219,39 +233,51 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         }
     }
     // PostToolUseFailure hooks: fire only when the tool failed (the C
-    // `Tool error:` convention). Its exit-2 stderr is appended like a
-    // PostToolUse block; success never reaches here.
+    // `Tool error:` convention); success never reaches here.
     if output.starts_with("Tool error:") && !ctx.hooks.post_tool_use_failure.is_empty() {
-        // plank has no per-tool interrupt tracking in the dispatch path, so the
-        // `is_interrupt` flag the reference carries is always false here; it is
-        // still emitted so hooks can rely on the field being present.
-        let base = crate::hooks::tool_event_input(
-            "PostToolUseFailure",
-            &call.name,
-            &mcp::args_to_json(call),
-            Some(&output),
-            &ctx.cwd,
-        );
-        let input = format!("{},\"is_interrupt\":false}}", &base[..base.len() - 1]);
-        let fail = crate::hooks::run_event(
-            &ctx.hooks.post_tool_use_failure,
-            &call.name,
-            &input,
-            &ctx.cwd,
-        );
-        ctx.hook_warnings.extend(fail.warnings);
-        ctx.hook_warnings.extend(fail.system_messages);
-        if ctx.hook_stop.is_none() {
-            ctx.hook_stop = fail.stop_reason;
-        }
-        if let Some(msg) = fail.block {
-            if !output.ends_with('\n') {
-                output.push('\n');
-            }
-            let _ = writeln!(output, "[PostToolUseFailure hook] {msg}");
-        }
+        fire_post_tool_failure(ctx, call, &arg_values, &mut output);
     }
     ToolResult::from_output(output)
+}
+
+/// Fires the `PostToolUseFailure` hooks and appends any exit-2 block message to
+/// `output`, mirroring the `PostToolUse` block framing. Split out of `dispatch`
+/// to keep it under the function-length lint.
+fn fire_post_tool_failure(
+    ctx: &mut ToolContext,
+    call: &ToolCall,
+    arg_values: &[&str],
+    output: &mut String,
+) {
+    // plank has no per-tool interrupt tracking in the dispatch path, so the
+    // `is_interrupt` flag the reference carries is always false here; it is
+    // still emitted so hooks can rely on the field being present.
+    let base = crate::hooks::tool_event_input(
+        "PostToolUseFailure",
+        &call.name,
+        &mcp::args_to_json(call),
+        Some(output),
+        &ctx.cwd,
+    );
+    let input = format!("{},\"is_interrupt\":false}}", &base[..base.len() - 1]);
+    let fail = crate::hooks::run_event_args(
+        &ctx.hooks.post_tool_use_failure,
+        &call.name,
+        arg_values,
+        &input,
+        &ctx.cwd,
+    );
+    ctx.hook_warnings.extend(fail.warnings);
+    ctx.hook_warnings.extend(fail.system_messages);
+    if ctx.hook_stop.is_none() {
+        ctx.hook_stop = fail.stop_reason;
+    }
+    if let Some(msg) = fail.block {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "[PostToolUseFailure hook] {msg}");
+    }
 }
 
 /// Executes all calls of one DSML block, framing each result with its label.
