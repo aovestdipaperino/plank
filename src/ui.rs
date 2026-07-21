@@ -5713,7 +5713,13 @@ mod tests {
     }
 
     #[test]
-    fn keypress_answers_at_once_and_snapshot_waits_for_the_post_key_frame() {
+    fn keypress_answers_at_once_and_service_replies_once_captured_is_set() {
+        // This test drives the queueing/reply plumbing (`drain`'s
+        // classification, `service`'s reply wiring) with `captured` set by
+        // hand. The early-return gate inside `capture()` itself — which is
+        // what actually decides *whether* a frame gets captured — is
+        // exercised for real by the `capture_*` tests below using a
+        // `TestBackend` frame.
         let mut r = UiRemote::detached();
         let (keys, keys_rx) = pending(crate::uiremote::RemoteCmd::Keypress(vec![
             KeyEvent::from(KeyCode::Char('h')),
@@ -5749,6 +5755,79 @@ mod tests {
         assert!(reply.contains(r#""cols":80"#), "{reply}");
         assert!(reply.contains(r#""rows":24"#), "{reply}");
         assert!(r.deferred.is_empty());
+    }
+
+    /// Draws one `TestBackend` frame and runs `r.capture(frame)` on it,
+    /// inside the closure passed to `Terminal::draw` (mirroring how the real
+    /// TUI loops call `capture` as the last statement of the draw closure).
+    fn capture_one_frame(r: &mut UiRemote) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(10, 3)).unwrap();
+        term.draw(|f| r.capture(f)).unwrap();
+    }
+
+    #[test]
+    fn capture_records_nothing_while_keys_are_still_queued() {
+        // This is the first of `capture`'s two early returns: a draw that
+        // happens mid-key-sequence (`injected` non-empty) must not satisfy a
+        // deferred snapshot/uitree request, even though one is pending —
+        // otherwise a harness could read a screen that hasn't seen all the
+        // keys it just sent.
+        let mut r = UiRemote::detached();
+        let (snap, _snap_rx) = pending(crate::uiremote::RemoteCmd::Snapshot);
+        r.deferred.push(snap);
+        r.injected
+            .push_back(Event::Key(KeyEvent::from(KeyCode::Char('x'))));
+
+        capture_one_frame(&mut r);
+
+        assert!(
+            r.captured.is_none(),
+            "capture() must not record a frame while injected keys remain queued"
+        );
+    }
+
+    #[test]
+    fn capture_records_the_frame_once_injected_keys_are_drained() {
+        // Second half of the same gate: once every injected key has been
+        // consumed (by `next_event`, in the real loop) and a deferred request
+        // is still waiting, the very next draw must be captured — this is
+        // what lets a harness send `keypress` then `snapshot` with no sleep
+        // and get the post-key screen.
+        let mut r = UiRemote::detached();
+        let (snap, _snap_rx) = pending(crate::uiremote::RemoteCmd::Snapshot);
+        r.deferred.push(snap);
+        assert!(r.injected.is_empty());
+
+        capture_one_frame(&mut r);
+
+        assert!(
+            r.captured.is_some(),
+            "capture() must record the frame once injected is empty and a request is deferred"
+        );
+        let (ansi, tree, cols, rows) = r.captured.as_ref().unwrap();
+        assert_eq!(*cols, 10);
+        assert_eq!(*rows, 3);
+        assert!(!ansi.is_empty());
+        assert!(!tree.is_empty());
+    }
+
+    #[test]
+    fn capture_records_nothing_when_nothing_is_deferred() {
+        // Second early return: with no deferred request at all, a draw is
+        // inert regardless of `injected` — there's nothing for it to answer,
+        // and it must not leave a stale `captured` behind for a request that
+        // arrives later (which would then race the *next* real capture).
+        let mut r = UiRemote::detached();
+        assert!(r.deferred.is_empty());
+
+        capture_one_frame(&mut r);
+
+        assert!(
+            r.captured.is_none(),
+            "capture() must not record a frame when nothing is deferred"
+        );
     }
 
     #[test]

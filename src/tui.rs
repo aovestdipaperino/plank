@@ -455,9 +455,11 @@ fn frame_rows(
     // the structural regions published here; `render_input` and `render_popup`
     // append their own regions later in the same pass.
     crate::uiremote::begin_frame();
-    crate::uiremote::region("root", area, &[]);
-    crate::uiremote::region("output", output, &[]);
-    crate::uiremote::region("status", status, &[]);
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::region("root", area, &[]);
+        crate::uiremote::region("output", output, &[]);
+        crate::uiremote::region("status", status, &[]);
+    }
     if let Some(rule) = rule {
         let text = "─".repeat(rule.width as usize);
         frame.render_widget(
@@ -564,24 +566,26 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
     if area.height == 0 || popup.rows().is_empty() {
         return;
     }
-    crate::uiremote::region(
-        "popup",
-        area,
-        &[
-            (
-                "rows",
-                crate::tools::mcp::Json::Num(f64::from(
-                    u32::try_from(popup.rows().len()).unwrap_or(u32::MAX),
-                )),
-            ),
-            (
-                "selected",
-                crate::tools::mcp::Json::Num(f64::from(
-                    u32::try_from(popup.selected()).unwrap_or(u32::MAX),
-                )),
-            ),
-        ],
-    );
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::region(
+            "popup",
+            area,
+            &[
+                (
+                    "rows",
+                    crate::tools::mcp::Json::Num(f64::from(
+                        u32::try_from(popup.rows().len()).unwrap_or(u32::MAX),
+                    )),
+                ),
+                (
+                    "selected",
+                    crate::tools::mcp::Json::Num(f64::from(
+                        u32::try_from(popup.selected()).unwrap_or(u32::MAX),
+                    )),
+                ),
+            ],
+        );
+    }
     frame.render_widget(Clear, area);
     let items: Vec<ListItem> = popup
         .rows()
@@ -647,11 +651,13 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
     // typed without decoding the ANSI snapshot. It is registered here rather
     // than in `frame_rows` because only this function sees the text; while the
     // agent is busy no prompt is drawn and no `input` region appears.
-    crate::uiremote::region(
-        "input",
-        input_area,
-        &[("text", crate::tools::mcp::Json::Str(input.to_string()))],
-    );
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::region(
+            "input",
+            input_area,
+            &[("text", crate::tools::mcp::Json::Str(input.to_string()))],
+        );
+    }
     let prompt = crate::status::prompt_text();
     let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
     let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
