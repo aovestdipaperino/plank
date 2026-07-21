@@ -1,16 +1,19 @@
 name: Promote beta to stable
 
-# Promotes the current beta (the highest major version) to the stable
-# channel, then opens the next major as the new, empty beta:
+# Promotes the current beta (the highest major.minor series) to the stable
+# channel, then opens the next minor as the new, empty beta:
 #
-#   1. Finds the latest release of the highest major (e.g. v8.3.1).
+#   1. Finds the latest release of the highest series (e.g. v2.3.7).
 #   2. Marks that GitHub release as a full (non-prerelease) release.
 #   3. Points the stable `plank` Homebrew formula at it, reusing the
 #      `plank-*.bottle.tar.gz` assets already built by release.yml
 #      (beta releases upload bottles under both formula names).
-#   4. Bumps Cargo.toml on main to the next major (e.g. 9.0.0), commits,
-#      tags v9.0.0, and publishes it as a prerelease — release.yml then
+#   4. Bumps Cargo.toml on main to the next minor (e.g. 2.4.0), commits,
+#      tags v2.4.0, and publishes it as a prerelease — release.yml then
 #      picks it up and seeds the new `plank-beta` formula.
+#
+# Majors are never bumped here. A major bump is a deliberate, manual
+# decision; promotion only ever advances the minor.
 #
 # Requires TAP_GITHUB_TOKEN to be a PAT with push access to BOTH
 # aovestdipaperino/homebrew-tap and this repo: releases created with the
@@ -26,7 +29,7 @@ concurrency: promote
 
 jobs:
   promote:
-    name: Promote and open next major
+    name: Promote and open next minor
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -40,14 +43,19 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          MAX_MAJOR=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1 | sort -n | tail -1)
-          TAG=$(git tag -l "v${MAX_MAJOR}.*" | sed 's/^v//' | sort -V | tail -1)
+          # Highest major.minor series, compared numerically on both
+          # components so 2.10 sorts above 2.9.
+          MAX_SERIES=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1,2 \
+            | sort -t. -k1,1n -k2,2n -u | tail -1)
+          MAJOR="${MAX_SERIES%%.*}"
+          MINOR="${MAX_SERIES#*.}"
+          TAG=$(git tag -l "v${MAX_SERIES}.*" | sed 's/^v//' | sort -V | tail -1)
           TAG="v${TAG}"
           VERSION="${TAG#v}"
-          echo "Promoting $TAG (major $MAX_MAJOR) to stable"
+          echo "Promoting $TAG (series $MAX_SERIES) to stable"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "next_version=$((MAX_MAJOR + 1)).0.0" >> "$GITHUB_OUTPUT"
+          echo "next_version=${MAJOR}.$((MINOR + 1)).0" >> "$GITHUB_OUTPUT"
 
       - name: Download stable-named bottles from the beta release
         env:
@@ -115,7 +123,7 @@ jobs:
           git diff --cached --quiet || git commit -m "plank ${VERSION} (promoted from beta)"
           git push
 
-      - name: Open next major beta
+      - name: Open next minor beta
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
@@ -141,5 +149,5 @@ jobs:
           gh release create "v${NEW}" \
             --prerelease \
             --title "v${NEW} (beta)" \
-            --notes "Opens the v${NEW%%.*} beta channel. Promoted v${OLD} to stable." \
+            --notes "Opens the v${NEW%.*} beta series. Promoted v${OLD} to stable." \
             --repo "${{ github.repository }}"

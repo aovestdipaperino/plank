@@ -2,24 +2,33 @@
 
 Plank ships through Homebrew only (`aovestdipaperino/homebrew-tap`); it is not
 published to crates.io. Releases follow a two-channel scheme driven entirely by
-the major version number:
+the `MAJOR.MINOR` series:
 
-- **Beta** — the highest major version across all `v*` tags. Releases in that
-  major update the `plank-beta` formula and are published as GitHub
+- **Beta** — the highest `MAJOR.MINOR` series across all `v*` tags. Releases in
+  that series update the `plank-beta` formula and are published as GitHub
   prereleases.
-- **Stable** — every major below the highest. Releases there update the
+- **Stable** — every series below the highest. Releases there update the
   `plank` formula.
 
+Within the beta series, **every release is a patch bump** — bug fixes and new
+features alike. A beta that opens at `v2.4.0` accumulates `v2.4.1`, `v2.4.2`,
+and so on for as long as it stays open; the minor never moves while the series
+is the beta.
+
 `release.yml` derives the channel automatically: when a GitHub release is
-published, it compares the tag's major against the highest tagged major and
-routes the bottles to the matching formula. There is no channel flag anywhere —
-the tag number *is* the channel.
+published, it compares the tag's `MAJOR.MINOR` against the highest tagged
+series and routes the bottles to the matching formula. There is no channel flag
+anywhere — the tag number *is* the channel.
+
+Majors are never bumped by automation. A major bump is a deliberate, manual
+decision, made by editing `Cargo.toml` and tagging directly; nothing in the
+release machinery produces one.
 
 ## Promoting a beta to stable
 
-Promotion flips the current beta major to the stable channel and opens the
-next major as the new, initially empty, beta. For example, promoting while
-v8.3.1 is the latest beta makes v8.3.1 the stable release and creates v9.0.0
+Promotion flips the current beta series to the stable channel and opens the
+next **minor** as the new, initially empty, beta. For example, promoting while
+v2.3.7 is the latest beta makes v2.3.7 the stable release and creates v2.4.0
 as the new beta.
 
 ### Prerequisites
@@ -45,12 +54,13 @@ gh workflow run promote.yml
 ```
 
 It takes no inputs; it always promotes the latest release of the highest
-major. A `concurrency: promote` group prevents overlapping runs.
+series. A `concurrency: promote` group prevents overlapping runs.
 
 ### What the workflow does
 
-1. **Finds the current beta**: the highest tagged major, and the latest
-   version within it (e.g. `v8.3.1`).
+1. **Finds the current beta**: the highest tagged `MAJOR.MINOR` series, and
+   the latest version within it (e.g. `v2.3.7`). The series comparison is
+   numeric on both components, so `2.10` correctly outranks `2.9`.
 2. **Downloads the stable-named bottles** from that beta release and aborts if
    any expected bottle is missing.
 3. **Marks the GitHub release as stable**: clears the prerelease flag and
@@ -58,26 +68,26 @@ major. A `concurrency: promote` group prevents overlapping runs.
 4. **Rewrites `Formula/plank.rb` in the tap** to point at the promoted tag,
    with fresh SHA-256s for the source tarball and both bottles, and pushes the
    commit (`plank <version> (promoted from beta)`).
-5. **Opens the next major beta**: bumps `Cargo.toml` (and `Cargo.lock`) on
-   `main` to `<major+1>.0.0`, commits, tags `v<major+1>.0.0`, and publishes it
-   as a prerelease. `release.yml` then fires on that release and seeds the new
+5. **Opens the next minor beta**: bumps `Cargo.toml` (and `Cargo.lock`) on
+   `main` to `<major>.<minor+1>.0`, commits, tags it, and publishes it as a
+   prerelease. `release.yml` then fires on that release and seeds the new
    `plank-beta` formula with freshly built bottles.
 
 ### After promotion
 
 - `brew upgrade plank` picks up the promoted version; `plank-beta` users move
-  onto the new major with its first beta release.
-- Subsequent releases tagged under the new highest major go to beta;
-  patch/minor tags under the promoted (now stable) major go straight to the
-  stable formula — useful for hotfixing stable without touching the beta.
+  onto the new minor with its first beta release.
+- Subsequent releases tagged under the new highest series go to beta; patch
+  tags under the promoted (now stable) series go straight to the stable
+  formula — useful for hotfixing stable without touching the beta.
 
 ### Verifying
 
 - The promoted GitHub release shows as **Latest** (not prerelease), and a
-  `v<major+1>.0.0` prerelease exists.
+  `v<major>.<minor+1>.0` prerelease exists.
 - `homebrew-tap` has two new commits: the updated `Formula/plank.rb` and,
   once `release.yml` finishes, the seeded `Formula/plank-beta.rb`.
-- `main` has the version-bump commit (`Open v<major+1>.0.0 beta channel`).
+- `main` has the version-bump commit (`Open v<major>.<minor+1>.0 beta channel`).
 
 Note the two formulas conflict (both install a `plank` binary), so users
 switch channels with `brew uninstall plank && brew install plank-beta` or the
@@ -85,31 +95,35 @@ reverse.
 
 ## Hotfixing a stable release
 
-Once a major has been promoted to stable, the beta lives in a higher major, so
+Once a series has been promoted to stable, the beta lives in a higher minor, so
 you can ship a fix to stable without touching the beta. `release.yml` routes by
-major automatically: a tag whose major is **below** the highest tagged major
-updates the `plank` (stable) formula; the highest major updates `plank-beta`.
-So a patch or minor tag under the promoted major is a stable-only release. (The
-v0.9.10 release was exactly this: a hotfix cut against stable while the v1 beta
-was already open.)
+series automatically: a tag whose `MAJOR.MINOR` is **below** the highest tagged
+series updates the `plank` (stable) formula; the highest series updates
+`plank-beta`. So a patch tag under the promoted series is a stable-only
+release. (The v0.9.10 release was exactly this: a hotfix cut against stable
+while the next beta was already open.)
+
+> ⚠️ A stable hotfix must bump **only the patch**. Bumping the minor would
+> land the tag in the beta series — or overtake it — and the fix would be
+> routed to `plank-beta` instead of `plank`. If a stable-only change is too
+> large for a patch, it is not a hotfix; carry it in the beta and let the next
+> promotion ship it.
 
 ### Running it
 
-Do the work off `main` — `main` tracks the beta major and its version must stay
-at `<beta-major>.0.0` or higher, so bumping it would not describe a stable
-patch.
+Do the work off `main` — `main` tracks the beta series, so bumping it would not
+describe a stable patch.
 
 1. Branch from the stable tag, not `main`:
    `git switch -c hotfix/x.y.z vX.Y.Z`.
 2. Commit the fix, keeping it minimal.
 3. Bump `Cargo.toml` (and `Cargo.lock`) to the next patch under the stable
-   major (`X.Y.(Z+1)`, or `X.(Y+1).0` for a larger stable-only change), commit,
-   and tag `vX.Y.(Z+1)`.
+   series (`X.Y.(Z+1)`), commit, and tag `vX.Y.(Z+1)`.
 4. Push the branch and the tag, then create a GitHub release for the tag as a
    normal release (**not** a prerelease). Create it with the `gh` CLI or a PAT,
    not the automation `GITHUB_TOKEN` — releases made with `GITHUB_TOKEN` do not
    trigger `release.yml`.
-5. `release.yml` fires, sees the tag's major is below the highest, builds
+5. `release.yml` fires, sees the tag's series is below the highest, builds
    bottles, and rewrites `Formula/plank.rb` for the new version. `plank-beta`
    is left alone.
 6. **Forward-port the fix to the beta** so it survives the next promotion:
@@ -137,6 +151,17 @@ marker, classifies the transition, and cleans up):
 | Major (`X.0.0`), downgrade, or missing marker | The sysprompt checkpoint **and** the image cache are dropped |
 
 Session transcripts (`kvcache/*.session`) are user data and are never
-removed. When cutting a release, pick the component accordingly: bump at
-least minor when the sysprompt text or engine snapshot format changes, and
-major when older cached state must not be trusted at all.
+removed.
+
+Because beta releases are always patch bumps, a sysprompt change shipped in
+beta no longer triggers the minor-bump cache drop. That is safe: the
+`sysprompt.kv` checkpoint carries a fingerprint of the prompt text
+(`Ds4Engine::checkpoint_fingerprint`) and is rebuilt whenever the fingerprint
+does not match, so a stale checkpoint is never trusted. The `upgrade.rs` drop
+is an optimisation that avoids carrying dead bytes on disk, not the mechanism
+that guarantees correctness.
+
+The minor bump still happens at every promotion, so each beta-to-stable
+transition clears the checkpoint once. A major bump — the only transition that
+also drops the image cache — remains a manual decision, appropriate when older
+cached state must not be trusted at all.

@@ -1,10 +1,11 @@
 name: Release
 
-# Channel model: the highest major version is always the beta channel.
-# A release whose major == the highest major across all tags goes to the
+# Channel model: the highest MAJOR.MINOR series is always the beta channel.
+# A release whose major.minor == the highest across all tags goes to the
 # `plank-beta` Homebrew formula; anything below that is a stable release
 # and updates the `plank` formula. Promotion (promote.yml) flips the
-# current beta major to stable and opens the next major as the new beta.
+# current beta series to stable and opens the next minor as the new beta,
+# so beta work accumulates as patch releases within one minor series.
 #
 # Homebrew (aovestdipaperino/homebrew-tap) is the ONLY distribution
 # channel — plank is macOS-only and is not published to crates.io.
@@ -31,20 +32,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Detect channel from major version
+      - name: Detect channel from major.minor series
         id: detect
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          MAJOR="${VERSION%%.*}"
-          MAX_MAJOR=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1 | sort -n | tail -1)
-          if [ "$MAJOR" -eq "$MAX_MAJOR" ]; then
+          SERIES=$(echo "$VERSION" | cut -d. -f1,2)
+          # Highest major.minor across all tags, compared numerically on both
+          # components so 2.10 sorts above 2.9.
+          MAX_SERIES=$(git tag -l 'v*' | sed 's/^v//' | cut -d. -f1,2 \
+            | sort -t. -k1,1n -k2,2n -u | tail -1)
+          if [ "$SERIES" = "$MAX_SERIES" ]; then
             CHANNEL=beta
           else
             CHANNEL=stable
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "channel=$CHANNEL" >> "$GITHUB_OUTPUT"
-          echo "Release $VERSION (major $MAJOR, highest major $MAX_MAJOR) -> $CHANNEL"
+          echo "Release $VERSION (series $SERIES, highest series $MAX_SERIES) -> $CHANNEL"
 
   build:
     name: Build ${{ matrix.name }}
