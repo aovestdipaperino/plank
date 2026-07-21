@@ -371,6 +371,12 @@ fn now_secs() -> u64 {
 fn render_transcript(session: &Session, system: &str) -> String {
     use std::fmt::Write as _;
     let mut out = format!("[system]\n{system}\n");
+    // The task list (issue #35) is injected fresh every turn from session
+    // state, so it costs a fixed few tokens and is never summarized away by
+    // compaction. An empty list adds nothing.
+    if let Some(block) = session.tasks.inject_block() {
+        let _ = write!(out, "[user]\n{block}\n");
+    }
     for m in &session.transcript {
         let tag = match m.role {
             crate::session::Role::User => "user",
@@ -802,8 +808,21 @@ impl Agent<'_> {
 
     /// Runs one model turn: stream text, execute tool calls, repeat until
     /// a turn produces no tool calls. Compacts first when context is tight.
+    /// Mirrors the live task list back onto the session after a tool dispatch
+    /// may have mutated it, so the persisted/rendered copy stays current and
+    /// the session is marked dirty when the list actually changed.
+    fn sync_tasks_after_dispatch(&mut self) {
+        if self.session.tasks != self.tool_ctx.tasks {
+            self.session.tasks.clone_from(&self.tool_ctx.tasks);
+            self.session.dirty = true;
+        }
+    }
+
     fn run_turn(&mut self) -> Result<(), String> {
         self.tool_ctx.skill_invocations = 0;
+        // The session owns the persisted task list; load it into the live tool
+        // context so the `task` tool mutates the copy that renders and saves.
+        self.tool_ctx.tasks.clone_from(&self.session.tasks);
         self.maybe_compact()?;
         self.maybe_append_system_prompt_reminder();
         // One clock for the whole turn: elapsed time accumulates across the
@@ -856,8 +875,12 @@ impl Agent<'_> {
             }
             if !finished.calls.is_empty() {
                 let observations = dispatch_all(finished.calls, &mut self.tool_ctx);
+                self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
+                for line in std::mem::take(&mut self.tool_ctx.task_completions) {
+                    println!("{}", self.debug_line(&format!("✓ {line}")));
+                }
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let line = if self.color {
                         format!("\x1b[38;5;238m{warning}{ANSI_RESET}")
@@ -1520,6 +1543,7 @@ impl Agent<'_> {
             "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             "/btw" => {
@@ -2270,6 +2294,7 @@ impl Agent<'_> {
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
+            let task_view = tui::TaskView::from(&self.session.tasks);
             terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
@@ -2285,6 +2310,7 @@ impl Agent<'_> {
                             input.cursor_pos(),
                             &status,
                             &mut view,
+                            &task_view,
                         );
                     } else {
                         tui::draw(
@@ -2295,6 +2321,7 @@ impl Agent<'_> {
                             &status,
                             &mut view,
                             selection.map(|(a, b)| tui::normalize_selection(a, b)),
+                            &task_view,
                         );
                     }
                     if let Some(p) = &input.popup {
@@ -2380,6 +2407,7 @@ impl Agent<'_> {
                                     &status,
                                     &mut view,
                                     Some(sel),
+                                    &task_view,
                                 );
                                 // The output area is everything above the
                                 // input and status rows.
@@ -2639,9 +2667,18 @@ impl Agent<'_> {
                     self.start.elapsed().as_secs()
                 );
                 let (log, view) = (&*self.log, &mut *self.view);
-                let _ = self
-                    .terminal
-                    .draw(|f| tui::draw(f, log, None, (0, 0), &status, view, None));
+                let _ = self.terminal.draw(|f| {
+                    tui::draw(
+                        f,
+                        log,
+                        None,
+                        (0, 0),
+                        &status,
+                        view,
+                        None,
+                        &tui::TaskView::default(),
+                    );
+                });
                 self.dirty = false;
                 while event::poll(Duration::ZERO).unwrap_or(false) {
                     if let Ok(Event::Key(k)) = event::read()
@@ -2720,8 +2757,18 @@ impl Agent<'_> {
                         ..Status::default()
                     };
                     let line = status::build_status_text(&st, false);
-                    let _ =
-                        terminal.draw(|f| tui::draw(f, log, None, (0, 0), &line, &mut view, None));
+                    let _ = terminal.draw(|f| {
+                        tui::draw(
+                            f,
+                            log,
+                            None,
+                            (0, 0),
+                            &line,
+                            &mut view,
+                            None,
+                            &tui::TaskView::default(),
+                        );
+                    });
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -2729,7 +2776,18 @@ impl Agent<'_> {
         if announced {
             log.pop_line();
             let status = self.idle_status_text();
-            let _ = terminal.draw(|f| tui::draw(f, log, None, (0, 0), &status, &mut view, None));
+            let _ = terminal.draw(|f| {
+                tui::draw(
+                    f,
+                    log,
+                    None,
+                    (0, 0),
+                    &status,
+                    &mut view,
+                    None,
+                    &tui::TaskView::default(),
+                );
+            });
         }
         Ok(())
     }
@@ -2931,6 +2989,7 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
         self.tool_ctx.skill_invocations = 0;
+        self.tool_ctx.tasks.clone_from(&self.session.tasks);
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
@@ -3009,6 +3068,11 @@ impl Agent<'_> {
             }
             if !out.calls.is_empty() {
                 let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
+                self.sync_tasks_after_dispatch();
+                for line in std::mem::take(&mut self.tool_ctx.task_completions) {
+                    let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
+                }
+                let _ = tx.send(UiEvent::Tasks(tui::TaskView::from(&self.session.tasks)));
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let _ = tx.send(UiEvent::Dim(warning));
                 }
@@ -3613,6 +3677,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/tasks" => {
+                for line in self.session.tasks.render_list().lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/agent" => {
                 for line in crate::agents::render_list(&self.agents).lines() {
                     log.push_plain(line.to_owned());
@@ -3770,6 +3839,9 @@ fn busy_ui_loop(
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
+    // Latest task-list snapshot (issue #35), updated on every `UiEvent::Tasks`
+    // and passed to `draw` for the status-bar counter and the contextual strip.
+    let mut task_view = tui::TaskView::default();
     // The `/btw` side panel (`btw`) is owned by `tui_loop`, so it survives
     // across turns: it opens on the first BtwBegin and stays up — even after
     // the answer finishes, the main task resumes, and the whole turn ends —
@@ -3794,6 +3866,7 @@ fn busy_ui_loop(
             }
             match ev {
                 UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
+                UiEvent::Tasks(tv) => task_view = tv,
                 UiEvent::BtwBegin => {
                     if btw.is_none() {
                         *btw = Some((OutputLog::new(), tui::OutputView::default()));
@@ -3844,6 +3917,7 @@ fn busy_ui_loop(
                         input.cursor_pos(),
                         &status_line,
                         view,
+                        &task_view,
                     );
                 } else {
                     tui::draw(
@@ -3854,6 +3928,7 @@ fn busy_ui_loop(
                         &status_line,
                         view,
                         None,
+                        &task_view,
                     );
                 }
                 if let Some(p) = &input.popup {
@@ -3869,7 +3944,7 @@ fn busy_ui_loop(
             // events just stop mattering.
             while let Ok(ev) = rx.try_recv() {
                 match ev {
-                    UiEvent::Status(_) | UiEvent::MainCheckpoint => {}
+                    UiEvent::Status(_) | UiEvent::MainCheckpoint | UiEvent::Tasks(_) => {}
                     UiEvent::BtwBegin => btw_active = true,
                     UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
@@ -4430,6 +4505,45 @@ mod tests {
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn render_transcript_injects_the_task_list_after_the_system_block() {
+        let mut s = Session::new();
+        s.push(Message::user("hello"));
+        // Empty list: no injection, nothing extra in the prompt.
+        assert!(!render_transcript(&s, "SYS").contains("Task list"));
+        s.tasks.add("do the thing", None);
+        s.tasks
+            .update(1, Some(crate::tasks::TaskStatus::InProgress), None, None)
+            .unwrap();
+        let rendered = render_transcript(&s, "SYS");
+        assert!(rendered.starts_with("[system]\nSYS\n"));
+        assert!(rendered.contains("# Task list"), "{rendered}");
+        assert!(
+            rendered.contains("- [1] in_progress: do the thing"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn task_list_survives_transcript_compaction() {
+        // Compaction rewrites the transcript but never the task list, so the
+        // per-turn injection keeps showing it (issue #35 acceptance).
+        let mut s = Session::new();
+        for i in 0..40 {
+            s.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "x".repeat(500)
+            )));
+            s.push(Message::assistant(format!("reply {i}")));
+        }
+        s.tasks.add("keep me across compaction", None);
+        let before = s.tasks.clone();
+        let cleared = crate::compact::microcompact(&mut s.transcript);
+        assert!(cleared > 0, "compaction should clear some large results");
+        assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
+        assert!(render_transcript(&s, "SYS").contains("keep me across compaction"));
+    }
 
     /// A `Write` sink backed by a shared buffer so a test can inspect the exact
     /// bytes the terminal renderer emits.

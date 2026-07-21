@@ -87,6 +87,13 @@ pub struct ToolContext {
     /// Skill invocations so far this turn; the turn driver resets it to 0 at
     /// the start of each turn. Bounds runaway skill-invokes-skill recursion.
     pub skill_invocations: usize,
+    /// Live model-visible task list (issue #35). The authoritative working copy
+    /// during a turn; the driver mirrors it onto the session (which serializes
+    /// it) so it survives compaction, `/resume`, and checkpoint rollback.
+    pub tasks: crate::tasks::TaskList,
+    /// Subjects of tasks the `task` tool just marked completed, drained by the
+    /// UI after each dispatch to write the single dim completion log line.
+    pub task_completions: Vec<String>,
 }
 
 /// Most `skill` invocations allowed within one turn before the tool refuses,
@@ -126,6 +133,8 @@ impl ToolContext {
             hook_warnings: Vec::new(),
             skills: Vec::new(),
             skill_invocations: 0,
+            tasks: crate::tasks::TaskList::new(),
+            task_completions: Vec::new(),
         }
     }
 
@@ -201,6 +210,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             SKILL_DEPTH_CAP,
             call,
         ),
+        "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         other => format!("Tool error: unknown tool: {other}\n"),
     };

@@ -268,3 +268,21 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "task",
+    "description": "Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "op": {"type": "string", "description": "add, update, or list"},
+        "id": {"type": "string", "description": "task id (for update)"},
+        "subject": {"type": "string", "description": "task description (for add; optional rename on update)"},
+        "status": {"type": "string", "description": "pending, in_progress, or completed (for update)"},
+        "active_form": {"type": "string", "description": "present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'"}
+      },
+      "required": ["op"]
+    }
+  }
+}

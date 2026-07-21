@@ -42,6 +42,9 @@ pub enum UiEvent {
     EndLine,
     /// Worker progress snapshot for the status footer.
     Status(Status),
+    /// Task list snapshot for the status-bar counter and the contextual strip
+    /// (issue #35), sent whenever a `task` tool call changes the list.
+    Tasks(crate::tui::TaskView),
     /// A `/btw` side answer is starting: the UI opens the side panel (if not
     /// already visible) and routes subsequent render events into it.
     BtwBegin,
@@ -306,6 +309,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),
         UiEvent::Status(_)
+        | UiEvent::Tasks(_)
         | UiEvent::BtwBegin
         | UiEvent::BtwEnd
         | UiEvent::MainCheckpoint

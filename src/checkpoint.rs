@@ -33,6 +33,8 @@ pub struct Checkpoint {
     pub summary: String,
     /// Full transcript snapshot, restored verbatim on rollback.
     pub transcript: Vec<Message>,
+    /// Task list snapshot, restored alongside the transcript (issue #35).
+    pub tasks: crate::tasks::TaskList,
     /// Serialized engine KV state; `None` when the engine has no snapshot
     /// support, in which case rollback re-prefills.
     pub kv: Option<Vec<u8>>,
@@ -86,6 +88,7 @@ impl CheckpointStore {
             created_at: unix_now(),
             summary: summarize(&session.transcript),
             transcript: session.transcript.clone(),
+            tasks: session.tasks.clone(),
             kv,
         };
         if let Some(slot) = self.entries.iter_mut().find(|c| c.name == name) {
@@ -110,6 +113,7 @@ impl CheckpointStore {
 /// this only rewinds the text state so the two stay consistent.
 pub fn restore_transcript(session: &mut Session, cp: &Checkpoint) {
     session.transcript.clone_from(&cp.transcript);
+    session.tasks.clone_from(&cp.tasks);
     session.dirty = true;
 }
 
@@ -253,6 +257,32 @@ mod tests {
         assert_eq!(session.transcript[0].text, "step one");
         assert_eq!(session.transcript[1].text, "did step one");
         assert!(session.dirty);
+    }
+
+    #[test]
+    fn rollback_restores_the_task_list_too() {
+        use crate::tasks::TaskStatus;
+        let mut store = CheckpointStore::new();
+        let mut session = session_with(&[Message::user("start")]);
+        session.tasks.add("task a", None);
+        session
+            .tasks
+            .update(1, Some(TaskStatus::InProgress), None, None)
+            .unwrap();
+        store.save("cp", &session, None);
+
+        // The list evolves past the checkpoint: a completion and a new task.
+        session
+            .tasks
+            .update(1, Some(TaskStatus::Completed), None, None)
+            .unwrap();
+        session.tasks.add("task b", None);
+        assert_eq!(session.tasks.tasks().len(), 2);
+
+        let cp = store.get("cp").unwrap().clone();
+        restore_transcript(&mut session, &cp);
+        assert_eq!(session.tasks.tasks().len(), 1);
+        assert_eq!(session.tasks.get(1).unwrap().status, TaskStatus::InProgress);
     }
 
     #[test]
