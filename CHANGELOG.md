@@ -6,8 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.0.2] - 2026-07-21
+
+Promotes the v2 beta line to stable. Everything accumulated on the beta channel
+since v1.6.0 — remote control, remote and hosted engines, the shared engine,
+mid-generation `/btw` suspend, checkpoints, per-session KV payloads — ships in
+this release, alongside a batch of TUI polish.
+
 ### Added
 
+- **Status bar shows the working directory and git branch**: the footer leads
+  with the cwd (home collapsed to `~`) and, inside a repository, the current
+  branch after a powerline glyph. Both are themed green; the branch is
+  discovered with the `git2` crate. Detached HEAD shows a short commit hash.
 - **Remote-control interface** (#25): drive a running instance from another
   process or machine over a loopback WebSocket. Mirror output and send
   `prompt`/`command`/`btw`/`interrupt` frames, with single-controller /
@@ -47,6 +58,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   preempt-and-rerun (see `--disable-btw-suspend` above).
 - The session on-disk format carries an optional KV payload sidecar; older
   payload-less sessions still load and list.
+- **Prefill footer** now animates with the same spinner verb and throbber as
+  token decoding, replacing the static label and progress bar.
+
+### Fixed
+
+- **Scrollback reaches the bottom of long output** (e.g. the `/context`
+  report): the view now clamps to ratatui's exact wrapped-line count instead of
+  a char-packing estimate that undercounted word-wrapped rows.
+- **Resumed sessions render as markdown**: `/resume`, `/switch`, and
+  `plank /resume` startup now replay assistant text through the live rendering
+  pipeline, so markdown, dimmed thinking, and tool-call banners come back
+  instead of flat plain text.
 
 ## [2.0.0] - 2026-07-19
 

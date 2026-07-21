@@ -3,12 +3,33 @@
 A short, human-readable highlight reel per release. For the full change list
 see the GitHub releases and commit history.
 
-## Beta (2.x, unreleased)
+## Beta (2.1, unreleased)
 
-The v2 line opens the door past your own machine. plank stays a local agent by
-default, but it can now be driven remotely, serve one model to many sessions at
-once, and talk to hosted models when you want them. Everything here lives on the
-beta channel (`brew install plank-beta`) and is not yet promoted to stable.
+The next beta series opens here (`brew install plank-beta`). Nothing new to
+report yet — the v2 line just landed on stable below.
+
+## 2.0.2
+
+The v2 line, promoted to stable. plank stays a local agent by default, but it
+can now be driven remotely, serve one model to many sessions at once, and talk
+to hosted models when you want them — plus a round of TUI polish.
+
+📁 **The status bar tells you where you are.** The footer now leads with the
+working directory (home shown as `~`) and, inside a git repo, the current
+branch after a powerline glyph, both in the theme green — so a resumed session
+in an unexpected folder or branch can't surprise you.
+
+🔁 **Resumed sessions look like live ones.** `/resume`, `/switch`, and `plank
+/resume` at startup now replay the conversation through the same renderer a live
+turn uses: assistant replies come back as rendered markdown with thinking dimmed
+and tool-call banners intact, instead of a flat wall of text.
+
+📜 **Long output scrolls all the way.** Big reports like `/context` now scroll to
+the very bottom instead of stopping a few lines short.
+
+✨ **A livelier prefill.** While the prompt is being ingested, the footer now
+animates with the same spinner and verb as token decoding, so you can tell it is
+working rather than staring at a frozen bar.
 
 🎛️ **Drive plank from anywhere.** A remote-control channel lets another process
 or machine attach to a running instance over a loopback WebSocket: mirror its
