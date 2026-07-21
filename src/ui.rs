@@ -634,6 +634,11 @@ struct Agent<'a> {
     /// Cumulative billed token usage for online (provider) turns this session,
     /// surfaced by `/usage`. Stays zero for local engines, which report none.
     usage: SessionUsage,
+    /// Engine-agnostic in/out token tally for the end-of-session stats.
+    stats: SessionStats,
+    /// When the current session began (process start, or the last `/clear`,
+    /// `/resume`, or `/switch`), for the end-of-session duration.
+    session_start: std::time::Instant,
 }
 
 /// Formats a non-negative token count with thousands separators (`12345` →
@@ -651,6 +656,32 @@ fn fmt_int(n: i32) -> String {
     out
 }
 
+/// Formats a `u64` token count with thousands separators, for the run stats.
+fn fmt_u64(n: u64) -> String {
+    let s = n.to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Formats a duration as `H:MM:SS`, dropping the hours field when zero
+/// (`4:07`, `1:02:09`), for the end-of-session stats.
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
 /// Running tally of provider token usage across a session's turns.
 #[derive(Debug, Clone, Copy, Default)]
 struct SessionUsage {
@@ -658,6 +689,19 @@ struct SessionUsage {
     turns: u32,
     /// Summed token usage across those turns.
     total: crate::engine::TokenUsage,
+}
+
+/// Engine-agnostic token tally for the end-of-session stats, in both
+/// directions. Unlike [`SessionUsage`] (provider billing only), this counts
+/// local turns too: output is the generated tokens, input the prompt tokens
+/// ingested (from the provider `usage` block when present, else the
+/// context-size delta of the pass).
+#[derive(Debug, Clone, Copy, Default)]
+struct SessionStats {
+    /// Tokens the model ingested (prompt / prefill), summed over all passes.
+    input_tokens: u64,
+    /// Tokens the model generated, summed over all passes.
+    output_tokens: u64,
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -802,8 +846,8 @@ impl Agent<'_> {
             .map_err(|e| e.to_string())?;
         stream.finish();
         bar.clear();
-        self.last_ctx_used = stats.ctx_used;
         self.record_usage(&stats);
+        self.last_ctx_used = stats.ctx_used;
         Ok((stream, assistant_text, stats))
     }
 
@@ -1217,6 +1261,32 @@ impl Agent<'_> {
     /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
     /// unless an online provider is driving the turns.
     fn record_usage(&mut self, stats: &crate::engine::GenerationStats) {
+        // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
+        // updated for this pass, so the local input estimate below sees the
+        // previous context size.
+        let (input, output) = if let Some(u) = stats.usage {
+            // Provider: exact figures from the usage block. `stats.generated`
+            // is not populated on the provider path, so read the output there.
+            (
+                i64::from(u.input_tokens)
+                    + i64::from(u.cache_read_tokens)
+                    + i64::from(u.cache_write_tokens),
+                i64::from(u.output_tokens),
+            )
+        } else {
+            // Local: output is the generated count; input is the growth in
+            // context minus what the model itself generated. Clamped so
+            // compaction (context shrinking) never subtracts from the tally.
+            (
+                i64::from(stats.ctx_used)
+                    - i64::from(self.last_ctx_used)
+                    - i64::from(stats.generated),
+                i64::from(stats.generated),
+            )
+        };
+        self.stats.input_tokens += u64::try_from(input.max(0)).unwrap_or(0);
+        self.stats.output_tokens += u64::try_from(output.max(0)).unwrap_or(0);
+
         if let Some(u) = stats.usage {
             self.usage.total.add(u);
             self.usage.turns += 1;
@@ -2014,6 +2084,30 @@ impl Agent<'_> {
         println!();
         println!("{bold}Session saved{reset} {dim}{}{reset}", path.display());
         println!("Resume it later with:  {bold}plank /resume {short}{reset}");
+    }
+
+    /// Prints the run's stats at exit: total tokens ingested and generated
+    /// across every turn (both directions), and the wall-clock duration of the
+    /// whole run. Silent when nothing was generated, so an idle run stays
+    /// quiet. Independent of the session save, so it reports even when the
+    /// final session was empty (e.g. after `/clear`).
+    fn report_run_stats(&self) {
+        let s = self.stats;
+        if s.input_tokens == 0 && s.output_tokens == 0 {
+            return;
+        }
+        let (bold, dim, reset) = if self.color {
+            ("\x1b[1m", "\x1b[38;5;238m", ANSI_RESET)
+        } else {
+            ("", "", "")
+        };
+        let elapsed = fmt_duration(self.session_start.elapsed());
+        println!();
+        println!(
+            "{bold}Session stats{reset}  ↓ {} ↑ {}  {dim}·{reset}  {elapsed}",
+            fmt_u64(s.input_tokens),
+            fmt_u64(s.output_tokens),
+        );
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -3557,8 +3651,8 @@ impl Agent<'_> {
         };
 
         let stats = result.map_err(|e| e.to_string())?;
-        self.last_ctx_used = stats.ctx_used;
         self.record_usage(&stats);
+        self.last_ctx_used = stats.ctx_used;
         stream.finish();
         let finished = stream.finished();
         let calls = finished.calls.to_vec();
@@ -4461,6 +4555,8 @@ fn new_agent(
         remote,
         ui_remote: None,
         usage: SessionUsage::default(),
+        stats: SessionStats::default(),
+        session_start: std::time::Instant::now(),
     })
 }
 
@@ -4498,6 +4594,7 @@ pub fn run_interactive(
     // how to resume it.
     agent.fire_session_end("exit", &mut |w| println!("{w}"));
     agent.report_session_on_exit();
+    agent.report_run_stats();
     result
 }
 
@@ -5292,6 +5389,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         }
     }
 
@@ -6109,6 +6208,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
 
         // Empty state: no provider turn recorded yet.
@@ -6140,7 +6241,47 @@ mod tests {
         // No cache traffic on the OpenAI path: the section is omitted.
         assert!(!report.contains("cache read"), "got: {report}");
         assert!(report.contains("total tokens   175"), "got: {report}");
+
+        // The engine-agnostic run stats tally both directions across every
+        // pass, from provider usage here: in = 100+50, out = 20+5.
+        assert_eq!(agent.stats.input_tokens, 150);
+        assert_eq!(agent.stats.output_tokens, 25);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_stats_count_local_passes_from_the_context_delta() {
+        // No provider `usage`: input is the growth in context minus what the
+        // pass generated, and compaction (context shrinking) never subtracts.
+        let dir = std::env::temp_dir().join(format!("plank-runstats-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let local = |generated, ctx_used| crate::engine::GenerationStats {
+            generated,
+            ctx_used,
+            ..Default::default()
+        };
+        // Pass 1: ctx 0 -> 130, generated 30  => input 100, output 30.
+        agent.record_usage(&local(30, 130));
+        agent.last_ctx_used = 130;
+        // Pass 2: ctx 130 -> 175, generated 15 => input 30, output 15.
+        agent.record_usage(&local(15, 175));
+        agent.last_ctx_used = 175;
+        // Pass 3: compaction shrank ctx to 40, generated 5 => input clamps to 0.
+        agent.record_usage(&local(5, 40));
+        assert_eq!(agent.stats.input_tokens, 130);
+        assert_eq!(agent.stats.output_tokens, 50);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duration_formats_with_and_without_hours() {
+        use std::time::Duration;
+        assert_eq!(fmt_duration(Duration::from_secs(0)), "0:00");
+        assert_eq!(fmt_duration(Duration::from_secs(247)), "4:07");
+        assert_eq!(fmt_duration(Duration::from_secs(3729)), "1:02:09");
+        assert_eq!(fmt_u64(1_234_567), "1,234,567");
     }
 
     #[test]
@@ -6179,6 +6320,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -6257,6 +6400,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -6335,6 +6480,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -6402,6 +6549,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -6456,6 +6605,8 @@ mod tests {
             remote: None,
             ui_remote: None,
             usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
         };
         agent.session.push(Message::user("run echo"));
 
