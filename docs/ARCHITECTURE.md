@@ -202,6 +202,13 @@ effect, never a stale pre-injection frame. This inject → redraw → answer
 ordering is what lets harness tests assert on the result without sleeping or
 polling: the reply itself is the synchronization point.
 
+That ordering covers the keys and the frame, but not work those keys set in
+motion on another thread. `@` completion results, for instance, come back from
+`complete::IndexWorker` and are pumped into the popup a tick or two later, so a
+`uitree` issued immediately after typing `@src/` shows the input text but no
+popup region yet — query again and it is there. State produced asynchronously
+needs a second look, not a longer wait.
+
 Two windows do not service remote commands, and a command issued inside
 either is answered with `{"ok":false,"error":"ui thread timed out"}` after ten
 seconds rather than hanging. The first is model warm-up, which a cold start
