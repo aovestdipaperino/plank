@@ -263,10 +263,13 @@ fn tools_prompt_matches_c_source() {
         &src,
         "agent_tools_prompt_after_edit",
     ));
+    // The base is what must match C byte-for-byte. Native plank tools (glob)
+    // and MCP tools are layered on top by `build_tools_prompt`, outside the
+    // trained table — see `append_native_extra_schemas`.
     assert_identical(
         &expected,
-        &plank::sysprompt::build_tools_prompt(&[]),
-        "tools prompt vs C",
+        &plank::sysprompt::build_tools_prompt_base(),
+        "tools prompt base vs C",
     );
 }
 

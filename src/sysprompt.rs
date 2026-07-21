@@ -129,6 +129,21 @@ pub fn provider_tool_registry(
     mcp_servers: &[crate::tools::mcp::McpServer],
 ) -> Vec<crate::engine::ToolSpec> {
     let mut specs = parse_builtin_tool_schemas();
+    // Native plank tools beyond the C table are appended to the text prompt by
+    // `append_native_extra_schemas`; mirror them here so provider engines see
+    // the same table.
+    specs.push(crate::engine::ToolSpec {
+        name: "glob".to_string(),
+        description: "Find files by name pattern across a directory tree. Use this instead of shelling out to find or ls. '**' crosses directory boundaries, '*' matches within one path component. Results are paths relative to the search root, sorted, capped at 100.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "glob pattern, e.g. '*.rs', '**/*test*', 'src/**/mod.rs'"},
+                "path": {"type": "string", "description": "directory to search from; defaults to the working directory"}
+            },
+            "required": ["pattern"]
+        }),
+    });
     for server in mcp_servers {
         if !server.alive() {
             continue;
@@ -193,15 +208,55 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 /// followed by the schemas of any MCP tools loaded at startup.
 #[must_use]
 pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> String {
+    let mut out = build_tools_prompt_base();
+    append_native_extra_schemas(&mut out);
+    crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
+    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    out
+}
+
+/// The C-derived tools prompt with nothing appended.
+///
+/// This is what the parity suite locks byte-for-byte against `refs/ds4`: it is
+/// exactly the three C string constants. Native plank tools (see
+/// [`append_native_extra_schemas`]) and MCP tools are layered on top by
+/// [`build_tools_prompt`], the same way MCP has always extended it, so the
+/// trained-table parity guarantee stays intact for the base.
+#[must_use]
+pub fn build_tools_prompt_base() -> String {
     let mut out = String::with_capacity(
         TOOLS_PROMPT_INTRO.len() + TOOLS_PROMPT_EDIT_LINE.len() + TOOLS_PROMPT_AFTER_EDIT.len(),
     );
     out.push_str(TOOLS_PROMPT_INTRO);
     out.push_str(TOOLS_PROMPT_EDIT_LINE);
     out.push_str(TOOLS_PROMPT_AFTER_EDIT);
-    crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
-    crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     out
+}
+
+/// Appends the schemas of native tools plank adds beyond the C-trained table.
+///
+/// These tools are **not** in the model's training-time tool table, which is
+/// why issue #32 requires measuring that the model actually calls them. They
+/// are appended here rather than baked into the C constants so the parity
+/// suite keeps verifying the base against the reference.
+fn append_native_extra_schemas(out: &mut String) {
+    out.push_str(
+        "\n{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"glob\",\n\
+         \x20   \"description\": \"Find files by name pattern across a directory tree. Use this instead of shelling out to find or ls. '**' crosses directory boundaries, '*' matches within one path component. Results are paths relative to the search root, sorted, capped at 100.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"pattern\": {\"type\": \"string\", \"description\": \"glob pattern, e.g. '*.rs', '**/*test*', 'src/**/mod.rs'\"},\n\
+         \x20       \"path\": {\"type\": \"string\", \"description\": \"directory to search from; defaults to the working directory\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"pattern\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
 }
 
 /// Returns the short DSML syntax reminder (verbatim from C).
@@ -356,7 +411,15 @@ mod tests {
         assert!(p.contains("### Available Tool Schemas"));
         assert!(p.contains("\"name\": \"bash_stop\""));
         assert!(p.contains("- Always use strict syntax for DSML tool stanzas.\n"));
-        assert!(p.ends_with("unless explicitly asked otherwise by the user.\n"));
+        // The C-derived base ends with the rules text; native tools (glob) are
+        // appended on top of it by `build_tools_prompt`.
+        assert!(
+            build_tools_prompt_base().ends_with("unless explicitly asked otherwise by the user.\n")
+        );
+        assert!(
+            p.contains("\"name\": \"glob\""),
+            "native glob tool is appended"
+        );
     }
 
     /// Guards the static/volatile boundary (docs/SYSTEM-PROMPT.md): the

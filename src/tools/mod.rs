@@ -173,6 +173,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "more" => files::tool_more(ctx, call),
         "write" => files::tool_write(ctx, call),
         "list" => files::tool_list(ctx, call),
+        "glob" => files::tool_glob(ctx, call),
         "edit" => edit::tool_edit(ctx, call),
         "search" => edit::tool_search(ctx, call),
         "bash" => bash::tool_bash(ctx, call),

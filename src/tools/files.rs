@@ -6,7 +6,7 @@
 
 use std::fmt::Write as _;
 use std::io::Read as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::dsml::ToolCall;
 
@@ -297,10 +297,296 @@ pub fn tool_list(ctx: &mut ToolContext, call: &ToolCall) -> String {
     out
 }
 
+/// Most matches `glob` returns before truncating.
+const GLOB_MAX_RESULTS: usize = 100;
+/// VCS metadata directories never descended into or reported.
+const GLOB_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn", ".jj"];
+
+/// Matches one path component against a glob segment (`*` and `?`; no `**`,
+/// which is handled by the walker across components).
+///
+/// A hand-rolled backtracking matcher rather than a dependency, matching the
+/// project's style. `*` spans any run within a single component; `?` is one
+/// character; every other character is literal.
+fn segment_matches(seg: &[char], name: &[char]) -> bool {
+    // Iterative backtracking: `star`/`mark` remember where to resume the last
+    // `*` if the current attempt dead-ends.
+    let (mut si, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark): (Option<usize>, usize) = (None, 0);
+    while ni < name.len() {
+        if si < seg.len() && (seg[si] == '?' || seg[si] == name[ni]) {
+            si += 1;
+            ni += 1;
+        } else if si < seg.len() && seg[si] == '*' {
+            star = Some(si);
+            mark = ni;
+            si += 1;
+        } else if let Some(s) = star {
+            si = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while si < seg.len() && seg[si] == '*' {
+        si += 1;
+    }
+    si == seg.len()
+}
+
+/// Matches a path against a glob pattern split on `/`.
+///
+/// `**` matches zero or more whole path components (crossing directory
+/// boundaries); a plain `*` stays within one component. Both sides are
+/// compared as `/`-split segments.
+fn glob_matches(pattern_segs: &[String], path: &str) -> bool {
+    let path_segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    glob_rec(pattern_segs, &path_segs)
+}
+
+/// Recursive core of [`glob_matches`], matching pattern segments to path
+/// segments; `**` consumes zero or more path segments.
+fn glob_rec(pat: &[String], path: &[&str]) -> bool {
+    match pat.first().map(String::as_str) {
+        None => path.is_empty(),
+        Some("**") => (0..=path.len()).any(|skip| glob_rec(&pat[1..], &path[skip..])),
+        Some(seg) => {
+            let seg_chars: Vec<char> = seg.chars().collect();
+            !path.is_empty()
+                && segment_matches(&seg_chars, &path[0].chars().collect::<Vec<_>>())
+                && glob_rec(&pat[1..], &path[1..])
+        }
+    }
+}
+
+/// Whether the pattern can only match inside a fixed leading directory, and
+/// that directory, so the walk can start there instead of at the root.
+///
+/// `src/**/mod.rs` need not walk the whole tree; `**/x` and `*.rs` must.
+fn glob_walk_root(pattern_segs: &[String]) -> PathBuf {
+    let mut root = PathBuf::new();
+    for seg in pattern_segs {
+        if seg.contains(['*', '?']) {
+            break;
+        }
+        root.push(seg);
+    }
+    root
+}
+
+/// Recursively collects file paths under `dir` matching `pattern_segs`,
+/// relative to `search_root`, skipping VCS metadata. Depth-first, sorted by
+/// the caller.
+fn glob_walk(dir: &Path, search_root: &Path, pattern_segs: &[String], out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(ft) = entry.file_type() else { continue };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if ft.is_dir() {
+            if GLOB_SKIP_DIRS.contains(&name.as_ref()) {
+                continue;
+            }
+            glob_walk(&entry.path(), search_root, pattern_segs, out);
+        } else if ft.is_file()
+            && let Ok(rel) = entry.path().strip_prefix(search_root)
+        {
+            let rel = rel.to_string_lossy().replace('\\', "/");
+            if glob_matches(pattern_segs, &rel) {
+                out.push(rel);
+            }
+        }
+    }
+}
+
+/// Finds files by name pattern across a tree (issue #32).
+///
+/// `**` crosses directory boundaries, `*` does not; results are relative to
+/// the search root, sorted, and capped at [`GLOB_MAX_RESULTS`]. VCS metadata
+/// directories are skipped, and a path outside the sandbox root is refused
+/// like the other file tools.
+pub fn tool_glob(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    let pattern = match call.arg_value("pattern") {
+        Some(p) if !p.is_empty() => p,
+        _ => return "Tool error: glob requires pattern\n".to_string(),
+    };
+    let base = match call.arg_value("path") {
+        Some(p) if !p.is_empty() => p,
+        _ => ".",
+    };
+    let search_root = ctx.resolve(base);
+    let Ok(canon_root) = search_root.canonicalize() else {
+        return format!("Tool error: glob path not found: {base}\n");
+    };
+    // Same containment rule as the other file tools: the resolved root must
+    // stay under the sandbox cwd.
+    if let Ok(cwd) = ctx.cwd.canonicalize()
+        && !canon_root.starts_with(&cwd)
+    {
+        return format!("Tool error: glob path escapes workspace: {base}\n");
+    }
+
+    let pattern_segs: Vec<String> = pattern
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    let walk_start = canon_root.join(glob_walk_root(&pattern_segs));
+    let mut matches = Vec::new();
+    glob_walk(&walk_start, &canon_root, &pattern_segs, &mut matches);
+    matches.sort();
+
+    if matches.is_empty() {
+        return format!("glob: no files match {pattern}\n");
+    }
+    let truncated = matches.len() > GLOB_MAX_RESULTS;
+    matches.truncate(GLOB_MAX_RESULTS);
+    let mut out = matches.join("\n");
+    out.push('\n');
+    if truncated {
+        let _ = writeln!(
+            out,
+            "... more than {GLOB_MAX_RESULTS} matches; showing the first {GLOB_MAX_RESULTS} ..."
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tools::{test_call, test_ctx};
+
+    /// Creates the given files (and their parent dirs) under `root`.
+    fn make_tree(root: &Path, files: &[&str]) {
+        for f in files {
+            let p = root.join(f);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, "x").unwrap();
+        }
+    }
+
+    #[test]
+    fn segment_matcher_star_and_question() {
+        let m = |seg: &str, name: &str| {
+            segment_matches(
+                &seg.chars().collect::<Vec<_>>(),
+                &name.chars().collect::<Vec<_>>(),
+            )
+        };
+        assert!(m("*.rs", "main.rs"));
+        assert!(m("*_test.rs", "foo_test.rs"));
+        assert!(!m("*.rs", "main.toml"));
+        assert!(m("a?c", "abc"));
+        assert!(!m("a?c", "ac"));
+        assert!(m("*", "anything"));
+        assert!(m("mod.rs", "mod.rs"));
+    }
+
+    #[test]
+    fn star_stays_within_a_component_but_doublestar_crosses() {
+        let segs = |p: &str| p.split('/').map(ToString::to_string).collect::<Vec<_>>();
+        assert!(glob_matches(&segs("*.rs"), "main.rs"));
+        assert!(
+            !glob_matches(&segs("*.rs"), "src/main.rs"),
+            "* must not cross /"
+        );
+        assert!(glob_matches(&segs("**/*.rs"), "src/deep/main.rs"));
+        assert!(
+            glob_matches(&segs("**/*.rs"), "main.rs"),
+            "** matches zero dirs"
+        );
+        assert!(glob_matches(&segs("src/**/mod.rs"), "src/a/b/mod.rs"));
+        assert!(!glob_matches(&segs("src/**/mod.rs"), "other/a/mod.rs"));
+    }
+
+    #[test]
+    fn glob_lists_only_the_directory_for_a_plain_star() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["a.rs", "b.rs", "sub/c.rs", "notes.txt"]);
+        let out = tool_glob(&mut ctx, &test_call("glob", &[("pattern", "*.rs")]));
+        assert_eq!(out, "a.rs\nb.rs\n", "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_doublestar_reaches_every_depth() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["a.rs", "sub/b.rs", "sub/deep/c.rs"]);
+        let out = tool_glob(&mut ctx, &test_call("glob", &[("pattern", "**/*.rs")]));
+        assert_eq!(out, "a.rs\nsub/b.rs\nsub/deep/c.rs\n", "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_never_descends_into_git() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["src/a.rs", ".git/config.rs", ".git/hooks/x.rs"]);
+        let out = tool_glob(&mut ctx, &test_call("glob", &[("pattern", "**/*.rs")]));
+        assert_eq!(out, "src/a.rs\n", "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_with_no_match_is_a_clear_message_not_an_error() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["a.rs"]);
+        let out = tool_glob(&mut ctx, &test_call("glob", &[("pattern", "*.zzz")]));
+        assert_eq!(out, "glob: no files match *.zzz\n");
+        assert!(!out.starts_with("Tool error"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_truncates_past_the_cap_and_says_so() {
+        let (mut ctx, dir) = test_ctx();
+        let files: Vec<String> = (0..150).map(|i| format!("f{i:03}.rs")).collect();
+        make_tree(&dir, &files.iter().map(String::as_str).collect::<Vec<_>>());
+        let out = tool_glob(&mut ctx, &test_call("glob", &[("pattern", "*.rs")]));
+        assert_eq!(out.lines().filter(|l| l.starts_with('f')).count(), 100);
+        assert!(out.contains("more than 100 matches"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_missing_pattern_matches_the_error_convention() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_glob(&mut ctx, &test_call("glob", &[]));
+        assert_eq!(out, "Tool error: glob requires pattern\n");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_refuses_a_path_outside_the_workspace() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["a.rs"]);
+        let out = tool_glob(
+            &mut ctx,
+            &test_call("glob", &[("pattern", "*.rs"), ("path", "..")]),
+        );
+        assert!(
+            out.contains("escapes workspace") || out.contains("not found"),
+            "{out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn glob_path_scopes_the_search() {
+        let (mut ctx, dir) = test_ctx();
+        make_tree(&dir, &["top.rs", "sub/inner.rs", "sub/deep/x.rs"]);
+        let out = tool_glob(
+            &mut ctx,
+            &test_call("glob", &[("pattern", "**/*.rs"), ("path", "sub")]),
+        );
+        assert_eq!(out, "deep/x.rs\ninner.rs\n", "{out:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn write_file(dir: &Path, name: &str, content: &str) {
         std::fs::write(dir.join(name), content).expect("write test file");
