@@ -28,7 +28,8 @@
 //!   "ui":     { "respectGitignore": true, "popupRows": 15,
 //!               "indexRefreshSecs": 5, "historySize": 512 },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
-//!   "mcp":    { "timeoutSecs": 30 }
+//!   "mcp":    { "timeoutSecs": 30 },
+//!   "ask":    { "maxOptions": 7 }
 //! }
 //! ```
 
@@ -45,6 +46,11 @@ pub const DEFAULT_INDEX_REFRESH_SECS: u64 = 5;
 pub const DEFAULT_HISTORY_SIZE: usize = 512;
 /// Seconds an MCP server has to answer a request when unset.
 pub const DEFAULT_MCP_TIMEOUT_SECS: u64 = 30;
+/// Most options the `ask` tool accepts when unset.
+pub const DEFAULT_ASK_MAX_OPTIONS: usize = 7;
+/// Fewest options the `ask` tool ever accepts; a choice needs two arms. Not
+/// configurable — a one-option "choice" is a degenerate question.
+pub const ASK_MIN_OPTIONS: usize = 2;
 
 /// Engine defaults: the same knobs as `-m`, `-t`, `--backend`, `--power`, `-c`.
 ///
@@ -113,6 +119,21 @@ impl Default for McpSettings {
     }
 }
 
+/// `ask` tool tuning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AskSettings {
+    /// Most options the `ask` tool accepts (the minimum is fixed at 2).
+    pub max_options: usize,
+}
+
+impl Default for AskSettings {
+    fn default() -> Self {
+        Self {
+            max_options: DEFAULT_ASK_MAX_OPTIONS,
+        }
+    }
+}
+
 /// The whole of `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -124,6 +145,8 @@ pub struct Settings {
     pub safety: SafetySettings,
     /// MCP client tuning.
     pub mcp: McpSettings,
+    /// `ask` tool tuning.
+    pub ask: AskSettings,
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -209,6 +232,12 @@ impl Settings {
 
         if let Some(v) = num::<u64>(root.get("mcp"), "timeoutSecs").filter(|v| *v > 0) {
             self.mcp.timeout_secs = v;
+        }
+
+        // A max below the fixed minimum would make every `ask` call impossible;
+        // clamp it up rather than silently breaking the tool.
+        if let Some(v) = num::<usize>(root.get("ask"), "maxOptions") {
+            self.ask.max_options = v.max(ASK_MIN_OPTIONS);
         }
     }
 
@@ -312,6 +341,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
     }
+    if s.ask.max_options != d.ask.max_options {
+        parts.push(format!("maxOptions={}", s.ask.max_options));
+    }
 
     if parts.is_empty() {
         return None;
@@ -390,8 +422,10 @@ mod tests {
                 "ui":{"respectGitignore":false,"popupRows":25,
                       "indexRefreshSecs":30,"historySize":4096},
                 "safety":{"sandbox":true,"btwSuspend":false},
-                "mcp":{"timeoutSecs":90}}"#,
+                "mcp":{"timeoutSecs":90},
+                "ask":{"maxOptions":10}}"#,
         );
+        assert_eq!(s.ask.max_options, 10);
         assert_eq!(s.engine.threads, Some(8));
         assert_eq!(s.engine.backend.as_deref(), Some("cpu"));
         assert_eq!(s.engine.power, Some(80));
@@ -403,6 +437,19 @@ mod tests {
         assert_eq!(s.safety.sandbox, Some(true));
         assert_eq!(s.safety.btw_suspend, Some(false));
         assert_eq!(s.mcp.timeout_secs, 90);
+    }
+
+    #[test]
+    fn ask_max_options_defaults_to_seven_and_clamps_up_to_the_minimum() {
+        assert_eq!(Settings::default().ask.max_options, 7);
+        // A max below the fixed minimum of 2 would make every ask impossible;
+        // it clamps up rather than breaking the tool.
+        assert_eq!(from_json(r#"{"ask":{"maxOptions":1}}"#).ask.max_options, 2);
+        assert_eq!(from_json(r#"{"ask":{"maxOptions":0}}"#).ask.max_options, 2);
+        assert_eq!(
+            from_json(r#"{"ask":{"maxOptions":12}}"#).ask.max_options,
+            12
+        );
     }
 
     #[test]

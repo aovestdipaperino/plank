@@ -110,7 +110,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
   "ui":     { "respectGitignore": true, "popupRows": 15,
               "indexRefreshSecs": 5, "historySize": 512 },
   "safety": { "sandbox": true, "btwSuspend": true },
-  "mcp":    { "timeoutSecs": 30 }
+  "mcp":    { "timeoutSecs": 30 },
+  "ask":    { "maxOptions": 7 }
 }
 ```
 
@@ -128,6 +129,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | `safety` | `sandbox` | off | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
+| `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
 
 Precedence runs left to right, each layer overriding the one before:
 

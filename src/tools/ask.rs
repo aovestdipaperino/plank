@@ -24,9 +24,15 @@ use std::time::Duration;
 use crate::dsml::ToolCall;
 
 /// Minimum number of options `ask` accepts: a choice needs at least two arms.
-pub const MIN_OPTIONS: usize = 2;
-/// Upper bound on options; more than this stops reading as a bounded pick.
-pub const MAX_OPTIONS: usize = 4;
+pub const MIN_OPTIONS: usize = crate::settings::ASK_MIN_OPTIONS;
+
+/// Upper bound on options, from `ask.maxOptions` (default 7). More than this
+/// stops reading as a bounded pick; configurable because the model sometimes
+/// wants a wider menu than the original cap of 4 allowed (issue #34).
+#[must_use]
+pub fn max_options() -> usize {
+    crate::settings::active().ask.max_options
+}
 
 /// One selectable choice: a short label and a one-line description of what
 /// picking it means.
@@ -45,7 +51,7 @@ pub struct AskRequest {
     pub question: String,
     /// Short UI-chip label (~12 chars).
     pub header: String,
-    /// Between [`MIN_OPTIONS`] and [`MAX_OPTIONS`] choices.
+    /// Between [`MIN_OPTIONS`] and [`max_options`] choices.
     pub options: Vec<AskOption>,
     /// When true, more than one option may be selected.
     pub multi: bool,
@@ -108,12 +114,12 @@ pub fn tool_ask(asker: Option<&mut Box<dyn Asker>>, call: &ToolCall) -> String {
     format_result(&asker.ask(req))
 }
 
-/// Parses and validates the `options` argument into 2..=4 [`AskOption`]s.
+/// Parses and validates the `options` argument into [`MIN_OPTIONS`]..=[`max_options`] [`AskOption`]s.
 ///
 /// Options arrive as a JSON array in the `options` argument — a list of
 /// `{"label": "...", "description": "..."}` objects; the array carries the
 /// structure DSML's flat string parameters cannot. A count outside
-/// [`MIN_OPTIONS`]..=[`MAX_OPTIONS`] is a dispatch error.
+/// [`MIN_OPTIONS`]..=[`max_options`] is a dispatch error.
 fn parse_options(call: &ToolCall) -> Result<Vec<AskOption>, String> {
     let raw = call.arg_value("options").unwrap_or("").trim();
     if raw.is_empty() {
@@ -147,9 +153,10 @@ fn parse_options(call: &ToolCall) -> Result<Vec<AskOption>, String> {
             description: description.to_string(),
         });
     }
-    if options.len() < MIN_OPTIONS || options.len() > MAX_OPTIONS {
+    let max = max_options();
+    if options.len() < MIN_OPTIONS || options.len() > max {
         return Err(format!(
-            "Tool error: ask needs {MIN_OPTIONS} to {MAX_OPTIONS} options, got {}\n",
+            "Tool error: ask needs {MIN_OPTIONS} to {max} options, got {}\n",
             options.len()
         ));
     }
@@ -439,14 +446,14 @@ mod tests {
 
     #[test]
     fn too_many_options_is_dispatch_error() {
-        let c = call(&[("question", "q?"), ("header", "h"), ("options", &opts(5))]);
+        let c = call(&[("question", "q?"), ("header", "h"), ("options", &opts(8))]);
         let out = tool_ask(None, &c);
         assert!(out.starts_with("Tool error:"), "{out}");
     }
 
     #[test]
     fn valid_count_bounds_are_accepted() {
-        for n in MIN_OPTIONS..=MAX_OPTIONS {
+        for n in MIN_OPTIONS..=max_options() {
             let c = call(&[("question", "q?"), ("header", "h"), ("options", &opts(n))]);
             // With no asker this fast-fails, but it must get past validation
             // (i.e. not a Tool error).
