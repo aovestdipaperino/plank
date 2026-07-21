@@ -879,6 +879,108 @@ pub fn draw(
     );
 }
 
+/// Draws one frame while an `ask` question (issue #34) is up: the output log
+/// on top, the interactive question panel in the input region, and the status
+/// bar below it. The panel is sized from the option count so it never overlaps
+/// the status bar, and it coexists with the same layout the resting prompt uses.
+pub fn draw_ask(
+    frame: &mut Frame,
+    log: &OutputLog,
+    req: &crate::tools::ask::AskRequest,
+    state: &crate::tools::ask::AskState,
+    status: &str,
+    view: &mut OutputView,
+    tasks: &TaskView,
+) {
+    let area = frame.area();
+    let panel_rows = crate::tools::ask::panel_rows(req.options.len())
+        // Never let the panel eat the whole screen: leave at least one output row.
+        .min(area.height.saturating_sub(2));
+    let r = Layout::vertical([
+        Constraint::Min(1),             // output
+        Constraint::Length(panel_rows), // question panel
+        Constraint::Length(1),          // status
+    ])
+    .split(area);
+    render_output(frame, r[0], log, view, None);
+    render_ask_panel(frame, r[1], req, state);
+
+    let status_style = Style::default()
+        .bg(Color::Indexed(238))
+        .fg(Color::Indexed(252));
+    frame.render_widget(
+        Paragraph::new(status_bar_line(
+            &with_remote_marker(status),
+            anim_tick_ms(),
+            status_style,
+            tasks,
+        ))
+        .style(status_style),
+        r[2],
+    );
+}
+
+/// Renders the question panel: a header chip and question, then the options as a
+/// selectable list (arrow keys move, Enter accepts, Space toggles in multi
+/// mode), and a key-hint footer. The highlighted row is reverse-styled; ticked
+/// multi-select rows carry a checkbox.
+fn render_ask_panel(
+    frame: &mut Frame,
+    area: Rect,
+    req: &crate::tools::ask::AskRequest,
+    state: &crate::tools::ask::AskState,
+) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!(" {} ", req.header),
+            Style::default()
+                .bg(THEME_GREEN)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            req.question.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(Line::raw(String::new()));
+    for (i, opt) in req.options.iter().enumerate() {
+        let is_cursor = i == state.cursor;
+        let ticked = state.selected.get(i).copied().unwrap_or(false);
+        let marker = if req.multi {
+            if ticked { "[x] " } else { "[ ] " }
+        } else if is_cursor {
+            "> "
+        } else {
+            "  "
+        };
+        let mut style = Style::default();
+        if is_cursor {
+            style = style.fg(THEME_GREEN).add_modifier(Modifier::BOLD);
+        }
+        let mut spans = vec![Span::styled(format!("{marker}{}", opt.label), style)];
+        if !opt.description.is_empty() {
+            spans.push(Span::styled(
+                format!("  — {}", opt.description),
+                Style::default().fg(Color::Indexed(245)),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    let hint = if req.multi {
+        "↑/↓ move · Space toggle · Enter accept · Esc decline"
+    } else {
+        "↑/↓ move · Enter accept · Esc decline"
+    };
+    lines.push(Line::from(Span::styled(
+        hint.to_string(),
+        Style::default().fg(Color::Indexed(238)),
+    )));
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 /// Renders a scrollback log into `area`, clamping `view` to the scrollable
 /// range and following the newest output unless the user has scrolled back.
 fn render_output(
