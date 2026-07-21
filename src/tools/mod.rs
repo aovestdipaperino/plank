@@ -7,6 +7,7 @@
 //! `Tool error: ...` convention for failures. The browser web tools
 //! (`google_search`, `visit_page`) live in [`web`].
 
+pub mod ask;
 pub mod bash;
 pub mod edit;
 pub mod files;
@@ -97,6 +98,13 @@ pub struct ToolContext {
     /// Subjects of tasks the `task` tool just marked completed, drained by the
     /// UI after each dispatch to write the single dim completion log line.
     pub task_completions: Vec<String>,
+    /// Front end that presents `ask` questions (issue #34); `None` in
+    /// non-interactive mode, where `ask` fast-fails instead of blocking.
+    pub asker: Option<Box<dyn ask::Asker>>,
+    /// UI-thread handle to the `ask` rendezvous, set only under the TUI (the
+    /// worker's [`asker`](Self::asker) parks requests here for the event loop to
+    /// render). `None` for the plain REPL (stdin asker) and non-interactive mode.
+    pub ask_bridge: Option<ask::AskBridge>,
 }
 
 /// Most `skill` invocations allowed within one turn before the tool refuses,
@@ -139,6 +147,8 @@ impl ToolContext {
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
+            asker: None,
+            ask_bridge: None,
         }
     }
 
@@ -227,6 +237,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             call,
         ),
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
+        "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         other => format!("Tool error: unknown tool: {other}\n"),
     };

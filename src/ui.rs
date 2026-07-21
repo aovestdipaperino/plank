@@ -2363,6 +2363,12 @@ impl Agent<'_> {
     /// # Errors
     /// Returns an error string on unrecoverable terminal or engine failure.
     fn run_tui(&mut self) -> Result<(), String> {
+        // Install the `ask` rendezvous (issue #34): the worker's asker parks a
+        // question on the shared bridge and the event loop renders it. Both
+        // halves share one Arc-backed bridge.
+        let ask_bridge = crate::tools::ask::AskBridge::new();
+        self.tool_ctx.asker = Some(Box::new(crate::tools::ask::BridgeAsker(ask_bridge.clone())));
+        self.tool_ctx.ask_bridge = Some(ask_bridge);
         // `--ui-remote`: bind the loopback listener *before* the alternate
         // screen is entered, so the port line lands on a clean stderr (stdout
         // belongs to the UI). Started here rather than in `main` because this
@@ -3027,6 +3033,10 @@ impl Agent<'_> {
                 let _ = shared.push_btw(q);
             }
             let bus_ref = bus.as_deref();
+            // UI-side handle to the `ask` rendezvous (issue #34), cloned out of
+            // the tool context before the closure borrows `self`. Only the main
+            // turn dispatches tools (and thus `ask`); the btw drain never does.
+            let ask_bridge = self.tool_ctx.ask_bridge.clone();
             if run_main {
                 run_worker_ui(
                     terminal,
@@ -3037,6 +3047,7 @@ impl Agent<'_> {
                     shared,
                     bus_ref,
                     rem,
+                    ask_bridge.as_ref(),
                     |tx| self.worker_turn(&tx, shared),
                 )??;
             } else {
@@ -3049,6 +3060,7 @@ impl Agent<'_> {
                     shared,
                     bus_ref,
                     rem,
+                    None,
                     |tx| {
                         self.drain_btw(&tx, shared);
                     },
@@ -3665,6 +3677,7 @@ impl Agent<'_> {
             &shared,
             bus.as_deref(),
             ui_remote.as_deref(),
+            None,
             |tx| {
                 self.drain_btw(&tx, &shared);
             },
@@ -3932,6 +3945,63 @@ impl Agent<'_> {
     }
 }
 
+/// Drives an interactive `ask` question (issue #34): renders the option panel
+/// into the input region and reads keys until the user answers, declines
+/// (Escape), or interrupts (Ctrl-C). Blocks the UI loop while up — the worker
+/// is already blocked on the [`AskBridge`], so nothing else needs servicing —
+/// and posts the outcome back through the bridge to unblock the worker.
+///
+/// Escape returns a distinct declined result and the turn continues; Ctrl-C
+/// both interrupts the turn and unblocks the worker so no partial state lingers.
+#[allow(clippy::too_many_arguments)]
+fn run_ask_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    status: &str,
+    tasks: &tui::TaskView,
+    shared: &TurnShared,
+    bridge: &crate::tools::ask::AskBridge,
+) -> Result<(), String> {
+    use crate::tools::ask::{AskOutcome, AskState};
+    let Some(req) = bridge.take_request() else {
+        return Ok(());
+    };
+    let mut state = AskState::new(req.options.len(), req.multi);
+    loop {
+        terminal
+            .draw(|f| tui::draw_ask(f, log, &req, &state, status, view, tasks))
+            .map_err(|e| e.to_string())?;
+        let Some(ev) = next_event(None, Duration::from_millis(100))? else {
+            continue;
+        };
+        let Event::Key(key) = ev else { continue };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Up => state.move_up(),
+            KeyCode::Down => state.move_down(),
+            KeyCode::Char(' ') if req.multi => state.toggle(),
+            KeyCode::Enter => {
+                bridge.respond(AskOutcome::Answered(state.accept(&req.options)));
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                bridge.respond(AskOutcome::Declined);
+                return Ok(());
+            }
+            KeyCode::Char('c') if ctrl => {
+                shared.interrupt.store(true, Ordering::Relaxed);
+                bridge.respond(AskOutcome::Interrupted);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
@@ -3946,6 +4016,7 @@ fn run_worker_ui<T: Send>(
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
+    ask: Option<&crate::tools::ask::AskBridge>,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -3961,6 +4032,7 @@ fn run_worker_ui<T: Send>(
             shared,
             bus,
             remote,
+            ask,
             || handle.is_finished(),
         );
         // On a UI error (terminal gone) the worker must still be stopped and
@@ -4013,6 +4085,7 @@ fn busy_ui_loop(
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
+    ask: Option<&crate::tools::ask::AskBridge>,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
@@ -4035,6 +4108,23 @@ fn busy_ui_loop(
     // duplicate when the pass re-runs.
     let mut main_checkpoint = 0usize;
     loop {
+        // An `ask` question parked by the worker takes over the input region
+        // until answered; the worker is blocked meanwhile, so no render events
+        // arrive and the takeover is self-contained (issue #34).
+        if let Some(bridge) = ask
+            && bridge.is_pending()
+        {
+            run_ask_panel(
+                terminal,
+                log,
+                view,
+                &status_line,
+                &task_view,
+                shared,
+                bridge,
+            )?;
+            continue;
+        }
         while let Ok(ev) = rx.try_recv() {
             // Mirror every worker event onto the remote bus so remote clients
             // see the same stream as the local TUI (issue #25, dual-path).
@@ -4397,9 +4487,48 @@ pub fn run_interactive(
     result
 }
 
+/// Plain-REPL [`Asker`](crate::tools::ask::Asker): prints the header, question,
+/// and numbered options, then reads one stdin line and resolves it to a choice
+/// (a number or a label prefix; an empty line declines). The degraded form of
+/// the TUI panel for the piped/non-fullscreen path (issue #34).
+struct StdinAsker {
+    color: bool,
+}
+
+impl crate::tools::ask::Asker for StdinAsker {
+    fn ask(&mut self, req: crate::tools::ask::AskRequest) -> crate::tools::ask::AskOutcome {
+        use crate::tools::ask::{AskOutcome, parse_repl_answer};
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "\n[{}] {}", req.header, req.question);
+        for (i, opt) in req.options.iter().enumerate() {
+            if opt.description.is_empty() {
+                let _ = writeln!(out, "  {}. {}", i + 1, opt.label);
+            } else {
+                let _ = writeln!(out, "  {}. {} — {}", i + 1, opt.label, opt.description);
+            }
+        }
+        let prompt = if req.multi {
+            "Choose (numbers/labels, comma-separated; blank to decline): "
+        } else {
+            "Choose (number or label; blank to decline): "
+        };
+        let _ = write!(out, "{prompt}");
+        let _ = out.flush();
+        let _ = self.color; // reserved for future styled prompts
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return AskOutcome::Declined;
+        }
+        parse_repl_answer(&req, &line)
+    }
+}
+
 /// Plain-REPL session flow: warm the cache, run the one-shot `-p` prompt if
 /// any, then read lines until EOF.
 fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String> {
+    // The plain REPL answers `ask` questions by printing numbered options and
+    // reading a line from stdin (issue #34).
+    agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
     agent.warm_plain()?;
     if let Some(history) = agent.resumed_history() {
         print!("{history}");

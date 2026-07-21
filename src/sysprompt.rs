@@ -170,6 +170,20 @@ pub fn provider_tool_registry(
             "required": ["op"]
         }),
     });
+    specs.push(crate::engine::ToolSpec {
+        name: "ask".to_string(),
+        description: "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 4 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "the full question, phrased as a question"},
+                "header": {"type": "string", "description": "short UI label, ~12 characters"},
+                "options": {"type": "string", "description": "JSON array of 2 to 4 {\"label\",\"description\"} objects"},
+                "multi": {"type": "string", "description": "true to allow selecting more than one option (default false)"}
+            },
+            "required": ["question", "header", "options"]
+        }),
+    });
     for server in mcp_servers {
         if !server.alive() {
             continue;
@@ -336,6 +350,23 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20       \"active_form\": {\"type\": \"string\", \"description\": \"present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"op\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"ask\",\n\
+         \x20   \"description\": \"Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 4 {\\\"label\\\",\\\"description\\\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"question\": {\"type\": \"string\", \"description\": \"the full question, phrased as a question\"},\n\
+         \x20       \"header\": {\"type\": \"string\", \"description\": \"short UI label, ~12 characters\"},\n\
+         \x20       \"options\": {\"type\": \"string\", \"description\": \"JSON array of 2 to 4 {\\\"label\\\",\\\"description\\\"} objects\"},\n\
+         \x20       \"multi\": {\"type\": \"string\", \"description\": \"true to allow selecting more than one option (default false)\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"question\", \"header\", \"options\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",
