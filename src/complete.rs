@@ -1105,7 +1105,20 @@ mod tests {
 
     #[test]
     fn falls_back_to_ripgrep_outside_a_git_repo() {
-        let dir = std::env::temp_dir().join(format!("plank-nogit-{}", std::process::id()));
+        // The fallback only ever fires when `rg` is on PATH, so on a machine
+        // without it (CI runners, typically) there is nothing to assert.
+        if Command::new("rg").arg("--version").output().is_err() {
+            eprintln!("skipping: ripgrep not installed");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "plank-nogit-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("sub/loose.txt"), b"x").unwrap();
         let idx = FileIndex::build(&dir, true);
