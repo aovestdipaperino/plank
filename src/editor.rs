@@ -218,11 +218,46 @@ impl LineBuffer {
 // History ring (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// Field separator used to tag a saved entry with its origin directory.
+///
+/// `\x1f` (ASCII Unit Separator) is effectively never typed at a prompt, so a
+/// legacy history file (plain lines, no separator) is unambiguously
+/// distinguishable from a directory-tagged one: any line without a leading
+/// separator loads as an untagged (global) entry.
+const DIR_SEP: char = '\x1f';
+
+/// One history entry: the text plus the directory it was entered in.
+///
+/// `dir` is `None` for entries with no directory scope — legacy entries loaded
+/// from a pre-tagging history file, or entries added when the working
+/// directory could not be resolved. Untagged entries are always eligible for
+/// navigation (a global fallback), so upgrading never hides old history.
+#[derive(Debug, Clone)]
+struct HistEntry {
+    text: String,
+    dir: Option<String>,
+}
+
+/// Canonical tag for the current working directory, or `None` if unresolved.
+#[must_use]
+fn current_dir_tag() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// A bounded command-history ring with consecutive-duplicate suppression.
+///
+/// Each entry records the directory it was entered in; navigation filters to
+/// the current directory (plus untagged/global entries) so a command typed in
+/// one project does not surface in another (issue #49).
 #[derive(Debug, Clone)]
 pub struct History {
-    entries: VecDeque<String>,
+    entries: VecDeque<HistEntry>,
     max: usize,
+    /// Directory new entries are tagged with, and the one navigation filters
+    /// to. Defaults to the process working directory; overridable for tests.
+    cwd: Option<String>,
 }
 
 impl Default for History {
@@ -232,13 +267,22 @@ impl Default for History {
 }
 
 impl History {
-    /// Creates an empty history bounded to `max` entries.
+    /// Creates an empty history bounded to `max` entries, tagging new entries
+    /// with the process working directory.
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
             entries: VecDeque::new(),
             max: max.max(1),
+            cwd: current_dir_tag(),
         }
+    }
+
+    /// Overrides the directory used for tagging and navigation filtering.
+    ///
+    /// Primarily for tests; the app relies on the process working directory.
+    pub fn set_cwd(&mut self, dir: Option<String>) {
+        self.cwd = dir;
     }
 
     /// Number of stored entries.
@@ -253,27 +297,60 @@ impl History {
         self.entries.is_empty()
     }
 
-    /// Returns the entry at `idx` (0 = oldest), if present.
+    /// Returns the entry text at `idx` (0 = oldest), if present.
     #[must_use]
     pub fn get(&self, idx: usize) -> Option<&str> {
-        self.entries.get(idx).map(String::as_str)
+        self.entries.get(idx).map(|e| e.text.as_str())
     }
 
-    /// Appends an entry, skipping empties and consecutive duplicates.
+    /// Returns the origin directory of the entry at `idx`, if tagged.
+    #[must_use]
+    pub fn dir_of(&self, idx: usize) -> Option<&str> {
+        self.entries.get(idx).and_then(|e| e.dir.as_deref())
+    }
+
+    /// Whether the entry at `idx` belongs to the current directory scope.
+    ///
+    /// True for entries tagged with the current directory and for untagged
+    /// (global/legacy) entries; false for entries from a different directory.
+    #[must_use]
+    pub fn is_eligible(&self, idx: usize) -> bool {
+        match self.entries.get(idx) {
+            None => false,
+            Some(e) => match &e.dir {
+                None => true,
+                Some(d) => Some(d.as_str()) == self.cwd.as_deref(),
+            },
+        }
+    }
+
+    /// Appends an entry (tagged with the current directory), skipping empties
+    /// and consecutive duplicates.
     pub fn add(&mut self, entry: impl AsRef<str>) {
+        let dir = self.cwd.clone();
+        self.add_in_dir(entry, dir);
+    }
+
+    /// Appends an entry tagged with an explicit directory (`None` = global).
+    pub fn add_in_dir(&mut self, entry: impl AsRef<str>, dir: Option<String>) {
         let entry = entry.as_ref();
-        if entry.is_empty() || self.entries.back().is_some_and(|last| last == entry) {
+        if entry.is_empty() || self.entries.back().is_some_and(|last| last.text == entry) {
             return;
         }
         if self.entries.len() == self.max {
             self.entries.pop_front();
         }
-        self.entries.push_back(entry.to_owned());
+        self.entries.push_back(HistEntry {
+            text: entry.to_owned(),
+            dir,
+        });
     }
 
-    /// Loads newline-separated history from `path`.
+    /// Loads history from `path`.
     ///
-    /// A missing file is not an error (fresh start).
+    /// Each line is either a plain (legacy, untagged) entry or a
+    /// directory-tagged entry of the form `\x1f<dir>\x1f<text>`. A missing file
+    /// is not an error (fresh start).
     ///
     /// # Errors
     ///
@@ -285,12 +362,15 @@ impl History {
             Err(e) => return Err(e),
         };
         for line in data.lines() {
-            self.add(line);
+            let (text, dir) = parse_line(line);
+            self.add_in_dir(text, dir);
         }
         Ok(())
     }
 
-    /// Saves the history to `path`, newline-separated.
+    /// Saves the history to `path`, one entry per line, tagging each entry with
+    /// its origin directory (untagged entries are written as plain lines, so a
+    /// downgrade still reads them).
     ///
     /// # Errors
     ///
@@ -298,11 +378,29 @@ impl History {
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let mut out = String::new();
         for e in &self.entries {
-            out.push_str(e);
+            if let Some(dir) = &e.dir {
+                out.push(DIR_SEP);
+                out.push_str(dir);
+                out.push(DIR_SEP);
+            }
+            out.push_str(&e.text);
             out.push('\n');
         }
         fs::write(path.as_ref(), out)
     }
+}
+
+/// Splits a saved history line into `(text, dir)`.
+///
+/// A line starting with [`DIR_SEP`] is `\x1f<dir>\x1f<text>`; anything else is
+/// a legacy untagged entry.
+fn parse_line(line: &str) -> (&str, Option<String>) {
+    if let Some(rest) = line.strip_prefix(DIR_SEP)
+        && let Some((dir, text)) = rest.split_once(DIR_SEP)
+    {
+        return (text, Some(dir.to_owned()));
+    }
+    (line, None)
 }
 
 /// Returns the default history path: `$HOME/.plank_history`.
@@ -802,10 +900,16 @@ impl Editor {
     }
 
     fn history_move(&mut self, dir: i32) {
-        if self.history.is_empty() {
+        // Only entries scoped to the current directory (plus untagged/global
+        // ones) are visited; `history_index` indexes into this eligible list,
+        // not the raw history (issue #49).
+        let eligible: Vec<usize> = (0..self.history.len())
+            .filter(|i| self.history.is_eligible(*i))
+            .collect();
+        if eligible.is_empty() {
             return;
         }
-        let len = self.history.len();
+        let len = eligible.len();
         let new_index = match (self.history_index, dir) {
             (None, d) if d < 0 => {
                 self.stash = self.buf.text().to_owned();
@@ -824,7 +928,11 @@ impl Editor {
         };
         self.history_index = new_index;
         if let Some(i) = new_index {
-            let entry = self.history.get(i).unwrap_or_default().to_owned();
+            let entry = eligible
+                .get(i)
+                .and_then(|h| self.history.get(*h))
+                .unwrap_or_default()
+                .to_owned();
             self.buf.set_text(entry);
         }
     }
@@ -1015,6 +1123,73 @@ mod tests {
         h3.load(dir.join("nope")).unwrap();
         assert!(h3.is_empty());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_dir_tagging_filters_eligibility() {
+        let mut h = History::new(10);
+        h.set_cwd(Some("/proj/a".into()));
+        h.add("cargo build"); // tagged /proj/a
+        h.set_cwd(Some("/proj/b".into()));
+        h.add("npm run"); // tagged /proj/b
+        // Viewed from /proj/a only the /proj/a entry is eligible.
+        h.set_cwd(Some("/proj/a".into()));
+        assert!(h.is_eligible(0));
+        assert!(!h.is_eligible(1));
+        // Viewed from /proj/b it flips.
+        h.set_cwd(Some("/proj/b".into()));
+        assert!(!h.is_eligible(0));
+        assert!(h.is_eligible(1));
+    }
+
+    #[test]
+    fn history_legacy_untagged_entries_are_always_eligible() {
+        // A pre-tagging file is just plain lines: they load untagged and stay
+        // visible from any directory (global fallback, no data lost on upgrade).
+        let dir = std::env::temp_dir().join(format!("plank_hist_legacy_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("hist");
+        fs::write(&path, "old one\nold two\n").unwrap();
+        let mut h = History::new(10);
+        h.load(&path).unwrap();
+        h.set_cwd(Some("/somewhere/else".into()));
+        assert_eq!(h.len(), 2);
+        assert!(h.is_eligible(0));
+        assert!(h.is_eligible(1));
+        assert_eq!(h.dir_of(0), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_save_roundtrip_preserves_dir_tags() {
+        let dir = std::env::temp_dir().join(format!("plank_hist_tag_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("hist");
+        let mut h = History::new(10);
+        h.add_in_dir("global cmd", None);
+        h.add_in_dir("scoped cmd", Some("/proj/a".into()));
+        h.save(&path).unwrap();
+        let mut h2 = History::new(10);
+        h2.load(&path).unwrap();
+        assert_eq!(h2.len(), 2);
+        assert_eq!(h2.get(0), Some("global cmd"));
+        assert_eq!(h2.dir_of(0), None);
+        assert_eq!(h2.get(1), Some("scoped cmd"));
+        assert_eq!(h2.dir_of(1), Some("/proj/a"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_no_project_scope_when_dir_unresolved() {
+        // Launched somewhere the cwd tag can't be resolved: new entries are
+        // untagged and remain eligible everywhere rather than vanishing.
+        let mut h = History::new(10);
+        h.set_cwd(None);
+        h.add("still visible");
+        assert_eq!(h.dir_of(0), None);
+        assert!(h.is_eligible(0));
+        h.set_cwd(Some("/anywhere".into()));
+        assert!(h.is_eligible(0));
     }
 
     // ---- Completion cycling ----

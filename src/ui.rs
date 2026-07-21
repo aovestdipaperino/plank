@@ -2282,8 +2282,14 @@ impl TuiInput {
     ///
     /// In bash mode only past `!` commands are eligible, mirroring the
     /// reference: prompt mode shows everything, bash mode filters to bash.
+    ///
+    /// Directory scope is an orthogonal, second filter (issue #49): entries
+    /// entered in another directory are hidden, keeping untagged/global entries
+    /// visible. The two filters compose — a `!` walk still cycles `!` commands
+    /// only, now further restricted to the current directory.
     fn hist_eligible(&self) -> Vec<usize> {
         (0..self.history.len())
+            .filter(|i| self.history.is_eligible(*i))
             .filter(|i| !self.hist_bang || self.history.get(*i).is_some_and(|e| e.starts_with('!')))
             .collect()
     }
@@ -4737,6 +4743,62 @@ mod tests {
         assert_eq!(input.buf.text(), "!git status");
         input.history_move(1);
         assert_eq!(input.buf.text(), "!half typed");
+    }
+
+    /// A `TuiInput` with history spread across two directories: prompts and
+    /// `!` commands tagged `/proj/a`, and one of each tagged `/proj/b`. The
+    /// current directory is pinned to `/proj/a`.
+    fn input_with_dir_scoped_history() -> TuiInput {
+        let mut input = TuiInput::new();
+        let h = &mut input.history;
+        h.add_in_dir("build a", Some("/proj/a".into()));
+        h.add_in_dir("!ls a", Some("/proj/a".into()));
+        h.add_in_dir("build b", Some("/proj/b".into()));
+        h.add_in_dir("!ls b", Some("/proj/b".into()));
+        h.set_cwd(Some("/proj/a".into()));
+        input
+    }
+
+    #[test]
+    fn history_hides_entries_from_other_directories() {
+        let mut input = input_with_dir_scoped_history();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            input.history_move(-1);
+            seen.push(input.buf.text().to_string());
+        }
+        // Only /proj/a entries appear; the /proj/b ones never surface and the
+        // walk clamps at the oldest eligible entry.
+        assert_eq!(seen, ["!ls a", "build a", "build a", "build a"]);
+    }
+
+    #[test]
+    fn dir_filter_composes_with_bash_mode_filter() {
+        // A `!` walk in /proj/a cycles `!` commands only, and only those tagged
+        // for the current directory: `!ls b` (from /proj/b) must not appear.
+        let mut input = input_with_dir_scoped_history();
+        input.buf.set_text("!");
+        input.buf.move_end();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            input.history_move(-1);
+            seen.push(input.buf.text().to_string());
+        }
+        assert_eq!(seen, ["!ls a", "!ls a"]);
+    }
+
+    #[test]
+    fn legacy_untagged_history_visits_from_any_directory() {
+        // Untagged (pre-#49) entries behave globally: still navigable even when
+        // the current directory has no scoped history of its own.
+        let mut input = TuiInput::new();
+        input.history.add_in_dir("legacy one", None);
+        input.history.add_in_dir("legacy two", None);
+        input.history.set_cwd(Some("/unrelated/dir".into()));
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "legacy two");
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "legacy one");
     }
 
     /// Builds a `TuiInput` whose popup is open with one canned row.
