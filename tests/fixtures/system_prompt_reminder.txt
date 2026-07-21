@@ -257,5 +257,19 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "skill",
+    "description": "Invoke an installed skill (a packaged procedure) by name; its instructions are returned for you to follow. Call with no name to list the installed skills first.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "description": "skill name; omit to enumerate installed skills"},
+        "args": {"type": "string", "description": "arguments passed to the skill"}
+      }
+    }
+  }
+}
 [End system prompt reminder.]
 

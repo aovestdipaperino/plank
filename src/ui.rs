@@ -793,6 +793,7 @@ impl Agent<'_> {
     /// Runs one model turn: stream text, execute tool calls, repeat until
     /// a turn produces no tool calls. Compacts first when context is tight.
     fn run_turn(&mut self) -> Result<(), String> {
+        self.tool_ctx.skill_invocations = 0;
         self.maybe_compact()?;
         self.maybe_append_system_prompt_reminder();
         // One clock for the whole turn: elapsed time accumulates across the
@@ -2833,6 +2834,7 @@ impl Agent<'_> {
         let Some(remote) = self.remote.clone() else {
             return self.run_turn();
         };
+        self.tool_ctx.skill_invocations = 0;
         let bus = Arc::clone(&remote.bus);
         let shared = &remote.shared;
         let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
@@ -2906,6 +2908,7 @@ impl Agent<'_> {
     /// tools, drain queued user lines between rounds, repeat until settled.
     /// Runs on the worker thread and talks to the UI only through `tx`.
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        self.tool_ctx.skill_invocations = 0;
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
@@ -4038,6 +4041,9 @@ fn new_agent(
     }
     let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
     let skills = crate::skills::load_default(&tool_ctx.cwd);
+    // The `skill` tool resolves names against the same set the slash command
+    // uses; hand the dispatch context its own copy.
+    tool_ctx.skills.clone_from(&skills);
     Ok(Agent {
         engine,
         cfg,

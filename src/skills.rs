@@ -165,6 +165,61 @@ pub fn render_list(skills: &[Skill]) -> String {
     out
 }
 
+/// Renders the model-facing skill list for the `skill` tool's enumerate case:
+/// one `name — description` per line, or a clear no-skills message.
+#[must_use]
+pub fn render_names(skills: &[Skill]) -> String {
+    if skills.is_empty() {
+        return "No skills are installed (checked ~/.plank/skills and ./.plank/skills).\n"
+            .to_string();
+    }
+    let mut out = String::from("Available skills (call skill with name set to one of):\n");
+    for s in skills {
+        out.push_str("- ");
+        out.push_str(&s.name);
+        if !s.description.is_empty() {
+            out.push_str(" — ");
+            out.push_str(&s.description);
+        }
+        out.push('\n');
+    }
+    out
+}
+
+/// `skill` tool: lets the model invoke a skill by name, mirroring what the
+/// user's `/name args` slash command produces (issue #36).
+///
+/// A missing/empty `name` enumerates the installed skills. An unknown name
+/// lists the available ones so a near miss self-corrects. The rendered text is
+/// returned as the tool result, so it lands in the transcript as guidance the
+/// model then follows.
+pub fn tool_skill(
+    skills: &[Skill],
+    invocations: &mut usize,
+    cap: usize,
+    call: &crate::dsml::ToolCall,
+) -> String {
+    let name = call.arg_value("name").unwrap_or("").trim();
+    if name.is_empty() {
+        return render_names(skills);
+    }
+    *invocations += 1;
+    if *invocations > cap {
+        return format!(
+            "Tool error: skill invocation limit ({cap}) reached this turn; \
+             refusing to expand another skill to avoid a loop\n"
+        );
+    }
+    let args = call.arg_value("args").unwrap_or("");
+    if let Some(skill) = skills.iter().find(|s| s.name == name) {
+        render(skill, args)
+    } else {
+        let mut out = format!("Tool error: unknown skill: {name}\n");
+        out.push_str(&render_names(skills));
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -258,5 +313,90 @@ mod tests {
         let skills = load_from(std::slice::from_ref(&root));
         assert!(skills.is_empty(), "{skills:?}");
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    fn skill(name: &str, body: &str) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: format!("does {name}"),
+            argument_hint: String::new(),
+            body: body.to_string(),
+            dir: PathBuf::new(),
+        }
+    }
+
+    fn skill_call(args: &[(&str, &str)]) -> crate::dsml::ToolCall {
+        crate::dsml::ToolCall {
+            name: "skill".to_string(),
+            args: args
+                .iter()
+                .map(|(k, v)| crate::dsml::ToolArg {
+                    name: (*k).to_string(),
+                    value: (*v).to_string(),
+                    is_string: true,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn skill_tool_renders_the_same_text_as_the_slash_command() {
+        let skills = vec![skill("plan", "Plan for $ARGUMENTS now.")];
+        let mut n = 0;
+        let out = tool_skill(
+            &skills,
+            &mut n,
+            8,
+            &skill_call(&[("name", "plan"), ("args", "the API")]),
+        );
+        assert_eq!(out, render(&skills[0], "the API"));
+        assert_eq!(out, "Plan for the API now.");
+    }
+
+    #[test]
+    fn skill_tool_with_no_name_enumerates() {
+        let skills = vec![skill("plan", "b"), skill("review", "b")];
+        let mut n = 0;
+        let out = tool_skill(&skills, &mut n, 8, &skill_call(&[]));
+        assert!(out.contains("plan — does plan"), "{out}");
+        assert!(out.contains("review — does review"), "{out}");
+        assert_eq!(n, 0, "enumerate does not count against the cap");
+    }
+
+    #[test]
+    fn skill_tool_unknown_name_lists_the_available_ones() {
+        let skills = vec![skill("plan", "b")];
+        let mut n = 0;
+        let out = tool_skill(&skills, &mut n, 8, &skill_call(&[("name", "nope")]));
+        assert!(
+            out.starts_with("Tool error: unknown skill: nope\n"),
+            "{out}"
+        );
+        assert!(out.contains("plan — does plan"), "{out}");
+    }
+
+    #[test]
+    fn skill_tool_with_no_skills_installed_is_a_clear_message() {
+        let mut n = 0;
+        let out = tool_skill(&[], &mut n, 8, &skill_call(&[]));
+        assert!(out.contains("No skills are installed"), "{out}");
+        let out2 = tool_skill(&[], &mut n, 8, &skill_call(&[("name", "x")]));
+        assert!(out2.starts_with("Tool error: unknown skill: x\n"), "{out2}");
+        assert!(out2.contains("No skills are installed"), "{out2}");
+    }
+
+    #[test]
+    fn skill_tool_caps_recursion_depth() {
+        let skills = vec![skill("plan", "body")];
+        let mut n = 0;
+        for _ in 0..3 {
+            let out = tool_skill(&skills, &mut n, 3, &skill_call(&[("name", "plan")]));
+            assert_eq!(out, "body");
+        }
+        let capped = tool_skill(&skills, &mut n, 3, &skill_call(&[("name", "plan")]));
+        assert!(
+            capped.contains("skill invocation limit (3) reached"),
+            "{capped}"
+        );
     }
 }

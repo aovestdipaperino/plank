@@ -82,7 +82,16 @@ pub struct ToolContext {
     /// User-only warnings from non-blocking hook failures, drained by the UI
     /// after each dispatch.
     pub hook_warnings: Vec<String>,
+    /// Skills the model may invoke via the `skill` tool (issue #36).
+    pub skills: Vec<crate::skills::Skill>,
+    /// Skill invocations so far this turn; the turn driver resets it to 0 at
+    /// the start of each turn. Bounds runaway skill-invokes-skill recursion.
+    pub skill_invocations: usize,
 }
+
+/// Most `skill` invocations allowed within one turn before the tool refuses,
+/// bounding a skill whose text tells the model to invoke another skill.
+pub const SKILL_DEPTH_CAP: usize = 8;
 
 impl std::fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -115,6 +124,8 @@ impl ToolContext {
             hooks: crate::hooks::Hooks::default(),
             sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
+            skills: Vec::new(),
+            skill_invocations: 0,
         }
     }
 
@@ -184,6 +195,12 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
         "mcp_list_resources" => mcp::tool_mcp_list_resources(&ctx.mcp, call),
         "mcp_read_resource" => mcp::tool_mcp_read_resource(&mut ctx.mcp, call),
+        "skill" => crate::skills::tool_skill(
+            &ctx.skills,
+            &mut ctx.skill_invocations,
+            SKILL_DEPTH_CAP,
+            call,
+        ),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         other => format!("Tool error: unknown tool: {other}\n"),
     };

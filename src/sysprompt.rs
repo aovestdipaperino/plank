@@ -144,6 +144,17 @@ pub fn provider_tool_registry(
             "required": ["pattern"]
         }),
     });
+    specs.push(crate::engine::ToolSpec {
+        name: "skill".to_string(),
+        description: "Invoke an installed skill (a packaged procedure) by name; its instructions are returned for you to follow. Call with no name to list the installed skills first.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "skill name; omit to enumerate installed skills"},
+                "args": {"type": "string", "description": "arguments passed to the skill"}
+            }
+        }),
+    });
     for server in mcp_servers {
         if !server.alive() {
             continue;
@@ -278,6 +289,20 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20       \"path\": {\"type\": \"string\", \"description\": \"directory to search from; defaults to the working directory\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"pattern\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"skill\",\n\
+         \x20   \"description\": \"Invoke an installed skill (a packaged procedure) by name; its instructions are returned for you to follow. Call with no name to list the installed skills first.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"name\": {\"type\": \"string\", \"description\": \"skill name; omit to enumerate installed skills\"},\n\
+         \x20       \"args\": {\"type\": \"string\", \"description\": \"arguments passed to the skill\"}\n\
+         \x20     }\n\
          \x20   }\n\
          \x20 }\n\
          }\n",
