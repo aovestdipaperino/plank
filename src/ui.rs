@@ -1981,6 +1981,15 @@ impl Agent<'_> {
     /// tell the user how to resume it. Returns `None` when there is nothing
     /// worth saving (no user turn) or the save fails.
     fn save_for_exit(&mut self) -> Option<(String, std::path::PathBuf)> {
+        // No activity since the session was started or loaded — nothing worth
+        // persisting. This skips both a fresh session with no turns and a
+        // resumed one exited without any new exchange (which would otherwise
+        // be re-written, bumping its timestamp for nothing). `dirty` is set by
+        // every transcript push, task update, and tag, and cleared on save and
+        // load.
+        if !self.session.dirty {
+            return None;
+        }
         let id = self.store.save(&mut self.session).ok()?;
         let path = self
             .store
@@ -1990,7 +1999,8 @@ impl Agent<'_> {
     }
 
     /// At session end, saves the transcript and prints where it landed and how
-    /// to resume it. A session with no user turn is silently skipped.
+    /// to resume it. A session with no activity this run (nothing pushed since
+    /// it was started or loaded) is silently skipped.
     fn report_session_on_exit(&mut self) {
         let Some((id, path)) = self.save_for_exit() else {
             return;
@@ -5955,6 +5965,16 @@ mod tests {
         assert_eq!(agent.session.id, id);
         // The id resolves through the store, which is what `/resume <id>` uses.
         assert!(agent.store.find(&id[..8]).is_ok());
+
+        // Re-exiting with no new activity does not re-save: `save` cleared
+        // `dirty`, so there is nothing to persist.
+        assert!(
+            agent.save_for_exit().is_none(),
+            "unchanged session re-saves"
+        );
+        // A new turn makes it dirty again, and it saves.
+        agent.session.push(Message::user("another"));
+        assert!(agent.save_for_exit().is_some());
         std::fs::remove_dir_all(&dir).ok();
     }
 
