@@ -92,6 +92,12 @@ Plank tracks `ds4_agent` for the core agent loop, but moves faster on the user-f
 - **Interruptible everywhere** — Esc stops generation *and* prompt prefill; the engine's cancel callback aborts mid-sync instead of making you wait out a long prompt.
 - **Text selection and clipboard** — click-drag selects rendered output (WYSIWYG, wrapped lines included) and copies it to the system clipboard on release via `pbcopy` plus OSC 52 (so copy also works over SSH); Cmd-V pastes into the prompt through bracketed paste.
 - **Hierarchical MCP configs with `primaryTools`** — user-scope plus project-scope config files, and per-server control over which tool schemas go in the system prompt (see below).
+- **`@` file completion** — type `@` in the prompt to open a fuzzy typeahead over the repo's files, directories, and MCP resources, ranked with [nucleo](https://crates.io/crates/nucleo-matcher); Tab extends the common prefix, Enter drills into directories, and submodule paths are demoted so the project's own files come first. Honors `.gitignore` (tunable), quotes paths with spaces, and refreshes as files and MCP servers appear.
+- **`glob` tool** — the model can find files by name pattern across the tree (`**/*_test.rs`, `src/**/mod.rs`) instead of shelling out to `find`. `**` crosses directories, `*` stays within a path segment, results are relative and capped, VCS metadata is skipped.
+- **MCP resources** — beyond tools, plank speaks the MCP *resource* protocol: `mcp_list_resources` and `mcp_read_resource` let the model reach content a server publishes as addressable resources (text inlines, binary reports type and size), and the same resources appear in `@` completion. Advertised only when a connected server actually publishes resources.
+- **`settings.json`** — persistent preferences for engine defaults, `@`-completion UI, safety defaults, and the MCP timeout, layered user-scope then project-scope (see below). A startup line names any setting in force, so a file that quietly selects the CPU backend can't hide.
+- **Mode-aware `!` history and live output** — arrow-key history on a `!` line cycles past shell commands only; `!` command output streams into the view as it is produced rather than appearing all at once when the command exits.
+- **`--ui-remote`** — a loopback control port for debugging convoluted TUI scenarios: `snapshot` captures the screen as ANSI text, `keypress` injects keys, and `uitree` returns the rendered layout as JSON, with replies ordered after the injected keys take effect so a harness never has to sleep.
 
 ### Highlights
 

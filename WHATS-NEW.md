@@ -52,6 +52,27 @@ not need it.
 green in the prompt and the `!` shell marker turns red, so you can see a command
 is recognized before you press Enter.
 
+📁 **`@` to reference a file.** Type `@` in the prompt for a fuzzy typeahead over
+your repo's files, directories, and MCP resources. Tab extends the shared
+prefix, Enter drills into a directory, paths with spaces get quoted, and your
+project's own files sort above vendored submodule paths.
+
+🔍 **The model can find files.** A `glob` tool lets it locate files by pattern
+(`**/*_test.rs`) directly, instead of shelling out to `find` — and it reliably
+reaches for it. Alongside it, plank now speaks the MCP *resource* protocol, so
+the model can read content a server publishes as resources, not just call its
+tools.
+
+⚙️ **Settings file.** Preferences you would otherwise retype — model and backend
+defaults, `@`-completion tuning, sandbox and `/btw` defaults, the MCP timeout —
+live in `~/.plank/settings.json`, overlaid per project. A startup line names
+anything in force, so a file that quietly picks the CPU backend can't hide as
+"plank got slow."
+
+🐚 **Better `!` shell commands.** Output now streams into the view as the command
+runs instead of arriving all at once at the end, and arrow-key history on a `!`
+line cycles through past shell commands only.
+
 All still local first, macOS, open source.
 
 ## 1.6.0
