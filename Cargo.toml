@@ -19,6 +19,7 @@ images = []
 [dependencies]
 libc = "0.2"
 ratatui = "0.29"
+unicode-width = "0.2"
 ureq = "3"
 logo-art = "0.2"
 image = { version = "0.25", default-features = false, features = ["png"] }

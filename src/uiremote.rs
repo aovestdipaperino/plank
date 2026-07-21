@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
+use unicode_width::UnicodeWidthStr;
 
 use crate::tools::mcp::{Json, json_escape, json_parse, json_write};
 
@@ -203,7 +204,16 @@ pub fn buffer_to_ansi(buf: &Buffer) -> String {
             out.push('\n');
         }
         let mut active = Style::default();
+        // Continuation cells after a double-width grapheme carry a literal
+        // space (`Cell::reset()`), not the wide-char marker `cell.skip`
+        // (an unrelated overlay/redraw hint) — so we step over them by
+        // display width ourselves, mirroring `Buffer::diff`.
+        let mut skip = 0usize;
         for x in area.left()..area.right() {
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
             let cell = &buf[(x, y)];
             let style = normalize(cell.style());
             if style != active {
@@ -239,9 +249,8 @@ pub fn buffer_to_ansi(buf: &Buffer) -> String {
                 }
                 active = style;
             }
-            if !cell.skip {
-                out.push_str(cell.symbol());
-            }
+            out.push_str(cell.symbol());
+            skip = cell.symbol().width().saturating_sub(1);
         }
         if !is_plain(active) {
             out.push_str("\u{1b}[0m");
@@ -406,5 +415,41 @@ mod tests {
     fn an_empty_buffer_is_an_empty_string() {
         let buf = Buffer::empty(Rect::new(0, 0, 0, 0));
         assert_eq!(buffer_to_ansi(&buf), "");
+    }
+
+    #[test]
+    fn wide_glyphs_serialise_without_overshooting_declared_width() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "世界", Style::default());
+        // Two double-width glyphs should occupy exactly 4 terminal columns:
+        // the glyph itself plus nothing at all for its continuation cell.
+        assert_eq!(buffer_to_ansi(&buf), "世界");
+    }
+
+    #[test]
+    fn ascii_and_wide_glyph_mix_stays_column_aligned() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        buf.set_string(0, 0, "a", Style::default());
+        buf.set_string(1, 0, "世", Style::default());
+        buf.set_string(3, 0, "bc", Style::default());
+        // a(1) + 世(2) + bc(2) = 5 declared columns, 1 trailing blank pad.
+        assert_eq!(buffer_to_ansi(&buf), "a世bc ");
+    }
+
+    #[test]
+    fn emoji_serialises_at_correct_display_width() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "🎉", Style::default());
+        assert_eq!(buffer_to_ansi(&buf), "🎉  ");
+    }
+
+    #[test]
+    fn cell_with_skip_flag_and_real_content_is_not_dropped() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf.set_string(0, 0, "abc", Style::default());
+        buf[(1, 0)].set_skip(true);
+        // `skip` is an overlay/redraw hint, not the wide-char continuation
+        // marker; content marked skip=true must still be emitted.
+        assert_eq!(buffer_to_ansi(&buf), "abc");
     }
 }
