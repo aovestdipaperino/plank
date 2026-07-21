@@ -909,7 +909,9 @@ impl Agent<'_> {
         if out.stop_reason.is_some() {
             return None;
         }
-        out.block
+        // A Stop `prompt` hook's text is fed to the model just like exit-2
+        // feedback, so a prompt hook can steer the model to keep working.
+        out.block.or(out.context)
     }
 
     /// Fires the `UserPromptSubmit` hooks for the turn's triggering prompt (the

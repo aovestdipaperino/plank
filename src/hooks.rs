@@ -1,13 +1,27 @@
-//! Command hooks: user shell commands run at lifecycle points.
+//! Hooks: user shell commands (and static prompts) run at lifecycle points.
 //!
-//! The first slice of the reference agent's hook system, command hooks only:
+//! Events, each firing with documented input on stdin:
 //!
 //! - **`PreToolUse`** — before a tool executes; exit code 2 blocks the tool and
 //!   its stderr becomes the model-visible tool error.
 //! - **`PostToolUse`** — after a tool executes; exit code 2 appends its stderr
 //!   to the observation the model sees.
+//! - **`PostToolUseFailure`** — after a tool that *failed* (carries the error).
 //! - **`Stop`** — when a turn is about to conclude; exit code 2 feeds its
 //!   stderr back to the model and the turn continues (once per turn).
+//! - **`UserPromptSubmit`** — every submitted prompt; may inject turn context.
+//! - **`SessionStart`** / **`SessionEnd`** — session begins (startup|resume|
+//!   clear|compact) / ends (exit reason); the former may inject context.
+//! - **`PreCompact`** / **`PostCompact`** — around a compaction pass; may inject
+//!   context (the latter carries the resulting summary).
+//!
+//! A hook is a `command` (shell) or a `prompt` (static text injected to the
+//! model). Beyond exit codes, a command hook may print a JSON response envelope
+//! on stdout — `continue:false`+`stopReason` (halt the turn), `systemMessage`
+//! (warn the user), `suppressOutput`, `async:true`+`asyncTimeout` — additive
+//! over the exit-code protocol. Matchers alternate on tool name and may match
+//! arguments, e.g. `bash(git *)` or `write(*.md)`. Unknown event names load
+//! with a warning rather than failing.
 //!
 //! Any other nonzero exit shows stderr to the *user* only. Hook input is a
 //! JSON object piped to the command's stdin. Configuration is JSON, merged
@@ -37,16 +51,21 @@ use crate::tools::mcp::{Json, json_escape, json_parse};
 /// Default hook timeout, in seconds.
 const HOOK_DEFAULT_TIMEOUT_SEC: u64 = 60;
 
-/// One command hook.
+/// One hook: either a shell command (`type: "command"`) or a static prompt
+/// (`type: "prompt"`) whose text is injected to the model instead of running a
+/// process.
 #[derive(Debug, Clone)]
 pub struct HookDef {
-    /// Shell command run via `/bin/sh -c`.
+    /// Shell command run via `/bin/sh -c`. Empty for prompt hooks.
     pub command: String,
-    /// Kill the hook after this many seconds.
+    /// Kill the hook after this many seconds. Unused for prompt hooks.
     pub timeout_sec: u64,
     /// When true (config `"async": true`), the hook is spawned fire-and-forget
     /// and never blocks the turn; its exit code and output are ignored.
     pub is_async: bool,
+    /// For a `prompt`-type hook, the text sent to the model as injected
+    /// context. `None` for command hooks.
+    pub prompt: Option<String>,
 }
 
 /// A matcher group: hooks that run when the matcher accepts the target.
@@ -208,8 +227,22 @@ pub struct HookOutcome {
 }
 
 fn parse_hook_def(v: &Json) -> Option<HookDef> {
-    // Only command hooks are supported; other types are ignored.
-    if v.str_or("type", "command") != "command" {
+    let kind = v.str_or("type", "command");
+    // Prompt hooks carry model-facing text instead of a shell command.
+    if kind == "prompt" {
+        let prompt = v.str_or("prompt", "").to_string();
+        if prompt.is_empty() {
+            return None;
+        }
+        return Some(HookDef {
+            command: String::new(),
+            timeout_sec: HOOK_DEFAULT_TIMEOUT_SEC,
+            is_async: false,
+            prompt: Some(prompt),
+        });
+    }
+    // Any other non-command type is ignored.
+    if kind != "command" {
         return None;
     }
     let command = v.str_or("command", "").to_string();
@@ -233,6 +266,7 @@ fn parse_hook_def(v: &Json) -> Option<HookDef> {
         command,
         timeout_sec,
         is_async,
+        prompt: None,
     })
 }
 
@@ -482,6 +516,18 @@ fn run_event_inner(
     let mut context = String::new();
     for group in groups.iter().filter(|g| g.matches(target, arg_values)) {
         for def in &group.hooks {
+            // Prompt hooks run no process: their text is injected to the model
+            // as context, independent of exit-code semantics.
+            if let Some(text) = &def.prompt {
+                let text = text.trim();
+                if !text.is_empty() {
+                    if !context.is_empty() {
+                        context.push('\n');
+                    }
+                    context.push_str(text);
+                }
+                continue;
+            }
             // async hooks are fire-and-forget: spawn, ignore result, never block.
             if def.is_async {
                 let (def, input, cwd) = (def.clone(), input.to_owned(), cwd.to_path_buf());
@@ -594,7 +640,7 @@ pub fn render_list(hooks: &Hooks) -> String {
         return "no hooks configured (checked ~/.plank/hooks.json and ./.plank/hooks.json)\n"
             .to_string();
     }
-    let mut out = String::from("Command hooks:\n");
+    let mut out = String::from("Hooks:\n");
     for (event, groups) in [
         ("PreToolUse", &hooks.pre_tool_use),
         ("PostToolUse", &hooks.post_tool_use),
@@ -613,11 +659,16 @@ pub fn render_list(hooks: &Hooks) -> String {
                 } else {
                     g.matcher.clone()
                 };
-                let _ = writeln!(
-                    out,
-                    "  {event} [{scope}] {} (timeout {}s)",
-                    h.command, h.timeout_sec
-                );
+                if let Some(prompt) = &h.prompt {
+                    let _ = writeln!(out, "  {event} [{scope}] prompt: {prompt}");
+                } else {
+                    let async_tag = if h.is_async { " async" } else { "" };
+                    let _ = writeln!(
+                        out,
+                        "  {event} [{scope}] {} (timeout {}s{async_tag})",
+                        h.command, h.timeout_sec
+                    );
+                }
             }
         }
     }
@@ -643,15 +694,36 @@ mod tests {
     }"#;
 
     #[test]
-    fn parses_events_matchers_and_ignores_non_command() {
+    fn parses_events_matchers_and_prompt_hooks() {
         let h = parse_config(CONFIG);
         assert_eq!(h.pre_tool_use.len(), 1);
         assert_eq!(h.pre_tool_use[0].matcher, "bash|edit");
         assert_eq!(h.post_tool_use[0].hooks[0].timeout_sec, 5);
-        // The prompt-type hook is ignored; the command survives.
-        assert_eq!(h.stop[0].hooks.len(), 1);
-        assert_eq!(h.stop[0].hooks[0].command, "check.sh");
-        assert_eq!(h.stop[0].hooks[0].timeout_sec, HOOK_DEFAULT_TIMEOUT_SEC);
+        // The Stop group has a prompt hook followed by a command hook; both
+        // survive now that prompt hooks are supported.
+        assert_eq!(h.stop[0].hooks.len(), 2);
+        assert_eq!(h.stop[0].hooks[0].prompt.as_deref(), Some("ignored"));
+        assert!(h.stop[0].hooks[0].command.is_empty());
+        assert_eq!(h.stop[0].hooks[1].command, "check.sh");
+        assert!(h.stop[0].hooks[1].prompt.is_none());
+        assert_eq!(h.stop[0].hooks[1].timeout_sec, HOOK_DEFAULT_TIMEOUT_SEC);
+    }
+
+    #[test]
+    fn prompt_hook_injects_text_as_context() {
+        let cwd = std::env::temp_dir();
+        let groups = vec![HookMatcher {
+            matcher: String::new(),
+            hooks: vec![HookDef {
+                command: String::new(),
+                timeout_sec: 0,
+                is_async: false,
+                prompt: Some("remember the style guide".to_string()),
+            }],
+        }];
+        let out = run_event(&groups, "", "{}", &cwd);
+        assert_eq!(out.context.as_deref(), Some("remember the style guide"));
+        assert!(out.block.is_none());
     }
 
     #[test]
@@ -766,6 +838,7 @@ mod tests {
                 command: "sleep 30".to_string(),
                 timeout_sec: 30,
                 is_async: true,
+                prompt: None,
             }],
         }];
         let start = Instant::now();
@@ -857,6 +930,7 @@ mod tests {
                 command: cmd.to_string(),
                 timeout_sec: 5,
                 is_async: false,
+                prompt: None,
             }],
         }]
     }
@@ -905,6 +979,7 @@ mod tests {
                 command: "sleep 30".to_string(),
                 timeout_sec: 1,
                 is_async: false,
+                prompt: None,
             }],
         }];
         let start = Instant::now();
