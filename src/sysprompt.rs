@@ -155,6 +155,21 @@ pub fn provider_tool_registry(
             }
         }),
     });
+    specs.push(crate::engine::ToolSpec {
+        name: "task".to_string(),
+        description: "Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "op": {"type": "string", "description": "add, update, or list"},
+                "id": {"type": "string", "description": "task id (for update)"},
+                "subject": {"type": "string", "description": "task description (for add; optional rename on update)"},
+                "status": {"type": "string", "description": "pending, in_progress, or completed (for update)"},
+                "active_form": {"type": "string", "description": "present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'"}
+            },
+            "required": ["op"]
+        }),
+    });
     for server in mcp_servers {
         if !server.alive() {
             continue;
@@ -303,6 +318,24 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20       \"name\": {\"type\": \"string\", \"description\": \"skill name; omit to enumerate installed skills\"},\n\
          \x20       \"args\": {\"type\": \"string\", \"description\": \"arguments passed to the skill\"}\n\
          \x20     }\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"task\",\n\
+         \x20   \"description\": \"Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"op\": {\"type\": \"string\", \"description\": \"add, update, or list\"},\n\
+         \x20       \"id\": {\"type\": \"string\", \"description\": \"task id (for update)\"},\n\
+         \x20       \"subject\": {\"type\": \"string\", \"description\": \"task description (for add; optional rename on update)\"},\n\
+         \x20       \"status\": {\"type\": \"string\", \"description\": \"pending, in_progress, or completed (for update)\"},\n\
+         \x20       \"active_form\": {\"type\": \"string\", \"description\": \"present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"op\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",

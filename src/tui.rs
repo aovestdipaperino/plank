@@ -438,6 +438,54 @@ impl Default for OutputView {
 /// Theme green, used for the prompt separator rule and panel accents.
 const THEME_GREEN: Color = Color::Indexed(114);
 
+/// A cheap, cloneable snapshot of the task list for rendering (issue #35): the
+/// status-bar counter plus the strip rows. Sent worker→UI over
+/// [`crate::worker::UiEvent::Tasks`] and passed straight into [`draw`], so
+/// neither thread needs to reach into session state during a frame.
+#[derive(Debug, Clone, Default)]
+pub struct TaskView {
+    completed: usize,
+    total: usize,
+    /// `(text, is_active)` rows for the contextual strip, already capped.
+    rows: Vec<(String, bool)>,
+}
+
+impl From<&crate::tasks::TaskList> for TaskView {
+    fn from(list: &crate::tasks::TaskList) -> Self {
+        let (completed, total) = list.counter().unwrap_or((0, 0));
+        Self {
+            completed,
+            total,
+            rows: list.strip_rows(),
+        }
+    }
+}
+
+impl TaskView {
+    /// `(completed, total)` for the status-bar counter, or `None` when empty.
+    #[must_use]
+    pub fn counter(&self) -> Option<(usize, usize)> {
+        if self.total == 0 {
+            None
+        } else {
+            Some((self.completed, self.total))
+        }
+    }
+
+    /// True when the list is non-empty and fully completed (counter goes dim).
+    #[must_use]
+    pub fn all_done(&self) -> bool {
+        self.total > 0 && self.completed == self.total
+    }
+
+    /// Strip rows above the separator rule, `(text, is_active)`, already capped
+    /// at three by [`crate::tasks::TaskList::strip_rows`].
+    #[must_use]
+    pub fn strip_rows(&self) -> &[(String, bool)] {
+        &self.rows
+    }
+}
+
 /// Splits `area` into `(output, input, status)` rows, giving the input
 /// `input_rows` rows. When `has_prompt`, a
 /// one-row green rule is inserted just above the input line (and drawn here),
@@ -448,8 +496,15 @@ fn frame_rows(
     area: Rect,
     has_prompt: bool,
     input_rows: u16,
+    tasks: &TaskView,
 ) -> (Rect, Rect, Rect) {
-    let (output, input, status, rule) = frame_geom(area, has_prompt, input_rows);
+    // The task strip (issue #35) sits directly above the rule; it appears only
+    // at rest (with a prompt) and only when a task is in flight, capped at
+    // three rows so it never crowds the scrollback.
+    let strip = if has_prompt { tasks.strip_rows() } else { &[] };
+    let strip_rows = u16::try_from(strip.len()).unwrap_or(0);
+    let (output, input, status, rule, strip_area) =
+        frame_geom(area, has_prompt, input_rows, strip_rows);
     // Draw-site instrumentation for `--ui-remote`. This is the one place both
     // `draw` and `draw_btw_split` funnel through, so the frame is reset and
     // the structural regions published here; `render_input` and `render_popup`
@@ -459,6 +514,9 @@ fn frame_rows(
         crate::uiremote::region("root", area, &[]);
         crate::uiremote::region("output", output, &[]);
         crate::uiremote::region("status", status, &[]);
+    }
+    if let Some(strip_area) = strip_area {
+        render_task_strip(frame, strip_area, strip);
     }
     if let Some(rule) = rule {
         let text = "─".repeat(rule.width as usize);
@@ -470,20 +528,52 @@ fn frame_rows(
     (output, input, status)
 }
 
-/// Pure geometry behind [`frame_rows`]: returns `(output, input, status, rule)`
-/// where `rule` is the separator row, present only when `has_prompt`.
+/// Draws the contextual task strip: the active task in the theme green the rule
+/// uses, pending tasks in the `Indexed(238)` gray thinking text uses.
+fn render_task_strip(frame: &mut Frame, area: Rect, rows: &[(String, bool)]) {
+    for (i, (text, is_active)) in rows.iter().enumerate() {
+        let Some(y) = area.y.checked_add(u16::try_from(i).unwrap_or(u16::MAX)) else {
+            break;
+        };
+        if y >= area.bottom() {
+            break;
+        }
+        let style = if *is_active {
+            Style::default().fg(THEME_GREEN)
+        } else {
+            Style::default().fg(Color::Indexed(238))
+        };
+        let marker = if *is_active { "▸ " } else { "  " };
+        let row = Rect::new(area.x, y, area.width, 1);
+        frame.render_widget(
+            Paragraph::new(Span::styled(format!("{marker}{text}"), style)),
+            row,
+        );
+    }
+}
+
+/// Pure geometry behind [`frame_rows`]: returns
+/// `(output, input, status, rule, strip)` where `rule` and `strip` are present
+/// only when `has_prompt` (and `strip` only when `strip_rows > 0`).
 ///
 /// Split out so layout can be computed (and tested) without a `Frame`.
-fn frame_geom(area: Rect, has_prompt: bool, input_rows: u16) -> (Rect, Rect, Rect, Option<Rect>) {
+fn frame_geom(
+    area: Rect,
+    has_prompt: bool,
+    input_rows: u16,
+    strip_rows: u16,
+) -> (Rect, Rect, Rect, Option<Rect>, Option<Rect>) {
     if has_prompt {
         let r = Layout::vertical([
             Constraint::Min(1),             // output
+            Constraint::Length(strip_rows), // task strip (0 when idle-empty)
             Constraint::Length(1),          // separator rule
             Constraint::Length(input_rows), // input
             Constraint::Length(1),          // status
         ])
         .split(area);
-        (r[0], r[2], r[3], Some(r[1]))
+        let strip = if strip_rows > 0 { Some(r[1]) } else { None };
+        (r[0], r[3], r[4], Some(r[2]), strip)
     } else {
         let r = Layout::vertical([
             Constraint::Min(1),
@@ -491,7 +581,7 @@ fn frame_geom(area: Rect, has_prompt: bool, input_rows: u16) -> (Rect, Rect, Rec
             Constraint::Length(1),
         ])
         .split(area);
-        (r[0], r[1], r[2], None)
+        (r[0], r[1], r[2], None, None)
     }
 }
 
@@ -648,7 +738,7 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
 /// `input_text` must be the same prompt text passed to the draw call, so the
 /// input's height (and therefore the popup's anchor) matches.
 pub fn draw_popup(frame: &mut Frame, input_text: &str, popup: &crate::complete::Popup) {
-    let (output, input, _, _) = frame_geom(frame.area(), true, input_height(input_text));
+    let (output, input, _, _, _) = frame_geom(frame.area(), true, input_height(input_text), 0);
     let rows = u16::try_from(popup.rows().len()).unwrap_or(u16::MAX);
     render_popup(frame, popup_rect(output, input, rows), popup);
 }
@@ -746,6 +836,7 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
 /// line renders empty and the cursor stays hidden until input is accepted again.
 /// `view` is the scroll state; it is clamped in place to the scrollable range
 /// and a jump-to-bottom hint is shown while it is pinned above the bottom.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
@@ -754,10 +845,16 @@ pub fn draw(
     status: &str,
     view: &mut OutputView,
     selection: Option<Selection>,
+    tasks: &TaskView,
 ) {
     let area = frame.area();
-    let (output, input_row, status_row) =
-        frame_rows(frame, area, input.is_some(), input.map_or(1, input_height));
+    let (output, input_row, status_row) = frame_rows(
+        frame,
+        area,
+        input.is_some(),
+        input.map_or(1, input_height),
+        tasks,
+    );
 
     render_output(frame, output, log, view, selection);
 
@@ -775,6 +872,7 @@ pub fn draw(
             &with_remote_marker(status),
             anim_tick_ms(),
             status_style,
+            tasks,
         ))
         .style(status_style),
         status_row,
@@ -830,12 +928,18 @@ pub fn draw_btw_split(
     cursor: (u16, u16),
     status: &str,
     view: &mut OutputView,
+    tasks: &TaskView,
 ) {
     use ratatui::widgets::{Block, Borders};
 
     let area = frame.area();
-    let (output, input_row, status_row) =
-        frame_rows(frame, area, input.is_some(), input.map_or(1, input_height));
+    let (output, input_row, status_row) = frame_rows(
+        frame,
+        area,
+        input.is_some(),
+        input.map_or(1, input_height),
+        tasks,
+    );
     let cols =
         Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(output);
 
@@ -868,6 +972,7 @@ pub fn draw_btw_split(
             &with_remote_marker(status),
             anim_tick_ms(),
             status_style,
+            tasks,
         ))
         .style(status_style),
         status_row,
@@ -976,29 +1081,40 @@ fn with_remote_marker(status: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// The bar segment lives between `[` and `]`; `▶` cells render in the theme
 /// color (military green) and `·` cells a dim gray.
-fn status_bar_line(text: &str, tick_ms: u64, base: Style) -> Line<'static> {
+fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Line<'static> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
     let bar = text
         .find('[')
         .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
-    let Some((open, close)) = bar else {
-        let mut spans = Vec::new();
-        push_accented(&mut spans, text, tick_ms, base, theme);
-        return Line::from(spans);
-    };
     let mut spans = Vec::new();
-    push_accented(&mut spans, &text[..=open], tick_ms, base, theme);
-    for ch in text[open + 1..close].chars() {
-        let style = match ch {
-            '▶' => theme,
-            '·' => base.fg(Color::Indexed(240)),
-            _ => base,
-        };
-        spans.push(Span::styled(ch.to_string(), style));
+    if let Some((open, close)) = bar {
+        push_accented(&mut spans, &text[..=open], tick_ms, base, theme);
+        for ch in text[open + 1..close].chars() {
+            let style = match ch {
+                '▶' => theme,
+                '·' => base.fg(Color::Indexed(240)),
+                _ => base,
+            };
+            spans.push(Span::styled(ch.to_string(), style));
+        }
+        spans.push(Span::styled(text[close..].to_string(), base));
+    } else {
+        push_accented(&mut spans, text, tick_ms, base, theme);
     }
-    spans.push(Span::styled(text[close..].to_string(), base));
+    // Task counter (issue #35): appended to the bracketed status region, themed
+    // green while work is in flight and dim gray once the list is complete. An
+    // empty list adds nothing.
+    if let Some((done, total)) = tasks.counter() {
+        let counter_style = if tasks.all_done() {
+            base.fg(Color::Indexed(240))
+        } else {
+            theme
+        };
+        spans.push(Span::styled(" | ".to_string(), base));
+        spans.push(Span::styled(format!("✓ {done}/{total}"), counter_style));
+    }
     Line::from(spans)
 }
 
@@ -1212,6 +1328,66 @@ mod tests {
         );
     }
 
+    fn task_view_with(entries: &[(&str, crate::tasks::TaskStatus)]) -> TaskView {
+        let mut list = crate::tasks::TaskList::new();
+        for (subject, status) in entries {
+            let id = list.add(*subject, None);
+            list.update(id, Some(*status), None, None).unwrap();
+        }
+        TaskView::from(&list)
+    }
+
+    #[test]
+    fn status_bar_counter_is_themed_in_flight_and_dim_when_done() {
+        use crate::tasks::TaskStatus::{Completed, InProgress};
+        let base = Style::default();
+        // An empty list adds nothing to the status bar.
+        let empty = status_bar_line("idle", 0, base, &TaskView::default());
+        assert!(!empty.spans.iter().any(|s| s.content.contains('/')));
+
+        // In flight: the counter carries the theme color.
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let tv = task_view_with(&[("a", Completed), ("b", InProgress)]);
+        let line = status_bar_line("idle", 0, base, &tv);
+        let counter = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("1/2"))
+            .expect("counter span present");
+        assert_eq!(counter.style.fg, Some(theme));
+
+        // Fully complete: the counter goes dim gray, not theme.
+        let tv = task_view_with(&[("a", Completed)]);
+        let line = status_bar_line("idle", 0, base, &tv);
+        let counter = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("1/1"))
+            .unwrap();
+        assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
+    }
+
+    #[test]
+    fn frame_geom_reserves_strip_rows_only_when_present() {
+        let area = Rect::new(0, 0, 80, 24);
+        // No strip: the rule sits directly above the input.
+        let (out0, _in0, _st0, rule0, strip0) = frame_geom(area, true, 1, 0);
+        assert!(strip0.is_none());
+        let rule0 = rule0.unwrap();
+        // Three strip rows: reserved between the output and the rule, and the
+        // output pane shrinks by exactly three rows.
+        let (out3, _in3, _st3, rule3, strip3) = frame_geom(area, true, 1, 3);
+        let strip3 = strip3.expect("strip present");
+        let rule3 = rule3.expect("rule present");
+        assert_eq!(strip3.height, 3);
+        assert_eq!(out3.height + 3, out0.height);
+        assert_eq!(strip3.y, out3.bottom());
+        assert_eq!(rule3.y, strip3.bottom());
+        // The rule/input/status band is fixed at the bottom; the strip is
+        // absorbed by shrinking the output, so the rule row does not move.
+        assert_eq!(rule3.y, rule0.y);
+    }
+
     #[test]
     fn verb_shimmer_sweeps_across_the_word() {
         let base = Style::default();
@@ -1220,7 +1396,12 @@ mod tests {
         let text = "◆ Pondering… 3s";
         let mut highlights = Vec::new();
         for step in 0..40u64 {
-            let line = status_bar_line(text, step * crate::status::SHIMMER_STEP_MS, base);
+            let line = status_bar_line(
+                text,
+                step * crate::status::SHIMMER_STEP_MS,
+                base,
+                &TaskView::default(),
+            );
             let hit: String = line
                 .spans
                 .iter()
@@ -1267,8 +1448,19 @@ mod tests {
         log.push_plain("some output");
         let mut view = OutputView::default();
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
-        term.draw(|f| draw(f, &log, Some("hi"), (0, 2), "idle", &mut view, None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                Some("hi"),
+                (0, 2),
+                "idle",
+                &mut view,
+                None,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
         let tree = crate::uiremote::frame_tree();
         crate::uiremote::set_recording(false);
 
@@ -1304,8 +1496,19 @@ mod tests {
 
         // Prompt visible: a green ─ rule sits on the row directly above input.
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
-        term.draw(|f| draw(f, &log, Some("hi"), (0, 2), "idle", &mut view, None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                Some("hi"),
+                (0, 2),
+                "idle",
+                &mut view,
+                None,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let prompt_y = input_row(buf).expect("prompt row present");
         let rule_y = prompt_y - 1;
@@ -1316,8 +1519,19 @@ mod tests {
         // Prompt hidden (agent busy): no rule — the row above the (empty)
         // input line is ordinary output, never the green ─.
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
-        term.draw(|f| draw(f, &log, None, (0, 0), "generating", &mut view, None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                None,
+                (0, 0),
+                "generating",
+                &mut view,
+                None,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
         let buf = term.backend().buffer();
         let has_rule = (0..buf.area.height).any(|y| {
             let c = &buf[(0, y)];
@@ -1335,8 +1549,19 @@ mod tests {
         let mut view = OutputView::default();
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
         // Cursor sits at the end of the second line ("bb").
-        term.draw(|f| draw(f, &log, Some("aa\nbb"), (1, 2), "idle", &mut view, None))
-            .unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                Some("aa\nbb"),
+                (1, 2),
+                "idle",
+                &mut view,
+                None,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
 
         let buf = term.backend().buffer();
         let prompt_y = input_row(buf).expect("prompt row present");
@@ -1398,7 +1623,8 @@ mod tests {
         // hand-made rects, for a one-row and a tall multi-row input.
         for (input_text, rows) in [("@src", 5u16), ("a\nb\nc\n@src", 15)] {
             let screen = Rect::new(0, 0, 80, 24);
-            let (output, input, status, rule) = frame_geom(screen, true, input_height(input_text));
+            let (output, input, status, rule, _strip) =
+                frame_geom(screen, true, input_height(input_text), 0);
             let rule = rule.expect("prompt showing means a rule row");
             let r = popup_rect(output, input, rows);
             assert!(r.y >= output.y, "popup starts inside the output pane");

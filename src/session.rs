@@ -201,6 +201,9 @@ pub struct Session {
     pub tag: String,
     /// Alternating role-tagged messages.
     pub transcript: Vec<Message>,
+    /// Model-visible task list (issue #35), persisted next to the transcript so
+    /// it survives compaction, `/resume`, and checkpoint rollback.
+    pub tasks: crate::tasks::TaskList,
     /// True when the transcript has unsaved changes.
     pub dirty: bool,
 }
@@ -215,6 +218,7 @@ impl Session {
             created_at: 0,
             tag: String::new(),
             transcript: Vec::new(),
+            tasks: crate::tasks::TaskList::new(),
             dirty: false,
         }
     }
@@ -378,6 +382,26 @@ impl SessionStore {
             let _ = writeln!(body, "msg {} {}", m.role.tag(), m.text.len());
             body.extend_from_slice(m.text.as_bytes());
             body.push(b'\n');
+        }
+        // Task list records (issue #35): omitted entirely when the list is
+        // empty so pre-feature files stay byte-identical.
+        if !session.tasks.is_empty() {
+            let _ = writeln!(body, "tasks {}", session.tasks.next_id());
+            for t in session.tasks.tasks() {
+                let af = t.active_form.as_deref().unwrap_or("");
+                let _ = writeln!(
+                    body,
+                    "task {} {} {} {}",
+                    t.id,
+                    t.status.as_str(),
+                    t.subject.len(),
+                    af.len()
+                );
+                body.extend_from_slice(t.subject.as_bytes());
+                body.push(b'\n');
+                body.extend_from_slice(af.as_bytes());
+                body.push(b'\n');
+            }
         }
         let last_prompt = last_prompt_of(&session.transcript);
         let _ = writeln!(body, "meta {} {}", session.tag.len(), last_prompt.len());
@@ -1069,8 +1093,38 @@ fn read_session_file(path: &Path) -> Result<Session> {
 
     let mut transcript = Vec::new();
     let mut tag = String::new();
+    let mut tasks: Vec<crate::tasks::Task> = Vec::new();
+    let mut tasks_next_id: u32 = 0;
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
+        // Task list records (issue #35): a `tasks <next_id>` marker followed by
+        // one `task <id> <status> <subject-len> <active-form-len>` record per
+        // task. Files written before the feature simply lack them.
+        if let Some(rest) = header.strip_prefix("tasks ") {
+            tasks_next_id = rest.trim().parse().map_err(|_| corrupt())?;
+            continue;
+        }
+        if let Some(rest) = header.strip_prefix("task ") {
+            let mut it = rest.split(' ');
+            let id: u32 = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let status = it.next().ok_or_else(corrupt)?;
+            let status = crate::tasks::TaskStatus::parse(status).ok_or_else(corrupt)?;
+            let subj_len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let af_len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let subject = take(&data, &mut pos, subj_len)?;
+            let active = take(&data, &mut pos, af_len)?;
+            tasks.push(crate::tasks::Task {
+                id,
+                subject,
+                status,
+                active_form: if active.is_empty() {
+                    None
+                } else {
+                    Some(active)
+                },
+            });
+            continue;
+        }
         // Trailing metadata record: tag + clipped last prompt (derived, so
         // only the tag is carried into the session).
         if let Some(rest) = header.strip_prefix("meta ") {
@@ -1099,6 +1153,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         created_at,
         tag,
         transcript,
+        tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
         dirty: false,
     })
 }
@@ -1332,6 +1387,61 @@ mod tests {
         // Resave keeps the same identity (overwrites the same file).
         s.push(Message::user("follow-up"));
         assert_eq!(store.save(&mut s).unwrap(), id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn task_list_round_trips_through_save_and_load() {
+        use crate::tasks::TaskStatus;
+        let dir = temp_dir("tasks");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("plan the work"));
+        s.push(Message::assistant("Planning.\n"));
+        s.tasks.add("read the spec", None);
+        s.tasks
+            .add("write the parser", Some("Writing the parser".to_string()));
+        // A subject with a newline and a fake record header, to prove the
+        // length-prefixed encoding is robust.
+        s.tasks
+            .add("subject with\ntask 9 pending 1 2\nembedded", None);
+        s.tasks
+            .update(1, Some(TaskStatus::Completed), None, None)
+            .unwrap();
+        s.tasks
+            .update(2, Some(TaskStatus::InProgress), None, None)
+            .unwrap();
+        let id = store.save(&mut s).unwrap();
+
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.tasks, s.tasks);
+        assert_eq!(loaded.tasks.tasks().len(), 3);
+        assert_eq!(loaded.tasks.get(1).unwrap().status, TaskStatus::Completed);
+        assert_eq!(
+            loaded.tasks.get(2).unwrap().active_form.as_deref(),
+            Some("Writing the parser")
+        );
+        assert_eq!(loaded.tasks.next_id(), s.tasks.next_id());
+        // The transcript and tag survive alongside the task list.
+        assert_eq!(loaded.transcript, s.transcript);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sessions_without_a_task_list_stay_byte_identical() {
+        let dir = temp_dir("notasks");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        s.push(Message::assistant("hello"));
+        let id = store.save(&mut s).unwrap();
+        let raw = fs::read_to_string(store.path_for_id(&id)).unwrap();
+        assert!(
+            !raw.contains("\ntasks "),
+            "empty list writes no task records"
+        );
+        let loaded = store.load(&id).unwrap();
+        assert!(loaded.tasks.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

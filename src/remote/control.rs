@@ -228,6 +228,14 @@ pub enum ServerMsg {
         /// Flattened status fields.
         status: StatusWire,
     },
+    /// Task-list counter snapshot (issue #35). The contextual strip is
+    /// local-TUI-only; the remote wire carries just the completed/total counter.
+    Tasks {
+        /// Completed task count.
+        completed: usize,
+        /// Total task count.
+        total: usize,
+    },
     /// A control request from a non-controller was refused.
     ControlDenied {
         /// Human-readable reason.
@@ -262,6 +270,10 @@ impl ServerMsg {
             UiEvent::Status(s) => Self::Status {
                 status: StatusWire::from(s),
             },
+            UiEvent::Tasks(tv) => {
+                let (completed, total) = tv.counter().unwrap_or((0, 0));
+                Self::Tasks { completed, total }
+            }
         }
     }
 
