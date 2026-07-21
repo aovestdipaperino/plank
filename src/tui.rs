@@ -450,6 +450,14 @@ fn frame_rows(
     input_rows: u16,
 ) -> (Rect, Rect, Rect) {
     let (output, input, status, rule) = frame_geom(area, has_prompt, input_rows);
+    // Draw-site instrumentation for `--ui-remote`. This is the one place both
+    // `draw` and `draw_btw_split` funnel through, so the frame is reset and
+    // the structural regions published here; `render_input` and `render_popup`
+    // append their own regions later in the same pass.
+    crate::uiremote::begin_frame();
+    crate::uiremote::region("root", area, &[]);
+    crate::uiremote::region("output", output, &[]);
+    crate::uiremote::region("status", status, &[]);
     if let Some(rule) = rule {
         let text = "─".repeat(rule.width as usize);
         frame.render_widget(
@@ -556,6 +564,24 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
     if area.height == 0 || popup.rows().is_empty() {
         return;
     }
+    crate::uiremote::region(
+        "popup",
+        area,
+        &[
+            (
+                "rows",
+                crate::tools::mcp::Json::Num(f64::from(
+                    u32::try_from(popup.rows().len()).unwrap_or(u32::MAX),
+                )),
+            ),
+            (
+                "selected",
+                crate::tools::mcp::Json::Num(f64::from(
+                    u32::try_from(popup.selected()).unwrap_or(u32::MAX),
+                )),
+            ),
+        ],
+    );
     frame.render_widget(Clear, area);
     let items: Vec<ListItem> = popup
         .rows()
@@ -617,6 +643,15 @@ pub fn input_height(input: &str) -> u16 {
 /// Rows after the first are indented under the prompt, and every row shares
 /// the cursor row's horizontal scroll so a long line stays visible.
 fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, u16)) {
+    // The input region carries its text, so a harness can assert on what is
+    // typed without decoding the ANSI snapshot. It is registered here rather
+    // than in `frame_rows` because only this function sees the text; while the
+    // agent is busy no prompt is drawn and no `input` region appears.
+    crate::uiremote::region(
+        "input",
+        input_area,
+        &[("text", crate::tools::mcp::Json::Str(input.to_string()))],
+    );
     let prompt = crate::status::prompt_text();
     let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
     let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
@@ -689,7 +724,12 @@ pub fn draw(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
+        Paragraph::new(status_bar_line(
+            &with_remote_marker(status),
+            anim_tick_ms(),
+            status_style,
+        ))
+        .style(status_style),
         status_row,
     );
 }
@@ -777,7 +817,12 @@ pub fn draw_btw_split(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(status, anim_tick_ms(), status_style)).style(status_style),
+        Paragraph::new(status_bar_line(
+            &with_remote_marker(status),
+            anim_tick_ms(),
+            status_style,
+        ))
+        .style(status_style),
         status_row,
     );
 }
@@ -865,6 +910,17 @@ fn push_accented(
         spans.push(Span::styled(seg[end..].to_string(), base));
     } else {
         spans.push(Span::styled(seg.to_string(), base));
+    }
+}
+
+/// Appends a visible marker to the status text while `--ui-remote` is active.
+///
+/// A session that can be typed into from outside must say so on screen.
+fn with_remote_marker(status: &str) -> std::borrow::Cow<'_, str> {
+    if crate::uiremote::recording_enabled() {
+        std::borrow::Cow::Owned(format!("{status} | remote"))
+    } else {
+        std::borrow::Cow::Borrowed(status)
     }
 }
 
@@ -1118,6 +1174,45 @@ mod tests {
             let cell = &buf[(0, y)];
             cell.symbol().starts_with(head) && cell.style().fg == Some(Color::Cyan)
         })
+    }
+
+    #[test]
+    fn draw_publishes_the_frame_regions_for_ui_remote() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let _guard = crate::uiremote::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::uiremote::set_recording(true);
+        let mut log = OutputLog::new();
+        log.push_plain("some output");
+        let mut view = OutputView::default();
+        let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw(f, &log, Some("hi"), (0, 2), "idle", &mut view, None))
+            .unwrap();
+        let tree = crate::uiremote::frame_tree();
+        crate::uiremote::set_recording(false);
+
+        // One top-level region (`root`, the whole frame) with the rest nested
+        // inside it, so the shape a harness sees is a single object.
+        assert!(tree.starts_with(r#"{"name":"root""#), "{tree}");
+        for name in ["output", "input", "status"] {
+            assert!(tree.contains(&format!(r#""name":"{name}""#)), "{tree}");
+        }
+        assert!(tree.contains(r#""text":"hi""#), "{tree}");
+    }
+
+    #[test]
+    fn status_bar_marks_an_active_remote_session() {
+        let _guard = crate::uiremote::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::uiremote::set_recording(false);
+        assert_eq!(with_remote_marker("idle"), "idle");
+        crate::uiremote::set_recording(true);
+        assert_eq!(with_remote_marker("idle"), "idle | remote");
+        crate::uiremote::set_recording(false);
     }
 
     #[test]

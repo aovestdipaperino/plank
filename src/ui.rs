@@ -8,9 +8,9 @@
 //! multiplex.
 
 use std::io::{BufRead, IsTerminal, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
@@ -30,11 +30,177 @@ use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
+use crate::tools::mcp::Json;
 use crate::tools::{ToolContext, dispatch_all};
 use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
 use crate::worker::{self, BroadcastBus, ChannelSink, TurnShared, UiEvent};
+
+/// UI-thread state for `--ui-remote` remote control.
+///
+/// Owns the listener handle, the queue of keys injected by remote clients,
+/// and the `snapshot`/`uitree` requests whose replies are deliberately held
+/// back until the screen reflects those keys (see [`UiRemote::drain`]).
+///
+/// It is wrapped in a `Mutex` and shared by `Arc` rather than passed as
+/// `&mut` because the TUI turn loop hands `&mut self` (the whole `Agent`) to
+/// a worker closure while the same tick still needs the remote state; the
+/// `Mutex` is uncontended in practice — only the UI thread ever locks it,
+/// the listener thread talks over channels.
+#[derive(Debug)]
+pub struct UiRemote {
+    /// Listener handle. `None` in unit tests, which exercise the queueing
+    /// logic without binding a port.
+    handle: Option<crate::uiremote::RemoteHandle>,
+    /// Key events queued by `keypress`, consumed by [`next_event`].
+    injected: std::collections::VecDeque<Event>,
+    /// `snapshot`/`uitree` requests waiting for a post-key frame.
+    deferred: Vec<crate::uiremote::Pending>,
+    /// `(ansi, tree)` captured inside the qualifying draw closure. The
+    /// terminal's current buffer is already the *next* frame's once `draw`
+    /// returns, so the screen has to be read while the frame is still live.
+    captured: Option<(String, String, u16, u16)>,
+}
+
+impl UiRemote {
+    /// Wraps a started listener for the TUI loops.
+    fn new(handle: crate::uiremote::RemoteHandle) -> Self {
+        Self {
+            handle: Some(handle),
+            injected: std::collections::VecDeque::new(),
+            deferred: Vec::new(),
+            captured: None,
+        }
+    }
+
+    /// A detached instance with no listener, for unit tests of the queueing
+    /// and deferral rules.
+    #[cfg(test)]
+    fn detached() -> Self {
+        Self {
+            handle: None,
+            injected: std::collections::VecDeque::new(),
+            deferred: Vec::new(),
+            captured: None,
+        }
+    }
+
+    /// Takes every command the listener has queued.
+    ///
+    /// `keypress` is answered immediately — the client only needs to know the
+    /// keys were accepted. `snapshot` and `uitree` are held: answering them
+    /// now would describe the screen *before* the keys took effect, which is
+    /// exactly the race this feature exists to remove.
+    fn drain(&mut self) {
+        while let Some(p) = self
+            .handle
+            .as_ref()
+            .and_then(crate::uiremote::RemoteHandle::try_recv)
+        {
+            match p.cmd {
+                crate::uiremote::RemoteCmd::Keypress(keys) => {
+                    for k in keys {
+                        self.injected.push_back(Event::Key(k));
+                    }
+                    let _ = p.reply.send(crate::uiremote::ok_reply(&[]));
+                }
+                _ => self.deferred.push(p),
+            }
+        }
+    }
+
+    /// Called at the end of every draw closure: records the finished frame
+    /// when a deferred reply is waiting and every injected key has already
+    /// been consumed.
+    fn capture(&mut self, frame: &mut ratatui::Frame) {
+        if self.deferred.is_empty() || !self.injected.is_empty() {
+            return;
+        }
+        let area = frame.area();
+        self.captured = Some((
+            crate::uiremote::buffer_to_ansi(frame.buffer_mut()),
+            crate::uiremote::frame_tree(),
+            area.width,
+            area.height,
+        ));
+    }
+
+    /// Called just after `terminal.draw` returns: answers the deferred
+    /// requests from the frame [`capture`](Self::capture) recorded, if any.
+    fn service(&mut self) {
+        let Some((ansi, tree, cols, rows)) = self.captured.take() else {
+            return;
+        };
+        for p in self.deferred.drain(..) {
+            let reply = match p.cmd {
+                crate::uiremote::RemoteCmd::Snapshot => crate::uiremote::ok_reply(&[
+                    ("ansi", Json::Str(ansi.clone())),
+                    ("cols", Json::Num(f64::from(cols))),
+                    ("rows", Json::Num(f64::from(rows))),
+                ]),
+                crate::uiremote::RemoteCmd::Uitree => {
+                    crate::uiremote::ok_reply(&[("tree", Json::Str(tree.clone()))])
+                }
+                // `drain` never defers a keypress.
+                crate::uiremote::RemoteCmd::Keypress(_) => {
+                    crate::uiremote::error_reply("keypress deferred unexpectedly")
+                }
+            };
+            let _ = p.reply.send(reply);
+        }
+    }
+}
+
+/// Drains remote commands for this tick, if remote control is on.
+fn remote_drain(remote: Option<&Mutex<UiRemote>>) {
+    if let Some(m) = remote
+        && let Ok(mut g) = m.lock()
+    {
+        g.drain();
+    }
+}
+
+/// Captures the just-drawn frame for any deferred remote request. Call as the
+/// last statement inside a `terminal.draw` closure.
+fn remote_capture(remote: Option<&Mutex<UiRemote>>, frame: &mut ratatui::Frame) {
+    if let Some(m) = remote
+        && let Ok(mut g) = m.lock()
+    {
+        g.capture(frame);
+    }
+}
+
+/// Answers deferred remote requests. Call right after `terminal.draw` returns.
+fn remote_service(remote: Option<&Mutex<UiRemote>>) {
+    if let Some(m) = remote
+        && let Ok(mut g) = m.lock()
+    {
+        g.service();
+    }
+}
+
+/// The single event source both TUI key loops use.
+///
+/// Injected events (from `--ui-remote`) are drained before the terminal is
+/// polled, so a remote keypress is always processed on the tick it arrives
+/// and never waits out the poll timeout. Returns `Ok(None)` when the poll
+/// timed out with nothing to report.
+fn next_event(
+    remote: Option<&Mutex<UiRemote>>,
+    timeout: Duration,
+) -> Result<Option<Event>, String> {
+    if let Some(m) = remote
+        && let Ok(mut g) = m.lock()
+        && let Some(ev) = g.injected.pop_front()
+    {
+        return Ok(Some(ev));
+    }
+    if !event::poll(timeout).map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    event::read().map(Some).map_err(|e| e.to_string())
+}
 
 /// Stdout writer that flushes after every write so tokens appear as streamed.
 #[derive(Debug)]
@@ -401,6 +567,9 @@ struct Agent<'a> {
     /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
     /// was not given, in which case the turn loops behave exactly as before.
     remote: Option<Arc<RemoteState>>,
+    /// TUI remote-control state (`--ui-remote`). `None` (the default) means
+    /// no listener thread, no injected keys and no draw-time recording.
+    ui_remote: Option<Arc<Mutex<UiRemote>>>,
     /// Cumulative billed token usage for online (provider) turns this session,
     /// surfaced by `/usage`. Stays zero for local engines, which report none.
     usage: SessionUsage,
@@ -1897,6 +2066,16 @@ impl Agent<'_> {
     /// # Errors
     /// Returns an error string on unrecoverable terminal or engine failure.
     fn run_tui(&mut self) -> Result<(), String> {
+        // `--ui-remote`: bind the loopback listener *before* the alternate
+        // screen is entered, so the port line lands on a clean stderr (stdout
+        // belongs to the UI). Started here rather than in `main` because this
+        // is the only front end the feature applies to.
+        if let Some(port) = self.cfg.ui_remote {
+            let handle = crate::uiremote::start(port)?;
+            eprintln!("ui-remote listening on 127.0.0.1:{}", handle.port);
+            crate::uiremote::set_recording(true);
+            self.ui_remote = Some(Arc::new(Mutex::new(UiRemote::new(handle))));
+        }
         let mut terminal = ratatui::init();
         // Capture the mouse so wheel events scroll the output buffer instead
         // of being translated by the terminal into arrow keys (history moves),
@@ -1921,6 +2100,10 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)]
     fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
+        // Cloned out of `self` so the remote state stays reachable while the
+        // loop hands `&mut self` to a turn.
+        let ui_remote = self.ui_remote.clone();
+        let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
         input.mcp_extra = crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp);
         let hist_path = default_history_path();
@@ -1971,6 +2154,7 @@ impl Agent<'_> {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
                 clip_checked = Instant::now();
             }
+            remote_drain(rem);
             input.pump_popup();
             let mut status = self.idle_status_text();
             if clip_has_image {
@@ -2006,10 +2190,12 @@ impl Agent<'_> {
                     if let Some(p) = &input.popup {
                         tui::draw_popup(f, input.buf.text(), p);
                     }
+                    remote_capture(rem, f);
                 })
                 .map_err(|e| e.to_string())?;
+            remote_service(rem);
 
-            if !event::poll(Duration::from_millis(200)).map_err(|e| e.to_string())? {
+            let Some(ev) = next_event(rem, Duration::from_millis(200))? else {
                 // Remote-driven input (issue #25): a remote controller's
                 // `prompt`/`command` frames start a local turn just as if typed
                 // here, so the local screen and the remote mirror stay in sync.
@@ -2045,8 +2231,7 @@ impl Agent<'_> {
                     }
                 }
                 continue;
-            }
-            let ev = event::read().map_err(|e| e.to_string())?;
+            };
             if let Event::Mouse(m) = &ev {
                 match m.kind {
                     MouseEventKind::ScrollUp => {
@@ -2462,6 +2647,10 @@ impl Agent<'_> {
         // editor uses, and mirror every event onto its bus (issue #25).
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
+        // Same remote-control state the idle loop uses: a turn started by an
+        // injected Enter must keep servicing the deferred snapshot/uitree.
+        let ui_remote = self.ui_remote.clone();
+        let rem = ui_remote.as_deref();
         let mut run_main = true;
         let mut carry_btw: Vec<String> = Vec::new();
         loop {
@@ -2474,13 +2663,31 @@ impl Agent<'_> {
             }
             let bus_ref = bus.as_deref();
             if run_main {
-                run_worker_ui(terminal, log, view, input, btw, shared, bus_ref, |tx| {
-                    self.worker_turn(&tx, shared)
-                })??;
+                run_worker_ui(
+                    terminal,
+                    log,
+                    view,
+                    input,
+                    btw,
+                    shared,
+                    bus_ref,
+                    rem,
+                    |tx| self.worker_turn(&tx, shared),
+                )??;
             } else {
-                run_worker_ui(terminal, log, view, input, btw, shared, bus_ref, |tx| {
-                    self.drain_btw(&tx, shared);
-                })?;
+                run_worker_ui(
+                    terminal,
+                    log,
+                    view,
+                    input,
+                    btw,
+                    shared,
+                    bus_ref,
+                    rem,
+                    |tx| {
+                        self.drain_btw(&tx, shared);
+                    },
+                )?;
             }
             // Lines typed while busy that no tool round drained become the
             // next turn's user message(s), as if resubmitted by hand.
@@ -3061,6 +3268,7 @@ impl Agent<'_> {
     ) -> Result<(), String> {
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
+        let ui_remote = self.ui_remote.clone();
         let shared = TurnShared::default();
         shared.push_btw(question.to_owned());
         run_worker_ui(
@@ -3071,6 +3279,7 @@ impl Agent<'_> {
             btw,
             &shared,
             bus.as_deref(),
+            ui_remote.as_deref(),
             |tx| {
                 self.drain_btw(&tx, &shared);
             },
@@ -3331,14 +3540,24 @@ fn run_worker_ui<T: Send>(
     btw: &mut BtwPanel,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
+    remote: Option<&Mutex<UiRemote>>,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::scope(|s| {
         let handle = s.spawn(move || job(tx));
-        let ui = busy_ui_loop(terminal, log, view, input, btw, &rx, shared, bus, || {
-            handle.is_finished()
-        });
+        let ui = busy_ui_loop(
+            terminal,
+            log,
+            view,
+            input,
+            btw,
+            &rx,
+            shared,
+            bus,
+            remote,
+            || handle.is_finished(),
+        );
         // On a UI error (terminal gone) the worker must still be stopped and
         // joined before the scope can end.
         if ui.is_err() {
@@ -3388,6 +3607,7 @@ fn busy_ui_loop(
     rx: &Receiver<UiEvent>,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
+    remote: Option<&Mutex<UiRemote>>,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
@@ -3451,6 +3671,7 @@ fn busy_ui_loop(
         // the channel and is drained below (the sender is gone once the
         // worker returns).
         let finished = done();
+        remote_drain(remote);
         input.pump_popup();
         terminal
             .draw(|f| {
@@ -3479,8 +3700,10 @@ fn busy_ui_loop(
                 if let Some(p) = &input.popup {
                     tui::draw_popup(f, input.buf.text(), p);
                 }
+                remote_capture(remote, f);
             })
             .map_err(|e| e.to_string())?;
+        remote_service(remote);
         if finished {
             // The worker is done (turn over); drain the tail in order. The
             // panel is discarded when this function returns, so late btw
@@ -3502,10 +3725,10 @@ fn busy_ui_loop(
             }
             return Ok(());
         }
-        if !event::poll(Duration::from_millis(100)).map_err(|e| e.to_string())? {
+        let Some(ev) = next_event(remote, Duration::from_millis(100))? else {
             continue;
-        }
-        match event::read().map_err(|e| e.to_string())? {
+        };
+        match ev {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // Same precedence as `tui_loop`: the popup sees keys first, so
                 // Esc closes it before it can interrupt the worker.
@@ -3713,6 +3936,7 @@ fn new_agent(
         skills,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote,
+        ui_remote: None,
         usage: SessionUsage::default(),
     })
 }
@@ -4258,6 +4482,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         }
     }
@@ -5063,6 +5288,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
 
@@ -5131,6 +5357,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("go"));
@@ -5207,6 +5434,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("kv payload flow"));
@@ -5283,6 +5511,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("hi"));
@@ -5348,6 +5577,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("run echo"));
@@ -5400,6 +5630,7 @@ mod tests {
             skills: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            ui_remote: None,
             usage: SessionUsage::default(),
         };
         agent.session.push(Message::user("run echo"));
@@ -5442,5 +5673,92 @@ mod tests {
         );
         assert!(events.iter().any(|e| matches!(e, UiEvent::Status(_))));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A `Pending` wired to a channel the test can read the reply from.
+    fn pending(cmd: crate::uiremote::RemoteCmd) -> (crate::uiremote::Pending, Receiver<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (crate::uiremote::Pending { cmd, reply: tx }, rx)
+    }
+
+    #[test]
+    fn injected_events_are_returned_before_polling_the_terminal() {
+        let remote = Mutex::new(UiRemote::detached());
+        {
+            let mut g = remote.lock().unwrap();
+            g.injected
+                .push_back(Event::Key(KeyEvent::from(KeyCode::Char('@'))));
+            g.injected
+                .push_back(Event::Key(KeyEvent::from(KeyCode::Down)));
+        }
+        // No terminal is attached in tests, so a real poll would fail or
+        // block; returning the queued events proves they are checked first.
+        let a = next_event(Some(&remote), Duration::ZERO).unwrap();
+        assert!(matches!(
+            a,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Char('@'),
+                ..
+            }))
+        ));
+        let b = next_event(Some(&remote), Duration::ZERO).unwrap();
+        assert!(matches!(
+            b,
+            Some(Event::Key(KeyEvent {
+                code: KeyCode::Down,
+                ..
+            }))
+        ));
+        assert!(remote.lock().unwrap().injected.is_empty());
+    }
+
+    #[test]
+    fn keypress_answers_at_once_and_snapshot_waits_for_the_post_key_frame() {
+        let mut r = UiRemote::detached();
+        let (keys, keys_rx) = pending(crate::uiremote::RemoteCmd::Keypress(vec![
+            KeyEvent::from(KeyCode::Char('h')),
+            KeyEvent::from(KeyCode::Char('i')),
+        ]));
+        let (snap, snap_rx) = pending(crate::uiremote::RemoteCmd::Snapshot);
+        // Stand in for `drain`'s classification (no listener is attached).
+        for p in [keys, snap] {
+            match p.cmd {
+                crate::uiremote::RemoteCmd::Keypress(ref k) => {
+                    for key in k.clone() {
+                        r.injected.push_back(Event::Key(key));
+                    }
+                    p.reply.send(crate::uiremote::ok_reply(&[])).unwrap();
+                }
+                _ => r.deferred.push(p),
+            }
+        }
+        // The keypress is acknowledged immediately...
+        assert_eq!(keys_rx.try_recv().unwrap(), r#"{"ok":true}"#);
+        // ...but the snapshot is not answered by a frame drawn while keys
+        // are still queued: no capture, so `service` has nothing to send.
+        assert_eq!(r.injected.len(), 2);
+        r.service();
+        assert!(snap_rx.try_recv().is_err());
+
+        // Once every key has been consumed, the next frame answers it.
+        r.injected.clear();
+        r.captured = Some(("SCREEN".to_string(), "{}".to_string(), 80, 24));
+        r.service();
+        let reply = snap_rx.try_recv().unwrap();
+        assert!(reply.contains(r#""ansi":"SCREEN""#), "{reply}");
+        assert!(reply.contains(r#""cols":80"#), "{reply}");
+        assert!(reply.contains(r#""rows":24"#), "{reply}");
+        assert!(r.deferred.is_empty());
+    }
+
+    #[test]
+    fn uitree_reply_carries_the_frame_tree_as_a_json_string() {
+        let mut r = UiRemote::detached();
+        let (p, rx) = pending(crate::uiremote::RemoteCmd::Uitree);
+        r.deferred.push(p);
+        r.captured = Some((String::new(), r#"{"name":"root"}"#.to_string(), 10, 4));
+        r.service();
+        let reply = rx.try_recv().unwrap();
+        assert!(reply.contains(r#""tree":"{\"name\":\"root\"}""#), "{reply}");
     }
 }

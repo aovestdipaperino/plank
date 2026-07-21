@@ -278,6 +278,14 @@ pub struct Region {
 /// Set while `--ui-remote` is active. Keeps [`region`] free otherwise.
 static RECORDING: AtomicBool = AtomicBool::new(false);
 
+/// Serialises every test that touches the process-global `RECORDING` flag.
+///
+/// Lives at module level (not inside `mod tests`) so tests in other modules —
+/// `crate::tui`'s draw-site instrumentation tests — take the *same* guard;
+/// two separate mutexes would not serialise anything.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 thread_local! {
     /// Regions recorded during the current frame. Drawing only happens on the
     /// UI thread, so a thread-local avoids threading a recorder through every
@@ -740,7 +748,7 @@ mod tests {
     // threads by default. Without serializing, one test's `set_recording`
     // races another's. `REGIONS` is itself a `thread_local!`, so it is safe
     // per-thread, but `RECORDING` is a plain `static` and must be guarded.
-    static UIREMOTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_LOCK as UIREMOTE_TEST_LOCK;
 
     #[test]
     fn region_is_a_no_op_when_recording_is_off() {

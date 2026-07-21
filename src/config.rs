@@ -41,6 +41,9 @@ pub struct AgentConfig {
     pub mcp_config_path: Option<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
+    /// Loopback port for `--ui-remote` TUI remote control; `Some(0)` asks for
+    /// an ephemeral port. `None` (the default) leaves the feature off entirely.
+    pub ui_remote: Option<u16>,
     /// True when `-h`/`--help` was given; caller should print [`usage`] and exit.
     pub show_help: bool,
     /// Optional help topic following `-h`/`--help`.
@@ -283,6 +286,7 @@ impl Default for AgentConfig {
             chdir_path: None,
             mcp_config_path: None,
             non_interactive: false,
+            ui_remote: None,
             show_help: false,
             help_topic: None,
             model_path: None,
@@ -370,6 +374,8 @@ Options:
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
       --non-interactive    disable the interactive UI
+      --ui-remote[=PORT]   accept TUI remote control on 127.0.0.1:PORT
+                           (omit PORT for an ephemeral one, printed to stderr)
   -sys, --system TEXT      override the system prompt
       --trace PATH         append a trace log to PATH
   -c, --ctx N              context window size in tokens (default 1048576)
@@ -716,6 +722,14 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--ui-remote" => c.ui_remote = Some(0),
+            a if a.starts_with("--ui-remote=") => {
+                let v = &a["--ui-remote=".len()..];
+                c.ui_remote = Some(
+                    v.parse::<u16>()
+                        .map_err(|_| format!("--ui-remote: bad port {v:?}"))?,
+                );
+            }
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "-c" | "--ctx" => c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?,
@@ -918,6 +932,22 @@ mod tests {
         assert!(err.contains("cannot be combined"), "got: {err}");
         // Invalid provider name.
         assert!(parse_options(&args(&["--provider", "bogus"])).is_err());
+    }
+
+    #[test]
+    fn parses_ui_remote_in_both_forms() {
+        assert_eq!(parse_options(&args(&[])).unwrap().ui_remote, None);
+        assert_eq!(
+            parse_options(&args(&["--ui-remote"])).unwrap().ui_remote,
+            Some(0)
+        );
+        assert_eq!(
+            parse_options(&args(&["--ui-remote=4321"]))
+                .unwrap()
+                .ui_remote,
+            Some(4321)
+        );
+        assert!(parse_options(&args(&["--ui-remote=nope"])).is_err());
     }
 
     #[test]
