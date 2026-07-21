@@ -5,9 +5,15 @@
 //! `ratatui::DefaultTerminal` (`Terminal<CrosstermBackend<Stdout>>`), so
 //! there is no in-process way to hand it a `TestBackend` without changing
 //! its signature — out of scope for a test-only change. What's covered
-//! instead is the exact mechanism the harness depends on: draw-time region
+//! instead is two of the three pieces a harness leans on: draw-time region
 //! recording (`uitree`) and screen serialization (`snapshot`), both driven
 //! headlessly through a `ratatui::backend::TestBackend`.
+//!
+//! The third piece — the deferral that makes `keypress` then `snapshot`
+//! return the *post-key* screen without a sleep — is **not** covered here.
+//! It needs a real key-loop tick, which needs the signature change above.
+//! Unit tests in `src/ui.rs` drive `UiRemote::capture` directly; issue #46
+//! tracks closing the gap properly.
 //!
 //! Only `uitree_reports_the_popup_selection` touches the process-global
 //! `RECORDING` flag (via `set_recording`/`region`); the other test never

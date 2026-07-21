@@ -692,10 +692,17 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
     frame.render_widget(Paragraph::new(lines).scroll((0, scroll)), text_area);
 
     let cursor_x = text_area.x + cursor_col.saturating_sub(scroll);
-    frame.set_cursor_position(Position::new(
+    let cursor = Position::new(
         cursor_x.min(input_area.right().saturating_sub(1)),
         input_area.y + cursor_row.min(input_area.height.saturating_sub(1)),
-    ));
+    );
+    frame.set_cursor_position(cursor);
+    // ratatui 0.29 keeps `Frame::cursor_position` private with no getter, so
+    // the snapshot's cursor field is recorded here, at the one site that sets
+    // it, rather than read back off the frame.
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::set_cursor(cursor.x, cursor.y);
+    }
 }
 
 /// Draws one frame: output log, input line, and status bar.

@@ -722,7 +722,19 @@ pub fn parse_options(args: &[String]) -> Result<AgentConfig, String> {
                 };
             }
             "--non-interactive" => c.non_interactive = true,
-            "--ui-remote" => c.ui_remote = Some(0),
+            // Bare `--ui-remote` means an ephemeral port. A following bare
+            // number is almost certainly someone meaning to pin one, so
+            // reject it rather than silently binding an ephemeral port and
+            // leaving the number to fall through as an unknown argument.
+            "--ui-remote" => {
+                if args.get(i + 1).is_some_and(|n| n.parse::<u16>().is_ok()) {
+                    return Err(format!(
+                        "--ui-remote takes no separate argument; use --ui-remote={}",
+                        args[i + 1]
+                    ));
+                }
+                c.ui_remote = Some(0);
+            }
             a if a.starts_with("--ui-remote=") => {
                 let v = &a["--ui-remote=".len()..];
                 c.ui_remote = Some(
@@ -948,6 +960,21 @@ mod tests {
             Some(4321)
         );
         assert!(parse_options(&args(&["--ui-remote=nope"])).is_err());
+    }
+
+    #[test]
+    fn space_separated_ui_remote_port_is_rejected_not_silently_ignored() {
+        // `--ui-remote 7777` reads as "pin port 7777" but would otherwise
+        // bind an ephemeral port and leave 7777 as a stray argument.
+        let err = parse_options(&args(&["--ui-remote", "7777"])).unwrap_err();
+        assert!(err.contains("--ui-remote=7777"), "{err}");
+        // A non-numeric follower is someone else's argument, not a port.
+        assert_eq!(
+            parse_options(&args(&["--ui-remote", "--non-interactive"]))
+                .unwrap()
+                .ui_remote,
+            Some(0)
+        );
     }
 
     #[test]

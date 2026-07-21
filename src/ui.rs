@@ -30,7 +30,6 @@ use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
-use crate::tools::mcp::Json;
 use crate::tools::{ToolContext, dispatch_all};
 use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
@@ -57,10 +56,25 @@ pub struct UiRemote {
     injected: std::collections::VecDeque<Event>,
     /// `snapshot`/`uitree` requests waiting for a post-key frame.
     deferred: Vec<crate::uiremote::Pending>,
-    /// `(ansi, tree)` captured inside the qualifying draw closure. The
-    /// terminal's current buffer is already the *next* frame's once `draw`
-    /// returns, so the screen has to be read while the frame is still live.
-    captured: Option<(String, String, u16, u16)>,
+    /// The frame captured inside the qualifying draw closure. The terminal's
+    /// current buffer is already the *next* frame's once `draw` returns, so
+    /// the screen has to be read while the frame is still live.
+    captured: Option<CapturedFrame>,
+}
+
+/// One rendered frame, recorded for a deferred `snapshot`/`uitree` reply.
+#[derive(Debug)]
+struct CapturedFrame {
+    /// The screen as ANSI text.
+    ansi: String,
+    /// Pre-rendered `uitree` JSON, spliced into the reply verbatim.
+    tree: String,
+    /// Frame width in columns.
+    cols: u16,
+    /// Frame height in rows.
+    rows: u16,
+    /// Cursor position, or `None` when the cursor is hidden.
+    cursor: Option<(u16, u16)>,
 }
 
 impl UiRemote {
@@ -118,29 +132,47 @@ impl UiRemote {
             return;
         }
         let area = frame.area();
-        self.captured = Some((
-            crate::uiremote::buffer_to_ansi(frame.buffer_mut()),
-            crate::uiremote::frame_tree(),
-            area.width,
-            area.height,
-        ));
+        let cursor = crate::uiremote::frame_cursor();
+        self.captured = Some(CapturedFrame {
+            ansi: crate::uiremote::buffer_to_ansi(frame.buffer_mut()),
+            tree: crate::uiremote::frame_tree(),
+            cols: area.width,
+            rows: area.height,
+            cursor,
+        });
+    }
+
+    /// Answers every still-deferred request with an error, so a client is
+    /// never left waiting out the reply timeout after the UI has gone.
+    fn abandon(&mut self) {
+        for p in self.deferred.drain(..) {
+            let _ = p.reply.send(crate::uiremote::error_reply("ui exiting"));
+        }
     }
 
     /// Called just after `terminal.draw` returns: answers the deferred
     /// requests from the frame [`capture`](Self::capture) recorded, if any.
     fn service(&mut self) {
-        let Some((ansi, tree, cols, rows)) = self.captured.take() else {
+        let Some(frame) = self.captured.take() else {
             return;
         };
+        // `cursor` is a two-element array, or JSON null when hidden — never
+        // invented coordinates, so a harness can tell "hidden" from "at 0,0".
+        let cursor = frame
+            .cursor
+            .map_or_else(|| "null".to_string(), |(x, y)| format!("[{x},{y}]"));
         for p in self.deferred.drain(..) {
             let reply = match p.cmd {
-                crate::uiremote::RemoteCmd::Snapshot => crate::uiremote::ok_reply(&[
-                    ("ansi", Json::Str(ansi.clone())),
-                    ("cols", Json::Num(f64::from(cols))),
-                    ("rows", Json::Num(f64::from(rows))),
+                crate::uiremote::RemoteCmd::Snapshot => crate::uiremote::ok_reply_raw(&[
+                    ("ansi", &crate::uiremote::json_string(&frame.ansi)),
+                    ("cols", &frame.cols.to_string()),
+                    ("rows", &frame.rows.to_string()),
+                    ("cursor", &cursor),
                 ]),
+                // Spliced raw so `tree` is a real object, not a string a
+                // client would have to decode a second time.
                 crate::uiremote::RemoteCmd::Uitree => {
-                    crate::uiremote::ok_reply(&[("tree", Json::Str(tree.clone()))])
+                    crate::uiremote::ok_reply_raw(&[("tree", &frame.tree)])
                 }
                 // `drain` never defers a keypress.
                 crate::uiremote::RemoteCmd::Keypress(_) => {
@@ -177,6 +209,19 @@ fn remote_service(remote: Option<&Mutex<UiRemote>>) {
         && let Ok(mut g) = m.lock()
     {
         g.service();
+    }
+}
+
+/// Fails any still-deferred remote request. Call when a key loop exits.
+///
+/// A `snapshot` deferred just before `/quit` or Ctrl-C would otherwise never
+/// be answered, leaving the harness blocked for the full reply timeout on
+/// every teardown.
+fn remote_abandon(remote: Option<&Mutex<UiRemote>>) {
+    if let Some(m) = remote
+        && let Ok(mut g) = m.lock()
+    {
+        g.abandon();
     }
 }
 
@@ -2217,6 +2262,7 @@ impl Agent<'_> {
                                 &mut btw_panel,
                             ) {
                                 input.history.save(&hist_path).ok();
+                                remote_abandon(rem);
                                 return Ok(());
                             }
                         } else {
@@ -5748,12 +5794,19 @@ mod tests {
 
         // Once every key has been consumed, the next frame answers it.
         r.injected.clear();
-        r.captured = Some(("SCREEN".to_string(), "{}".to_string(), 80, 24));
+        r.captured = Some(CapturedFrame {
+            ansi: "SCREEN".to_string(),
+            tree: "{}".to_string(),
+            cols: 80,
+            rows: 24,
+            cursor: Some((12, 3)),
+        });
         r.service();
         let reply = snap_rx.try_recv().unwrap();
         assert!(reply.contains(r#""ansi":"SCREEN""#), "{reply}");
         assert!(reply.contains(r#""cols":80"#), "{reply}");
         assert!(reply.contains(r#""rows":24"#), "{reply}");
+        assert!(reply.contains(r#""cursor":[12,3]"#), "{reply}");
         assert!(r.deferred.is_empty());
     }
 
@@ -5806,11 +5859,11 @@ mod tests {
             r.captured.is_some(),
             "capture() must record the frame once injected is empty and a request is deferred"
         );
-        let (ansi, tree, cols, rows) = r.captured.as_ref().unwrap();
-        assert_eq!(*cols, 10);
-        assert_eq!(*rows, 3);
-        assert!(!ansi.is_empty());
-        assert!(!tree.is_empty());
+        let f = r.captured.as_ref().unwrap();
+        assert_eq!(f.cols, 10);
+        assert_eq!(f.rows, 3);
+        assert!(!f.ansi.is_empty());
+        assert!(!f.tree.is_empty());
     }
 
     #[test]
@@ -5831,13 +5884,52 @@ mod tests {
     }
 
     #[test]
-    fn uitree_reply_carries_the_frame_tree_as_a_json_string() {
+    fn uitree_reply_carries_the_frame_tree_as_a_json_object() {
         let mut r = UiRemote::detached();
         let (p, rx) = pending(crate::uiremote::RemoteCmd::Uitree);
         r.deferred.push(p);
-        r.captured = Some((String::new(), r#"{"name":"root"}"#.to_string(), 10, 4));
+        r.captured = Some(CapturedFrame {
+            ansi: String::new(),
+            tree: r#"{"name":"root"}"#.to_string(),
+            cols: 10,
+            rows: 4,
+            cursor: None,
+        });
         r.service();
         let reply = rx.try_recv().unwrap();
-        assert!(reply.contains(r#""tree":"{\"name\":\"root\"}""#), "{reply}");
+        // Spliced, not escaped: a harness reads reply["tree"]["name"] with a
+        // single decode, as the docs promise.
+        assert_eq!(reply, r#"{"ok":true,"tree":{"name":"root"}}"#);
+    }
+
+    #[test]
+    fn snapshot_reports_a_hidden_cursor_as_null() {
+        let mut r = UiRemote::detached();
+        let (p, rx) = pending(crate::uiremote::RemoteCmd::Snapshot);
+        r.deferred.push(p);
+        r.captured = Some(CapturedFrame {
+            ansi: "x".to_string(),
+            tree: "{}".to_string(),
+            cols: 10,
+            rows: 4,
+            cursor: None,
+        });
+        r.service();
+        let reply = rx.try_recv().unwrap();
+        // Null, not (0,0) — a harness must be able to tell "hidden" from
+        // "parked in the top-left corner".
+        assert!(reply.contains(r#""cursor":null"#), "{reply}");
+    }
+
+    #[test]
+    fn abandoning_answers_deferred_requests_instead_of_stranding_them() {
+        let mut r = UiRemote::detached();
+        let (p, rx) = pending(crate::uiremote::RemoteCmd::Snapshot);
+        r.deferred.push(p);
+        r.abandon();
+        let reply = rx.try_recv().expect("a reply, not a 10s timeout");
+        assert!(reply.contains(r#""ok":false"#), "{reply}");
+        assert!(reply.contains("ui exiting"), "{reply}");
+        assert!(r.deferred.is_empty());
     }
 }

@@ -123,6 +123,35 @@ pub fn ok_reply(fields: &[(&str, Json)]) -> String {
     out
 }
 
+/// Renders a success reply whose values are **already-rendered JSON**,
+/// spliced verbatim rather than escaped as strings.
+///
+/// This is how `uitree` returns a real nested object: [`frame_tree`] hands
+/// back pre-rendered JSON, and passing it through [`ok_reply`] would escape it
+/// into a string, forcing every client to decode twice. Callers are
+/// responsible for the fragments being valid JSON.
+#[must_use]
+pub fn ok_reply_raw(fields: &[(&str, &str)]) -> String {
+    let mut out = String::from(r#"{"ok":true"#);
+    for (k, v) in fields {
+        out.push(',');
+        json_escape(&mut out, k);
+        out.push(':');
+        out.push_str(v);
+    }
+    out.push('}');
+    out
+}
+
+/// Renders `s` as a JSON string literal, for building fragments to pass to
+/// [`ok_reply_raw`].
+#[must_use]
+pub fn json_string(s: &str) -> String {
+    let mut out = String::new();
+    json_escape(&mut out, s);
+    out
+}
+
 /// Maps a colour to its SGR foreground parameter, or `None` when it is the
 /// default (unstyled) colour.
 fn sgr_fg(c: Color) -> Option<String> {
@@ -291,6 +320,10 @@ thread_local! {
     /// UI thread, so a thread-local avoids threading a recorder through every
     /// draw signature. This is deliberate hidden state; see the design doc.
     static REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+
+    /// Cursor position recorded for the current frame, on the same thread and
+    /// for the same reason as [`REGIONS`].
+    static CURSOR: std::cell::Cell<Option<(u16, u16)>> = const { std::cell::Cell::new(None) };
 }
 
 /// True while draw-time region recording is on.
@@ -314,6 +347,25 @@ pub fn set_recording(on: bool) {
 /// skip it — only `region()` itself needs to be free when recording is off.
 pub fn begin_frame() {
     REGIONS.with(|r| r.borrow_mut().clear());
+    CURSOR.with(|c| c.set(None));
+}
+
+/// Records where the frame put the cursor.
+///
+/// ratatui 0.29 keeps `Frame::cursor_position` private with no getter, so the
+/// cursor cannot be read back off a finished frame. It is instead reported by
+/// the one draw site that sets it. A no-op unless recording is enabled.
+pub fn set_cursor(x: u16, y: u16) {
+    if !recording_enabled() {
+        return;
+    }
+    CURSOR.with(|c| c.set(Some((x, y))));
+}
+
+/// The cursor position recorded for the current frame, if any.
+#[must_use]
+pub fn frame_cursor() -> Option<(u16, u16)> {
+    CURSOR.with(std::cell::Cell::get)
 }
 
 /// Records one drawn region. A no-op unless recording is enabled.
@@ -365,6 +417,9 @@ fn node_json(regions: &[Region], idx: usize, out: &mut String) {
         out.push(':');
         json_write(out, v);
     }
+    // This nested scan is O(n^3) over the frame's regions, which is fine for
+    // the handful a frame records today. Revisit past ~50 regions — e.g. if
+    // the whole UI gets instrumented for automated coverage.
     // Children are later regions contained by this one and not by any
     // intervening region — the nearest enclosing ancestor wins. This is
     // O(n^2) per node (O(n^3) overall) but frames hold a handful of regions,
@@ -634,6 +689,55 @@ mod tests {
     #[test]
     fn error_replies_escape_their_message() {
         assert!(error_reply(r#"bad "quote""#).contains(r#"\"quote\""#));
+    }
+
+    #[test]
+    fn raw_replies_splice_prerendered_json_as_objects_not_strings() {
+        // `uitree` must hand back a real object. Escaping it into a string
+        // would force every client to decode twice, which no reader of the
+        // docs would guess.
+        let r = ok_reply_raw(&[("tree", r#"{"name":"root"}"#)]);
+        assert_eq!(r, r#"{"ok":true,"tree":{"name":"root"}}"#);
+        assert!(!r.contains('\\'), "must not be escaped: {r}");
+        assert!(!r.contains('\n'));
+    }
+
+    #[test]
+    fn json_string_escapes_for_use_as_a_raw_field() {
+        assert_eq!(json_string(r#"a"b"#), r#""a\"b""#);
+        assert_eq!(json_string("a\nb"), r#""a\nb""#);
+        // Round-trips through the raw builder without breaking the line.
+        let r = ok_reply_raw(&[("ansi", &json_string("x\ny"))]);
+        assert_eq!(r, r#"{"ok":true,"ansi":"x\ny"}"#);
+        assert!(!r.contains('\n'), "escaped newline must not break the line");
+    }
+
+    #[test]
+    fn cursor_is_recorded_per_frame_and_cleared_by_begin_frame() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(true);
+        begin_frame();
+        assert_eq!(frame_cursor(), None, "no cursor until a draw reports one");
+        set_cursor(12, 3);
+        assert_eq!(frame_cursor(), Some((12, 3)));
+        // A new frame starts with no cursor, so a hidden cursor is never
+        // reported as the previous frame's position.
+        begin_frame();
+        assert_eq!(frame_cursor(), None);
+        set_recording(false);
+    }
+
+    #[test]
+    fn set_cursor_is_a_no_op_when_recording_is_off() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(false);
+        begin_frame();
+        set_cursor(9, 9);
+        assert_eq!(frame_cursor(), None);
     }
 
     #[test]

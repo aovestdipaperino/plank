@@ -182,8 +182,10 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 starts the normal Ratatui TUI and, in addition, opens a `127.0.0.1`-only
 `TcpListener` a test harness can attach to and drive line-by-line JSON: `{
 "cmd": "keypress", "keys": ["down", "enter"] }` → `{"ok":true}`; `{"cmd":
-"snapshot"}` → `{"ok":true,"ansi":"..."}` (the screen as ANSI text, one line
-per row); `{"cmd":"uitree"}` → `{"ok":true,"tree":{"name":"root",...}}` (the
+"snapshot"}` → `{"ok":true,"ansi":"...","cols":100,"rows":30,"cursor":[12,28]}`
+(the screen as ANSI text, one line per row, with `cursor` reporting where the
+frame left the caret — JSON `null` when it is hidden, never invented
+coordinates); `{"cmd":"uitree"}` → `{"ok":true,"tree":{"name":"root",...}}` (the
 current frame's instrumented regions as nested JSON). The address is not
 configurable — only the port is — so this is deliberately unreachable from
 anything but the local machine, matching `--control`'s existing loopback
@@ -199,6 +201,15 @@ then `snapshot` back-to-back always sees the screen *after* those keys took
 effect, never a stale pre-injection frame. This inject → redraw → answer
 ordering is what lets harness tests assert on the result without sleeping or
 polling: the reply itself is the synchronization point.
+
+Two windows do not service remote commands, and a command issued inside
+either is answered with `{"ok":false,"error":"ui thread timed out"}` after ten
+seconds rather than hanging. The first is model warm-up, which a cold start
+can spend well over ten seconds in — a harness should retry until its first
+`snapshot` succeeds instead of assuming the port is broken. The second is a
+running `!` shell command: `tui_bang` draws and polls the terminal on its own,
+so injected keys cannot interrupt one and a snapshot taken during one will
+time out.
 
 `uitree` reflects only draw sites that call `uiremote::region(name, rect,
 state)` — an uninstrumented widget is simply invisible to it, not an empty
