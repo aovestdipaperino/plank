@@ -259,6 +259,168 @@ pub fn buffer_to_ansi(buf: &Buffer) -> String {
     out
 }
 
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use ratatui::layout::Rect;
+
+/// One instrumented draw region.
+#[derive(Debug, Clone)]
+pub struct Region {
+    /// Stable identifier for the region, e.g. `"popup"`.
+    pub name: String,
+    /// Where it was drawn this frame.
+    pub rect: Rect,
+    /// Extra state the region chose to publish.
+    pub state: Vec<(String, Json)>,
+}
+
+/// Set while `--ui-remote` is active. Keeps [`region`] free otherwise.
+static RECORDING: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Regions recorded during the current frame. Drawing only happens on the
+    /// UI thread, so a thread-local avoids threading a recorder through every
+    /// draw signature. This is deliberate hidden state; see the design doc.
+    static REGIONS: RefCell<Vec<Region>> = const { RefCell::new(Vec::new()) };
+}
+
+/// True while draw-time region recording is on.
+#[must_use]
+pub fn recording_enabled() -> bool {
+    RECORDING.load(Ordering::Relaxed)
+}
+
+/// Turns draw-time region recording on or off.
+pub fn set_recording(on: bool) {
+    RECORDING.store(on, Ordering::Relaxed);
+}
+
+/// Clears the previous frame's regions. Call once per draw pass.
+///
+/// This always clears, even while recording is off: recording can be toggled
+/// on between draw passes, and if the clear were gated on the flag, the first
+/// frame after re-enabling it would silently inherit whatever regions were
+/// left over from the last time it was on. A `Vec::clear` is negligible next
+/// to the many `region()` calls a real frame makes, so there is no need to
+/// skip it — only `region()` itself needs to be free when recording is off.
+pub fn begin_frame() {
+    REGIONS.with(|r| r.borrow_mut().clear());
+}
+
+/// Records one drawn region. A no-op unless recording is enabled.
+pub fn region(name: &str, rect: Rect, state: &[(&str, Json)]) {
+    if !recording_enabled() {
+        return;
+    }
+    let entry = Region {
+        name: name.to_string(),
+        rect,
+        state: state
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect(),
+    };
+    REGIONS.with(|r| r.borrow_mut().push(entry));
+}
+
+/// True when `outer` fully contains `inner`.
+///
+/// Equal-sized (and equally-positioned) rects deliberately do NOT count as
+/// containment: a full-screen root and a full-screen overlay have identical
+/// rects, and treating one as "inside" the other would arbitrarily bury
+/// whichever was drawn second inside the first with no way to tell them
+/// apart as siblings. Both are instead left as top-level regions; see
+/// `frame_tree`'s handling of multiple top-level regions.
+fn contains(outer: Rect, inner: Rect) -> bool {
+    inner.x >= outer.x
+        && inner.y >= outer.y
+        && inner.right() <= outer.right()
+        && inner.bottom() <= outer.bottom()
+        && (outer.width, outer.height) != (inner.width, inner.height)
+}
+
+/// Renders one region and its children as a JSON object.
+fn node_json(regions: &[Region], idx: usize, out: &mut String) {
+    let r = &regions[idx];
+    out.push('{');
+    out.push_str(r#""name":"#);
+    json_escape(out, &r.name);
+    let _ = write!(
+        out,
+        r#","x":{},"y":{},"width":{},"height":{}"#,
+        r.rect.x, r.rect.y, r.rect.width, r.rect.height
+    );
+    for (k, v) in &r.state {
+        out.push(',');
+        json_escape(out, k);
+        out.push(':');
+        json_write(out, v);
+    }
+    // Children are later regions contained by this one and not by any
+    // intervening region — the nearest enclosing ancestor wins. This is
+    // O(n^2) per node (O(n^3) overall) but frames hold a handful of regions,
+    // so clarity wins over speed here.
+    let kids: Vec<usize> = (idx + 1..regions.len())
+        .filter(|&j| {
+            contains(r.rect, regions[j].rect)
+                && (idx + 1..j).all(|m| {
+                    !(contains(r.rect, regions[m].rect)
+                        && contains(regions[m].rect, regions[j].rect))
+                })
+        })
+        .collect();
+    if !kids.is_empty() {
+        out.push_str(r#","children":["#);
+        for (n, &j) in kids.iter().enumerate() {
+            if n > 0 {
+                out.push(',');
+            }
+            node_json(regions, j, out);
+        }
+        out.push(']');
+    }
+    out.push('}');
+}
+
+/// The current frame's regions as a JSON tree, nested by containment.
+///
+/// Returns `{}` when nothing was recorded. When every region nests under a
+/// single top-level region (the common case: one full-screen root), that
+/// region is rendered directly. When more than one region is NOT contained
+/// by any other (e.g. two full-screen rects, or a popup drawn outside the
+/// root's bounds), all of them are wrapped in a synthetic
+/// `{"children":[...]}` object rather than silently dropping every top-level
+/// region but the first.
+#[must_use]
+pub fn frame_tree() -> String {
+    REGIONS.with(|r| {
+        let regions = r.borrow();
+        if regions.is_empty() {
+            return "{}".to_string();
+        }
+        let tops: Vec<usize> = (0..regions.len())
+            .filter(|&i| {
+                !(0..regions.len()).any(|j| j != i && contains(regions[j].rect, regions[i].rect))
+            })
+            .collect();
+        let mut out = String::new();
+        if let [only] = tops[..] {
+            node_json(&regions, only, &mut out);
+        } else {
+            out.push_str(r#"{"children":["#);
+            for (n, &i) in tops.iter().enumerate() {
+                if n > 0 {
+                    out.push(',');
+                }
+                node_json(&regions, i, &mut out);
+            }
+            out.push_str("]}");
+        }
+        out
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +613,80 @@ mod tests {
         // `skip` is an overlay/redraw hint, not the wide-char continuation
         // marker; content marked skip=true must still be emitted.
         assert_eq!(buffer_to_ansi(&buf), "abc");
+    }
+
+    // `RECORDING` and `REGIONS` are process/thread-local globals shared by
+    // every test in this binary, and cargo test runs tests in parallel
+    // threads by default. Without serializing, one test's `set_recording`
+    // races another's. `REGIONS` is itself a `thread_local!`, so it is safe
+    // per-thread, but `RECORDING` is a plain `static` and must be guarded.
+    static UIREMOTE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn region_is_a_no_op_when_recording_is_off() {
+        let _guard = UIREMOTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(false);
+        begin_frame();
+        region("popup", Rect::new(0, 0, 10, 5), &[]);
+        assert_eq!(frame_tree(), "{}");
+    }
+
+    #[test]
+    fn records_a_flat_region_with_its_rect_and_state() {
+        let _guard = UIREMOTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(true);
+        begin_frame();
+        region(
+            "popup",
+            Rect::new(1, 2, 30, 15),
+            &[("rows", Json::Num(15.0)), ("selected", Json::Num(3.0))],
+        );
+        let tree = frame_tree();
+        assert!(tree.contains(r#""name":"popup""#), "{tree}");
+        assert!(tree.contains(r#""x":1"#), "{tree}");
+        assert!(tree.contains(r#""y":2"#), "{tree}");
+        assert!(tree.contains(r#""width":30"#), "{tree}");
+        assert!(tree.contains(r#""height":15"#), "{tree}");
+        assert!(tree.contains(r#""selected":3"#), "{tree}");
+        set_recording(false);
+    }
+
+    #[test]
+    fn nests_a_contained_region_inside_its_container() {
+        let _guard = UIREMOTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(true);
+        begin_frame();
+        region("root", Rect::new(0, 0, 100, 30), &[]);
+        region("input", Rect::new(0, 28, 100, 1), &[]);
+        let tree = frame_tree();
+        // `input` sits inside `root`, so it must appear in root's children,
+        // not as a second top-level node.
+        let root_at = tree.find("\"name\":\"root\"").expect("root present");
+        let input_at = tree.find("\"name\":\"input\"").expect("input present");
+        assert!(root_at < input_at, "child must follow its parent: {tree}");
+        assert!(tree.contains(r#""children""#), "{tree}");
+        set_recording(false);
+    }
+
+    #[test]
+    fn begin_frame_discards_the_previous_frames_regions() {
+        let _guard = UIREMOTE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_recording(true);
+        begin_frame();
+        region("stale", Rect::new(0, 0, 5, 5), &[]);
+        begin_frame();
+        region("fresh", Rect::new(0, 0, 5, 5), &[]);
+        let tree = frame_tree();
+        assert!(!tree.contains("stale"), "{tree}");
+        assert!(tree.contains("fresh"), "{tree}");
+        set_recording(false);
     }
 }
