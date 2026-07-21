@@ -174,3 +174,11 @@ test` and review the diff before committing.
   `[invalid tool call: ...]` banner (which names the offending tag) is shown,
   routed through `RenderSink::error_text`. Byte-parity applies to what the
   *model* sees (transcript, tool results), never to the terminal projection.
+- **`Agent::tui_loop` cannot be driven in-process by an integration test.**
+  Its terminal parameter is `&mut ratatui::DefaultTerminal`, a type alias for
+  `Terminal<CrosstermBackend<Stdout>>` — not generic over `Backend` — so a
+  `TestBackend` can't be substituted without changing production code's
+  signature just to make it testable. `tests/ui_remote.rs` covers the
+  `uiremote` primitives it depends on (region recording, `frame_tree`,
+  `buffer_to_ansi`) directly instead; the injection/deferred-reply plumbing
+  in `UiRemote::drain` stays covered only by `src/ui.rs`'s unit tests.

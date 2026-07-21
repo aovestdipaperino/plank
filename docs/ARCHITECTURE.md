@@ -177,6 +177,39 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
 
+### Remote control of the TUI (`uiremote.rs`)
+`--ui-remote[=PORT]` (bare form binds an ephemeral port; `=PORT` picks one)
+starts the normal Ratatui TUI and, in addition, opens a `127.0.0.1`-only
+`TcpListener` a test harness can attach to and drive line-by-line JSON: `{
+"cmd": "keypress", "keys": ["down", "enter"] }` → `{"ok":true}`; `{"cmd":
+"snapshot"}` → `{"ok":true,"ansi":"..."}` (the screen as ANSI text, one line
+per row); `{"cmd":"uitree"}` → `{"ok":true,"tree":{"name":"root",...}}` (the
+current frame's instrumented regions as nested JSON). The address is not
+configurable — only the port is — so this is deliberately unreachable from
+anything but the local machine, matching `--control`'s existing loopback
+posture. Connections are served one at a time on the listener's own thread;
+a second client that connects while the first is attached does not get an
+error, it queues in the kernel's accept backlog and is served once the first
+disconnects — there is no busy-rejection.
+
+`keypress` is acknowledged immediately, but `snapshot`/`uitree` are
+deliberately held: `UiRemote::drain` queues injected keys and defers replies
+until the *next* qualifying draw, so a client that sends `keypress`
+then `snapshot` back-to-back always sees the screen *after* those keys took
+effect, never a stale pre-injection frame. This inject → redraw → answer
+ordering is what lets harness tests assert on the result without sleeping or
+polling: the reply itself is the synchronization point.
+
+`uitree` reflects only draw sites that call `uiremote::region(name, rect,
+state)` — an uninstrumented widget is simply invisible to it, not an empty
+node. `frame_tree`'s JSON shape depends on how many regions have no
+enclosing parent: the common case (one full-screen root) renders that root
+directly as a bare `{"name":"root",...}` object with its children nested
+inside; when more than one region is top-level (e.g. a popup drawn outside
+the root's bounds, or two same-sized siblings), all of them are wrapped in a
+synthetic `{"children":[...]}` object that carries no `"name"` key of its
+own.
+
 ### Support (`config.rs`, `trace.rs`, `interrupt.rs`, `logo.rs`, `repro.rs`)
 CLI parsing, trace logging (`--trace`), the SIGINT flag for interrupting
 generation, the startup banner, and `/repro` — a read-only diagnostic dump of
