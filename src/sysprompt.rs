@@ -158,6 +158,30 @@ pub fn provider_tool_registry(
             });
         }
     }
+    // Resource tools, advertised only when a server actually publishes
+    // resources — mirroring `append_resource_tool_schemas` for the text path.
+    if mcp_servers
+        .iter()
+        .any(|s| s.alive() && !s.resources().is_empty())
+    {
+        specs.push(crate::engine::ToolSpec {
+            name: "mcp_list_resources".to_string(),
+            description: "List resources published by connected MCP servers, as {server}:{uri}. Optional 'server' filters to one server.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"server": {"type": "string"}}
+            }),
+        });
+        specs.push(crate::engine::ToolSpec {
+            name: "mcp_read_resource".to_string(),
+            description: "Read one MCP resource's contents. Both 'server' and 'uri' are required (as listed by mcp_list_resources). Text inlines; binary reports type and size.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"server": {"type": "string"}, "uri": {"type": "string"}},
+                "required": ["server", "uri"]
+            }),
+        });
+    }
     specs
 }
 
@@ -211,6 +235,7 @@ pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> Strin
     let mut out = build_tools_prompt_base();
     append_native_extra_schemas(&mut out);
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
+    crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     out
 }

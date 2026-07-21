@@ -323,6 +323,8 @@ pub struct McpResource {
     pub uri: String,
     /// Human-readable label; empty when the server gave none.
     pub name: String,
+    /// MIME type; empty when the server gave none.
+    pub mime: String,
 }
 
 /// Extracts the `resources` array from a `resources/list` result.
@@ -339,6 +341,7 @@ fn parse_resources(root: &Json) -> Vec<McpResource> {
             Some(McpResource {
                 uri: uri.to_string(),
                 name: r.str_or("name", "").to_string(),
+                mime: r.str_or("mimeType", "").to_string(),
             })
         })
         .collect()
@@ -858,6 +861,49 @@ pub fn append_tool_schemas(out: &mut String, servers: &[McpServer]) {
 /// Appends the `# MCP Server Instructions` block: one `## <server>` section
 /// per connected server that provided a non-empty `instructions` field in
 /// its initialize response. Emits nothing when no server did.
+/// Appends the `mcp_list_resources` / `mcp_read_resource` schemas, but only
+/// when some live server advertises resources.
+///
+/// Gating on presence keeps the tools out of every prompt when nothing
+/// publishes resources, and keeps `build_tools_prompt(&[])` — the parity and
+/// fixture path — byte-unchanged.
+pub fn append_resource_tool_schemas(out: &mut String, servers: &[McpServer]) {
+    let any = servers.iter().any(|s| s.alive && !s.resources().is_empty());
+    if !any {
+        return;
+    }
+    out.push_str(
+        "\n{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"mcp_list_resources\",\n\
+         \x20   \"description\": \"List resources published by connected MCP servers, as {server}:{uri}. Optional 'server' filters to one server.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"server\": {\"type\": \"string\"}\n\
+         \x20     }\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"mcp_read_resource\",\n\
+         \x20   \"description\": \"Read one MCP resource's contents. Both 'server' and 'uri' are required (as listed by mcp_list_resources). Text inlines; binary reports type and size.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"server\": {\"type\": \"string\"},\n\
+         \x20       \"uri\": {\"type\": \"string\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"server\", \"uri\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+}
+
 pub fn append_server_instructions(out: &mut String, servers: &[McpServer]) {
     let mut wrote_header = false;
     for s in servers {
@@ -995,6 +1041,115 @@ pub fn tool_mcp_describe(servers: &[McpServer], call: &ToolCall) -> String {
     }
     if found == 0 && out.is_empty() {
         out.push_str("Tool error: mcp_describe found no tool names\n");
+    }
+    out
+}
+
+/// Size cap for one `mcp_read_resource` result, matching the file tools'
+/// spirit of never flooding the context.
+const RESOURCE_READ_CAP: usize = 64 * 1024;
+
+/// `mcp_list_resources`: lists resources advertised by connected servers.
+///
+/// With no `server` argument, lists across every live server, tagging each
+/// row with its server. Empty (a server advertising no resources) is a clear
+/// message, not a tool error (issue #33).
+#[must_use]
+pub fn tool_mcp_list_resources(servers: &[McpServer], call: &ToolCall) -> String {
+    let filter = call.arg_value("server").filter(|s| !s.is_empty());
+    if let Some(name) = filter
+        && !servers.iter().any(|s| s.name == name)
+    {
+        return format!("Tool error: unknown mcp server: {name}\n");
+    }
+    let mut out = String::new();
+    let mut count = 0usize;
+    for server in servers.iter().filter(|s| s.alive) {
+        if filter.is_some_and(|f| f != server.name) {
+            continue;
+        }
+        for r in server.resources() {
+            count += 1;
+            let _ = write!(out, "{}:{}", server.name, r.uri);
+            if !r.name.is_empty() {
+                let _ = write!(out, "  ({})", r.name);
+            }
+            if !r.mime.is_empty() {
+                let _ = write!(out, "  [{}]", r.mime);
+            }
+            out.push('\n');
+        }
+    }
+    if count == 0 {
+        return match filter {
+            Some(name) => format!("mcp_list_resources: {name} advertises no resources\n"),
+            None => {
+                "mcp_list_resources: no resources advertised by any connected server\n".to_string()
+            }
+        };
+    }
+    out
+}
+
+/// `mcp_read_resource`: reads one resource's contents by `server` and `uri`.
+///
+/// Text contents inline (capped); binary contents report MIME type and byte
+/// size rather than dumping bytes into the context (issue #33).
+#[must_use]
+pub fn tool_mcp_read_resource(servers: &mut [McpServer], call: &ToolCall) -> String {
+    let Some(server_name) = call.arg_value("server").filter(|s| !s.is_empty()) else {
+        return "Tool error: mcp_read_resource requires server\n".to_string();
+    };
+    let Some(uri) = call.arg_value("uri").filter(|s| !s.is_empty()) else {
+        return "Tool error: mcp_read_resource requires uri\n".to_string();
+    };
+    let Some(server) = servers
+        .iter_mut()
+        .find(|s| s.name == server_name && s.alive)
+    else {
+        return format!("Tool error: mcp server not available: {server_name}\n");
+    };
+
+    let mut params = String::from("{\"uri\":");
+    json_escape(&mut params, uri);
+    params.push('}');
+    let result = match server.request("resources/read", &params) {
+        Ok(r) => r,
+        Err(err) => return format!("Tool error: mcp_read_resource failed: {err}\n"),
+    };
+    let Some(Json::Arr(contents)) = result.get("contents") else {
+        return format!("Tool error: no such resource: {server_name}:{uri}\n");
+    };
+    if contents.is_empty() {
+        return format!("Tool error: no such resource: {server_name}:{uri}\n");
+    }
+    let mut out = String::new();
+    for item in contents {
+        if let Some(Json::Str(text)) = item.get("text") {
+            out.push_str(text);
+            if !text.ends_with('\n') {
+                out.push('\n');
+            }
+        } else if let Some(Json::Str(blob)) = item.get("blob") {
+            let mime = item.str_or("mimeType", "application/octet-stream");
+            // base64 decodes to 3 bytes per 4 chars, minus padding.
+            let approx = blob.trim_end_matches('=').len() * 3 / 4;
+            let _ = writeln!(
+                out,
+                "[binary resource: {mime}, ~{approx} bytes, not inlined]"
+            );
+        }
+    }
+    if out.is_empty() {
+        return format!("Tool error: resource had no readable contents: {server_name}:{uri}\n");
+    }
+    if out.len() > RESOURCE_READ_CAP {
+        let mut end = RESOURCE_READ_CAP;
+        while !out.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.truncate(end);
+        out.push_str("\n... resource truncated at 64 KiB ...\n");
     }
     out
 }
@@ -1363,10 +1518,189 @@ done
         let r = vec![McpResource {
             uri: "note://b".to_string(),
             name: "B".to_string(),
+            mime: String::new(),
         }];
         let c = resource_candidates_from("tolaria", &r);
         assert_eq!(c.len(), 1);
         assert_eq!(c[0].text, "tolaria:note://b");
         assert_eq!(c[0].kind, crate::complete::Kind::Resource);
+    }
+
+    /// A server with a canned resource set (no live subprocess), for the
+    /// list-side tests that never issue a request.
+    fn server_with_resources(name: &str, resources: Vec<McpResource>) -> McpServer {
+        let cfg = McpServerConfig {
+            name: name.to_string(),
+            command: "cat".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            primary_tools: None,
+        };
+        let mut s = McpServer::spawn(&cfg).expect("spawn cat");
+        s.resources = resources;
+        s
+    }
+
+    fn res(uri: &str, name: &str, mime: &str) -> McpResource {
+        McpResource {
+            uri: uri.to_string(),
+            name: name.to_string(),
+            mime: mime.to_string(),
+        }
+    }
+
+    fn list_call(server: Option<&str>) -> ToolCall {
+        ToolCall {
+            name: "mcp_list_resources".to_string(),
+            args: server
+                .map(|s| {
+                    vec![ToolArg {
+                        name: "server".to_string(),
+                        value: s.to_string(),
+                        is_string: true,
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
+    fn list_resources_spans_every_server_and_tags_each() {
+        let servers = [
+            server_with_resources("alpha", vec![res("file:///a.txt", "A", "text/plain")]),
+            server_with_resources("beta", vec![res("note://b", "", "")]),
+        ];
+        let out = tool_mcp_list_resources(&servers, &list_call(None));
+        assert!(
+            out.contains("alpha:file:///a.txt  (A)  [text/plain]"),
+            "{out}"
+        );
+        assert!(out.contains("beta:note://b\n"), "{out}");
+    }
+
+    #[test]
+    fn list_resources_filters_to_one_server() {
+        let servers = [
+            server_with_resources("alpha", vec![res("file:///a.txt", "A", "")]),
+            server_with_resources("beta", vec![res("note://b", "B", "")]),
+        ];
+        let out = tool_mcp_list_resources(&servers, &list_call(Some("beta")));
+        assert!(out.contains("beta:note://b"), "{out}");
+        assert!(!out.contains("alpha:"), "{out}");
+    }
+
+    #[test]
+    fn list_resources_empty_is_a_message_not_an_error() {
+        let servers = [server_with_resources("alpha", Vec::new())];
+        let out = tool_mcp_list_resources(&servers, &list_call(None));
+        assert!(out.contains("no resources advertised"), "{out}");
+        assert!(!out.starts_with("Tool error"), "{out}");
+    }
+
+    #[test]
+    fn list_resources_unknown_server_is_an_error() {
+        let servers = [server_with_resources("alpha", vec![res("x://y", "", "")])];
+        let out = tool_mcp_list_resources(&servers, &list_call(Some("nope")));
+        assert_eq!(out, "Tool error: unknown mcp server: nope\n");
+    }
+
+    #[test]
+    fn read_resource_requires_both_args() {
+        let mut servers = [server_with_resources("alpha", Vec::new())];
+        let only_server = ToolCall {
+            name: "mcp_read_resource".to_string(),
+            args: vec![ToolArg {
+                name: "server".to_string(),
+                value: "alpha".to_string(),
+                is_string: true,
+            }],
+        };
+        assert_eq!(
+            tool_mcp_read_resource(&mut servers, &only_server),
+            "Tool error: mcp_read_resource requires uri\n"
+        );
+        let empty = ToolCall {
+            name: "mcp_read_resource".to_string(),
+            args: Vec::new(),
+        };
+        assert_eq!(
+            tool_mcp_read_resource(&mut servers, &empty),
+            "Tool error: mcp_read_resource requires server\n"
+        );
+    }
+
+    #[test]
+    fn resource_tool_schemas_appear_only_when_resources_exist() {
+        let with = [server_with_resources("alpha", vec![res("x://y", "", "")])];
+        let mut out = String::new();
+        append_resource_tool_schemas(&mut out, &with);
+        assert!(out.contains("\"name\": \"mcp_list_resources\""), "{out}");
+        assert!(out.contains("\"name\": \"mcp_read_resource\""), "{out}");
+
+        let without = [server_with_resources("alpha", Vec::new())];
+        let mut out2 = String::new();
+        append_resource_tool_schemas(&mut out2, &without);
+        assert!(out2.is_empty(), "no schemas without resources: {out2:?}");
+    }
+
+    #[test]
+    fn read_resource_round_trips_text_and_flags_binary() {
+        // A stdio server that advertises one resource and answers
+        // resources/read with a text item and a base64 blob item.
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{\"resources\":{}}}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[]}}" ;;
+    *'"resources/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"resources\":[{\"uri\":\"note://a\",\"name\":\"A\",\"mimeType\":\"text/plain\"}]}}" ;;
+    *'"resources/read"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"contents\":[{\"uri\":\"note://a\",\"text\":\"hello resource\"},{\"uri\":\"note://a\",\"mimeType\":\"image/png\",\"blob\":\"AAAA\"}]}}" ;;
+    *)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
+  esac
+done
+"#;
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"demo\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].resources().len(), 1, "resource was listed");
+
+        let list = tool_mcp_list_resources(&servers, &list_call(None));
+        assert!(list.contains("demo:note://a  (A)  [text/plain]"), "{list}");
+
+        let read = ToolCall {
+            name: "mcp_read_resource".to_string(),
+            args: vec![
+                ToolArg {
+                    name: "server".to_string(),
+                    value: "demo".to_string(),
+                    is_string: true,
+                },
+                ToolArg {
+                    name: "uri".to_string(),
+                    value: "note://a".to_string(),
+                    is_string: true,
+                },
+            ],
+        };
+        let out = tool_mcp_read_resource(&mut servers, &read);
+        assert!(out.contains("hello resource"), "text inlined: {out}");
+        assert!(
+            out.contains("[binary resource: image/png"),
+            "binary flagged: {out}"
+        );
+        assert!(!out.contains("AAAA"), "blob bytes must not inline: {out}");
     }
 }
