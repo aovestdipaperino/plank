@@ -604,6 +604,9 @@ struct Agent<'a> {
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
     skills: Vec<crate::skills::Skill>,
+    /// Named agent definitions loaded from ~/.plank/agents overlaid by
+    /// ./.plank/agents; dispatched via `/subagent <name> <task>`.
+    agents: Vec<crate::agents::AgentDef>,
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
@@ -1509,6 +1512,7 @@ impl Agent<'_> {
             "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             "/btw" => {
                 if arg.is_empty() {
@@ -1532,14 +1536,23 @@ impl Agent<'_> {
                 Err(e) => println!("repro failed: {e}"),
             },
             "/subagent" => {
-                if arg.is_empty() {
-                    println!("usage: /subagent <task>");
+                let (def, task) = crate::agents::resolve(&self.agents, arg);
+                let (instructions, task, started) = match def {
+                    Some(d) => (
+                        Some(d.body.clone()),
+                        task.to_string(),
+                        format!("[subagent started: {}]", d.name),
+                    ),
+                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                };
+                if task.is_empty() {
+                    println!("usage: /subagent [<name>] <task>");
                 } else {
-                    println!("{}", self.debug_line("[subagent started]"));
-                    let fork_at = self.begin_subagent_fork(arg);
+                    println!("{}", self.debug_line(&started));
+                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
                     // Restore the transcript even when the turn errored.
                     let turn = self.run_turn();
-                    let reported = self.finish_subagent_fork(fork_at, arg);
+                    let reported = self.finish_subagent_fork(fork_at, &task);
                     turn?;
                     let trailer = if reported {
                         "[subagent report added to the conversation]"
@@ -1829,10 +1842,12 @@ impl Agent<'_> {
     /// transcript and returns the pre-fork length for later truncation. The
     /// fork inherits the parent transcript prefix, so the engine's per-turn
     /// sync reuses the parent KV cache.
-    fn begin_subagent_fork(&mut self, task: &str) -> usize {
+    fn begin_subagent_fork(&mut self, instructions: Option<&str>, task: &str) -> usize {
         let fork_at = self.session.transcript.len();
-        self.session
-            .push(Message::user(crate::agents::task_message(task)));
+        self.session.push(Message::user(crate::agents::task_message(
+            instructions,
+            task,
+        )));
         fork_at
     }
 
@@ -3588,6 +3603,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/agent" => {
+                for line in crate::agents::render_list(&self.agents).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/hooks" => {
                 for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
                     log.push_plain(line.to_owned());
@@ -3612,16 +3632,25 @@ impl Agent<'_> {
                 Err(e) => log.push_plain(format!("repro failed: {e}")),
             },
             "/subagent" => {
-                if arg.is_empty() {
-                    log.push_plain("usage: /subagent <task>");
+                let (def, task) = crate::agents::resolve(&self.agents, arg);
+                let (instructions, task, started) = match def {
+                    Some(d) => (
+                        Some(d.body.clone()),
+                        task.to_string(),
+                        format!("[subagent started: {}]", d.name),
+                    ),
+                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                };
+                if task.is_empty() {
+                    log.push_plain("usage: /subagent [<name>] <task>");
                 } else {
-                    log.push_dim("[subagent started]");
-                    let fork_at = self.begin_subagent_fork(arg);
+                    log.push_dim(started);
+                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
                     if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
                         // Restore the transcript even when the turn errored.
-                        self.finish_subagent_fork(fork_at, arg);
+                        self.finish_subagent_fork(fork_at, &task);
                         log.push_plain(format!("/subagent failed: {e}"));
-                    } else if self.finish_subagent_fork(fork_at, arg) {
+                    } else if self.finish_subagent_fork(fork_at, &task) {
                         log.push_dim("[subagent report added to the conversation]");
                     } else {
                         log.push_dim("[subagent produced no report — nothing added]");
@@ -4038,6 +4067,7 @@ fn new_agent(
     }
     let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
     let skills = crate::skills::load_default(&tool_ctx.cwd);
+    let agents = crate::agents::load_default(&tool_ctx.cwd);
     Ok(Agent {
         engine,
         cfg,
@@ -4054,6 +4084,7 @@ fn new_agent(
         last_ctx_used: 0,
         context_content,
         skills,
+        agents,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote,
         ui_remote: None,
@@ -4683,6 +4714,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5489,6 +5521,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5558,6 +5591,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5635,6 +5669,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5712,6 +5747,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5720,7 +5756,7 @@ mod tests {
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
-        let fork_at = agent.begin_subagent_fork("count the tests");
+        let fork_at = agent.begin_subagent_fork(None, "count the tests");
         assert_eq!(fork_at, 2);
         agent.run_turn().unwrap();
         // Fork grew: task, assistant(tool call), tool result, final report.
@@ -5735,7 +5771,7 @@ mod tests {
         assert!(!report.contains("echo 42"), "sidechain leaked: {report}");
 
         // A fork with no assistant output restores the transcript untouched.
-        let fork_at = agent.begin_subagent_fork("noop");
+        let fork_at = agent.begin_subagent_fork(None, "noop");
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
@@ -5778,6 +5814,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
@@ -5831,6 +5868,7 @@ mod tests {
             last_ctx_used: 0,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
             ui_remote: None,
