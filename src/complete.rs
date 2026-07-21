@@ -72,6 +72,9 @@ pub struct Candidate {
     pub text: String,
     /// What the candidate refers to.
     pub kind: Kind,
+    /// Set for paths inside a git submodule: vendored reference material that
+    /// must never outrank the project's own files (see issue #45).
+    pub demoted: bool,
 }
 
 /// A candidate that survived ranking.
@@ -93,6 +96,9 @@ const BONUS_CONSECUTIVE: i32 = 8;
 const BONUS_BASENAME: i32 = 20;
 /// Files and directories outrank MCP resources at equal quality.
 const BONUS_FILE_KIND: i32 = 5;
+/// Submodule paths sort below every non-submodule match. The penalty exceeds
+/// any achievable bonus total, so demotion is absolute rather than a tiebreak.
+const PENALTY_SUBMODULE: i32 = 100_000;
 
 /// Scores `text` against `query` as a case-insensitive subsequence.
 ///
@@ -183,15 +189,28 @@ pub fn rank(query: &str, cands: &[Candidate], limit: usize) -> Vec<Match> {
             Some(Match {
                 text: c.text.clone(),
                 kind: c.kind,
-                score: base + kind_bonus,
+                score: base + kind_bonus - if c.demoted { PENALTY_SUBMODULE } else { 0 },
             })
         })
         .collect();
     // Stable ordering: score descending, then lexicographic for determinism.
     out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.text.cmp(&b.text)));
+    // Demoted (submodule) rows are dropped entirely whenever the project has
+    // matches of its own: leaving them in would still spend the row budget and
+    // poison the Tab common prefix, which is most of what issue #45 was. They
+    // reappear when nothing else matches, so a submodule path stays reachable.
+    if out.iter().any(|m| m.score > SCORE_FLOOR) {
+        out.retain(|m| m.score > SCORE_FLOOR);
+    }
     out.truncate(limit);
     out
 }
+
+/// Every demoted match scores below this; every other match scores above it.
+///
+/// `score_one` subtracts the path length, so an undemoted match cannot fall
+/// this far without a path longer than [`PENALTY_SUBMODULE`] characters.
+const SCORE_FLOOR: i32 = -PENALTY_SUBMODULE / 2;
 
 /// The longest prefix shared by every match, compared by characters.
 #[must_use]
@@ -301,6 +320,25 @@ pub struct FileIndex {
     last_git_mtime: Option<SystemTime>,
     /// Cached `is_git_repo(root)`; probing it costs a subprocess per call.
     is_git: bool,
+    /// Submodule roots, each with a trailing `/`; everything beneath one is
+    /// demoted so vendored trees cannot bury the project's own files.
+    submodules: Vec<String>,
+}
+
+/// Reads submodule paths from `.gitmodules`, each returned with a trailing `/`.
+///
+/// Parses the file directly rather than shelling out: `git config` would cost
+/// another subprocess on every index build, and the `path =` lines are the
+/// whole of what we need.
+fn submodule_prefixes(root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join(".gitmodules")) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| l.trim().strip_prefix("path"))
+        .filter_map(|r| r.trim_start().strip_prefix('='))
+        .map(|p| format!("{}/", p.trim().trim_end_matches('/')))
+        .collect()
 }
 
 impl FileIndex {
@@ -333,6 +371,7 @@ impl FileIndex {
             last_refresh: None,
             last_git_mtime: None,
             is_git,
+            submodules: submodule_prefixes(root),
         };
         idx.rebuild_candidates();
         idx
@@ -370,15 +409,19 @@ impl FileIndex {
                 dirs.insert(p[..cut].to_string());
             }
         }
+        let subs = &self.submodules;
+        let demoted = |t: &str| subs.iter().any(|s| t.starts_with(s.as_str()));
         self.cands = dirs
             .into_iter()
             .map(|text| Candidate {
+                demoted: demoted(&text),
                 text,
                 kind: Kind::Dir,
             })
             .chain(self.paths.iter().map(|p| Candidate {
                 text: p.clone(),
                 kind: Kind::File,
+                demoted: demoted(p),
             }))
             .collect();
         self.signature = signature_of(&self.paths);
@@ -432,9 +475,19 @@ pub enum IndexMsg {
 }
 
 /// A query sent to the index worker.
+#[derive(Debug)]
 struct QueryMsg {
     generation: u64,
     text: String,
+}
+
+/// A request to the index worker.
+#[derive(Debug)]
+enum Req {
+    /// Rank `text` and reply with `IndexMsg::Results`.
+    Query(QueryMsg),
+    /// Replace the extra (MCP resource) candidates mixed into every ranking.
+    SetExtra(Vec<Candidate>),
 }
 
 /// Owns the file index on its own thread and answers ranked queries.
@@ -442,7 +495,7 @@ struct QueryMsg {
 /// Dropping the worker closes the request channel, which ends the thread.
 #[derive(Debug)]
 pub struct IndexWorker {
-    tx: Sender<QueryMsg>,
+    tx: Sender<Req>,
     rx: Receiver<IndexMsg>,
 }
 
@@ -451,7 +504,7 @@ impl IndexWorker {
     /// ranking pass.
     #[must_use]
     pub fn spawn(root: PathBuf, extra: Vec<Candidate>, respect_gitignore: bool) -> Self {
-        let (tx, qrx) = channel::<QueryMsg>();
+        let (tx, qrx) = channel::<Req>();
         let (mrx_tx, rx) = channel::<IndexMsg>();
         std::thread::spawn(move || {
             let mut index = FileIndex::build(&root, respect_gitignore);
@@ -462,7 +515,15 @@ impl IndexWorker {
             if mrx_tx.send(IndexMsg::Refreshed).is_err() {
                 return;
             }
-            while let Ok(q) = qrx.recv() {
+            let mut extra = extra;
+            while let Ok(req) = qrx.recv() {
+                let q = match req {
+                    Req::Query(q) => q,
+                    Req::SetExtra(e) => {
+                        extra = e;
+                        continue;
+                    }
+                };
                 let now = Instant::now();
                 let mtime = git_index_mtime(&root);
                 if index.needs_refresh(now, mtime) {
@@ -501,10 +562,19 @@ impl IndexWorker {
     ///
     /// A dead worker is ignored; the popup simply shows nothing.
     pub fn query(&self, generation: u64, text: &str) {
-        let _ = self.tx.send(QueryMsg {
+        let _ = self.tx.send(Req::Query(QueryMsg {
             generation,
             text: text.to_string(),
-        });
+        }));
+    }
+
+    /// Replaces the extra (MCP resource) candidates for later queries.
+    ///
+    /// Without this the resource list would stay frozen at whatever was live
+    /// when the worker started, so a server connecting later would never
+    /// contribute completions (issue #41).
+    pub fn set_extra(&self, extra: Vec<Candidate>) {
+        let _ = self.tx.send(Req::SetExtra(extra));
     }
 
     /// Takes one pending message, if any.
@@ -623,7 +693,11 @@ impl Popup {
             }
             KeyCode::Tab => {
                 let lcp = longest_common_prefix(&self.rows);
-                if lcp.is_empty() {
+                // Tab must only ever *extend* what was typed. Matching is a
+                // fuzzy subsequence, so the rows need not share the query as a
+                // prefix at all — inserting the raw common prefix could shrink
+                // `@docs/ARCH` to `@d`, silently eating the user's input.
+                if lcp.len() <= self.token.query.len() || !lcp.starts_with(&self.token.query) {
                     return PopupAction::Consumed;
                 }
                 let quote = if self.token.quoted { "\"" } else { "" };
@@ -811,6 +885,7 @@ mod tests {
         Candidate {
             text: t.to_string(),
             kind: Kind::File,
+            demoted: false,
         }
     }
 
@@ -854,14 +929,101 @@ mod tests {
             Candidate {
                 text: "notes".to_string(),
                 kind: Kind::Resource,
+                demoted: false,
             },
             Candidate {
                 text: "notes".to_string(),
                 kind: Kind::File,
+                demoted: false,
             },
         ];
         let m = rank("notes", &c, 15);
         assert_eq!(m[0].kind, Kind::File);
+    }
+
+    #[test]
+    fn submodule_paths_sort_below_every_project_path() {
+        // The submodule path is the *better* textual match: exact basename,
+        // consecutive run. Demotion must still bury it (issue #45).
+        let mut sub = file("refs/ds4/ui.rs");
+        sub.demoted = true;
+        let c = vec![sub, file("src/deep/nested/elsewhere/ui_helpers.rs")];
+        let m = rank("ui.rs", &c, 15);
+        assert_eq!(m.len(), 1, "a project match hides submodule rows: {m:?}");
+        assert_eq!(m[0].text, "src/deep/nested/elsewhere/ui_helpers.rs");
+    }
+
+    #[test]
+    fn tab_never_shortens_what_was_typed() {
+        // Fuzzy matching means the rows need not begin with the query, so the
+        // common prefix can be shorter than it. Tab must then do nothing
+        // rather than truncate the input.
+        let mut p = Popup::new(AtToken {
+            start: 0,
+            query: "docs/ARCH".to_string(),
+            quoted: false,
+        });
+        p.accept_msg(IndexMsg::Results {
+            generation: p.generation(),
+            rows: rank(
+                "docs/ARCH",
+                &[file("docs/ARCHITECTURE.md"), file("d/o/c/s/A/R/C/H.rs")],
+                15,
+            ),
+        });
+        let mut buf = LineBuffer::new();
+        buf.insert("@docs/ARCH");
+        p.handle_key(key(KeyCode::Tab), &mut buf);
+        assert_eq!(buf.text(), "@docs/ARCH");
+    }
+
+    #[test]
+    fn submodule_rows_do_not_poison_the_tab_prefix() {
+        // The regression behind issue #45's second symptom: submodule rows
+        // shared no prefix with the project's, so Tab could never extend.
+        let mut sub = file("refs/ds4/Cargo.toml");
+        sub.demoted = true;
+        let c = vec![sub, file("Cargo.toml"), file("Cargo.lock")];
+        let m = rank("Cargo", &c, 15);
+        assert_eq!(longest_common_prefix(&m), "Cargo.");
+    }
+
+    #[test]
+    fn submodule_paths_remain_reachable() {
+        let mut sub = file("refs/ds4/agent.c");
+        sub.demoted = true;
+        let m = rank("agent.c", &[sub], 15);
+        assert_eq!(m.len(), 1, "demotion must not filter, only reorder");
+    }
+
+    #[test]
+    fn gitmodules_paths_are_read_with_a_trailing_slash() {
+        let dir = temp_repo(&["a.txt"]);
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"refs/ds4\"]\n\tpath = refs/ds4\n\turl = https://example.invalid\n",
+        )
+        .unwrap();
+        assert_eq!(submodule_prefixes(&dir), vec!["refs/ds4/".to_string()]);
+    }
+
+    #[test]
+    fn index_marks_submodule_files_demoted() {
+        let dir = temp_repo(&["src/ui.rs", "refs/ds4/ui.rs"]);
+        std::fs::write(
+            dir.join(".gitmodules"),
+            "[submodule \"refs/ds4\"]\n\tpath = refs/ds4\n",
+        )
+        .unwrap();
+        let idx = FileIndex::build(&dir, true);
+        let by = |t: &str| idx.candidates().iter().find(|c| c.text == t).cloned();
+        assert!(
+            by("refs/ds4/ui.rs")
+                .expect("submodule file indexed")
+                .demoted
+        );
+        assert!(!by("src/ui.rs").expect("project file indexed").demoted);
+        assert!(by("refs/ds4/").expect("submodule dir indexed").demoted);
     }
 
     #[test]
@@ -1182,11 +1344,36 @@ mod tests {
     }
 
     #[test]
+    fn set_extra_makes_a_late_server_completable() {
+        // Issue #41: the worker starts with no resources, as it does when the
+        // first `@` precedes an MCP server finishing its handshake.
+        let dir = temp_repo(&["src/ui.rs"]);
+        let w = IndexWorker::spawn(dir.clone(), Vec::new(), true);
+        w.set_extra(vec![Candidate {
+            text: "latecomer:note://z".to_string(),
+            kind: Kind::Resource,
+            demoted: false,
+        }]);
+        w.query(1, "latecomer");
+        loop {
+            if let IndexMsg::Results { rows, .. } = recv_blocking(&w) {
+                assert!(
+                    rows.iter().any(|r| r.text == "latecomer:note://z"),
+                    "{rows:?}"
+                );
+                break;
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn worker_includes_extra_candidates() {
         let dir = temp_repo(&["src/ui.rs"]);
         let extra = vec![Candidate {
             text: "tolaria:note://b".to_string(),
             kind: Kind::Resource,
+            demoted: false,
         }];
         let w = IndexWorker::spawn(dir.clone(), extra, true);
         w.query(1, "tolaria");

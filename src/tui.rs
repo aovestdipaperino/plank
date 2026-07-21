@@ -561,6 +561,34 @@ pub fn popup_rect(output: Rect, input: Rect, rows: u16) -> Rect {
 ///
 /// Clears the region first so the scrollback underneath does not bleed
 /// through; the selected row is highlighted in the theme green.
+/// Trims `text` to `budget` display columns, dropping characters from the
+/// *left* and marking the cut with `…`.
+///
+/// Completion rows are paths, so the informative end is the basename. Clipping
+/// on the right (ratatui's default) hides exactly the part the user is reading
+/// — see issue #42.
+fn elide_left(text: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= budget {
+        return text.to_string();
+    }
+    if budget <= 1 {
+        return "…".repeat(budget);
+    }
+    // Take characters from the end until the ellipsis plus the tail fills the
+    // budget; a wide character that would overflow simply stops the loop.
+    let mut tail = String::new();
+    for c in text.chars().rev() {
+        let mut next = String::from(c);
+        next.push_str(&tail);
+        if next.width() + 1 > budget {
+            break;
+        }
+        tail = next;
+    }
+    format!("…{tail}")
+}
+
 fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
     use ratatui::widgets::{Clear, List, ListItem, ListState, StatefulWidget};
     if area.height == 0 || popup.rows().is_empty() {
@@ -596,7 +624,13 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
                 crate::complete::Kind::Resource => "@",
                 crate::complete::Kind::File => " ",
             };
-            ListItem::new(Span::raw(format!("{marker} {}", m.text)))
+            // The highlight symbol ("> ") and the kind marker plus its space
+            // each eat two columns of every row.
+            let budget = usize::from(area.width).saturating_sub(4);
+            ListItem::new(Span::raw(format!(
+                "{marker} {}",
+                elide_left(&m.text, budget)
+            )))
         })
         .collect();
     let list = List::new(items)
@@ -970,6 +1004,37 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style) -> Line<'static> {
 
 #[cfg(test)]
 mod tests {
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn elide_left_keeps_the_basename_visible() {
+        let long = "deeply/nested/directory/structure/for/testing/a-very-long-filename.txt";
+        let out = super::elide_left(long, 20);
+        assert!(out.starts_with('…'), "{out:?}");
+        assert!(out.ends_with("filename.txt"), "{out:?}");
+        assert!(out.width() <= 20, "{out:?} is {} wide", out.width());
+    }
+
+    #[test]
+    fn elide_left_leaves_a_fitting_path_alone() {
+        assert_eq!(super::elide_left("src/ui.rs", 20), "src/ui.rs");
+        assert_eq!(super::elide_left("src/ui.rs", 9), "src/ui.rs");
+    }
+
+    #[test]
+    fn elide_left_never_exceeds_the_budget_with_wide_characters() {
+        // A wide character that cannot fit beside the ellipsis must be
+        // dropped, not half-drawn.
+        for budget in 0..12 {
+            let out = super::elide_left("世界世界世界", budget);
+            assert!(
+                out.width() <= budget,
+                "budget {budget}: {out:?} is {} wide",
+                out.width()
+            );
+        }
+    }
+
     use super::*;
 
     /// `(content, fg)` pairs for each span, for terse assertions.

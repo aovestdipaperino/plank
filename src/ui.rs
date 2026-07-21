@@ -1933,14 +1933,13 @@ struct TuiInput {
     popup: Option<crate::complete::Popup>,
     /// Index worker, started lazily on the first `@`.
     worker: Option<crate::complete::IndexWorker>,
-    /// MCP resource candidates, snapshotted once by `tui_loop` and handed to
-    /// the worker when it starts. Lives here so the free-function busy loop
-    /// gets identical behavior without threading the agent through.
+    /// MCP resource candidates, refreshed by `tui_loop` and handed to the
+    /// worker. Lives here so the free-function busy loop gets identical
+    /// behavior without threading the agent through.
     ///
-    /// NOTE: this is a snapshot frozen when the index worker starts (the first
-    /// `@` of the session) and is never refreshed — an MCP server that
-    /// connects later contributes no completion candidates for the rest of the
-    /// session.
+    /// Refreshed by `tui_loop` on every idle tick and pushed to the running
+    /// worker, so a server that connects mid-session starts contributing
+    /// completions (issue #41).
     mcp_extra: Vec<crate::complete::Candidate>,
 }
 
@@ -2004,6 +2003,21 @@ impl TuiInput {
         let generation = popup.bump_generation(token);
         if let Some(w) = &self.worker {
             w.query(generation, &query);
+        }
+    }
+
+    /// Replaces the MCP resource candidates, forwarding them to a running
+    /// worker so a server connecting mid-session becomes completable.
+    ///
+    /// A no-op when the list is unchanged, which is the common case: this runs
+    /// on every idle tick.
+    fn set_mcp_extra(&mut self, extra: Vec<crate::complete::Candidate>) {
+        if extra == self.mcp_extra {
+            return;
+        }
+        self.mcp_extra = extra;
+        if let Some(w) = &self.worker {
+            w.set_extra(self.mcp_extra.clone());
         }
     }
 
@@ -2150,7 +2164,7 @@ impl Agent<'_> {
         let ui_remote = self.ui_remote.clone();
         let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
-        input.mcp_extra = crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp);
+        input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
         let mut log = OutputLog::new();
@@ -2200,6 +2214,7 @@ impl Agent<'_> {
                 clip_checked = Instant::now();
             }
             remote_drain(rem);
+            input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
             let mut status = self.idle_status_text();
             if clip_has_image {

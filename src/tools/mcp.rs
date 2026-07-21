@@ -348,6 +348,7 @@ fn resource_candidates_from(
         .map(|r| crate::complete::Candidate {
             text: format!("{server}:{}", r.uri),
             kind: crate::complete::Kind::Resource,
+            demoted: false,
         })
         .collect()
 }

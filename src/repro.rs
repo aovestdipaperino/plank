@@ -118,8 +118,20 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
 ///
 /// Returns a message when the directory or file cannot be created.
 pub fn save(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
-    let dir = repro_dir(cwd);
-    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    save_in(&repro_dir(cwd), secs, report)
+}
+
+/// Writes `report` into an explicit directory, disambiguating same-second
+/// filenames with a `-N` suffix.
+///
+/// Split out from [`save`] so tests can exercise the naming rule against a
+/// scratch directory without reaching for the process-global `HOME`.
+///
+/// # Errors
+/// Returns the OS error message when the directory cannot be created or the
+/// file cannot be written.
+pub fn save_in(dir: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut path = dir.join(format!("repro-{secs}.md"));
     let mut n = 1;
     while path.exists() {
@@ -173,16 +185,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-repro-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        // Force HOME to the scratch dir so repro_dir is isolated.
-        // SAFETY: single-threaded test; restored immediately after.
-        let saved_home = std::env::var_os("HOME");
-        unsafe { std::env::set_var("HOME", &dir) };
-        let a = save(&dir, 1000, "first").unwrap();
-        let b = save(&dir, 1000, "second").unwrap();
-        match saved_home {
-            Some(h) => unsafe { std::env::set_var("HOME", h) },
-            None => unsafe { std::env::remove_var("HOME") },
-        }
+        // Never mutate HOME here: `cargo test` runs tests on parallel threads
+        // in one process, so a process-global env write races every other test
+        // (and every `git` subprocess they spawn) — see issue #43.
+        let a = save_in(&dir, 1000, "first").unwrap();
+        let b = save_in(&dir, 1000, "second").unwrap();
         assert_ne!(a, b);
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
