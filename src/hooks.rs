@@ -65,22 +65,62 @@ impl HookMatcher {
     }
 }
 
+/// Every event name plank recognizes in a hooks config. A config naming any
+/// other event is ignored with a warning rather than failing to load.
+pub const KNOWN_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "Stop",
+    "UserPromptSubmit",
+    "SessionStart",
+    "SessionEnd",
+    "PreCompact",
+    "PostCompact",
+];
+
 /// All configured hooks, by event.
 #[derive(Debug, Clone, Default)]
 pub struct Hooks {
     /// Hooks run before each tool call.
     pub pre_tool_use: Vec<HookMatcher>,
-    /// Hooks run after each tool call.
+    /// Hooks run after each tool call (success or failure).
     pub post_tool_use: Vec<HookMatcher>,
+    /// Hooks run after a tool call that *failed* (carries the error).
+    pub post_tool_use_failure: Vec<HookMatcher>,
     /// Hooks run when a turn is about to conclude.
     pub stop: Vec<HookMatcher>,
+    /// Hooks run on every submitted user prompt; may inject turn context.
+    pub user_prompt_submit: Vec<HookMatcher>,
+    /// Hooks run when a session begins (startup|resume|clear|compact); may
+    /// inject context.
+    pub session_start: Vec<HookMatcher>,
+    /// Hooks run when a session ends (carries the exit reason).
+    pub session_end: Vec<HookMatcher>,
+    /// Hooks run before a compaction pass (trigger manual|auto); may inject
+    /// context.
+    pub pre_compact: Vec<HookMatcher>,
+    /// Hooks run after a compaction pass (carries the resulting summary); may
+    /// inject context.
+    pub post_compact: Vec<HookMatcher>,
+    /// Warnings gathered while loading (e.g. unknown event names), surfaced to
+    /// the user at startup rather than aborting the load.
+    pub warnings: Vec<String>,
 }
 
 impl Hooks {
     /// True when no hooks are configured at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.pre_tool_use.is_empty() && self.post_tool_use.is_empty() && self.stop.is_empty()
+        self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
+            && self.post_tool_use_failure.is_empty()
+            && self.stop.is_empty()
+            && self.user_prompt_submit.is_empty()
+            && self.session_start.is_empty()
+            && self.session_end.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
     }
 }
 
@@ -91,6 +131,10 @@ pub struct HookOutcome {
     pub block: Option<String>,
     /// Other-nonzero stderr lines, destined for the user only.
     pub warnings: Vec<String>,
+    /// Exit-0 stdout of context-capable events (`UserPromptSubmit`,
+    /// `SessionStart`, `PreCompact`, `PostCompact`), destined for the model as
+    /// injected turn context. Empty for tool/stop events.
+    pub context: Option<String>,
 }
 
 fn parse_hook_def(v: &Json) -> Option<HookDef> {
@@ -135,7 +179,8 @@ fn parse_event(root: &Json, event: &str) -> Vec<HookMatcher> {
         .collect()
 }
 
-/// Parses one hooks.json text; unknown events and hook types are ignored.
+/// Parses one hooks.json text; unknown hook types are ignored and unknown
+/// event names are skipped with a warning (never a load failure).
 #[must_use]
 pub fn parse_config(text: &str) -> Hooks {
     let Some(mut root) = json_parse(text) else {
@@ -145,10 +190,27 @@ pub fn parse_config(text: &str) -> Hooks {
     if let Some(inner) = root.get("hooks") {
         root = inner.clone();
     }
+    // Warn on any event key we do not recognize, so a typo or a config aimed
+    // at a richer agent degrades gracefully instead of silently vanishing.
+    let mut warnings = Vec::new();
+    if let Json::Obj(members) = &root {
+        for (key, _) in members {
+            if !KNOWN_EVENTS.contains(&key.as_str()) {
+                warnings.push(format!("hooks: ignoring unknown event \"{key}\""));
+            }
+        }
+    }
     Hooks {
         pre_tool_use: parse_event(&root, "PreToolUse"),
         post_tool_use: parse_event(&root, "PostToolUse"),
+        post_tool_use_failure: parse_event(&root, "PostToolUseFailure"),
         stop: parse_event(&root, "Stop"),
+        user_prompt_submit: parse_event(&root, "UserPromptSubmit"),
+        session_start: parse_event(&root, "SessionStart"),
+        session_end: parse_event(&root, "SessionEnd"),
+        pre_compact: parse_event(&root, "PreCompact"),
+        post_compact: parse_event(&root, "PostCompact"),
+        warnings,
     }
 }
 
@@ -165,7 +227,14 @@ pub fn load_from(paths: &[PathBuf]) -> Hooks {
         let h = parse_config(&text);
         merged.pre_tool_use.extend(h.pre_tool_use);
         merged.post_tool_use.extend(h.post_tool_use);
+        merged.post_tool_use_failure.extend(h.post_tool_use_failure);
         merged.stop.extend(h.stop);
+        merged.user_prompt_submit.extend(h.user_prompt_submit);
+        merged.session_start.extend(h.session_start);
+        merged.session_end.extend(h.session_end);
+        merged.pre_compact.extend(h.pre_compact);
+        merged.post_compact.extend(h.post_compact);
+        merged.warnings.extend(h.warnings);
     }
     merged
 }
@@ -212,33 +281,51 @@ pub fn tool_event_input(
     out
 }
 
-/// Runs one hook command with `input` on stdin; returns (exit code, stderr).
-/// A timeout or spawn failure reads as a user-visible warning, never a block.
-fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String) {
+/// Builds the stdin JSON for a non-tool lifecycle event. `fields` are extra
+/// string members specific to the event (e.g. `("source", "startup")` for
+/// `SessionStart`, `("prompt", text)` for `UserPromptSubmit`), always emitted
+/// as JSON strings alongside the common `hook_event_name` and `cwd`.
+#[must_use]
+pub fn lifecycle_event_input(event: &str, fields: &[(&str, &str)], cwd: &Path) -> String {
+    let mut out = String::from("{\"hook_event_name\":");
+    json_escape(&mut out, event);
+    for (key, value) in fields {
+        out.push(',');
+        json_escape(&mut out, key);
+        out.push(':');
+        json_escape(&mut out, value);
+    }
+    out.push_str(",\"cwd\":");
+    json_escape(&mut out, &cwd.to_string_lossy());
+    out.push('}');
+    out
+}
+
+/// Runs one hook command with `input` on stdin; returns (exit code, stdout,
+/// stderr). A timeout or spawn failure reads as a user-visible warning (on
+/// stderr), never a block.
+fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
     let child = Command::new("/bin/sh")
         .arg("-c")
         .arg(&def.command)
         .current_dir(cwd)
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn();
     let mut child = match child {
         Ok(c) => c,
-        Err(e) => return (1, format!("hook failed to start: {e}")),
+        Err(e) => return (1, String::new(), format!("hook failed to start: {e}")),
     };
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(input.as_bytes());
     }
+    // Drain stdout and stderr on their own threads so a hook that fills one
+    // pipe buffer cannot deadlock against our wait loop.
+    let stdout = child.stdout.take();
+    let out_reader = std::thread::spawn(move || read_all(stdout));
     let stderr = child.stderr.take();
-    let reader = std::thread::spawn(move || {
-        let mut out = Vec::new();
-        if let Some(mut s) = stderr {
-            use std::io::Read as _;
-            let _ = s.read_to_end(&mut out);
-        }
-        String::from_utf8_lossy(&out).into_owned()
-    });
+    let err_reader = std::thread::spawn(move || read_all(stderr));
     let deadline = Instant::now() + Duration::from_secs(def.timeout_sec);
     let status = loop {
         match child.try_wait() {
@@ -253,11 +340,25 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String) {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let stderr_text = reader.join().unwrap_or_default();
+    let stdout_text = out_reader.join().unwrap_or_default();
+    let stderr_text = err_reader.join().unwrap_or_default();
     match status {
-        Some(s) => (s.code().unwrap_or(1), stderr_text),
-        None => (1, format!("hook timed out after {}s", def.timeout_sec)),
+        Some(s) => (s.code().unwrap_or(1), stdout_text, stderr_text),
+        None => (
+            1,
+            stdout_text,
+            format!("hook timed out after {}s", def.timeout_sec),
+        ),
     }
+}
+
+/// Reads a child pipe to end as a lossy UTF-8 string.
+fn read_all<R: std::io::Read>(pipe: Option<R>) -> String {
+    let mut out = Vec::new();
+    if let Some(mut s) = pipe {
+        let _ = s.read_to_end(&mut out);
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Runs every matching hook of one event; the first exit-2 stderr becomes
@@ -265,13 +366,43 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String) {
 /// user-visible warnings.
 #[must_use]
 pub fn run_event(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) -> HookOutcome {
+    run_event_inner(groups, target, input, cwd, false)
+}
+
+/// Like [`run_event`], but exit-0 stdout of each matching hook is collected as
+/// injected turn context ([`HookOutcome::context`]). Used by the context-capable
+/// lifecycle events (`UserPromptSubmit`, `SessionStart`, `PreCompact`,
+/// `PostCompact`).
+#[must_use]
+pub fn run_event_ctx(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) -> HookOutcome {
+    run_event_inner(groups, target, input, cwd, true)
+}
+
+fn run_event_inner(
+    groups: &[HookMatcher],
+    target: &str,
+    input: &str,
+    cwd: &Path,
+    capture_context: bool,
+) -> HookOutcome {
     let mut outcome = HookOutcome::default();
+    let mut context = String::new();
     for group in groups.iter().filter(|g| g.matches(target)) {
         for def in &group.hooks {
-            let (code, stderr) = run_hook(def, input, cwd);
+            let (code, stdout, stderr) = run_hook(def, input, cwd);
             let stderr = stderr.trim().to_string();
             match code {
-                0 => {}
+                0 => {
+                    if capture_context {
+                        let stdout = stdout.trim();
+                        if !stdout.is_empty() {
+                            if !context.is_empty() {
+                                context.push('\n');
+                            }
+                            context.push_str(stdout);
+                        }
+                    }
+                }
                 2 => {
                     if outcome.block.is_none() {
                         outcome.block = Some(if stderr.is_empty() {
@@ -291,6 +422,9 @@ pub fn run_event(groups: &[HookMatcher], target: &str, input: &str, cwd: &Path) 
             }
         }
     }
+    if !context.is_empty() {
+        outcome.context = Some(context);
+    }
     outcome
 }
 
@@ -305,7 +439,13 @@ pub fn render_list(hooks: &Hooks) -> String {
     for (event, groups) in [
         ("PreToolUse", &hooks.pre_tool_use),
         ("PostToolUse", &hooks.post_tool_use),
+        ("PostToolUseFailure", &hooks.post_tool_use_failure),
         ("Stop", &hooks.stop),
+        ("UserPromptSubmit", &hooks.user_prompt_submit),
+        ("SessionStart", &hooks.session_start),
+        ("SessionEnd", &hooks.session_end),
+        ("PreCompact", &hooks.pre_compact),
+        ("PostCompact", &hooks.post_compact),
     ] {
         for g in groups {
             for h in &g.hooks {
@@ -353,6 +493,61 @@ mod tests {
         assert_eq!(h.stop[0].hooks.len(), 1);
         assert_eq!(h.stop[0].hooks[0].command, "check.sh");
         assert_eq!(h.stop[0].hooks[0].timeout_sec, HOOK_DEFAULT_TIMEOUT_SEC);
+    }
+
+    #[test]
+    fn parses_new_lifecycle_events() {
+        let cfg = r#"{
+            "UserPromptSubmit": [ { "hooks": [ { "type": "command", "command": "u" } ] } ],
+            "SessionStart":     [ { "hooks": [ { "type": "command", "command": "s" } ] } ],
+            "SessionEnd":       [ { "hooks": [ { "type": "command", "command": "e" } ] } ],
+            "PreCompact":       [ { "hooks": [ { "type": "command", "command": "pre" } ] } ],
+            "PostCompact":      [ { "hooks": [ { "type": "command", "command": "post" } ] } ],
+            "PostToolUseFailure": [ { "hooks": [ { "type": "command", "command": "f" } ] } ]
+        }"#;
+        let h = parse_config(cfg);
+        assert_eq!(h.user_prompt_submit[0].hooks[0].command, "u");
+        assert_eq!(h.session_start[0].hooks[0].command, "s");
+        assert_eq!(h.session_end[0].hooks[0].command, "e");
+        assert_eq!(h.pre_compact[0].hooks[0].command, "pre");
+        assert_eq!(h.post_compact[0].hooks[0].command, "post");
+        assert_eq!(h.post_tool_use_failure[0].hooks[0].command, "f");
+        assert!(h.warnings.is_empty());
+        assert!(!h.is_empty());
+    }
+
+    #[test]
+    fn unknown_event_warns_but_loads() {
+        let cfg = r#"{
+            "Bogus": [ { "hooks": [ { "type": "command", "command": "x" } ] } ],
+            "Stop":  [ { "hooks": [ { "type": "command", "command": "s" } ] } ]
+        }"#;
+        let h = parse_config(cfg);
+        // The known event still loads; the unknown one is dropped with a warning.
+        assert_eq!(h.stop[0].hooks[0].command, "s");
+        assert_eq!(h.warnings.len(), 1);
+        assert!(h.warnings[0].contains("Bogus"));
+    }
+
+    #[test]
+    fn lifecycle_input_carries_fields() {
+        let cwd = std::env::temp_dir();
+        let input = lifecycle_event_input("SessionStart", &[("source", "startup")], &cwd);
+        assert!(input.contains("\"hook_event_name\":\"SessionStart\""));
+        assert!(input.contains("\"source\":\"startup\""));
+        assert!(input.contains("\"cwd\":"));
+    }
+
+    #[test]
+    fn context_capable_event_collects_stdout() {
+        let cwd = std::env::temp_dir();
+        // Exit-0 stdout becomes injected context; exit-0 stderr is ignored.
+        let out = run_event_ctx(&one("echo hello-context", ""), "", "{}", &cwd);
+        assert_eq!(out.context.as_deref(), Some("hello-context"));
+        assert!(out.block.is_none());
+        // Plain run_event never captures stdout as context.
+        let plain = run_event(&one("echo hello-context", ""), "", "{}", &cwd);
+        assert!(plain.context.is_none());
     }
 
     #[test]

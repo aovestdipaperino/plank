@@ -206,6 +206,35 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             let _ = writeln!(output, "[PostToolUse hook] {msg}");
         }
     }
+    // PostToolUseFailure hooks: fire only when the tool failed (the C
+    // `Tool error:` convention). Its exit-2 stderr is appended like a
+    // PostToolUse block; success never reaches here.
+    if output.starts_with("Tool error:") && !ctx.hooks.post_tool_use_failure.is_empty() {
+        // plank has no per-tool interrupt tracking in the dispatch path, so the
+        // `is_interrupt` flag the reference carries is always false here; it is
+        // still emitted so hooks can rely on the field being present.
+        let base = crate::hooks::tool_event_input(
+            "PostToolUseFailure",
+            &call.name,
+            &mcp::args_to_json(call),
+            Some(&output),
+            &ctx.cwd,
+        );
+        let input = format!("{},\"is_interrupt\":false}}", &base[..base.len() - 1]);
+        let fail = crate::hooks::run_event(
+            &ctx.hooks.post_tool_use_failure,
+            &call.name,
+            &input,
+            &ctx.cwd,
+        );
+        ctx.hook_warnings.extend(fail.warnings);
+        if let Some(msg) = fail.block {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "[PostToolUseFailure hook] {msg}");
+        }
+    }
     ToolResult::from_output(output)
 }
 
