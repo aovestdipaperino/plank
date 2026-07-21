@@ -7,6 +7,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::editor::LineBuffer;
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
 /// A `@`-prefixed completion token found to the left of the cursor.
@@ -84,64 +85,26 @@ pub struct Match {
     pub text: String,
     /// What the candidate refers to.
     pub kind: Kind,
-    /// Higher sorts first.
-    pub score: i32,
+    /// Higher sorts first. Nucleo's match score; not comparable across queries.
+    pub score: u16,
 }
 
-/// Bonus for a match landing right after a path separator.
-const BONUS_SEGMENT: i32 = 12;
-/// Bonus for each additional consecutively matched character.
-const BONUS_CONSECUTIVE: i32 = 8;
-/// Bonus for the match lying entirely within the basename.
-const BONUS_BASENAME: i32 = 20;
-/// Files and directories outrank MCP resources at equal quality.
-const BONUS_FILE_KIND: i32 = 5;
-/// Submodule paths sort below every non-submodule match. The penalty exceeds
-/// any achievable bonus total, so demotion is absolute rather than a tiebreak.
-const PENALTY_SUBMODULE: i32 = 100_000;
-
-/// Scores `text` against `query` as a case-insensitive subsequence.
+/// Scores `text` against `query` with nucleo, or `None` when it does not match.
 ///
-/// Returns `None` when `query` is not a subsequence of `text`. Consecutive
-/// runs, matches at a path-segment boundary, and matches inside the basename
-/// all raise the score; longer paths are penalised so shorter ones win ties.
-fn score_one(query: &str, text: &str) -> Option<i32> {
+/// `Config::DEFAULT.match_paths()` is nucleo's path-aware profile: it already
+/// rewards matches at a path-segment boundary and inside the final segment,
+/// which is what the hand-rolled scorer this replaced spent most of its code
+/// on. An empty query matches everything at score 0.
+fn score_one(matcher: &mut Matcher, query: &str, text: &str) -> Option<u16> {
     if query.is_empty() {
         return Some(0);
     }
-    let hay: Vec<char> = text.to_lowercase().chars().collect();
-    let needle: Vec<char> = query.to_lowercase().chars().collect();
-    let basename_start = text.rfind('/').map_or(0, |i| i + 1);
-    let mut score = 0;
-    let mut hi = 0usize;
-    let mut last_hit: Option<usize> = None;
-    let mut first_hit: Option<usize> = None;
-    for &n in &needle {
-        loop {
-            let h = *hay.get(hi)?;
-            hi += 1;
-            if h == n {
-                break;
-            }
-        }
-        let pos = hi - 1;
-        if first_hit.is_none() {
-            first_hit = Some(pos);
-        }
-        if last_hit == Some(pos.wrapping_sub(1)) {
-            score += BONUS_CONSECUTIVE;
-        }
-        if pos == 0 || hay.get(pos.wrapping_sub(1)) == Some(&'/') {
-            score += BONUS_SEGMENT;
-        }
-        last_hit = Some(pos);
-    }
-    if first_hit.is_some_and(|f| f >= basename_start) {
-        score += BONUS_BASENAME;
-    }
-    // Penalise length so a shorter path wins an otherwise equal contest.
-    score -= i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
-    Some(score)
+    let mut hay = Vec::new();
+    let mut needle = Vec::new();
+    matcher.fuzzy_match(
+        Utf32Str::new(text, &mut hay),
+        Utf32Str::new(&query.to_lowercase(), &mut needle),
+    )
 }
 
 /// Normalises a user-typed path query against the repo-relative index.
@@ -174,43 +137,53 @@ pub fn normalize_query(query: &str) -> String {
 }
 
 /// Ranks `cands` against `query`, best first, truncated to `limit`.
+///
+/// Demoted (submodule) candidates are considered only when nothing else
+/// matches: leaving them in would spend the row budget and poison the Tab
+/// common prefix, which is most of what issue #45 was. Partitioning rather
+/// than penalising the score keeps this independent of the scorer's range.
 #[must_use]
 pub fn rank(query: &str, cands: &[Candidate], limit: usize) -> Vec<Match> {
     let query = &normalize_query(query);
-    let mut out: Vec<Match> = cands
-        .iter()
-        .filter_map(|c| {
-            let base = score_one(query, &c.text)?;
-            let kind_bonus = if c.kind == Kind::Resource {
-                0
-            } else {
-                BONUS_FILE_KIND
-            };
-            Some(Match {
-                text: c.text.clone(),
-                kind: c.kind,
-                score: base + kind_bonus - if c.demoted { PENALTY_SUBMODULE } else { 0 },
+    let mut matcher = Matcher::new(Config::DEFAULT.match_paths());
+    let score = |matcher: &mut Matcher, only_demoted: bool| -> Vec<Match> {
+        cands
+            .iter()
+            .filter(|c| c.demoted == only_demoted)
+            .filter_map(|c| {
+                Some(Match {
+                    text: c.text.clone(),
+                    kind: c.kind,
+                    score: score_one(matcher, query, &c.text)?,
+                })
             })
-        })
-        .collect();
-    // Stable ordering: score descending, then lexicographic for determinism.
-    out.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.text.cmp(&b.text)));
-    // Demoted (submodule) rows are dropped entirely whenever the project has
-    // matches of its own: leaving them in would still spend the row budget and
-    // poison the Tab common prefix, which is most of what issue #45 was. They
-    // reappear when nothing else matches, so a submodule path stays reachable.
-    if out.iter().any(|m| m.score > SCORE_FLOOR) {
-        out.retain(|m| m.score > SCORE_FLOOR);
+            .collect()
+    };
+    let mut out = score(&mut matcher, false);
+    if out.is_empty() {
+        out = score(&mut matcher, true);
     }
+    // Score descending, then files before resources, then the shorter path,
+    // then lexicographic — every tier deterministic.
+    out.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| kind_rank(a.kind).cmp(&kind_rank(b.kind)))
+            .then_with(|| a.text.chars().count().cmp(&b.text.chars().count()))
+            .then_with(|| a.text.cmp(&b.text))
+    });
     out.truncate(limit);
     out
 }
 
-/// Every demoted match scores below this; every other match scores above it.
-///
-/// `score_one` subtracts the path length, so an undemoted match cannot fall
-/// this far without a path longer than [`PENALTY_SUBMODULE`] characters.
-const SCORE_FLOOR: i32 = -PENALTY_SUBMODULE / 2;
+/// Sort tier for a kind: files and directories outrank MCP resources when the
+/// match quality is otherwise equal.
+fn kind_rank(kind: Kind) -> u8 {
+    match kind {
+        Kind::File | Kind::Dir => 0,
+        Kind::Resource => 1,
+    }
+}
 
 /// The longest prefix shared by every match, compared by characters.
 #[must_use]
@@ -675,11 +648,25 @@ impl Popup {
                 PopupAction::Consumed
             }
             KeyCode::Tab => {
-                let lcp = longest_common_prefix(&self.rows);
-                // Tab must only ever *extend* what was typed. Matching is a
-                // fuzzy subsequence, so the rows need not share the query as a
-                // prefix at all — inserting the raw common prefix could shrink
-                // `@docs/ARCH` to `@d`, silently eating the user's input.
+                // Only rows that literally begin with the query can contribute
+                // to a *prefix* completion. Matching is fuzzy, so the popup
+                // legitimately holds rows that do not — `@Carg` matches
+                // `docs/SHARED-ENGINE-DESIGN.md` — and letting those vote
+                // empties the common prefix and makes Tab do nothing.
+                let prefixed: Vec<Match> = self
+                    .rows
+                    .iter()
+                    .filter(|m| m.text.starts_with(self.token.query.as_str()))
+                    .cloned()
+                    .collect();
+                let lcp = longest_common_prefix(if prefixed.is_empty() {
+                    &self.rows
+                } else {
+                    &prefixed
+                });
+                // Tab must only ever *extend* what was typed: inserting a
+                // shorter prefix would shrink `@docs/ARCH` to `@d`, silently
+                // eating the user's input.
                 if lcp.len() <= self.token.query.len() || !lcp.starts_with(&self.token.query) {
                     return PopupAction::Consumed;
                 }
@@ -937,10 +924,55 @@ mod tests {
     }
 
     #[test]
+    fn tab_extends_past_a_fuzzy_row_that_shares_no_prefix() {
+        // `@Carg` also fuzzy-matches docs/SHARED-ENGINE-DESIGN.md (c-a-r-g).
+        // Letting that row vote on the common prefix empties it, so Tab did
+        // nothing at all; only prefix matches may contribute.
+        let mut p = Popup::new(AtToken {
+            start: 0,
+            query: "Carg".to_string(),
+            quoted: false,
+        });
+        p.accept_msg(IndexMsg::Results {
+            generation: p.generation(),
+            rows: rank(
+                "Carg",
+                &[
+                    file("Cargo.toml"),
+                    file("Cargo.lock"),
+                    file("docs/SHARED-ENGINE-DESIGN.md"),
+                ],
+                15,
+            ),
+        });
+        let mut buf = LineBuffer::new();
+        buf.insert("@Carg");
+        p.handle_key(key(KeyCode::Tab), &mut buf);
+        assert_eq!(buf.text(), "@Cargo.");
+    }
+
+    #[test]
     fn tab_never_shortens_what_was_typed() {
-        // Fuzzy matching means the rows need not begin with the query, so the
-        // common prefix can be shorter than it. Tab must then do nothing
-        // rather than truncate the input.
+        // No row begins with the query, so the prefix subset is empty and the
+        // common prefix of the fuzzy rows is shorter than what was typed.
+        // Inserting it would eat the user's input, so Tab must do nothing.
+        let mut p = Popup::new(AtToken {
+            start: 0,
+            query: "docs/ARCH".to_string(),
+            quoted: false,
+        });
+        p.accept_msg(IndexMsg::Results {
+            generation: p.generation(),
+            rows: rank("docs/ARCH", &[file("d/o/c/s/A/R/C/H.rs")], 15),
+        });
+        let mut buf = LineBuffer::new();
+        buf.insert("@docs/ARCH");
+        p.handle_key(key(KeyCode::Tab), &mut buf);
+        assert_eq!(buf.text(), "@docs/ARCH");
+    }
+
+    #[test]
+    fn tab_completes_a_unique_prefix_match_in_full() {
         let mut p = Popup::new(AtToken {
             start: 0,
             query: "docs/ARCH".to_string(),
@@ -957,7 +989,7 @@ mod tests {
         let mut buf = LineBuffer::new();
         buf.insert("@docs/ARCH");
         p.handle_key(key(KeyCode::Tab), &mut buf);
-        assert_eq!(buf.text(), "@docs/ARCH");
+        assert_eq!(buf.text(), "@docs/ARCHITECTURE.md");
     }
 
     #[test]

@@ -1927,7 +1927,12 @@ struct TurnOutput {
 struct TuiInput {
     buf: LineBuffer,
     history: History,
+    /// Position within [`TuiInput::hist_eligible`], not within the history
+    /// itself: in bash mode the two differ.
     hist_idx: Option<usize>,
+    /// True when the current history walk started from a `!` line, fixing it
+    /// to bash mode for the rest of the walk.
+    hist_bang: bool,
     stash: String,
     /// Open `@` suggestion popup, when one is showing.
     popup: Option<crate::complete::Popup>,
@@ -1949,6 +1954,7 @@ impl TuiInput {
             buf: LineBuffer::new(),
             history: History::new(crate::settings::active().ui.history_size),
             hist_idx: None,
+            hist_bang: false,
             stash: String::new(),
             popup: None,
             worker: None,
@@ -2091,11 +2097,28 @@ impl TuiInput {
     }
 
     /// Moves through history like the line editor (dir -1 = older).
+    /// Indices of the history entries this navigation may visit, oldest first.
+    ///
+    /// In bash mode only past `!` commands are eligible, mirroring the
+    /// reference: prompt mode shows everything, bash mode filters to bash.
+    fn hist_eligible(&self) -> Vec<usize> {
+        (0..self.history.len())
+            .filter(|i| !self.hist_bang || self.history.get(*i).is_some_and(|e| e.starts_with('!')))
+            .collect()
+    }
+
     fn history_move(&mut self, dir: i32) {
-        if self.history.is_empty() {
+        if self.hist_idx.is_none() {
+            // Mode is fixed when navigation starts. Re-deriving it per keypress
+            // would flip it the moment a non-`!` entry lands in the buffer,
+            // stranding the user in the middle of a cycle.
+            self.hist_bang = self.buf.text().starts_with('!');
+        }
+        let eligible = self.hist_eligible();
+        if eligible.is_empty() {
             return;
         }
-        let len = self.history.len();
+        let len = eligible.len();
         let new_index = match (self.hist_idx, dir) {
             (None, d) if d < 0 => {
                 self.stash = self.buf.text().to_owned();
@@ -2113,7 +2136,11 @@ impl TuiInput {
         };
         self.hist_idx = new_index;
         if let Some(i) = new_index {
-            let entry = self.history.get(i).unwrap_or_default().to_owned();
+            let entry = eligible
+                .get(i)
+                .and_then(|h| self.history.get(*h))
+                .unwrap_or_default()
+                .to_owned();
             self.buf.set_text(entry);
         }
     }
