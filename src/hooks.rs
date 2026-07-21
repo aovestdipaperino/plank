@@ -44,6 +44,9 @@ pub struct HookDef {
     pub command: String,
     /// Kill the hook after this many seconds.
     pub timeout_sec: u64,
+    /// When true (config `"async": true`), the hook is spawned fire-and-forget
+    /// and never blocks the turn; its exit code and output are ignored.
+    pub is_async: bool,
 }
 
 /// A matcher group: hooks that run when the matcher accepts the target.
@@ -135,6 +138,14 @@ pub struct HookOutcome {
     /// `SessionStart`, `PreCompact`, `PostCompact`), destined for the model as
     /// injected turn context. Empty for tool/stop events.
     pub context: Option<String>,
+    /// Set by a `{"continue": false}` response envelope: the turn should halt,
+    /// carrying the optional `stopReason` (or a default) for the user.
+    pub stop_reason: Option<String>,
+    /// `systemMessage` envelope values: user-visible notes that never block.
+    pub system_messages: Vec<String>,
+    /// `suppressOutput` envelope flag: keep this hook's stdout out of the
+    /// transcript (no context injection).
+    pub suppress_output: bool,
 }
 
 fn parse_hook_def(v: &Json) -> Option<HookDef> {
@@ -146,7 +157,15 @@ fn parse_hook_def(v: &Json) -> Option<HookDef> {
     if command.is_empty() {
         return None;
     }
-    let timeout_sec = match v.get("timeout") {
+    let is_async = matches!(v.get("async"), Some(Json::Bool(true)));
+    // `asyncTimeout` overrides the kill deadline for async hooks; otherwise the
+    // usual `timeout` applies.
+    let timeout_key = if is_async && v.get("asyncTimeout").is_some() {
+        "asyncTimeout"
+    } else {
+        "timeout"
+    };
+    let timeout_sec = match v.get(timeout_key) {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         Some(Json::Num(n)) if *n >= 1.0 => n.round() as u64,
         _ => HOOK_DEFAULT_TIMEOUT_SEC,
@@ -154,6 +173,7 @@ fn parse_hook_def(v: &Json) -> Option<HookDef> {
     Some(HookDef {
         command,
         timeout_sec,
+        is_async,
     })
 }
 
@@ -389,11 +409,37 @@ fn run_event_inner(
     let mut context = String::new();
     for group in groups.iter().filter(|g| g.matches(target)) {
         for def in &group.hooks {
+            // async hooks are fire-and-forget: spawn, ignore result, never block.
+            if def.is_async {
+                let (def, input, cwd) = (def.clone(), input.to_owned(), cwd.to_path_buf());
+                std::thread::spawn(move || {
+                    let _ = run_hook(&def, &input, &cwd);
+                });
+                continue;
+            }
             let (code, stdout, stderr) = run_hook(def, input, cwd);
             let stderr = stderr.trim().to_string();
+            // Optional JSON response envelope on stdout. When absent, stdout is
+            // plain context text and exit codes stay fully authoritative.
+            let envelope = parse_envelope(&stdout);
+            if let Some(env) = &envelope {
+                if let Some(reason) = &env.stop_reason
+                    && outcome.stop_reason.is_none()
+                {
+                    outcome.stop_reason = Some(reason.clone());
+                }
+                if let Some(msg) = &env.system_message {
+                    outcome.system_messages.push(msg.clone());
+                }
+                if env.suppress_output {
+                    outcome.suppress_output = true;
+                }
+            }
             match code {
                 0 => {
-                    if capture_context {
+                    // Plain (non-envelope) stdout of a context event is injected
+                    // unless the hook asked to suppress its output.
+                    if capture_context && envelope.is_none() && !outcome.suppress_output {
                         let stdout = stdout.trim();
                         if !stdout.is_empty() {
                             if !context.is_empty() {
@@ -426,6 +472,46 @@ fn run_event_inner(
         outcome.context = Some(context);
     }
     outcome
+}
+
+/// Parsed subset of the response envelope plank honors.
+struct Envelope {
+    /// `Some` when `continue` is `false`; carries `stopReason` (or a default).
+    stop_reason: Option<String>,
+    /// `systemMessage` string, if present.
+    system_message: Option<String>,
+    /// `suppressOutput` flag.
+    suppress_output: bool,
+}
+
+/// Parses a hook's stdout as a response envelope. Returns `None` unless the
+/// stdout is a JSON object (the additive contract: no JSON means exit codes
+/// alone decide). An object with none of the known keys still counts as an
+/// envelope, so its stdout is not re-used as plain context.
+fn parse_envelope(stdout: &str) -> Option<Envelope> {
+    let trimmed = stdout.trim();
+    if !trimmed.starts_with('{') {
+        return None;
+    }
+    let Some(root @ Json::Obj(_)) = json_parse(trimmed) else {
+        return None;
+    };
+    let stop_reason = match root.get("continue") {
+        Some(Json::Bool(false)) => {
+            Some(root.str_or("stopReason", "hook requested stop").to_string())
+        }
+        _ => None,
+    };
+    let system_message = match root.get("systemMessage") {
+        Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let suppress_output = matches!(root.get("suppressOutput"), Some(Json::Bool(true)));
+    Some(Envelope {
+        stop_reason,
+        system_message,
+        suppress_output,
+    })
 }
 
 /// Renders the `/hooks` listing.
@@ -551,6 +637,84 @@ mod tests {
     }
 
     #[test]
+    fn envelope_continue_false_halts_and_system_message_warns() {
+        let cwd = std::env::temp_dir();
+        let out = run_event(
+            &one(
+                r#"echo '{"continue": false, "stopReason": "stop now", "systemMessage": "heads up"}'"#,
+                "",
+            ),
+            "bash",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(out.stop_reason.as_deref(), Some("stop now"));
+        assert_eq!(out.system_messages, vec!["heads up".to_string()]);
+        // Envelope JSON is not re-used as plain context.
+        assert!(out.context.is_none());
+    }
+
+    #[test]
+    fn envelope_suppress_output_blocks_context_injection() {
+        let cwd = std::env::temp_dir();
+        // Plain stdout would inject; suppressOutput keeps it out. The JSON here
+        // *is* the envelope, so there is no plain context anyway — assert the
+        // flag is read.
+        let out = run_event_ctx(
+            &one(r#"echo '{"suppressOutput": true}'"#, ""),
+            "",
+            "{}",
+            &cwd,
+        );
+        assert!(out.suppress_output);
+        assert!(out.context.is_none());
+    }
+
+    #[test]
+    fn no_envelope_keeps_exit_code_semantics() {
+        let cwd = std::env::temp_dir();
+        // Non-JSON stdout on exit 2 still blocks via stderr; stdout ignored.
+        let out = run_event(
+            &one("echo plain; echo err >&2; exit 2", ""),
+            "bash",
+            "{}",
+            &cwd,
+        );
+        assert_eq!(out.block.as_deref(), Some("err"));
+        assert!(out.stop_reason.is_none());
+    }
+
+    #[test]
+    fn async_hook_does_not_block() {
+        let cwd = std::env::temp_dir();
+        let groups = vec![HookMatcher {
+            matcher: String::new(),
+            hooks: vec![HookDef {
+                command: "sleep 30".to_string(),
+                timeout_sec: 30,
+                is_async: true,
+            }],
+        }];
+        let start = Instant::now();
+        let out = run_event(&groups, "bash", "{}", &cwd);
+        // Fire-and-forget: returns immediately, contributes nothing.
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(out, HookOutcome::default());
+    }
+
+    #[test]
+    fn parses_async_flag_and_timeout() {
+        let cfg = r#"{
+            "Stop": [ { "hooks": [
+                { "type": "command", "command": "x", "async": true, "asyncTimeout": 5 }
+            ] } ]
+        }"#;
+        let h = parse_config(cfg);
+        assert!(h.stop[0].hooks[0].is_async);
+        assert_eq!(h.stop[0].hooks[0].timeout_sec, 5);
+    }
+
+    #[test]
     fn accepts_wrapped_hooks_key_and_bad_json() {
         let h = parse_config(&format!("{{\"hooks\":{CONFIG}}}"));
         assert_eq!(h.pre_tool_use.len(), 1);
@@ -579,6 +743,7 @@ mod tests {
             hooks: vec![HookDef {
                 command: cmd.to_string(),
                 timeout_sec: 5,
+                is_async: false,
             }],
         }]
     }
@@ -626,6 +791,7 @@ mod tests {
             hooks: vec![HookDef {
                 command: "sleep 30".to_string(),
                 timeout_sec: 1,
+                is_async: false,
             }],
         }];
         let start = Instant::now();

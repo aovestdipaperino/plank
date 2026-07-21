@@ -82,6 +82,9 @@ pub struct ToolContext {
     /// User-only warnings from non-blocking hook failures, drained by the UI
     /// after each dispatch.
     pub hook_warnings: Vec<String>,
+    /// Set by a tool hook's `{"continue": false}` response envelope; the turn
+    /// driver halts the turn after the dispatch that produced it.
+    pub hook_stop: Option<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -115,6 +118,7 @@ impl ToolContext {
             hooks: crate::hooks::Hooks::default(),
             sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
+            hook_stop: None,
         }
     }
 
@@ -162,6 +166,10 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         );
         let pre = crate::hooks::run_event(&ctx.hooks.pre_tool_use, &call.name, &input, &ctx.cwd);
         ctx.hook_warnings.extend(pre.warnings);
+        ctx.hook_warnings.extend(pre.system_messages);
+        if ctx.hook_stop.is_none() {
+            ctx.hook_stop = pre.stop_reason;
+        }
         if let Some(msg) = pre.block {
             return ToolResult::from_output(format!(
                 "Tool error: blocked by PreToolUse hook: {msg}\n"
@@ -199,6 +207,10 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         );
         let post = crate::hooks::run_event(&ctx.hooks.post_tool_use, &call.name, &input, &ctx.cwd);
         ctx.hook_warnings.extend(post.warnings);
+        ctx.hook_warnings.extend(post.system_messages);
+        if ctx.hook_stop.is_none() {
+            ctx.hook_stop = post.stop_reason;
+        }
         if let Some(msg) = post.block {
             if !output.ends_with('\n') {
                 output.push('\n');
@@ -228,6 +240,10 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             &ctx.cwd,
         );
         ctx.hook_warnings.extend(fail.warnings);
+        ctx.hook_warnings.extend(fail.system_messages);
+        if ctx.hook_stop.is_none() {
+            ctx.hook_stop = fail.stop_reason;
+        }
         if let Some(msg) = fail.block {
             if !output.ends_with('\n') {
                 output.push('\n');

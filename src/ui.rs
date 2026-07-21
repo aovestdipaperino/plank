@@ -793,7 +793,10 @@ impl Agent<'_> {
     /// Runs one model turn: stream text, execute tool calls, repeat until
     /// a turn produces no tool calls. Compacts first when context is tight.
     fn run_turn(&mut self) -> Result<(), String> {
-        self.fire_user_prompt_submit(&mut |w| println!("{w}"));
+        if let Some(reason) = self.fire_user_prompt_submit(&mut |w| println!("{w}")) {
+            println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+            return Ok(());
+        }
         self.maybe_compact()?;
         self.maybe_append_system_prompt_reminder();
         // One clock for the whole turn: elapsed time accumulates across the
@@ -859,6 +862,11 @@ impl Agent<'_> {
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
+                // A tool hook's `continue:false` envelope halts the turn.
+                if let Some(reason) = self.tool_ctx.hook_stop.take() {
+                    println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+                    return Ok(());
+                }
                 continue;
             }
             let mut renderer = stream.into_sink().renderer;
@@ -893,8 +901,13 @@ impl Agent<'_> {
         let input = crate::hooks::tool_event_input("Stop", "", "{}", None, &self.tool_ctx.cwd);
         let out =
             crate::hooks::run_event(&self.tool_ctx.hooks.stop, "", &input, &self.tool_ctx.cwd);
-        for w in out.warnings {
+        for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
+        }
+        // A `continue:false` envelope wins over an exit-2 feedback loop: the
+        // turn concludes rather than being fed back to the model.
+        if out.stop_reason.is_some() {
+            return None;
         }
         out.block
     }
@@ -902,9 +915,9 @@ impl Agent<'_> {
     /// Fires the `UserPromptSubmit` hooks for the turn's triggering prompt (the
     /// last user message). Exit-0 stdout and any exit-2 block feedback inject a
     /// `<hook_context>` user message into this turn; other nonzero exits warn.
-    fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) {
+    fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
         if self.tool_ctx.hooks.user_prompt_submit.is_empty() {
-            return;
+            return None;
         }
         let prompt = self
             .session
@@ -925,13 +938,14 @@ impl Agent<'_> {
             &input,
             &self.tool_ctx.cwd,
         );
-        for w in out.warnings {
+        for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
         }
         if let Some(ctx) = out.context.or(out.block) {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+        out.stop_reason
     }
 
     /// Fires the `SessionStart` hooks with the given source (startup|resume|
@@ -952,7 +966,7 @@ impl Agent<'_> {
             &input,
             &self.tool_ctx.cwd,
         );
-        for w in out.warnings {
+        for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
         }
         if let Some(ctx) = out.context {
@@ -978,7 +992,12 @@ impl Agent<'_> {
             &input,
             &self.tool_ctx.cwd,
         );
-        for w in out.warnings.into_iter().chain(out.block) {
+        for w in out
+            .warnings
+            .into_iter()
+            .chain(out.system_messages)
+            .chain(out.block)
+        {
             warn(w);
         }
     }
@@ -1098,7 +1117,7 @@ impl Agent<'_> {
                 &input,
                 &self.tool_ctx.cwd,
             );
-            for w in out.warnings {
+            for w in out.warnings.into_iter().chain(out.system_messages) {
                 println!("{w}");
             }
             if let Some(ctx) = out.context {
@@ -1145,7 +1164,7 @@ impl Agent<'_> {
                 &input,
                 &self.tool_ctx.cwd,
             );
-            for w in out.warnings {
+            for w in out.warnings.into_iter().chain(out.system_messages) {
                 println!("{w}");
             }
             if let Some(ctx) = out.context {
@@ -3046,9 +3065,12 @@ impl Agent<'_> {
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
-        self.fire_user_prompt_submit(&mut |w| {
+        if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
-        });
+        }) {
+            let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+            return Ok(());
+        }
         self.maybe_compact_notify(&mut note)?;
         self.maybe_reminder_notify(&mut note);
         // One clock for the whole turn: elapsed time accumulates across the
@@ -3132,6 +3154,11 @@ impl Agent<'_> {
                 )));
                 for line in observations.lines() {
                     let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                }
+                // A tool hook's `continue:false` envelope halts the turn.
+                if let Some(reason) = self.tool_ctx.hook_stop.take() {
+                    let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+                    return Ok(());
                 }
                 self.drain_queued(shared, tx);
                 continue;
