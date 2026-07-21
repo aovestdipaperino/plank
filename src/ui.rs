@@ -804,6 +804,10 @@ impl Agent<'_> {
     /// a turn produces no tool calls. Compacts first when context is tight.
     fn run_turn(&mut self) -> Result<(), String> {
         self.tool_ctx.skill_invocations = 0;
+        if let Some(reason) = self.fire_user_prompt_submit(&mut |w| println!("{w}")) {
+            println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+            return Ok(());
+        }
         self.maybe_compact()?;
         self.maybe_append_system_prompt_reminder();
         // One clock for the whole turn: elapsed time accumulates across the
@@ -869,6 +873,11 @@ impl Agent<'_> {
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
+                // A tool hook's `continue:false` envelope halts the turn.
+                if let Some(reason) = self.tool_ctx.hook_stop.take() {
+                    println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+                    return Ok(());
+                }
                 continue;
             }
             let mut renderer = stream.into_sink().renderer;
@@ -903,10 +912,107 @@ impl Agent<'_> {
         let input = crate::hooks::tool_event_input("Stop", "", "{}", None, &self.tool_ctx.cwd);
         let out =
             crate::hooks::run_event(&self.tool_ctx.hooks.stop, "", &input, &self.tool_ctx.cwd);
-        for w in out.warnings {
+        for w in out.warnings.into_iter().chain(out.system_messages) {
             warn(w);
         }
-        out.block
+        // A `continue:false` envelope wins over an exit-2 feedback loop: the
+        // turn concludes rather than being fed back to the model.
+        if out.stop_reason.is_some() {
+            return None;
+        }
+        // A Stop `prompt` hook's text is fed to the model just like exit-2
+        // feedback, so a prompt hook can steer the model to keep working.
+        out.block.or(out.context)
+    }
+
+    /// Fires the `UserPromptSubmit` hooks for the turn's triggering prompt (the
+    /// last user message). Exit-0 stdout and any exit-2 block feedback inject a
+    /// `<hook_context>` user message into this turn; other nonzero exits warn.
+    fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
+        if self.tool_ctx.hooks.user_prompt_submit.is_empty() {
+            return None;
+        }
+        let prompt = self
+            .session
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::session::Role::User)
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        let input = crate::hooks::lifecycle_event_input(
+            "UserPromptSubmit",
+            &[("prompt", &prompt)],
+            &self.tool_ctx.cwd,
+        );
+        let out = crate::hooks::run_event_ctx(
+            &self.tool_ctx.hooks.user_prompt_submit,
+            "",
+            &input,
+            &self.tool_ctx.cwd,
+        );
+        for w in out.warnings.into_iter().chain(out.system_messages) {
+            warn(w);
+        }
+        if let Some(ctx) = out.context.or(out.block) {
+            self.session
+                .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        }
+        out.stop_reason
+    }
+
+    /// Fires the `SessionStart` hooks with the given source (startup|resume|
+    /// clear|compact), injecting any produced context as a `<hook_context>`
+    /// user message so it rides along with the session.
+    fn fire_session_start(&mut self, source: &str, warn: &mut dyn FnMut(String)) {
+        if self.tool_ctx.hooks.session_start.is_empty() {
+            return;
+        }
+        let input = crate::hooks::lifecycle_event_input(
+            "SessionStart",
+            &[("source", source)],
+            &self.tool_ctx.cwd,
+        );
+        let out = crate::hooks::run_event_ctx(
+            &self.tool_ctx.hooks.session_start,
+            "",
+            &input,
+            &self.tool_ctx.cwd,
+        );
+        for w in out.warnings.into_iter().chain(out.system_messages) {
+            warn(w);
+        }
+        if let Some(ctx) = out.context {
+            self.session
+                .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        }
+    }
+
+    /// Fires the `SessionEnd` hooks with the exit `reason`. Terminal event: no
+    /// context is injected, only user-visible warnings are surfaced.
+    fn fire_session_end(&mut self, reason: &str, warn: &mut dyn FnMut(String)) {
+        if self.tool_ctx.hooks.session_end.is_empty() {
+            return;
+        }
+        let input = crate::hooks::lifecycle_event_input(
+            "SessionEnd",
+            &[("reason", reason)],
+            &self.tool_ctx.cwd,
+        );
+        let out = crate::hooks::run_event(
+            &self.tool_ctx.hooks.session_end,
+            "",
+            &input,
+            &self.tool_ctx.cwd,
+        );
+        for w in out
+            .warnings
+            .into_iter()
+            .chain(out.system_messages)
+            .chain(out.block)
+        {
+            warn(w);
+        }
     }
 
     /// Re-injects the trusted system prompt shape after enough context has
@@ -1004,6 +1110,34 @@ impl Agent<'_> {
     /// summary + recent verbatim tail.
     fn compact(&mut self, reason: &str) -> Result<(), String> {
         print!("{}", compact::banner(reason, self.color));
+        // PreCompact: `manual` for a user-driven `/compact`, `auto` otherwise.
+        // Injected context is pinned as a user message so it survives the
+        // rebuild in the verbatim tail.
+        let trigger = if reason == "user request" {
+            "manual"
+        } else {
+            "auto"
+        };
+        if !self.tool_ctx.hooks.pre_compact.is_empty() {
+            let input = crate::hooks::lifecycle_event_input(
+                "PreCompact",
+                &[("trigger", trigger)],
+                &self.tool_ctx.cwd,
+            );
+            let out = crate::hooks::run_event_ctx(
+                &self.tool_ctx.hooks.pre_compact,
+                "",
+                &input,
+                &self.tool_ctx.cwd,
+            );
+            for w in out.warnings.into_iter().chain(out.system_messages) {
+                println!("{w}");
+            }
+            if let Some(ctx) = out.context {
+                self.session
+                    .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+            }
+        }
         let mut prompt_text = render_transcript(&self.session, &self.system);
         {
             use std::fmt::Write as _;
@@ -1028,6 +1162,29 @@ impl Agent<'_> {
         }
 
         self.rebuild_after_compact(&summary);
+        // PostCompact: carries the extracted durable summary; injected context
+        // is appended after the rebuilt transcript.
+        if !self.tool_ctx.hooks.post_compact.is_empty() {
+            let extracted = compact::extract_summary(&summary);
+            let input = crate::hooks::lifecycle_event_input(
+                "PostCompact",
+                &[("trigger", trigger), ("summary", &extracted)],
+                &self.tool_ctx.cwd,
+            );
+            let out = crate::hooks::run_event_ctx(
+                &self.tool_ctx.hooks.post_compact,
+                "",
+                &input,
+                &self.tool_ctx.cwd,
+            );
+            for w in out.warnings.into_iter().chain(out.system_messages) {
+                println!("{w}");
+            }
+            if let Some(ctx) = out.context {
+                self.session
+                    .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+            }
+        }
         println!("{}", self.debug_line("context compacted"));
         Ok(())
     }
@@ -1380,6 +1537,7 @@ impl Agent<'_> {
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
+                self.fire_session_start("clear", &mut |w| println!("{w}"));
                 println!("started a new session");
             }
             "/help" => print!("{}", crate::config::usage()),
@@ -2934,6 +3092,12 @@ impl Agent<'_> {
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
+        if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
+            let _ = tx.send(UiEvent::Dim(w));
+        }) {
+            let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+            return Ok(());
+        }
         self.maybe_compact_notify(&mut note)?;
         self.maybe_reminder_notify(&mut note);
         // One clock for the whole turn: elapsed time accumulates across the
@@ -3017,6 +3181,11 @@ impl Agent<'_> {
                 )));
                 for line in observations.lines() {
                     let _ = tx.send(UiEvent::Dim(line.to_owned()));
+                }
+                // A tool hook's `continue:false` envelope halts the turn.
+                if let Some(reason) = self.tool_ctx.hook_stop.take() {
+                    let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+                    return Ok(());
                 }
                 self.drain_queued(shared, tx);
                 continue;
@@ -3457,6 +3626,7 @@ impl Agent<'_> {
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
+                self.fire_session_start("clear", &mut |w| log.push_plain(w));
                 log.push_plain("started a new session");
             }
             "/checkpoint" => {
@@ -4058,6 +4228,9 @@ fn new_agent(
     // schemas land in it, like agent_worker_init.
     tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
     tool_ctx.hooks = crate::hooks::load_default(&tool_ctx.cwd);
+    for w in &tool_ctx.hooks.warnings {
+        eprintln!("{w}");
+    }
     tool_ctx.sandbox = crate::sandbox::load_default(&tool_ctx.cwd);
     if let Some(enabled) = cfg.sandbox_override {
         tool_ctx.sandbox.enabled = enabled;
@@ -4117,9 +4290,15 @@ pub fn run_interactive(
     let mut agent = new_agent(engine, cfg, true, remote)?;
 
     // `plank /resume [prefix]` loads a prior session before the loop starts.
+    let resumed = cfg.resume.is_some();
     if let Some(arg) = &cfg.resume {
         agent.resume_from_cli(arg)?;
     }
+    // SessionStart fires once the session identity is settled: `resume` when a
+    // prior session was loaded, `startup` otherwise.
+    agent.fire_session_start(if resumed { "resume" } else { "startup" }, &mut |w| {
+        println!("{w}");
+    });
 
     // A real terminal gets the full-screen ratatui UI (works cleanly in Warp
     // and other block terminals via the alternate screen). Piped input falls
@@ -4129,7 +4308,9 @@ pub fn run_interactive(
     } else {
         run_plain_flow(&mut agent, cfg)
     };
-    // Whatever happened, save the session and tell the user how to resume it.
+    // Whatever happened, fire SessionEnd, save the session, and tell the user
+    // how to resume it.
+    agent.fire_session_end("exit", &mut |w| println!("{w}"));
     agent.report_session_on_exit();
     result
 }
@@ -4354,9 +4535,12 @@ pub fn run_non_interactive(
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, false, remote)?;
     agent.warm_plain()?;
+    agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
         agent.session.push(Message::user(prompt));
-        return agent.run_turn();
+        let r = agent.run_turn();
+        agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
+        return r;
     }
     // Headless with a remote bridge and no `-p`: instead of the stdin protocol,
     // serve remote controllers — drive turns from their `prompt` frames and
@@ -4380,6 +4564,7 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt.trim_end()));
         agent.run_turn()?;
     }
+    agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     Ok(())
 }
 
