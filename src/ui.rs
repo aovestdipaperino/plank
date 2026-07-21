@@ -4340,6 +4340,76 @@ mod tests {
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
 
+    /// A `TuiInput` whose history holds an interleaved mix of prompts and
+    /// `!` commands, for the mode-aware navigation tests.
+    fn input_with_mixed_history() -> TuiInput {
+        let mut input = TuiInput::new();
+        for e in ["write a test", "!ls -la", "explain this", "!git status"] {
+            input.history.add(e);
+        }
+        input
+    }
+
+    #[test]
+    fn history_in_prompt_mode_visits_every_entry() {
+        let mut input = input_with_mixed_history();
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            input.history_move(-1);
+            seen.push(input.buf.text().to_string());
+        }
+        assert_eq!(
+            seen,
+            ["!git status", "explain this", "!ls -la", "write a test"]
+        );
+    }
+
+    #[test]
+    fn history_on_a_bang_line_visits_only_bang_entries() {
+        let mut input = input_with_mixed_history();
+        input.buf.set_text("!");
+        input.buf.move_end();
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            input.history_move(-1);
+            seen.push(input.buf.text().to_string());
+        }
+        assert_eq!(seen, ["!git status", "!ls -la"]);
+    }
+
+    #[test]
+    fn bash_mode_is_fixed_when_the_walk_starts() {
+        // Loading a `!` entry makes the buffer start with `!`. If mode were
+        // re-derived per keypress, a walk begun in prompt mode would switch to
+        // bash mode mid-cycle and strand the user.
+        let mut input = input_with_mixed_history();
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "!git status");
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "explain this", "mode flipped mid-walk");
+    }
+
+    #[test]
+    fn bash_mode_with_no_bang_entries_leaves_the_line_alone() {
+        let mut input = TuiInput::new();
+        input.history.add("write a test");
+        input.buf.set_text("!gi");
+        input.buf.move_end();
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "!gi");
+    }
+
+    #[test]
+    fn history_walk_restores_the_stashed_line_on_the_way_back() {
+        let mut input = input_with_mixed_history();
+        input.buf.set_text("!half typed");
+        input.buf.move_end();
+        input.history_move(-1);
+        assert_eq!(input.buf.text(), "!git status");
+        input.history_move(1);
+        assert_eq!(input.buf.text(), "!half typed");
+    }
+
     /// Builds a `TuiInput` whose popup is open with one canned row.
     fn input_with_popup(text: &str, cursor_back: usize) -> TuiInput {
         use crate::complete::{IndexMsg, Kind, Match, Popup, detect_at_token};
