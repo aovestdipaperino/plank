@@ -264,11 +264,11 @@ impl Write for FlushingStdout {
 }
 
 /// Routes viz output into the markdown token renderer.
-struct TerminalSink {
-    renderer: TokenRenderer<FlushingStdout>,
+struct TerminalSink<W: Write> {
+    renderer: TokenRenderer<W>,
 }
 
-impl RenderSink for TerminalSink {
+impl<W: Write> RenderSink for TerminalSink<W> {
     fn visible_text(&mut self, text: &str) {
         self.renderer.set_in_think(false);
         self.renderer.write(text);
@@ -276,6 +276,13 @@ impl RenderSink for TerminalSink {
     fn think_text(&mut self, text: &str) {
         self.renderer.set_in_think(true);
         self.renderer.write(text);
+    }
+    fn tool_text(&mut self, text: &str) {
+        // Tool banners carry their own styling and must render verbatim; going
+        // through `write` would markdown-process them and eat `*`/`_`/backtick
+        // out of param values (e.g. `pattern=**/mod.rs`).
+        self.renderer.set_in_think(false);
+        self.renderer.plain(text);
     }
     fn error_text(&mut self, text: &str) {
         self.renderer.set_in_think(false);
@@ -685,7 +692,7 @@ impl Agent<'_> {
         turn_start: Instant,
     ) -> Result<
         (
-            StreamRenderer<TerminalSink>,
+            StreamRenderer<TerminalSink<FlushingStdout>>,
             String,
             crate::engine::GenerationStats,
         ),
@@ -4390,6 +4397,61 @@ fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
 mod tests {
     use super::*;
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A `Write` sink backed by a shared buffer so a test can inspect the exact
+    /// bytes the terminal renderer emits.
+    #[derive(Clone)]
+    struct SharedBuf(Rc<RefCell<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression for #48: a tool-call banner param value containing markdown
+    /// metacharacters (`*`, `_`, backtick) must render verbatim on the plain /
+    /// non-interactive stdout path — the model sent `pattern=**/x.rs` but the
+    /// banner used to drop the `*`s because `tool_text` fell through to the
+    /// markdown-processing `visible_text`.
+    #[test]
+    fn tool_banner_param_value_renders_metachars_verbatim() {
+        let buf = Rc::new(RefCell::new(Vec::new()));
+        let sink = TerminalSink {
+            renderer: TokenRenderer::new(
+                SharedBuf(buf.clone()),
+                RenderOptions {
+                    use_color: false,
+                    format_thinking: true,
+                    format_markdown: true,
+                },
+            ),
+        };
+        let mut stream = StreamRenderer::new(sink);
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"search\">",
+            "<｜DSML｜parameter name=\"pattern\">**/x.rs a_b `c`</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        stream.push(stanza);
+        stream.finish();
+        drop(stream);
+        let out = String::from_utf8(buf.borrow().clone()).unwrap();
+        assert!(
+            out.contains("**/x.rs"),
+            "star stripped from banner: {out:?}"
+        );
+        assert!(out.contains("a_b"), "underscore mangled: {out:?}");
+        assert!(out.contains("`c`"), "backtick eaten: {out:?}");
+    }
 
     /// A `TuiInput` whose history holds an interleaved mix of prompts and
     /// `!` commands, for the mode-aware navigation tests.
