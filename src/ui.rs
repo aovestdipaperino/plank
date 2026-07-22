@@ -3047,6 +3047,19 @@ impl Agent<'_> {
                             if !text.trim().is_empty() {
                                 tui::copy_to_clipboard(&text);
                             }
+                        } else if let Some((col, row)) = selection.map(|(a, _)| a) {
+                            // A plain click (no drag): copy a fenced code block
+                            // when its header `⧉ copy` control was clicked. The
+                            // output area is everything above the input/status.
+                            let size = terminal.size().unwrap_or_default();
+                            let out_h = size.height.saturating_sub(2);
+                            if row < out_h
+                                && let Some(code) = log.code_copy_at(size.width, view.top, col, row)
+                            {
+                                tui::copy_to_clipboard(&code);
+                                log.push_dim("[copied code block to clipboard]");
+                            }
+                            selection = None;
                         } else {
                             selection = None;
                         }

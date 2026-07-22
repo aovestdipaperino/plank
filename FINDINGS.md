@@ -202,3 +202,17 @@ test` and review the diff before committing.
   (`ttl: "1h"` plus the `anthropic-beta: extended-cache-ttl-2025-04-11`
   header); it costs 2× base input on the cache *write* but keeps reads at
   0.1×, a clear win when the prefix is re-read far more than it changes.
+
+- **`ratatui-markdown` code-block headers can't be customized via the block's
+  `header_override`.** When a `RenderHooks` impl (plank uses `HighlightHooks`)
+  returns `Some` from `render_code_block`, the crate renders the whole block —
+  header, body, footer — from that one call and `return`s before it ever
+  consults `header_override`/`code_block_header`. So injecting a control (the
+  `⧉ copy` affordance) into the language-label row by mutating the parsed
+  `MarkdownBlock::CodeBlock` is silently ignored for any block the highlighter
+  recognizes. The reliable seam is *after* `md.render`: scan the rendered
+  `Line`s (`╭` header → `╰` footer, body rows carry a `│ ` gutter) and append
+  the control span there. That scan also recovers the block's raw text WYSIWYG
+  (strip the `│ ` gutter, trim trailing space) — the same philosophy as
+  `selection_text`, and it needs no back-reference to the markdown source,
+  which `OutputLog` discards once a streaming segment closes.
