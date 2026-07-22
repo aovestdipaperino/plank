@@ -232,6 +232,13 @@ struct ToolViz {
     read_max: String,
     read_whole: String,
     code_param_active: bool,
+    /// Destination captured from a `write` call's path param, for the dim
+    /// content-preview header.
+    write_path: String,
+    /// True when the current `write` targets a file that does not yet exist:
+    /// only then does the content stream as a dim preview (an overwrite is left
+    /// to the post-edit diff card).
+    write_is_create: bool,
 }
 
 impl ToolViz {
@@ -538,6 +545,28 @@ impl<S: RenderSink> StreamRenderer<S> {
         Self::flush_stream(S::think_text, &mut self.sink, &mut self.think_carry);
     }
 
+    /// Emits `write`-preview bytes in the thinking (dim) color. Independent of
+    /// `show_tool_calls` and `show_thinking`, so a write's content is always
+    /// visible as a dim preview of what is being saved.
+    fn emit_preview_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        self.last_output_newline = bytes.last() == Some(&b'\n');
+        self.think_carry.extend_from_slice(bytes);
+        Self::flush_stream(S::think_text, &mut self.sink, &mut self.think_carry);
+    }
+
+    fn viz_preview_puts(&mut self, s: &str) {
+        self.emit_preview_bytes(s.as_bytes());
+    }
+
+    /// True while streaming the `write` tool's content body, which renders as a
+    /// dim preview rather than through the normal (banner-gated) channel.
+    fn viz_is_write_preview(&self) -> bool {
+        self.viz.tool_name == "write" && self.viz.param_kind == ParamKind::Content
+    }
+
     fn flush_carry(&mut self) {
         for (write, carry) in [
             (S::visible_text as fn(&mut S, &str), &mut self.vis_carry),
@@ -718,6 +747,15 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn viz_code_byte(&mut self, c: u8) {
+        // A new file's body streams as a dim preview; an overwrite's body is
+        // dropped here (the post-edit diff card shows it).
+        if self.viz_is_write_preview() {
+            if self.viz.write_is_create {
+                self.emit_preview_bytes(&[c]);
+            }
+            self.viz.at_line_start = c == b'\n';
+            return;
+        }
         self.viz_code_prefix();
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
@@ -740,7 +778,21 @@ impl<S: RenderSink> StreamRenderer<S> {
             }
             ParamKind::Content => {
                 self.viz_newline_if_open();
-                if self.viz.tool_name != "write" {
+                if self.viz.tool_name == "write" {
+                    // Stream the content as a dim preview only for a new file;
+                    // an overwrite is shown by the post-edit diff card instead.
+                    self.viz.write_is_create = !std::path::Path::new(&self.viz.write_path).exists();
+                    // A dim header names the file for the content preview. Only
+                    // when the banner is off, else the banner already shows it.
+                    if self.viz.write_is_create && !self.show_tool_calls {
+                        let path = if self.viz.write_path.is_empty() {
+                            "<file>".to_string()
+                        } else {
+                            self.viz.write_path.clone()
+                        };
+                        self.viz_preview_puts(&format!("write {path}\n"));
+                    }
+                } else {
                     let label = format!("{name}:\n");
                     self.viz_puts(&label);
                 }
@@ -783,6 +835,10 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.viz_code_begin();
             self.viz_code_byte(c);
             return;
+        }
+        // Capture the write destination for the content-preview header.
+        if self.viz.tool_name == "write" && self.viz.param_kind == ParamKind::Path {
+            self.viz.write_path.push(c as char);
         }
         self.emit_visible_bytes(&[c]);
         self.viz.at_line_start = c == b'\n';
@@ -1206,6 +1262,33 @@ mod tests {
     }
 
     #[test]
+    fn write_content_previews_dim_even_with_banners_off() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        // Banners off (default): the content still previews, on the think
+        // (dim) channel, with a header naming the file — nothing in visible.
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.push(stanza);
+        sr.finish();
+        let think = &sr.sink().think;
+        assert!(think.contains("write src/foo.rs"), "header: {think:?}");
+        assert!(think.contains("fn main() {}"), "content preview: {think:?}");
+        assert!(
+            !sr.sink().visible.contains("fn main()"),
+            "content not on the visible channel: {:?}",
+            sr.sink().visible
+        );
+        assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
+    }
+
+    #[test]
     fn show_tool_calls_false_suppresses_the_banner_but_keeps_visible_text() {
         let stanza = concat!(
             "answer before. ",
@@ -1625,7 +1708,13 @@ mod tests {
         for sr in [run_chunked(stanza), run_charwise(stanza)] {
             let vis = &sr.sink().visible;
             assert!(vis.contains("🛠️ write  path=x.txt"), "{vis:?}");
-            assert!(vis.contains("line one\nline two"), "{vis:?}");
+            // The content now previews on the dim (think) channel, not visible.
+            assert!(!vis.contains("line one"), "{vis:?}");
+            assert!(
+                sr.sink().think.contains("line one\nline two"),
+                "{:?}",
+                sr.sink().think
+            );
             assert!(!vis.contains("content:"), "{vis:?}");
             assert!(!vis.contains("DSML"), "{vis:?}");
         }

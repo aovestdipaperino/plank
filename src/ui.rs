@@ -928,6 +928,9 @@ impl Agent<'_> {
                 self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
+                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                    print!("{}", preview.to_ansi(self.color));
+                }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
                     println!("{}", self.debug_line(&format!("✓ {line}")));
                 }
@@ -3378,6 +3381,9 @@ impl Agent<'_> {
             if !out.calls.is_empty() {
                 let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
                 self.sync_tasks_after_dispatch();
+                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                    let _ = tx.send(UiEvent::EditCard(preview));
+                }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
                     let _ = tx.send(UiEvent::Dim(format!("✓ {line}")));
                 }

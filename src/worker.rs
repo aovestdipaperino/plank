@@ -34,6 +34,8 @@ pub enum UiEvent {
     Error(String),
     /// A dim log line (tool observations, notices, hook warnings).
     Dim(String),
+    /// A git-style diff card for a file an `edit`/`write` call changed.
+    EditCard(crate::tools::diff::EditPreview),
     /// A plain log line.
     Plain(String),
     /// A user-echo line (queued prompts, `/btw` questions).
@@ -305,6 +307,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Tool(t) => log.tool_text(&t),
         UiEvent::Error(t) => log.error_text(&t),
         UiEvent::Dim(t) => log.push_dim(t),
+        UiEvent::EditCard(p) => crate::tui::render_diff_card(log, &p),
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),

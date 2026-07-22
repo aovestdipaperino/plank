@@ -244,12 +244,23 @@ pub fn tool_write(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let Some(content) = call.arg_value("content") else {
         return "Tool error: write requires content\n".to_string();
     };
-    let mut file = match std::fs::File::create(ctx.resolve(path)) {
+    let full = ctx.resolve(path);
+    // Prior content (for the diff card); absent means this write creates it.
+    let prior = std::fs::read(&full).ok();
+    let mut file = match std::fs::File::create(&full) {
         Ok(f) => f,
         Err(e) => return format!("Tool error: open for write failed: {e}\n"),
     };
     if let Err(e) = std::io::Write::write_all(&mut file, content.as_bytes()) {
         return format!("Tool error: write failed: {e}\n");
+    }
+    // A new file is shown by the streaming dim preview; only an overwrite gets
+    // a post-edit diff card here.
+    if let Some(prior) = &prior {
+        let old = String::from_utf8_lossy(prior);
+        let mut preview = crate::tools::diff::edit_preview(path, &old, content, false);
+        preview.bytes = Some(content.len());
+        ctx.edit_previews.push(preview);
     }
     format!("Wrote {} bytes to {}\n", content.len(), path)
 }
@@ -683,6 +694,30 @@ mod tests {
             tool_write(&mut ctx, &test_call("write", &[("path", "p")])),
             "Tool error: write requires content\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn write_card_only_for_overwrites_not_new_files() {
+        let (mut ctx, dir) = test_ctx();
+        // New file: no diff card (the streaming preview shows it).
+        tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "c.txt"), ("content", "one\n")]),
+        );
+        assert!(ctx.edit_previews.is_empty(), "new file: no card");
+
+        // Overwrite: a card diffing old vs new, with the byte size set.
+        tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "c.txt"), ("content", "two\n")]),
+        );
+        assert_eq!(ctx.edit_previews.len(), 1, "overwrite: one card");
+        let card = &ctx.edit_previews[0];
+        assert!(!card.created);
+        assert_eq!(card.added, 1);
+        assert_eq!(card.removed, 1);
+        assert_eq!(card.bytes, Some(4));
         std::fs::remove_dir_all(dir).ok();
     }
 

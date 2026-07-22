@@ -260,6 +260,10 @@ impl ServerMsg {
             UiEvent::Tool(t) => Self::Tool { text: t.clone() },
             UiEvent::Error(t) => Self::Error { text: t.clone() },
             UiEvent::Dim(t) => Self::Dim { text: t.clone() },
+            // Remote clients render the card as a pre-styled ANSI text block.
+            UiEvent::EditCard(p) => Self::Dim {
+                text: p.to_ansi(true),
+            },
             UiEvent::Plain(t) => Self::Plain { text: t.clone() },
             UiEvent::UserEcho(t) => Self::UserEcho { text: t.clone() },
             UiEvent::EndLine => Self::EndLine,

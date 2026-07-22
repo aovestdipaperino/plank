@@ -843,6 +843,76 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
     }
 }
 
+/// Renders a git-style diff card for a changed file into the output log: a
+/// bold `Update(path)` / `Create(path)` header, an added/removed summary, then
+/// `@@` hunks with red-background removals and green-background additions.
+pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview) {
+    use crate::tools::diff::{DiffRow, gutter, human_size, plural};
+    let verb = if p.created { "Create" } else { "Update" };
+    let mut head = vec![
+        Span::styled("● ", Style::default().fg(THEME_GREEN)),
+        Span::styled(
+            format!("{verb}({})", p.path),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if let Some(bytes) = p.bytes {
+        head.push(Span::styled(
+            format!(" · {}", human_size(bytes)),
+            Style::default().fg(Color::Indexed(240)),
+        ));
+    }
+    log.push_spans(head);
+
+    let dim = Style::default().fg(Color::Indexed(240));
+    log.push_spans(vec![Span::styled(
+        format!(
+            "  └ Added {} {}, removed {} {}",
+            p.added,
+            plural(p.added),
+            p.removed,
+            plural(p.removed)
+        ),
+        dim,
+    )]);
+
+    let del = Style::default()
+        .bg(Color::Indexed(52))
+        .fg(Color::Indexed(224));
+    let add = Style::default()
+        .bg(Color::Indexed(22))
+        .fg(Color::Indexed(194));
+    for row in &p.rows {
+        match row {
+            DiffRow::Hunk {
+                old_start,
+                old_len,
+                new_start,
+                new_len,
+            } => log.push_spans(vec![Span::styled(
+                format!("  @@ -{old_start},{old_len} +{new_start},{new_len} @@"),
+                Style::default().fg(Color::Indexed(44)),
+            )]),
+            DiffRow::Context { text, .. } => log.push_spans(vec![
+                Span::styled(format!("{}   ", gutter(row.gutter())), dim),
+                Span::raw(text.clone()),
+            ]),
+            DiffRow::Del { text, .. } => log.push_spans(vec![Span::styled(
+                format!("{} - {text}", gutter(row.gutter())),
+                del,
+            )]),
+            DiffRow::Add { text, .. } => log.push_spans(vec![Span::styled(
+                format!("{} + {text}", gutter(row.gutter())),
+                add,
+            )]),
+            DiffRow::Elision(n) => {
+                log.push_spans(vec![Span::styled(format!("      ⋯ {n} more lines ⋯"), dim)]);
+            }
+        }
+    }
+    log.push_spans(vec![]);
+}
+
 /// Minimal pre-UI screen shown while the system-prompt KV cache is (re)built at
 /// launch: a centered note and a simple progress bar. The full UI is withheld
 /// until warming finishes, so the user sees clear progress instead of an idle

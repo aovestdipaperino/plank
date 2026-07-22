@@ -288,6 +288,14 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         return format!("Tool error: write {path}: {e}\n");
     }
 
+    // Record a diff preview for the UI change card.
+    ctx.edit_previews.push(crate::tools::diff::edit_preview(
+        path,
+        &String::from_utf8_lossy(&data),
+        &String::from_utf8_lossy(&out_data),
+        false,
+    ));
+
     let effect = old_new_line_effect(&data, &out_data, offset, remove_len);
     let kind = if anchored {
         "anchored old/new replacement"

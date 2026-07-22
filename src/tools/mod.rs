@@ -9,6 +9,7 @@
 
 pub mod ask;
 pub mod bash;
+pub mod diff;
 pub mod edit;
 pub mod files;
 pub mod mcp;
@@ -98,6 +99,9 @@ pub struct ToolContext {
     /// Subjects of tasks the `task` tool just marked completed, drained by the
     /// UI after each dispatch to write the single dim completion log line.
     pub task_completions: Vec<String>,
+    /// Diff previews from `edit`/`write` calls this dispatch, drained by the UI
+    /// to render a git-style change card. Empty when nothing changed a file.
+    pub edit_previews: Vec<diff::EditPreview>,
     /// Front end that presents `ask` questions (issue #34); `None` in
     /// non-interactive mode, where `ask` fast-fails instead of blocking.
     pub asker: Option<Box<dyn ask::Asker>>,
@@ -147,6 +151,7 @@ impl ToolContext {
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
+            edit_previews: Vec::new(),
             asker: None,
             ask_bridge: None,
         }
@@ -326,6 +331,9 @@ pub fn dispatch_all(calls: &[ToolCall], ctx: &mut ToolContext) -> String {
     if calls.is_empty() {
         return "Tool error: empty tool call block\n".to_string();
     }
+    // Diff previews accumulate per dispatch; clear any a prior caller left
+    // undrained so cards never leak between turns.
+    ctx.edit_previews.clear();
     let mut all = String::new();
     for (i, call) in calls.iter().enumerate() {
         let res = dispatch(call, ctx);
