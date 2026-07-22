@@ -1987,6 +1987,42 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/config" => {
+                if arg.is_empty() {
+                    print!(
+                        "{}",
+                        crate::configform::render_text_list(crate::settings::active())
+                    );
+                } else {
+                    let mut p = arg.splitn(2, char::is_whitespace);
+                    let key = p.next().unwrap_or("");
+                    let val = p.next().unwrap_or("").trim();
+                    let mut working = crate::settings::active().clone();
+                    match crate::configform::set_from_path(&mut working, key, val) {
+                        Ok(field) => {
+                            let (section, fkey) = (field.section, field.key);
+                            match crate::settings::project_path() {
+                                Some(path) => match working.save_to(&path) {
+                                    Ok(()) => {
+                                        crate::settings::reinstall(working);
+                                        println!(
+                                            "set {section}.{fkey} = {} (saved to {})",
+                                            crate::configform::display(
+                                                crate::settings::active(),
+                                                field.id
+                                            ),
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => println!("config save failed: {e}"),
+                                },
+                                None => println!("config: no working directory"),
+                            }
+                        }
+                        Err(e) => println!("{e}"),
+                    }
+                }
+            }
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
@@ -2834,6 +2870,9 @@ impl Agent<'_> {
         // Endpoints of a mouse drag selection over the output area, in screen
         // cells (anchor, current). Copied to the clipboard on button release.
         let mut selection: Option<((u16, u16), (u16, u16))> = None;
+        // The interactive `/config` modal, when open; it intercepts all keys
+        // and renders over the frame until Esc (save) or q/Ctrl-C (cancel).
+        let mut config_form: Option<crate::configform::ConfigForm> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
         // attached to the message as file references the model's tools can
         // read. Always empty while IMAGES_ENABLED is off.
@@ -2887,6 +2926,9 @@ impl Agent<'_> {
                     if let Some(p) = &input.popup {
                         tui::draw_popup(f, input.buf.text(), p);
                     }
+                    if let Some(form) = &config_form {
+                        tui::draw_config(f, form);
+                    }
                     remote_capture(rem, f);
                 })
                 .map_err(|e| e.to_string())?;
@@ -2912,6 +2954,7 @@ impl Agent<'_> {
                                 &mut view,
                                 &mut input,
                                 &mut btw_panel,
+                                &mut config_form,
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
@@ -3035,6 +3078,30 @@ impl Agent<'_> {
             if key.kind != KeyEventKind::Press {
                 continue;
             }
+            // The `/config` modal, when open, owns every key until it closes.
+            if let Some(form) = config_form.as_mut() {
+                match form.handle_key(key) {
+                    crate::configform::Outcome::Stay => {}
+                    crate::configform::Outcome::Cancel => {
+                        config_form = None;
+                        log.push_dim("config: cancelled (no changes saved)");
+                    }
+                    crate::configform::Outcome::Save(settings) => {
+                        config_form = None;
+                        match crate::settings::project_path() {
+                            Some(path) => match settings.save_to(&path) {
+                                Ok(()) => {
+                                    crate::settings::reinstall(settings);
+                                    log.push_plain(format!("config saved to {}", path.display()));
+                                }
+                                Err(e) => log.push_plain(format!("config save failed: {e}")),
+                            },
+                            None => log.push_plain("config: no working directory"),
+                        }
+                    }
+                }
+                continue;
+            }
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
             selection = None;
@@ -3141,6 +3208,7 @@ impl Agent<'_> {
                             &mut view,
                             &mut input,
                             &mut btw_panel,
+                            &mut config_form,
                         ) {
                             break;
                         }
@@ -4037,7 +4105,7 @@ impl Agent<'_> {
     }
 
     /// Handles a slash command in the TUI; returns false to quit.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn tui_slash(
         &mut self,
         line: &str,
@@ -4046,12 +4114,20 @@ impl Agent<'_> {
         view: &mut tui::OutputView,
         input: &mut TuiInput,
         btw: &mut BtwPanel,
+        config_form: &mut Option<crate::configform::ConfigForm>,
     ) -> bool {
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/quit" | "/exit" => return false,
+            "/config" => {
+                // Open the interactive modal; the run loop drives it and
+                // persists on close. `arg` is ignored (the form edits everything).
+                *config_form = Some(crate::configform::ConfigForm::new(
+                    crate::settings::active().clone(),
+                ));
+            }
             "/new" | "/clear" => {
                 self.session = Session::new();
                 self.reminder = SystemPromptReminder::new();
@@ -4387,6 +4463,9 @@ impl LiveCommands {
             "/usage" => Some(Cow::Borrowed(self.usage.as_str())),
             "/mcp" => Some(Cow::Borrowed(self.mcp.as_str())),
             "/help" => Some(Cow::Owned(crate::config::usage())),
+            "/config" => Some(Cow::Owned(crate::configform::render_text_list(
+                crate::settings::active(),
+            ))),
             _ => None,
         }
     }

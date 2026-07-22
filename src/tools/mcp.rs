@@ -612,6 +612,11 @@ impl McpServer {
                 });
             }
         }
+        // Servers may return `tools/list` in a nondeterministic order (e.g. from
+        // an unordered map). Sort by name so the rendered schemas — and hence the
+        // fingerprinted system-prompt KV snapshot (`sysprompt.kv`) — are byte-stable
+        // across launches; otherwise the snapshot rebuilds on nearly every start.
+        self.tools.sort_by(|a, b| a.name.cmp(&b.name));
         // Resources are optional. Only ask a server that advertised the
         // capability: one that silently ignores unknown methods (rather than
         // replying -32601) would stall the whole handshake for
@@ -1442,6 +1447,40 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn handshake_sorts_tools_by_name_for_a_stable_fingerprint() {
+        // Regression: a server that lists tools in a nondeterministic order
+        // (here reverse-alphabetical) would otherwise render the system prompt
+        // differently each launch, churning the `sysprompt.kv` fingerprint and
+        // forcing a rebuild on nearly every start. Handshake sorts by name.
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\"}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[{\"name\":\"charlie\",\"description\":\"c\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"bravo\",\"description\":\"b\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"alpha\",\"description\":\"a\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
+  esac
+done
+"#;
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"demo\":{{\"command\":\"sh\",\"args\":[\"-c\",{}]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, script);
+                esc
+            }
+        ));
+        let servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1, "server should start and handshake");
+        let names: Vec<&str> = servers[0].tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["alpha", "bravo", "charlie"]);
     }
 
     #[test]

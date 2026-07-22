@@ -37,10 +37,10 @@
 //! }
 //! ```
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
-use crate::tools::mcp::{Json, json_parse};
+use crate::tools::mcp::{Json, json_escape, json_parse, json_write};
 
 /// Popup rows offered by `@` completion when unset.
 pub const DEFAULT_POPUP_ROWS: usize = 15;
@@ -447,8 +447,163 @@ fn expand_tilde(s: &str) -> PathBuf {
     }
 }
 
-/// Process-wide settings, installed once at startup.
-static ACTIVE: OnceLock<Settings> = OnceLock::new();
+/// The project-scoped settings file, `<cwd>/.plank/settings.json` — the
+/// highest-precedence file and where `/config` writes.
+#[must_use]
+pub fn project_path() -> Option<PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join(".plank").join("settings.json"))
+}
+
+fn upsert(obj: &mut Vec<(String, Json)>, key: &str, val: Json) {
+    if let Some(slot) = obj.iter_mut().find(|(k, _)| k == key) {
+        slot.1 = val;
+    } else {
+        obj.push((key.to_string(), val));
+    }
+}
+
+/// Upserts an optional value, or removes the key when `val` is `None` so that
+/// an unset optional is reflected as absence (its built-in default on reload).
+fn upsert_opt(obj: &mut Vec<(String, Json)>, key: &str, val: Option<Json>) {
+    match val {
+        Some(v) => upsert(obj, key, v),
+        None => obj.retain(|(k, _)| k != key),
+    }
+}
+
+/// Returns the named section object, creating it if absent or non-object.
+fn section<'a>(root: &'a mut Vec<(String, Json)>, name: &str) -> &'a mut Vec<(String, Json)> {
+    let idx = if let Some(i) = root.iter().position(|(k, _)| k == name) {
+        if !matches!(root[i].1, Json::Obj(_)) {
+            root[i].1 = Json::Obj(Vec::new());
+        }
+        i
+    } else {
+        root.push((name.to_string(), Json::Obj(Vec::new())));
+        root.len() - 1
+    };
+    match &mut root[idx].1 {
+        Json::Obj(o) => o,
+        _ => unreachable!("just ensured an object"),
+    }
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_lossless)]
+fn inum(v: i32) -> Json {
+    Json::Num(v as f64)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn unum(v: u64) -> Json {
+    Json::Num(v as f64)
+}
+
+/// Pretty-prints a JSON value with two-space indentation (objects only get
+/// multi-line treatment; scalars and arrays stay compact via [`json_write`]).
+fn write_pretty(out: &mut String, v: &Json, indent: usize) {
+    match v {
+        Json::Obj(members) if !members.is_empty() => {
+            out.push_str("{\n");
+            for (i, (k, val)) in members.iter().enumerate() {
+                for _ in 0..=indent {
+                    out.push_str("  ");
+                }
+                json_escape(out, k);
+                out.push_str(": ");
+                write_pretty(out, val, indent + 1);
+                if i + 1 < members.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            for _ in 0..indent {
+                out.push_str("  ");
+            }
+            out.push('}');
+        }
+        other => json_write(out, other),
+    }
+}
+
+impl Settings {
+    /// Serializes these settings to `path`, preserving any unknown keys already
+    /// present (so a newer plank's file survives an older binary's write).
+    ///
+    /// # Errors
+    /// Returns `Err` if the parent directory cannot be created or the write fails.
+    pub fn save_to(&self, path: &Path) -> Result<(), String> {
+        let mut root: Vec<(String, Json)> = match std::fs::read_to_string(path) {
+            Ok(t) => match json_parse(&t) {
+                Some(Json::Obj(o)) => o,
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+
+        {
+            let e = section(&mut root, "engine");
+            upsert_opt(
+                e,
+                "model",
+                self.engine
+                    .model
+                    .as_ref()
+                    .map(|p| Json::Str(p.display().to_string())),
+            );
+            upsert_opt(e, "threads", self.engine.threads.map(inum));
+            upsert_opt(e, "backend", self.engine.backend.clone().map(Json::Str));
+            upsert_opt(e, "power", self.engine.power.map(inum));
+            upsert_opt(e, "ctx", self.engine.ctx.map(inum));
+        }
+        {
+            let u = section(&mut root, "ui");
+            upsert(u, "respectGitignore", Json::Bool(self.ui.respect_gitignore));
+            upsert(u, "popupRows", unum(self.ui.popup_rows as u64));
+            upsert(u, "indexRefreshSecs", unum(self.ui.index_refresh_secs));
+            upsert(u, "historySize", unum(self.ui.history_size as u64));
+            upsert(u, "showToolCalls", Json::Bool(self.ui.show_tool_calls));
+            upsert(u, "showToolResults", Json::Bool(self.ui.show_tool_results));
+            upsert(u, "showThinking", Json::Bool(self.ui.show_thinking));
+        }
+        {
+            let s = section(&mut root, "safety");
+            upsert_opt(s, "sandbox", self.safety.sandbox.map(Json::Bool));
+            upsert_opt(s, "btwSuspend", self.safety.btw_suspend.map(Json::Bool));
+        }
+        upsert(
+            section(&mut root, "mcp"),
+            "timeoutSecs",
+            unum(self.mcp.timeout_secs),
+        );
+        upsert(
+            section(&mut root, "ask"),
+            "maxOptions",
+            unum(self.ask.max_options as u64),
+        );
+        {
+            let t = section(&mut root, "tools");
+            upsert(t, "task", Json::Bool(self.tools.task));
+            upsert(t, "agent", Json::Bool(self.tools.agent));
+            upsert(t, "planMode", Json::Bool(self.tools.plan_mode));
+        }
+
+        let mut out = String::new();
+        write_pretty(&mut out, &Json::Obj(root), 0);
+        out.push('\n');
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(path, out).map_err(|e| e.to_string())
+    }
+}
+
+/// Process-wide settings. A swappable `&'static` (the payload is `Box::leak`ed)
+/// so [`reinstall`] can update it live from `/config` without changing the
+/// zero-cost `&'static` contract that [`active`]'s many call sites rely on. The
+/// per-swap leak is bounded — swaps happen only on explicit user action.
+static ACTIVE: RwLock<Option<&'static Settings>> = RwLock::new(None);
 
 /// Installs the process-wide settings. Later calls are ignored.
 ///
@@ -456,16 +611,37 @@ static ACTIVE: OnceLock<Settings> = OnceLock::new();
 /// [`active`] sees built-in defaults until this runs, which is what tests and
 /// library consumers get.
 pub fn install(settings: Settings) {
-    let _ = ACTIVE.set(settings);
+    // Recover rather than panic on a poisoned lock: settings are advisory and a
+    // stale guard is harmless here.
+    let mut slot = ACTIVE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = Some(Box::leak(Box::new(settings)));
+    }
+}
+
+/// Replaces the process-wide settings (used by `/config` after a save), so the
+/// current session picks up the change on its next [`active`] read.
+pub fn reinstall(settings: Settings) {
+    *ACTIVE
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));
 }
 
 /// The process-wide settings, or the built-in defaults before [`install`].
 #[must_use]
 pub fn active() -> &'static Settings {
     static FALLBACK: OnceLock<Settings> = OnceLock::new();
-    ACTIVE
-        .get()
-        .unwrap_or_else(|| FALLBACK.get_or_init(Settings::default))
+    // References are `Copy`, so the `&'static` escapes the read guard cleanly.
+    if let Some(s) = *ACTIVE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        s
+    } else {
+        FALLBACK.get_or_init(Settings::default)
+    }
 }
 
 #[cfg(test)]
@@ -655,6 +831,39 @@ mod tests {
         assert!(note.contains("popupRows=4"), "{note}");
         assert!(note.contains("historySize=7"), "{note}");
         assert!(note.contains("timeoutSecs=45"), "{note}");
+    }
+
+    #[test]
+    fn save_to_round_trips_and_preserves_unknown_keys() {
+        let dir = std::env::temp_dir().join(format!("plank-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // Seed a file with a key this binary does not know about.
+        std::fs::write(&path, "{\"future\":{\"nope\":1},\"ui\":{\"popupRows\":3}}").unwrap();
+
+        let mut s = Settings::default();
+        s.ui.show_thinking = false;
+        s.ui.popup_rows = 9;
+        s.mcp.timeout_secs = 45;
+        s.engine.ctx = Some(8192);
+        s.engine.backend = None; // unset -> absent
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("\"future\""),
+            "unknown section preserved:\n{text}"
+        );
+        assert!(!text.contains("backend"), "unset optional omitted");
+
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.ui.show_thinking);
+        assert_eq!(reloaded.ui.popup_rows, 9);
+        assert_eq!(reloaded.mcp.timeout_secs, 45);
+        assert_eq!(reloaded.engine.ctx, Some(8192));
+        assert_eq!(reloaded.engine.backend, None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

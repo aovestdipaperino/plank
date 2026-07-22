@@ -616,6 +616,20 @@ fn round2(x: f32) -> serde_json::Value {
     serde_json::json!(v)
 }
 
+/// The Anthropic beta opt-in required for the 1-hour prompt-cache tier.
+pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
+
+/// Cache-breakpoint marker for the stable prefix (system + tools).
+///
+/// Uses the 1-hour tier rather than the 5-minute default: an interactive agent
+/// routinely pauses longer than 5 minutes between turns, which silently drops
+/// the whole cached prefix. The 1h tier costs 2x base input on the *write* (vs
+/// 1.25x for 5m) but keeps reads at 0.1x, a clear win when turns are re-read
+/// far more often than the prefix changes. Requires [`EXTENDED_CACHE_TTL_BETA`].
+fn cache_control() -> serde_json::Value {
+    serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
+}
+
 pub fn build_anthropic_request(
     model: &str,
     system: &str,
@@ -703,7 +717,7 @@ pub fn build_anthropic_request(
         // System as a one-element block array so a cache breakpoint can attach.
         let mut sys_block = serde_json::json!({ "type": "text", "text": sys });
         if cache {
-            sys_block["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            sys_block["cache_control"] = cache_control();
         }
         body["system"] = serde_json::json!([sys_block]);
     }
@@ -720,7 +734,7 @@ pub fn build_anthropic_request(
             .collect();
         // Breakpoint on the last (stable) tool: caches the whole tool prefix.
         if cache && let Some(last) = wire_tools.last_mut() {
-            last["cache_control"] = serde_json::json!({ "type": "ephemeral" });
+            last["cache_control"] = cache_control();
         }
         body["tools"] = serde_json::json!(wire_tools);
         // Serial dispatch mirrors the OpenAI path: disable parallel tool use.
@@ -979,7 +993,8 @@ impl Engine for ProviderEngine {
                 }
                 ProviderKind::Anthropic => request
                     .header("x-api-key", self.api_key.as_str())
-                    .header("anthropic-version", "2023-06-01"),
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-beta", EXTENDED_CACHE_TTL_BETA),
             };
             match request.send(payload.as_str()) {
                 Ok(r) => {
@@ -1438,7 +1453,7 @@ mod tests {
             &GenerationOptions::default(),
             true,
         );
-        let eph = serde_json::json!({ "type": "ephemeral" });
+        let eph = serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
         // End of system prompt (caches tools + system).
         assert_eq!(body["system"][0]["cache_control"], eph);
         // Last tool definition (tools-only fallback breakpoint); earlier tools

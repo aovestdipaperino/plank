@@ -16,7 +16,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use std::sync::{Arc, OnceLock};
@@ -1046,6 +1046,77 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64) {
     frame.render_widget(Paragraph::new(text), rows[1]);
 }
 
+/// Draws the interactive `/config` editor as a centered modal overlay.
+///
+/// Rows come from [`crate::configform::ConfigForm::rows`]: section headers are
+/// dimmed, the selected field is reversed, and a field being edited shows its
+/// live buffer with a caret. A footer carries the key hints and any error.
+pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
+    let rows = form.rows();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 2);
+    for row in &rows {
+        if row.header {
+            lines.push(Line::from(Span::styled(
+                format!("[{}]", row.label),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            continue;
+        }
+        let marker = if row.selected { "▸ " } else { "  " };
+        let value = if row.editing {
+            format!("{}▏", row.value)
+        } else {
+            row.value.clone()
+        };
+        let label = format!("{marker}{:<24} {}", row.label, value);
+        let style = if row.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(label, style)));
+    }
+    lines.push(Line::from(""));
+    let footer = match form.status() {
+        Some(err) => Span::styled(
+            format!("  ! {err}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ),
+        None if form.editing() => Span::styled(
+            "  type value · ⏎ commit · Esc cancel edit",
+            Style::default().fg(Color::DarkGray),
+        ),
+        None => Span::styled(
+            "  ↑↓ move · ⏎/Space edit·toggle · Esc save & close · q cancel",
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    lines.push(Line::from(footer));
+
+    let area = frame.area();
+    let width = 66.min(area.width.saturating_sub(4)).max(20);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" config → ./.plank/settings.json ")
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor` its `(row, col)` position.
@@ -1475,6 +1546,16 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(format!("✓ {done}/{total}"), counter_style));
     }
+    // Rotating yellow tip at the tail. It changes every few seconds off the
+    // animation clock; on a narrow terminal the line truncates and drops it.
+    let tip = crate::status::rotating_tip(tick_ms);
+    if !tip.is_empty() {
+        spans.push(Span::styled(" | ".to_string(), base));
+        spans.push(Span::styled(
+            format!("💡 {tip}"),
+            base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
     Line::from(spans)
 }
 
@@ -1740,9 +1821,10 @@ mod tests {
     fn status_bar_counter_is_themed_in_flight_and_dim_when_done() {
         use crate::tasks::TaskStatus::{Completed, InProgress};
         let base = Style::default();
-        // An empty list adds nothing to the status bar.
+        // An empty list adds no task counter to the status bar (the "✓ n/n"
+        // segment); rotating tips may still contribute other spans.
         let empty = status_bar_line("idle", 0, base, &TaskView::default());
-        assert!(!empty.spans.iter().any(|s| s.content.contains('/')));
+        assert!(!empty.spans.iter().any(|s| s.content.contains('✓')));
 
         // In flight: the counter carries the theme color.
         let theme = Color::Indexed(crate::status::THEME_COLOR);

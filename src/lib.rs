@@ -12,6 +12,7 @@ pub mod checkpoint;
 pub mod compact;
 pub mod complete;
 pub mod config;
+pub mod configform;
 pub mod context;
 pub mod download;
 #[cfg(ds4_engine)]
