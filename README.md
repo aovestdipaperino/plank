@@ -113,6 +113,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
               "showThinking": true },
+  "tools":  { "task": false, "agent": false, "planMode": false },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 }
@@ -137,6 +138,9 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
+| `tools` | `task` | `false` | Enable the `task` todo-list tool. Off by default — it, like `agent`/`planMode`, has no counterpart in the C reference the model was trained on, so a small model tends to misuse it. |
+| | `agent` | `false` | Enable the `agent` sub-agent delegation tool. |
+| | `planMode` | `false` | Enable plan mode (`EnterPlanMode`/`ExitPlanMode`). |
 
 Precedence runs left to right, each layer overriding the one before:
 

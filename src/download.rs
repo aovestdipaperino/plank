@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Model auto-download with a playful progress display.
 //!
 //! When no `-m` is given, plank looks for `~/.plank/ds4flash.gguf`. If it is

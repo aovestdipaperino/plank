@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Asynchronous bash jobs: spawn, poll output, and stop shell commands.
 //!
 //! Port of the "Asynchronous Bash Jobs" section of `ds4_agent.c`. Bash

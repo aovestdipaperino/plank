@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Agent configuration and command-line parsing.
 //!
 //! Ports the "Small Utilities And Command-Line Parsing" section of the C

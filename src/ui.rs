@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Interactive REPL and headless front-ends over the agent turn loop.
 //!
 //! Port of the "Interactive Runtime Loop" section of `ds4_agent.c`. Like the
@@ -913,6 +916,9 @@ impl Agent<'_> {
             .unwrap_or("")
             .trim()
             .to_owned();
+        if !self.tool_ctx.tools.agent {
+            return "Tool error: the agent tool is not enabled\n".to_string();
+        }
         if task.is_empty() {
             return "Tool error: agent requires a non-empty 'task' to delegate\n".to_string();
         }
@@ -6877,6 +6883,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
         };
+        agent.tool_ctx.tools.agent = true; // opt-in tool (default off)
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
 

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! `plank remote <url>`: the interactive remote-control *client* (issue #25).
 //!
 //! Connects to a running plank instance's remote-control WebSocket (started

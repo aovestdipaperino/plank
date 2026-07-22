@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! `@` typeahead completion for the Ratatui TUI prompt.
 
 use std::collections::BTreeSet;

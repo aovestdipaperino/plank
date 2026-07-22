@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Inference engine abstraction.
 //!
 //! The C agent calls directly into the ds4 engine. Plank keeps that surface

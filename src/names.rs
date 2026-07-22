@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Memorable session names: a funny adjective plus a celebrity, e.g.
 //! `deadly-einstein`. Half the celebrity pool is scientists; the other half is
 //! historical / pop / sport figures, so a name is science-flavoured ~50% of

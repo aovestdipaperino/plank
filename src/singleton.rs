@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Single-instance model-lock probe.
 //!
 //! The ds4 engine refuses to start a second process (the model maps tens of

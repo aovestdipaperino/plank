@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Remote engines (issue #26, `docs/REMOTE-ENGINE-DESIGN.md`).
 //!
 //! Two independent `Engine` implementations share this module:

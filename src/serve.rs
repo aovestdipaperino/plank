@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! `plank serve` — host a plank engine behind HTTP+SSE (flavor a, issue #26).
 //!
 //! The server is a thin adapter: it wraps whatever [`Engine`] `make_engine`

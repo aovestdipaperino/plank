@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Layered persistent memory loaded into session-start context (issue #2).
 //!
 //! Memory is two plain markdown files, layered like the other `.plank`

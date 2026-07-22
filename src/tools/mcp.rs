@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! MCP client: external tools from stdio MCP servers.
 //!
 //! Port of the "MCP Client" section of `ds4_agent.c` (mcp-support branch).

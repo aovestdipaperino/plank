@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Context tracking for agent: git status, AGENTS.md discovery, datetime.
 //!
 //! Provides context content and token-counting by category for the /context report.

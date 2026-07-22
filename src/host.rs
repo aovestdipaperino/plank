@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Shared reference-counted engine host: one model, many sessions (issue #28).
 //!
 //! Implements the design in `docs/SHARED-ENGINE-DESIGN.md`. The host owns a

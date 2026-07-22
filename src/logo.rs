@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Startup banner: the plank logo, rendered from `resources/logo.png`.
 //!
 //! Uses the `logo-art` crate to turn the PNG into true-color half-block ANSI

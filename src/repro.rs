@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! `/repro` — dump the current session to disk for bug diagnosis.
 //!
 //! A repro file captures the exact input the engine would see (the rendered

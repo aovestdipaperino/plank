@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Assistant markdown rendering: streaming terminal renderer for model output.
 //!
 //! Port of the "Assistant Markdown Rendering" section of `refs/ds4/ds4_agent.c`.

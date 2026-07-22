@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Wire types for flavor (a) — hosting plank's own ds4 engine behind an HTTP
 //! socket (`plank serve` + `RemoteDs4Engine`).
 //!

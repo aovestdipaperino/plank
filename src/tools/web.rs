@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Browser web tools: `google_search` and `visit_page`.
 //!
 //! Port of the "Browser Web Tools" section of `ds4_agent.c` plus the page

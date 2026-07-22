@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Terminal line editor with a status footer, ported from the ds4 agent.
 //!
 //! This is a faithful-but-tractable port of the linenoise-derived editor in

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! In-session named rollback points (`/checkpoint`, `/rollback`).
 //!
 //! A checkpoint is a snapshot of the current conversation the user can return

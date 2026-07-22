@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! macOS Seatbelt sandbox for model-initiated shell commands (issue #17).
 //!
 //! When enabled, `bash` tool commands run under `/usr/bin/sandbox-exec` with

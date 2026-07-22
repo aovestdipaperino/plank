@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Plank: a Rust port of the ds4 agent.
 //!
 //! The port proceeds functionality-by-functionality from the C reference in

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! `--ui-remote`: remote control of the TUI for testing.
 
 use std::fmt::Write as _;

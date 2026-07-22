@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Agent session persistence, listing, and history rendering.
 //!
 //! Port of the ds4 agent sections "Agent KV Store And Session Persistence"

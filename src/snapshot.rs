@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Session-snapshot primitive and an unconditional-restore RAII guard.
 //!
 //! The core [`RestoreOnDrop`] guard is always available (and unit-testable

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Plank agent binary: interactive REPL and one-shot headless mode.
 
 use std::io::{IsTerminal, Write as _};

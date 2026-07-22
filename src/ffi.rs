@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Raw FFI declarations for the ds4 C inference engine.
 //!
 //! Only the subset plank needs is declared: engine open/close, chat-template

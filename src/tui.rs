@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Ratatui-based full-screen interactive UI.
 //!
 //! Uses the alternate screen buffer so every terminal — including block-based

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Image pasting for the TUI prompt (macOS).
 //!
 //! Port of Claude Code's image-paste pipeline (see the vault note

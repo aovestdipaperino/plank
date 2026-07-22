@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Flavor (a) client: [`RemoteDs4Engine`].
 //!
 //! A dumb transport over `ureq` for a plank engine hosted by [`crate::serve`].

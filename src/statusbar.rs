@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Single-line live progress display for prefill and generation.
 //!
 //! Shown on the current line and rewritten in place with a carriage return, so

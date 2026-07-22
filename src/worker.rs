@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Worker/UI split for the TUI (issue #12), mirroring the C's "Model Worker
 //! Thread" and "Worker/UI Synchronization Helpers" sections.
 //!

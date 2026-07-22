@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Context compaction: reclaim context in escalating steps.
 //!
 //! Cheapest first: **microcompact** clears the bodies of old tool results

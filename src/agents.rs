@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Single-subagent sidechain support (issue #10, reduced scope).
 //!
 //! `/subagent <task>` runs a delegated task as a *fork* of the current

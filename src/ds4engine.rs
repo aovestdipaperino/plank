@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Safe wrapper around the ds4 C engine implementing [`Engine`].
 //!
 //! Present only under the `ds4_engine` cfg (macOS + built `refs/ds4` submodule).

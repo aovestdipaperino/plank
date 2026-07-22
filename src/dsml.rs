@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Streaming DSML tool-call parser.
 //!
 //! The model streams raw text tokens. This parser recognizes completed DSML

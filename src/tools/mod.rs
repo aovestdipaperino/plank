@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Agent tool execution: argument parsing, shared context, and dispatch.
 //!
 //! Port of the "Tool Argument Parsing And File Tool Helpers" and "Tool
@@ -97,6 +100,10 @@ pub struct ToolContext {
     /// True while a read-only plan-mode gate is active (issue #50). Mutating
     /// tools refuse until `ExitPlanMode` clears it.
     pub plan_mode: bool,
+    /// Which opt-in non-trained tools (`task`/`agent`/plan mode) are enabled,
+    /// captured from settings when the context is built. Dispatch refuses a
+    /// disabled tool even if the model calls it.
+    pub tools: crate::settings::ToolSettings,
     /// Set by a tool hook's `{"continue": false}` response envelope; the turn
     /// driver halts the turn after the dispatch that produced it.
     pub hook_stop: Option<String>,
@@ -140,6 +147,17 @@ fn is_plan_mode_blocked(name: &str) -> bool {
     PLAN_MODE_BLOCKED_TOOLS.contains(&name)
 }
 
+/// True when `name` is an opt-in non-trained tool that is currently disabled.
+/// (`agent` is gated at the `Agent` layer, not here.)
+#[must_use]
+fn is_tool_disabled(name: &str, tools: crate::settings::ToolSettings) -> bool {
+    match name {
+        "task" => !tools.task,
+        "EnterPlanMode" | "ExitPlanMode" => !tools.plan_mode,
+        _ => false,
+    }
+}
+
 impl std::fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ToolContext")
@@ -175,6 +193,7 @@ impl ToolContext {
             skill_invocations: 0,
             subagent_depth: 0,
             plan_mode: false,
+            tools: crate::settings::active().tools,
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
@@ -212,6 +231,7 @@ impl ToolContext {
 ///
 /// Mirrors `agent_execute_tool_call`: the same tool names the C agent
 /// registers, minus the browser web tools.
+#[allow(clippy::too_many_lines)]
 pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
         return ToolResult::from_output("Tool error: missing tool name\n".to_string());
@@ -245,6 +265,15 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
                 "Tool error: blocked by PreToolUse hook: {msg}\n"
             ));
         }
+    }
+    // Non-trained tools are opt-in (see `ToolSettings`); if one is called while
+    // disabled — a small model sometimes does — refuse cleanly instead of
+    // running it, and never leave a stray plan-mode/task gate behind.
+    if is_tool_disabled(&call.name, ctx.tools) {
+        return ToolResult::from_output(format!(
+            "Tool error: the {} tool is not enabled\n",
+            call.name
+        ));
     }
     // Plan mode (issue #50): while the read-only gate is active, refuse any
     // workspace-mutating tool so the model researches and proposes before it
@@ -569,6 +598,7 @@ mod tests {
     #[test]
     fn plan_mode_gates_mutating_tools_and_exits_on_approval() {
         let (mut ctx, dir) = test_ctx();
+        ctx.tools.plan_mode = true; // opt-in tool (default off)
         // Entering plan mode turns on the read-only gate.
         let res = dispatch(&test_call("EnterPlanMode", &[]), &mut ctx);
         assert!(!res.is_error);
@@ -606,6 +636,7 @@ mod tests {
     #[test]
     fn exit_plan_mode_errors_when_not_planning() {
         let (mut ctx, dir) = test_ctx();
+        ctx.tools.plan_mode = true; // opt-in tool (default off)
         let res = dispatch(&test_call("ExitPlanMode", &[("plan", "p")]), &mut ctx);
         assert!(res.is_error);
         assert!(res.output.contains("plan mode is not active"));

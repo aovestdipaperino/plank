@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Builds the ds4 C engine from the `refs/ds4` submodule on macOS.
 //!
 //! Produces `libds4core.a` from the Metal-backend objects and links the

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! System prompt rendering: tool prompt text, reminders, datetime context.
 //!
 //! Port of the prompt-construction half of the "System Prompt Rendering And
@@ -155,21 +158,23 @@ pub fn provider_tool_registry(
             }
         }),
     });
-    specs.push(crate::engine::ToolSpec {
-        name: "task".to_string(),
-        description: "Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "op": {"type": "string", "description": "add, update, or list"},
-                "id": {"type": "string", "description": "task id (for update)"},
-                "subject": {"type": "string", "description": "task description (for add; optional rename on update)"},
-                "status": {"type": "string", "description": "pending, in_progress, or completed (for update)"},
-                "active_form": {"type": "string", "description": "present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'"}
-            },
-            "required": ["op"]
-        }),
-    });
+    if crate::settings::active().tools.task {
+        specs.push(crate::engine::ToolSpec {
+            name: "task".to_string(),
+            description: "Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "op": {"type": "string", "description": "add, update, or list"},
+                    "id": {"type": "string", "description": "task id (for update)"},
+                    "subject": {"type": "string", "description": "task description (for add; optional rename on update)"},
+                    "status": {"type": "string", "description": "pending, in_progress, or completed (for update)"},
+                    "active_form": {"type": "string", "description": "present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'"}
+                },
+                "required": ["op"]
+            }),
+        });
+    }
     specs.push(crate::engine::ToolSpec {
         name: "ask".to_string(),
         description: "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.".to_string(),
@@ -231,37 +236,42 @@ pub fn provider_tool_registry(
 /// [`append_agent_and_plan_schemas`]; split out to keep
 /// [`provider_tool_registry`] under the function-length lint.
 fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
-    specs.push(crate::engine::ToolSpec {
-        name: "agent".to_string(),
-        description: "Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task": {"type": "string", "description": "the complete, standalone task to delegate; include all needed context"},
-                "name": {"type": "string", "description": "optional configured agent name to act as; omit for a general-purpose sub-agent"}
-            },
-            "required": ["task"]
-        }),
-    });
-    specs.push(crate::engine::ToolSpec {
-        name: "EnterPlanMode".to_string(),
-        description: "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {}
-        }),
-    });
-    specs.push(crate::engine::ToolSpec {
-        name: "ExitPlanMode".to_string(),
-        description: "Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "plan": {"type": "string", "description": "the full plan to carry out, for the user to approve"}
-            },
-            "required": ["plan"]
-        }),
-    });
+    let tools = &crate::settings::active().tools;
+    if tools.agent {
+        specs.push(crate::engine::ToolSpec {
+            name: "agent".to_string(),
+            description: "Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task": {"type": "string", "description": "the complete, standalone task to delegate; include all needed context"},
+                    "name": {"type": "string", "description": "optional configured agent name to act as; omit for a general-purpose sub-agent"}
+                },
+                "required": ["task"]
+            }),
+        });
+    }
+    if tools.plan_mode {
+        specs.push(crate::engine::ToolSpec {
+            name: "EnterPlanMode".to_string(),
+            description: "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {}
+            }),
+        });
+        specs.push(crate::engine::ToolSpec {
+            name: "ExitPlanMode".to_string(),
+            description: "Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "plan": {"type": "string", "description": "the full plan to carry out, for the user to approve"}
+                },
+                "required": ["plan"]
+            }),
+        });
+    }
 }
 
 /// Parses the built-in OpenAI-shaped tool schemas out of the DS4 tools prompt
@@ -343,6 +353,27 @@ pub fn build_tools_prompt_base() -> String {
 /// why issue #32 requires measuring that the model actually calls them. They
 /// are appended here rather than baked into the C constants so the parity
 /// suite keeps verifying the base against the reference.
+/// The `task` tool schema (text path), gated by `tools.task`. Ends on the
+/// object close so it slots between the skill and ask blocks.
+const TASK_SCHEMA: &str = "{\n\
+     \x20 \"type\": \"function\",\n\
+     \x20 \"function\": {\n\
+     \x20   \"name\": \"task\",\n\
+     \x20   \"description\": \"Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.\",\n\
+     \x20   \"parameters\": {\n\
+     \x20     \"type\": \"object\",\n\
+     \x20     \"properties\": {\n\
+     \x20       \"op\": {\"type\": \"string\", \"description\": \"add, update, or list\"},\n\
+     \x20       \"id\": {\"type\": \"string\", \"description\": \"task id (for update)\"},\n\
+     \x20       \"subject\": {\"type\": \"string\", \"description\": \"task description (for add; optional rename on update)\"},\n\
+     \x20       \"status\": {\"type\": \"string\", \"description\": \"pending, in_progress, or completed (for update)\"},\n\
+     \x20       \"active_form\": {\"type\": \"string\", \"description\": \"present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'\"}\n\
+     \x20     },\n\
+     \x20     \"required\": [\"op\"]\n\
+     \x20   }\n\
+     \x20 }\n\
+     }\n";
+
 fn append_native_extra_schemas(out: &mut String) {
     out.push_str(
         "\n{\n\
@@ -373,26 +404,13 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20     }\n\
          \x20   }\n\
          \x20 }\n\
-         }\n\
-         {\n\
-         \x20 \"type\": \"function\",\n\
-         \x20 \"function\": {\n\
-         \x20   \"name\": \"task\",\n\
-         \x20   \"description\": \"Track a plan that survives context compaction. op='add' appends a pending task (needs 'subject') and returns its id; op='update' changes a task's status/subject (needs 'id'); op='list' returns every task. Statuses: pending, in_progress, completed. The current list is shown to you each turn, so use 'list' only to recover it.\",\n\
-         \x20   \"parameters\": {\n\
-         \x20     \"type\": \"object\",\n\
-         \x20     \"properties\": {\n\
-         \x20       \"op\": {\"type\": \"string\", \"description\": \"add, update, or list\"},\n\
-         \x20       \"id\": {\"type\": \"string\", \"description\": \"task id (for update)\"},\n\
-         \x20       \"subject\": {\"type\": \"string\", \"description\": \"task description (for add; optional rename on update)\"},\n\
-         \x20       \"status\": {\"type\": \"string\", \"description\": \"pending, in_progress, or completed (for update)\"},\n\
-         \x20       \"active_form\": {\"type\": \"string\", \"description\": \"present-tense form shown while the task is in progress, e.g. 'Refactoring the parser'\"}\n\
-         \x20     },\n\
-         \x20     \"required\": [\"op\"]\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n\
-         {\n\
+         }\n",
+    );
+    if crate::settings::active().tools.task {
+        out.push_str(TASK_SCHEMA);
+    }
+    out.push_str(
+        "{\n\
          \x20 \"type\": \"function\",\n\
          \x20 \"function\": {\n\
          \x20   \"name\": \"ask\",\n\
@@ -417,48 +435,55 @@ fn append_native_extra_schemas(out: &mut String) {
 /// (issue #50). Split from [`append_native_extra_schemas`] to keep each under
 /// the function-length lint; both are native tools outside the C-trained table.
 fn append_agent_and_plan_schemas(out: &mut String) {
-    out.push_str(
-        "{\n\
-         \x20 \"type\": \"function\",\n\
-         \x20 \"function\": {\n\
-         \x20   \"name\": \"agent\",\n\
-         \x20   \"description\": \"Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research (locate where X is handled, summarize how Y works) or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.\",\n\
-         \x20   \"parameters\": {\n\
-         \x20     \"type\": \"object\",\n\
-         \x20     \"properties\": {\n\
-         \x20       \"task\": {\"type\": \"string\", \"description\": \"the complete, standalone task to delegate; include all needed context\"},\n\
-         \x20       \"name\": {\"type\": \"string\", \"description\": \"optional configured agent name to act as; omit for a general-purpose sub-agent\"}\n\
-         \x20     },\n\
-         \x20     \"required\": [\"task\"]\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n\
-         {\n\
-         \x20 \"type\": \"function\",\n\
-         \x20 \"function\": {\n\
-         \x20   \"name\": \"EnterPlanMode\",\n\
-         \x20   \"description\": \"Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.\",\n\
-         \x20   \"parameters\": {\n\
-         \x20     \"type\": \"object\",\n\
-         \x20     \"properties\": {}\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n\
-         {\n\
-         \x20 \"type\": \"function\",\n\
-         \x20 \"function\": {\n\
-         \x20   \"name\": \"ExitPlanMode\",\n\
-         \x20   \"description\": \"Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.\",\n\
-         \x20   \"parameters\": {\n\
-         \x20     \"type\": \"object\",\n\
-         \x20     \"properties\": {\n\
-         \x20       \"plan\": {\"type\": \"string\", \"description\": \"the full plan to carry out, for the user to approve\"}\n\
-         \x20     },\n\
-         \x20     \"required\": [\"plan\"]\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n",
-    );
+    let tools = &crate::settings::active().tools;
+    if tools.agent {
+        out.push_str(
+            "{\n\
+             \x20 \"type\": \"function\",\n\
+             \x20 \"function\": {\n\
+             \x20   \"name\": \"agent\",\n\
+             \x20   \"description\": \"Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research (locate where X is handled, summarize how Y works) or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.\",\n\
+             \x20   \"parameters\": {\n\
+             \x20     \"type\": \"object\",\n\
+             \x20     \"properties\": {\n\
+             \x20       \"task\": {\"type\": \"string\", \"description\": \"the complete, standalone task to delegate; include all needed context\"},\n\
+             \x20       \"name\": {\"type\": \"string\", \"description\": \"optional configured agent name to act as; omit for a general-purpose sub-agent\"}\n\
+             \x20     },\n\
+             \x20     \"required\": [\"task\"]\n\
+             \x20   }\n\
+             \x20 }\n\
+             }\n",
+        );
+    }
+    if tools.plan_mode {
+        out.push_str(
+            "{\n\
+             \x20 \"type\": \"function\",\n\
+             \x20 \"function\": {\n\
+             \x20   \"name\": \"EnterPlanMode\",\n\
+             \x20   \"description\": \"Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.\",\n\
+             \x20   \"parameters\": {\n\
+             \x20     \"type\": \"object\",\n\
+             \x20     \"properties\": {}\n\
+             \x20   }\n\
+             \x20 }\n\
+             }\n\
+             {\n\
+             \x20 \"type\": \"function\",\n\
+             \x20 \"function\": {\n\
+             \x20   \"name\": \"ExitPlanMode\",\n\
+             \x20   \"description\": \"Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.\",\n\
+             \x20   \"parameters\": {\n\
+             \x20     \"type\": \"object\",\n\
+             \x20     \"properties\": {\n\
+             \x20       \"plan\": {\"type\": \"string\", \"description\": \"the full plan to carry out, for the user to approve\"}\n\
+             \x20     },\n\
+             \x20     \"required\": [\"plan\"]\n\
+             \x20   }\n\
+             \x20 }\n\
+             }\n",
+        );
+    }
 }
 
 /// Returns the short DSML syntax reminder (verbatim from C).

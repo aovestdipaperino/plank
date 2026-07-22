@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! In-place stderr log rendering for the noisy C-engine load phase.
 //!
 //! The ds4 C library prints its startup diagnostics ("ds4: ...") directly to

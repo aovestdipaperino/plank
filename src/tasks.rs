@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Model-visible task list (issue #35): structured working memory that
 //! survives compaction.
 //!

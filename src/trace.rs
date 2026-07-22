@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Trace logging, ported from the "Trace Logging" section of `ds4_agent.c`.
 //!
 //! Every trace line starts with a local-time timestamp in the exact format

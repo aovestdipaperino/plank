@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Post-edit diff preview: a compact, git-style change card shown when the
 //! `edit` or `write` tool modifies a file.
 //!

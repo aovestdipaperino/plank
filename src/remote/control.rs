@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Remote-control interface (issue #25): a loopback WebSocket server that lets
 //! another process or machine mirror a running plank instance and, by policy,
 //! drive it. This is the CLI-only, backend-free variant specified in

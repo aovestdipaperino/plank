@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Streaming tool-call visualization.
 //!
 //! Sits between raw model output and the terminal: it detects the DSML

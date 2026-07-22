@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Version-transition maintenance for the `~/.plank` cache directory.
 //!
 //! Plank persists rebuildable state under `~/.plank`: the system-prompt KV

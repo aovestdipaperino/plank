@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! File tools: `read`, `more`, `write`, and `list`.
 //!
 //! Port of the file-tool half of "Tool Argument Parsing And File Tool

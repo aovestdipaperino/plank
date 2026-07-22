@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Persistent user preferences (`settings.json`).
 //!
 //! Holds the settings that are *stable preferences* rather than per-run
@@ -151,6 +154,21 @@ impl Default for AskSettings {
     }
 }
 
+/// Opt-in switches for tools the `DeepSeek` model was not trained on (they have
+/// no counterpart in the C `ds4_agent`). Off by default so the base model sees
+/// roughly its trained tool surface; a small model tends to hallucinate a
+/// pseudo-syntax (e.g. bare `<task>` blocks) for unfamiliar tools rather than
+/// emit valid DSML, so these stay hidden unless deliberately enabled.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ToolSettings {
+    /// The `task` todo-list tool (issue #35).
+    pub task: bool,
+    /// The `agent` sub-agent delegation tool (issue #50).
+    pub agent: bool,
+    /// Plan mode (`EnterPlanMode`/`ExitPlanMode`, issue #50).
+    pub plan_mode: bool,
+}
+
 /// The whole of `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -164,6 +182,8 @@ pub struct Settings {
     pub mcp: McpSettings,
     /// `ask` tool tuning.
     pub ask: AskSettings,
+    /// Opt-in non-trained tools.
+    pub tools: ToolSettings,
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -264,6 +284,17 @@ impl Settings {
         // clamp it up rather than silently breaking the tool.
         if let Some(v) = num::<usize>(root.get("ask"), "maxOptions") {
             self.ask.max_options = v.max(ASK_MIN_OPTIONS);
+        }
+
+        let tools = root.get("tools");
+        if let Some(v) = boolean(tools, "task") {
+            self.tools.task = v;
+        }
+        if let Some(v) = boolean(tools, "agent") {
+            self.tools.agent = v;
+        }
+        if let Some(v) = boolean(tools, "planMode") {
+            self.tools.plan_mode = v;
         }
     }
 
@@ -379,6 +410,15 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.ask.max_options != d.ask.max_options {
         parts.push(format!("maxOptions={}", s.ask.max_options));
     }
+    if s.tools.task != d.tools.task {
+        parts.push(format!("tools.task={}", s.tools.task));
+    }
+    if s.tools.agent != d.tools.agent {
+        parts.push(format!("tools.agent={}", s.tools.agent));
+    }
+    if s.tools.plan_mode != d.tools.plan_mode {
+        parts.push(format!("tools.planMode={}", s.tools.plan_mode));
+    }
 
     if parts.is_empty() {
         return None;
@@ -487,6 +527,19 @@ mod tests {
         assert!(note.contains("showToolCalls=true"), "{note}");
         assert!(note.contains("showToolResults=true"), "{note}");
         assert_eq!(note_for(&Settings::default(), &[]), None);
+    }
+
+    #[test]
+    fn non_trained_tools_default_off_and_opt_in() {
+        let d = Settings::default();
+        assert!(!d.tools.task && !d.tools.agent && !d.tools.plan_mode);
+        let s = from_json(r#"{"tools":{"task":true,"agent":true,"planMode":true}}"#);
+        assert!(s.tools.task && s.tools.agent && s.tools.plan_mode);
+        // Only the enabled (non-default) flags surface in the startup note.
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("tools.task=true"), "{note}");
+        assert!(note.contains("tools.agent=true"), "{note}");
+        assert!(note.contains("tools.planMode=true"), "{note}");
     }
 
     #[test]

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Flavor (b): [`ProviderEngine`] over third-party LLM APIs (issue #26, §4.2).
 //!
 //! v1 wires the **OpenAI-compatible** chat-completions API (which also covers

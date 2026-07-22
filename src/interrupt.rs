@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! SIGINT handling: Ctrl-C interrupts a generation instead of killing plank.
 //!
 //! Port of `agent_sigint_handler`: a signal-async-safe flag the generation

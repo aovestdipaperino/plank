@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Edit and search tools: unique old/new replacement and recursive grep.
 //!
 //! Port of the "Edit And Search Tools" section of `ds4_agent.c`. The edit

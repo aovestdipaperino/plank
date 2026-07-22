@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! User-defined skills: markdown prompt templates exposed as slash commands.
 //!
 //! A skill is a directory containing a `SKILL.md` file with optional YAML-ish

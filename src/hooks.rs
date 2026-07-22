@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Hooks: user shell commands (and static prompts) run at lifecycle points.
 //!
 //! Events, each firing with documented input on stdin:

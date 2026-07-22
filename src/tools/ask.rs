@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! The `ask` tool (issue #34): structured multiple-choice questions to the user.
 //!
 //! When a turn is genuinely ambiguous the model's only trained move is to emit

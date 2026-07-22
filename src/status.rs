@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Enzo Lombardi
+// SPDX-License-Identifier: MIT
+
 //! Terminal prompt, status footer, and progress rendering.
 //!
 //! Port of the "Terminal Prompt, Status Footer" section of `ds4_agent.c`:
