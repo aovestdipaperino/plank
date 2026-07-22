@@ -167,13 +167,19 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
 
-### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`)
+### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`
   (a `RenderSink`), the frame layout, and the magenta-colored progress bar.
   `OutputView` tracks the scroll viewport: it follows the newest output by
   default, pins in place when the user wheels back (also mid-generation),
-  and shows a jump-to-bottom hint until End resumes following.
-- `status.rs` — the compact footer text and the prefill progress bar.
+  and shows a jump-to-bottom hint until End resumes following. `draw_config`
+  renders the `/config` modal overlay.
+- `status.rs` — the compact footer text and the prefill progress bar. Also owns
+  the rotating status-bar tips (`TIPS`/`rotating_tip`), shown in yellow at the
+  tail of the bar and advanced off the animation clock.
+- `configform.rs` — the front-end-agnostic `/config` editor: the `FIELDS`
+  registry, the `ConfigForm` key/edit state machine, and the textual setter used
+  by the plain REPL.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
 
@@ -249,14 +255,25 @@ built-in defaults < ~/.plank/settings.json < ./.plank/settings.json < env < CLI 
 
 The file holds only *stable preferences*, never per-run choices — `--prompt`,
 `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and the
-serve/control options deliberately have no key. Four groups:
+serve/control options deliberately have no key. Six groups:
 
 | Group | Keys | Replaces |
 |---|---|---|
 | `engine` | `model`, `threads`, `backend`, `power`, `ctx` | `-m`/`-t`/`--backend`/`--power`/`-c`, and the hardcoded `~/.plank/ds4flash.gguf` fallback |
-| `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize` | magic numbers in `complete.rs` and `ui.rs` |
+| `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize`, `showToolCalls`, `showToolResults`, `showThinking` | magic numbers in `complete.rs` and `ui.rs` |
 | `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
 | `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
+| `ask` | `maxOptions` | the `ask` tool's option cap |
+| `tools` | `task`, `agent`, `planMode` | opt-in switches for non-trained tools |
+
+Editing: `/config` opens an interactive modal (`configform.rs`) in the TUI, or
+`/config <section>.<key> <value>` sets one from the prompt (e.g. `/config
+ui.showThinking false`). Both write `./.plank/settings.json` via
+`Settings::save_to` — which round-trips the existing file so unknown keys
+survive — and then call `settings::reinstall` so the change takes effect in the
+running session without a restart. The `configform` module is front-end-agnostic
+(the plain REPL renders the same `FIELDS` table as text); only `tui::draw_config`
+knows about the terminal.
 
 Two rules govern the implementation. **A broken settings file never stops plank
 from starting**: malformed JSON, a wrongly-typed value, an unknown key, or an
@@ -272,7 +289,9 @@ flags override the file simply by assigning over it. `parse_options` (no
 settings argument) stays hermetic on the built-in defaults — that is what tests
 and library consumers get. Non-CLI settings reach their consumers through
 `settings::active()`, a process-global installed at startup that returns the
-built-in defaults until `install` runs.
+built-in defaults until `install` runs. It is a swappable `&'static` (the
+payload is `Box::leak`ed), so `/config` can `reinstall` a fresh copy live
+without touching `active()`'s many call sites.
 
 `settings::startup_note` prints one stderr line naming the settings actually in
 force, because a file that quietly selects the CPU backend or shrinks the

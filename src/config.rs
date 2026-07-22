@@ -471,6 +471,10 @@ Settings file:
           \"mcp\":    { \"timeoutSecs\": 30 }
         }
 
+      Edit these interactively with /config (a TUI form), or set one from the
+      prompt: /config <section>.<key> <value> (e.g. /config ui.showThinking
+      false). Changes save to ./.plank/settings.json.
+
       No secrets: keep the provider API key on --api-key or the environment,
       since ./.plank/settings.json is inside the working tree.
 "
@@ -577,7 +581,8 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/hooks"
             | "/remote"
             | "/grant"
-    ) || slash_command_with_args(cmd, "/btw")
+    ) || slash_command_with_args(cmd, "/config")
+        || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")

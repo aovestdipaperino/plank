@@ -182,3 +182,23 @@ test` and review the diff before committing.
   `uiremote` primitives it depends on (region recording, `frame_tree`,
   `buffer_to_ansi`) directly instead; the injection/deferred-reply plumbing
   in `UiRemote::drain` stays covered only by `src/ui.rs`'s unit tests.
+- **A volatile byte in an MCP tool schema rebuilds `sysprompt.kv` on every
+  launch.** The system-prompt KV snapshot is fingerprinted over the whole
+  prompt text, which includes every connected MCP server's tool schemas. An
+  MCP server that interpolates live data into a tool *description* — the
+  trigger was `tokensave_context` advertising `(520445 nodes)`, a graph-size
+  counter — changes the prompt bytes each run, so the fingerprint misses and
+  the (~130 MB) snapshot is rebuilt cold every start. Fix is on the server
+  (keep descriptions static; put counts in tool *results*). Defensively,
+  `McpServer::handshake` now sorts tools by name so a server returning
+  `tools/list` in a nondeterministic order can't churn the fingerprint by
+  reordering alone. Diagnose with a fingerprint/prompt diff across two
+  launches; the culprit is almost always a same-length change (a fixed-width
+  number ticking) mid-prompt.
+- **Anthropic prompt-cache breakpoints default to the 5-minute tier.** A bare
+  `cache_control: {type: "ephemeral"}` expires after 5 minutes, so an
+  interactive turn taken more than 5 minutes after the last one loses the
+  cached system+tools prefix. `remote/provider.rs` requests the 1-hour tier
+  (`ttl: "1h"` plus the `anthropic-beta: extended-cache-ttl-2025-04-11`
+  header); it costs 2× base input on the cache *write* but keeps reads at
+  0.1×, a clear win when the prefix is re-read far more than it changes.

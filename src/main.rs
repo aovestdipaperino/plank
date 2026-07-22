@@ -1,7 +1,25 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Plank agent binary: interactive REPL and one-shot headless mode.
+//! Plank agent binary: entry point for all agent modes.
+//!
+//! This binary provides four entry points, selected by CLI arguments:
+//!
+//! 1. **Interactive agent** (default, TUI or plain stdout): the main agent loop
+//!    that drives inference, tool dispatch, and user interaction. Uses Ratatui
+//!    when both stdin and stdout are real terminals, otherwise a plain line REPL.
+//! 2. **Non-interactive / headless** (`--non-interactive`): reads commands from
+//!    stdin and prints structured output, for scripting and CI integration.
+//! 3. **Remote server** (`plank serve`): hosts the engine over a WebSocket
+//!    control interface. Supports single-tenant and shared-engine modes.
+//! 4. **Remote client** (`plank remote <url>`): connects to a remote server,
+//!    mirrors its output, and forwards typed lines as prompts.
+//!
+//! Engine selection is delegated to [`make_engine`] (local ds4 engine on macOS,
+//! provider API engines, or the `EchoEngine` stub elsewhere) and [`make_host`] for
+//! the shared-engine variant. Startup maintenance, RAM checks, instance-lock
+//! guarding, and remote-control server setup are all handled here before
+//! handing control to the UI layer.
 
 use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;

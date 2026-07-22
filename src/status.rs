@@ -391,6 +391,74 @@ pub fn format_elapsed(secs: f64) -> String {
     }
 }
 
+/// How long each rotating status-bar tip stays up before the next one.
+pub const TIP_ROTATE_MS: u64 = 120_000;
+
+/// Rotating one-line hints shown (in yellow) at the tail of the TUI status bar.
+/// Each points at a real command or key binding; keep them short — the bar
+/// truncates on narrow terminals and the tip is last.
+pub const TIPS: &[&str] = &[
+    "try /context to see context usage",
+    "try /config to change settings interactively",
+    "try /compact to summarize and free up context",
+    "try /usage to see token usage and cost this session",
+    "try /checkpoint <name> to bookmark this point",
+    "try /rollback <name> to jump back to a checkpoint",
+    "try /save to persist this session to disk",
+    "try /list to see your saved sessions",
+    "try /switch <sha> to load another session",
+    "try /resume to pick up your most recent session",
+    "try /del <sha> to delete a saved session",
+    "try /tag <text> to label this session",
+    "try /history to reprint recent turns",
+    "try /new to start a fresh session",
+    "try /mcp to see connected MCP servers and their tools",
+    "try /skills to list the skills available to the model",
+    "try /tasks to see the model's todo list",
+    "try /agent to list sub-agents you can delegate to",
+    "try /hooks to see which hooks are configured",
+    "try /remember <fact> to save a note for later sessions",
+    "try /init to generate an AGENTS.md for this repo",
+    "try /power <1..100> to cap GPU power draw",
+    "try /strip <sha> to trim a session's oldest turns",
+    "try /help to see every command and flag",
+    "type @ to fuzzy-complete a file path into your prompt",
+    "prefix a line with ! to run a shell command yourself",
+    "press Shift+Enter (or Alt+Enter) for a newline",
+    "press Ctrl+C once to clear the input line",
+    "press Ctrl+U to delete to the start of the line",
+    "press Ctrl+W to delete the previous word",
+    "press Up/Down to walk your prompt history",
+    "paste an image and the model can open it with its tools",
+    "scroll up with the mouse wheel to review scrollback",
+    "drag with the mouse to select and copy text",
+    "ask a mid-turn question with /btw <question>",
+    "enable the task tool with /config tools.task true",
+    "enable sub-agents with /config tools.agent true",
+    "enable plan mode with /config tools.planMode true",
+    "hide thinking text with /config ui.showThinking false",
+    "show tool calls with /config ui.showToolCalls true",
+    "echo tool results with /config ui.showToolResults true",
+    "settings save to ./.plank/settings.json — commit it to share",
+    "flags override settings.json; settings.json overrides defaults",
+    "put project notes in AGENTS.md and plank reads them at start",
+    "MCP servers load from ~/.plank/.mcp.json and ./.mcp.json",
+    "compaction keeps a durable summary plus the recent tail",
+    "the system prompt is cached on disk so restarts are fast",
+    "-sys \"...\" overrides the system prompt for one run",
+    "run one prompt and exit with plank -p \"your question\"",
+    "keep secrets out of settings.json; use --api-key or env vars",
+    "your session is saved automatically — /resume brings it back",
+];
+
+/// The tip to show for the given animation clock, or `""` when none exist.
+#[must_use]
+pub fn rotating_tip(tick_ms: u64) -> &'static str {
+    // TIPS is a non-empty compile-time table, so the modulo never divides by zero.
+    let idx = usize::try_from(tick_ms / TIP_ROTATE_MS).unwrap_or(0) % TIPS.len();
+    TIPS[idx]
+}
+
 fn power_suffix(st: &Status) -> String {
     if st.power_percent > 0 && st.power_percent < 100 {
         format!(" | ⚡ {}%", st.power_percent)
@@ -708,6 +776,18 @@ mod tests {
         assert!(bar.starts_with('[') && bar.ends_with(']'));
         assert_eq!(bar.matches('▶').count(), 16);
         assert_eq!(bar.matches('·').count(), 16);
+    }
+
+    #[test]
+    fn rotating_tip_advances_and_wraps() {
+        assert_eq!(rotating_tip(0), TIPS[0]);
+        // Halfway through the first window still shows the first tip.
+        assert_eq!(rotating_tip(TIP_ROTATE_MS - 1), TIPS[0]);
+        // The next window advances by one.
+        assert_eq!(rotating_tip(TIP_ROTATE_MS), TIPS[1 % TIPS.len()]);
+        // After a full cycle it wraps back to the first.
+        let cycle = TIP_ROTATE_MS * TIPS.len() as u64;
+        assert_eq!(rotating_tip(cycle), TIPS[0]);
     }
 
     #[test]
