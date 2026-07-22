@@ -1079,6 +1079,7 @@ impl Agent<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
         self.tool_ctx.skill_invocations = 0;
         // The session owns the persisted task list; load it into the live tool
@@ -1185,6 +1186,12 @@ impl Agent<'_> {
             }
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
+            }
+            if crate::notify::should_notify_complete(
+                turn_start.elapsed(),
+                crate::settings::active().ui.notify_after_secs,
+            ) {
+                crate::notify::notify("plank", "Turn complete");
             }
             return Ok(());
         }
@@ -3421,6 +3428,12 @@ impl Agent<'_> {
         // With a remote bridge, share its persistent `TurnShared` so remote
         // `prompt`/`btw`/`interrupt` frames land in the same queues the local
         // editor uses, and mirror every event onto its bus (issue #25).
+        // Stamped once at the outermost per-user-turn boundary for the TUI
+        // front end: `tui_turn` is called exactly once per user submission
+        // (see call sites in `tui_loop`/`busy_ui_loop`), even though its own
+        // inner loop may run extra rounds for leftover queued lines or a
+        // btw-only drain.
+        let turn_started = Instant::now();
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         // Same remote-control state the idle loop uses: a turn started by an
@@ -3481,6 +3494,12 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                if crate::notify::should_notify_complete(
+                    turn_started.elapsed(),
+                    crate::settings::active().ui.notify_after_secs,
+                ) {
+                    crate::notify::notify("plank", "Turn complete");
+                }
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -3501,10 +3520,15 @@ impl Agent<'_> {
             return self.run_turn();
         };
         self.tool_ctx.skill_invocations = 0;
+        // Outermost per-user-turn boundary for the headless remote path: when
+        // a remote bridge is present this function (not `worker_turn`, which
+        // it drives on a scoped thread) is the single call per queued line in
+        // `pump_remote`, so the stamp/notify belongs here, not in the delegate.
+        let turn_started = Instant::now();
         let bus = Arc::clone(&remote.bus);
         let shared = &remote.shared;
         let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
-        std::thread::scope(|s| {
+        let result = std::thread::scope(|s| {
             let worker = s.spawn(|| self.worker_turn(&tx, shared));
             loop {
                 while let Ok(ev) = rx.try_recv() {
@@ -3522,7 +3546,16 @@ impl Agent<'_> {
             worker
                 .join()
                 .map_err(|_| "worker thread panicked".to_owned())?
-        })
+        });
+        if result.is_ok()
+            && crate::notify::should_notify_complete(
+                turn_started.elapsed(),
+                crate::settings::active().ui.notify_after_secs,
+            )
+        {
+            crate::notify::notify("plank", "Turn complete");
+        }
+        result
     }
 
     /// Drains the remote controller's pending input once: a mirrored turn for
@@ -4959,6 +4992,11 @@ pub fn run_interactive(
     remote: Option<Arc<RemoteState>>,
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, true, remote)?;
+
+    // Seed the notification enable flag once, before either front-end loop
+    // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
+    // one entry point, so this covers both).
+    crate::notify::set_enabled(crate::settings::active().ui.notifications);
 
     // `plank /resume [prefix]` loads a prior session before the loop starts.
     let resumed = cfg.resume.is_some();
