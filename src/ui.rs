@@ -4627,6 +4627,11 @@ fn busy_ui_loop(
     // `/btw` truncates back to it so the discarded partial output does not
     // duplicate when the pass re-runs.
     let mut main_checkpoint = 0usize;
+    // Latches so a given pending `ask` question notifies at most once: set
+    // when we notify, reset as soon as the bridge is observed not pending.
+    // Guards against `run_ask_panel` returning while still pending, which
+    // would otherwise re-notify for the same question on the next iteration.
+    let mut ask_notified = false;
     loop {
         // An `ask` question parked by the worker takes over the input region
         // until answered; the worker is blocked meanwhile, so no render events
@@ -4634,7 +4639,10 @@ fn busy_ui_loop(
         if let Some(bridge) = ask
             && bridge.is_pending()
         {
-            crate::notify::notify("plank", "Waiting for your input");
+            if !ask_notified {
+                crate::notify::notify("plank", "Waiting for your input");
+                ask_notified = true;
+            }
             run_ask_panel(
                 terminal,
                 log,
@@ -4646,6 +4654,7 @@ fn busy_ui_loop(
             )?;
             continue;
         }
+        ask_notified = false;
         while let Ok(ev) = rx.try_recv() {
             // Mirror every worker event onto the remote bus so remote clients
             // see the same stream as the local TUI (issue #25, dual-path).
@@ -5299,6 +5308,9 @@ pub fn run_non_interactive(
     remote: Option<Arc<RemoteState>>,
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, false, remote)?;
+    // Seed the notification enable flag once, mirroring `run_interactive`, so
+    // headless/non-interactive runs also honor `ui.notifications`.
+    crate::notify::set_enabled(crate::settings::active().ui.notifications);
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
@@ -6491,6 +6503,9 @@ mod tests {
 
     #[test]
     fn notify_command_toggles_and_reports() {
+        let _g = crate::notify::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::notify::set_enabled(true);
         let off = Agent::notify_command("off");
         assert!(off.to_lowercase().contains("off"));

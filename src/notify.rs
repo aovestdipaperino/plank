@@ -35,6 +35,7 @@ pub fn should_notify_complete(elapsed: Duration, after_secs: u64) -> bool {
 /// Escape a string for inclusion inside an `AppleScript` double-quoted literal:
 /// backslash and double-quote are backslash-escaped; CR/LF become spaces so
 /// the body stays a single line and cannot terminate or inject the script.
+#[cfg(any(target_os = "macos", test))]
 pub(crate) fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_was_cr = false;
@@ -95,6 +96,15 @@ pub fn notify(title: &str, body: &str) {
     }
 }
 
+/// Serializes tests that touch the process-global `ENABLED` flag, so
+/// `cargo test --lib` (which runs tests concurrently) cannot interleave
+/// `set_enabled` calls between this module's test and `ui`'s
+/// `notify_command_toggles_and_reports`. Lives at module level (not inside
+/// `mod tests`) so both take the *same* guard — two separate mutexes would
+/// not serialize anything.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +129,9 @@ mod tests {
 
     #[test]
     fn enable_flag_round_trips() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_enabled(false);
         assert!(!enabled());
         set_enabled(true);
