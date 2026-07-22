@@ -459,6 +459,57 @@ pub fn rotating_tip(tick_ms: u64) -> &'static str {
     TIPS[idx]
 }
 
+/// How long a transient "flash" tip (e.g. a copy confirmation) stays in the
+/// status bar before it reverts to the rotating tip. Fixed, not configurable.
+pub const FLASH_TIP_MS: u64 = 10_000;
+
+/// A transient status-bar message shown in place of the rotating tip until it
+/// expires, then cleared automatically on the next read. Process-global so any
+/// call site (e.g. a clipboard copy in the mouse handler) can post one without
+/// threading state through the draw path.
+static FLASH_TIP: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a flash tip posted `elapsed` ago is still within its window.
+#[must_use]
+pub fn flash_active(elapsed: std::time::Duration) -> bool {
+    elapsed < std::time::Duration::from_millis(FLASH_TIP_MS)
+}
+
+/// Posts a transient status-bar tip, replacing any current one and restarting
+/// the window.
+pub fn set_flash_tip(msg: String) {
+    let mut guard = FLASH_TIP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((msg, std::time::Instant::now()));
+}
+
+/// Clears any active flash tip immediately.
+pub fn clear_flash_tip() {
+    let mut guard = FLASH_TIP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+/// The active flash tip if one is still within its window; expired tips are
+/// cleared and reported as `None` so the caller falls back to the rotating tip.
+#[must_use]
+pub fn flash_tip() -> Option<String> {
+    let mut guard = FLASH_TIP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.as_ref() {
+        Some((msg, at)) if flash_active(at.elapsed()) => Some(msg.clone()),
+        Some(_) => {
+            *guard = None;
+            None
+        }
+        None => None,
+    }
+}
+
 fn power_suffix(st: &Status) -> String {
     if st.power_percent > 0 && st.power_percent < 100 {
         format!(" | ⚡ {}%", st.power_percent)
@@ -788,6 +839,27 @@ mod tests {
         // After a full cycle it wraps back to the first.
         let cycle = TIP_ROTATE_MS * TIPS.len() as u64;
         assert_eq!(rotating_tip(cycle), TIPS[0]);
+    }
+
+    #[test]
+    fn flash_active_respects_window() {
+        use std::time::Duration;
+        assert!(flash_active(Duration::from_millis(0)));
+        assert!(flash_active(Duration::from_millis(FLASH_TIP_MS - 1)));
+        assert!(!flash_active(Duration::from_millis(FLASH_TIP_MS)));
+        assert!(!flash_active(Duration::from_millis(FLASH_TIP_MS + 5_000)));
+    }
+
+    #[test]
+    fn flash_tip_round_trips_and_clears() {
+        set_flash_tip("Copied 42 chars".to_string());
+        assert_eq!(flash_tip().as_deref(), Some("Copied 42 chars"));
+        // A fresh post replaces the previous one.
+        set_flash_tip("Copied 7 chars".to_string());
+        assert_eq!(flash_tip().as_deref(), Some("Copied 7 chars"));
+        // Leave the process-global clean for other tests in this binary.
+        clear_flash_tip();
+        assert_eq!(flash_tip(), None);
     }
 
     #[test]
