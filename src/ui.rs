@@ -2466,14 +2466,11 @@ impl TuiInput {
         }
     }
 
-    /// Cursor position within the input text as `(row, col)`, where `row`
-    /// counts embedded newlines and `col` is the display column on that row.
-    fn cursor_pos(&self) -> (u16, u16) {
+    /// Cursor position as a char index into the input text. The TUI wraps the
+    /// prompt itself, so it maps this to a visual `(row, col)` at render time.
+    fn cursor_char(&self) -> usize {
         let text = self.buf.text();
-        let before = &text[..self.buf.cursor().min(text.len())];
-        let row = u16::try_from(before.matches('\n').count()).unwrap_or(u16::MAX);
-        let line = before.rsplit('\n').next().unwrap_or(before);
-        (row, u16::try_from(line.chars().count()).unwrap_or(u16::MAX))
+        text[..self.buf.cursor().min(text.len())].chars().count()
     }
 
     /// Moves through history like the line editor (dir -1 = older).
@@ -2654,7 +2651,7 @@ impl Agent<'_> {
                             btw_log,
                             btw_view,
                             Some(input.buf.text()),
-                            input.cursor_pos(),
+                            input.cursor_char(),
                             &status,
                             &mut view,
                             &task_view,
@@ -2664,7 +2661,7 @@ impl Agent<'_> {
                             f,
                             &log,
                             Some(input.buf.text()),
-                            input.cursor_pos(),
+                            input.cursor_char(),
                             &status,
                             &mut view,
                             selection.map(|(a, b)| tui::normalize_selection(a, b)),
@@ -2750,7 +2747,7 @@ impl Agent<'_> {
                                     f,
                                     &log,
                                     Some(input.buf.text()),
-                                    input.cursor_pos(),
+                                    input.cursor_char(),
                                     &status,
                                     &mut view,
                                     Some(sel),
@@ -3019,7 +3016,7 @@ impl Agent<'_> {
                         f,
                         log,
                         None,
-                        (0, 0),
+                        0,
                         &status,
                         view,
                         None,
@@ -4369,7 +4366,7 @@ fn busy_ui_loop(
                         btw_log,
                         btw_view,
                         Some(input.buf.text()),
-                        input.cursor_pos(),
+                        input.cursor_char(),
                         &status_line,
                         view,
                         &task_view,
@@ -4379,7 +4376,7 @@ fn busy_ui_loop(
                         f,
                         log,
                         Some(input.buf.text()),
-                        input.cursor_pos(),
+                        input.cursor_char(),
                         &status_line,
                         view,
                         None,

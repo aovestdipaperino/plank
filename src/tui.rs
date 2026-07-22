@@ -14,6 +14,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
+use unicode_width::UnicodeWidthStr;
 
 use std::sync::{Arc, OnceLock};
 
@@ -517,7 +518,7 @@ fn frame_rows(
     // three rows so it never crowds the scrollback.
     let strip = if has_prompt { tasks.strip_rows() } else { &[] };
     let strip_rows = u16::try_from(strip.len()).unwrap_or(0);
-    let (output, input, status, rule, strip_area) =
+    let (output, input, status, rule_top, rule_bottom, strip_area) =
         frame_geom(area, has_prompt, input_rows, strip_rows);
     // Draw-site instrumentation for `--ui-remote`. This is the one place both
     // `draw` and `draw_btw_split` funnel through, so the frame is reset and
@@ -532,7 +533,8 @@ fn frame_rows(
     if let Some(strip_area) = strip_area {
         render_task_strip(frame, strip_area, strip);
     }
-    if let Some(rule) = rule {
+    // Both rules bracket the resting prompt (above and below the input).
+    for rule in [rule_top, rule_bottom].into_iter().flatten() {
         let text = "─".repeat(rule.width as usize);
         frame.render_widget(
             Paragraph::new(Span::styled(text, Style::default().fg(THEME_GREEN))),
@@ -567,8 +569,9 @@ fn render_task_strip(frame: &mut Frame, area: Rect, rows: &[(String, bool)]) {
 }
 
 /// Pure geometry behind [`frame_rows`]: returns
-/// `(output, input, status, rule, strip)` where `rule` and `strip` are present
-/// only when `has_prompt` (and `strip` only when `strip_rows > 0`).
+/// `(output, input, status, rule_top, rule_bottom, strip)`. The rules bracket
+/// the resting prompt (one above, one below) and are present only when
+/// `has_prompt`; `strip` only when `strip_rows > 0`.
 ///
 /// Split out so layout can be computed (and tested) without a `Frame`.
 fn frame_geom(
@@ -576,18 +579,19 @@ fn frame_geom(
     has_prompt: bool,
     input_rows: u16,
     strip_rows: u16,
-) -> (Rect, Rect, Rect, Option<Rect>, Option<Rect>) {
+) -> (Rect, Rect, Rect, Option<Rect>, Option<Rect>, Option<Rect>) {
     if has_prompt {
         let r = Layout::vertical([
             Constraint::Min(1),             // output
             Constraint::Length(strip_rows), // task strip (0 when idle-empty)
-            Constraint::Length(1),          // separator rule
+            Constraint::Length(1),          // top rule
             Constraint::Length(input_rows), // input
+            Constraint::Length(1),          // bottom rule
             Constraint::Length(1),          // status
         ])
         .split(area);
         let strip = if strip_rows > 0 { Some(r[1]) } else { None };
-        (r[0], r[3], r[4], Some(r[2]), strip)
+        (r[0], r[3], r[5], Some(r[2]), Some(r[4]), strip)
     } else {
         let r = Layout::vertical([
             Constraint::Min(1),
@@ -595,7 +599,7 @@ fn frame_geom(
             Constraint::Length(1),
         ])
         .split(area);
-        (r[0], r[1], r[2], None, None)
+        (r[0], r[1], r[2], None, None, None)
     }
 }
 
@@ -752,39 +756,148 @@ fn render_popup(frame: &mut Frame, area: Rect, popup: &crate::complete::Popup) {
 /// `input_text` must be the same prompt text passed to the draw call, so the
 /// input's height (and therefore the popup's anchor) matches.
 pub fn draw_popup(frame: &mut Frame, input_text: &str, popup: &crate::complete::Popup) {
-    let (output, input, _, _, _) = frame_geom(frame.area(), true, input_height(input_text), 0);
+    let tw = input_text_width(frame.area().width);
+    let (output, input, _, _, _, _) =
+        frame_geom(frame.area(), true, input_height(input_text, tw), 0);
     let rows = u16::try_from(popup.rows().len()).unwrap_or(u16::MAX);
     render_popup(frame, popup_rect(output, input, rows), popup);
 }
 
-/// Horizontal scroll offset for the input line, in display columns.
-///
-/// The prompt glyph is always drawn, so the text gets `width - prompt_width`
-/// cells. When the cursor would fall past the last usable column, the view
-/// scrolls just far enough to keep the cursor (and thus the freshly typed
-/// character) on screen.
-fn input_scroll(cursor_col: u16, row_width: u16, prompt_width: u16) -> u16 {
-    let avail = row_width.saturating_sub(prompt_width);
-    if avail == 0 {
-        return cursor_col;
+/// Display width of the prompt glyph (`🪵> `), the left indent shared by every
+/// input row.
+fn prompt_width() -> u16 {
+    u16::try_from(UnicodeWidthStr::width(crate::status::prompt_text())).unwrap_or(0)
+}
+
+/// Columns available for the wrapped input text at the given frame width.
+fn input_text_width(frame_width: u16) -> u16 {
+    frame_width.saturating_sub(prompt_width()).max(1)
+}
+
+/// Display width of a char, treating control chars as zero.
+fn char_width(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+
+/// Start offsets (in chars) of each visual segment when wrapping `chars` at
+/// `width` cells: a word wrap that breaks at the last space before an overflow,
+/// or hard-breaks a token too long to fit. Always starts with `0`.
+fn wrap_offsets(chars: &[char], width: usize) -> Vec<usize> {
+    let width = width.max(1);
+    let mut starts = vec![0usize];
+    let mut seg_start = 0usize;
+    let mut col = 0usize;
+    let mut last_space: Option<usize> = None;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let w = char_width(chars[i]);
+        if col + w > width && i > seg_start {
+            let brk = match last_space {
+                Some(s) if s + 1 > seg_start => s + 1,
+                _ => i,
+            };
+            starts.push(brk);
+            seg_start = brk;
+            col = chars[seg_start..i].iter().copied().map(char_width).sum();
+            last_space = (seg_start..i).rev().find(|&k| chars[k] == ' ');
+            continue;
+        }
+        if chars[i] == ' ' {
+            last_space = Some(i);
+        }
+        col += w;
+        i += 1;
     }
-    cursor_col.saturating_sub(avail.saturating_sub(1))
+    starts
 }
 
-/// Number of rows the prompt needs for `input` — one per embedded newline.
-///
-/// The input area grows with the text, taking rows away from the scrollback.
+/// Number of visual rows the prompt needs for `input` wrapped at `width` cells
+/// — one per wrapped segment across all logical (newline-separated) lines.
 #[must_use]
-pub fn input_height(input: &str) -> u16 {
-    u16::try_from(input.matches('\n').count() + 1).unwrap_or(u16::MAX)
+pub fn input_height(input: &str, width: u16) -> u16 {
+    let width = width as usize;
+    let rows: usize = input
+        .split('\n')
+        .map(|line| wrap_offsets(&line.chars().collect::<Vec<_>>(), width).len())
+        .sum();
+    u16::try_from(rows.max(1)).unwrap_or(u16::MAX)
 }
 
-/// Draws the prompt glyph and the (possibly multi-line) input text into
-/// `input_area`, placing the terminal cursor at `cursor` = `(row, col)`.
+/// Coalesces styled cells into spans, merging runs of the same style.
+fn cells_to_spans(cells: &[(char, Style)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut run = String::new();
+    let mut run_style: Option<Style> = None;
+    for &(c, st) in cells {
+        if run_style == Some(st) {
+            run.push(c);
+        } else {
+            if let Some(s) = run_style {
+                spans.push(Span::styled(std::mem::take(&mut run), s));
+            }
+            run.push(c);
+            run_style = Some(st);
+        }
+    }
+    if let (Some(s), false) = (run_style, run.is_empty()) {
+        spans.push(Span::styled(run, s));
+    }
+    spans
+}
+
+/// Word-wraps `input` into styled visual rows and locates the cursor's visual
+/// `(row, col)` for the char index `cursor_char`. Line 0 keeps its
+/// command/`!` highlighting; continuation lines render plain.
+fn wrap_input(input: &str, width: u16, cursor_char: usize) -> (Vec<Line<'static>>, u16, u16) {
+    let width = (width as usize).max(1);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let (mut cur_row, mut cur_col) = (0u16, 0u16);
+    let mut base = 0usize; // input char index at the start of the logical line
+    for (li, logical) in input.split('\n').enumerate() {
+        let styled: Vec<(char, Style)> = if li == 0 {
+            input_spans(logical)
+                .into_iter()
+                .flat_map(|s| {
+                    let st = s.style;
+                    s.content.chars().map(move |c| (c, st)).collect::<Vec<_>>()
+                })
+                .collect()
+        } else {
+            logical.chars().map(|c| (c, Style::default())).collect()
+        };
+        let chars: Vec<char> = styled.iter().map(|&(c, _)| c).collect();
+        let offsets = wrap_offsets(&chars, width);
+        let len = chars.len();
+        for (si, &start) in offsets.iter().enumerate() {
+            let end = offsets.get(si + 1).copied().unwrap_or(len);
+            let is_last = si + 1 == offsets.len();
+            // The cursor sits in this segment when its index falls within
+            // [start, end) — or exactly at `end` on the final segment (line end).
+            if cursor_char >= base + start
+                && (cursor_char < base + end || (is_last && cursor_char <= base + end))
+            {
+                cur_row = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+                let off = cursor_char - (base + start);
+                let w: usize = chars[start..start + off]
+                    .iter()
+                    .copied()
+                    .map(char_width)
+                    .sum();
+                cur_col = u16::try_from(w).unwrap_or(u16::MAX);
+            }
+            lines.push(Line::from(cells_to_spans(&styled[start..end])));
+        }
+        base += len + 1; // +1 for the consumed newline
+    }
+    (lines, cur_row, cur_col)
+}
+
+/// Draws the prompt glyph and the word-wrapped input text into `input_area`,
+/// placing the terminal cursor for the char index `cursor_char`.
 ///
-/// Rows after the first are indented under the prompt, and every row shares
-/// the cursor row's horizontal scroll so a long line stays visible.
-fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, u16)) {
+/// The text is indented under the prompt and wraps to the next row instead of
+/// scrolling horizontally.
+fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor_char: usize) {
     // The input region carries its text, so a harness can assert on what is
     // typed without decoding the ANSI snapshot. It is registered here rather
     // than in `frame_rows` because only this function sees the text; while the
@@ -796,43 +909,31 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
             &[("text", crate::tools::mcp::Json::Str(input.to_string()))],
         );
     }
-    let prompt = crate::status::prompt_text();
-    let prompt_span = Span::styled(prompt, Style::default().fg(Color::Cyan));
-    let prompt_width = u16::try_from(prompt_span.width()).unwrap_or(0);
-    let prompt_row = Rect {
-        height: 1,
-        ..input_area
-    };
-    frame.render_widget(Paragraph::new(Line::from(vec![prompt_span])), prompt_row);
+    let prompt_span = Span::styled(
+        crate::status::prompt_text(),
+        Style::default().fg(Color::Cyan),
+    );
+    let pw = prompt_width();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![prompt_span])),
+        Rect {
+            height: 1,
+            ..input_area
+        },
+    );
 
-    // Only the first line can be a slash command or a `!` shell escape, so the
-    // continuation lines render plain.
-    let lines: Vec<Line<'static>> = input
-        .split('\n')
-        .enumerate()
-        .map(|(i, l)| {
-            if i == 0 {
-                Line::from(input_spans(l))
-            } else {
-                Line::raw(l.to_string())
-            }
-        })
-        .collect();
-
-    let (cursor_row, cursor_col) = cursor;
-    let scroll = input_scroll(cursor_col, input_area.width, prompt_width);
     let text_area = Rect {
-        x: input_area.x + prompt_width,
+        x: input_area.x + pw,
         y: input_area.y,
-        width: input_area.width.saturating_sub(prompt_width),
+        width: input_area.width.saturating_sub(pw),
         height: input_area.height,
     };
-    frame.render_widget(Paragraph::new(lines).scroll((0, scroll)), text_area);
+    let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, cursor_char);
+    frame.render_widget(Paragraph::new(lines), text_area);
 
-    let cursor_x = text_area.x + cursor_col.saturating_sub(scroll);
     let cursor = Position::new(
-        cursor_x.min(input_area.right().saturating_sub(1)),
-        input_area.y + cursor_row.min(input_area.height.saturating_sub(1)),
+        (text_area.x + cur_col).min(input_area.right().saturating_sub(1)),
+        input_area.y + cur_row.min(input_area.height.saturating_sub(1)),
     );
     frame.set_cursor_position(cursor);
     // ratatui 0.29 keeps `Frame::cursor_position` private with no getter, so
@@ -954,18 +1055,19 @@ pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
     input: Option<&str>,
-    cursor: (u16, u16),
+    cursor: usize,
     status: &str,
     view: &mut OutputView,
     selection: Option<Selection>,
     tasks: &TaskView,
 ) {
     let area = frame.area();
+    let tw = input_text_width(area.width);
     let (output, input_row, status_row) = frame_rows(
         frame,
         area,
         input.is_some(),
-        input.map_or(1, input_height),
+        input.map_or(1, |t| input_height(t, tw)),
         tasks,
     );
 
@@ -1138,7 +1240,7 @@ pub fn draw_btw_split(
     btw_log: &OutputLog,
     btw_view: &mut OutputView,
     input: Option<&str>,
-    cursor: (u16, u16),
+    cursor: usize,
     status: &str,
     view: &mut OutputView,
     tasks: &TaskView,
@@ -1146,11 +1248,12 @@ pub fn draw_btw_split(
     use ratatui::widgets::{Block, Borders};
 
     let area = frame.area();
+    let tw = input_text_width(area.width);
     let (output, input_row, status_row) = frame_rows(
         frame,
         area,
         input.is_some(),
-        input.map_or(1, input_height),
+        input.map_or(1, |t| input_height(t, tw)),
         tasks,
     );
     let cols =
@@ -1467,21 +1570,38 @@ mod tests {
     }
 
     #[test]
-    fn input_height_is_one_row_per_line() {
-        assert_eq!(input_height(""), 1);
-        assert_eq!(input_height("one line"), 1);
-        assert_eq!(input_height("two\nlines"), 2);
+    fn input_height_counts_newlines_and_wrapped_rows() {
+        // Wide enough to never wrap: one row per logical line.
+        assert_eq!(input_height("", 80), 1);
+        assert_eq!(input_height("one line", 80), 1);
+        assert_eq!(input_height("two\nlines", 80), 2);
         // A trailing newline opens a new (empty) row to type on.
-        assert_eq!(input_height("trailing\n"), 2);
+        assert_eq!(input_height("trailing\n", 80), 2);
+        // Narrow width wraps a long line onto extra rows.
+        assert_eq!(input_height("abcdefghij", 4), 3); // 4+4+2
+        assert_eq!(input_height("aaaa\nbbbbbb", 5), 3); // 1 + 2
     }
 
     #[test]
-    fn input_scroll_holds_still_until_the_cursor_leaves_the_row() {
-        // 20 columns, a 2-wide prompt: 18 usable, last is column 17.
-        assert_eq!(input_scroll(0, 20, 2), 0);
-        assert_eq!(input_scroll(17, 20, 2), 0);
-        assert_eq!(input_scroll(18, 20, 2), 1);
-        assert_eq!(input_scroll(30, 20, 2), 13);
+    fn word_wrap_breaks_at_spaces_and_maps_the_cursor() {
+        // "hello world" at width 8 wraps after "hello " → "hello ", "world".
+        let (lines, row, col) = wrap_input("hello world", 8, 11);
+        assert_eq!(lines.len(), 2);
+        let row0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(row0, "hello ");
+        // Cursor at end (char 11) lands on the second row after "world".
+        assert_eq!((row, col), (1, 5));
+    }
+
+    #[test]
+    fn word_wrap_hard_breaks_a_too_long_token() {
+        // No spaces: a hard break at the width boundary.
+        let (lines, _, _) = wrap_input("abcdefgh", 4, 0);
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["abcd".to_string(), "efgh".to_string()]);
     }
 
     #[test]
@@ -1677,13 +1797,26 @@ mod tests {
     #[test]
     fn frame_geom_reserves_strip_rows_only_when_present() {
         let area = Rect::new(0, 0, 80, 24);
-        // No strip: the rule sits directly above the input.
-        let (out0, _in0, _st0, rule0, strip0) = frame_geom(area, true, 1, 0);
+        // No strip: the top rule sits directly above the input, the bottom
+        // rule directly below it (above the status bar).
+        let (out0, in0, st0, rule0, rule_bot0, strip0) = frame_geom(area, true, 1, 0);
         assert!(strip0.is_none());
         let rule0 = rule0.unwrap();
+        let rule_bot0 = rule_bot0.expect("bottom rule present");
+        assert_eq!(rule0.y + 1, in0.y, "top rule directly above input");
+        assert_eq!(
+            in0.bottom(),
+            rule_bot0.y,
+            "bottom rule directly below input"
+        );
+        assert_eq!(
+            rule_bot0.bottom(),
+            st0.y,
+            "bottom rule directly above status"
+        );
         // Three strip rows: reserved between the output and the rule, and the
         // output pane shrinks by exactly three rows.
-        let (out3, _in3, _st3, rule3, strip3) = frame_geom(area, true, 1, 3);
+        let (out3, _in3, _st3, rule3, _rule_bot3, strip3) = frame_geom(area, true, 1, 3);
         let strip3 = strip3.expect("strip present");
         let rule3 = rule3.expect("rule present");
         assert_eq!(strip3.height, 3);
@@ -1760,7 +1893,7 @@ mod tests {
                 f,
                 &log,
                 Some("hi"),
-                (0, 2),
+                2,
                 "idle",
                 &mut view,
                 None,
@@ -1808,7 +1941,7 @@ mod tests {
                 f,
                 &log,
                 Some("hi"),
-                (0, 2),
+                2,
                 "idle",
                 &mut view,
                 None,
@@ -1831,7 +1964,7 @@ mod tests {
                 f,
                 &log,
                 None,
-                (0, 0),
+                0,
                 "generating",
                 &mut view,
                 None,
@@ -1861,7 +1994,7 @@ mod tests {
                 f,
                 &log,
                 Some("aa\nbb"),
-                (1, 2),
+                5,
                 "idle",
                 &mut view,
                 None,
@@ -1930,8 +2063,8 @@ mod tests {
         // hand-made rects, for a one-row and a tall multi-row input.
         for (input_text, rows) in [("@src", 5u16), ("a\nb\nc\n@src", 15)] {
             let screen = Rect::new(0, 0, 80, 24);
-            let (output, input, status, rule, _strip) =
-                frame_geom(screen, true, input_height(input_text), 0);
+            let (output, input, status, rule, _rule_bot, _strip) =
+                frame_geom(screen, true, input_height(input_text, 78), 0);
             let rule = rule.expect("prompt showing means a rule row");
             let r = popup_rect(output, input, rows);
             assert!(r.y >= output.y, "popup starts inside the output pane");
