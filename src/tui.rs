@@ -47,9 +47,85 @@ fn error_style() -> Style {
 /// Implements [`RenderSink`] so the viz stream renderer appends directly:
 /// visible output rendered as markdown (via `ratatui-markdown`, including
 /// code-block syntax highlighting), thinking and tool text in gray/plain.
+/// Header marker `ratatui-markdown` opens a fenced code block with (`╭─ lang`).
+const CODE_HEADER_MARK: char = '╭';
+/// Footer marker that closes a fenced code block (`╰─`).
+const CODE_FOOTER_MARK: char = '╰';
+/// The `│ ` gutter each code body line carries; stripped to recover the source.
+const CODE_BODY_GUTTER: &str = "│ ";
+/// Clickable control appended to a code block's header, next to the language.
+const CODE_COPY_LABEL: &str = " ⧉ copy";
+
+/// A rendered fenced code block: its logical `lines` range, the raw code it
+/// holds (`│ ` gutter stripped, trailing whitespace trimmed, WYSIWYG), and the
+/// inclusive screen columns of the header's `⧉ copy` control.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeBlockRegion {
+    /// Logical index (into `lines`) of the `╭` header row.
+    pub header: usize,
+    /// Inclusive screen-column span of the header's copy control.
+    pub copy_cols: (u16, u16),
+    /// Block contents, one body line per row, ready for the clipboard.
+    pub code: String,
+}
+
+/// Concatenates a line's span contents into its plain text.
+fn line_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Appends the `⧉ copy` control to every code-block header in `lines[from..]`
+/// and returns the regions found there (with absolute `lines` indices). A block
+/// runs from a `╭` header to its `╰` footer; body rows contribute their text
+/// with the `│ ` gutter stripped.
+fn annotate_code_blocks(lines: &mut [Line<'static>], from: usize) -> Vec<CodeBlockRegion> {
+    let mut regions = Vec::new();
+    let mut i = from;
+    while i < lines.len() {
+        let header_text = line_text(&lines[i]);
+        if !header_text.starts_with(CODE_HEADER_MARK) {
+            i += 1;
+            continue;
+        }
+        let header = i;
+        let mut code_lines: Vec<String> = Vec::new();
+        let mut j = i + 1;
+        while j < lines.len() {
+            let body = line_text(&lines[j]);
+            if body.starts_with(CODE_FOOTER_MARK) {
+                break;
+            }
+            let stripped = body.strip_prefix(CODE_BODY_GUTTER).unwrap_or(&body);
+            code_lines.push(stripped.trim_end().to_owned());
+            j += 1;
+        }
+        let start_col = u16::try_from(UnicodeWidthStr::width(header_text.as_str())).unwrap_or(0);
+        let end_col = start_col
+            .saturating_add(u16::try_from(UnicodeWidthStr::width(CODE_COPY_LABEL)).unwrap_or(0));
+        lines[header].spans.push(Span::styled(
+            CODE_COPY_LABEL.to_owned(),
+            Style::default()
+                .fg(Color::Indexed(245))
+                .add_modifier(Modifier::DIM),
+        ));
+        regions.push(CodeBlockRegion {
+            header,
+            copy_cols: (start_col, end_col.saturating_sub(1)),
+            code: code_lines.join("\n"),
+        });
+        // Resume past the footer (or at EOF for a still-streaming block).
+        i = j + 1;
+    }
+    regions
+}
+
 #[derive(Debug, Default)]
 pub struct OutputLog {
     lines: Vec<Line<'static>>,
+    /// Rendered fenced code blocks, each carrying its raw text and the screen
+    /// columns of its header's `⧉ copy` control, so a click on that control
+    /// copies the block verbatim. Rebuilt alongside `lines` in `md_render`.
+    code_blocks: Vec<CodeBlockRegion>,
     current: Vec<Span<'static>>,
     /// Raw markdown of the visible segment currently streaming, plus the
     /// index in `lines` where its rendered form starts. Re-rendered whole on
@@ -107,6 +183,11 @@ impl OutputLog {
         let blocks = md.parse(&self.md_buf);
         self.lines.truncate(start);
         self.lines.extend(md.render(&blocks, &ThemeConfig::new()));
+        // Rebuild the code-block registry for the re-rendered segment; blocks
+        // in committed earlier segments keep their (stable) indices.
+        self.code_blocks.retain(|r| r.header < start);
+        self.code_blocks
+            .extend(annotate_code_blocks(&mut self.lines, start));
     }
 
     /// Appends a fully-styled standalone line (e.g. the user echo).
@@ -162,6 +243,7 @@ impl OutputLog {
         self.md_close();
         self.current.clear();
         self.lines.truncate(len);
+        self.code_blocks.retain(|r| r.header < len);
     }
 
     /// Sets (or clears) the transient progress line pinned below the output.
@@ -181,6 +263,41 @@ impl OutputLog {
             lines.push(progress.clone());
         }
         Text::from(lines)
+    }
+
+    /// Maps a click at output-area cell (`col`, `row`) — with the log scrolled
+    /// so its first visible wrapped row is `top` and wrapped at `width` — to the
+    /// raw text of a code block, when the click lands on that block's header
+    /// `⧉ copy` control. `None` otherwise.
+    #[must_use]
+    pub fn code_copy_at(&self, width: u16, top: usize, col: u16, row: u16) -> Option<String> {
+        if self.code_blocks.is_empty() {
+            return None;
+        }
+        let width = width.max(1);
+        let target = top.checked_add(row as usize)?;
+        let mut acc = 0usize;
+        for (idx, line) in self.lines.iter().enumerate() {
+            // Each logical line wraps independently (Wrap { trim: false }), so
+            // its screen height matches how `render_output` lays it out.
+            let height = Paragraph::new(Text::from(line.clone()))
+                .wrap(Wrap { trim: false })
+                .line_count(width)
+                .max(1);
+            if target < acc + height {
+                // The header sits on the block's first wrapped row.
+                if target != acc {
+                    return None;
+                }
+                return self
+                    .code_blocks
+                    .iter()
+                    .find(|r| r.header == idx && col >= r.copy_cols.0 && col <= r.copy_cols.1)
+                    .map(|r| r.code.clone());
+            }
+            acc += height;
+        }
+        None
     }
 }
 
@@ -1782,6 +1899,60 @@ mod tests {
             colors.len() >= 2,
             "expected multi-color highlighted code: {:?}",
             log.lines
+        );
+    }
+
+    #[test]
+    fn code_block_records_region_and_copy_control() {
+        let mut log = OutputLog::new();
+        log.visible_text("```rust\nfn main() {}\nlet x = 1;\n```\n");
+        assert_eq!(log.code_blocks.len(), 1, "one block recorded");
+        let region = &log.code_blocks[0];
+        // The raw code round-trips with the `│ ` gutter stripped.
+        assert_eq!(region.code, "fn main() {}\nlet x = 1;");
+        // The header carries the `⧉ copy` control after the language label.
+        let header = line_text(&log.lines[region.header]);
+        assert!(header.starts_with("╭"), "header: {header:?}");
+        assert!(header.contains("rust"), "header: {header:?}");
+        assert!(header.contains("copy"), "header: {header:?}");
+    }
+
+    #[test]
+    fn code_copy_at_hits_control_and_misses_elsewhere() {
+        let mut log = OutputLog::new();
+        log.visible_text("```rust\nfn main() {}\n```\n");
+        let region = log.code_blocks[0].clone();
+        let (c0, c1) = region.copy_cols;
+
+        // A click inside the control's columns on the header row copies it.
+        assert_eq!(
+            log.code_copy_at(80, 0, c0, 0).as_deref(),
+            Some("fn main() {}")
+        );
+        assert_eq!(
+            log.code_copy_at(80, 0, c1, 0).as_deref(),
+            Some("fn main() {}")
+        );
+        // The language label (column 0) is not the control.
+        assert_eq!(log.code_copy_at(80, 0, 0, 0), None);
+        // Just past the control is a miss.
+        assert_eq!(log.code_copy_at(80, 0, c1 + 1, 0), None);
+        // A body row is not the header.
+        assert_eq!(log.code_copy_at(80, 0, c0, 1), None);
+    }
+
+    #[test]
+    fn code_copy_at_respects_scroll_offset() {
+        let mut log = OutputLog::new();
+        // Push a plain line, then a code block; scrolling shifts the header up.
+        log.visible_text("intro line\n\n```sh\necho hi\n```\n");
+        let region = log.code_blocks[0].clone();
+        let header_row = region.header;
+        let (c0, _) = region.copy_cols;
+        // With the header scrolled to the top visible row, the click lands.
+        assert_eq!(
+            log.code_copy_at(80, header_row, c0, 0).as_deref(),
+            Some("echo hi")
         );
     }
 
