@@ -5,8 +5,43 @@ see the GitHub releases and commit history.
 
 ## Beta (2.1, unreleased)
 
-The next beta series opens here (`brew install plank-beta`). Nothing new to
-report yet — the v2 line just landed on stable below.
+The 2.1 beta (`brew install plank-beta`) is a round of "see what the agent is
+doing" polish, plus the first delegation tool.
+
+🧑‍🔧 **Delegate to a sub-agent.** The model can hand a bounded task to a fresh,
+scoped sub-agent with the new `agent` tool and get back only its conclusion,
+instead of filling the main transcript with the research. It runs as a sidechain
+off your conversation and rolls back out afterward, so the delegation is cheap.
+An optional `name` picks one of your `~/.plank/agents` personas.
+
+📝 **Plan mode.** `EnterPlanMode` puts the model in a read-only phase — it can
+research with read/list/glob/search but `write`, `edit`, and `bash` are refused
+— until it proposes a plan with `ExitPlanMode` and you approve it. A cheap
+course-correction before any edits land.
+
+📊 **File changes show as a git diff.** When the model edits a file (or
+overwrites one), plank now renders a git-style change card: an `Update(path)`
+header, an added/removed summary, and `@@` hunks with red/green line
+highlighting. A brand-new file instead streams its contents dimmed as it is
+written, so you always see what is going onto disk.
+
+⏳ **Progress you can actually see.** The system-prompt cache, if it needs
+rebuilding at launch, now does so behind a simple progress bar before the full
+UI appears. During a turn the spinner, verb, and token stats sit on their own
+line right below the output — so even while thinking is hidden, you can tell the
+turn is alive. The status bar itself is quieter: it shows the working directory,
+git branch, and context as a percentage, framed above and below by a rule.
+
+🔎 **Run reports without waiting.** `/context`, `/usage`, `/mcp`, and `/help` now
+work while the model is still generating, answered from a turn-start snapshot —
+no need to interrupt to check where things stand.
+
+⌨️ **The prompt wraps.** Long input wraps onto the next line instead of scrolling
+sideways, so you can see the whole thing as you type.
+
+⚙️ **`showThinking` setting.** Set `ui.showThinking: false` to hide the model's
+dimmed thinking from the display (it still produces it); the on-screen progress
+line keeps the turn visible either way.
 
 ## 2.0.2
 

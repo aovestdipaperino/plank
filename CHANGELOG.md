@@ -6,6 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-agent tool (`agent`)** (#50): the model delegates a bounded task to a
+  fresh scoped sub-agent (a sidechain fork of the transcript) and gets back only
+  its final report; nesting is bounded (`SUBAGENT_DEPTH_CAP = 1`). An optional
+  `name` selects a `~/.plank/agents` / `./.plank/agents` persona. Wired into both
+  the plain-REPL and TUI/worker turn loops.
+- **Plan mode (`EnterPlanMode` / `ExitPlanMode`)** (#50): a read-only
+  propose-then-approve gate. While active, `write`/`edit`/`bash` are refused and
+  read-only tools stay; `ExitPlanMode` presents the plan via the `ask` panel for
+  approval (auto-approves in non-interactive runs).
+- **Git-style diff card** for `edit` and overwriting `write`: an
+  `Update`/`Create(path)` header, an added/removed summary, and `@@` hunks with
+  red-background removals and green-background additions (Myers diff via the
+  `similar` crate). A `write` to a new file instead streams its content as a dim
+  preview while it is generated.
+- **`ui.showThinking` setting** (default `true`): when `false`, thinking text is
+  produced but not displayed.
+- **Read-only reports run mid-turn**: `/context`, `/usage`, `/mcp`, and `/help`
+  work while the model is generating, answered from a turn-start snapshot.
+
+### Changed
+
+- The status bar shows context as a bare percentage (`ctx N%`), and the animated
+  progress (throbber + spinner verb + token stats) renders on a line pinned
+  below the output rather than in the footer. The resting prompt is framed by a
+  rule above and below it.
+- The system-prompt KV cache, when it needs rebuilding at launch, is warmed
+  behind a simple progress bar before the full UI is shown.
+- The prompt input word-wraps to the next line instead of scrolling
+  horizontally.
+
+### Fixed
+
+- Long scrollback (e.g. the `/context` report) now scrolls all the way to the
+  bottom (exact wrapped-line count instead of a char-packing estimate).
+- Resumed sessions (`/resume`, `/switch`, `plank /resume`) replay through the
+  live renderer, so history returns as markdown with dimmed thinking and
+  tool-call banners instead of flat text.
+
 ## [2.0.2] - 2026-07-21
 
 Promotes the v2 beta line to stable. Everything accumulated on the beta channel

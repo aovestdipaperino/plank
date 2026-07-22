@@ -73,6 +73,9 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
 - **`/btw` side questions** — ask something mid-task; the running generation genuinely suspends, answers in a split panel, and resumes byte-for-byte with no re-prefill.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
+- **Git-style diff cards** — an `edit` (or an overwriting `write`) renders as a change card with an `Update(path)` header, an added/removed summary, and red/green `@@` hunks; a brand-new file streams its content dimmed as it is written.
+- **`agent` sub-agent tool** — the model delegates a bounded task to a fresh scoped sub-agent and gets back only its conclusion, keeping the main transcript clean; bounded so a sub-agent can't itself delegate.
+- **Plan mode** — `EnterPlanMode` holds the model read-only (research only) until it proposes a plan you approve with `ExitPlanMode`, before any edits land.
 - **`@` file completion, `glob`, and a model-visible task list** that survives compaction.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
 - **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
