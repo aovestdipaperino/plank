@@ -4619,6 +4619,7 @@ fn busy_ui_loop(
         if let Some(bridge) = ask
             && bridge.is_pending()
         {
+            crate::notify::notify("plank", "Waiting for your input");
             run_ask_panel(
                 terminal,
                 log,
