@@ -81,6 +81,14 @@
     border:2px solid var(--line);border-radius:16px;padding:13px 14px;max-width:520px;
     box-shadow:0 6px 0 rgb(var(--shadow) / .08);
   }
+  /* channel toggle */
+  .chan{display:inline-flex;gap:4px;background:var(--paper);border:2px solid var(--line);
+    border-radius:999px;padding:4px;margin-bottom:12px}
+  .seg{border:0;cursor:pointer;font-weight:800;font-size:14px;color:var(--bark-soft);
+    background:transparent;border-radius:999px;padding:7px 15px;transition:color .15s,background .15s}
+  .seg.is-on{color:#fff;background:var(--pine)}
+  .seg:not(.is-on):hover{color:var(--bark)}
+
   .install .prompt{color:var(--honey);font-weight:700}
   .install code{flex:1;font-size:14.5px;color:var(--bark);white-space:nowrap;overflow-x:auto}
   .copybtn{
@@ -185,12 +193,16 @@
         no <span class="mono">“your request has been queued.”</span> Just you, your Metal GPU,
         and a suspiciously capable piece of wood.</p>
 
+        <div class="chan rounded" role="tablist" aria-label="Release channel">
+          <button class="seg is-on" id="segStable" role="tab" aria-selected="true" onclick="setChan('stable')">🌲 Stable</button>
+          <button class="seg" id="segBeta" role="tab" aria-selected="false" onclick="setChan('beta')">🪚 Beta</button>
+        </div>
         <div class="install">
           <span class="prompt mono">$</span>
-          <code class="mono" id="cmd">brew install aovestdipaperino/tap/plank-beta</code>
+          <code class="mono" id="cmd">brew install aovestdipaperino/tap/plank</code>
           <button class="copybtn rounded" onclick="copyCmd()">Copy</button>
         </div>
-        <p class="beta-note">Currently in beta — like all good lumber, still curing. <span class="mono">v2.3.2</span></p>
+        <p class="beta-note" id="note">Seasoned lumber — the stable channel. <span class="mono">brew upgrade</span> keeps you steady.</p>
       </div>
 
       <div class="stage" aria-hidden="true">
@@ -305,6 +317,24 @@
 <div class="toast rounded" id="toast">Copied! (to your clipboard — not the cloud)</div>
 
 <script>
+  var CHAN = {
+    stable: {
+      cmd: "brew install aovestdipaperino/tap/plank",
+      note: 'Seasoned lumber — the stable channel. <span class="mono">brew upgrade</span> keeps you steady.'
+    },
+    beta: {
+      cmd: "brew install aovestdipaperino/tap/plank-beta",
+      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v2.3.2</span>.'
+    }
+  };
+  function setChan(c){
+    document.getElementById('cmd').textContent = CHAN[c].cmd;
+    document.getElementById('note').innerHTML = CHAN[c].note;
+    var stable = c === 'stable';
+    var s = document.getElementById('segStable'), b = document.getElementById('segBeta');
+    s.classList.toggle('is-on', stable);  s.setAttribute('aria-selected', stable);
+    b.classList.toggle('is-on', !stable); b.setAttribute('aria-selected', !stable);
+  }
   function copyCmd(){
     var text = document.getElementById('cmd').textContent.trim();
     var done = function(){
