@@ -184,6 +184,7 @@ pub fn provider_tool_registry(
             "required": ["question", "header", "options"]
         }),
     });
+    push_agent_and_plan_specs(&mut specs);
     for server in mcp_servers {
         if !server.alive() {
             continue;
@@ -223,6 +224,44 @@ pub fn provider_tool_registry(
         });
     }
     specs
+}
+
+/// Pushes the provider-path [`ToolSpec`](crate::engine::ToolSpec)s for the
+/// `agent` and plan-mode tools (issue #50). Mirrors the text-path schemas in
+/// [`append_agent_and_plan_schemas`]; split out to keep
+/// [`provider_tool_registry`] under the function-length lint.
+fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
+    specs.push(crate::engine::ToolSpec {
+        name: "agent".to_string(),
+        description: "Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "the complete, standalone task to delegate; include all needed context"},
+                "name": {"type": "string", "description": "optional configured agent name to act as; omit for a general-purpose sub-agent"}
+            },
+            "required": ["task"]
+        }),
+    });
+    specs.push(crate::engine::ToolSpec {
+        name: "EnterPlanMode".to_string(),
+        description: "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {}
+        }),
+    });
+    specs.push(crate::engine::ToolSpec {
+        name: "ExitPlanMode".to_string(),
+        description: "Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "plan": {"type": "string", "description": "the full plan to carry out, for the user to approve"}
+            },
+            "required": ["plan"]
+        }),
+    });
 }
 
 /// Parses the built-in OpenAI-shaped tool schemas out of the DS4 tools prompt
@@ -367,6 +406,55 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20       \"multi\": {\"type\": \"string\", \"description\": \"true to allow selecting more than one option (default false)\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"question\", \"header\", \"options\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+    append_agent_and_plan_schemas(out);
+}
+
+/// Appends the `agent` (sub-agent delegation) and plan-mode tool schemas
+/// (issue #50). Split from [`append_native_extra_schemas`] to keep each under
+/// the function-length lint; both are native tools outside the C-trained table.
+fn append_agent_and_plan_schemas(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"agent\",\n\
+         \x20   \"description\": \"Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research (locate where X is handled, summarize how Y works) or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"task\": {\"type\": \"string\", \"description\": \"the complete, standalone task to delegate; include all needed context\"},\n\
+         \x20       \"name\": {\"type\": \"string\", \"description\": \"optional configured agent name to act as; omit for a general-purpose sub-agent\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"task\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"EnterPlanMode\",\n\
+         \x20   \"description\": \"Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {}\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"ExitPlanMode\",\n\
+         \x20   \"description\": \"Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"plan\": {\"type\": \"string\", \"description\": \"the full plan to carry out, for the user to approve\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"plan\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",

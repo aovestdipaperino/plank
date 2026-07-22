@@ -89,6 +89,14 @@ pub struct ToolContext {
     /// Skill invocations so far this turn; the turn driver resets it to 0 at
     /// the start of each turn. Bounds runaway skill-invokes-skill recursion.
     pub skill_invocations: usize,
+    /// Current sub-agent nesting depth (issue #50). The turn driver increments
+    /// this around a delegated `agent` tool run and the `agent` tool refuses
+    /// once it reaches [`SUBAGENT_DEPTH_CAP`], bounding agent-invokes-agent
+    /// recursion the same way [`SKILL_DEPTH_CAP`] bounds skills.
+    pub subagent_depth: usize,
+    /// True while a read-only plan-mode gate is active (issue #50). Mutating
+    /// tools refuse until `ExitPlanMode` clears it.
+    pub plan_mode: bool,
     /// Set by a tool hook's `{"continue": false}` response envelope; the turn
     /// driver halts the turn after the dispatch that produced it.
     pub hook_stop: Option<String>,
@@ -114,6 +122,23 @@ pub struct ToolContext {
 /// Most `skill` invocations allowed within one turn before the tool refuses,
 /// bounding a skill whose text tells the model to invoke another skill.
 pub const SKILL_DEPTH_CAP: usize = 8;
+
+/// Maximum sub-agent nesting depth (issue #50). A depth of 1 means a top-level
+/// turn may delegate to a sub-agent, but that sub-agent may not delegate again;
+/// this bounds runaway agent-invokes-agent recursion.
+pub const SUBAGENT_DEPTH_CAP: usize = 1;
+
+/// Tools that mutate the workspace and are therefore refused while plan mode is
+/// active (issue #50). Read-only tools stay available so the model can research
+/// before proposing a plan. `bash` is included because it can run arbitrary
+/// side-effecting commands.
+const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &["write", "edit", "bash"];
+
+/// True when `name` is a workspace-mutating tool blocked under plan mode.
+#[must_use]
+fn is_plan_mode_blocked(name: &str) -> bool {
+    PLAN_MODE_BLOCKED_TOOLS.contains(&name)
+}
 
 impl std::fmt::Debug for ToolContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -148,6 +173,8 @@ impl ToolContext {
             hook_warnings: Vec::new(),
             skills: Vec::new(),
             skill_invocations: 0,
+            subagent_depth: 0,
+            plan_mode: false,
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
@@ -219,7 +246,18 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             ));
         }
     }
+    // Plan mode (issue #50): while the read-only gate is active, refuse any
+    // workspace-mutating tool so the model researches and proposes before it
+    // edits. The gate itself is entered/exited by dedicated tools below.
+    if ctx.plan_mode && is_plan_mode_blocked(&call.name) {
+        return ToolResult::from_output(format!(
+            "Tool error: plan mode is active — {} is read-only until you call ExitPlanMode with your proposed plan and it is approved\n",
+            call.name
+        ));
+    }
     let output = match call.name.as_str() {
+        "EnterPlanMode" => tool_enter_plan_mode(ctx),
+        "ExitPlanMode" => tool_exit_plan_mode(ctx, call),
         "read" => files::tool_read(ctx, call),
         "more" => files::tool_more(ctx, call),
         "write" => files::tool_write(ctx, call),
@@ -320,6 +358,69 @@ fn fire_post_tool_failure(
             output.push('\n');
         }
         let _ = writeln!(output, "[PostToolUseFailure hook] {msg}");
+    }
+}
+
+/// Handles `EnterPlanMode`: turns on the read-only plan gate (issue #50).
+///
+/// Idempotent — entering plan mode when already in it just reaffirms the gate.
+fn tool_enter_plan_mode(ctx: &mut ToolContext) -> String {
+    ctx.plan_mode = true;
+    "Plan mode is on. You are now read-only: research with read/list/glob/search \
+     and the web/MCP tools, but do not modify the workspace. When you have a \
+     concrete plan, call ExitPlanMode with the plan in its 'plan' argument to \
+     ask the user for approval before making changes.\n"
+        .to_string()
+}
+
+/// Handles `ExitPlanMode`: presents the proposed plan for approval and, when
+/// approved, lifts the read-only gate (issue #50).
+///
+/// With an interactive [`ask::Asker`] the user approves or rejects; a rejection
+/// keeps the gate on. Without one (non-interactive / headless) the plan is
+/// auto-approved so scripted runs are not wedged, mirroring the `ask` tool's
+/// non-interactive fast-path.
+fn tool_exit_plan_mode(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    if !ctx.plan_mode {
+        return "Tool error: ExitPlanMode called but plan mode is not active\n".to_string();
+    }
+    let plan = call.arg_value("plan").unwrap_or("").trim();
+    if plan.is_empty() {
+        return "Tool error: ExitPlanMode requires a non-empty 'plan' describing what you intend to do\n"
+            .to_string();
+    }
+    let Some(asker) = ctx.asker.as_mut() else {
+        // No interactive user to approve; lift the gate and proceed.
+        ctx.plan_mode = false;
+        return "No interactive user is available to approve the plan \
+                (non-interactive mode); plan mode lifted, proceed.\n"
+            .to_string();
+    };
+    let req = ask::AskRequest {
+        question: format!("Approve this plan?\n\n{plan}"),
+        header: "Plan".to_string(),
+        options: vec![
+            ask::AskOption {
+                label: "Approve".to_string(),
+                description: "Proceed with the plan and allow edits".to_string(),
+            },
+            ask::AskOption {
+                label: "Keep planning".to_string(),
+                description: "Stay read-only and refine the plan".to_string(),
+            },
+        ],
+        multi: false,
+    };
+    match asker.ask(req) {
+        ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Approve") => {
+            ctx.plan_mode = false;
+            "Plan approved. Plan mode is off; you may now modify the workspace to carry it out.\n"
+                .to_string()
+        }
+        _ => {
+            "Plan not approved; plan mode stays on. Refine the plan and call ExitPlanMode again.\n"
+                .to_string()
+        }
     }
 }
 
@@ -462,6 +563,52 @@ mod tests {
         let res = dispatch(&test_call("frobnicate", &[]), &mut ctx);
         assert!(res.is_error);
         assert_eq!(res.output, "Tool error: unknown tool: frobnicate\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn plan_mode_gates_mutating_tools_and_exits_on_approval() {
+        let (mut ctx, dir) = test_ctx();
+        // Entering plan mode turns on the read-only gate.
+        let res = dispatch(&test_call("EnterPlanMode", &[]), &mut ctx);
+        assert!(!res.is_error);
+        assert!(ctx.plan_mode);
+        // A mutating tool is now refused with a plan-mode error.
+        let res = dispatch(
+            &test_call("write", &[("path", "x.txt"), ("content", "hi")]),
+            &mut ctx,
+        );
+        assert!(res.is_error);
+        assert!(res.output.contains("plan mode is active"));
+        // A read-only tool still works (list of the scratch dir).
+        let res = dispatch(&test_call("list", &[]), &mut ctx);
+        assert!(!res.is_error, "read-only tool blocked: {}", res.output);
+        // ExitPlanMode requires a plan.
+        let res = dispatch(&test_call("ExitPlanMode", &[]), &mut ctx);
+        assert!(res.is_error);
+        assert!(ctx.plan_mode, "gate must stay on without a plan");
+        // With a plan and no asker (non-interactive), it auto-approves.
+        let res = dispatch(
+            &test_call("ExitPlanMode", &[("plan", "do the thing")]),
+            &mut ctx,
+        );
+        assert!(!res.is_error);
+        assert!(!ctx.plan_mode, "gate must lift after approval");
+        // Now the mutating tool is allowed again.
+        let res = dispatch(
+            &test_call("write", &[("path", "x.txt"), ("content", "hi")]),
+            &mut ctx,
+        );
+        assert!(!res.is_error, "write still blocked: {}", res.output);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn exit_plan_mode_errors_when_not_planning() {
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("ExitPlanMode", &[("plan", "p")]), &mut ctx);
+        assert!(res.is_error);
+        assert!(res.output.contains("plan mode is not active"));
         std::fs::remove_dir_all(dir).ok();
     }
 

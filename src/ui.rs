@@ -30,7 +30,7 @@ use crate::render::{RenderOptions, TokenRenderer};
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
-use crate::tools::{ToolContext, dispatch_all};
+use crate::tools::{ToolContext, dispatch, dispatch_all};
 use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
@@ -316,6 +316,16 @@ fn btw_user_message(question: &str) -> String {
          \n\
          {question}"
     )
+}
+
+/// A [`RenderSink`] that discards everything. Used by the sub-agent driver
+/// (issue #50), whose sidechain generation must run the same [`StreamRenderer`]
+/// call/greedy detection as a normal turn but produce no on-screen output.
+struct NullSink;
+
+impl RenderSink for NullSink {
+    fn visible_text(&mut self, _text: &str) {}
+    fn think_text(&mut self, _text: &str) {}
 }
 
 /// Builds the model-visible payload for a failed generation pass, matching
@@ -852,6 +862,205 @@ impl Agent<'_> {
         Ok((stream, assistant_text, stats))
     }
 
+    /// Executes one DSML block's tool calls, routing any `agent` call through
+    /// the sub-agent driver (issue #50) and everything else through the normal
+    /// [`dispatch_all`]. Frames results identically to [`dispatch_all`] so the
+    /// model sees the same `Tool result K (name):` headers regardless of path.
+    ///
+    /// The common case (no `agent` call) delegates straight to `dispatch_all`
+    /// for zero behavioral change; the special path only engages when the model
+    /// actually delegates.
+    fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
+        use std::fmt::Write as _;
+        if !calls.iter().any(|c| c.name == "agent") {
+            return dispatch_all(calls, &mut self.tool_ctx);
+        }
+        if calls.is_empty() {
+            return "Tool error: empty tool call block\n".to_string();
+        }
+        // Mirror dispatch_all: clear any undrained previews so cards never leak.
+        self.tool_ctx.edit_previews.clear();
+        let mut all = String::new();
+        for (i, call) in calls.iter().enumerate() {
+            let out = if call.name == "agent" {
+                self.run_agent_tool(call)
+            } else {
+                dispatch(call, &mut self.tool_ctx).output
+            };
+            let name = if call.name.is_empty() {
+                "unknown"
+            } else {
+                call.name.as_str()
+            };
+            let _ = writeln!(all, "Tool result {} ({}):", i + 1, name);
+            all.push_str(&out);
+            if !out.is_empty() && !out.ends_with('\n') {
+                all.push('\n');
+            }
+        }
+        all
+    }
+
+    /// Runs the model-invocable `agent` tool: delegates `task` to a fresh scoped
+    /// sub-agent (a sidechain fork of the live transcript) and returns only its
+    /// final report as the tool observation (issue #50). The sidechain shares
+    /// the parent transcript prefix, so the engine reuses the parent KV cache on
+    /// the way in and rolls the fork back out afterward.
+    fn run_agent_tool(&mut self, call: &ToolCall) -> String {
+        let task = call
+            .arg_value("task")
+            .or_else(|| call.arg_value("prompt"))
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        if task.is_empty() {
+            return "Tool error: agent requires a non-empty 'task' to delegate\n".to_string();
+        }
+        if self.tool_ctx.subagent_depth >= crate::tools::SUBAGENT_DEPTH_CAP {
+            return "Tool error: sub-agent nesting limit reached; complete this work directly\n"
+                .to_string();
+        }
+        let name = call.arg_value("name").unwrap_or("").trim();
+        let instructions = if name.is_empty() {
+            None
+        } else {
+            match self.agents.iter().find(|d| d.name == name) {
+                Some(d) => Some(d.body.clone()),
+                None => return format!("Tool error: unknown agent '{name}'\n"),
+            }
+        };
+        let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+        self.tool_ctx.subagent_depth += 1;
+        let result = self.run_subagent_loop();
+        self.tool_ctx.subagent_depth -= 1;
+        // Extract the sidechain's final report before truncating it back out.
+        let report = self.session.transcript[fork_at..]
+            .iter()
+            .rev()
+            .find(|m| {
+                matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty()
+            })
+            .map(|m| m.text.trim().to_owned());
+        self.session.transcript.truncate(fork_at);
+        match result {
+            Err(e) => format!("Tool error: sub-agent failed: {e}\n"),
+            Ok(()) => match report {
+                Some(r) => format!("Sub-agent report:\n{r}\n"),
+                None => "Tool error: sub-agent produced no report\n".to_string(),
+            },
+        }
+    }
+
+    /// Headless generate→dispatch loop for a sub-agent sidechain (issue #50):
+    /// like the main turn loop but with no on-screen streaming, footer, hooks,
+    /// or compaction. Bounded by a round budget so a stuck sub-agent cannot loop
+    /// forever. Nested `agent` calls route through [`run_tool_calls`], so the
+    /// [`SUBAGENT_DEPTH_CAP`](crate::tools::SUBAGENT_DEPTH_CAP) guard applies.
+    fn run_subagent_loop(&mut self) -> Result<(), String> {
+        const MAX_ROUNDS: usize = 40;
+        let turn_start = Instant::now();
+        for _ in 0..MAX_ROUNDS {
+            let prompt_text = render_transcript(&self.session, &self.system);
+            let (calls, assistant_text, err) = self.generate_quiet(&prompt_text, turn_start)?;
+            self.session.push(Message::assistant(assistant_text));
+            if let Some(payload) = err {
+                self.session.push(Message::user(format!(
+                    "<tool_result>{payload}</tool_result>"
+                )));
+                continue;
+            }
+            if calls.is_empty() {
+                return Ok(());
+            }
+            let observations = self.run_tool_calls(&calls);
+            self.sync_tasks_after_dispatch();
+            // The sidechain has no UI to drain these into; discard so they never
+            // leak onto the parent turn's screen.
+            self.tool_ctx.edit_previews.clear();
+            self.tool_ctx.task_completions.clear();
+            self.tool_ctx.hook_warnings.clear();
+            self.session.push(Message::user(format!(
+                "<tool_result>{observations}</tool_result>"
+            )));
+        }
+        Err("sub-agent exceeded its round budget".to_string())
+    }
+
+    /// One quiet generation pass for the sub-agent loop: drives the engine with
+    /// a discarding sink (no stdout / TUI output) and returns the parsed tool
+    /// calls, the assistant text, and an optional tool-error payload to feed
+    /// back (preflight or engine-reported parse error). Mirrors the call/greedy
+    /// detection of [`stream_generation`] via the shared [`StreamRenderer`].
+    fn generate_quiet(
+        &mut self,
+        prompt_text: &str,
+        _turn_start: Instant,
+    ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
+        let mut stream = StreamRenderer::new(NullSink);
+        stream.set_preflight(edit_preflight(&self.tool_ctx));
+        if !matches!(
+            self.cfg.generation.think_mode,
+            crate::engine::ThinkMode::Off
+        ) && !self.engine.wants_structured()
+        {
+            stream.begin_in_think();
+        }
+        let mut assistant_text = String::new();
+        let preflight_stop = AtomicBool::new(false);
+        let greedy = AtomicBool::new(false);
+        let bufs = self
+            .engine
+            .wants_structured()
+            .then(|| self.build_structured(prompt_text));
+        let st;
+        let prompt = match &bufs {
+            Some(b) => {
+                st = crate::engine::StructuredTurn {
+                    system: &b.system,
+                    messages: &b.messages,
+                    tools: &b.tools,
+                    rendered: &b.rendered,
+                };
+                crate::engine::Prompt::Structured(&st)
+            }
+            None => crate::engine::Prompt::Flat(prompt_text),
+        };
+        let stats = self
+            .engine
+            .generate(
+                prompt,
+                &self.cfg.generation,
+                &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                &|| greedy.load(Ordering::Relaxed),
+                &mut |ev| {
+                    if let EngineEvent::Text(t) = ev {
+                        assistant_text.push_str(&t);
+                        stream.push(&t);
+                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
+                        if stream.preflight_error().is_some() {
+                            preflight_stop.store(true, Ordering::Relaxed);
+                        }
+                    }
+                },
+            )
+            .map_err(|e| e.to_string())?;
+        stream.finish();
+        self.record_usage(&stats);
+        self.last_ctx_used = stats.ctx_used;
+        let preflight_error = stream.preflight_error().map(str::to_owned);
+        if stats.interrupted && preflight_error.is_none() {
+            crate::interrupt::clear();
+            return Err("interrupted".to_string());
+        }
+        let finished = stream.finished();
+        if let Some(err) = preflight_error.as_deref().or(finished.error) {
+            let payload = tool_error_payload(preflight_error.is_some(), err);
+            return Ok((Vec::new(), assistant_text, Some(payload)));
+        }
+        let calls = finished.calls.to_vec();
+        Ok((calls, assistant_text, None))
+    }
+
     /// Runs one model turn: stream text, execute tool calls, repeat until
     /// a turn produces no tool calls. Compacts first when context is tight.
     /// Mirrors the live task list back onto the session after a tool dispatch
@@ -924,7 +1133,8 @@ impl Agent<'_> {
                 continue;
             }
             if !finished.calls.is_empty() {
-                let observations = dispatch_all(finished.calls, &mut self.tool_ctx);
+                let calls = finished.calls.to_vec();
+                let observations = self.run_tool_calls(&calls);
                 self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
@@ -3376,7 +3586,7 @@ impl Agent<'_> {
                 continue;
             }
             if !out.calls.is_empty() {
-                let observations = dispatch_all(&out.calls, &mut self.tool_ctx);
+                let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
                 for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
                     let _ = tx.send(UiEvent::EditCard(preview));
@@ -6606,6 +6816,96 @@ mod tests {
         assert_eq!(agent.load_session_payload(&loaded), None);
         // Stripping again still succeeds, like the C's rewrite.
         assert!(agent.strip_session(&id[..8]).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_tool_delegates_and_returns_only_the_report() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-agenttool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Main turn delegates via the `agent` tool.
+        let delegate = concat!(
+            "Delegating.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"agent\">",
+            "<｜DSML｜parameter name=\"task\" string=\"true\">count the tests</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        // The sub-agent runs a bash tool, then reports.
+        let sub_tool = concat!(
+            "Counting.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo 42</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let engine = ScriptedEngine {
+            replies: vec![
+                delegate.to_string(),
+                sub_tool.to_string(),
+                "There are 42 tests.\n".to_string(),
+                "Done: the sub-agent counted 42.\n".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[]),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
+        };
+        agent.session.push(Message::user("please count the tests"));
+        agent.run_turn().unwrap();
+
+        // Find the tool_result carrying the sub-agent's report.
+        let tool_result = agent
+            .session
+            .transcript
+            .iter()
+            .find(|m| m.text.contains("Tool result 1 (agent):"))
+            .expect("agent tool result present");
+        assert!(
+            tool_result.text.contains("Sub-agent report:"),
+            "missing report framing: {}",
+            tool_result.text
+        );
+        assert!(
+            tool_result.text.contains("There are 42 tests."),
+            "missing report body: {}",
+            tool_result.text
+        );
+        // The sidechain's internal bash call must not leak into the parent.
+        assert!(
+            !tool_result.text.contains("echo 42"),
+            "sidechain leaked: {}",
+            tool_result.text
+        );
+        // The final assistant message concludes the main turn.
+        let last = agent.session.transcript.last().unwrap();
+        assert!(last.text.contains("Done: the sub-agent counted 42."));
         std::fs::remove_dir_all(&dir).ok();
     }
 

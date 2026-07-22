@@ -303,3 +303,43 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "agent",
+    "description": "Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research (locate where X is handled, summarize how Y works) or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "task": {"type": "string", "description": "the complete, standalone task to delegate; include all needed context"},
+        "name": {"type": "string", "description": "optional configured agent name to act as; omit for a general-purpose sub-agent"}
+      },
+      "required": ["task"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "EnterPlanMode",
+    "description": "Enter read-only plan mode: research and design without changing anything. While it is active, write/edit/bash are refused; only read-only tools work. Use it when a task is risky or ambiguous and the user should approve an approach before you edit. Exit with ExitPlanMode.",
+    "parameters": {
+      "type": "object",
+      "properties": {}
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "ExitPlanMode",
+    "description": "Leave plan mode by presenting your proposed plan for the user's approval. On approval the read-only gate lifts and you may edit; otherwise plan mode stays on and you should refine the plan. 'plan' is the full proposed plan.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "plan": {"type": "string", "description": "the full plan to carry out, for the user to approve"}
+      },
+      "required": ["plan"]
+    }
+  }
+}
