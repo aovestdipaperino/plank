@@ -32,6 +32,8 @@ pub enum FieldId {
     UiShowToolCalls,
     UiShowToolResults,
     UiShowThinking,
+    UiNotifications,
+    UiNotifyAfterSecs,
     SafetySandbox,
     SafetyBtwSuspend,
     McpTimeoutSecs,
@@ -158,6 +160,20 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::UiNotifications,
+        "ui",
+        "notifications",
+        "macOS desktop notifications on turn events",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::UiNotifyAfterSecs,
+        "ui",
+        "notifyAfterSecs",
+        "min turn seconds before a complete notification",
+        Kind::Count,
+    ),
+    f(
         FieldId::SafetySandbox,
         "safety",
         "sandbox",
@@ -254,6 +270,8 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls.to_string(),
         FieldId::UiShowToolResults => s.ui.show_tool_results.to_string(),
         FieldId::UiShowThinking => s.ui.show_thinking.to_string(),
+        FieldId::UiNotifications => s.ui.notifications.to_string(),
+        FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::SafetySandbox => tri_str(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
@@ -279,6 +297,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = !s.ui.show_tool_calls,
         FieldId::UiShowToolResults => s.ui.show_tool_results = !s.ui.show_tool_results,
         FieldId::UiShowThinking => s.ui.show_thinking = !s.ui.show_thinking,
+        FieldId::UiNotifications => s.ui.notifications = !s.ui.notifications,
         FieldId::ToolsTask => s.tools.task = !s.tools.task,
         FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
         FieldId::ToolsPlanMode => s.tools.plan_mode = !s.tools.plan_mode,
@@ -340,6 +359,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
             s.ui.popup_rows = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
         }
         FieldId::UiIndexRefreshSecs => s.ui.index_refresh_secs = parse_pos(0)?,
+        FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs = parse_pos(0)?,
         FieldId::UiHistorySize => {
             s.ui.history_size = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
         }
@@ -353,6 +373,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiShowToolCalls
         | FieldId::UiShowToolResults
         | FieldId::UiShowThinking
+        | FieldId::UiNotifications
         | FieldId::ToolsTask
         | FieldId::ToolsAgent
         | FieldId::ToolsPlanMode => {
@@ -371,6 +392,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = b,
         FieldId::UiShowToolResults => s.ui.show_tool_results = b,
         FieldId::UiShowThinking => s.ui.show_thinking = b,
+        FieldId::UiNotifications => s.ui.notifications = b,
         FieldId::ToolsTask => s.tools.task = b,
         FieldId::ToolsAgent => s.tools.agent = b,
         FieldId::ToolsPlanMode => s.tools.plan_mode = b,

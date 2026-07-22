@@ -98,6 +98,12 @@ pub struct UiSettings {
     /// default; when off, thinking is hidden from the display but the model
     /// still produces it.
     pub show_thinking: bool,
+    /// Fire native macOS desktop notifications at turn lifecycle points
+    /// (turn complete past the threshold, and awaiting input). On by default.
+    pub notifications: bool,
+    /// Minimum turn duration, in seconds, before a completed turn notifies.
+    /// Awaiting-input notifications ignore this. Default 10.
+    pub notify_after_secs: u64,
 }
 
 impl Default for UiSettings {
@@ -110,6 +116,8 @@ impl Default for UiSettings {
             show_tool_calls: false,
             show_tool_results: false,
             show_thinking: true,
+            notifications: true,
+            notify_after_secs: 10,
         }
     }
 }
@@ -267,6 +275,12 @@ impl Settings {
         if let Some(v) = boolean(ui, "showThinking") {
             self.ui.show_thinking = v;
         }
+        if let Some(v) = boolean(ui, "notifications") {
+            self.ui.notifications = v;
+        }
+        if let Some(v) = num(ui, "notifyAfterSecs") {
+            self.ui.notify_after_secs = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -403,6 +417,12 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.ui.show_thinking != d.ui.show_thinking {
         parts.push(format!("showThinking={}", s.ui.show_thinking));
+    }
+    if s.ui.notifications != d.ui.notifications {
+        parts.push(format!("notifications={}", s.ui.notifications));
+    }
+    if s.ui.notify_after_secs != d.ui.notify_after_secs {
+        parts.push(format!("notifyAfterSecs={}", s.ui.notify_after_secs));
     }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
@@ -566,6 +586,8 @@ impl Settings {
             upsert(u, "showToolCalls", Json::Bool(self.ui.show_tool_calls));
             upsert(u, "showToolResults", Json::Bool(self.ui.show_tool_results));
             upsert(u, "showThinking", Json::Bool(self.ui.show_thinking));
+            upsert(u, "notifications", Json::Bool(self.ui.notifications));
+            upsert(u, "notifyAfterSecs", unum(self.ui.notify_after_secs));
         }
         {
             let s = section(&mut root, "safety");
@@ -870,5 +892,22 @@ mod tests {
     fn active_is_the_defaults_until_installed() {
         // Tests never call `install`, so every consumer sees the defaults.
         assert_eq!(active().ui.popup_rows, 15);
+    }
+
+    #[test]
+    fn notification_defaults_and_overlay() {
+        let s = Settings::default();
+        assert!(s.ui.notifications);
+        assert_eq!(s.ui.notify_after_secs, 10);
+
+        let mut s = Settings::default();
+        s.overlay(r#"{ "ui": { "notifications": false, "notifyAfterSecs": 30 } }"#);
+        assert!(!s.ui.notifications);
+        assert_eq!(s.ui.notify_after_secs, 30);
+
+        // Bad value ignored, default retained.
+        let mut s = Settings::default();
+        s.overlay(r#"{ "ui": { "notifyAfterSecs": "nope" } }"#);
+        assert_eq!(s.ui.notify_after_secs, 10);
     }
 }

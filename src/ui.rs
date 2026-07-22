@@ -1079,6 +1079,7 @@ impl Agent<'_> {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
         self.tool_ctx.skill_invocations = 0;
         // The session owns the persisted task list; load it into the live tool
@@ -1185,6 +1186,12 @@ impl Agent<'_> {
             }
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
+            }
+            if crate::notify::should_notify_complete(
+                turn_start.elapsed(),
+                crate::settings::active().ui.notify_after_secs,
+            ) {
+                crate::notify::notify("plank", "Turn complete");
             }
             return Ok(());
         }
@@ -1975,6 +1982,7 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
+            "/notify" => println!("{}", Self::notify_command(arg)),
             "/strip" => {
                 if arg.is_empty() {
                     println!("usage: /strip <sha-prefix>");
@@ -2347,6 +2355,19 @@ impl Agent<'_> {
             .count_tokens(&render_transcript(&s, &self.system))
             .max(0);
         Ok((id, tokens))
+    }
+
+    /// Parses a `/notify [on|off]` argument and applies it; returns the
+    /// status line to report to the user.
+    fn notify_command(arg: &str) -> String {
+        let new_state = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            "" => !crate::notify::enabled(),
+            other => return format!("/notify: expected on|off, got `{other}`"),
+        };
+        crate::notify::set_enabled(new_state);
+        format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
@@ -3421,6 +3442,12 @@ impl Agent<'_> {
         // With a remote bridge, share its persistent `TurnShared` so remote
         // `prompt`/`btw`/`interrupt` frames land in the same queues the local
         // editor uses, and mirror every event onto its bus (issue #25).
+        // Stamped once at the outermost per-user-turn boundary for the TUI
+        // front end: `tui_turn` is called exactly once per user submission
+        // (see call sites in `tui_loop`/`busy_ui_loop`), even though its own
+        // inner loop may run extra rounds for leftover queued lines or a
+        // btw-only drain.
+        let turn_started = Instant::now();
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
         // Same remote-control state the idle loop uses: a turn started by an
@@ -3481,6 +3508,12 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                if crate::notify::should_notify_complete(
+                    turn_started.elapsed(),
+                    crate::settings::active().ui.notify_after_secs,
+                ) {
+                    crate::notify::notify("plank", "Turn complete");
+                }
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -3501,10 +3534,15 @@ impl Agent<'_> {
             return self.run_turn();
         };
         self.tool_ctx.skill_invocations = 0;
+        // Outermost per-user-turn boundary for the headless remote path: when
+        // a remote bridge is present this function (not `worker_turn`, which
+        // it drives on a scoped thread) is the single call per queued line in
+        // `pump_remote`, so the stamp/notify belongs here, not in the delegate.
+        let turn_started = Instant::now();
         let bus = Arc::clone(&remote.bus);
         let shared = &remote.shared;
         let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
-        std::thread::scope(|s| {
+        let result = std::thread::scope(|s| {
             let worker = s.spawn(|| self.worker_turn(&tx, shared));
             loop {
                 while let Ok(ev) = rx.try_recv() {
@@ -3522,7 +3560,16 @@ impl Agent<'_> {
             worker
                 .join()
                 .map_err(|_| "worker thread panicked".to_owned())?
-        })
+        });
+        if result.is_ok()
+            && crate::notify::should_notify_complete(
+                turn_started.elapsed(),
+                crate::settings::active().ui.notify_after_secs,
+            )
+        {
+            crate::notify::notify("plank", "Turn complete");
+        }
+        result
     }
 
     /// Drains the remote controller's pending input once: a mirrored turn for
@@ -4274,6 +4321,7 @@ impl Agent<'_> {
                 }
                 None => log.push_plain("usage: /power <1..100>"),
             },
+            "/notify" => log.push_plain(Self::notify_command(arg)),
             "/strip" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /strip <sha-prefix>");
@@ -4579,6 +4627,11 @@ fn busy_ui_loop(
     // `/btw` truncates back to it so the discarded partial output does not
     // duplicate when the pass re-runs.
     let mut main_checkpoint = 0usize;
+    // Latches so a given pending `ask` question notifies at most once: set
+    // when we notify, reset as soon as the bridge is observed not pending.
+    // Guards against `run_ask_panel` returning while still pending, which
+    // would otherwise re-notify for the same question on the next iteration.
+    let mut ask_notified = false;
     loop {
         // An `ask` question parked by the worker takes over the input region
         // until answered; the worker is blocked meanwhile, so no render events
@@ -4586,6 +4639,10 @@ fn busy_ui_loop(
         if let Some(bridge) = ask
             && bridge.is_pending()
         {
+            if !ask_notified {
+                crate::notify::notify("plank", "Waiting for your input");
+                ask_notified = true;
+            }
             run_ask_panel(
                 terminal,
                 log,
@@ -4597,6 +4654,7 @@ fn busy_ui_loop(
             )?;
             continue;
         }
+        ask_notified = false;
         while let Ok(ev) = rx.try_recv() {
             // Mirror every worker event onto the remote bus so remote clients
             // see the same stream as the local TUI (issue #25, dual-path).
@@ -4960,6 +5018,11 @@ pub fn run_interactive(
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, true, remote)?;
 
+    // Seed the notification enable flag once, before either front-end loop
+    // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
+    // one entry point, so this covers both).
+    crate::notify::set_enabled(crate::settings::active().ui.notifications);
+
     // `plank /resume [prefix]` loads a prior session before the loop starts.
     let resumed = cfg.resume.is_some();
     if let Some(arg) = &cfg.resume {
@@ -5245,6 +5308,9 @@ pub fn run_non_interactive(
     remote: Option<Arc<RemoteState>>,
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, false, remote)?;
+    // Seed the notification enable flag once, mirroring `run_interactive`, so
+    // headless/non-interactive runs also honor `ui.notifications`.
+    crate::notify::set_enabled(crate::settings::active().ui.notifications);
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
@@ -6433,6 +6499,27 @@ mod tests {
         let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert!(d.resume_from_cli("nonexistent0").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notify_command_toggles_and_reports() {
+        let _g = crate::notify::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::notify::set_enabled(true);
+        let off = Agent::notify_command("off");
+        assert!(off.to_lowercase().contains("off"));
+        assert!(!crate::notify::enabled());
+        let on = Agent::notify_command("on");
+        assert!(on.to_lowercase().contains("on"));
+        assert!(crate::notify::enabled());
+        // bare toggle flips
+        Agent::notify_command("");
+        assert!(!crate::notify::enabled());
+        // unknown arg reports an error and doesn't change state
+        let err = Agent::notify_command("bogus");
+        assert!(err.contains("bogus"));
+        assert!(!crate::notify::enabled());
     }
 
     #[test]
