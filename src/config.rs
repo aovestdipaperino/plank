@@ -595,6 +595,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
         || slash_command_with_args(cmd, "/history")
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
+        || slash_command_with_args(cmd, "/notify")
 }
 
 /// Parses one engine-tuning option that takes a value (already extracted as

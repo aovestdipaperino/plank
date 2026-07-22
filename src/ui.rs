@@ -1982,6 +1982,7 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
+            "/notify" => println!("{}", Self::notify_command(arg)),
             "/strip" => {
                 if arg.is_empty() {
                     println!("usage: /strip <sha-prefix>");
@@ -2354,6 +2355,19 @@ impl Agent<'_> {
             .count_tokens(&render_transcript(&s, &self.system))
             .max(0);
         Ok((id, tokens))
+    }
+
+    /// Parses a `/notify [on|off]` argument and applies it; returns the
+    /// status line to report to the user.
+    fn notify_command(arg: &str) -> String {
+        let new_state = match arg.trim() {
+            "on" => true,
+            "off" => false,
+            "" => !crate::notify::enabled(),
+            other => return format!("/notify: expected on|off, got `{other}`"),
+        };
+        crate::notify::set_enabled(new_state);
+        format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
@@ -4307,6 +4321,7 @@ impl Agent<'_> {
                 }
                 None => log.push_plain("usage: /power <1..100>"),
             },
+            "/notify" => log.push_plain(Self::notify_command(arg)),
             "/strip" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /strip <sha-prefix>");
@@ -6472,6 +6487,24 @@ mod tests {
         let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert!(d.resume_from_cli("nonexistent0").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn notify_command_toggles_and_reports() {
+        crate::notify::set_enabled(true);
+        let off = Agent::notify_command("off");
+        assert!(off.to_lowercase().contains("off"));
+        assert!(!crate::notify::enabled());
+        let on = Agent::notify_command("on");
+        assert!(on.to_lowercase().contains("on"));
+        assert!(crate::notify::enabled());
+        // bare toggle flips
+        Agent::notify_command("");
+        assert!(!crate::notify::enabled());
+        // unknown arg reports an error and doesn't change state
+        let err = Agent::notify_command("bogus");
+        assert!(err.contains("bogus"));
+        assert!(!crate::notify::enabled());
     }
 
     #[test]
