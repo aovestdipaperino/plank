@@ -23,7 +23,7 @@ use std::sync::{Arc, OnceLock};
 
 use ratatui_markdown::ThemeConfig;
 use ratatui_markdown::highlight::{HighlightHooks, TreeSitterHighlighter};
-use ratatui_markdown::markdown::MarkdownRenderer;
+use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 
 use crate::viz::RenderSink;
 
@@ -76,9 +76,16 @@ fn line_text(line: &Line<'_>) -> String {
 
 /// Appends the `⧉ copy` control to every code-block header in `lines[from..]`
 /// and returns the regions found there (with absolute `lines` indices). A block
-/// runs from a `╭` header to its `╰` footer; body rows contribute their text
-/// with the `│ ` gutter stripped.
-fn annotate_code_blocks(lines: &mut [Line<'static>], from: usize) -> Vec<CodeBlockRegion> {
+/// runs from a `╭` header to its `╰` footer. Each region's copied text is the
+/// verbatim source from `raw_codes` (the Nth `╭` header pairs with the Nth
+/// entry, both in document order); if that pairing is unavailable it falls back
+/// to the rendered body rows with the `│ ` gutter stripped — which may include
+/// soft-wrap breaks, so it is a last resort only.
+fn annotate_code_blocks(
+    lines: &mut [Line<'static>],
+    from: usize,
+    raw_codes: &[&str],
+) -> Vec<CodeBlockRegion> {
     let mut regions = Vec::new();
     let mut i = from;
     while i < lines.len() {
@@ -108,10 +115,14 @@ fn annotate_code_blocks(lines: &mut [Line<'static>], from: usize) -> Vec<CodeBlo
                 .fg(Color::Indexed(245))
                 .add_modifier(Modifier::DIM),
         ));
+        let code = raw_codes.get(regions.len()).map_or_else(
+            || code_lines.join("\n"),
+            |raw| raw.trim_end_matches('\n').to_owned(),
+        );
         regions.push(CodeBlockRegion {
             header,
             copy_cols: (start_col, end_col.saturating_sub(1)),
-            code: code_lines.join("\n"),
+            code,
         });
         // Resume past the footer (or at EOF for a still-streaming block).
         i = j + 1;
@@ -181,13 +192,26 @@ impl OutputLog {
         let md = MarkdownRenderer::new(width)
             .with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
         let blocks = md.parse(&self.md_buf);
+        // The verbatim source of each top-level code block, in document order.
+        // Copying must use this, not the rendered rows: the renderer soft-wraps
+        // long lines to the width, and reading those wrapped rows back would
+        // turn every wrap point into a spurious newline. Blockquoted code blocks
+        // are excluded here just as they are skipped by `annotate_code_blocks`
+        // (their headers carry a gutter prefix), so the two lists stay aligned.
+        let raw_codes: Vec<&str> = blocks
+            .iter()
+            .filter_map(|b| match b {
+                MarkdownBlock::CodeBlock { code, .. } => Some(code.as_str()),
+                _ => None,
+            })
+            .collect();
         self.lines.truncate(start);
         self.lines.extend(md.render(&blocks, &ThemeConfig::new()));
         // Rebuild the code-block registry for the re-rendered segment; blocks
         // in committed earlier segments keep their (stable) indices.
         self.code_blocks.retain(|r| r.header < start);
         self.code_blocks
-            .extend(annotate_code_blocks(&mut self.lines, start));
+            .extend(annotate_code_blocks(&mut self.lines, start, &raw_codes));
     }
 
     /// Appends a fully-styled standalone line (e.g. the user echo).
@@ -2044,6 +2068,22 @@ mod tests {
         assert!(header.starts_with("╭"), "header: {header:?}");
         assert!(header.contains("rust"), "header: {header:?}");
         assert!(header.contains("copy"), "header: {header:?}");
+    }
+
+    #[test]
+    fn code_copy_preserves_long_lines_across_soft_wrap() {
+        // A single source line longer than the (test-default 80) render width
+        // is soft-wrapped into several rendered rows. Copying must yield the
+        // original one line, not the wrapped rows joined by newlines.
+        let mut log = OutputLog::new();
+        let source = "x".repeat(200);
+        log.visible_text(&format!("```bash\n{source}\n```\n"));
+        assert_eq!(log.code_blocks.len(), 1, "one block recorded");
+        assert_eq!(log.code_blocks[0].code, source);
+        assert!(
+            !log.code_blocks[0].code.contains('\n'),
+            "soft-wrap must not introduce newlines"
+        );
     }
 
     #[test]
