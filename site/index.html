@@ -159,6 +159,18 @@
   .term pre{margin:0;padding:18px 18px 22px;color:#e7dcc7;font-size:13.5px;line-height:1.72;overflow-x:auto}
   .term .u{color:#5cc797}.term .k{color:#e8ad4c}.term .d{color:#8a7a63}.term .p{color:#ff7259}
 
+  /* screenshots */
+  .shots{display:flex;flex-direction:column;gap:22px;margin-top:8px}
+  .shot{background:var(--paper);border:2px solid var(--line);border-radius:18px;overflow:hidden;
+    box-shadow:0 10px 0 rgb(var(--shadow) / .08);margin:0}
+  .shot .frame{display:flex;gap:7px;align-items:center;padding:10px 13px;
+    background:color-mix(in srgb,var(--line) 45%,var(--paper));border-bottom:2px solid var(--line)}
+  .shot .frame i{width:11px;height:11px;border-radius:50%;display:block}
+  .shot .frame b{margin-left:6px;font-size:13px;font-weight:800;color:var(--bark-soft)}
+  .shot img{display:block;width:100%;height:auto;background:#161009}
+  .shot figcaption{padding:13px 16px;font-size:14.5px;color:var(--bark-soft)}
+  .shot figcaption b{color:var(--bark);font-weight:800}
+
   /* footer */
   footer{border-top:2px dashed var(--line);margin-top:20px;padding:26px 0 46px;color:var(--bark-soft);font-size:14px}
   .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
@@ -296,6 +308,31 @@
 <span class="u">you ▸</span> ship it
 <span class="p">plank ▸</span> that's a you decision, friend. i'm a board.
 </pre>
+      </div>
+    </section>
+
+    <section>
+      <p class="kicker">Real screenshots, no mockups</p>
+      <h2 class="rounded">Yes, it actually does this.</h2>
+      <div class="shots">
+        <figure class="shot">
+          <div class="frame"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><b>plank — lock-free queue in Rust</b></div>
+          <img loading="lazy" decoding="async" src="https://raw.githubusercontent.com/aovestdipaperino/plank/main/assets/syntax-highlighting.png"
+               alt="plank writing a lock-free MPSC queue in Rust: dimmed thinking text above a syntax-highlighted code block">
+          <figcaption><b>Writing a lock-free MPSC queue in Rust.</b> Reasoning dimmed up top, code syntax-highlighted below — every token generated on your Mac.</figcaption>
+        </figure>
+        <figure class="shot">
+          <div class="frame"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><b>plank — /context</b></div>
+          <img loading="lazy" decoding="async" src="https://raw.githubusercontent.com/aovestdipaperino/plank/main/assets/context-usage.png"
+               alt="plank's /context report showing 12.4k of 1,000,000 tokens used on DeepSeek V4 Flash, broken down by category">
+          <figcaption><b>The <span class="mono">/context</span> report.</b> 12.4k of 1,000,000 tokens used — DeepSeek V4 Flash still has 98.8% of the workshop free.</figcaption>
+        </figure>
+        <figure class="shot">
+          <div class="frame"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><b>plank — /btw split view</b></div>
+          <img loading="lazy" decoding="async" src="https://raw.githubusercontent.com/aovestdipaperino/plank/main/assets/btw-panel.png"
+               alt="plank split view: a task counting 1 to 20 on the left, a /btw side question answered on the right">
+          <figcaption><b>Split brain.</b> A task counts 1–20 on the left while a throwaway <span class="mono">/btw</span> question gets answered on the right — without ever touching the real conversation.</figcaption>
+        </figure>
       </div>
     </section>
   </main>
