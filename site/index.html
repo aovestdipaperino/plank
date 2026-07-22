@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plank — the agent local inference deserves</title>
+<meta name="description" content="A coding agent that runs entirely on your Mac. No cloud, no API keys, no queue. Just you, your Metal GPU, and a very good piece of wood.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+  :root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+  :root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.6; font-size:17px;
+    -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  /* top bar */
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{
+    font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;
+  }
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+
+  /* hero */
+  .hero{display:flex;gap:30px;align-items:center;padding:34px 0 12px;flex-wrap:wrap}
+  .hero .copy{flex:1 1 340px;min-width:280px}
+  .eyebrow{
+    display:inline-block;font-size:12.5px;font-weight:800;letter-spacing:.09em;
+    text-transform:uppercase;color:var(--honey-ink);
+    background:color-mix(in srgb,var(--honey) 18%,transparent);
+    padding:5px 11px;border-radius:999px;
+  }
+  h1{
+    font-size:clamp(40px,7vw,66px);line-height:1.02;letter-spacing:-.03em;
+    margin:.34em 0 .12em;text-wrap:balance;font-weight:820;
+  }
+  h1 .say{color:var(--honey)}
+  .tag{font-size:clamp(19px,2.6vw,23px);color:var(--bark-soft);font-weight:600;margin:.2em 0 1em;text-wrap:balance}
+  .tag b{color:var(--pine);font-weight:800}
+  .blurb{max-width:52ch;color:var(--bark);margin:0 0 22px}
+
+  /* install box */
+  .install{
+    display:flex;align-items:center;gap:10px;background:var(--paper);
+    border:2px solid var(--line);border-radius:16px;padding:13px 14px;max-width:520px;
+    box-shadow:0 6px 0 rgb(var(--shadow) / .08);
+  }
+  .install .prompt{color:var(--honey);font-weight:700}
+  .install code{flex:1;font-size:14.5px;color:var(--bark);white-space:nowrap;overflow-x:auto}
+  .copybtn{
+    border:0;cursor:pointer;font-weight:800;font-size:13px;color:#fff;background:var(--pine);
+    border-radius:10px;padding:8px 13px;transition:transform .1s,filter .15s;white-space:nowrap;
+  }
+  .copybtn:hover{filter:brightness(1.06);transform:translateY(-1px)}
+  .copybtn:active{transform:translateY(1px)}
+  .beta-note{font-size:13.5px;color:var(--bark-soft);margin:10px 2px 0}
+
+  /* mascot */
+  .stage{flex:0 0 240px;display:flex;justify-content:center}
+  .plank{
+    --w:150px;position:relative;width:var(--w);height:calc(var(--w)*1.36);
+    background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#e7b463,#cf9038 55%,#b9791f);
+    border-radius:24px;box-shadow:0 16px 0 rgb(var(--shadow) / .12), inset 0 0 0 3px #ffffff30;
+    transform:rotate(-5deg);transform-origin:50% 100%;
+    animation:wobble 5.5s ease-in-out infinite;
+  }
+  @media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+  .knot{position:absolute;width:18px;height:13px;border-radius:50%;background:#00000022;left:22px;bottom:26px}
+  .face{position:absolute;top:34px;left:0;right:0;display:flex;flex-direction:column;align-items:center;gap:11px}
+  .eyes{display:flex;gap:20px}
+  .eye{width:34px;height:34px;border-radius:50%;background:#fff;box-shadow:inset 0 2px 3px #00000030;display:flex;align-items:center;justify-content:center}
+  .pupil{width:13px;height:13px;border-radius:50%;background:#2b2018;animation:look 5.5s ease-in-out infinite}
+  .mouth{width:34px;height:17px;border:3.5px solid #2b2018;border-top:0;border-radius:0 0 22px 22px}
+  .blush{position:absolute;top:78px;width:15px;height:9px;border-radius:50%;background:#e2503a55}
+  .blush.l{left:20px} .blush.r{right:20px}
+  @keyframes wobble{0%,100%{transform:rotate(-5deg)}50%{transform:rotate(4deg)}}
+  @keyframes look{0%,100%{transform:translateX(-3px)}50%{transform:translateX(3px)}}
+  @media (prefers-reduced-motion:reduce){.plank{animation:none}.pupil{animation:none}}
+
+  /* section scaffolding */
+  section{padding:30px 0}
+  .kicker{font-size:12.5px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--bark-soft);margin:0 0 14px}
+  h2{font-size:clamp(26px,4vw,34px);letter-spacing:-.02em;margin:0 0 6px;font-weight:800;text-wrap:balance}
+
+  /* why-local pills */
+  .whys{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px;margin-top:8px}
+  .why{background:var(--paper);border:2px solid var(--line);border-radius:16px;padding:16px 17px}
+  .why .big{font-size:26px}
+  .why h3{margin:8px 0 3px;font-size:17.5px;font-weight:800}
+  .why p{margin:0;font-size:14.5px;color:var(--bark-soft)}
+
+  /* feature cards */
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+  .card{
+    background:var(--paper);border:2px solid var(--line);border-radius:18px;padding:20px;
+    box-shadow:0 8px 0 rgb(var(--shadow) / .07);transition:transform .12s,box-shadow .12s;
+  }
+  .card:hover{transform:translateY(-3px);box-shadow:0 11px 0 rgb(var(--shadow) / .1)}
+  .card .ico{font-size:30px;line-height:1}
+  .card h3{margin:12px 0 5px;font-size:19px;font-weight:800}
+  .card p{margin:0;color:var(--bark-soft);font-size:15px}
+
+  /* terminal */
+  .term{background:#161009;border-radius:16px;overflow:hidden;border:2px solid #000;box-shadow:0 14px 0 rgb(var(--shadow) / .14)}
+  .term .top{display:flex;gap:8px;align-items:center;padding:11px 14px;background:#22190f}
+  .term .top i{width:12px;height:12px;border-radius:50%;display:block}
+  .dot-r{background:#ff5f57}.dot-y{background:#febc2e}.dot-g{background:#28c840}
+  .term .top span{margin-left:8px;color:#b7a78c;font-size:13px}
+  .term pre{margin:0;padding:18px 18px 22px;color:#e7dcc7;font-size:13.5px;line-height:1.72;overflow-x:auto}
+  .term .u{color:#5cc797}.term .k{color:#e8ad4c}.term .d{color:#8a7a63}.term .p{color:#ff7259}
+
+  /* footer */
+  footer{border-top:2px dashed var(--line);margin-top:20px;padding:26px 0 46px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  footer a{font-weight:700}
+  .fine{margin-top:14px;font-size:12.5px;opacity:.85;max-width:60ch}
+
+  .toast{
+    position:fixed;left:50%;bottom:26px;transform:translateX(-50%) translateY(20px);
+    background:var(--bark);color:var(--birch);padding:11px 18px;border-radius:999px;
+    font-weight:700;font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;z-index:9;
+  }
+  .toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="bar">
+      <div class="brand rounded"><span class="chip">🪵</span> plank</div>
+      <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="hero">
+      <div class="copy">
+        <span class="eyebrow">Local-first coding agent · macOS</span>
+        <h1 class="rounded">Meet Plank.<br>It's <span class="say">a good board.</span></h1>
+        <p class="tag rounded">The agent <b>local inference</b> deserves.</p>
+        <p class="blurb">A coding agent that runs entirely on your Mac. No cloud, no API keys,
+        no <span class="mono">“your request has been queued.”</span> Just you, your Metal GPU,
+        and a suspiciously capable piece of wood.</p>
+
+        <div class="install">
+          <span class="prompt mono">$</span>
+          <code class="mono" id="cmd">brew install aovestdipaperino/tap/plank-beta</code>
+          <button class="copybtn rounded" onclick="copyCmd()">Copy</button>
+        </div>
+        <p class="beta-note">Currently in beta — like all good lumber, still curing. <span class="mono">v2.3.2</span></p>
+      </div>
+
+      <div class="stage" aria-hidden="true">
+        <div class="plank">
+          <span class="knot"></span>
+          <div class="face">
+            <div class="eyes">
+              <span class="eye"><span class="pupil"></span></span>
+              <span class="eye"><span class="pupil"></span></span>
+            </div>
+            <span class="mouth"></span>
+          </div>
+          <span class="blush l"></span><span class="blush r"></span>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <p class="kicker">Why keep it local</p>
+      <h2 class="rounded">Your code stays in the workshop.</h2>
+      <div class="whys">
+        <div class="why">
+          <div class="big">✈️</div>
+          <h3>Works in airplane mode</h3>
+          <p>The only agent that respects your window seat. Zero bars, full brain.</p>
+        </div>
+        <div class="why">
+          <div class="big">🔒</div>
+          <h3>No secrets leave the Mac</h3>
+          <p>Your API keys, your NDAs, your embarrassing variable names — all stay home.</p>
+        </div>
+        <div class="why">
+          <div class="big">🧾</div>
+          <h3>$0.00 per token</h3>
+          <p>The bill for local inference is a slightly warmer laptop. That's the whole invoice.</p>
+        </div>
+        <div class="why">
+          <div class="big">⚡</div>
+          <h3>No round trips</h3>
+          <p>Runs on the DeepSeek V4 Flash model, right there on Metal. The latency is you thinking.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <p class="kicker">What's in the box</p>
+      <h2 class="rounded">Batteries, tools, and one plank.</h2>
+      <div class="cards">
+        <div class="card">
+          <div class="ico">⌨️</div>
+          <h3 class="rounded">Lives in your terminal</h3>
+          <p>A cozy Ratatui TUI with streaming output, thinking, diffs, and a status bar that occasionally roasts you.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🧰</div>
+          <h3 class="rounded">A full tool belt</h3>
+          <p>Read, edit, glob, bash (sync &amp; background jobs), web fetch — the boring superpowers that actually ship code.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🔌</div>
+          <h3 class="rounded">Speaks MCP</h3>
+          <p>Plug in your own MCP servers via a tidy <span class="mono">.mcp.json</span>. Plank makes friends easily.</p>
+        </div>
+        <div class="card">
+          <div class="ico">💾</div>
+          <h3 class="rounded">Remembers things</h3>
+          <p>Persistent sessions with a real KV-cache, so it only re-reads the new stuff. Elephants, meet lumber.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🔔</div>
+          <h3 class="rounded">Taps you on the shoulder</h3>
+          <p>Native macOS notifications when a turn finishes or it needs you. No hooks, no fuss.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🦀</div>
+          <h3 class="rounded">Written in Rust</h3>
+          <p>Fast, fearless, and it compiles clean under <span class="mono">-D warnings</span>. The plank has standards.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <p class="kicker">A day in the life</p>
+      <h2 class="rounded">You talk. Plank works.</h2>
+      <div class="term mono" role="img" aria-label="Example plank terminal session">
+        <div class="top"><i class="dot-r"></i><i class="dot-y"></i><i class="dot-g"></i><span>plank — ~/code/very-important-startup</span></div>
+<pre><span class="u">you ▸</span> add a dark mode toggle and don't break anything
+<span class="d">🪵 reading src/theme.rs … editing 3 files … running tests …</span>
+<span class="k">✓ 47 passing, 0 failed</span>
+<span class="d">🔔 turn complete</span>
+<span class="u">you ▸</span> ship it
+<span class="p">plank ▸</span> that's a you decision, friend. i'm a board.
+</pre>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footgrid">
+      <div class="brand rounded"><span class="chip">🪵</span> plank</div>
+      <div>
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a> ·
+        <a href="https://github.com/aovestdipaperino/homebrew-tap" target="_blank" rel="noopener">Homebrew tap</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). No planks were harmed in the making of this agent.
+    Not affiliated with your local hardware store. Please do not attempt to actually walk the plank.</p>
+  </footer>
+</div>
+
+<div class="toast rounded" id="toast">Copied! (to your clipboard — not the cloud)</div>
+
+<script>
+  function copyCmd(){
+    var text = document.getElementById('cmd').textContent.trim();
+    var done = function(){
+      var t = document.getElementById('toast');
+      t.classList.add('show');
+      clearTimeout(window.__tt);
+      window.__tt = setTimeout(function(){ t.classList.remove('show'); }, 2200);
+    };
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(text).then(done, done);
+    } else { done(); }
+  }
+</script>
+</body>
+</html>
