@@ -501,6 +501,76 @@ pub fn selection_text(buf: &Buffer, area: Rect, sel: Selection) -> String {
     out.join("\n")
 }
 
+/// A drag selection stored in content space: an inclusive `(x, row)` start and
+/// end where `row` is the absolute wrapped-line index (independent of scroll),
+/// so the selection tracks the text as the viewport scrolls.
+pub type ContentSelection = ((u16, usize), (u16, usize));
+
+/// Orders two content-space endpoints into reading order (top-to-bottom, then
+/// left-to-right).
+fn order_content(sel: ContentSelection) -> ContentSelection {
+    let (a, b) = sel;
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// Projects a [`ContentSelection`] onto the visible output area given the
+/// current scroll `top` (in wrapped rows) and the area `height`. Endpoints
+/// above or below the viewport clamp to its edges as full-width boundary rows,
+/// so a selection larger than one screen still highlights its visible portion.
+/// Returns `None` when the whole selection is off-screen. Screen rows are
+/// relative to the area's top (the output area starts at row 0).
+#[must_use]
+pub fn selection_screen(sel: ContentSelection, top: usize, height: u16) -> Option<Selection> {
+    let ((sx, sy), (ex, ey)) = order_content(sel);
+    let bottom = top + height as usize; // exclusive
+    if ey < top || sy >= bottom {
+        return None;
+    }
+    // Above the viewport: start at the top-left, so row 0 selects from the left.
+    let start = if sy < top {
+        (0, 0)
+    } else {
+        (sx, u16::try_from(sy - top).unwrap_or(u16::MAX))
+    };
+    // Below the viewport: end at the bottom-right. `selection_row_bounds` clips
+    // the column to the area, so `u16::MAX` is a safe "to end of row" sentinel.
+    let end = if ey >= bottom {
+        (u16::MAX, height.saturating_sub(1))
+    } else {
+        (ex, u16::try_from(ey - top).unwrap_or(u16::MAX))
+    };
+    Some((start, end))
+}
+
+/// Extracts the selected text for a [`ContentSelection`] by rendering just the
+/// selected wrapped-row range into an off-screen buffer (reusing ratatui's own
+/// wrapping) and reading it back — so a selection spanning more than the
+/// visible viewport still copies in full. `width` is the wrapped output width.
+#[must_use]
+pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection) -> String {
+    use ratatui::widgets::Widget as _;
+    let width = width.max(1);
+    let ((sx, sy), (ex, ey)) = order_content(sel);
+    let para = Paragraph::new(log.to_text()).wrap(Wrap { trim: false });
+    let total = para.line_count(width);
+    if total == 0 || sy >= total {
+        return String::new();
+    }
+    let ey = ey.min(total - 1);
+    let height = u16::try_from(ey - sy + 1).unwrap_or(u16::MAX);
+    let rect = Rect::new(0, 0, width, height);
+    let mut buf = Buffer::empty(rect);
+    let scroll = u16::try_from(sy).unwrap_or(u16::MAX);
+    para.scroll((scroll, 0)).render(rect, &mut buf);
+    // Rebase into the buffer's own space (its row 0 is content row `sy`).
+    let local: Selection = ((sx, 0), (ex, height.saturating_sub(1)));
+    selection_text(&buf, rect, local)
+}
+
 /// Minimal standard base64 (with padding) for the OSC 52 payload.
 fn base64(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -1249,7 +1319,7 @@ pub fn draw(
     cursor: usize,
     status: &str,
     view: &mut OutputView,
-    selection: Option<Selection>,
+    selection: Option<ContentSelection>,
     tasks: &TaskView,
 ) {
     let area = frame.area();
@@ -1394,7 +1464,7 @@ fn render_output(
     area: Rect,
     log: &OutputLog,
     view: &mut OutputView,
-    selection: Option<Selection>,
+    selection: Option<ContentSelection>,
 ) {
     let text = log.to_text();
     let width = area.width.max(1);
@@ -1414,7 +1484,8 @@ fn render_output(
     if !view.follow {
         draw_jump_hint(frame, area);
     }
-    if let Some(sel) = selection {
+    // Project the content-space selection onto the (post-clamp) viewport.
+    if let Some(sel) = selection.and_then(|s| selection_screen(s, view.top, area.height)) {
         highlight_selection(frame.buffer_mut(), area, sel);
     }
 }
@@ -1663,15 +1734,25 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(format!("✓ {done}/{total}"), counter_style));
     }
-    // Rotating yellow tip at the tail. It changes every few seconds off the
-    // animation clock; on a narrow terminal the line truncates and drops it.
-    let tip = crate::status::rotating_tip(tick_ms);
-    if !tip.is_empty() {
+    // Tail tip. A transient "flash" (e.g. a copy confirmation) takes over for
+    // its window; otherwise the rotating yellow tip shows, changing every few
+    // seconds off the animation clock. On a narrow terminal the line truncates
+    // and drops whichever tip is last.
+    if let Some(flash) = crate::status::flash_tip() {
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(
-            format!("💡 {tip}"),
-            base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            format!("📋 {flash}"),
+            base.fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
+    } else {
+        let tip = crate::status::rotating_tip(tick_ms);
+        if !tip.is_empty() {
+            spans.push(Span::styled(" | ".to_string(), base));
+            spans.push(Span::styled(
+                format!("💡 {tip}"),
+                base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ));
+        }
     }
     Line::from(spans)
 }
@@ -1835,6 +1916,54 @@ mod tests {
         log.end_line();
         // "hello" and "world" become two lines.
         assert_eq!(log.lines.len(), 2);
+    }
+
+    #[test]
+    fn selection_screen_projects_and_clamps() {
+        // Fully visible: rows shift down by `top`, columns untouched.
+        assert_eq!(
+            selection_screen(((2, 5), (4, 7)), 3, 10),
+            Some(((2, 2), (4, 4)))
+        );
+        // Start above the viewport clamps to the top-left (full first row).
+        assert_eq!(
+            selection_screen(((1, 1), (3, 8)), 5, 10),
+            Some(((0, 0), (3, 3)))
+        );
+        // End below the viewport clamps to the bottom-right sentinel.
+        assert_eq!(
+            selection_screen(((2, 5), (9, 30)), 0, 10),
+            Some(((2, 5), (u16::MAX, 9)))
+        );
+        // Endpoints given out of order are normalized.
+        assert_eq!(
+            selection_screen(((4, 7), (2, 5)), 3, 10),
+            Some(((2, 2), (4, 4)))
+        );
+        // Entirely above or below the viewport yields nothing.
+        assert_eq!(selection_screen(((0, 0), (2, 2)), 10, 5), None);
+        assert_eq!(selection_screen(((0, 20), (2, 22)), 0, 10), None);
+    }
+
+    #[test]
+    fn selection_text_content_reads_across_rows() {
+        let mut log = OutputLog::new();
+        log.push_plain("hello");
+        log.push_plain("world");
+        log.push_plain("foobar");
+
+        // A multi-row selection: full first/middle rows, partial last row.
+        assert_eq!(
+            selection_text_content(&log, 20, ((0, 0), (4, 2))),
+            "hello\nworld\nfooba"
+        );
+        // A single-row partial selection.
+        assert_eq!(selection_text_content(&log, 20, ((1, 0), (3, 0))), "ell");
+        // A row past the end clamps rather than panicking.
+        assert_eq!(
+            selection_text_content(&log, 20, ((0, 0), (4, 99))),
+            "hello\nworld\nfooba"
+        );
     }
 
     #[test]

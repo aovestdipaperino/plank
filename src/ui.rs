@@ -2888,9 +2888,11 @@ impl Agent<'_> {
             self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
         }
 
-        // Endpoints of a mouse drag selection over the output area, in screen
-        // cells (anchor, current). Copied to the clipboard on button release.
-        let mut selection: Option<((u16, u16), (u16, u16))> = None;
+        // Endpoints of a mouse drag selection over the output area, in content
+        // space: `(column, absolute-wrapped-row)`. Anchoring the row to content
+        // (not the screen) lets the selection survive scrolling. Copied to the
+        // clipboard on button release.
+        let mut selection: Option<tui::ContentSelection> = None;
         // The interactive `/config` modal, when open; it intercepts all keys
         // and renders over the frame until Esc (save) or q/Ctrl-C (cancel).
         let mut config_form: Option<crate::configform::ConfigForm> = None;
@@ -2940,7 +2942,7 @@ impl Agent<'_> {
                             input.cursor_char(),
                             &status,
                             &mut view,
-                            selection.map(|(a, b)| tui::normalize_selection(a, b)),
+                            selection,
                             &task_view,
                         );
                     }
@@ -2997,67 +2999,51 @@ impl Agent<'_> {
             if let Event::Mouse(m) = &ev {
                 match m.kind {
                     MouseEventKind::ScrollUp => {
-                        selection = None;
+                        // Selection endpoints are content-anchored, so scrolling
+                        // leaves them alone — the highlight tracks the text.
                         view.follow = false;
                         view.top = view.top.saturating_sub(3);
                     }
                     MouseEventKind::ScrollDown => {
-                        selection = None;
                         // Clamped by draw, which re-enters follow mode at the bottom.
                         view.top = view.top.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        selection = Some(((m.column, m.row), (m.column, m.row)));
+                        let row = view.top.saturating_add(usize::from(m.row));
+                        selection = Some(((m.column, row), (m.column, row)));
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some((_, end)) = &mut selection {
-                            *end = (m.column, m.row);
+                            *end = (m.column, view.top.saturating_add(usize::from(m.row)));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if let Some((a, b)) = selection.filter(|(a, b)| a != b) {
-                            // Redraw and read the cells inside the same frame:
-                            // after a draw() the terminal's current buffer is
-                            // the cleared next-frame one, so extraction must
-                            // happen while the frame content is still present.
-                            let sel = tui::normalize_selection(a, b);
-                            let mut text = String::new();
-                            let _ = terminal.draw(|f| {
-                                tui::draw(
-                                    f,
-                                    &log,
-                                    Some(input.buf.text()),
-                                    input.cursor_char(),
-                                    &status,
-                                    &mut view,
-                                    Some(sel),
-                                    &task_view,
-                                );
-                                // The output area is everything above the
-                                // input and status rows.
-                                let area = f.area();
-                                let area = ratatui::layout::Rect::new(
-                                    0,
-                                    0,
-                                    area.width,
-                                    area.height.saturating_sub(2),
-                                );
-                                text = tui::selection_text(f.buffer_mut(), area, sel);
-                            });
+                        let size = terminal.size().unwrap_or_default();
+                        if let Some(sel) = selection.filter(|(a, b)| a != b) {
+                            // A drag: extract from the content model (not the
+                            // screen buffer) so a selection larger than the
+                            // viewport still copies in full.
+                            let text = tui::selection_text_content(&log, size.width, sel);
                             if !text.trim().is_empty() {
                                 tui::copy_to_clipboard(&text);
+                                let chars = text.chars().count();
+                                crate::status::set_flash_tip(format!("Copied {chars} chars"));
                             }
                         } else if let Some((col, row)) = selection.map(|(a, _)| a) {
                             // A plain click (no drag): copy a fenced code block
                             // when its header `⧉ copy` control was clicked. The
-                            // output area is everything above the input/status.
-                            let size = terminal.size().unwrap_or_default();
+                            // stored row is absolute, so map it back to a screen
+                            // row for the click test.
                             let out_h = size.height.saturating_sub(2);
-                            if row < out_h
-                                && let Some(code) = log.code_copy_at(size.width, view.top, col, row)
+                            let screen_row =
+                                u16::try_from(row.saturating_sub(view.top)).unwrap_or(u16::MAX);
+                            if screen_row < out_h
+                                && let Some(code) =
+                                    log.code_copy_at(size.width, view.top, col, screen_row)
                             {
                                 tui::copy_to_clipboard(&code);
-                                log.push_dim("[copied code block to clipboard]");
+                                let chars = code.chars().count();
+                                crate::status::set_flash_tip(format!("Copied {chars} chars"));
                             }
                             selection = None;
                         } else {
