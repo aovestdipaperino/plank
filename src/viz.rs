@@ -316,6 +316,10 @@ pub struct StreamRenderer<S> {
     /// by `ui.showToolCalls`; defaults true so tests and callers that don't set
     /// it keep the banners. See [`StreamRenderer::set_show_tool_calls`].
     show_tool_calls: bool,
+    /// When false, thinking text is parsed (so `<think>`/`</think>` still drive
+    /// state) but never emitted to the sink. Gated by `ui.showThinking`;
+    /// defaults true. See [`StreamRenderer::set_show_thinking`].
+    show_thinking: bool,
 }
 
 /// Hook validating a partially-parsed tool call mid-stream.
@@ -362,6 +366,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             preflight: Preflight(None),
             preflight_error: None,
             show_tool_calls: true,
+            show_thinking: true,
         }
     }
 
@@ -370,6 +375,14 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// and hidden but no banner, param, read, or diff line is emitted.
     pub fn set_show_tool_calls(&mut self, show: bool) {
         self.show_tool_calls = show;
+    }
+
+    /// Sets whether thinking text is displayed (default true). Production wires
+    /// this from `ui.showThinking`; when false the model still produces its
+    /// thinking (and `<think>` tags still drive parser state) but none of it is
+    /// emitted to the sink.
+    pub fn set_show_thinking(&mut self, show: bool) {
+        self.show_thinking = show;
     }
 
     /// Installs the mid-stream preflight hook: called with the pending call
@@ -518,6 +531,9 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn emit_think_bytes(&mut self, bytes: &[u8]) {
+        if !self.show_thinking {
+            return;
+        }
         self.think_carry.extend_from_slice(bytes);
         Self::flush_stream(S::think_text, &mut self.sink, &mut self.think_carry);
     }
@@ -1218,6 +1234,25 @@ mod tests {
         assert!(!vis.contains("🛠️"), "banner suppressed: {vis:?}");
         assert!(!vis.contains("ls -la"), "params suppressed: {vis:?}");
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
+    }
+
+    #[test]
+    fn show_thinking_false_suppresses_thinking_but_keeps_visible_text() {
+        let text = "<think>secret reasoning</think>visible answer";
+
+        // Default: thinking is emitted to the think channel.
+        let shown = run_chunked(text);
+        assert_eq!(shown.sink().think, "secret reasoning");
+        assert_eq!(shown.sink().visible.trim(), "visible answer");
+
+        // Gated off: nothing on the think channel, prose unaffected (a leading
+        // post-think separator newline may remain).
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_thinking(false);
+        sr.push(text);
+        sr.finish();
+        assert_eq!(sr.sink().think, "", "thinking suppressed");
+        assert_eq!(sr.sink().visible.trim(), "visible answer", "prose kept");
     }
 
     fn run_charwise(text: &str) -> StreamRenderer<Cap> {

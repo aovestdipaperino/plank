@@ -49,7 +49,7 @@ impl StatusBar {
             return;
         }
         let (_, cols) = term_size();
-        let mut line = status::build_status_text(st, self.color);
+        let mut line = status::build_status_text(st, self.color, true);
         // Keep the status within one screen row so it never wraps.
         if line.chars().count() > cols {
             line = line.chars().take(cols).collect();

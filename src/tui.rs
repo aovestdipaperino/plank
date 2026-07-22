@@ -52,6 +52,11 @@ pub struct OutputLog {
     /// each append so partial emphasis/fences resolve as more text arrives.
     md_buf: String,
     md_start: Option<usize>,
+    /// Transient progress line pinned below the scrollback (throbber + verb +
+    /// stats), shown while the worker runs so activity stays visible even when
+    /// no text is streaming. Not part of the persistent `lines`; cleared when
+    /// the turn ends.
+    progress: Option<Line<'static>>,
 }
 
 impl OutputLog {
@@ -155,12 +160,21 @@ impl OutputLog {
         self.lines.truncate(len);
     }
 
-    /// Renders the log (including the in-progress line) as ratatui text.
+    /// Sets (or clears) the transient progress line pinned below the output.
+    pub fn set_progress(&mut self, line: Option<Line<'static>>) {
+        self.progress = line;
+    }
+
+    /// Renders the log (including the in-progress line and any pinned progress
+    /// line) as ratatui text.
     #[must_use]
     pub fn to_text(&self) -> Text<'static> {
         let mut lines = self.lines.clone();
         if !self.current.is_empty() {
             lines.push(Line::from(self.current.clone()));
+        }
+        if let Some(progress) = &self.progress {
+            lines.push(progress.clone());
         }
         Text::from(lines)
     }
@@ -829,6 +843,35 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor: (u16, 
     }
 }
 
+/// Minimal pre-UI screen shown while the system-prompt KV cache is (re)built at
+/// launch: a centered note and a simple progress bar. The full UI is withheld
+/// until warming finishes, so the user sees clear progress instead of an idle
+/// screen during the one slow step.
+pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64) {
+    let total = total.max(1);
+    let done = done.clamp(0, total);
+    let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
+    let bar = crate::status::progress_bar(done, total, tps, false);
+    let area = frame.area();
+    let rows = Layout::vertical([
+        Constraint::Percentage(45),
+        Constraint::Length(2),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            "Updating system prompt cache…",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .centered(),
+        Line::from(format!("{bar}  {pct}%")).centered(),
+    ]);
+    frame.render_widget(Paragraph::new(text), rows[1]);
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor` its `(row, col)` position.
@@ -1161,6 +1204,18 @@ fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, th
     spans.push(Span::styled(sep.to_string(), base));
 }
 
+/// Styles the plain progress text (`⠹ Verb… (stats)`) as a standalone output
+/// line: the spinner verb shimmers in the theme green, the rest stays default.
+/// Used to render the progress on a line below the output.
+#[must_use]
+pub fn progress_line(text: &str) -> Line<'static> {
+    let base = Style::default();
+    let theme = base.fg(THEME_GREEN).add_modifier(Modifier::BOLD);
+    let mut spans = Vec::new();
+    push_accented(&mut spans, text, anim_tick_ms(), base, theme);
+    Line::from(spans)
+}
+
 fn push_accented(
     spans: &mut Vec<Span<'static>>,
     seg: &str,
@@ -1401,6 +1456,28 @@ mod tests {
     }
 
     #[test]
+    fn progress_line_is_pinned_below_output_and_clears() {
+        let mut log = OutputLog::new();
+        log.visible_text("answer");
+        log.end_line();
+        let base = log.to_text().lines.len();
+
+        // Pinned progress adds one trailing line without touching scrollback.
+        log.set_progress(Some(super::progress_line(
+            "⠹ Cooking… (2s · ↓ 5 tokens · 4.0 t/s)",
+        )));
+        let with = log.to_text();
+        assert_eq!(with.lines.len(), base + 1);
+        let last = with.lines.last().unwrap();
+        let text: String = last.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Cooking…"), "{text}");
+
+        // Clearing removes it again.
+        log.set_progress(None);
+        assert_eq!(log.to_text().lines.len(), base);
+    }
+
+    #[test]
     fn visible_text_renders_markdown_emphasis() {
         let mut log = OutputLog::new();
         log.visible_text("some **bold** words");
@@ -1501,7 +1578,7 @@ mod tests {
         let base = Style::default();
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let glyph = crate::status::POWERLINE_BRANCH;
-        let text = format!("~/Code/plank {glyph} main | ctx 1k/8k (12%) | idle");
+        let text = format!("~/Code/plank {glyph} main | ctx 12% | idle");
         let line = status_bar_line(&text, 0, base, &TaskView::default());
 
         let path = line

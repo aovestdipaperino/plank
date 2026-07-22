@@ -763,6 +763,7 @@ impl Agent<'_> {
         };
         let mut stream = StreamRenderer::new(sink);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
+        stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
@@ -1924,6 +1925,7 @@ impl Agent<'_> {
 
         log.push_dim("--- session history ---");
         let show_tool_calls = crate::settings::active().ui.show_tool_calls;
+        let show_thinking = crate::settings::active().ui.show_thinking;
         let pre_open_think = !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -1953,6 +1955,7 @@ impl Agent<'_> {
                     // banners come back exactly as they were shown.
                     let mut stream = StreamRenderer::new(std::mem::take(log));
                     stream.set_show_tool_calls(show_tool_calls);
+                    stream.set_show_thinking(show_thinking);
                     if pre_open_think {
                         stream.begin_in_think();
                     }
@@ -2580,6 +2583,11 @@ impl Agent<'_> {
         input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
+
+        // Rebuild the system-prompt cache first, behind a simple progress bar,
+        // so the full UI appears only once the one slow launch step is done.
+        self.tui_warm(terminal)?;
+
         let mut log = OutputLog::new();
         for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 144 / 100)) {
             log.push_spans(line.spans);
@@ -2595,8 +2603,6 @@ impl Agent<'_> {
         // A `plank /resume` startup shows the recovered conversation so far,
         // rendered like the live stream (markdown + thinking gray).
         self.replay_history_into_log(&mut log);
-
-        self.tui_warm(terminal, &mut log)?;
 
         let mut view = tui::OutputView::default();
         // The `/btw` side panel, owned here so it outlives any single turn:
@@ -3060,73 +3066,20 @@ impl Agent<'_> {
     }
 
     /// Warms the system-prompt KV cache at startup, drawing prefill progress.
-    fn tui_warm(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-        log: &mut OutputLog,
-    ) -> Result<(), String> {
+    /// Warms the system-prompt KV cache before the full TUI is shown. When the
+    /// cache is already current no prefill runs and nothing is drawn; when it
+    /// needs rebuilding, a minimal centered progress bar is shown until it is
+    /// done, then the caller renders the real UI over it.
+    fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         let checkpoint = self.sysprompt_checkpoint();
         let system = self.system.clone();
-        let ctx_size = self.engine.ctx_size();
-        let power = self.power_percent;
-        let mut announced = false;
-        let verb = status::random_verb_index();
-        let start = Instant::now();
-        let mut view = tui::OutputView::default();
         self.engine
             .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
-                    if !announced {
-                        announced = true;
-                        log.push_spans(vec![ratatui::text::Span::styled(
-                            "Updating system prompt cache...",
-                            ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
-                        )]);
-                    }
-                    let st = Status {
-                        state: WorkerState::Prefill,
-                        prefill_done: p.done,
-                        prefill_total: p.total,
-                        prefill_label: verb,
-                        prefill_tps: p.tps,
-                        elapsed_secs: start.elapsed().as_secs_f64(),
-                        ctx_size,
-                        power_percent: power,
-                        ..Status::default()
-                    };
-                    let line = status::build_status_text(&st, false);
-                    let _ = terminal.draw(|f| {
-                        tui::draw(
-                            f,
-                            log,
-                            None,
-                            (0, 0),
-                            &line,
-                            &mut view,
-                            None,
-                            &tui::TaskView::default(),
-                        );
-                    });
+                    let _ = terminal.draw(|f| tui::draw_warm(f, p.done, p.total, p.tps));
                 }
             })
             .map_err(|e| e.to_string())?;
-        // The cache note is transient: remove it once the warm-up finishes.
-        if announced {
-            log.pop_line();
-            let status = self.idle_status_text();
-            let _ = terminal.draw(|f| {
-                tui::draw(
-                    f,
-                    log,
-                    None,
-                    (0, 0),
-                    &status,
-                    &mut view,
-                    None,
-                    &tui::TaskView::default(),
-                );
-            });
-        }
         Ok(())
     }
 
@@ -3164,7 +3117,7 @@ impl Agent<'_> {
             power_percent: self.power_percent,
             ..Status::default()
         };
-        status::build_status_text(&st, false)
+        status::build_status_text(&st, false, true)
     }
 
     /// One TUI turn: runs the generate → tools loop on a worker thread while
@@ -3205,6 +3158,9 @@ impl Agent<'_> {
             // the tool context before the closure borrows `self`. Only the main
             // turn dispatches tools (and thus `ask`); the btw drain never does.
             let ask_bridge = self.tool_ctx.ask_bridge.clone();
+            // Snapshot the read-only reports so `/context` & co. stay usable
+            // while the worker owns the engine for this turn.
+            let live = LiveCommands::capture(self);
             if run_main {
                 run_worker_ui(
                     terminal,
@@ -3216,6 +3172,7 @@ impl Agent<'_> {
                     bus_ref,
                     rem,
                     ask_bridge.as_ref(),
+                    &live,
                     |tx| self.worker_turn(&tx, shared),
                 )??;
             } else {
@@ -3229,6 +3186,7 @@ impl Agent<'_> {
                     bus_ref,
                     rem,
                     None,
+                    &live,
                     |tx| {
                         self.drain_btw(&tx, shared);
                     },
@@ -3604,6 +3562,7 @@ impl Agent<'_> {
         }
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
+        stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
@@ -3839,6 +3798,7 @@ impl Agent<'_> {
         let ui_remote = self.ui_remote.clone();
         let shared = TurnShared::default();
         shared.push_btw(question.to_owned());
+        let live = LiveCommands::capture(self);
         run_worker_ui(
             terminal,
             log,
@@ -3849,6 +3809,7 @@ impl Agent<'_> {
             bus.as_deref(),
             ui_remote.as_deref(),
             None,
+            &live,
             |tx| {
                 self.drain_btw(&tx, &shared);
             },
@@ -4173,6 +4134,45 @@ fn run_ask_panel(
     }
 }
 
+/// Pre-rendered output for the read-only slash commands that stay usable while
+/// the worker owns the engine (`/context`, `/usage`, `/mcp`, `/help`).
+///
+/// The worker holds `self` for the whole turn, so the UI thread cannot call
+/// back into the agent; these reports are captured once at turn start instead.
+/// The cost is a tokenize pass over the transcript for `/context`, which is
+/// cheap next to the prefill/decoding the turn is about to do. Commands not
+/// listed here still tell the user to wait for the turn to finish.
+struct LiveCommands {
+    context: String,
+    usage: String,
+    mcp: String,
+}
+
+impl LiveCommands {
+    /// Captures the read-only reports before the worker takes the engine.
+    fn capture(agent: &Agent<'_>) -> Self {
+        Self {
+            context: agent.render_context_report(true),
+            usage: agent.render_usage_report(true),
+            mcp: render_mcp_report(&agent.tool_ctx.mcp, true),
+        }
+    }
+
+    /// ANSI output for a read-only command runnable mid-turn, or `None` when
+    /// the command must wait for the turn to finish. `/help` is static, so it
+    /// is rendered on demand rather than snapshotted.
+    fn output(&self, cmd: &str) -> Option<std::borrow::Cow<'_, str>> {
+        use std::borrow::Cow;
+        match cmd {
+            "/context" => Some(Cow::Borrowed(self.context.as_str())),
+            "/usage" => Some(Cow::Borrowed(self.usage.as_str())),
+            "/mcp" => Some(Cow::Borrowed(self.mcp.as_str())),
+            "/help" => Some(Cow::Owned(crate::config::usage())),
+            _ => None,
+        }
+    }
+}
+
 /// Runs `job` on a scoped worker thread while the UI thread keeps the
 /// terminal live (the C's worker/UI split). The worker owns the agent for
 /// the duration of the job and reports through the channel; the UI applies
@@ -4188,6 +4188,7 @@ fn run_worker_ui<T: Send>(
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
     ask: Option<&crate::tools::ask::AskBridge>,
+    live: &LiveCommands,
     job: impl FnOnce(Sender<UiEvent>) -> T + Send,
 ) -> Result<T, String> {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -4204,6 +4205,7 @@ fn run_worker_ui<T: Send>(
             bus,
             remote,
             ask,
+            live,
             || handle.is_finished(),
         );
         // On a UI error (terminal gone) the worker must still be stopped and
@@ -4257,6 +4259,7 @@ fn busy_ui_loop(
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
     ask: Option<&crate::tools::ask::AskBridge>,
+    live_cmds: &LiveCommands,
     done: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut status_line = String::new();
@@ -4303,7 +4306,15 @@ fn busy_ui_loop(
                 bus.broadcast(ev.clone());
             }
             match ev {
-                UiEvent::Status(st) => status_line = status::build_status_text(&st, false),
+                UiEvent::Status(st) => {
+                    // The animated progress (throbber + verb + stats) always
+                    // lives on a line pinned below the output, not in the
+                    // footer — independent of showThinking.
+                    status_line = status::build_status_text(&st, false, false);
+                    log.set_progress(
+                        status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
+                    );
+                }
                 UiEvent::Tasks(tv) => task_view = tv,
                 UiEvent::BtwBegin => {
                     if btw.is_none() {
@@ -4395,6 +4406,9 @@ fn busy_ui_loop(
                     }
                 }
             }
+            // The turn is over: drop the pinned progress line so it does not
+            // linger into the idle view.
+            log.set_progress(None);
             return Ok(());
         }
         let Some(ev) = next_event(remote, Duration::from_millis(100))? else {
@@ -4464,8 +4478,22 @@ fn busy_ui_loop(
                                 log.push_dim("[/btw — pausing the task to answer now]");
                             }
                             view.follow = true;
+                        } else if let Some(out) = line
+                            .starts_with('/')
+                            .then(|| line.split_whitespace().next().unwrap_or(&line))
+                            .and_then(|cmd| live_cmds.output(cmd))
+                        {
+                            // Read-only reports (`/context`, `/usage`, `/mcp`,
+                            // `/help`) run against a turn-start snapshot, so they
+                            // stay available while the model streams.
+                            input.history.add(&line);
+                            log.push_spans(tui::user_echo_spans(&line));
+                            log.push_ansi(&out);
+                            view.follow = true;
                         } else if line.starts_with('/') || line.starts_with('!') {
-                            log.push_dim("[commands don't queue — wait for the model to finish]");
+                            log.push_dim(
+                                "[that command can't run mid-turn — wait for the model to finish]",
+                            );
                         } else {
                             input.history.add(&line);
                             log.push_spans(tui::user_echo_spans(&line));
@@ -4538,7 +4566,7 @@ fn busy_ui_loop(
 }
 
 fn print_footer(st: &Status, color: bool) {
-    let line = status::build_status_text(st, color);
+    let line = status::build_status_text(st, color, true);
     if color {
         println!(
             "{}{line}{}",
@@ -6107,6 +6135,25 @@ mod tests {
         let mut d = test_agent(&dir, ScriptedEngine::default(), &cfg);
         assert!(d.resume_from_cli("nonexistent0").is_err());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn live_commands_allow_read_only_reports_and_reject_the_rest() {
+        let live = LiveCommands {
+            context: "CTX".to_owned(),
+            usage: "USE".to_owned(),
+            mcp: "MCP".to_owned(),
+        };
+        assert_eq!(live.output("/context").as_deref(), Some("CTX"));
+        assert_eq!(live.output("/usage").as_deref(), Some("USE"));
+        assert_eq!(live.output("/mcp").as_deref(), Some("MCP"));
+        // /help is static, rendered on demand — just present.
+        assert!(live.output("/help").is_some());
+        // Mutating / stateful commands must not run mid-turn.
+        assert!(live.output("/compact").is_none());
+        assert!(live.output("/save").is_none());
+        assert!(live.output("/resume").is_none());
+        assert!(live.output("/context-ish").is_none());
     }
 
     #[test]

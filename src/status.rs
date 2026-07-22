@@ -441,18 +441,63 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
     out
 }
 
-/// Builds the compact one-line footer shown below the prompt.
+/// The animated progress segment — throbber, spinner verb, and the
+/// elapsed/tokens/throughput readout — for the prefill and generating states.
+/// `None` in every other state. Split out so the TUI can render it on a line
+/// below the output instead of in the footer.
 #[must_use]
-pub fn build_status_text(st: &Status, color: bool) -> String {
-    let used = format_ctx_size(st.ctx_used);
-    let total_ctx = if st.ctx_size > 0 {
+pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
+    let theme = |text: &str| {
+        if color {
+            format!("\x1b[38;5;{THEME_COLOR};1m{text}{STATUS_STYLE_START}")
+        } else {
+            text.to_owned()
+        }
+    };
+    match st.state {
+        WorkerState::Prefill => {
+            let total = if st.prefill_total > 0 {
+                st.prefill_total
+            } else {
+                1
+            };
+            let done = st.prefill_done.min(total);
+            Some(format!(
+                "{} {}… ({} · ↑ {}/{} tokens · {:.1} t/s)",
+                throbber(),
+                theme(prefill_label(st)),
+                format_elapsed(st.elapsed_secs),
+                format_ctx_size(done),
+                format_ctx_size(total),
+                st.prefill_tps
+            ))
+        }
+        WorkerState::Generating => Some(format!(
+            "{} {}… ({} · ↓ {} tokens{} · {:.1} t/s)",
+            throbber(),
+            theme(prefill_label(st)),
+            format_elapsed(st.elapsed_secs),
+            format_ctx_size(st.generated),
+            if st.greedy_sampling { " ❄️" } else { "" },
+            st.gen_tps
+        )),
+        _ => None,
+    }
+}
+
+/// Builds the compact one-line footer shown below the prompt. When
+/// `progress_in_bar` is false the animated [`progress_segment`] is omitted from
+/// prefill/generating footers (the TUI renders it in the output area instead).
+#[must_use]
+pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> String {
+    // Context usage shown as a bare percentage of the window (the ctx gauge).
+    let ctx = if st.ctx_size > 0 {
         format!(
-            "{} ({:.0}%)",
-            format_ctx_size(st.ctx_size),
+            "ctx {:.0}%",
             100.0 * f64::from(st.ctx_used) / f64::from(st.ctx_size)
         )
     } else {
-        format_ctx_size(st.ctx_size)
+        "ctx 0%".to_owned()
     };
     let power = power_suffix(st);
     // Theme-colored accent text; returns to the footer style (not a full
@@ -473,47 +518,28 @@ pub fn build_status_text(st: &Status, color: bool) -> String {
         format!("{} | ", theme(&cwd))
     };
     let body = match st.state {
-        WorkerState::Prefill => {
-            let total = if st.prefill_total > 0 {
-                st.prefill_total
-            } else {
-                1
-            };
-            let done = st.prefill_done.min(total);
-            format!(
-                "ctx {used}/{total_ctx} | {} {}… ({} · ↑ {}/{} tokens · {:.1} t/s){power}",
-                throbber(),
-                theme(prefill_label(st)),
-                format_elapsed(st.elapsed_secs),
-                format_ctx_size(done),
-                format_ctx_size(total),
-                st.prefill_tps
-            )
+        WorkerState::Prefill | WorkerState::Generating => {
+            match progress_segment(st, color).filter(|_| progress_in_bar) {
+                Some(progress) => format!("{ctx} | {progress}{power}"),
+                // Progress lifted into the output area (showThinking off).
+                None => format!("{ctx}{power}"),
+            }
         }
-        WorkerState::Generating => format!(
-            "ctx {used}/{total_ctx} | {} {}… ({} · ↓ {} tokens{} · {:.1} t/s){power}",
-            throbber(),
-            theme(prefill_label(st)),
-            format_elapsed(st.elapsed_secs),
-            format_ctx_size(st.generated),
-            if st.greedy_sampling { " ❄️" } else { "" },
-            st.gen_tps
-        ),
         WorkerState::Compacting => format!(
-            "ctx {used}/{total_ctx} | COMPACTING summary {} tokens {:.1} t/s{power}",
+            "{ctx} | COMPACTING summary {} tokens {:.1} t/s{power}",
             st.generated, st.gen_tps
         ),
-        WorkerState::Saving => format!("ctx {used}/{total_ctx} | saving session{power}"),
+        WorkerState::Saving => format!("{ctx} | saving session{power}"),
         WorkerState::Error => format!(
-            "ctx {used}/{total_ctx} | error: {}{power}",
+            "{ctx} | error: {}{power}",
             if st.error.is_empty() {
                 "unknown error"
             } else {
                 &st.error
             }
         ),
-        WorkerState::Stopped => format!("ctx {used}/{total_ctx} | interrupted{power}"),
-        WorkerState::Idle => format!("ctx {used}/{total_ctx} | idle{power}"),
+        WorkerState::Stopped => format!("{ctx} | interrupted{power}"),
+        WorkerState::Idle => format!("{ctx} | idle{power}"),
     };
     format!("{dir}{body}")
 }
@@ -561,10 +587,43 @@ mod tests {
             ..Status::default()
         };
         assert!(
-            build_status_text(&st, false).ends_with("ctx 1k/8k (12%) | idle"),
+            build_status_text(&st, false, true).ends_with("ctx 12% | idle"),
             "{}",
-            build_status_text(&st, false)
+            build_status_text(&st, false, true)
         );
+    }
+
+    #[test]
+    fn progress_in_bar_toggle_moves_the_segment_out_of_the_footer() {
+        let st = Status {
+            state: WorkerState::Generating,
+            generated: 42,
+            gen_tps: 9.5,
+            elapsed_secs: 62.0,
+            ctx_used: 1500,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        // In the bar: the footer carries the throbber/verb/stats.
+        let shown = build_status_text(&st, false, true);
+        assert!(shown.contains("↓ 42 tokens"), "{shown}");
+        assert!(
+            shown.contains(&format!("{}…", prefill_label(&st))),
+            "{shown}"
+        );
+
+        // Out of the bar: footer is just the ctx gauge, no progress segment.
+        let hidden = build_status_text(&st, false, false);
+        assert!(!hidden.contains("↓ 42 tokens"), "{hidden}");
+        assert!(!hidden.contains('…'), "{hidden}");
+        assert!(hidden.contains("ctx 19%"), "{hidden}");
+
+        // The segment is still available for the output-area line.
+        let seg = progress_segment(&st, false).expect("segment present");
+        assert!(seg.contains("↓ 42 tokens · 9.5 t/s"), "{seg}");
+
+        // No progress segment outside prefill/generating.
+        assert!(progress_segment(&Status::default(), false).is_none());
     }
 
     #[test]
@@ -593,8 +652,8 @@ mod tests {
             ctx_size: 8000,
             ..Status::default()
         };
-        let line = build_status_text(&st, false);
-        assert!(line.contains("ctx 1.5k/8k (19%) | "), "{line}");
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("ctx 19% | "), "{line}");
         assert!(line.contains("(1m 2s · ↓ 42 tokens · 9.5 t/s)"), "{line}");
         assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
     }
@@ -611,8 +670,8 @@ mod tests {
             ctx_size: 8000,
             ..Status::default()
         };
-        let line = build_status_text(&st, false);
-        assert!(line.contains("ctx 1.5k/8k (19%) | "), "{line}");
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("ctx 19% | "), "{line}");
         assert!(
             line.contains("(5s · ↑ 500/2k tokens · 120.0 t/s)"),
             "{line}"
@@ -655,9 +714,9 @@ mod tests {
             power_percent: 50,
             ..Status::default()
         };
-        assert!(build_status_text(&st, false).ends_with("⚡ 50%"));
+        assert!(build_status_text(&st, false, true).ends_with("⚡ 50%"));
         st.power_percent = 100;
-        assert!(!build_status_text(&st, false).contains('⚡'));
+        assert!(!build_status_text(&st, false, true).contains('⚡'));
     }
 
     #[test]

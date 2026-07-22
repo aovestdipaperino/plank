@@ -26,7 +26,8 @@
 //!   "engine": { "model": "~/models/ds4.gguf", "threads": 8, "backend": "metal",
 //!               "power": 80, "ctx": 262144 },
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
-//!               "historySize": 512, "showToolCalls": false, "showToolResults": false },
+//!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
+//!               "showThinking": true },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 }
@@ -71,6 +72,9 @@ pub struct EngineSettings {
 }
 
 /// UI behaviour that used to be magic numbers in the source.
+// The display toggles (showToolCalls/showToolResults/showThinking) are
+// genuinely independent on/off knobs, not a state machine to model as an enum.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UiSettings {
     /// Whether `@` completion honours `.gitignore` for untracked files.
@@ -87,6 +91,10 @@ pub struct UiSettings {
     /// Echo tool result text (observations) into the scrollback. Off by
     /// default; the model always receives the results either way.
     pub show_tool_results: bool,
+    /// Render the model's thinking text (dimmed) in the scrollback. On by
+    /// default; when off, thinking is hidden from the display but the model
+    /// still produces it.
+    pub show_thinking: bool,
 }
 
 impl Default for UiSettings {
@@ -98,6 +106,7 @@ impl Default for UiSettings {
             history_size: DEFAULT_HISTORY_SIZE,
             show_tool_calls: false,
             show_tool_results: false,
+            show_thinking: true,
         }
     }
 }
@@ -235,6 +244,9 @@ impl Settings {
         if let Some(v) = boolean(ui, "showToolResults") {
             self.ui.show_tool_results = v;
         }
+        if let Some(v) = boolean(ui, "showThinking") {
+            self.ui.show_thinking = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -358,6 +370,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.ui.show_tool_results != d.ui.show_tool_results {
         parts.push(format!("showToolResults={}", s.ui.show_tool_results));
     }
+    if s.ui.show_thinking != d.ui.show_thinking {
+        parts.push(format!("showThinking={}", s.ui.show_thinking));
+    }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
     }
@@ -472,6 +487,19 @@ mod tests {
         assert!(note.contains("showToolCalls=true"), "{note}");
         assert!(note.contains("showToolResults=true"), "{note}");
         assert_eq!(note_for(&Settings::default(), &[]), None);
+    }
+
+    #[test]
+    fn show_thinking_defaults_on_and_can_be_turned_off() {
+        assert!(
+            Settings::default().ui.show_thinking,
+            "thinking shown by default"
+        );
+        let s = from_json(r#"{"ui":{"showThinking":false}}"#);
+        assert!(!s.ui.show_thinking);
+        // Only the non-default (off) value is surfaced in the startup note.
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("showThinking=false"), "{note}");
     }
 
     #[test]
