@@ -30,7 +30,7 @@
 //!               "power": 80, "ctx": 262144 },
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
 //!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-//!               "showThinking": true },
+//!               "showThinking": true, "crtOff": true },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 }
@@ -104,6 +104,9 @@ pub struct UiSettings {
     /// Minimum turn duration, in seconds, before a completed turn notifies.
     /// Awaiting-input notifications ignore this. Default 10.
     pub notify_after_secs: u64,
+    /// Play the CRT power-off animation of the final frame on clean TUI
+    /// exit. On by default; see issue #54.
+    pub crt_off: bool,
 }
 
 impl Default for UiSettings {
@@ -118,6 +121,7 @@ impl Default for UiSettings {
             show_thinking: true,
             notifications: true,
             notify_after_secs: 10,
+            crt_off: true,
         }
     }
 }
@@ -281,6 +285,9 @@ impl Settings {
         if let Some(v) = num(ui, "notifyAfterSecs") {
             self.ui.notify_after_secs = v;
         }
+        if let Some(v) = boolean(ui, "crtOff") {
+            self.ui.crt_off = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -423,6 +430,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.ui.notify_after_secs != d.ui.notify_after_secs {
         parts.push(format!("notifyAfterSecs={}", s.ui.notify_after_secs));
+    }
+    if s.ui.crt_off != d.ui.crt_off {
+        parts.push(format!("crtOff={}", s.ui.crt_off));
     }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
@@ -588,6 +598,7 @@ impl Settings {
             upsert(u, "showThinking", Json::Bool(self.ui.show_thinking));
             upsert(u, "notifications", Json::Bool(self.ui.notifications));
             upsert(u, "notifyAfterSecs", unum(self.ui.notify_after_secs));
+            upsert(u, "crtOff", Json::Bool(self.ui.crt_off));
         }
         {
             let s = section(&mut root, "safety");
@@ -909,5 +920,34 @@ mod tests {
         let mut s = Settings::default();
         s.overlay(r#"{ "ui": { "notifyAfterSecs": "nope" } }"#);
         assert_eq!(s.ui.notify_after_secs, 10);
+    }
+
+    #[test]
+    fn crt_off_defaults_on_and_can_be_turned_off() {
+        assert!(Settings::default().ui.crt_off, "default is on");
+
+        let s = from_json(r#"{"ui":{"crtOff":false}}"#);
+        assert!(!s.ui.crt_off);
+
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("crtOff=false"), "{note}");
+    }
+
+    #[test]
+    fn crt_off_round_trips_through_save() {
+        let dir = std::env::temp_dir().join(format!("plank-crt-off-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.ui.crt_off = false;
+        s.save_to(&path).unwrap();
+
+        let mut reloaded = Settings::default();
+        let text = std::fs::read_to_string(&path).unwrap();
+        reloaded.overlay(&text);
+        assert!(!reloaded.ui.crt_off);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
