@@ -212,3 +212,53 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn ds4_session_snapshot_free(snap: *mut Ds4SessionSnapshot);
 }
+
+/// Confirm callback type, mirroring `ds4_web_confirm_fn`.
+pub type Ds4WebConfirmFn = unsafe extern "C" fn(
+    privdata: *mut c_void,
+    message: *const c_char,
+    err: *mut c_char,
+    err_len: usize,
+) -> c_int;
+/// Log callback type, mirroring `ds4_web_log_fn`.
+pub type Ds4WebLogFn = unsafe extern "C" fn(privdata: *mut c_void, message: *const c_char);
+/// Cancel callback type, mirroring `ds4_web_cancel_fn`.
+pub type Ds4WebCancelFn = unsafe extern "C" fn(privdata: *mut c_void) -> bool;
+
+/// Web subsystem config, mirroring `ds4_web_config` in `ds4_web.h`.
+#[repr(C)]
+#[allow(missing_debug_implementations)]
+pub struct Ds4WebConfig {
+    pub home_dir: *const c_char,
+    pub port: c_int,
+    pub confirm: Option<Ds4WebConfirmFn>,
+    pub confirm_privdata: *mut c_void,
+    pub log: Option<Ds4WebLogFn>,
+    pub log_privdata: *mut c_void,
+    pub cancel: Option<Ds4WebCancelFn>,
+    pub cancel_privdata: *mut c_void,
+}
+
+/// Opaque browser handle, mirroring `struct ds4_web`.
+#[repr(C)]
+#[allow(missing_debug_implementations)]
+pub struct Ds4Web {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    pub fn ds4_web_create(cfg: *const Ds4WebConfig) -> *mut Ds4Web;
+    pub fn ds4_web_free(web: *mut Ds4Web);
+    pub fn ds4_web_google_search(
+        web: *mut Ds4Web,
+        query: *const c_char,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> *mut c_char;
+    pub fn ds4_web_visit_page(
+        web: *mut Ds4Web,
+        url: *const c_char,
+        err: *mut c_char,
+        err_len: usize,
+    ) -> *mut c_char;
+}

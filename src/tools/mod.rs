@@ -124,6 +124,11 @@ pub struct ToolContext {
     /// worker's [`asker`](Self::asker) parks requests here for the event loop to
     /// render). `None` for the plain REPL (stdin asker) and non-interactive mode.
     pub ask_bridge: Option<ask::AskBridge>,
+    /// Live browser session for the web tools, created lazily on first web use
+    /// and reused across turns (like the C agent keeping Chrome alive). Only on
+    /// `ds4_engine` builds; the curl path needs no handle.
+    #[cfg(ds4_engine)]
+    pub web_browser: Option<crate::ds4web::WebBrowser>,
 }
 
 /// Most `skill` invocations allowed within one turn before the tool refuses,
@@ -200,6 +205,8 @@ impl ToolContext {
             edit_previews: Vec::new(),
             asker: None,
             ask_bridge: None,
+            #[cfg(ds4_engine)]
+            web_browser: None,
         }
     }
 

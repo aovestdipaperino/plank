@@ -107,9 +107,8 @@ Use write for new files or deliberate whole-file replacement. Use edit with path
 changes; old must match exactly once. For large replacements prefer anchored old text: the first \
 lines, then [upto], then unique final lines — never close old immediately after [upto].\n\n\
 ## Web\n\n\
-Use google_search to find web pages (a client-side search that returns a link map, no browser) and \
-visit_page to read a known URL. google_search accepts optional allowed_domains or blocked_domains \
-(comma-separated, not both). visit_page may ask permission to start a browser on first use.\n\n\
+Use google_search to find web pages and visit_page to read a known URL. The first web call may \
+ask permission to start a browser.\n\n\
 ## Rules\n\n\
 - Prefer read/search to get anchors, then anchored edit to avoid retyping large text.\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\

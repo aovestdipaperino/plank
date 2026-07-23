@@ -21,10 +21,16 @@
 //! for pages), the `[Content truncated by browser extractor.]` caption, the
 //! `visit_page` head-plus-temp-file framing, and the `Tool error:` texts.
 //!
+//! On `ds4_engine` builds the tools instead drive the C engine's real browser
+//! (`ds4_web.c`, Chrome over CDP) via [`crate::ds4web`], so results come from a
+//! genuine browser that dodges the bot challenges plain curl trips; the curl
+//! path above is the fallback for non-`ds4` builds (CI/dev).
+//!
 //! The C approval flow (`agent_web_confirm`) is ported as the
-//! [`super::ToolContext::web_confirm`] hook: the first web tool call per
-//! session asks for approval with the C's exact prompt; a `None` hook
-//! auto-denies with the C's non-interactive refusal message.
+//! [`super::ToolContext::web_confirm`] hook and the ask-bridge gate: the first
+//! web tool call per session asks for approval, and an "Always allow" answer is
+//! persisted as durable consent ([`crate::consent`]) so future sessions skip
+//! the prompt. A `None` hook (non-interactive) auto-denies.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -39,8 +45,10 @@ const WEB_HEAD_BYTES: usize = 8 * 1024;
 /// Maximum lines of the rendered page shown inline (`AGENT_WEB_HEAD_LINES`).
 const WEB_HEAD_LINES: usize = 100;
 /// `curl --max-time` in seconds (the C's CDP timeout is 20 s).
+#[cfg_attr(ds4_engine, allow(dead_code))]
 const CURL_TIMEOUT_SEC: u32 = 20;
 /// Cap on fetched HTML, mirroring the C's 4 MiB websocket message cap.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 /// Page Markdown length at which extraction stops (`web_extract_page_js`).
 const PAGE_CONTENT_CAP: usize = 900_000;
@@ -54,33 +62,50 @@ pub struct WebState {
     pub allowed: bool,
 }
 
-/// Executes the `google_search` tool: client-side web search via `DuckDuckGo`.
+/// Executes the `google_search` tool.
 ///
-/// Despite the trained name, this performs a client-side `DuckDuckGo` HTML
-/// search (curl, no browser, no approval gate) and returns a link map. Accepts
-/// an optional `allowed_domains` or `blocked_domains` (comma-separated,
-/// mutually exclusive).
-pub fn tool_google_search(_ctx: &mut ToolContext, call: &ToolCall) -> String {
+/// On `ds4_engine` builds this drives the ds4 C engine's real browser (Chrome
+/// over CDP) after the approval gate, returning the C extractor's Markdown. On
+/// other builds it falls back to a client-side `DuckDuckGo` HTML scrape (curl,
+/// no browser) with optional `allowed_domains`/`blocked_domains` filtering.
+#[cfg_attr(ds4_engine, allow(clippy::needless_return))]
+pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let query = call.arg_value("query").unwrap_or("").trim();
     if query.is_empty() {
         return "Tool error: google_search requires query\n".to_string();
     }
-    let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
-    let blocked = parse_domain_list(call.arg_value("blocked_domains").unwrap_or(""));
-    if !allowed.is_empty() && !blocked.is_empty() {
-        return "Tool error: google_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
-            .to_string();
+    #[cfg(ds4_engine)]
+    {
+        let _ = call;
+        if let Err(e) = ensure_allowed(ctx) {
+            return format!("Tool error: google_search failed: {e}\n");
+        }
+        let query = query.to_string();
+        return match browser(ctx).and_then(|b| b.google_search(&query)) {
+            Ok(md) => md,
+            Err(e) => format!("Tool error: google_search failed: {e}\n"),
+        };
     }
-    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-    let html = match curl_fetch(&url) {
-        Ok(html) => html,
-        Err(e) => return format!("Tool error: google_search failed: {e}\n"),
-    };
-    if is_ddg_challenge(&html) {
-        return "Tool error: google_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
+    #[cfg(not(ds4_engine))]
+    {
+        let _ = ctx;
+        let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
+        let blocked = parse_domain_list(call.arg_value("blocked_domains").unwrap_or(""));
+        if !allowed.is_empty() && !blocked.is_empty() {
+            return "Tool error: google_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
+                .to_string();
+        }
+        let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+        let html = match curl_fetch(&url) {
+            Ok(html) => html,
+            Err(e) => return format!("Tool error: google_search failed: {e}\n"),
+        };
+        if is_ddg_challenge(&html) {
+            return "Tool error: google_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
+        }
+        let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
+        render_search_results(query, &hits)
     }
-    let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
-    render_search_results(query, &hits)
 }
 
 /// Executes the `visit_page` tool: renders a URL to Markdown with link map.
@@ -95,11 +120,24 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if let Err(e) = ensure_allowed(ctx) {
         return format!("Tool error: visit_page failed: {e}\n");
     }
-    let html = match curl_fetch(&url) {
-        Ok(html) => html,
-        Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
+    // On ds4_engine builds render the page in the C engine's real browser;
+    // elsewhere fetch with curl and extract Markdown in Rust.
+    #[cfg(ds4_engine)]
+    let md = {
+        let url = url.clone();
+        match browser(ctx).and_then(|b| b.visit_page(&url)) {
+            Ok(md) => md,
+            Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
+        }
     };
-    let md = extract_page_markdown(&url, &html);
+    #[cfg(not(ds4_engine))]
+    let md = {
+        let html = match curl_fetch(&url) {
+            Ok(html) => html,
+            Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
+        };
+        extract_page_markdown(&url, &html)
+    };
     let path = match write_temp_text("ds4_agent_web", &md) {
         Ok(path) => path,
         Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
@@ -108,11 +146,28 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
 }
 
 /// Splits a comma-separated domain list arg into lowercased, non-empty hosts.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn parse_domain_list(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Lazily creates and returns the session's C-engine browser, rooted at `$HOME`
+/// (falling back to the working directory). Reused across turns.
+///
+/// # Errors
+/// Returns a message if the browser subsystem could not be created.
+#[cfg(ds4_engine)]
+fn browser(ctx: &mut ToolContext) -> Result<&mut crate::ds4web::WebBrowser, String> {
+    if ctx.web_browser.is_none() {
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| ctx.cwd.clone(), std::path::PathBuf::from);
+        ctx.web_browser = Some(crate::ds4web::WebBrowser::new(&home)?);
+    }
+    Ok(ctx.web_browser.as_mut().expect("web_browser was just set"))
 }
 
 /// Runs the session approval gate, mirroring `web_ensure_browser`.
@@ -123,11 +178,22 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
 /// gate is routed through the [`Asker`](crate::tools::ask::Asker) the event
 /// loop already services; the plain REPL and tests keep the stdin hook.
 ///
+/// The user may answer "Always allow", which is recorded as durable per-user
+/// consent ([`crate::consent`]) so future sessions skip the prompt.
+///
 /// # Errors
 ///
 /// Returns the C refusal texts when no confirmation path exists or the user denies.
 fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
     if ctx.web.allowed {
+        return Ok(());
+    }
+    // Standing consent from a previous "Always allow" — never prompt again.
+    // Skipped under `cfg(test)` so unit tests don't depend on the developer's
+    // real `~/.plank/web-consent` marker.
+    #[cfg(not(test))]
+    if crate::consent::web_consent_granted() {
+        ctx.web.allowed = true;
         return Ok(());
     }
     // TUI: approve via the ask bridge, never blocking stdin under raw mode.
@@ -140,7 +206,11 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
             options: vec![
                 crate::tools::ask::AskOption {
                     label: "Allow".to_string(),
-                    description: "Start Chrome and let web tools access the network".to_string(),
+                    description: "Allow web access for this session".to_string(),
+                },
+                crate::tools::ask::AskOption {
+                    label: "Always allow".to_string(),
+                    description: "Allow web access now and in every future session".to_string(),
                 },
                 crate::tools::ask::AskOption {
                     label: "Deny".to_string(),
@@ -151,6 +221,18 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
         };
         return match asker.ask(req) {
             crate::tools::ask::AskOutcome::Answered(labels)
+                if labels.iter().any(|l| l == "Always allow") =>
+            {
+                // Best-effort persistence; a write failure still grants the
+                // session so the current call proceeds.
+                if let Err(e) = crate::consent::grant_web_consent() {
+                    ctx.hook_warnings
+                        .push(format!("could not save web consent: {e}"));
+                }
+                ctx.web.allowed = true;
+                Ok(())
+            }
+            crate::tools::ask::AskOutcome::Answered(labels)
                 if labels.iter().any(|l| l == "Allow") =>
             {
                 ctx.web.allowed = true;
@@ -159,7 +241,8 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
             _ => Err("user denied Chrome browser start".to_string()),
         };
     }
-    // Plain REPL / tests: the stdin confirm hook.
+    // Plain REPL / tests: the stdin confirm hook. Its bool cannot carry the
+    // "always" choice, so persistence is only offered on the TUI path.
     let Some(confirm) = ctx.web_confirm.as_mut() else {
         return Err("visible Chrome browser startup requires interactive approval".to_string());
     };
@@ -178,6 +261,7 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns a message when curl cannot be spawned or exits nonzero.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn curl_fetch(url: &str) -> Result<String, String> {
     let out = Command::new("curl")
         .args([
@@ -249,12 +333,15 @@ pub fn url_encode(s: impl AsRef<str>) -> String {
 // ============================================================================
 
 /// Max result links rendered by `web_search` (mirrors the search extractor cap).
+#[cfg_attr(ds4_engine, allow(dead_code))]
 const SEARCH_MAX_LINKS: usize = 20;
 /// Max title characters rendered per link.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 const SEARCH_TITLE_CAP: usize = 180;
 
 /// One parsed `DuckDuckGo` result.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(ds4_engine, allow(dead_code))]
 struct SearchHit {
     title: String,
     url: String,
@@ -262,6 +349,7 @@ struct SearchHit {
 }
 
 /// True when the page is `DuckDuckGo`'s anti-bot challenge, not results.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn is_ddg_challenge(html: &str) -> bool {
     html.contains("anomaly-modal") || html.contains("challenge-form")
 }
@@ -270,6 +358,7 @@ fn is_ddg_challenge(html: &str) -> bool {
 ///
 /// DDG wraps hits as `//duckduckgo.com/l/?uddg=<encoded url>&...`; this decodes
 /// the `uddg` param. Scheme-relative `//host/...` becomes `https://host/...`.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn decode_ddg_href(href: &str) -> String {
     if let Some(pos) = href.find("uddg=") {
         let rest = &href[pos + "uddg=".len()..];
@@ -286,11 +375,13 @@ fn decode_ddg_href(href: &str) -> String {
 }
 
 /// True if a raw tag's `class` attribute contains `needle` as a token.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn class_contains(attrs: &str, needle: &str) -> bool {
     attr_value(attrs, "class").is_some_and(|c| c.split_whitespace().any(|t| t == needle))
 }
 
 /// Concatenates text tokens from `start` until the matching close tag `name`.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn collect_text_until_close(toks: &[Tok<'_>], start: usize, name: &str) -> String {
     let mut out = String::new();
     for tok in &toks[start..] {
@@ -313,6 +404,7 @@ fn collect_text_until_close(toks: &[Tok<'_>], start: usize, name: &str) -> Strin
 /// [`decode_ddg_href`], inner text → title); a following
 /// `<a class="result__snippet">` before the next result attaches the snippet.
 /// Hits with an empty title or URL are dropped.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn parse_ddg_results(html: &str) -> Vec<SearchHit> {
     let toks = tokenize(html);
     let mut hits: Vec<SearchHit> = Vec::new();
@@ -356,6 +448,7 @@ fn parse_ddg_results(html: &str) -> Vec<SearchHit> {
 }
 
 /// Lowercased host of an `http(s)` URL, or `None` if not parseable.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn host_of(url: &str) -> Option<String> {
     let rest = url
         .strip_prefix("https://")
@@ -371,12 +464,14 @@ fn host_of(url: &str) -> Option<String> {
 }
 
 /// True if `host` equals `domain` or is a subdomain of it.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn host_in_domain(host: &str, domain: &str) -> bool {
     host == domain || host.ends_with(&format!(".{domain}"))
 }
 
 /// Keeps hits per allow/block lists. `allowed` (if non-empty) is a whitelist;
 /// `blocked` is a blacklist. Callers guarantee at most one is non-empty.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn filter_by_domains(
     hits: Vec<SearchHit>,
     allowed: &[String],
@@ -396,6 +491,7 @@ fn filter_by_domains(
 }
 
 /// Renders hits as a plank-style link map with a query header.
+#[cfg_attr(ds4_engine, allow(dead_code))]
 fn render_search_results(query: &str, hits: &[SearchHit]) -> String {
     let mut out = format!("Web search results for query: \"{query}\"\n\n");
     if hits.is_empty() {
@@ -1318,6 +1414,9 @@ let y = 2;</pre>
         assert!(!is_ddg_challenge(DDG_FIXTURE));
     }
 
+    // Domain filtering is a property of the curl fallback path only; on
+    // ds4_engine builds google_search goes through the C browser instead.
+    #[cfg(not(ds4_engine))]
     #[test]
     fn google_search_rejects_both_domain_lists() {
         let (mut ctx, dir) = test_ctx();

@@ -22,7 +22,13 @@ fn main() {
         println!("cargo:warning=refs/ds4 submodule missing; building without the ds4 engine");
         return;
     }
-    let objs = ["ds4.o", "ds4_distributed.o", "ds4_ssd.o", "ds4_metal.o"];
+    let objs = [
+        "ds4.o",
+        "ds4_distributed.o",
+        "ds4_ssd.o",
+        "ds4_metal.o",
+        "ds4_web.o",
+    ];
     let status = Command::new("make")
         .arg("-C")
         .arg(&ds4)
@@ -56,6 +62,8 @@ fn main() {
         "ds4_metal.m",
         "ds4_ssd.c",
         "ds4_distributed.c",
+        "ds4_web.c",
+        "ds4_web.h",
     ] {
         println!("cargo:rerun-if-changed={}", ds4.join(f).display());
     }

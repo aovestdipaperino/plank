@@ -13,10 +13,13 @@ pub mod compact;
 pub mod complete;
 pub mod config;
 pub mod configform;
+pub mod consent;
 pub mod context;
 pub mod download;
 #[cfg(ds4_engine)]
 pub mod ds4engine;
+#[cfg(ds4_engine)]
+pub mod ds4web;
 pub mod dsml;
 pub mod editor;
 pub mod engine;
