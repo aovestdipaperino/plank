@@ -3167,8 +3167,17 @@ impl Agent<'_> {
                         view.top = view.top.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let row = view.top.saturating_add(usize::from(m.row));
-                        selection = Some(((m.column, row), (m.column, row)));
+                        // A click on the jump-to-bottom hint resumes follow mode
+                        // (same as End) instead of starting a text selection.
+                        if view.jump_hint_rect.is_some_and(|r| {
+                            r.contains(ratatui::layout::Position::new(m.column, m.row))
+                        }) {
+                            view.follow = true;
+                            selection = None;
+                        } else {
+                            let row = view.top.saturating_add(usize::from(m.row));
+                            selection = Some(((m.column, row), (m.column, row)));
+                        }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if let Some((_, end)) = &mut selection {
@@ -5070,6 +5079,14 @@ fn busy_ui_loop(
                 MouseEventKind::ScrollDown => {
                     // Clamped by draw, which re-enters follow mode at the bottom.
                     view.top = view.top.saturating_add(3);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    // Clicking the jump-to-bottom hint resumes follow mode.
+                    if view.jump_hint_rect.is_some_and(|r| {
+                        r.contains(ratatui::layout::Position::new(m.column, m.row))
+                    }) {
+                        view.follow = true;
+                    }
                 }
                 _ => {}
             },

@@ -653,6 +653,11 @@ pub struct OutputView {
     pub top: usize,
     /// True when the view tracks the newest output.
     pub follow: bool,
+    /// Screen rect of the jump-to-bottom hint drawn on the last frame, or
+    /// `None` when the hint is hidden (the view already follows the bottom).
+    /// Set by `render_output`; read by the mouse handler to make the hint
+    /// clickable.
+    pub jump_hint_rect: Option<Rect>,
 }
 
 impl Default for OutputView {
@@ -660,6 +665,7 @@ impl Default for OutputView {
         Self {
             top: 0,
             follow: true,
+            jump_hint_rect: None,
         }
     }
 }
@@ -1505,9 +1511,11 @@ fn render_output(
     let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
     let para = para.scroll((scroll, 0));
     frame.render_widget(para, area);
-    if !view.follow {
-        draw_jump_hint(frame, area);
-    }
+    view.jump_hint_rect = if view.follow {
+        None
+    } else {
+        draw_jump_hint(frame, area)
+    };
     // Project the content-space selection onto the (post-clamp) viewport.
     if let Some(sel) = selection.and_then(|s| selection_screen(s, view.top, area.height)) {
         highlight_selection(frame.buffer_mut(), area, sel);
@@ -1582,12 +1590,14 @@ pub fn draw_btw_split(
 }
 
 /// Overlays the jump-to-bottom affordance on the output area's bottom-right
-/// corner while the view is pinned above the newest output.
-fn draw_jump_hint(frame: &mut Frame, area: Rect) {
-    const HINT: &str = " ↓ End: jump to bottom ";
+/// corner while the view is pinned above the newest output. Returns the screen
+/// rect it drew (so the mouse handler can make it clickable), or `None` when
+/// the area is too small to show the hint.
+fn draw_jump_hint(frame: &mut Frame, area: Rect) -> Option<Rect> {
+    const HINT: &str = " ↓ End/click: jump to bottom ";
     let hint_width = u16::try_from(HINT.chars().count()).unwrap_or(u16::MAX);
     if area.width < hint_width || area.height == 0 {
-        return;
+        return None;
     }
     let rect = Rect::new(area.right() - hint_width, area.bottom() - 1, hint_width, 1);
     let style = Style::default()
@@ -1595,6 +1605,7 @@ fn draw_jump_hint(frame: &mut Frame, area: Rect) {
         .fg(Color::Indexed(252))
         .add_modifier(Modifier::BOLD);
     frame.render_widget(Paragraph::new(Span::styled(HINT, style)), rect);
+    Some(rect)
 }
 
 /// Milliseconds since the first frame, driving the shimmer sweep.
@@ -2019,6 +2030,49 @@ mod tests {
         // Clearing removes it again.
         log.set_progress(None);
         assert_eq!(log.to_text().lines.len(), base);
+    }
+
+    #[test]
+    fn jump_hint_rect_tracks_follow_state() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut log = OutputLog::new();
+        for i in 0..50 {
+            log.visible_text(&format!("line {i}"));
+            log.end_line();
+        }
+        // Scrolled up (not following): the hint is drawn and its rect recorded
+        // at the bottom-right of the area, so the mouse handler can hit-test it.
+        let mut view = OutputView {
+            top: 0,
+            follow: false,
+            jump_hint_rect: None,
+        };
+        let mut term = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_output(f, area, &log, &mut view, None);
+        })
+        .unwrap();
+        let r = view
+            .jump_hint_rect
+            .expect("hint rect set while scrolled up");
+        assert_eq!(r.y, 5, "hint on the bottom row");
+        assert_eq!(r.x + r.width, 40, "hint flush to the right edge");
+        assert_eq!(r.height, 1);
+
+        // Following the bottom: no hint, rect cleared.
+        view.follow = true;
+        term.draw(|f| {
+            let area = f.area();
+            render_output(f, area, &log, &mut view, None);
+        })
+        .unwrap();
+        assert!(
+            view.jump_hint_rect.is_none(),
+            "hint hidden while following the newest output"
+        );
     }
 
     #[test]
