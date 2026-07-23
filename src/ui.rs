@@ -229,9 +229,9 @@ fn remote_abandon(remote: Option<&Mutex<UiRemote>>) {
 }
 
 /// Map a ratatui [`Color`](ratatui::style::Color) to concrete 24-bit RGB for
-/// the CRT-off frame transcription. `Reset` becomes a neutral gray (the
-/// assumed default foreground); background colors and styles are not
-/// represented (crt-off 0.1 has no bg API — see issue #55).
+/// the CRT-off frame image. `Reset` becomes a neutral gray (the assumed
+/// default foreground); for the background variant, where `Reset` should be
+/// black, see [`bg_to_rgb`].
 fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
     use ratatui::style::Color;
     match c {
