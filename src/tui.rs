@@ -1264,14 +1264,17 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Opt
     // Reason for the rebuild (cache missing / prompt changed + diff), below the
     // progress bar in the reserved region.
     if let Some(notice) = notice {
+        // First line (the reason) is centered; any diff lines below it are left
+        // aligned so `-`/`+` rows line up and stay readable.
         let lines: Vec<Line> = notice
             .lines()
-            .map(|l| {
-                Line::from(Span::styled(
+            .enumerate()
+            .map(|(i, l)| {
+                let line = Line::from(Span::styled(
                     l.to_owned(),
                     Style::default().fg(Color::Yellow),
-                ))
-                .centered()
+                ));
+                if i == 0 { line.centered() } else { line }
             })
             .collect();
         frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);

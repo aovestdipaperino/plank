@@ -220,70 +220,50 @@ pub fn plural(n: usize) -> &'static str {
     if n == 1 { "line" } else { "lines" }
 }
 
-/// A compact, single-line summary of the first differing region between `old`
-/// and `new`, each side trimmed to about `width` characters around the change
-/// (with `…` marking elision). Built on the same [`edit_preview`] machinery as
-/// the code-diff cards, but rendered tiny — enough to eyeball whether a change
-/// (e.g. a system-prompt cache miss) was benign, like a ticking counter, rather
-/// than the whole diff. Returns `None` when the texts are identical.
+/// A compact multi-line summary of the first changes between `old` and `new`:
+/// up to `max_lines` changed lines, each prefixed `-`/`+` and sanitized so the
+/// warm-up display stays readable (control characters — including embedded
+/// CR/NL from MCP tool schemas — are stripped, and long lines are truncated
+/// with `…`). Built on the same [`edit_preview`] machinery as the code-diff
+/// cards. Returns `None` when the texts are identical.
 // Consumed only by the ds4_engine warm-up path; the echo-only build (CI) has no
 // caller, so silence dead_code there. Tests exercise it in every configuration.
 #[cfg_attr(not(ds4_engine), allow(dead_code))]
 #[must_use]
-pub fn first_change_snippet(old: &str, new: &str, width: usize) -> Option<String> {
+pub fn first_change_snippet(old: &str, new: &str, max_lines: usize) -> Option<String> {
+    const WIDTH: usize = 80;
     let preview = edit_preview("", old, new, false);
-    let first = |add: bool| {
-        preview.rows.iter().find_map(|r| match r {
-            DiffRow::Del { text, .. } if !add => Some(text.as_str()),
-            DiffRow::Add { text, .. } if add => Some(text.as_str()),
-            _ => None,
-        })
-    };
-    let more = |shown: usize| {
-        let extra = preview.added + preview.removed - shown;
-        if extra > 0 {
-            format!("  (+{extra} more {})", plural(extra))
-        } else {
-            String::new()
+    let mut lines = Vec::new();
+    for row in &preview.rows {
+        let rendered = match row {
+            DiffRow::Del { text, .. } => format!("- {}", sanitize_line(text, WIDTH)),
+            DiffRow::Add { text, .. } => format!("+ {}", sanitize_line(text, WIDTH)),
+            _ => continue,
+        };
+        lines.push(rendered);
+        if lines.len() >= max_lines {
+            break;
         }
-    };
-    match (first(false), first(true)) {
-        (Some(o), Some(n)) => Some(format!(
-            "{} → {}{}",
-            change_window(o, n, width),
-            change_window(n, o, width),
-            more(2)
-        )),
-        (Some(o), None) => Some(format!("- {}{}", change_window(o, "", width), more(1))),
-        (None, Some(n)) => Some(format!("+ {}{}", change_window(n, "", width), more(1))),
-        (None, None) => None,
     }
+    if lines.is_empty() {
+        return None;
+    }
+    let total = preview.added + preview.removed;
+    if total > lines.len() {
+        let extra = total - lines.len();
+        lines.push(format!("… (+{extra} more changed {})", plural(extra)));
+    }
+    Some(lines.join("\n"))
 }
 
-/// The slice of `a` that differs from `b`, plus a few characters of context,
-/// capped at `width` characters and bracketed with `…` where trimmed.
+/// One diff line made safe for a single terminal row: control characters
+/// (CR, NL, tab, …) removed so nothing reflows or garbles the display, then
+/// truncated to `width` characters with a trailing `…` when trimmed.
 #[cfg_attr(not(ds4_engine), allow(dead_code))]
-fn change_window(a: &str, b: &str, width: usize) -> String {
-    const CTX: usize = 4;
-    let ac: Vec<char> = a.chars().collect();
-    let bc: Vec<char> = b.chars().collect();
-    let mut p = 0;
-    while p < ac.len() && p < bc.len() && ac[p] == bc[p] {
-        p += 1;
-    }
-    let max_suf = ac.len().min(bc.len()) - p;
-    let mut s = 0;
-    while s < max_suf && ac[ac.len() - 1 - s] == bc[bc.len() - 1 - s] {
-        s += 1;
-    }
-    let start = p.saturating_sub(CTX);
-    let end = (ac.len() - s + CTX).min(ac.len()).min(start + width);
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    out.extend(&ac[start..end]);
-    if end < ac.len() {
+fn sanitize_line(s: &str, width: usize) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    let mut out: String = clean.chars().take(width).collect();
+    if clean.chars().count() > width {
         out.push('…');
     }
     out
@@ -307,29 +287,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_change_snippet_centers_on_the_change() {
-        // A benign counter tick deep inside a long line: the snippet must show
-        // the differing region (not the identical head/tail), both sides.
-        let old = "tokensave_context tool: the graph has (520445 nodes) available\n";
-        let new = "tokensave_context tool: the graph has (520448 nodes) available\n";
-        let snip = first_change_snippet(old, new, 20).expect("differs");
-        assert!(snip.contains('→'), "{snip}");
-        assert!(snip.contains("445"), "old side shown: {snip}");
-        assert!(snip.contains("448"), "new side shown: {snip}");
-        // Tiny: nowhere near the full ~60-char lines.
-        assert!(snip.chars().count() < 60, "kept compact: {snip}");
-        // The identical head is elided, not echoed in full.
+    fn first_change_snippet_is_bounded_and_sanitized() {
+        // A changed line carrying embedded control chars (CR/tab) — as MCP tool
+        // schemas can — must render on one clean row, not reflow the display.
+        let old = "intro line\nold tool: does\ta\rthing\ntail\n";
+        let new = "intro line\nnew tool: does\ta\rthing\ntail\n";
+        let snip = first_change_snippet(old, new, 5).expect("differs");
         assert!(
-            !snip.contains("tokensave_context tool"),
-            "head elided: {snip}"
+            snip.lines().any(|l| l.starts_with("- ")),
+            "shows removal: {snip:?}"
+        );
+        assert!(
+            snip.lines().any(|l| l.starts_with("+ ")),
+            "shows addition: {snip:?}"
+        );
+        // No control characters survive into the rendered snippet.
+        assert!(
+            !snip.contains('\r') && !snip.contains('\t'),
+            "sanitized: {snip:?}"
         );
 
-        // Identical texts have no change to show.
-        assert!(first_change_snippet(old, old, 20).is_none());
+        // Bounded to max_lines changed rows, plus a one-line elision summary.
+        let mut o = String::new();
+        let mut n = String::new();
+        for i in 0..20 {
+            let _ = std::fmt::Write::write_fmt(&mut o, format_args!("line {i}\n"));
+            let _ = std::fmt::Write::write_fmt(&mut n, format_args!("LINE {i}\n"));
+        }
+        let capped = first_change_snippet(&o, &n, 5).expect("differs");
+        assert!(capped.lines().count() <= 6, "capped: {capped}");
+        assert!(capped.contains("more changed"), "notes elision: {capped}");
 
-        // A pure addition is summarized with a `+`.
-        let plus = first_change_snippet("a\n", "a\nb\n", 20).expect("added");
-        assert!(plus.starts_with('+'), "{plus}");
+        // Identical texts have no change to show.
+        assert!(first_change_snippet(old, old, 5).is_none());
     }
 
     #[test]
