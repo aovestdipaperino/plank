@@ -580,9 +580,9 @@ impl Ds4Session {
     }
 }
 
-/// Characters of each side shown in the first-change snippet when a
-/// system-prompt cache miss is reported.
-const SYSPROMPT_SNIPPET_WIDTH: usize = 24;
+/// Changed lines shown in the first-change diff when a system-prompt cache
+/// miss is reported (plus a one-line "+N more" summary when there are more).
+const SYSPROMPT_SNIPPET_LINES: usize = 5;
 
 /// Debug aid for the sysprompt-cache churn investigation (gated behind
 /// `PLANK_DEBUG_SYSPROMPT`). Dumps the exact system prompt that produced
@@ -879,10 +879,10 @@ impl Engine for Ds4Session {
                     && let Some(snip) = crate::tools::diff::first_change_snippet(
                         &old,
                         system,
-                        SYSPROMPT_SNIPPET_WIDTH,
+                        SYSPROMPT_SNIPPET_LINES,
                     )
                 {
-                    msg.push_str("\nfirst change: ");
+                    msg.push('\n');
                     msg.push_str(&snip);
                 }
                 on_event(EngineEvent::Notice(msg));
