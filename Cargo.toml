@@ -36,6 +36,7 @@ tungstenite = "0.24"
 nucleo-matcher = "0.3"
 git2 = { version = "0.21.0", default-features = false }
 similar = "3.1.1"
+crt-off = "0.1"
 
 [lints.rust]
 missing_debug_implementations = "warn"

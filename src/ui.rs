@@ -232,7 +232,6 @@ fn remote_abandon(remote: Option<&Mutex<UiRemote>>) {
 /// the CRT-off frame transcription. `Reset` becomes a neutral gray (the
 /// assumed default foreground); background colors and styles are not
 /// represented (crt-off 0.1 has no bg API — see issue #55).
-#[allow(dead_code)]
 fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
     use ratatui::style::Color;
     match c {
@@ -258,9 +257,32 @@ fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
     }
 }
 
+/// Transcribe a rendered ratatui frame into a [`crt_off::ScreenBuffer`],
+/// row by row, reproducing foreground glyphs and their colors. crt-off 0.1
+/// is write-only and sequential (no cursor addressing, no background color),
+/// so background fills and text styles are dropped (issue #55). Blank cells
+/// are emitted as spaces, which record no pixel.
+///
+/// Not yet called from non-test code — a follow-up task wires this into the
+/// exit-animation render path (issue #54).
+#[allow(dead_code)]
+fn frame_to_screen(buf: &ratatui::buffer::Buffer) -> crt_off::ScreenBuffer {
+    let area = buf.area();
+    let mut screen = crt_off::ScreenBuffer::new(u32::from(area.width), u32::from(area.height));
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &buf[(x, y)];
+            let (r, g, b) = color_to_rgb(cell.fg);
+            screen.fg(r, g, b).put(cell.symbol());
+        }
+        screen.putln("");
+    }
+    screen
+}
+
 /// xterm-256 palette index to RGB: 0-15 base colors, 16-231 the 6x6x6 cube,
 /// 232-255 the 24-step grayscale ramp.
-#[allow(dead_code, clippy::many_single_char_names)]
+#[allow(clippy::many_single_char_names)]
 fn indexed_to_rgb(i: u8) -> (u8, u8, u8) {
     const BASE: [(u8, u8, u8); 16] = [
         (0, 0, 0),
@@ -7590,5 +7612,24 @@ mod tests {
         assert_eq!(color_to_rgb(Color::Indexed(231)), (255, 255, 255)); // cube max
         assert_eq!(color_to_rgb(Color::Indexed(232)), (8, 8, 8)); // ramp start
         assert_eq!(color_to_rgb(Color::Indexed(255)), (238, 238, 238)); // ramp end
+    }
+
+    #[test]
+    fn frame_to_screen_reproduces_dimensions_and_content() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        use ratatui::style::Color;
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
+        // Row 0: "hi" then a blank cell.
+        buf[(0, 0)].set_symbol("h").set_fg(Color::Green);
+        buf[(1, 0)].set_symbol("i").set_fg(Color::Green);
+        // Row 1 left blank (spaces).
+        let screen = frame_to_screen(&buf);
+        assert_eq!(screen.width(), 3);
+        // crt-off counts a row as content whenever any cell wrote color, even
+        // a blank " " cell with an explicit fg (here, the `Reset` neutral
+        // gray applied to every unset cell) — both rows count, not just row 0.
+        assert_eq!(screen.content_rows(), 2);
     }
 }

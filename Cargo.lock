@@ -175,6 +175,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "crt-off"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab9df811a2bc3c943d89e3a6083d78240ad8631037e3aaebaad18db6d5f4d966"
+dependencies = [
+ "crossterm",
+ "image",
+ "logo-art",
+]
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -676,6 +687,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 name = "plank"
 version = "2.4.0"
 dependencies = [
+ "crt-off",
  "git2",
  "image",
  "libc",
