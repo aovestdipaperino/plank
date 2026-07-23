@@ -52,4 +52,5 @@ pub mod ui;
 pub mod uiremote;
 pub mod upgrade;
 pub mod viz;
+pub mod warp;
 pub mod worker;
