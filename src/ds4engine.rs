@@ -580,6 +580,42 @@ impl Ds4Session {
     }
 }
 
+/// Debug aid for the sysprompt-cache churn investigation (gated behind
+/// `PLANK_DEBUG_SYSPROMPT`). Dumps the exact system prompt that produced
+/// `computed` to `<cache-dir>/sysprompt-debug-<fp8>.txt` and appends a line to
+/// `sysprompt-debug.log`, so two launches leave two diffable prompt files and a
+/// running record of computed-vs-stored fingerprints. Best-effort; never fails
+/// the warm-up.
+fn debug_log_sysprompt(checkpoint: &Path, system: &str, computed: &str, stored: Option<&str>) {
+    let Some(dir) = checkpoint.parent() else {
+        return;
+    };
+    let fp8 = &computed[..computed.len().min(8)];
+    let dump = dir.join(format!("sysprompt-debug-{fp8}.txt"));
+    let _ = std::fs::write(&dump, system);
+    let hit = stored == Some(computed);
+    let line = format!(
+        "pid={} decision={} computed={} stored={} system_len={} dump={}\n",
+        std::process::id(),
+        if hit { "HIT" } else { "MISS" },
+        computed,
+        stored.unwrap_or("<none>"),
+        system.len(),
+        dump.display(),
+    );
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("sysprompt-debug.log"))
+        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    eprintln!(
+        "[sysprompt-debug] {} computed={computed} stored={} (prompt dumped to {})",
+        if hit { "HIT" } else { "MISS" },
+        stored.unwrap_or("<none>"),
+        dump.display()
+    );
+}
+
 impl Engine for Ds4Session {
     #[allow(clippy::too_many_lines)]
     fn generate(
@@ -800,19 +836,43 @@ impl Engine for Ds4Session {
     ) -> Result<bool, EngineError> {
         let tokens = self.model.build_system_tokens(system);
         let fingerprint = self.model.checkpoint_fingerprint(system);
+        let debug = std::env::var_os("PLANK_DEBUG_SYSPROMPT").is_some();
         let session = self.ensure_session()?;
 
         // Fast path: restore a matching on-disk checkpoint, skipping prefill.
-        if let Some(path) = checkpoint
-            && let Ok(mut bytes) = std::fs::read(path)
-            && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
-            && bytes[..nl] == *fingerprint.as_bytes()
-        {
-            let payload = bytes.split_off(nl + 1);
-            if SessionSnapshot::restore_bytes(session, &payload).is_ok() {
-                return Ok(false);
+        if let Some(path) = checkpoint {
+            let stored = std::fs::read(path).ok().and_then(|bytes| {
+                let nl = bytes.iter().position(|&b| b == b'\n')?;
+                std::str::from_utf8(&bytes[..nl]).ok().map(str::to_owned)
+            });
+            if debug {
+                debug_log_sysprompt(path, system, &fingerprint, stored.as_deref());
             }
-            // A stale/incompatible snapshot: fall through and rebuild.
+            if stored.as_deref() == Some(fingerprint.as_str())
+                && let Ok(mut bytes) = std::fs::read(path)
+                && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
+            {
+                let payload = bytes.split_off(nl + 1);
+                if SessionSnapshot::restore_bytes(session, &payload).is_ok() {
+                    if debug {
+                        eprintln!("[sysprompt-debug] HIT: restored snapshot fp={fingerprint}");
+                    }
+                    return Ok(false);
+                }
+                if debug {
+                    eprintln!(
+                        "[sysprompt-debug] MISS: fingerprint matched but restore_bytes failed \
+                         (incompatible snapshot); rebuilding fp={fingerprint}"
+                    );
+                }
+                // A stale/incompatible snapshot: fall through and rebuild.
+            } else if debug {
+                eprintln!(
+                    "[sysprompt-debug] MISS: fingerprint mismatch (stored={} computed={fingerprint}); \
+                     rebuilding — diff the dumped prompts to see what changed",
+                    stored.as_deref().unwrap_or("<none>")
+                );
+            }
         }
 
         // Cache miss: prefill the system prompt, streaming progress.
