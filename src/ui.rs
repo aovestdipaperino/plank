@@ -263,9 +263,6 @@ fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
 /// so background fills and text styles are dropped (issue #55). Blank cells
 /// are emitted as spaces, which record no pixel.
 ///
-/// Not yet called from non-test code — a follow-up task wires this into the
-/// exit-animation render path (issue #54).
-#[allow(dead_code)]
 fn frame_to_screen(buf: &ratatui::buffer::Buffer) -> crt_off::ScreenBuffer {
     let area = buf.area();
     let mut screen = crt_off::ScreenBuffer::new(u32::from(area.width), u32::from(area.height));
@@ -2927,6 +2924,23 @@ impl Agent<'_> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
         let result = self.tui_loop(&mut terminal);
+        // Retro CRT power-off of the final frame on a clean exit. Best-effort:
+        // any error is swallowed so the terminal is always restored and the
+        // real turn outcome (`result`) is what we return. Skipped on error
+        // exits (keep error text readable), non-TTY stdout, or when disabled.
+        if result.is_ok() && crate::settings::active().ui.crt_off && std::io::stdout().is_terminal()
+        {
+            let screen = frame_to_screen(terminal.current_buffer_mut());
+            let cfg = crt_off::Config {
+                hold_secs: 0.0,
+                vstretch_secs: 0.35,
+                hstretch_secs: 0.25,
+                dot_fade_secs: 0.2,
+                black_secs: 0.1,
+                fps: 60.0,
+            };
+            let _ = screen.animate(&cfg);
+        }
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             PopKeyboardEnhancementFlags,
