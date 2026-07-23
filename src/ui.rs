@@ -3589,7 +3589,17 @@ impl Agent<'_> {
                     }
                     if let Some(msg) = &notice {
                         for line in msg.lines() {
-                            eprintln!("  {line}");
+                            // Match the code-diff card colors on the -/+ rows.
+                            let colored = match (color, line.as_bytes().first()) {
+                                (true, Some(b'-')) => {
+                                    format!("\x1b[48;5;52m\x1b[38;5;224m{line}{ANSI_RESET}")
+                                }
+                                (true, Some(b'+')) => {
+                                    format!("\x1b[48;5;22m\x1b[38;5;194m{line}{ANSI_RESET}")
+                                }
+                                _ => line.to_owned(),
+                            };
+                            eprintln!("  {colored}");
                         }
                     }
                 }
