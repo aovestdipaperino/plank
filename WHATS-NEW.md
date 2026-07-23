@@ -5,7 +5,7 @@ see the GitHub releases and commit history.
 
 ## Beta (2.1, unreleased)
 
-The 2.1 beta (`brew install plank-beta`) is a round of "see what the agent is
+The 2.1 beta (`brew install plank-agent-beta`) is a round of "see what the agent is
 doing" polish, plus the first delegation tool.
 
 🧑‍🔧 **Delegate to a sub-agent.** The model can hand a bounded task to a fresh,

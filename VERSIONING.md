@@ -5,10 +5,10 @@ published to crates.io. Releases follow a two-channel scheme driven entirely by
 the `MAJOR.MINOR` series:
 
 - **Beta** — the highest `MAJOR.MINOR` series across all `v*` tags. Releases in
-  that series update the `plank-beta` formula and are published as GitHub
+  that series update the `plank-agent-beta` formula and are published as GitHub
   prereleases.
 - **Stable** — every series below the highest. Releases there update the
-  `plank` formula.
+  `plank-agent` formula.
 
 Within the beta series, **every release is a patch bump** — bug fixes and new
 features alike. A beta that opens at `v2.4.0` accumulates `v2.4.1`, `v2.4.2`,
@@ -34,9 +34,9 @@ as the new beta.
 ### Prerequisites
 
 - The beta release you intend to promote must have both bottle assets
-  (`plank-<version>.arm64_sequoia.bottle.tar.gz` and
-  `plank-<version>.sequoia.bottle.tar.gz`) attached — `release.yml` uploads
-  beta bottles under both the `plank-beta` and `plank` names precisely so
+  (`plank-agent-<version>.arm64_sequoia.bottle.tar.gz` and
+  `plank-agent-<version>.sequoia.bottle.tar.gz`) attached — `release.yml` uploads
+  beta bottles under both the `plank-agent-beta` and `plank-agent` names precisely so
   promotion can reuse them without rebuilding. The workflow aborts if either
   is missing.
 - The `TAP_GITHUB_TOKEN` repository secret must be a PAT with push access to
@@ -65,17 +65,17 @@ series. A `concurrency: promote` group prevents overlapping runs.
    any expected bottle is missing.
 3. **Marks the GitHub release as stable**: clears the prerelease flag and
    marks it `--latest`.
-4. **Rewrites `Formula/plank.rb` in the tap** to point at the promoted tag,
+4. **Rewrites `Formula/plank-agent.rb` in the tap** to point at the promoted tag,
    with fresh SHA-256s for the source tarball and both bottles, and pushes the
    commit (`plank <version> (promoted from beta)`).
 5. **Opens the next minor beta**: bumps `Cargo.toml` (and `Cargo.lock`) on
    `main` to `<major>.<minor+1>.0`, commits, tags it, and publishes it as a
    prerelease. `release.yml` then fires on that release and seeds the new
-   `plank-beta` formula with freshly built bottles.
+   `plank-agent-beta` formula with freshly built bottles.
 
 ### After promotion
 
-- `brew upgrade plank` picks up the promoted version; `plank-beta` users move
+- `brew upgrade plank-agent` picks up the promoted version; `plank-agent-beta` users move
   onto the new minor with its first beta release.
 - Subsequent releases tagged under the new highest series go to beta; patch
   tags under the promoted (now stable) series go straight to the stable
@@ -85,12 +85,12 @@ series. A `concurrency: promote` group prevents overlapping runs.
 
 - The promoted GitHub release shows as **Latest** (not prerelease), and a
   `v<major>.<minor+1>.0` prerelease exists.
-- `homebrew-tap` has two new commits: the updated `Formula/plank.rb` and,
-  once `release.yml` finishes, the seeded `Formula/plank-beta.rb`.
+- `homebrew-tap` has two new commits: the updated `Formula/plank-agent.rb` and,
+  once `release.yml` finishes, the seeded `Formula/plank-agent-beta.rb`.
 - `main` has the version-bump commit (`Open v<major>.<minor+1>.0 beta channel`).
 
 Note the two formulas conflict (both install a `plank` binary), so users
-switch channels with `brew uninstall plank && brew install plank-beta` or the
+switch channels with `brew uninstall plank-agent && brew install plank-agent-beta` or the
 reverse.
 
 ## Hotfixing a stable release
@@ -98,14 +98,14 @@ reverse.
 Once a series has been promoted to stable, the beta lives in a higher minor, so
 you can ship a fix to stable without touching the beta. `release.yml` routes by
 series automatically: a tag whose `MAJOR.MINOR` is **below** the highest tagged
-series updates the `plank` (stable) formula; the highest series updates
-`plank-beta`. So a patch tag under the promoted series is a stable-only
+series updates the `plank-agent` (stable) formula; the highest series updates
+`plank-agent-beta`. So a patch tag under the promoted series is a stable-only
 release. (The v0.9.10 release was exactly this: a hotfix cut against stable
 while the next beta was already open.)
 
 > ⚠️ A stable hotfix must bump **only the patch**. Bumping the minor would
 > land the tag in the beta series — or overtake it — and the fix would be
-> routed to `plank-beta` instead of `plank`. If a stable-only change is too
+> routed to `plank-agent-beta` instead of `plank-agent`. If a stable-only change is too
 > large for a patch, it is not a hotfix; carry it in the beta and let the next
 > promotion ship it.
 
@@ -124,7 +124,7 @@ describe a stable patch.
    not the automation `GITHUB_TOKEN` — releases made with `GITHUB_TOKEN` do not
    trigger `release.yml`.
 5. `release.yml` fires, sees the tag's series is below the highest, builds
-   bottles, and rewrites `Formula/plank.rb` for the new version. `plank-beta`
+   bottles, and rewrites `Formula/plank-agent.rb` for the new version. `plank-agent-beta`
    is left alone.
 6. **Forward-port the fix to the beta** so it survives the next promotion:
    cherry-pick the hotfix commit onto `main` and push. Do not carry the hotfix
@@ -134,8 +134,8 @@ describe a stable patch.
 
 - The hotfix release shows as **Latest** (stable releases outrank the beta
   prerelease), and `homebrew-tap` has one new commit updating
-  `Formula/plank.rb`; `Formula/plank-beta.rb` is unchanged.
-- `brew upgrade plank` picks up the hotfix; `plank-beta` users are unaffected.
+  `Formula/plank-agent.rb`; `Formula/plank-agent-beta.rb` is unchanged.
+- `brew upgrade plank-agent` picks up the hotfix; `plank-agent-beta` users are unaffected.
 - The fix commit exists on both the hotfix tag and `main`.
 
 ## What a bump means for local caches

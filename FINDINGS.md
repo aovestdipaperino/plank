@@ -126,7 +126,7 @@ test` and review the diff before committing.
   non-portable for bottles; override `NATIVE_CPU_FLAG` per arch
   (`apple-m1` / `x86-64-v3`).
 - **Releases are Homebrew-only and the tag number is the channel.** The
-  highest tagged major is beta (`plank-beta` formula), everything below is
+  highest tagged major is beta (`plank-agent-beta` formula), everything below is
   stable — there is no channel flag anywhere. See `VERSIONING.md`.
 - **Upgrades run maintenance keyed on the version delta.** On first launch
   after a version change, `src/upgrade.rs` drops the sysprompt KV checkpoint

@@ -16,13 +16,15 @@ Homebrew is the only distribution channel (plank is not on crates.io):
 
 ```sh
 brew tap aovestdipaperino/tap
-brew install plank         # stable channel
-brew install plank-beta    # beta channel
+brew install plank-agent         # stable channel
+brew install plank-agent-beta    # beta channel
 ```
 
-Or in one step without a prior tap: `brew install aovestdipaperino/tap/plank`. Prebuilt bottles exist for Apple Silicon and Intel Macs; on other setups Homebrew builds from source (requires Rust). Upgrade with `brew upgrade plank`.
+Or in one step without a prior tap: `brew install aovestdipaperino/tap/plank-agent`. Prebuilt bottles exist for Apple Silicon and Intel Macs; on other setups Homebrew builds from source (requires Rust). Upgrade with `brew upgrade plank-agent`.
 
-Releases follow a two-channel scheme: the highest `MAJOR.MINOR` series is always the beta, and every release within it is a patch bump. When a beta series is promoted to stable, the next minor opens as the new (initially empty) beta — e.g. promoting the v2.0 series to stable creates v2.1.0 as the new beta. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank && brew install plank-beta` (or the reverse). See [VERSIONING.md](VERSIONING.md) for the channel model and the promote-to-stable process.
+> **Note — formula naming.** The Homebrew formulas are `plank-agent` / `plank-agent-beta`, not `plank`, because a `plank` formula already exists in Homebrew and the bare name collides. The installed binary is still just `plank` — you run `plank`, only the `brew install` name carries the `-agent` suffix.
+
+Releases follow a two-channel scheme: the highest `MAJOR.MINOR` series is always the beta, and every release within it is a patch bump. When a beta series is promoted to stable, the next minor opens as the new (initially empty) beta — e.g. promoting the v2.0 series to stable creates v2.1.0 as the new beta. The two formulas conflict since both install a `plank` binary, so switch channels with `brew uninstall plank-agent && brew install plank-agent-beta` (or the reverse). See [VERSIONING.md](VERSIONING.md) for the channel model and the promote-to-stable process.
 
 ## Building
 
