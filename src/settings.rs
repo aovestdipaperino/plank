@@ -129,7 +129,8 @@ impl Default for UiSettings {
 /// Persisted defaults for the two-sided safety flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SafetySettings {
-    /// Default for the bash write sandbox; overridden by `--sandbox`/`--no-sandbox`.
+    /// Default for the bash write sandbox (on where sandbox-exec exists);
+    /// overridden by `--sandbox`/`--no-sandbox`.
     pub sandbox: Option<bool>,
     /// Default for `/btw` mid-generation suspend; overridden by
     /// `--btw-suspend`/`--disable-btw-suspend`.

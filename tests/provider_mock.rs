@@ -383,7 +383,7 @@ fn anthropic_request_cache_control_over_socket() {
 
     let body = server.next_body();
     let json: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
-    let ephemeral = serde_json::json!({ "type": "ephemeral" });
+    let ephemeral = serde_json::json!({ "type": "ephemeral", "ttl": "1h" });
 
     // System block (caches tools + system) and last tool (tools-only fallback)
     // are marked; the first tool and the trailing message are not.
