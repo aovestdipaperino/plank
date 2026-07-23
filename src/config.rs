@@ -60,7 +60,7 @@ pub struct AgentConfig {
     /// GPU power cap percent from `--power`; 0 = unset.
     pub power_percent: i32,
     /// `--sandbox`/`--no-sandbox` override for the bash write sandbox;
-    /// `None` defers to sandbox.json (default off).
+    /// `None` defers to sandbox.json (default on where sandbox-exec exists).
     pub sandbox_override: Option<bool>,
     /// Native-engine tuning knobs (MTP, SSD streaming, steering, ...).
     pub engine: EngineTuning,
@@ -436,9 +436,9 @@ Options:
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
       --sandbox            run model bash commands under sandbox-exec
-                           (writes limited to cwd/temp; see sandbox.json)
-      --no-sandbox         disable the bash sandbox even if sandbox.json
-                           enables it
+                           (writes limited to cwd/temp; see sandbox.json).
+                           On by default on macOS
+      --no-sandbox         disable the bash sandbox
       --disable-btw-suspend
                            answer an in-pass /btw by queuing at the next
                            generation boundary instead of freezing/resuming the

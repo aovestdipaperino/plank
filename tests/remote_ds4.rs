@@ -66,6 +66,10 @@ fn start_mock(slow: bool) -> (String, Arc<AtomicBool>) {
         while !stop_thread.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    // On BSD/macOS an accepted socket inherits the listener's
+                    // non-blocking mode, so a request that has not landed yet
+                    // reads as WouldBlock and the connection gets dropped.
+                    stream.set_nonblocking(false).unwrap();
                     let mut reader = BufReader::new(&stream);
                     let Some((_method, path, _body)) = read_request(&mut reader) else {
                         continue;

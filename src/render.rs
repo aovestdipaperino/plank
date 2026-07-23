@@ -10,6 +10,7 @@
 //! ambiguous marker bytes long enough to decide whether they are formatting or
 //! literal text. It also hides `<think>` tags and renders thinking text grey.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::io::Write;
 
@@ -1316,6 +1317,36 @@ const FENCE_LANG_MAX: usize = 31;
 /// SGR for thinking text: a barely-visible dark gray (256-color index 238).
 const THINK_GREY: &[u8] = b"\x1b[38;5;238m";
 
+/// True for control bytes that must not reach the terminal from model text.
+/// Tab, newline, and carriage return are layout the renderer relies on.
+fn is_unsafe_control(b: u8) -> bool {
+    (b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r')) || b == 0x7f
+}
+
+/// Strips control bytes from text the model supplies.
+///
+/// Every escape this renderer emits it writes itself, so an ESC arriving in
+/// the stream came from the model, or from the file or web page it is quoting.
+/// Passed through to a terminal it would run as a control sequence — an OSC 52
+/// clipboard write, a title change, cursor moves that rewrite earlier output —
+/// which is a plain injection channel out of any file the model reads. Without
+/// the ESC the rest of such a sequence is inert text, so it is left visible.
+/// The TUI front end is unaffected (ratatui drops control characters); this is
+/// the stdout path's equivalent guard.
+fn without_control_bytes(bytes: &[u8]) -> Cow<'_, [u8]> {
+    if bytes.iter().copied().any(is_unsafe_control) {
+        Cow::Owned(
+            bytes
+                .iter()
+                .copied()
+                .filter(|&b| !is_unsafe_control(b))
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(bytes)
+    }
+}
+
 /// Streaming markdown-aware terminal renderer for assistant output.
 ///
 /// Port of `agent_token_renderer`: bold/italic/inline code, fenced code
@@ -1437,10 +1468,11 @@ impl<W: Write> TokenRenderer<W> {
 
     /// Streams raw bytes; UTF-8 sequences may be split across calls.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
+        let bytes = without_control_bytes(bytes);
         if self.opts.format_thinking {
-            self.process(bytes, false);
+            self.process(&bytes, false);
         } else {
-            for &b in bytes {
+            for &b in bytes.iter() {
                 self.write_char(b);
             }
         }
@@ -1477,12 +1509,13 @@ impl<W: Write> TokenRenderer<W> {
 
     /// Emits text verbatim, bypassing markdown but flushing pending state.
     pub fn plain(&mut self, s: &str) {
+        let s = without_control_bytes(s.as_bytes());
         self.markdown_emit_pending_literals();
         self.flush_utf8();
-        self.out_str(s);
+        self.out(&s);
         if !s.is_empty() {
             self.wrote_visible_output = true;
-            self.last_output_newline = s.ends_with('\n');
+            self.last_output_newline = s.last() == Some(&b'\n');
         }
     }
 
@@ -2192,6 +2225,21 @@ mod tests {
         let out = output(r);
         assert!(out.starts_with("hello world\n"));
         assert!(!out.contains('\x1b'));
+    }
+
+    #[test]
+    fn model_escape_sequences_never_reach_the_terminal() {
+        // A file the model quotes back can carry an OSC 52 clipboard write.
+        let mut r = renderer(RenderOptions::default());
+        r.write("before\x1b]52;c;cHduZWQ=\x07after");
+        r.plain("banner \x1b[31mred\x1b[0m\n");
+        r.finish();
+        let out = output(r);
+        assert!(!out.contains('\x1b'), "escape survived: {out:?}");
+        assert!(!out.contains('\x07'), "bell survived: {out:?}");
+        // Neutered, not swallowed: the payload stays readable as plain text.
+        assert!(out.contains("before") && out.contains("after"));
+        assert!(out.contains("banner "));
     }
 
     #[test]

@@ -688,6 +688,28 @@ pub fn welcome_banner(ctx_size: i32, color: bool) -> String {
     }
 }
 
+/// Startup lines shown when the engine is the echo stub: nothing infers until
+/// a model is configured, and the binary itself cannot say so any other way.
+///
+/// The stub is only ever selected when the binary was built without the local
+/// ds4 engine and no `--provider`/`--remote` was given, so the lines list the
+/// three ways out of that state.
+#[must_use]
+pub fn no_model_lines() -> Vec<String> {
+    vec![
+        "No model loaded: this build has no local engine, so replies come from the echo stub."
+            .to_owned(),
+        "  local  : git submodule update --init refs/ds4 && cargo build   (macOS + Metal, 96 GB RAM)"
+            .to_owned(),
+        "           then plank -m <model.gguf>, or plank with no -m to fetch ~/.plank/ds4flash.gguf (~81 GB)"
+            .to_owned(),
+        "  hosted : plank --provider anthropic --model <name>   (key from $ANTHROPIC_API_KEY)".to_owned(),
+        "  remote : plank --remote <url>   (another box running plank serve)".to_owned(),
+        "  persist: ~/.plank/settings.json, e.g. {\"engine\": {\"model\": \"~/models/ds4.gguf\"}}"
+            .to_owned(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
