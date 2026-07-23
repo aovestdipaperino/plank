@@ -257,24 +257,60 @@ fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
     }
 }
 
-/// Transcribe a rendered ratatui frame into a [`crt_off::ScreenBuffer`],
-/// row by row, reproducing foreground glyphs and their colors. crt-off 0.1
-/// is write-only and sequential (no cursor addressing, no background color),
-/// so background fills and text styles are dropped (issue #55). Blank cells
-/// are emitted as spaces, which record no pixel.
+/// Map a cell background [`Color`](ratatui::style::Color) to RGB. Identical to
+/// [`color_to_rgb`] except `Reset` becomes black (the terminal's default
+/// background) rather than the default-foreground gray.
+fn bg_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
+    match c {
+        ratatui::style::Color::Reset => (0, 0, 0),
+        other => color_to_rgb(other),
+    }
+}
+
+/// The single RGB colour that represents a cell in the CRT-off frame image.
 ///
-fn frame_to_screen(buf: &ratatui::buffer::Buffer) -> crt_off::ScreenBuffer {
+/// A cell with a visible glyph is drawn in its foreground colour; a blank cell
+/// (space or empty) is drawn in its background colour, so background fills like
+/// the status bar and selection highlight keep their colour instead of
+/// collapsing to black. The `REVERSED` modifier swaps foreground and
+/// background before the choice, matching how the terminal paints it. Other
+/// text styles (bold/dim/italic/underline) are not represented (issue #55).
+fn cell_rgb(cell: &ratatui::buffer::Cell) -> (u8, u8, u8) {
+    let reversed = cell.modifier.contains(ratatui::style::Modifier::REVERSED);
+    let (fg, bg) = if reversed {
+        (cell.bg, cell.fg)
+    } else {
+        (cell.fg, cell.bg)
+    };
+    if cell.symbol().trim().is_empty() {
+        bg_to_rgb(bg)
+    } else {
+        color_to_rgb(fg)
+    }
+}
+
+/// Rasterize a rendered ratatui frame into an [`image::RgbaImage`] for the
+/// CRT-off effect, reproducing both foreground glyphs and background fills
+/// (see [`cell_rgb`]). crt-off packs two vertical image pixels per terminal
+/// cell (a half-block per text row), so the image is `width` x `height * 2`
+/// and each cell paints both of its pixels the same colour. Feed the result
+/// to [`crt_off::animate`].
+fn frame_to_image(buf: &ratatui::buffer::Buffer) -> image::RgbaImage {
     let area = buf.area();
-    let mut screen = crt_off::ScreenBuffer::new(u32::from(area.width), u32::from(area.height));
+    let w = u32::from(area.width).max(1);
+    let h = u32::from(area.height).max(1);
+    let mut img = image::RgbaImage::from_pixel(w, h * 2, image::Rgba([0, 0, 0, 255]));
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
-            let cell = &buf[(x, y)];
-            let (r, g, b) = color_to_rgb(cell.fg);
-            screen.fg(r, g, b).put(cell.symbol());
+            let (cr, cg, cb) = cell_rgb(&buf[(x, y)]);
+            let px = image::Rgba([cr, cg, cb, 255]);
+            let px_x = u32::from(x - area.left());
+            let px_y = u32::from(y - area.top()) * 2;
+            img.put_pixel(px_x, px_y, px);
+            img.put_pixel(px_x, px_y + 1, px);
         }
-        screen.putln("");
     }
-    screen
+    img
 }
 
 /// xterm-256 palette index to RGB: 0-15 base colors, 16-231 the 6x6x6 cube,
@@ -2930,7 +2966,7 @@ impl Agent<'_> {
         // exits (keep error text readable), non-TTY stdout, or when disabled.
         if result.is_ok() && crate::settings::active().ui.crt_off && std::io::stdout().is_terminal()
         {
-            let screen = frame_to_screen(terminal.current_buffer_mut());
+            let img = frame_to_image(terminal.current_buffer_mut());
             let cfg = crt_off::Config {
                 hold_secs: 0.0,
                 vstretch_secs: 0.35,
@@ -2939,7 +2975,10 @@ impl Agent<'_> {
                 black_secs: 0.1,
                 fps: 60.0,
             };
-            let _ = screen.animate(&cfg);
+            // `use_alt_screen: false` — we already own the alternate screen; the
+            // effect repaints the final frame in place and restores raw mode on
+            // drop before our own teardown runs.
+            let _ = crt_off::animate(&img, false, &cfg);
         }
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
@@ -7629,21 +7668,34 @@ mod tests {
     }
 
     #[test]
-    fn frame_to_screen_reproduces_dimensions_and_content() {
+    fn frame_to_image_reproduces_dimensions_glyphs_and_backgrounds() {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
-        use ratatui::style::Color;
+        use ratatui::style::{Color, Modifier};
 
         let mut buf = Buffer::empty(Rect::new(0, 0, 3, 2));
-        // Row 0: "hi" then a blank cell.
+        // Row 0, col 0: a green glyph -> foreground colour.
         buf[(0, 0)].set_symbol("h").set_fg(Color::Green);
-        buf[(1, 0)].set_symbol("i").set_fg(Color::Green);
-        // Row 1 left blank (spaces).
-        let screen = frame_to_screen(&buf);
-        assert_eq!(screen.width(), 3);
-        // `content_rows()` tracks how far the row cursor advanced, not whether
-        // pixels were written (blank " " cells record none): frame_to_screen
-        // calls `putln` once per buffer row, so both rows count, not just row 0.
-        assert_eq!(screen.content_rows(), 2);
+        // Row 0, col 1: a blank cell with a blue background -> background colour
+        // (this is the case #55 fixes; the old transcription dropped it to black).
+        buf[(1, 0)].set_symbol(" ").set_bg(Color::Blue);
+        // Row 1, col 0: reversed blank cell -> fg/bg swap, so the (blank) cell
+        // paints in its foreground red rather than its background.
+        buf[(0, 1)].set_symbol(" ").set_fg(Color::Red);
+        buf[(0, 1)].modifier = Modifier::REVERSED;
+
+        let img = frame_to_image(&buf);
+
+        // width = columns, height = 2 * rows (half-block packing).
+        assert_eq!(img.dimensions(), (3, 4));
+        // Green glyph, both stacked pixels of the cell.
+        assert_eq!(img.get_pixel(0, 0).0, [0, 205, 0, 255]);
+        assert_eq!(img.get_pixel(0, 1).0, [0, 205, 0, 255]);
+        // Blank cell keeps its blue background.
+        assert_eq!(img.get_pixel(1, 0).0, [0, 0, 238, 255]);
+        // Reversed blank cell paints in the swapped-in foreground red.
+        assert_eq!(img.get_pixel(0, 2).0, [205, 0, 0, 255]);
+        // An untouched blank cell (Reset bg) stays black.
+        assert_eq!(img.get_pixel(2, 0).0, [0, 0, 0, 255]);
     }
 }
