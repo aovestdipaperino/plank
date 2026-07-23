@@ -1317,6 +1317,7 @@ impl Agent<'_> {
             ) {
                 crate::notify::notify("plank", "Turn complete");
             }
+            crate::warp::emit("stop", &self.session.id);
             return Ok(());
         }
     }
@@ -3683,6 +3684,7 @@ impl Agent<'_> {
                 ) {
                     crate::notify::notify("plank", "Turn complete");
                 }
+                crate::warp::emit("stop", &self.session.id);
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -3730,13 +3732,14 @@ impl Agent<'_> {
                 .join()
                 .map_err(|_| "worker thread panicked".to_owned())?
         });
-        if result.is_ok()
-            && crate::notify::should_notify_complete(
+        if result.is_ok() {
+            if crate::notify::should_notify_complete(
                 turn_started.elapsed(),
                 crate::settings::active().ui.notify_after_secs,
-            )
-        {
-            crate::notify::notify("plank", "Turn complete");
+            ) {
+                crate::notify::notify("plank", "Turn complete");
+            }
+            crate::warp::emit("stop", &self.session.id);
         }
         result
     }
@@ -6824,10 +6827,10 @@ mod tests {
         agent.session.dirty = false;
         let before = agent.session.transcript.len();
 
-        // Commands that only report state must neither log into the transcript
-        // nor mark the session dirty, so a session that only ran them gets no
-        // resume point.
-        for cmd in ["/usage", "/context", "/help", "/stats"] {
+        // Commands that only report state or edit settings must neither log
+        // into the transcript nor mark the session dirty, so a session that
+        // only ran them gets no resume point.
+        for cmd in ["/usage", "/context", "/help", "/stats", "/config", "/mcp"] {
             agent.slash(cmd).unwrap_or_else(|e| panic!("{cmd}: {e}"));
             assert_eq!(
                 agent.session.transcript.len(),
