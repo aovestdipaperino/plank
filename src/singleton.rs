@@ -62,6 +62,17 @@ pub fn probe_lock(_path: &Path) -> LockProbe {
     LockProbe::Free
 }
 
+/// Reads the PID the lock holder wrote to `path`, if any.
+///
+/// The ds4 engine truncates the lock file and writes its `getpid()` as the
+/// first line (`ds4_acquire_instance_lock` in `ds4.c`). Returns `None` when the
+/// file is absent, empty, or the first line is not a positive integer.
+#[must_use]
+pub fn lock_holder_pid(path: &Path) -> Option<i32> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().next()?.trim().parse::<i32>().ok()
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -94,6 +105,26 @@ mod tests {
         drop(holder);
         assert_eq!(probe_lock(&path), LockProbe::Free);
         assert_eq!(probe_lock(&path), LockProbe::Free);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn reads_holder_pid_from_lock_file() {
+        let path =
+            std::env::temp_dir().join(format!("plank-singleton-pid-{}.lock", std::process::id()));
+        std::fs::remove_file(&path).ok();
+
+        // Absent file: no PID.
+        assert_eq!(lock_holder_pid(&path), None);
+
+        // First line is the PID (as ds4.c writes it: "%ld\n").
+        std::fs::write(&path, "4321\n").unwrap();
+        assert_eq!(lock_holder_pid(&path), Some(4321));
+
+        // Garbage first line: no PID.
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        assert_eq!(lock_holder_pid(&path), None);
 
         std::fs::remove_file(&path).ok();
     }

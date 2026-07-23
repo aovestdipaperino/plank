@@ -143,17 +143,17 @@ fn total_ram_bytes() -> Option<u64> {
 /// Returns a clear message when another instance already holds the lock.
 #[cfg(ds4_engine)]
 fn acquire_model_lock() -> Result<(), String> {
-    use plank::singleton::{LockProbe, probe_lock};
+    use plank::singleton::{LockProbe, lock_holder_pid, probe_lock};
 
     let path = std::env::var_os("DS4_LOCK_FILE")
         .filter(|p| !p.is_empty())
         .map_or_else(|| std::path::PathBuf::from("/tmp/ds4.lock"), Into::into);
     if probe_lock(&path) == LockProbe::Contended {
-        return Err(
-            "another plank (ds4) instance is already running. Only one instance can load the \
+        let who = lock_holder_pid(&path).map_or_else(String::new, |pid| format!(" (PID {pid})"));
+        return Err(format!(
+            "another plank (ds4) instance is already running{who}. Only one instance can load the \
              ~82 GB DeepSeek V4 Flash model at a time — close the other instance and try again."
-                .to_string(),
-        );
+        ));
     }
     Ok(())
 }
