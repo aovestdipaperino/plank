@@ -868,13 +868,13 @@ impl Engine for Ds4Session {
                     }
                 }
                 // Key matched but the bytes would not load: a format change.
-                eprintln!(
-                    "plank: system prompt cache is incompatible with this build; rebuilding it."
-                );
+                on_event(EngineEvent::Notice(
+                    "system prompt cache is incompatible with this build; rebuilding it".to_owned(),
+                ));
             } else if let Some(stored_fp) = stored.as_deref() {
-                // Genuine key mismatch: the prompt text changed. Show a compact
+                // Genuine key mismatch: the prompt text changed. Attach a compact
                 // diff of the first change so the user can judge if it is benign.
-                eprintln!("plank: system prompt changed; rebuilding cache.");
+                let mut msg = "system prompt changed; rebuilding cache".to_owned();
                 if let Ok(old) = std::fs::read_to_string(path.with_extension("prompt"))
                     && let Some(snip) = crate::tools::diff::first_change_snippet(
                         &old,
@@ -882,8 +882,10 @@ impl Engine for Ds4Session {
                         SYSPROMPT_SNIPPET_WIDTH,
                     )
                 {
-                    eprintln!("       first change: {snip}");
+                    msg.push_str("\nfirst change: ");
+                    msg.push_str(&snip);
                 }
+                on_event(EngineEvent::Notice(msg));
                 if debug {
                     eprintln!(
                         "[sysprompt-debug] MISS: fingerprint mismatch (stored={stored_fp} computed={fingerprint})"
@@ -891,9 +893,10 @@ impl Engine for Ds4Session {
                 }
             } else {
                 // No readable checkpoint: first run, or the cache was cleared.
-                eprintln!(
-                    "plank: system prompt cache missing; building it (first run, or the cache was cleared)."
-                );
+                on_event(EngineEvent::Notice(
+                    "system prompt cache missing; building it (first run, or the cache was cleared)"
+                        .to_owned(),
+                ));
             }
         }
 
@@ -1919,6 +1922,7 @@ mod tests {
                     }
                 }
                 EngineEvent::Text(t) => reply1.push_str(&t),
+                EngineEvent::Notice(_) => {}
             },
         )
         .unwrap();

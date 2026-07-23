@@ -1238,7 +1238,7 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
 /// launch: a centered note and a simple progress bar. The full UI is withheld
 /// until warming finishes, so the user sees clear progress instead of an idle
 /// screen during the one slow step.
-pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64) {
+pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Option<&str>) {
     let total = total.max(1);
     let done = done.clamp(0, total);
     let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
@@ -1261,6 +1261,21 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64) {
         Line::from(format!("{bar}  {pct}%")).centered(),
     ]);
     frame.render_widget(Paragraph::new(text), rows[1]);
+    // Reason for the rebuild (cache missing / prompt changed + diff), below the
+    // progress bar in the reserved region.
+    if let Some(notice) = notice {
+        let lines: Vec<Line> = notice
+            .lines()
+            .map(|l| {
+                Line::from(Span::styled(
+                    l.to_owned(),
+                    Style::default().fg(Color::Yellow),
+                ))
+                .centered()
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);
+    }
 }
 
 /// Draws the interactive `/config` editor as a centered modal overlay.

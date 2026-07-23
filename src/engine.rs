@@ -179,6 +179,9 @@ pub enum EngineEvent {
     Prefill(PrefillProgress),
     /// A piece of generated text (may split UTF-8 across pieces).
     Text(String),
+    /// A human-facing note the front-end should surface alongside progress
+    /// (e.g. why the system-prompt cache is being rebuilt). May be multi-line.
+    Notice(String),
 }
 
 /// Per-pass token accounting reported by an online provider. Local engines do

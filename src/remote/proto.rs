@@ -273,7 +273,10 @@ impl WireEvent {
                 total: p.total,
                 tps: p.tps,
             },
-            EngineEvent::Text(s) => Self::Text { s: s.clone() },
+            // Text, and (defensively) a warm Notice — the serve path warms with
+            // checkpoint=None, so a Notice never actually reaches the wire; if
+            // that changes, surfacing it as text is a reasonable fallback.
+            EngineEvent::Text(s) | EngineEvent::Notice(s) => Self::Text { s: s.clone() },
         }
     }
 

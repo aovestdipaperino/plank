@@ -1100,7 +1100,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 EngineEvent::Text(t) => Some(t.as_str()),
-                EngineEvent::Prefill(_) => None,
+                EngineEvent::Prefill(_) | EngineEvent::Notice(_) => None,
             })
             .collect()
     }

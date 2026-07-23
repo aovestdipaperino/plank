@@ -135,6 +135,7 @@ fn remote_ds4_generate_end_to_end() {
             &mut |ev| match ev {
                 EngineEvent::Text(s) => text.push_str(&s),
                 EngineEvent::Prefill(_) => prefill_seen = true,
+                EngineEvent::Notice(_) => {}
             },
         )
         .expect("generate");

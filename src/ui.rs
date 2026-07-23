@@ -979,6 +979,8 @@ impl Agent<'_> {
                             ..Status::default()
                         });
                     }
+                    // Notices are a warm-up-only signal; never emitted mid-turn.
+                    EngineEvent::Notice(_) => {}
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -3548,11 +3550,20 @@ impl Agent<'_> {
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         let checkpoint = self.sysprompt_checkpoint();
         let system = self.system.clone();
+        // The rebuild reason (cache missing / prompt changed + diff) arrives as a
+        // Notice before prefill; keep it and render it below the progress bar.
+        let mut notice: Option<String> = None;
         self.engine
-            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
-                if let EngineEvent::Prefill(p) = ev {
-                    let _ = terminal.draw(|f| tui::draw_warm(f, p.done, p.total, p.tps));
+            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| match ev {
+                EngineEvent::Notice(msg) => {
+                    notice = Some(msg);
+                    let _ = terminal.draw(|f| tui::draw_warm(f, 0, 1, 0.0, notice.as_deref()));
                 }
+                EngineEvent::Prefill(p) => {
+                    let _ = terminal
+                        .draw(|f| tui::draw_warm(f, p.done, p.total, p.tps, notice.as_deref()));
+                }
+                EngineEvent::Text(_) => {}
             })
             .map_err(|e| e.to_string())?;
         Ok(())
@@ -3564,20 +3575,30 @@ impl Agent<'_> {
         let system = self.system.clone();
         let mut announced = false;
         let color = self.color;
+        // Reason for the rebuild, printed under the "Updating…" line.
+        let mut notice: Option<String> = None;
         self.engine
-            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| {
-                if matches!(ev, EngineEvent::Prefill(_)) && !announced {
+            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| match ev {
+                EngineEvent::Notice(msg) => notice = Some(msg),
+                EngineEvent::Prefill(_) if !announced => {
                     announced = true;
                     if color {
                         eprintln!("\x1b[33mUpdating system prompt cache...{ANSI_RESET}");
                     } else {
                         eprintln!("Updating system prompt cache...");
                     }
+                    if let Some(msg) = &notice {
+                        for line in msg.lines() {
+                            eprintln!("  {line}");
+                        }
+                    }
                 }
+                EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
             })
             .map_err(|e| e.to_string())?;
-        // Erase the transient cache note once the warm-up finishes.
-        if announced && color {
+        // Erase the transient "Updating…" note once the warm-up finishes. The
+        // reason lines (if any) are left in the scrollback on purpose.
+        if announced && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
         Ok(())
@@ -4143,6 +4164,8 @@ impl Agent<'_> {
                     power_percent: power,
                     ..Status::default()
                 },
+                // Warm-up-only signal; never emitted mid-turn.
+                EngineEvent::Notice(_) => return,
             };
             let _ = tx.send(UiEvent::Status(status));
         };
