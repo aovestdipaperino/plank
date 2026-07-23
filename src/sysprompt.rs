@@ -95,7 +95,7 @@ pub enum SystemPrompt {
 #[must_use]
 pub fn provider_system_prompt(user_system: &str) -> String {
     let mut out = String::from(
-        "You are a coding agent running in a local workspace. Use the provided tools for local \
+        "You are Plank, a coding agent running in a local workspace. Use the provided tools for local \
 file and system work. Avoid printing large file contents or large code blocks as answers; create \
 or edit files with tools, then summarize results briefly.\n\n\
 ## Reading files\n\n\
@@ -108,7 +108,9 @@ changes; old must match exactly once. For large replacements prefer anchored old
 lines, then [upto], then unique final lines — never close old immediately after [upto].\n\n\
 ## Web\n\n\
 Use google_search to find web pages and visit_page to read a known URL. The first web call may \
-ask permission to start a browser.\n\n\
+ask permission to start a browser. Use web_search for a client-side search that returns a link map \
+without starting a browser; it accepts optional allowed_domains or blocked_domains (comma-separated, \
+not both).\n\n\
 ## Rules\n\n\
 - Prefer read/search to get anchors, then anchored edit to avoid retyping large text.\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\

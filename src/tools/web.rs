@@ -94,6 +94,43 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     frame_visit_output(&url, &path, &md)
 }
 
+/// Splits a comma-separated domain list arg into lowercased, non-empty hosts.
+fn parse_domain_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Executes the `web_search` tool: client-side `DuckDuckGo` search, no browser.
+///
+/// Deviation from the browser web tools: no approval gate — this is a plain
+/// curl fetch of the `DuckDuckGo` HTML endpoint, not a visible Chrome session.
+/// Accepts an optional `allowed_domains` or `blocked_domains` (comma-separated,
+/// mutually exclusive) and returns a plank-style link map.
+pub fn tool_web_search(_ctx: &mut ToolContext, call: &ToolCall) -> String {
+    let query = call.arg_value("query").unwrap_or("").trim();
+    if query.is_empty() {
+        return "Tool error: web_search requires query\n".to_string();
+    }
+    let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
+    let blocked = parse_domain_list(call.arg_value("blocked_domains").unwrap_or(""));
+    if !allowed.is_empty() && !blocked.is_empty() {
+        return "Tool error: web_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
+            .to_string();
+    }
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    let html = match curl_fetch(&url) {
+        Ok(html) => html,
+        Err(e) => return format!("Tool error: web_search failed: {e}\n"),
+    };
+    if is_ddg_challenge(&html) {
+        return "Tool error: web_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
+    }
+    let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
+    render_web_search(query, &hits)
+}
+
 /// Runs the session approval gate, mirroring `web_ensure_browser`.
 ///
 /// # Errors
@@ -182,6 +219,176 @@ pub fn url_encode(s: impl AsRef<str>) -> String {
             out.push('%');
             out.push(HEX[usize::from(b >> 4)] as char);
             out.push(HEX[usize::from(b & 15)] as char);
+        }
+    }
+    out
+}
+
+// ============================================================================
+// web_search: DuckDuckGo client-side search (pure, unit-tested)
+// ============================================================================
+
+/// Max result links rendered by `web_search` (mirrors the search extractor cap).
+const WEB_SEARCH_MAX_LINKS: usize = 20;
+/// Max title characters rendered per link.
+const WEB_SEARCH_TITLE_CAP: usize = 180;
+
+/// One parsed `DuckDuckGo` result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchHit {
+    title: String,
+    url: String,
+    snippet: String,
+}
+
+/// True when the page is `DuckDuckGo`'s anti-bot challenge, not results.
+fn is_ddg_challenge(html: &str) -> bool {
+    html.contains("anomaly-modal") || html.contains("challenge-form")
+}
+
+/// Resolves a `DuckDuckGo` result href to the real destination URL.
+///
+/// DDG wraps hits as `//duckduckgo.com/l/?uddg=<encoded url>&...`; this decodes
+/// the `uddg` param. Scheme-relative `//host/...` becomes `https://host/...`.
+fn decode_ddg_href(href: &str) -> String {
+    if let Some(pos) = href.find("uddg=") {
+        let rest = &href[pos + "uddg=".len()..];
+        let val = rest.split('&').next().unwrap_or(rest);
+        let decoded = percent_decode(val);
+        if !decoded.is_empty() {
+            return decoded;
+        }
+    }
+    if let Some(rest) = href.strip_prefix("//") {
+        return format!("https://{rest}");
+    }
+    href.to_string()
+}
+
+/// True if a raw tag's `class` attribute contains `needle` as a token.
+fn class_contains(attrs: &str, needle: &str) -> bool {
+    attr_value(attrs, "class").is_some_and(|c| c.split_whitespace().any(|t| t == needle))
+}
+
+/// Concatenates text tokens from `start` until the matching close tag `name`.
+fn collect_text_until_close(toks: &[Tok<'_>], start: usize, name: &str) -> String {
+    let mut out = String::new();
+    for tok in &toks[start..] {
+        match tok {
+            Tok::Text(t) => out.push_str(t),
+            Tok::Tag {
+                name: n,
+                closing: true,
+                ..
+            } if n == name => break,
+            Tok::Tag { .. } => {}
+        }
+    }
+    out
+}
+
+/// Extracts result hits from a `DuckDuckGo` HTML results page.
+///
+/// Walks tokens: an `<a class="result__a">` opens a hit (href → real URL via
+/// [`decode_ddg_href`], inner text → title); a following
+/// `<a class="result__snippet">` before the next result attaches the snippet.
+/// Hits with an empty title or URL are dropped.
+fn parse_ddg_results(html: &str) -> Vec<SearchHit> {
+    let toks = tokenize(html);
+    let mut hits: Vec<SearchHit> = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if let Tok::Tag {
+            name,
+            attrs,
+            closing: false,
+        } = &toks[i]
+        {
+            if name == "a" && class_contains(attrs, "result__a") {
+                let url = attr_value(attrs, "href")
+                    .map(|h| decode_ddg_href(&h))
+                    .unwrap_or_default();
+                let title = clean(decode_entities(collect_text_until_close(&toks, i + 1, "a")));
+                if !title.is_empty() && !url.is_empty() {
+                    hits.push(SearchHit {
+                        title,
+                        url,
+                        snippet: String::new(),
+                    });
+                }
+                i += 1;
+                continue;
+            }
+            if name == "a" && class_contains(attrs, "result__snippet") {
+                let snip = clean(decode_entities(collect_text_until_close(&toks, i + 1, "a")));
+                if let Some(last) = hits.last_mut()
+                    && last.snippet.is_empty()
+                {
+                    last.snippet = snip;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    hits
+}
+
+/// Lowercased host of an `http(s)` URL, or `None` if not parseable.
+fn host_of(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host = host.split('@').next_back().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// True if `host` equals `domain` or is a subdomain of it.
+fn host_in_domain(host: &str, domain: &str) -> bool {
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
+/// Keeps hits per allow/block lists. `allowed` (if non-empty) is a whitelist;
+/// `blocked` is a blacklist. Callers guarantee at most one is non-empty.
+fn filter_by_domains(
+    hits: Vec<SearchHit>,
+    allowed: &[String],
+    blocked: &[String],
+) -> Vec<SearchHit> {
+    hits.into_iter()
+        .filter(|h| {
+            let Some(host) = host_of(&h.url) else {
+                return false;
+            };
+            if !allowed.is_empty() {
+                return allowed.iter().any(|d| host_in_domain(&host, d));
+            }
+            !blocked.iter().any(|d| host_in_domain(&host, d))
+        })
+        .collect()
+}
+
+/// Renders hits as a plank-style link map with a query header.
+fn render_web_search(query: &str, hits: &[SearchHit]) -> String {
+    let mut out = format!("Web search results for query: \"{query}\"\n\n");
+    if hits.is_empty() {
+        out.push_str("No results.\n");
+        return out;
+    }
+    for h in hits.iter().take(WEB_SEARCH_MAX_LINKS) {
+        let title = slice_chars(&esc_link_text(&h.title), WEB_SEARCH_TITLE_CAP).to_string();
+        if h.snippet.is_empty() {
+            let _ = writeln!(out, "- [{title}]({})", h.url);
+        } else {
+            let snip = esc_link_text(&h.snippet);
+            let _ = writeln!(out, "- [{title}]({}) — {snip}", h.url);
         }
     }
     out
@@ -1029,6 +1236,165 @@ let y = 2;</pre>
         // Grant path flips the sticky per-session flag before any fetch.
         assert!(ensure_allowed(&mut ctx).is_ok());
         assert!(ctx.web.allowed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- web_search ----
+
+    const DDG_FIXTURE: &str = r##"<html><body>
+<div class="result results_links">
+  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Frust-lang.org%2F&rut=1">The <b>Rust</b> Language</a>
+  <a class="result__snippet" href="#">A language empowering everyone.</a>
+</div>
+<div class="result results_links">
+  <a class="result__a" href="https://doc.rust-lang.org/book/">The Rust Book</a>
+</div>
+<a class="result__a" href="">   </a>
+</body></html>"##;
+
+    #[test]
+    fn percent_decode_basic() {
+        assert_eq!(percent_decode("a%20b%2Fc"), "a b/c");
+        assert_eq!(percent_decode("bad%2"), "bad%2");
+    }
+
+    #[test]
+    fn decode_ddg_href_unwraps_uddg() {
+        let h = "//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fp%3Fa%3D1&rut=xyz";
+        assert_eq!(decode_ddg_href(h), "https://example.com/p?a=1");
+    }
+
+    #[test]
+    fn decode_ddg_href_passthrough_and_scheme() {
+        assert_eq!(
+            decode_ddg_href("https://direct.example/x"),
+            "https://direct.example/x"
+        );
+        assert_eq!(
+            decode_ddg_href("//host.example/y"),
+            "https://host.example/y"
+        );
+    }
+
+    #[test]
+    fn parse_ddg_results_extracts_hits() {
+        let hits = parse_ddg_results(DDG_FIXTURE);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].title, "The Rust Language");
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        assert_eq!(hits[0].snippet, "A language empowering everyone.");
+        assert_eq!(hits[1].url, "https://doc.rust-lang.org/book/");
+        assert_eq!(hits[1].snippet, "");
+    }
+
+    fn hit(url: &str) -> SearchHit {
+        SearchHit {
+            title: "t".into(),
+            url: url.into(),
+            snippet: String::new(),
+        }
+    }
+
+    #[test]
+    fn host_of_extracts_host() {
+        assert_eq!(
+            host_of("https://a.example.com/p?x=1"),
+            Some("a.example.com".to_string())
+        );
+        assert_eq!(
+            host_of("http://Example.COM"),
+            Some("example.com".to_string())
+        );
+        assert_eq!(host_of("not a url"), None);
+    }
+
+    #[test]
+    fn filter_by_domains_allow_and_block() {
+        let hits = vec![hit("https://a.example.com/1"), hit("https://other.org/2")];
+        let allowed = vec!["example.com".to_string()];
+        let kept = filter_by_domains(hits.clone(), &allowed, &[]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].url, "https://a.example.com/1");
+
+        let blocked = vec!["example.com".to_string()];
+        let kept = filter_by_domains(hits, &[], &blocked);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].url, "https://other.org/2");
+    }
+
+    #[test]
+    fn render_web_search_link_map() {
+        let hits = vec![
+            SearchHit {
+                title: "Rust".into(),
+                url: "https://rust-lang.org/".into(),
+                snippet: "lang".into(),
+            },
+            SearchHit {
+                title: "Book".into(),
+                url: "https://doc.rust-lang.org/book/".into(),
+                snippet: String::new(),
+            },
+        ];
+        let out = render_web_search("rust", &hits);
+        assert!(out.starts_with("Web search results for query: \"rust\"\n"));
+        assert!(out.contains("- [Rust](https://rust-lang.org/) — lang\n"));
+        assert!(out.contains("- [Book](https://doc.rust-lang.org/book/)\n"));
+    }
+
+    #[test]
+    fn render_web_search_no_results() {
+        let out = render_web_search("nothing", &[]);
+        assert!(out.contains("No results."));
+    }
+
+    #[test]
+    fn render_web_search_caps_links() {
+        let hits: Vec<SearchHit> = (0..30)
+            .map(|n| SearchHit {
+                title: format!("t{n}"),
+                url: format!("https://e{n}.com/"),
+                snippet: String::new(),
+            })
+            .collect();
+        let out = render_web_search("q", &hits);
+        assert_eq!(out.matches("\n- [").count(), WEB_SEARCH_MAX_LINKS);
+    }
+
+    #[test]
+    fn ddg_challenge_detected() {
+        assert!(is_ddg_challenge(
+            "<form id=\"challenge-form\"><div class=\"anomaly-modal__mask\"></div></form>"
+        ));
+        assert!(!is_ddg_challenge(DDG_FIXTURE));
+    }
+
+    #[test]
+    fn tool_web_search_requires_query() {
+        let (mut ctx, dir) = test_ctx();
+        let out = dispatch(&test_call("web_search", &[]), &mut ctx);
+        assert_eq!(out.output, "Tool error: web_search requires query\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn tool_web_search_rejects_both_domain_lists() {
+        let (mut ctx, dir) = test_ctx();
+        let out = dispatch(
+            &test_call(
+                "web_search",
+                &[
+                    ("query", "rust"),
+                    ("allowed_domains", "a.com"),
+                    ("blocked_domains", "b.com"),
+                ],
+            ),
+            &mut ctx,
+        );
+        assert_eq!(
+            out.output,
+            "Tool error: web_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }

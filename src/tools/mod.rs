@@ -299,6 +299,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "bash_stop" => bash::tool_bash_status_or_stop(ctx, call, true),
         "google_search" => web::tool_google_search(ctx, call),
         "visit_page" => web::tool_visit_page(ctx, call),
+        "web_search" => web::tool_web_search(ctx, call),
         "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
         "mcp_list_resources" => mcp::tool_mcp_list_resources(&ctx.mcp, call),
         "mcp_read_resource" => mcp::tool_mcp_read_resource(&mut ctx.mcp, call),
