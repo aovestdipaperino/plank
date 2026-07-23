@@ -580,6 +580,10 @@ impl Ds4Session {
     }
 }
 
+/// Characters of each side shown in the first-change snippet when a
+/// system-prompt cache miss is reported.
+const SYSPROMPT_SNIPPET_WIDTH: usize = 24;
+
 /// Debug aid for the sysprompt-cache churn investigation (gated behind
 /// `PLANK_DEBUG_SYSPROMPT`). Dumps the exact system prompt that produced
 /// `computed` to `<cache-dir>/sysprompt-debug-<fp8>.txt` and appends a line to
@@ -840,37 +844,55 @@ impl Engine for Ds4Session {
         let session = self.ensure_session()?;
 
         // Fast path: restore a matching on-disk checkpoint, skipping prefill.
+        // On any miss, tell the user *why* it is rebuilding — a missing cache,
+        // a changed prompt (with a compact diff so a benign change like a
+        // ticking counter is obvious), or an incompatible snapshot.
         if let Some(path) = checkpoint {
-            let stored = std::fs::read(path).ok().and_then(|bytes| {
+            let file = std::fs::read(path).ok();
+            let stored = file.as_ref().and_then(|bytes| {
                 let nl = bytes.iter().position(|&b| b == b'\n')?;
                 std::str::from_utf8(&bytes[..nl]).ok().map(str::to_owned)
             });
             if debug {
                 debug_log_sysprompt(path, system, &fingerprint, stored.as_deref());
             }
-            if stored.as_deref() == Some(fingerprint.as_str())
-                && let Ok(mut bytes) = std::fs::read(path)
-                && let Some(nl) = bytes.iter().position(|&b| b == b'\n')
-            {
-                let payload = bytes.split_off(nl + 1);
-                if SessionSnapshot::restore_bytes(session, &payload).is_ok() {
-                    if debug {
-                        eprintln!("[sysprompt-debug] HIT: restored snapshot fp={fingerprint}");
+            if stored.as_deref() == Some(fingerprint.as_str()) {
+                // Key matches: restore, skipping prefill.
+                if let Some(bytes) = &file {
+                    let nl = bytes.iter().position(|&b| b == b'\n').unwrap_or(0);
+                    if SessionSnapshot::restore_bytes(session, &bytes[nl + 1..]).is_ok() {
+                        if debug {
+                            eprintln!("[sysprompt-debug] HIT: restored snapshot fp={fingerprint}");
+                        }
+                        return Ok(false);
                     }
-                    return Ok(false);
+                }
+                // Key matched but the bytes would not load: a format change.
+                eprintln!(
+                    "plank: system prompt cache is incompatible with this build; rebuilding it."
+                );
+            } else if let Some(stored_fp) = stored.as_deref() {
+                // Genuine key mismatch: the prompt text changed. Show a compact
+                // diff of the first change so the user can judge if it is benign.
+                eprintln!("plank: system prompt changed; rebuilding cache.");
+                if let Ok(old) = std::fs::read_to_string(path.with_extension("prompt"))
+                    && let Some(snip) = crate::tools::diff::first_change_snippet(
+                        &old,
+                        system,
+                        SYSPROMPT_SNIPPET_WIDTH,
+                    )
+                {
+                    eprintln!("       first change: {snip}");
                 }
                 if debug {
                     eprintln!(
-                        "[sysprompt-debug] MISS: fingerprint matched but restore_bytes failed \
-                         (incompatible snapshot); rebuilding fp={fingerprint}"
+                        "[sysprompt-debug] MISS: fingerprint mismatch (stored={stored_fp} computed={fingerprint})"
                     );
                 }
-                // A stale/incompatible snapshot: fall through and rebuild.
-            } else if debug {
+            } else {
+                // No readable checkpoint: first run, or the cache was cleared.
                 eprintln!(
-                    "[sysprompt-debug] MISS: fingerprint mismatch (stored={} computed={fingerprint}); \
-                     rebuilding — diff the dumped prompts to see what changed",
-                    stored.as_deref().unwrap_or("<none>")
+                    "plank: system prompt cache missing; building it (first run, or the cache was cleared)."
                 );
             }
         }
@@ -901,9 +923,11 @@ impl Engine for Ds4Session {
             )));
         }
 
-        // Persist a fresh checkpoint for the next launch.
+        // Persist a fresh checkpoint for the next launch, plus a sidecar copy of
+        // the prompt text so the next mismatch can show what changed.
         if let Some(path) = checkpoint {
             Self::save_checkpoint(session, path, &fingerprint);
+            let _ = std::fs::write(path.with_extension("prompt"), system);
         }
         Ok(true)
     }
