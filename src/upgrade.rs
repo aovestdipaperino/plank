@@ -4,26 +4,37 @@
 //! Version-transition maintenance for the `~/.plank` cache directory.
 //!
 //! Plank persists rebuildable state under `~/.plank`: the system-prompt KV
-//! checkpoint (`kvcache/sysprompt.kv`) and the pasted-image cache
-//! (`image-cache/`). Their on-disk formats follow the binary, so after an
-//! upgrade a stale file could be read by code that no longer understands it.
-//! Instead of asking the user to clean up, the version delta itself encodes
-//! the maintenance the new binary performs on first launch (the tokensave
-//! "maintenance-based versioning" idea):
+//! checkpoint (`kvcache/sysprompt.kv`), the per-session KV payload sidecars
+//! (`kvcache/*.payload`), and the pasted-image cache (`image-cache/`).
 //!
-//! - **patch** bump — nothing to do; only the recorded marker advances.
-//! - **minor** bump — drop the sysprompt KV checkpoint and the per-session
-//!   KV payload sidecars (`kvcache/*.payload`) so they are rebuilt.
-//! - **major** bump, downgrade, or unreadable marker — drop the sysprompt
-//!   checkpoint, the payload sidecars, *and* the image cache.
+//! The **KV caches are never dropped on a version change.** Their validity is
+//! self-describing, independent of the plank version:
+//!
+//! - *Content* — both the sysprompt checkpoint and the payload sidecars are
+//!   prefixed with a textual fingerprint (`model ‖ system [‖ transcript]`); a
+//!   changed prompt misses and rebuilds on its own.
+//! - *Format* — the serialized snapshot carries its own
+//!   `DS4_SESSION_PAYLOAD_MAGIC`/`DS4_SESSION_PAYLOAD_VERSION` plus layout
+//!   invariants (context size, DS4 layout, ring/graph chunk shape). Loading an
+//!   incompatible snapshot returns a graceful error ("unsupported session
+//!   payload version"), so the warm-up rebuilds rather than trusting it.
+//!
+//! Tying the KV cache to the plank version was actively harmful: two
+//! co-installed versions (e.g. a homebrew build and a dev build) sharing one
+//! `~/.plank/kvcache` mutually deleted `sysprompt.kv` on every switch, forcing
+//! a ~130 MB cold rebuild even though the prompt was byte-identical. The
+//! fingerprint and the payload format-version already provide every guarantee
+//! the version delta was standing in for.
+//!
+//! Only the image cache remains version-gated, since it has no such
+//! self-validation:
+//!
+//! - **patch / minor** bump — nothing to do; only the recorded marker advances.
+//! - **major** bump, downgrade, or unreadable marker — drop the image cache.
 //!
 //! Session transcripts (`kvcache/*.kv`) are user data and are never touched.
-//! The payload sidecars are pure caches of prefilling those transcripts:
-//! they are already fingerprint-guarded (a stale payload is detected and
-//! ignored at load time), so deleting them on upgrade only reclaims disk —
-//! trust never depended on it. Everything removed here is rebuilt
-//! automatically on demand, so a wrong classification costs one warm-up,
-//! never data.
+//! Everything removed here is rebuilt automatically on demand, so a wrong
+//! classification costs one warm-up, never data.
 
 use std::path::Path;
 
@@ -102,34 +113,16 @@ pub fn run_startup_maintenance(plank_dir: &Path, current: &str) -> Transition {
     }
     let previous = std::fs::read_to_string(&marker).ok();
     let transition = classify(previous.as_deref(), current);
-    match transition {
-        Transition::None | Transition::Patch => {}
-        Transition::Minor => {
-            drop_kv_caches(plank_dir);
-        }
-        Transition::Major => {
-            drop_kv_caches(plank_dir);
-            let _ = std::fs::remove_dir_all(plank_dir.join("image-cache"));
-        }
+    // The KV caches (sysprompt.kv, *.payload) self-validate by fingerprint and
+    // snapshot format-version, so no version transition touches them. Only the
+    // image cache, which has no such guard, is dropped on a major transition.
+    if transition == Transition::Major {
+        let _ = std::fs::remove_dir_all(plank_dir.join("image-cache"));
     }
     if transition != Transition::None || previous.is_none() {
         let _ = std::fs::write(&marker, current);
     }
     transition
-}
-
-/// Removes the rebuildable KV caches: the sysprompt checkpoint and every
-/// per-session payload sidecar. Transcripts (`*.kv` session files) survive.
-fn drop_kv_caches(plank_dir: &Path) {
-    let kvcache = plank_dir.join("kvcache");
-    let _ = std::fs::remove_file(kvcache.join("sysprompt.kv"));
-    if let Ok(entries) = std::fs::read_dir(&kvcache) {
-        for entry in entries.flatten() {
-            if entry.path().extension().is_some_and(|e| e == "payload") {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -189,12 +182,15 @@ mod tests {
     }
 
     #[test]
-    fn minor_drops_sysprompt_keeps_sessions_and_images() {
+    fn minor_keeps_all_kv_caches_and_images() {
+        // The KV caches self-validate (fingerprint + snapshot format-version),
+        // so a version bump never drops them — this is the fix for two
+        // co-installed versions churning sysprompt.kv on every switch.
         let dir = tmp("minor");
         setup(&dir, "1.2.3");
         assert_eq!(run_startup_maintenance(&dir, "1.3.0"), Transition::Minor);
-        assert!(!dir.join("kvcache").join("sysprompt.kv").exists());
-        assert!(!dir.join("kvcache").join("abc.payload").exists());
+        assert!(dir.join("kvcache").join("sysprompt.kv").exists());
+        assert!(dir.join("kvcache").join("abc.payload").exists());
         assert!(dir.join("kvcache").join("abc.session").exists());
         assert!(dir.join("image-cache").join("img.png").exists());
         assert_eq!(
@@ -205,14 +201,16 @@ mod tests {
     }
 
     #[test]
-    fn major_also_drops_image_cache_never_sessions() {
+    fn major_drops_only_image_cache_keeping_kv_and_sessions() {
         let dir = tmp("major");
         setup(&dir, "1.2.3");
         assert_eq!(run_startup_maintenance(&dir, "2.0.0"), Transition::Major);
-        assert!(!dir.join("kvcache").join("sysprompt.kv").exists());
-        assert!(!dir.join("kvcache").join("abc.payload").exists());
-        assert!(!dir.join("image-cache").exists());
+        // KV caches survive even a major bump — they self-validate on load.
+        assert!(dir.join("kvcache").join("sysprompt.kv").exists());
+        assert!(dir.join("kvcache").join("abc.payload").exists());
         assert!(dir.join("kvcache").join("abc.session").exists());
+        // Only the image cache, which has no self-validation, is dropped.
+        assert!(!dir.join("image-cache").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
