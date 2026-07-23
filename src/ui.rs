@@ -1979,6 +1979,9 @@ impl Agent<'_> {
                 self.context_content = ContextContent::new();
                 let combined = self.context_content.combined();
                 self.session.push(Message::user(combined));
+                // Scaffolding only — not activity worth a resume point (see
+                // `save_for_exit`); a real turn re-dirties it.
+                self.session.dirty = false;
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
@@ -4347,6 +4350,9 @@ impl Agent<'_> {
                 self.context_content = ContextContent::new();
                 let combined = self.context_content.combined();
                 self.session.push(Message::user(combined));
+                // Scaffolding only — not activity worth a resume point (see
+                // `save_for_exit`); a real turn re-dirties it.
+                self.session.dirty = false;
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
@@ -5124,6 +5130,11 @@ fn new_agent(
     let combined = context_content.combined();
     trace.text("context", &combined);
     session.push(Message::user(combined));
+    // Session-start context is scaffolding, not user activity: a session that
+    // only ever holds it (no ds4_engine invocation) is not worth a resume point,
+    // so it must not count as dirty. A real turn re-dirties it. (See
+    // `save_for_exit`.)
+    session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
@@ -6799,6 +6810,81 @@ mod tests {
         // A new turn makes it dirty again, and it saves.
         agent.session.push(Message::user("another"));
         assert!(agent.save_for_exit().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn readonly_slash_commands_do_not_dirty_or_log() {
+        let dir = scratch_dir("readonly-slash");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Session-start scaffolding, not activity.
+        let combined = agent.context_content.combined();
+        agent.session.push(Message::user(combined));
+        agent.session.dirty = false;
+        let before = agent.session.transcript.len();
+
+        // Commands that only report state must neither log into the transcript
+        // nor mark the session dirty, so a session that only ran them gets no
+        // resume point.
+        for cmd in ["/usage", "/context", "/help", "/stats"] {
+            agent.slash(cmd).unwrap_or_else(|e| panic!("{cmd}: {e}"));
+            assert_eq!(
+                agent.session.transcript.len(),
+                before,
+                "{cmd} must not log into the conversation"
+            );
+            assert!(!agent.session.dirty, "{cmd} must not dirty the session");
+        }
+        assert!(
+            agent.save_for_exit().is_none(),
+            "a report-only session gets no resume point"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn context_scaffolding_alone_is_not_worth_a_resume_point() {
+        let dir = scratch_dir("scaffold-only");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Reproduce what new_agent / `/clear` do at session start: inject the
+        // session-start context, then mark it non-dirty (it is scaffolding, not
+        // user activity — the fix).
+        let combined = agent.context_content.combined();
+        agent.session.push(Message::user(combined));
+        agent.session.dirty = false;
+        assert!(
+            agent.save_for_exit().is_none(),
+            "a session holding only session-start context gets no resume point"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn bang_line_is_not_logged_and_leaves_no_resume_point() {
+        let dir = scratch_dir("bang-no-log");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Session-start scaffolding, not activity.
+        let combined = agent.context_content.combined();
+        agent.session.push(Message::user(combined));
+        agent.session.dirty = false;
+        let before = agent.session.transcript.len();
+
+        // A `!` shell line runs but must not enter the transcript or dirty the
+        // session, so a `!`-only session is not worth a resume point.
+        handle_plain_line(&mut agent, "!echo plank-bang-test").unwrap();
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "! shell lines must not be logged in the conversation"
+        );
+        assert!(!agent.session.dirty, "! must not dirty the session");
+        assert!(
+            agent.save_for_exit().is_none(),
+            "a !-only session gets no resume point"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
