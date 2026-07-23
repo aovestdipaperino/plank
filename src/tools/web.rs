@@ -117,13 +117,49 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
 
 /// Runs the session approval gate, mirroring `web_ensure_browser`.
 ///
+/// The Ratatui TUI runs its own event loop with the terminal in raw mode, so
+/// the stdin-reading [`web_confirm`](ToolContext::web_confirm) hook would block
+/// forever and freeze the agent. When an ask bridge is present (TUI only), the
+/// gate is routed through the [`Asker`](crate::tools::ask::Asker) the event
+/// loop already services; the plain REPL and tests keep the stdin hook.
+///
 /// # Errors
 ///
-/// Returns the C refusal texts when no hook is installed or the user denies.
+/// Returns the C refusal texts when no confirmation path exists or the user denies.
 fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
     if ctx.web.allowed {
         return Ok(());
     }
+    // TUI: approve via the ask bridge, never blocking stdin under raw mode.
+    if ctx.ask_bridge.is_some()
+        && let Some(asker) = ctx.asker.as_mut()
+    {
+        let req = crate::tools::ask::AskRequest {
+            question: "Allow the web tool to start a visible Chrome browser?".to_string(),
+            header: "Web".to_string(),
+            options: vec![
+                crate::tools::ask::AskOption {
+                    label: "Allow".to_string(),
+                    description: "Start Chrome and let web tools access the network".to_string(),
+                },
+                crate::tools::ask::AskOption {
+                    label: "Deny".to_string(),
+                    description: "Refuse web access for this session".to_string(),
+                },
+            ],
+            multi: false,
+        };
+        return match asker.ask(req) {
+            crate::tools::ask::AskOutcome::Answered(labels)
+                if labels.iter().any(|l| l == "Allow") =>
+            {
+                ctx.web.allowed = true;
+                Ok(())
+            }
+            _ => Err("user denied Chrome browser start".to_string()),
+        };
+    }
+    // Plain REPL / tests: the stdin confirm hook.
     let Some(confirm) = ctx.web_confirm.as_mut() else {
         return Err("visible Chrome browser startup requires interactive approval".to_string());
     };
@@ -1113,6 +1149,42 @@ let y = 2;</pre>
         // Grant path flips the sticky per-session flag before any fetch.
         assert!(ensure_allowed(&mut ctx).is_ok());
         assert!(ctx.web.allowed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Fake asker returning a fixed outcome, standing in for the TUI bridge.
+    struct FixedAsker(crate::tools::ask::AskOutcome);
+    impl crate::tools::ask::Asker for FixedAsker {
+        fn ask(&mut self, _req: crate::tools::ask::AskRequest) -> crate::tools::ask::AskOutcome {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn tui_approval_uses_asker_not_stdin() {
+        // With an ask bridge present (TUI), approval must route through the
+        // asker — never the stdin hook, which would deadlock under raw mode.
+        let (mut ctx, dir) = test_ctx();
+        ctx.ask_bridge = Some(crate::tools::ask::AskBridge::new());
+        // A stdin hook that would panic if ever called proves it is bypassed.
+        ctx.web_confirm = Some(Box::new(|_| panic!("stdin hook must not run in TUI mode")));
+
+        ctx.asker = Some(Box::new(FixedAsker(
+            crate::tools::ask::AskOutcome::Answered(vec!["Allow".to_string()]),
+        )));
+        assert!(ensure_allowed(&mut ctx).is_ok());
+        assert!(ctx.web.allowed);
+
+        // A declining asker keeps the gate closed.
+        ctx.web.allowed = false;
+        ctx.asker = Some(Box::new(FixedAsker(
+            crate::tools::ask::AskOutcome::Declined,
+        )));
+        assert_eq!(
+            ensure_allowed(&mut ctx),
+            Err("user denied Chrome browser start".to_string())
+        );
+        assert!(!ctx.web.allowed);
         std::fs::remove_dir_all(dir).ok();
     }
 
