@@ -2,8 +2,8 @@ name: Release
 
 # Channel model: the highest MAJOR.MINOR series is always the beta channel.
 # A release whose major.minor == the highest across all tags goes to the
-# `plank-beta` Homebrew formula; anything below that is a stable release
-# and updates the `plank` formula. Promotion (promote.yml) flips the
+# `plank-agent-beta` Homebrew formula; anything below that is a stable release
+# and updates the `plank-agent` formula. Promotion (promote.yml) flips the
 # current beta series to stable and opens the next minor as the new beta,
 # so beta work accumulates as patch releases within one minor series.
 #
@@ -104,8 +104,8 @@ jobs:
         run: |
           VERSION="${{ needs.channel.outputs.version }}"
           BOTTLE_TAG="${{ matrix.bottle_tag }}"
-          for NAME in plank plank-beta; do
-            if [ "$NAME" = "plank-beta" ] && [ "${{ needs.channel.outputs.channel }}" != "beta" ]; then
+          for NAME in plank-agent plank-agent-beta; do
+            if [ "$NAME" = "plank-agent-beta" ] && [ "${{ needs.channel.outputs.channel }}" != "beta" ]; then
               continue
             fi
             mkdir -p "$NAME/$VERSION/bin" "$NAME/$VERSION/share/plank/metal"
@@ -151,7 +151,7 @@ jobs:
         run: |
           VERSION="${{ needs.channel.outputs.version }}"
           CHANNEL="${{ needs.channel.outputs.channel }}"
-          FORMULA_NAME=$([ "$CHANNEL" = "beta" ] && echo plank-beta || echo plank)
+          FORMULA_NAME=$([ "$CHANNEL" = "beta" ] && echo plank-agent-beta || echo plank-agent)
           echo "formula_name=$FORMULA_NAME" >> "$GITHUB_OUTPUT"
           echo "source_sha=$(sha256sum source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
           for tag in arm64_sequoia sequoia; do
@@ -171,11 +171,11 @@ jobs:
           SEQUOIA_SHA="${{ steps.hashes.outputs.sequoia_sha }}"
 
           if [ "$CHANNEL" = "beta" ]; then
-            CLASS_NAME=PlankBeta
+            CLASS_NAME=PlankAgentBeta
             DESC="Interactive coding agent with a terminal REPL (beta channel)"
-            EXTRA='  conflicts_with "plank", because: "both install a plank binary"'
+            EXTRA='  conflicts_with "plank-agent", because: "both install a plank binary"'
           else
-            CLASS_NAME=Plank
+            CLASS_NAME=PlankAgent
             DESC="Interactive coding agent with a terminal REPL (Rust port of ds4)"
             EXTRA=''
           fi

@@ -5,12 +5,12 @@ name: Promote beta to stable
 #
 #   1. Finds the latest release of the highest series (e.g. v2.3.7).
 #   2. Marks that GitHub release as a full (non-prerelease) release.
-#   3. Points the stable `plank` Homebrew formula at it, reusing the
-#      `plank-*.bottle.tar.gz` assets already built by release.yml
+#   3. Points the stable `plank-agent` Homebrew formula at it, reusing the
+#      `plank-agent-*.bottle.tar.gz` assets already built by release.yml
 #      (beta releases upload bottles under both formula names).
 #   4. Bumps Cargo.toml on main to the next minor (e.g. 2.4.0), commits,
 #      tags v2.4.0, and publishes it as a prerelease — release.yml then
-#      picks it up and seeds the new `plank-beta` formula.
+#      picks it up and seeds the new `plank-agent-beta` formula.
 #
 # Majors are never bumped here. A major bump is a deliberate, manual
 # decision; promotion only ever advances the minor.
@@ -64,10 +64,10 @@ jobs:
           TAG="${{ steps.beta.outputs.tag }}"
           VERSION="${{ steps.beta.outputs.version }}"
           mkdir bottles
-          gh release download "$TAG" --pattern "plank-${VERSION}.*.bottle.tar.gz" --dir bottles
+          gh release download "$TAG" --pattern "plank-agent-${VERSION}.*.bottle.tar.gz" --dir bottles
           for t in arm64_sequoia sequoia; do
-            if [ ! -f "bottles/plank-${VERSION}.${t}.bottle.tar.gz" ]; then
-              echo "::error::bottle plank-${VERSION}.${t}.bottle.tar.gz missing from release $TAG — aborting promotion"
+            if [ ! -f "bottles/plank-agent-${VERSION}.${t}.bottle.tar.gz" ]; then
+              echo "::error::bottle plank-agent-${VERSION}.${t}.bottle.tar.gz missing from release $TAG — aborting promotion"
               exit 1
             fi
           done
@@ -84,13 +84,13 @@ jobs:
         run: |
           VERSION="${{ steps.beta.outputs.version }}"
           SOURCE_SHA=$(sha256sum source.tar.gz | awk '{print $1}')
-          ARM64_SEQUOIA_SHA=$(sha256sum "bottles/plank-${VERSION}.arm64_sequoia.bottle.tar.gz" | awk '{print $1}')
-          SEQUOIA_SHA=$(sha256sum "bottles/plank-${VERSION}.sequoia.bottle.tar.gz" | awk '{print $1}')
+          ARM64_SEQUOIA_SHA=$(sha256sum "bottles/plank-agent-${VERSION}.arm64_sequoia.bottle.tar.gz" | awk '{print $1}')
+          SEQUOIA_SHA=$(sha256sum "bottles/plank-agent-${VERSION}.sequoia.bottle.tar.gz" | awk '{print $1}')
 
           git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/aovestdipaperino/homebrew-tap.git" tap
 
-          cat > tap/Formula/plank.rb << EOF
-          class Plank < Formula
+          cat > tap/Formula/plank-agent.rb << EOF
+          class PlankAgent < Formula
             desc "Interactive coding agent with a terminal REPL (Rust port of ds4)"
             homepage "https://github.com/aovestdipaperino/plank"
             url "https://github.com/aovestdipaperino/plank/archive/refs/tags/v${VERSION}.tar.gz"
@@ -119,8 +119,8 @@ jobs:
           cd tap
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/plank.rb
-          git diff --cached --quiet || git commit -m "plank ${VERSION} (promoted from beta)"
+          git add Formula/plank-agent.rb
+          git diff --cached --quiet || git commit -m "plank-agent ${VERSION} (promoted from beta)"
           git push
 
       - name: Open next minor beta
