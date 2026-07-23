@@ -3,6 +3,10 @@
 
 //! macOS Seatbelt sandbox for model-initiated shell commands (issue #17).
 //!
+//! On by default on macOS: a model-chosen command should not be able to write
+//! outside the project it was pointed at. `--no-sandbox` (or `"enabled": false`)
+//! turns it off.
+//!
 //! When enabled, `bash` tool commands run under `/usr/bin/sandbox-exec` with
 //! a generated profile: read everywhere, write only under the working
 //! directory, temp dirs, and any configured extra roots. User-typed `!`
@@ -31,14 +35,27 @@ use crate::tools::mcp::{Json, json_parse};
 use std::path::{Path, PathBuf};
 
 /// Sandbox policy for model-initiated bash commands.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Sandbox {
-    /// Master switch; default off.
+    /// Master switch; on by default wherever `sandbox-exec` exists (macOS).
     pub enabled: bool,
     /// Extra roots writable in addition to cwd and temp dirs.
     pub writable_paths: Vec<PathBuf>,
     /// `*`-glob patterns for commands that skip the sandbox entirely.
     pub excluded_commands: Vec<String>,
+}
+
+impl Default for Sandbox {
+    /// On where Seatbelt exists, off elsewhere: `sandbox-exec` is macOS-only,
+    /// and wrapping a command in a binary that is not there would fail every
+    /// model-initiated command on other platforms.
+    fn default() -> Self {
+        Self {
+            enabled: cfg!(target_os = "macos"),
+            writable_paths: Vec::new(),
+            excluded_commands: Vec::new(),
+        }
+    }
 }
 
 impl Sandbox {
@@ -167,9 +184,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn disabled_by_default() {
+    fn enabled_by_default_on_macos_only() {
         let sb = Sandbox::default();
-        assert!(!sb.should_sandbox("rm -rf /"));
+        assert_eq!(sb.should_sandbox("rm -rf /"), cfg!(target_os = "macos"));
     }
 
     #[test]
