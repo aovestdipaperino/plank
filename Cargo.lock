@@ -674,7 +674,7 @@ checksum = "19f132c84eca552bf34cab8ec81f1c1dcc229b811638f9d283dceabe58c5569e"
 
 [[package]]
 name = "plank"
-version = "2.3.2"
+version = "2.3.3"
 dependencies = [
  "git2",
  "image",
