@@ -228,6 +228,75 @@ fn remote_abandon(remote: Option<&Mutex<UiRemote>>) {
     }
 }
 
+/// Map a ratatui [`Color`](ratatui::style::Color) to concrete 24-bit RGB for
+/// the CRT-off frame transcription. `Reset` becomes a neutral gray (the
+/// assumed default foreground); background colors and styles are not
+/// represented (crt-off 0.1 has no bg API — see issue #55).
+#[allow(dead_code)]
+fn color_to_rgb(c: ratatui::style::Color) -> (u8, u8, u8) {
+    use ratatui::style::Color;
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Reset => (192, 192, 192),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (127, 127, 127),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (92, 92, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Indexed(i) => indexed_to_rgb(i),
+    }
+}
+
+/// xterm-256 palette index to RGB: 0-15 base colors, 16-231 the 6x6x6 cube,
+/// 232-255 the 24-step grayscale ramp.
+#[allow(dead_code, clippy::many_single_char_names)]
+fn indexed_to_rgb(i: u8) -> (u8, u8, u8) {
+    const BASE: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (205, 0, 0),
+        (0, 205, 0),
+        (205, 205, 0),
+        (0, 0, 238),
+        (205, 0, 205),
+        (0, 205, 205),
+        (229, 229, 229),
+        (127, 127, 127),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (92, 92, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    match i {
+        0..=15 => BASE[i as usize],
+        16..=231 => {
+            let n = i - 16;
+            let steps = [0u8, 95, 135, 175, 215, 255];
+            let r = steps[(n / 36) as usize];
+            let g = steps[((n / 6) % 6) as usize];
+            let b = steps[(n % 6) as usize];
+            (r, g, b)
+        }
+        232..=255 => {
+            let v = 8 + 10 * (i - 232);
+            (v, v, v)
+        }
+    }
+}
+
 /// The single event source both TUI key loops use.
 ///
 /// Injected events (from `--ui-remote`) are drained before the terminal is
@@ -7501,5 +7570,25 @@ mod tests {
         assert!(reply.contains(r#""ok":false"#), "{reply}");
         assert!(reply.contains("ui exiting"), "{reply}");
         assert!(r.deferred.is_empty());
+    }
+
+    #[test]
+    fn color_to_rgb_maps_variants() {
+        use ratatui::style::Color;
+        // Passthrough
+        assert_eq!(color_to_rgb(Color::Rgb(10, 20, 30)), (10, 20, 30));
+        // Named
+        assert_eq!(color_to_rgb(Color::Black), (0, 0, 0));
+        assert_eq!(color_to_rgb(Color::White), (255, 255, 255));
+        assert_eq!(color_to_rgb(Color::Red), (205, 0, 0));
+        // Reset -> neutral gray
+        assert_eq!(color_to_rgb(Color::Reset), (192, 192, 192));
+        // Indexed: 16 base colors, cube, grayscale ramp
+        assert_eq!(color_to_rgb(Color::Indexed(0)), (0, 0, 0));
+        assert_eq!(color_to_rgb(Color::Indexed(15)), (255, 255, 255));
+        assert_eq!(color_to_rgb(Color::Indexed(16)), (0, 0, 0)); // cube origin
+        assert_eq!(color_to_rgb(Color::Indexed(231)), (255, 255, 255)); // cube max
+        assert_eq!(color_to_rgb(Color::Indexed(232)), (8, 8, 8)); // ramp start
+        assert_eq!(color_to_rgb(Color::Indexed(255)), (238, 238, 238)); // ramp end
     }
 }
