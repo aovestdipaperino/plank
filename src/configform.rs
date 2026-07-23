@@ -34,6 +34,7 @@ pub enum FieldId {
     UiShowThinking,
     UiNotifications,
     UiNotifyAfterSecs,
+    UiCrtOff,
     SafetySandbox,
     SafetyBtwSuspend,
     McpTimeoutSecs,
@@ -174,6 +175,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Count,
     ),
     f(
+        FieldId::UiCrtOff,
+        "ui",
+        "crtOff",
+        "CRT power-off animation on TUI exit",
+        Kind::Bool,
+    ),
+    f(
         FieldId::SafetySandbox,
         "safety",
         "sandbox",
@@ -272,6 +280,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiShowThinking => s.ui.show_thinking.to_string(),
         FieldId::UiNotifications => s.ui.notifications.to_string(),
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
+        FieldId::UiCrtOff => s.ui.crt_off.to_string(),
         FieldId::SafetySandbox => tri_str(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
@@ -298,6 +307,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiShowToolResults => s.ui.show_tool_results = !s.ui.show_tool_results,
         FieldId::UiShowThinking => s.ui.show_thinking = !s.ui.show_thinking,
         FieldId::UiNotifications => s.ui.notifications = !s.ui.notifications,
+        FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
         FieldId::ToolsTask => s.tools.task = !s.tools.task,
         FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
         FieldId::ToolsPlanMode => s.tools.plan_mode = !s.tools.plan_mode,
@@ -374,6 +384,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiShowToolResults
         | FieldId::UiShowThinking
         | FieldId::UiNotifications
+        | FieldId::UiCrtOff
         | FieldId::ToolsTask
         | FieldId::ToolsAgent
         | FieldId::ToolsPlanMode => {
@@ -393,6 +404,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiShowToolResults => s.ui.show_tool_results = b,
         FieldId::UiShowThinking => s.ui.show_thinking = b,
         FieldId::UiNotifications => s.ui.notifications = b,
+        FieldId::UiCrtOff => s.ui.crt_off = b,
         FieldId::ToolsTask => s.tools.task = b,
         FieldId::ToolsAgent => s.tools.agent = b,
         FieldId::ToolsPlanMode => s.tools.plan_mode = b,
@@ -737,6 +749,22 @@ mod tests {
         // Empty clears the optional.
         set_from_path(&mut s, "engine.backend", "").unwrap();
         assert_eq!(s.engine.backend, None);
+    }
+
+    #[test]
+    fn crt_off_field_toggles() {
+        let mut form = ConfigForm::new(Settings::default());
+        // Cursor starts at engine.model; walk to ui.crtOff.
+        let idx = FIELDS
+            .iter()
+            .position(|f| f.id == FieldId::UiCrtOff)
+            .unwrap();
+        for _ in 0..idx {
+            form.handle_key(k(KeyCode::Down));
+        }
+        assert!(form.working.ui.crt_off, "default on");
+        form.handle_key(k(KeyCode::Enter));
+        assert!(!form.working.ui.crt_off, "toggled off");
     }
 
     #[test]
