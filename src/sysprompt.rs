@@ -107,10 +107,9 @@ Use write for new files or deliberate whole-file replacement. Use edit with path
 changes; old must match exactly once. For large replacements prefer anchored old text: the first \
 lines, then [upto], then unique final lines — never close old immediately after [upto].\n\n\
 ## Web\n\n\
-Use google_search to find web pages and visit_page to read a known URL. The first web call may \
-ask permission to start a browser. Use web_search for a client-side search that returns a link map \
-without starting a browser; it accepts optional allowed_domains or blocked_domains (comma-separated, \
-not both).\n\n\
+Use google_search to find web pages (a client-side search that returns a link map, no browser) and \
+visit_page to read a known URL. google_search accepts optional allowed_domains or blocked_domains \
+(comma-separated, not both). visit_page may ask permission to start a browser on first use.\n\n\
 ## Rules\n\n\
 - Prefer read/search to get anchors, then anchored edit to avoid retyping large text.\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\
@@ -149,7 +148,6 @@ pub fn provider_tool_registry(
             "required": ["pattern"]
         }),
     });
-    push_web_search_spec(&mut specs);
     specs.push(crate::engine::ToolSpec {
         name: "skill".to_string(),
         description: "Invoke an installed skill (a packaged procedure) by name; its instructions are returned for you to follow. Call with no name to list the installed skills first.".to_string(),
@@ -238,25 +236,6 @@ pub fn provider_tool_registry(
 /// `agent` and plan-mode tools (issue #50). Mirrors the text-path schemas in
 /// [`append_agent_and_plan_schemas`]; split out to keep
 /// [`provider_tool_registry`] under the function-length lint.
-/// Pushes the provider-path [`ToolSpec`](crate::engine::ToolSpec) for
-/// `web_search`. Mirrors the text-path schema appended by
-/// [`append_native_extra_schemas`].
-fn push_web_search_spec(specs: &mut Vec<crate::engine::ToolSpec>) {
-    specs.push(crate::engine::ToolSpec {
-        name: "web_search".to_string(),
-        description: "Search the web client-side (via DuckDuckGo) and return a link map of results. Unlike google_search this does not start a browser and needs no approval. Optionally restrict results with allowed_domains or blocked_domains (comma-separated hostnames; supply at most one of the two).".to_string(),
-        parameters: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "the search query"},
-                "allowed_domains": {"type": "string", "description": "comma-separated hostnames to restrict results to"},
-                "blocked_domains": {"type": "string", "description": "comma-separated hostnames to exclude from results"}
-            },
-            "required": ["query"]
-        }),
-    });
-}
-
 fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
     let tools = &crate::settings::active().tools;
     if tools.agent {
@@ -446,24 +425,6 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20       \"multi\": {\"type\": \"string\", \"description\": \"true to allow selecting more than one option (default false)\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"question\", \"header\", \"options\"]\n\
-         \x20   }\n\
-         \x20 }\n\
-         }\n",
-    );
-    out.push_str(
-        "{\n\
-         \x20 \"type\": \"function\",\n\
-         \x20 \"function\": {\n\
-         \x20   \"name\": \"web_search\",\n\
-         \x20   \"description\": \"Search the web client-side (via DuckDuckGo) and return a link map of results. Unlike google_search this does not start a browser and needs no approval. Optionally restrict results with allowed_domains or blocked_domains (comma-separated hostnames; supply at most one of the two).\",\n\
-         \x20   \"parameters\": {\n\
-         \x20     \"type\": \"object\",\n\
-         \x20     \"properties\": {\n\
-         \x20       \"query\": {\"type\": \"string\", \"description\": \"the search query\"},\n\
-         \x20       \"allowed_domains\": {\"type\": \"string\", \"description\": \"comma-separated hostnames to restrict results to\"},\n\
-         \x20       \"blocked_domains\": {\"type\": \"string\", \"description\": \"comma-separated hostnames to exclude from results\"}\n\
-         \x20     },\n\
-         \x20     \"required\": [\"query\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",

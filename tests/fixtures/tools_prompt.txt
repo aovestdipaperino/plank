@@ -285,19 +285,3 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
-{
-  "type": "function",
-  "function": {
-    "name": "web_search",
-    "description": "Search the web client-side (via DuckDuckGo) and return a link map of results. Unlike google_search this does not start a browser and needs no approval. Optionally restrict results with allowed_domains or blocked_domains (comma-separated hostnames; supply at most one of the two).",
-    "parameters": {
-      "type": "object",
-      "properties": {
-        "query": {"type": "string", "description": "the search query"},
-        "allowed_domains": {"type": "string", "description": "comma-separated hostnames to restrict results to"},
-        "blocked_domains": {"type": "string", "description": "comma-separated hostnames to exclude from results"}
-      },
-      "required": ["query"]
-    }
-  }
-}

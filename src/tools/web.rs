@@ -54,20 +54,33 @@ pub struct WebState {
     pub allowed: bool,
 }
 
-/// Executes the `google_search` tool: fetches and summarizes Google results.
-pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
-    let query = call.arg_value("query").unwrap_or("");
+/// Executes the `google_search` tool: client-side web search via `DuckDuckGo`.
+///
+/// Despite the trained name, this performs a client-side `DuckDuckGo` HTML
+/// search (curl, no browser, no approval gate) and returns a link map. Accepts
+/// an optional `allowed_domains` or `blocked_domains` (comma-separated,
+/// mutually exclusive).
+pub fn tool_google_search(_ctx: &mut ToolContext, call: &ToolCall) -> String {
+    let query = call.arg_value("query").unwrap_or("").trim();
     if query.is_empty() {
         return "Tool error: google_search requires query\n".to_string();
     }
-    if let Err(e) = ensure_allowed(ctx) {
-        return format!("Tool error: google_search failed: {e}\n");
+    let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
+    let blocked = parse_domain_list(call.arg_value("blocked_domains").unwrap_or(""));
+    if !allowed.is_empty() && !blocked.is_empty() {
+        return "Tool error: google_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
+            .to_string();
     }
-    let url = format!("https://www.google.com/search?q={}", url_encode(query));
-    match curl_fetch(&url) {
-        Ok(html) => extract_search_markdown(&url, &html),
-        Err(e) => format!("Tool error: google_search failed: {e}\n"),
+    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
+    let html = match curl_fetch(&url) {
+        Ok(html) => html,
+        Err(e) => return format!("Tool error: google_search failed: {e}\n"),
+    };
+    if is_ddg_challenge(&html) {
+        return "Tool error: google_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
     }
+    let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
+    render_search_results(query, &hits)
 }
 
 /// Executes the `visit_page` tool: renders a URL to Markdown with link map.
@@ -100,35 +113,6 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
         .map(|s| s.trim().to_ascii_lowercase())
         .filter(|s| !s.is_empty())
         .collect()
-}
-
-/// Executes the `web_search` tool: client-side `DuckDuckGo` search, no browser.
-///
-/// Deviation from the browser web tools: no approval gate — this is a plain
-/// curl fetch of the `DuckDuckGo` HTML endpoint, not a visible Chrome session.
-/// Accepts an optional `allowed_domains` or `blocked_domains` (comma-separated,
-/// mutually exclusive) and returns a plank-style link map.
-pub fn tool_web_search(_ctx: &mut ToolContext, call: &ToolCall) -> String {
-    let query = call.arg_value("query").unwrap_or("").trim();
-    if query.is_empty() {
-        return "Tool error: web_search requires query\n".to_string();
-    }
-    let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
-    let blocked = parse_domain_list(call.arg_value("blocked_domains").unwrap_or(""));
-    if !allowed.is_empty() && !blocked.is_empty() {
-        return "Tool error: web_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
-            .to_string();
-    }
-    let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-    let html = match curl_fetch(&url) {
-        Ok(html) => html,
-        Err(e) => return format!("Tool error: web_search failed: {e}\n"),
-    };
-    if is_ddg_challenge(&html) {
-        return "Tool error: web_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
-    }
-    let hits = filter_by_domains(parse_ddg_results(&html), &allowed, &blocked);
-    render_web_search(query, &hits)
 }
 
 /// Runs the session approval gate, mirroring `web_ensure_browser`.
@@ -229,9 +213,9 @@ pub fn url_encode(s: impl AsRef<str>) -> String {
 // ============================================================================
 
 /// Max result links rendered by `web_search` (mirrors the search extractor cap).
-const WEB_SEARCH_MAX_LINKS: usize = 20;
+const SEARCH_MAX_LINKS: usize = 20;
 /// Max title characters rendered per link.
-const WEB_SEARCH_TITLE_CAP: usize = 180;
+const SEARCH_TITLE_CAP: usize = 180;
 
 /// One parsed `DuckDuckGo` result.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,14 +360,14 @@ fn filter_by_domains(
 }
 
 /// Renders hits as a plank-style link map with a query header.
-fn render_web_search(query: &str, hits: &[SearchHit]) -> String {
+fn render_search_results(query: &str, hits: &[SearchHit]) -> String {
     let mut out = format!("Web search results for query: \"{query}\"\n\n");
     if hits.is_empty() {
         out.push_str("No results.\n");
         return out;
     }
-    for h in hits.iter().take(WEB_SEARCH_MAX_LINKS) {
-        let title = slice_chars(&esc_link_text(&h.title), WEB_SEARCH_TITLE_CAP).to_string();
+    for h in hits.iter().take(SEARCH_MAX_LINKS) {
+        let title = slice_chars(&esc_link_text(&h.title), SEARCH_TITLE_CAP).to_string();
         if h.snippet.is_empty() {
             let _ = writeln!(out, "- [{title}]({})", h.url);
         } else {
@@ -696,52 +680,6 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Returns true for hostnames the search extractor skips (`bad` in the JS).
-#[must_use]
-pub fn is_google_host(host: &str) -> bool {
-    for dom in ["google.", "gstatic.", "googleusercontent."] {
-        if host.starts_with(dom) || host.contains(&format!(".{dom}")) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Extracts the hostname from an http(s) URL.
-fn url_host(url: &str) -> &str {
-    let after = url.find("://").map_or(url, |p| &url[p + 3..]);
-    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
-    let hostport = &after[..end];
-    hostport.rsplit_once(':').map_or(hostport, |(h, _)| h)
-}
-
-/// Extracts visible text from HTML, dropping script/style/noscript.
-#[must_use]
-pub fn html_to_text(html: &str) -> String {
-    let mut out = String::new();
-    let mut skip = 0usize;
-    for tok in tokenize(html) {
-        match tok {
-            Tok::Tag { name, closing, .. } => match name.as_str() {
-                "script" | "style" | "noscript" => {
-                    if closing {
-                        skip = skip.saturating_sub(1);
-                    } else {
-                        skip += 1;
-                    }
-                }
-                _ => out.push(' '),
-            },
-            Tok::Text(t) => {
-                if skip == 0 {
-                    out.push_str(&decode_entities(t));
-                }
-            }
-        }
-    }
-    out
-}
-
 /// Extracts the `<title>` text, if any.
 fn html_title(html: &str) -> Option<String> {
     let mut in_title = false;
@@ -766,37 +704,6 @@ fn html_title(html: &str) -> Option<String> {
 // ============================================================================
 // Markdown builders (formats replicated from ds4_web.c's extraction JS)
 // ============================================================================
-
-/// Builds the `google_search` Markdown, mirroring `web_extract_search_js`.
-#[must_use]
-pub fn extract_search_markdown(url: &str, html: &str) -> String {
-    let mut lines = vec![
-        "# Google search results".to_string(),
-        String::new(),
-        format!("URL: {url}"),
-        String::new(),
-        "## Visible links".to_string(),
-    ];
-    let mut seen = HashSet::new();
-    for link in extract_links(url, html) {
-        if is_google_host(url_host(&link.href)) || !seen.insert(link.href.clone()) {
-            continue;
-        }
-        lines.push(format!(
-            "- [{}]({})",
-            slice_chars(&link.text, 180),
-            link.href
-        ));
-        if seen.len() >= 20 {
-            break;
-        }
-    }
-    lines.push(String::new());
-    lines.push("## Text snapshot".to_string());
-    let text = clean(html_to_text(html));
-    lines.push(slice_chars(&text, 1200).to_string());
-    lines.join("\n")
-}
 
 /// Blocks the page extractor turns into Markdown (`web_extract_page_js`).
 const BLOCK_TAGS: [&str; 14] = [
@@ -1084,9 +991,6 @@ mod tests {
             unwrap_google_redirect("https://www.google.com/url?q=https%3A%2F%2Fex.com%2Fp&sa=U"),
             "https://ex.com/p"
         );
-        assert!(is_google_host("www.google.com"));
-        assert!(is_google_host("gstatic.com"));
-        assert!(!is_google_host("notgoogle.example.com"));
     }
 
     #[test]
@@ -1100,22 +1004,6 @@ mod tests {
         assert_eq!(links[0].href, "https://a.com/x");
         assert_eq!(links[0].text, "Read this");
         assert_eq!(links[1].href, "https://base.org/rel");
-    }
-
-    #[test]
-    fn search_markdown_format() {
-        let html = r#"<html><body>
-            <a href="https://www.google.com/settings">Google settings link</a>
-            <a href="/url?q=https://ex.com/hit&amp;sa=U">Example result title</a>
-            <p>Snippet body text</p></body></html>"#;
-        let md = extract_search_markdown("https://www.google.com/search?q=x", html);
-        let lines: Vec<&str> = md.lines().collect();
-        assert_eq!(lines[0], "# Google search results");
-        assert_eq!(lines[2], "URL: https://www.google.com/search?q=x");
-        assert_eq!(lines[4], "## Visible links");
-        assert_eq!(lines[5], "- [Example result title](https://ex.com/hit)");
-        assert_eq!(lines[7], "## Text snapshot");
-        assert!(lines[8].contains("Snippet body text"));
     }
 
     #[test]
@@ -1206,17 +1094,6 @@ let y = 2;</pre>
     }
 
     #[test]
-    fn approval_gate_denies_without_hook() {
-        let (mut ctx, dir) = test_ctx();
-        let res = dispatch(&test_call("google_search", &[("query", "q")]), &mut ctx);
-        assert_eq!(
-            res.output,
-            "Tool error: google_search failed: visible Chrome browser startup requires interactive approval\n"
-        );
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
     fn approval_gate_denial_and_grant() {
         let (mut ctx, dir) = test_ctx();
         ctx.web_confirm = Some(Box::new(|msg: &str| {
@@ -1239,7 +1116,7 @@ let y = 2;</pre>
         std::fs::remove_dir_all(dir).ok();
     }
 
-    // ---- web_search ----
+    // ---- google_search (DuckDuckGo) ----
 
     const DDG_FIXTURE: &str = r##"<html><body>
 <div class="result results_links">
@@ -1323,7 +1200,7 @@ let y = 2;</pre>
     }
 
     #[test]
-    fn render_web_search_link_map() {
+    fn render_search_results_link_map() {
         let hits = vec![
             SearchHit {
                 title: "Rust".into(),
@@ -1336,20 +1213,20 @@ let y = 2;</pre>
                 snippet: String::new(),
             },
         ];
-        let out = render_web_search("rust", &hits);
+        let out = render_search_results("rust", &hits);
         assert!(out.starts_with("Web search results for query: \"rust\"\n"));
         assert!(out.contains("- [Rust](https://rust-lang.org/) — lang\n"));
         assert!(out.contains("- [Book](https://doc.rust-lang.org/book/)\n"));
     }
 
     #[test]
-    fn render_web_search_no_results() {
-        let out = render_web_search("nothing", &[]);
+    fn render_search_results_no_results() {
+        let out = render_search_results("nothing", &[]);
         assert!(out.contains("No results."));
     }
 
     #[test]
-    fn render_web_search_caps_links() {
+    fn render_search_results_caps_links() {
         let hits: Vec<SearchHit> = (0..30)
             .map(|n| SearchHit {
                 title: format!("t{n}"),
@@ -1357,8 +1234,8 @@ let y = 2;</pre>
                 snippet: String::new(),
             })
             .collect();
-        let out = render_web_search("q", &hits);
-        assert_eq!(out.matches("\n- [").count(), WEB_SEARCH_MAX_LINKS);
+        let out = render_search_results("q", &hits);
+        assert_eq!(out.matches("\n- [").count(), SEARCH_MAX_LINKS);
     }
 
     #[test]
@@ -1370,19 +1247,11 @@ let y = 2;</pre>
     }
 
     #[test]
-    fn tool_web_search_requires_query() {
-        let (mut ctx, dir) = test_ctx();
-        let out = dispatch(&test_call("web_search", &[]), &mut ctx);
-        assert_eq!(out.output, "Tool error: web_search requires query\n");
-        std::fs::remove_dir_all(dir).ok();
-    }
-
-    #[test]
-    fn tool_web_search_rejects_both_domain_lists() {
+    fn google_search_rejects_both_domain_lists() {
         let (mut ctx, dir) = test_ctx();
         let out = dispatch(
             &test_call(
-                "web_search",
+                "google_search",
                 &[
                     ("query", "rust"),
                     ("allowed_domains", "a.com"),
@@ -1393,7 +1262,7 @@ let y = 2;</pre>
         );
         assert_eq!(
             out.output,
-            "Tool error: web_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
+            "Tool error: google_search failed: allowed_domains and blocked_domains are mutually exclusive\n"
         );
         std::fs::remove_dir_all(dir).ok();
     }
