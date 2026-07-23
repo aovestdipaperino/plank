@@ -616,6 +616,109 @@ fn round2(x: f32) -> serde_json::Value {
     serde_json::json!(v)
 }
 
+// ---------------------------------------------------------------------------
+// Retry policy (issue: providers return transient HTTP errors mid-session)
+// ---------------------------------------------------------------------------
+
+/// Maximum request attempts before a provider error is surfaced to the user.
+const MAX_ATTEMPTS: u32 = 5;
+
+/// Whether an HTTP error status is worth retrying. Request-timeout (408),
+/// rate-limit (429) and any 5xx server error are transient; auth/permission
+/// and the other 4xx (400, 401, 403, 404, 422, …) are permanent — retrying a
+/// bad API key just delays the same failure and can trip rate limits, so those
+/// fail fast.
+#[must_use]
+fn status_is_retryable(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+/// Parses a `Retry-After` header expressed as an integer number of seconds
+/// (the alternate HTTP-date form is not honored; we fall back to our own
+/// backoff for it). Capped at 30s so a hostile or fat-fingered header can't
+/// stall the agent indefinitely.
+#[must_use]
+fn parse_retry_after(value: &str) -> Option<std::time::Duration> {
+    let secs: u64 = value.trim().parse().ok()?;
+    Some(std::time::Duration::from_secs(secs.min(30)))
+}
+
+/// Exponential backoff for attempt `n` (0-based): 250ms, 500ms, 1s, 2s, 4s,
+/// capped at 4s. Jitter is layered on by [`jittered`].
+#[must_use]
+fn backoff_base(attempt: u32) -> std::time::Duration {
+    let ms = 250u64.saturating_mul(1u64 << attempt.min(4));
+    std::time::Duration::from_millis(ms.min(4000))
+}
+
+/// Applies "full jitter" to a backoff delay: a duration in `[base/2, base]`,
+/// so concurrent clients don't retry in lockstep. Uses the wall clock as a
+/// cheap entropy source (no `rand` dependency).
+#[must_use]
+fn jittered(base: std::time::Duration) -> std::time::Duration {
+    let base_ns = u64::try_from(base.as_nanos()).unwrap_or(u64::MAX);
+    if base_ns == 0 {
+        return base;
+    }
+    let entropy = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::from(d.subsec_nanos()))
+        .unwrap_or(0);
+    let half = base_ns / 2;
+    std::time::Duration::from_nanos(half + (entropy % (half + 1)))
+}
+
+/// Extracts a human-readable message from a provider error-response body.
+/// `OpenAI` and Anthropic both wrap it as `{"error":{"message":"…"}}`; fall back
+/// to a bare top-level `message`, then to the raw body (trimmed and
+/// length-bounded) when it isn't recognizable JSON.
+#[must_use]
+fn provider_error_message(body: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v.pointer("/error/message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+        if let Some(msg) = v.get("message").and_then(|m| m.as_str()) {
+            return msg.to_string();
+        }
+    }
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        "(no response body)".to_string()
+    } else {
+        trimmed.chars().take(300).collect()
+    }
+}
+
+/// Builds a fresh streaming request for `kind` with the provider's auth headers.
+///
+/// `Accept-Encoding: identity` is set deliberately: with the default `gzip`,
+/// ureq decompresses the SSE body through `flate2`'s fixed 32 KiB
+/// `MultiGzDecoder` buffer, which — together with the server's gzip flush
+/// granularity — batches tokens into chunks and makes the live display stutter.
+/// That buffer is a compile-time constant with no public tuning knob, so the
+/// only lever is to not compress at all; identity streaming delivers one SSE
+/// frame at a time. ureq honors an explicit `Accept-Encoding` (it only adds
+/// `gzip` when the caller set none).
+fn ureq_provider_request(
+    agent: &ureq::Agent,
+    url: &str,
+    kind: ProviderKind,
+    api_key: &str,
+) -> ureq::RequestBuilder<ureq::typestate::WithBody> {
+    let request = agent
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header("Accept-Encoding", "identity");
+    match kind {
+        ProviderKind::OpenAi => request.header("Authorization", format!("Bearer {api_key}")),
+        ProviderKind::Anthropic => request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", EXTENDED_CACHE_TTL_BETA),
+    }
+}
+
 /// The Anthropic beta opt-in required for the 1-hour prompt-cache tier.
 pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 
@@ -978,42 +1081,61 @@ impl Engine for ProviderEngine {
         }));
 
         let url = format!("{}{}", self.base_url, self.endpoint());
-        // A pooled keep-alive connection can be closed by the server between
-        // turns; the reuse then fails on write with a broken pipe / reset before
-        // any response is read. The write never reached the server, so retrying
-        // on a fresh connection is safe (and only these connection-setup errors
-        // are retried — never a real HTTP status or a mid-stream failure).
+        // Surface HTTP error statuses as ordinary responses instead of ureq's
+        // default `StatusCode` error, so we can read the provider's error body
+        // (a useful message, not just "http status: 500") and any `Retry-After`
+        // header before deciding whether to retry.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .build()
+            .into();
+
+        // Retry transient failures with exponential, jittered backoff: HTTP
+        // 408/429/5xx and connection-setup drops (a pooled keep-alive socket the
+        // server closed between turns — the write never reached it, so a fresh
+        // connection is safe). Auth/permission and other 4xx fail fast. A real
+        // HTTP status error therefore no longer aborts the whole session.
         let mut resp = None;
-        let mut last_err = None;
-        for attempt in 0..=2 {
-            let request = ureq::post(&url).header("Content-Type", "application/json");
-            let request = match self.kind {
-                ProviderKind::OpenAi => {
-                    request.header("Authorization", format!("Bearer {}", self.api_key))
-                }
-                ProviderKind::Anthropic => request
-                    .header("x-api-key", self.api_key.as_str())
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-beta", EXTENDED_CACHE_TTL_BETA),
-            };
+        let mut last_err: Option<String> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            let request = ureq_provider_request(&agent, &url, self.kind, &self.api_key);
             match request.send(payload.as_str()) {
-                Ok(r) => {
-                    resp = Some(r);
-                    break;
+                Ok(mut r) => {
+                    let status = r.status().as_u16();
+                    if (200..300).contains(&status) {
+                        resp = Some(r);
+                        break;
+                    }
+                    let retry_after = r
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(parse_retry_after);
+                    let body = r.body_mut().read_to_string().unwrap_or_default();
+                    let msg = format!(
+                        "provider request failed (HTTP {status}): {}",
+                        provider_error_message(&body)
+                    );
+                    if attempt + 1 < MAX_ATTEMPTS && status_is_retryable(status) {
+                        std::thread::sleep(
+                            retry_after.unwrap_or_else(|| jittered(backoff_base(attempt))),
+                        );
+                        last_err = Some(msg);
+                    } else {
+                        return Err(EngineError::new(msg));
+                    }
                 }
-                Err(e) if attempt < 2 && is_transient_send_error(&e) => {
-                    last_err = Some(e);
-                    std::thread::sleep(std::time::Duration::from_millis(150));
+                Err(e) if attempt + 1 < MAX_ATTEMPTS && is_transient_send_error(&e) => {
+                    std::thread::sleep(jittered(backoff_base(attempt)));
+                    last_err = Some(format!("provider request: {e}"));
                 }
                 Err(e) => return Err(EngineError::new(format!("provider request: {e}"))),
             }
         }
         let Some(mut resp) = resp else {
-            let msg = last_err.map_or_else(
-                || "provider request: connection failed".to_string(),
-                |e| format!("provider request: {e}"),
-            );
-            return Err(EngineError::new(msg));
+            return Err(EngineError::new(last_err.unwrap_or_else(|| {
+                "provider request: connection failed".to_string()
+            })));
         };
 
         let mut translator = self.translator();
@@ -1103,6 +1225,72 @@ mod tests {
                 EngineEvent::Prefill(_) | EngineEvent::Notice(_) => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn retryable_statuses_only_transient() {
+        // Transient: request timeout, rate limit, and every 5xx.
+        for s in [408, 429, 500, 502, 503, 504, 599] {
+            assert!(status_is_retryable(s), "{s} should retry");
+        }
+        // Permanent: auth/permission and other client errors fail fast.
+        for s in [400, 401, 403, 404, 409, 422, 200, 301] {
+            assert!(!status_is_retryable(s), "{s} should not retry");
+        }
+    }
+
+    #[test]
+    fn retry_after_parses_seconds_and_caps() {
+        use std::time::Duration;
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after("  7 "), Some(Duration::from_secs(7)));
+        // Capped at 30s.
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(30)));
+        // The HTTP-date form is not honored (we fall back to our own backoff).
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after(""), None);
+    }
+
+    #[test]
+    fn backoff_grows_then_caps() {
+        use std::time::Duration;
+        assert_eq!(backoff_base(0), Duration::from_millis(250));
+        assert_eq!(backoff_base(1), Duration::from_millis(500));
+        assert_eq!(backoff_base(2), Duration::from_millis(1000));
+        assert_eq!(backoff_base(3), Duration::from_millis(2000));
+        assert_eq!(backoff_base(4), Duration::from_millis(4000));
+        // Capped, and no overflow on a large attempt count.
+        assert_eq!(backoff_base(9), Duration::from_millis(4000));
+        assert_eq!(backoff_base(u32::MAX), Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn jitter_stays_within_half_to_full() {
+        use std::time::Duration;
+        let base = Duration::from_millis(1000);
+        for _ in 0..64 {
+            let d = jittered(base);
+            assert!(d >= base / 2 && d <= base, "jitter {d:?} out of range");
+        }
+        // A zero base stays zero (no divide-by-zero).
+        assert_eq!(jittered(Duration::ZERO), Duration::ZERO);
+    }
+
+    #[test]
+    fn error_message_extraction() {
+        // OpenAI/Anthropic nested shape.
+        assert_eq!(
+            provider_error_message(r#"{"error":{"message":"invalid api key","type":"auth"}}"#),
+            "invalid api key"
+        );
+        // Bare top-level message.
+        assert_eq!(
+            provider_error_message(r#"{"message":"rate limited"}"#),
+            "rate limited"
+        );
+        // Non-JSON falls back to the trimmed raw body.
+        assert_eq!(provider_error_message("  Bad Gateway  "), "Bad Gateway");
+        assert_eq!(provider_error_message("   "), "(no response body)");
     }
 
     #[test]
