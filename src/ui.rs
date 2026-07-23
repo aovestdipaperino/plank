@@ -1317,7 +1317,7 @@ impl Agent<'_> {
                 turn_start.elapsed(),
                 crate::settings::active().ui.notify_after_secs,
             ) {
-                crate::notify::notify("plank", "Turn complete");
+                self.notify_task_complete();
             }
             crate::warp::emit("stop", &self.session.id);
             return Ok(());
@@ -3713,7 +3713,7 @@ impl Agent<'_> {
                     turn_started.elapsed(),
                     crate::settings::active().ui.notify_after_secs,
                 ) {
-                    crate::notify::notify("plank", "Turn complete");
+                    self.notify_task_complete();
                 }
                 crate::warp::emit("stop", &self.session.id);
                 return Ok(());
@@ -3768,7 +3768,7 @@ impl Agent<'_> {
                 turn_started.elapsed(),
                 crate::settings::active().ui.notify_after_secs,
             ) {
-                crate::notify::notify("plank", "Turn complete");
+                self.notify_task_complete();
             }
             crate::warp::emit("stop", &self.session.id);
         }
@@ -4245,6 +4245,23 @@ impl Agent<'_> {
             calls,
             error,
         })
+    }
+
+    /// Fires the "task complete" desktop notification for a finished turn: the
+    /// user's prompt as the (bold) headline, with a "Task Complete" subtitle.
+    fn notify_task_complete(&self) {
+        let prompt = self
+            .session
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::session::Role::User)
+            .map_or("", |m| m.text.as_str());
+        crate::notify::notify_full(
+            &crate::notify::prompt_summary(prompt),
+            Some("Task Complete"),
+            "",
+        );
     }
 
     /// Compacts before a TUI turn when context is tight; progress lines go to

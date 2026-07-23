@@ -103,6 +103,17 @@ fn logo_path() -> Option<std::path::PathBuf> {
 
 /// Fire a desktop notification. No-op when disabled or off macOS.
 pub fn notify(title: &str, body: &str) {
+    notify_full(title, None, body);
+}
+
+/// Fire a desktop notification with an optional subtitle. No-op when disabled
+/// or off macOS.
+///
+/// macOS renders the `summary` in bold and the `subtitle` in regular weight
+/// beneath it, so callers wanting a bold line (e.g. the user's prompt) pass it
+/// as `summary`. The subtitle is ignored by notification servers that lack the
+/// concept.
+pub fn notify_full(summary: &str, subtitle: Option<&str>, body: &str) {
     if !enabled() {
         return;
     }
@@ -110,12 +121,16 @@ pub fn notify(title: &str, body: &str) {
     {
         // Detach: the ObjC delivery is quick but must never stall a turn, and a
         // failed notification is ignored (best-effort, like the old path).
-        let title = title.to_string();
+        let summary = summary.to_string();
+        let subtitle = subtitle.map(str::to_string);
         let body = body.to_string();
         std::thread::spawn(move || {
             ensure_application();
             let mut n = notify_rust::Notification::new();
-            n.summary(&title).body(&body);
+            n.summary(&summary).body(&body);
+            if let Some(sub) = &subtitle {
+                n.subtitle(sub);
+            }
             if let Some(path) = logo_path() {
                 n.image_path(&path.to_string_lossy());
             }
@@ -124,7 +139,24 @@ pub fn notify(title: &str, body: &str) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (title, body);
+        let _ = (summary, subtitle, body);
+    }
+}
+
+/// Condenses a user prompt into a single-line notification headline: newlines
+/// and runs of whitespace collapse to single spaces, and the result is
+/// truncated with an ellipsis past [`PROMPT_SUMMARY_MAX`] characters. Empty
+/// (or whitespace-only) prompts yield `"plank"` so the banner is never blank.
+#[must_use]
+pub fn prompt_summary(prompt: &str) -> String {
+    const PROMPT_SUMMARY_MAX: usize = 80;
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return "plank".to_string();
+    }
+    match collapsed.char_indices().nth(PROMPT_SUMMARY_MAX) {
+        Some((i, _)) => format!("{}…", &collapsed[..i]),
+        None => collapsed,
     }
 }
 
@@ -166,6 +198,17 @@ mod tests {
         // The mapping is env-driven; assert the default branch explicitly since
         // TERM_PROGRAM under the test harness is unspecified.
         assert!(!host_terminal_bundle_id().is_empty());
+    }
+
+    #[test]
+    fn prompt_summary_collapses_and_truncates() {
+        assert_eq!(prompt_summary("  fix   the\n bug  "), "fix the bug");
+        assert_eq!(prompt_summary("   "), "plank");
+        assert_eq!(prompt_summary(""), "plank");
+        let long = "a".repeat(100);
+        let out = prompt_summary(&long);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 81); // 80 chars + ellipsis
     }
 
     #[test]
