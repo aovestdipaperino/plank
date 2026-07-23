@@ -40,6 +40,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Provider engine no longer aborts on an HTTP error.** A 4xx/5xx from an
+  OpenAI/Anthropic-compatible provider used to propagate out as a fatal
+  `EngineError` (crashing the plain-REPL / non-interactive / `-p` paths).
+  Transient failures (HTTP 408/429/5xx and connection-setup drops) now retry
+  with bounded, jittered exponential backoff (up to 5 attempts, ~250ms→4s,
+  honoring `Retry-After`); auth/permission errors (401/403) fail fast with the
+  provider's own error message instead of a bare `http status: N`.
+- **Smoother remote token streaming.** The provider request now asks for
+  `Accept-Encoding: identity`; the default gzip stream was decompressed through
+  `flate2`'s fixed 32 KiB buffer and arrived in chunky clumps. Identity encoding
+  streams one SSE frame at a time.
 - Long scrollback (e.g. the `/context` report) now scrolls all the way to the
   bottom (exact wrapped-line count instead of a char-packing estimate).
 - Resumed sessions (`/resume`, `/switch`, `plank /resume`) replay through the

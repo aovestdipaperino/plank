@@ -336,11 +336,25 @@ to the retained id (Anthropic requires this; OpenAI-compatible needs the
 - **Timeouts:** connect + idle-read timeouts on the reqwest client; a stalled
   provider surfaces as `EngineError`, which the turn loop already renders as a
   tool/engine error (`src/ui.rs:383`).
-- **Retries:** (b) uses llms-sdk `RetryPolicy` (bounded, jittered) for transient
-  5xx/429 **before** the first byte streams; once streaming has begun a failure
-  is non-idempotent and is surfaced, not retried (partial output already
-  rendered). (a) does not retry mid-turn either; it relies on re-sync on the
-  next turn (§4.1).
+- **Retries:** (b) retries in the sync `ureq` path (no llms-sdk runtime) with
+  bounded, jittered exponential backoff (`src/remote/provider.rs`): up to 5
+  attempts, ~250ms→4s doubling with full jitter, honoring a `Retry-After`
+  header (capped at 30s). Retried classes are transient HTTP **408 / 429 / 5xx**
+  and connection-setup drops (a pooled keep-alive socket the server closed
+  before the write landed); **401 / 403 and the other 4xx fail fast** — retrying
+  a bad key just defers the same error and can trip rate limits. The agent is
+  built with `http_status_as_error(false)` so an error response can be read for
+  its `{"error":{"message":…}}` body and surfaced verbatim instead of a bare
+  `http status: N`. All retrying happens **before** the first byte streams; once
+  streaming has begun a failure is non-idempotent and is surfaced, not retried
+  (partial output already rendered). (a) does not retry mid-turn either; it
+  relies on re-sync on the next turn (§4.1).
+- **Streaming smoothness:** the provider request sets `Accept-Encoding:
+  identity`. With the default `gzip`, ureq decompresses the SSE body through
+  `flate2`'s fixed 32 KiB `MultiGzDecoder` buffer, which — together with the
+  server's gzip flush granularity — batches tokens into visible clumps. That
+  buffer is a compile-time constant with no public tuning knob, so the only
+  lever is to not compress: identity encoding delivers one SSE frame at a time.
 - **Interrupt for (a):** `DELETE /generate/{id}`; for (b): drop the stream
   (the SDK/reqwest aborts the HTTP request).
 
