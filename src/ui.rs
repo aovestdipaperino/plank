@@ -7641,9 +7641,9 @@ mod tests {
         // Row 1 left blank (spaces).
         let screen = frame_to_screen(&buf);
         assert_eq!(screen.width(), 3);
-        // crt-off counts a row as content whenever any cell wrote color, even
-        // a blank " " cell with an explicit fg (here, the `Reset` neutral
-        // gray applied to every unset cell) — both rows count, not just row 0.
+        // `content_rows()` tracks how far the row cursor advanced, not whether
+        // pixels were written (blank " " cells record none): frame_to_screen
+        // calls `putln` once per buffer row, so both rows count, not just row 0.
         assert_eq!(screen.content_rows(), 2);
     }
 }
