@@ -532,6 +532,14 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     if !tui {
         print!("{}", plank::logo::banner());
         print!("{}", status::welcome_banner(cfg.generation.ctx_size, color));
+        // Only the echo stub has no model name; the TUI prints the same lines
+        // into its own scrollback.
+        if engine.model_name().is_empty() {
+            for line in status::no_model_lines() {
+                println!("{line}");
+            }
+            println!();
+        }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
     plank::ui::run_interactive(engine, cfg, remote_state)

@@ -2871,6 +2871,20 @@ impl Agent<'_> {
             status::format_ctx_size(self.engine.ctx_size())
         ));
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
+        // Only the echo stub has no model name, and it answers nothing useful.
+        if self.engine.model_name().is_empty() {
+            log.push_plain(String::new());
+            for (i, line) in status::no_model_lines().into_iter().enumerate() {
+                if i == 0 {
+                    log.push_spans(vec![ratatui::text::Span::styled(
+                        line,
+                        ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
+                    )]);
+                } else {
+                    log.push_dim(line);
+                }
+            }
+        }
         log.push_plain(String::new());
 
         // A `plank /resume` startup shows the recovered conversation so far,
