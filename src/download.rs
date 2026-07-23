@@ -327,6 +327,19 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     result?;
     joined?;
 
+    // A body that ends early reads as a clean EOF, so a short .part would be
+    // renamed into place and only fail much later, deep in the model loader.
+    // Leave the .part alone: a re-run resumes it.
+    if let Some(expected) = total.filter(|t| *t > 0) {
+        let got = partial_bytes(dest);
+        if got != expected {
+            return Err(format!(
+                "download incomplete: {:.1} of {:.1} GB. Re-run plank to resume.",
+                gb(got),
+                gb(expected)
+            ));
+        }
+    }
     std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
     eprintln!("Model ready at {}.", dest.display());
     Ok(())
