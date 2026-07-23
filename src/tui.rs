@@ -1264,17 +1264,35 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Opt
     // Reason for the rebuild (cache missing / prompt changed + diff), below the
     // progress bar in the reserved region.
     if let Some(notice) = notice {
-        // First line (the reason) is centered; any diff lines below it are left
-        // aligned so `-`/`+` rows line up and stay readable.
+        // First line (the reason) is centered yellow; diff rows below use the
+        // same red/green backgrounds as the code-diff cards (del bg 52 / fg 224,
+        // add bg 22 / fg 194) so a `-`/`+` diff reads the same everywhere. The
+        // elision summary is dimmed.
         let lines: Vec<Line> = notice
             .lines()
             .enumerate()
             .map(|(i, l)| {
-                let line = Line::from(Span::styled(
-                    l.to_owned(),
-                    Style::default().fg(Color::Yellow),
-                ));
-                if i == 0 { line.centered() } else { line }
+                if i == 0 {
+                    return Line::from(Span::styled(
+                        l.to_owned(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ))
+                    .centered();
+                }
+                let style = if l.starts_with("- ") {
+                    Style::default()
+                        .bg(Color::Indexed(52))
+                        .fg(Color::Indexed(224))
+                } else if l.starts_with("+ ") {
+                    Style::default()
+                        .bg(Color::Indexed(22))
+                        .fg(Color::Indexed(194))
+                } else {
+                    Style::default().fg(Color::Indexed(240))
+                };
+                Line::from(Span::styled(l.to_owned(), style))
             })
             .collect();
         frame.render_widget(Paragraph::new(Text::from(lines)), rows[2]);
