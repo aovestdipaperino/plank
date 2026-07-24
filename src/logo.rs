@@ -50,20 +50,24 @@ pub fn art(width: u32) -> String {
     logo_art::image_to_ansi(transparent_png(), width.max(1))
 }
 
-/// Version label like `v0.9.9`, with ` BETA` appended for beta builds.
+/// Version label like `v2.5.0`, with ` BETA` appended for beta builds.
 ///
-/// A build is beta when the version carries a `beta` pre-release identifier or
-/// the release workflow sets `PLANK_CHANNEL=beta` at compile time.
+/// Channel-by-patch scheme (see VERSIONING.md): a `X.Y.0` version is a stable
+/// release, any patch above 0 is a beta. A `beta` pre-release identifier or a
+/// compile-time `PLANK_CHANNEL=beta` still forces the label for odd builds.
 #[must_use]
 pub fn version_label() -> String {
     let version = env!("CARGO_PKG_VERSION");
-    let beta = version.contains("beta")
-        || option_env!("PLANK_CHANNEL").is_some_and(|c| c.eq_ignore_ascii_case("beta"));
-    if beta {
+    let forced = option_env!("PLANK_CHANNEL").is_some_and(|c| c.eq_ignore_ascii_case("beta"));
+    if is_beta(version, env!("CARGO_PKG_VERSION_PATCH")) || forced {
         format!("v{version} BETA")
     } else {
         format!("v{version}")
     }
+}
+
+fn is_beta(version: &str, patch: &str) -> bool {
+    patch != "0" || version.contains("beta")
 }
 
 /// The logo art at [`DEFAULT_WIDTH`] followed by a version line.
@@ -85,6 +89,15 @@ mod tests {
     #[test]
     fn banner_has_version() {
         assert!(super::banner().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    // Channel-by-patch: X.Y.0 is stable, any higher patch is a beta build.
+    #[test]
+    fn beta_follows_patch_number() {
+        assert!(!super::is_beta("2.5.0", "0"));
+        assert!(super::is_beta("2.5.1", "1"));
+        assert!(super::is_beta("2.5.12", "12"));
+        assert!(super::is_beta("3.0.0-beta.1", "0"));
     }
 
     #[test]

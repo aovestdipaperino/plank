@@ -1,23 +1,23 @@
 name: Promote beta to stable
 
-# Promotes the current beta (the highest major.minor series) to the stable
-# channel, then opens the next minor as the new, empty beta:
+# Channel-by-patch scheme (see VERSIONING.md): `vX.Y.0` is stable, `vX.Y.Z`
+# with Z >= 1 is beta. Promotion closes the current series and opens the next
+# minor with a stable/beta pair:
 #
-#   1. Finds the latest release of the highest series (e.g. v2.3.7).
-#   2. Marks that GitHub release as a full (non-prerelease) release.
-#   3. Points the stable `plank-agent` Homebrew formula at it, reusing the
-#      `plank-agent-*.bottle.tar.gz` assets already built by release.yml
-#      (beta releases upload bottles under both formula names).
-#   4. Bumps Cargo.toml on main to the next minor (e.g. 2.4.0), commits,
-#      tags v2.4.0, and publishes it as a prerelease — release.yml then
-#      picks it up and seeds the new `plank-agent-beta` formula.
+#   1. Finds the highest tagged MAJOR.MINOR series (e.g. 2.5, latest v2.5.3).
+#   2. Bumps Cargo.toml on main to `<major>.<minor+1>.0`, commits, tags, and
+#      publishes it as a FULL release — release.yml builds it fresh and points
+#      the stable `plank-agent` formula at it.
+#   3. Bumps again to `<major>.<minor+1>.1`, commits, tags, and publishes it
+#      as a prerelease — release.yml seeds the new `plank-agent-beta` formula.
 #
-# Majors are never bumped here. A major bump is a deliberate, manual
-# decision; promotion only ever advances the minor.
+# The `.0` and `.1` releases are built from the same code (only the version
+# differs), so the new beta starts exactly where the new stable is. Majors
+# are never bumped here; a major bump is a deliberate, manual decision.
 #
 # Requires TAP_GITHUB_TOKEN to be a PAT with push access to BOTH
 # aovestdipaperino/homebrew-tap and this repo: releases created with the
-# default GITHUB_TOKEN would not trigger release.yml for the new beta.
+# default GITHUB_TOKEN would not trigger release.yml.
 
 on:
   workflow_dispatch:
@@ -29,7 +29,7 @@ concurrency: promote
 
 jobs:
   promote:
-    name: Promote and open next minor
+    name: Open next minor as stable + beta pair
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -38,10 +38,8 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.TAP_GITHUB_TOKEN }}
 
-      - name: Find current beta release
-        id: beta
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute next series
+        id: next
         run: |
           # Highest major.minor series, compared numerically on both
           # components so 2.10 sorts above 2.9.
@@ -49,105 +47,53 @@ jobs:
             | sort -t. -k1,1n -k2,2n -u | tail -1)
           MAJOR="${MAX_SERIES%%.*}"
           MINOR="${MAX_SERIES#*.}"
-          TAG=$(git tag -l "v${MAX_SERIES}.*" | sed 's/^v//' | sort -V | tail -1)
-          TAG="v${TAG}"
-          VERSION="${TAG#v}"
-          echo "Promoting $TAG (series $MAX_SERIES) to stable"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "next_version=${MAJOR}.$((MINOR + 1)).0" >> "$GITHUB_OUTPUT"
+          LATEST=$(git tag -l "v${MAX_SERIES}.*" | sed 's/^v//' | sort -V | tail -1)
+          STABLE="${MAJOR}.$((MINOR + 1)).0"
+          BETA="${MAJOR}.$((MINOR + 1)).1"
+          echo "Promoting series $MAX_SERIES (latest v$LATEST): stable v$STABLE, new beta v$BETA"
+          echo "stable=$STABLE" >> "$GITHUB_OUTPUT"
+          echo "beta=$BETA" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
 
-      - name: Download stable-named bottles from the beta release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG="${{ steps.beta.outputs.tag }}"
-          VERSION="${{ steps.beta.outputs.version }}"
-          mkdir bottles
-          gh release download "$TAG" --pattern "plank-agent-${VERSION}.*.bottle.tar.gz" --dir bottles
-          for t in arm64_sequoia sequoia; do
-            if [ ! -f "bottles/plank-agent-${VERSION}.${t}.bottle.tar.gz" ]; then
-              echo "::error::bottle plank-agent-${VERSION}.${t}.bottle.tar.gz missing from release $TAG — aborting promotion"
-              exit 1
-            fi
-          done
-          curl -sL "https://github.com/${{ github.repository }}/archive/refs/tags/${TAG}.tar.gz" -o source.tar.gz
-
-      - name: Mark release as stable
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ steps.beta.outputs.tag }}" --prerelease=false --latest
-
-      - name: Update stable formula in tap
-        env:
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
-        run: |
-          VERSION="${{ steps.beta.outputs.version }}"
-          SOURCE_SHA=$(sha256sum source.tar.gz | awk '{print $1}')
-          ARM64_SEQUOIA_SHA=$(sha256sum "bottles/plank-agent-${VERSION}.arm64_sequoia.bottle.tar.gz" | awk '{print $1}')
-          SEQUOIA_SHA=$(sha256sum "bottles/plank-agent-${VERSION}.sequoia.bottle.tar.gz" | awk '{print $1}')
-
-          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/aovestdipaperino/homebrew-tap.git" tap
-
-          cat > tap/Formula/plank-agent.rb << EOF
-          class PlankAgent < Formula
-            desc "Interactive coding agent with a terminal REPL (Rust port of ds4)"
-            homepage "https://github.com/aovestdipaperino/plank"
-            url "https://github.com/aovestdipaperino/plank/archive/refs/tags/v${VERSION}.tar.gz"
-            sha256 "${SOURCE_SHA}"
-            license "MIT"
-
-            depends_on :macos
-            depends_on "rust" => :build
-
-            bottle do
-              root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
-              sha256 cellar: :any_skip_relocation, arm64_sequoia: "${ARM64_SEQUOIA_SHA}"
-              sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
-            end
-
-            def install
-              system "cargo", "install", *std_cargo_args
-            end
-
-            test do
-              system "#{bin}/plank", "--help"
-            end
-          end
-          EOF
-
-          cd tap
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Formula/plank-agent.rb
-          git diff --cached --quiet || git commit -m "plank-agent ${VERSION} (promoted from beta)"
-          git push
-
-      - name: Open next minor beta
+      - name: Tag and release the stable .0 and beta .1
         env:
           GH_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
         run: |
-          OLD="${{ steps.beta.outputs.version }}"
-          NEW="${{ steps.beta.outputs.next_version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          sed -i "0,/^version = \".*\"/s//version = \"${NEW}\"/" Cargo.toml
-          # Keep Cargo.lock in sync without needing a full toolchain.
-          python3 - << PYEOF
+          bump() {
+            NEW="$1"
+            sed -i "0,/^version = \".*\"/s//version = \"${NEW}\"/" Cargo.toml
+            # Keep Cargo.lock in sync without needing a full toolchain.
+            python3 - << PYEOF
           import re
           lock = open("Cargo.lock").read()
           lock = re.sub(r'(name = "plank"\nversion = )"[^"]+"', r'\g<1>"${NEW}"', lock)
           open("Cargo.lock", "w").write(lock)
           PYEOF
+            git add Cargo.toml Cargo.lock
+          }
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock
-          git commit -m "Open v${NEW} beta channel"
-          git tag "v${NEW}"
-          git push origin main "v${NEW}"
+          STABLE="${{ steps.next.outputs.stable }}"
+          BETA="${{ steps.next.outputs.beta }}"
 
-          gh release create "v${NEW}" \
+          bump "$STABLE"
+          git commit -m "Promote v${{ steps.next.outputs.latest }} beta work to stable v${STABLE}"
+          git tag "v${STABLE}"
+
+          bump "$BETA"
+          git commit -m "Open v${BETA} beta channel"
+          git tag "v${BETA}"
+
+          git push origin main "v${STABLE}" "v${BETA}"
+
+          # Full release first so `Latest` lands on the stable; both created
+          # with the PAT so release.yml fires for each.
+          gh release create "v${STABLE}" \
+            --title "v${STABLE}" \
+            --notes "Stable release: v${{ steps.next.outputs.latest }} beta work promoted. See CHANGELOG.md."
+          gh release create "v${BETA}" \
             --prerelease \
-            --title "v${NEW} (beta)" \
-            --notes "Opens the v${NEW%.*} beta series. Promoted v${OLD} to stable." \
-            --repo "${{ github.repository }}"
+            --title "v${BETA} (beta)" \
+            --notes "Opens the v${BETA%.*} beta channel; identical to v${STABLE}."
