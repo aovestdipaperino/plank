@@ -976,11 +976,13 @@ pub struct ProviderEngine {
 
 impl ProviderEngine {
     /// Constructs a provider engine. `base_url` defaults per provider when
-    /// empty; `api_key` must be resolved by the caller (env or flag).
+    /// empty; `api_key` must be resolved by the caller (env or flag). A
+    /// missing key falls back to `DUMMY` — key-less endpoints (a local
+    /// `ollama serve`, llama.cpp's server) accept any bearer token, and a real
+    /// provider rejects it with its own auth error.
     ///
     /// # Errors
-    /// Returns [`EngineError`] when the provider is not yet supported or the
-    /// API key is empty.
+    /// Returns [`EngineError`] when the provider is not yet supported.
     pub fn new(
         kind: ProviderKind,
         base_url: Option<String>,
@@ -989,12 +991,11 @@ impl ProviderEngine {
         ctx_size: i32,
         cache: bool,
     ) -> Result<Self, EngineError> {
-        if api_key.trim().is_empty() {
-            return Err(EngineError::new(format!(
-                "no API key: set ${} or pass --api-key",
-                kind.api_key_env()
-            )));
-        }
+        let api_key = if api_key.trim().is_empty() {
+            "DUMMY".to_string()
+        } else {
+            api_key
+        };
         let base_url = base_url
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| kind.default_base_url().to_string())
@@ -1441,30 +1442,16 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
     }
 
+    // A missing key falls back to DUMMY so key-less endpoints (local ollama,
+    // llama.cpp server) work out of the box; real providers reject it with
+    // their own auth error.
     #[test]
-    fn missing_key_errors_both_providers() {
-        assert!(
-            ProviderEngine::new(
-                ProviderKind::OpenAi,
-                None,
-                String::new(),
-                "m".into(),
-                0,
-                true
-            )
-            .is_err()
-        );
-        assert!(
-            ProviderEngine::new(
-                ProviderKind::Anthropic,
-                None,
-                String::new(),
-                "m".into(),
-                0,
-                true
-            )
-            .is_err()
-        );
+    fn missing_key_falls_back_to_dummy() {
+        for kind in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+            let e = ProviderEngine::new(kind, None, String::new(), "m".into(), 0, true)
+                .expect("empty key must not error");
+            assert_eq!(e.api_key, "DUMMY");
+        }
         let e = ProviderEngine::new(
             ProviderKind::OpenAi,
             None,

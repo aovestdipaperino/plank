@@ -205,6 +205,30 @@ pub fn notify_full(summary: &str, subtitle: Option<&str>, body: &str) {
 /// the private `_showsButtons` key, which forces the persistent *alert* style
 /// regardless of the borrowed app's setting. The actions themselves do nothing;
 /// they exist only to trigger that style.
+///
+/// # Platform caveat (macOS 13+)
+///
+/// Apple deprecated `NSUserNotificationCenter` and stopped honoring its
+/// private keys (including `_showsButtons`) on macOS 13 (Ventura) and later.
+/// On those versions the override is ignored and the banner renders in
+/// whatever style the *borrowed* app (the host terminal — see
+/// [`host_terminal_bundle_id`]) is configured for in System Settings, which
+/// ships as the auto-fading **Banner** style by default. The sticky banner
+/// therefore still auto-fades after ~5s on current macOS despite the actions
+/// being attached.
+///
+/// The only supported fix is to migrate to `UNUserNotificationCenter` (notify-rust's
+/// `preview-macos-un` feature / the `mac-usernotifications` crate), but that API
+/// keys everything off `NSBundle::mainBundle().bundleIdentifier()` and refuses to
+/// deliver (`check_bundle` returns `Err`) when the binary is **not** a bundled,
+/// code-signed `.app`. Plank ships as a bare Homebrew binary with no bundle, so
+/// the UN path silently drops every notification — strictly worse than the
+/// current auto-fade. Adopting it would require redistributing plank as a signed
+/// `.app` bundle (a packaging change, not a `notify.rs` change).
+///
+/// **User-side workaround**: in System Settings → Notifications → [Terminal /
+/// iTerm / Warp / …] set the alert style from "Banners" to **"Alerts"**. Alerts
+/// persist until dismissed, restoring sticky behavior without a code change.
 pub fn notify_sticky(summary: &str, subtitle: Option<&str>, body: &str) {
     deliver(summary, subtitle, body, true);
 }
@@ -213,6 +237,16 @@ fn deliver(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) {
     if !should_deliver() {
         return;
     }
+    // Remember the last delivered notification so `/renotify` can re-show it
+    // (e.g. to screenshot the banner). Recorded only when we actually deliver,
+    // so a suppressed (disabled / unfocused) call does not clobber a prior one.
+    record_last(summary, subtitle, body);
+    deliver_raw(summary, subtitle, body, sticky);
+}
+
+/// Platform delivery with no mode/focus gating. Used by [`deliver`] (after the
+/// gate + recording) and by [`renotify`] (an explicit user request, always on).
+fn deliver_raw(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) {
     #[cfg(target_os = "macos")]
     {
         // Detach: the ObjC delivery is quick but must never stall a turn, and a
@@ -244,6 +278,48 @@ fn deliver(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) {
     {
         let _ = (summary, subtitle, body, sticky);
     }
+}
+
+/// The last notification plank actually delivered, remembered so [`renotify`]
+/// can re-show it on demand (used by the non-advertised `/renotify` command to
+/// get a fresh banner on screen for screenshotting).
+#[derive(Clone)]
+struct LastNotify {
+    summary: String,
+    subtitle: Option<String>,
+    body: String,
+}
+
+static LAST: std::sync::Mutex<Option<LastNotify>> = std::sync::Mutex::new(None);
+
+fn record_last(summary: &str, subtitle: Option<&str>, body: &str) {
+    *LAST.lock().unwrap() = Some(LastNotify {
+        summary: summary.to_string(),
+        subtitle: subtitle.map(str::to_string),
+        body: body.to_string(),
+    });
+}
+
+/// Re-shows the last delivered notification as a sticky banner, for
+/// screenshotting. Returns `false` if no notification has fired yet in this
+/// session. Bypasses [`should_deliver`] — the user asked for it explicitly, so
+/// focus/mode gating does not apply. Always re-delivers as sticky so the
+/// banner stays on screen long enough to capture.
+///
+/// Not advertised in `/help`; invoked by the hidden `/renotify` slash command.
+#[must_use]
+pub fn renotify() -> bool {
+    // Recover from a poisoned mutex (only possible after a prior panic in a
+    // test that held the lock) rather than propagating the panic into a turn.
+    let guard = LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(last) = guard.clone() else {
+        return false;
+    };
+    drop(guard);
+    deliver_raw(&last.summary, last.subtitle.as_deref(), &last.body, true);
+    true
 }
 
 /// Condenses a user prompt into a single-line notification headline: newlines
@@ -394,6 +470,46 @@ mod tests {
         let body = latest_output_body(&long, false);
         assert!(body.starts_with("Latest output: ..."));
         assert!(body.ends_with("THE END"));
+    }
+
+    #[test]
+    fn renotify_returns_false_with_no_prior_notification() {
+        // No notification has fired in a fresh test process, so there is nothing
+        // to re-show. (Serlializes against other tests that might set LAST.)
+        let _g = TEST_LOCK.lock().unwrap();
+        *LAST.lock().unwrap() = None;
+        assert!(!renotify());
+    }
+
+    #[test]
+    fn renotify_replays_last_after_a_deliver() {
+        let _g = TEST_LOCK.lock().unwrap();
+        // Force the gate on so `deliver` records + delivers (platform delivery
+        // is a detached no-op off-macOS / best-effort on macOS; only the
+        // recording matters here).
+        set_mode(NotifyMode::Always);
+        notify_sticky("hello", Some("sub"), "world");
+        let last = LAST.lock().unwrap().clone();
+        assert_eq!(last.as_ref().unwrap().summary, "hello");
+        assert_eq!(last.as_ref().unwrap().subtitle.as_deref(), Some("sub"));
+        assert_eq!(last.as_ref().unwrap().body, "world");
+        // renotify reports success and preserves the recorded content.
+        assert!(renotify());
+        let last2 = LAST.lock().unwrap().clone();
+        assert_eq!(last2.as_ref().unwrap().summary, "hello");
+    }
+
+    #[test]
+    fn suppressed_deliver_does_not_clobber_last() {
+        let _g = TEST_LOCK.lock().unwrap();
+        set_mode(NotifyMode::Always);
+        notify_sticky("first", None, "body1");
+        // Now disable: a subsequent notify must not overwrite the recorded last.
+        set_mode(NotifyMode::Never);
+        notify_full("second", None, "body2");
+        let last = LAST.lock().unwrap().clone();
+        assert_eq!(last.as_ref().unwrap().summary, "first");
+        assert_eq!(last.as_ref().unwrap().body, "body1");
     }
 
     #[test]

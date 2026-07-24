@@ -2149,6 +2149,15 @@ impl Agent<'_> {
                 None => println!("usage: /power <1..100>"),
             },
             "/notify" => println!("{}", Self::notify_command(arg)),
+            // Non-advertised: re-shows the last desktop notification so it can be
+            // screenshotted. Not in `/help` or `slash_command_known`.
+            "/renotify" => {
+                if crate::notify::renotify() {
+                    println!("re-showing last notification");
+                } else {
+                    println!("no notification to re-show yet");
+                }
+            }
             "/strip" => {
                 if arg.is_empty() {
                     println!("usage: /strip <sha-prefix>");
@@ -4620,6 +4629,15 @@ impl Agent<'_> {
                 None => log.push_plain("usage: /power <1..100>"),
             },
             "/notify" => log.push_plain(Self::notify_command(arg)),
+            // Non-advertised: re-shows the last desktop notification so it can be
+            // screenshotted. Not in `/help` or `slash_command_known`.
+            "/renotify" => {
+                if crate::notify::renotify() {
+                    log.push_plain("re-showing last notification");
+                } else {
+                    log.push_plain("no notification to re-show yet");
+                }
+            }
             "/strip" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /strip <sha-prefix>");
@@ -4938,7 +4956,7 @@ fn busy_ui_loop(
             && bridge.is_pending()
         {
             if !ask_notified {
-                crate::notify::notify("plank", "Waiting for your input");
+                crate::notify::notify_sticky("plank", None, "Waiting for your input");
                 ask_notified = true;
             }
             run_ask_panel(
