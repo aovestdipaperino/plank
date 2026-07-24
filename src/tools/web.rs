@@ -93,7 +93,10 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
         let query = query.to_string();
         return match browser(ctx).and_then(|b| b.google_search(&query)) {
             Ok(md) => md,
-            Err(e) => format!("Tool error: google_search failed: {e}\n"),
+            Err(e) => {
+                crate::errlog::log_error("google_search", &format!("query \"{query}\": {e}"));
+                format!("Tool error: google_search failed: {e}\n")
+            }
         };
     }
     #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
@@ -108,7 +111,10 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
         let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
         let html = match fetch_html(&url) {
             Ok(html) => html,
-            Err(e) => return format!("Tool error: google_search failed: {e}\n"),
+            Err(e) => {
+                crate::errlog::log_error("google_search", &format!("query \"{query}\": {e}"));
+                return format!("Tool error: google_search failed: {e}\n");
+            }
         };
         if is_ddg_challenge(&html) {
             return "Tool error: google_search failed: DuckDuckGo returned a bot-verification challenge instead of results\n".to_string();
@@ -138,14 +144,20 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
         let url = url.clone();
         match browser(ctx).and_then(|b| b.visit_page(&url)) {
             Ok(md) => md,
-            Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
+            Err(e) => {
+                crate::errlog::log_error("visit_page", &format!("{url}: {e}"));
+                return format!("Tool error: visit_page failed: {e}\n");
+            }
         }
     };
     #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
     let md = {
         let html = match fetch_html(&url) {
             Ok(html) => html,
-            Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
+            Err(e) => {
+                crate::errlog::log_error("visit_page", &format!("{url}: {e}"));
+                return format!("Tool error: visit_page failed: {e}\n");
+            }
         };
         extract_page_markdown(&url, &html)
     };
