@@ -200,6 +200,13 @@ impl Default for RemoteConfig {
     }
 }
 
+/// Default prefill chunk size (tokens). Non-zero so a long prompt is prefilled
+/// in bounded chunks: the engine checks the cancel callback at each chunk
+/// boundary, so Ctrl-C during prefill is observed within ~one chunk instead of
+/// only after the whole prompt is prefilled. Small enough to feel responsive,
+/// large enough that the extra command-buffer overhead stays negligible.
+pub const DEFAULT_PREFILL_CHUNK: u32 = 1024;
+
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
 /// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
 /// keep the engine defaults; the whole struct is ignored by `EchoEngine`.
@@ -213,7 +220,10 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Prefill chunk size from `--prefill-chunk`; 0 = engine default.
+    /// Prefill chunk size from `--prefill-chunk`; 0 = engine default (whole
+    /// prompt in one chunk). Defaults to [`DEFAULT_PREFILL_CHUNK`] so prefill is
+    /// chunked and Ctrl-C is observed at chunk boundaries instead of only after
+    /// the entire prompt is prefilled.
     pub prefill_chunk: u32,
     /// Quality mode from `--quality`.
     pub quality: bool,
@@ -246,7 +256,7 @@ impl Default for EngineTuning {
             mtp_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
-            prefill_chunk: 0,
+            prefill_chunk: DEFAULT_PREFILL_CHUNK,
             quality: false,
             warm_weights: false,
             ssd_streaming: false,
@@ -377,7 +387,8 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --prefill-chunk N    prefill chunk size in tokens (engine default when unset)
+      --prefill-chunk N    prefill chunk in tokens (default 1024; 0 = whole prompt,
+                           less responsive to Ctrl-C)
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
