@@ -205,7 +205,7 @@ impl Default for RemoteConfig {
 /// boundary, so Ctrl-C during prefill is observed within ~one chunk instead of
 /// only after the whole prompt is prefilled. Small enough to feel responsive,
 /// large enough that the extra command-buffer overhead stays negligible.
-pub const DEFAULT_PREFILL_CHUNK: u32 = 1024;
+pub const DEFAULT_PREFILL_CHUNK: u32 = 256;
 
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
 /// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
@@ -387,7 +387,7 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --prefill-chunk N    prefill chunk in tokens (default 1024; 0 = whole prompt,
+      --prefill-chunk N    prefill chunk in tokens (default 256; 0 = whole prompt,
                            less responsive to Ctrl-C)
       --quality            enable quality mode
       --warm-weights       touch all weights at load
