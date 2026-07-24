@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-07-24
+
 ### Added
 
 - **MCP Streamable HTTP transport**: `.mcp.json` entries with a `"url"` (plus
