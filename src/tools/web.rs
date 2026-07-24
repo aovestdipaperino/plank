@@ -26,6 +26,11 @@
 //! genuine browser that dodges the bot challenges plain curl trips; the curl
 //! path above is the fallback for non-`ds4` builds (CI/dev).
 //!
+//! With the `use_obscura` feature (default) both of those transports are
+//! replaced by the embedded obscura headless browser ([`crate::obscura_web`],
+//! statically linked from the `refs/obscura` submodule): pages are fetched and
+//! JS-rendered in-process, then flow through the same Rust extraction below.
+//!
 //! The C approval flow (`agent_web_confirm`) is ported as the
 //! [`super::ToolContext::web_confirm`] hook and the ask-bridge gate: the first
 //! web tool call per session asks for approval, and an "Always allow" answer is
@@ -34,6 +39,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+#[cfg(not(feature = "use_obscura"))]
 use std::process::Command;
 
 use crate::dsml::ToolCall;
@@ -45,10 +51,11 @@ const WEB_HEAD_BYTES: usize = 8 * 1024;
 /// Maximum lines of the rendered page shown inline (`AGENT_WEB_HEAD_LINES`).
 const WEB_HEAD_LINES: usize = 100;
 /// `curl --max-time` in seconds (the C's CDP timeout is 20 s).
+#[cfg(not(feature = "use_obscura"))]
 #[cfg_attr(ds4_engine, allow(dead_code))]
 const CURL_TIMEOUT_SEC: u32 = 20;
 /// Cap on fetched HTML, mirroring the C's 4 MiB websocket message cap.
-#[cfg_attr(ds4_engine, allow(dead_code))]
+#[cfg_attr(all(ds4_engine, not(feature = "use_obscura")), allow(dead_code))]
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
 /// Page Markdown length at which extraction stops (`web_extract_page_js`).
 const PAGE_CONTENT_CAP: usize = 900_000;
@@ -68,13 +75,16 @@ pub struct WebState {
 /// over CDP) after the approval gate, returning the C extractor's Markdown. On
 /// other builds it falls back to a client-side `DuckDuckGo` HTML scrape (curl,
 /// no browser) with optional `allowed_domains`/`blocked_domains` filtering.
-#[cfg_attr(ds4_engine, allow(clippy::needless_return))]
+#[cfg_attr(
+    all(ds4_engine, not(feature = "use_obscura")),
+    allow(clippy::needless_return)
+)]
 pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let query = call.arg_value("query").unwrap_or("").trim();
     if query.is_empty() {
         return "Tool error: google_search requires query\n".to_string();
     }
-    #[cfg(ds4_engine)]
+    #[cfg(all(ds4_engine, not(feature = "use_obscura")))]
     {
         let _ = call;
         if let Err(e) = ensure_allowed(ctx) {
@@ -86,7 +96,7 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
             Err(e) => format!("Tool error: google_search failed: {e}\n"),
         };
     }
-    #[cfg(not(ds4_engine))]
+    #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
     {
         let _ = ctx;
         let allowed = parse_domain_list(call.arg_value("allowed_domains").unwrap_or(""));
@@ -96,7 +106,7 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
                 .to_string();
         }
         let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-        let html = match curl_fetch(&url) {
+        let html = match fetch_html(&url) {
             Ok(html) => html,
             Err(e) => return format!("Tool error: google_search failed: {e}\n"),
         };
@@ -120,9 +130,10 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if let Err(e) = ensure_allowed(ctx) {
         return format!("Tool error: visit_page failed: {e}\n");
     }
-    // On ds4_engine builds render the page in the C engine's real browser;
-    // elsewhere fetch with curl and extract Markdown in Rust.
-    #[cfg(ds4_engine)]
+    // On ds4_engine builds (without obscura) render the page in the C
+    // engine's real browser; elsewhere fetch the HTML (obscura or curl) and
+    // extract Markdown in Rust.
+    #[cfg(all(ds4_engine, not(feature = "use_obscura")))]
     let md = {
         let url = url.clone();
         match browser(ctx).and_then(|b| b.visit_page(&url)) {
@@ -130,9 +141,9 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
             Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
         }
     };
-    #[cfg(not(ds4_engine))]
+    #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
     let md = {
-        let html = match curl_fetch(&url) {
+        let html = match fetch_html(&url) {
             Ok(html) => html,
             Err(e) => return format!("Tool error: visit_page failed: {e}\n"),
         };
@@ -159,7 +170,7 @@ fn parse_domain_list(raw: &str) -> Vec<String> {
 ///
 /// # Errors
 /// Returns a message if the browser subsystem could not be created.
-#[cfg(ds4_engine)]
+#[cfg(all(ds4_engine, not(feature = "use_obscura")))]
 fn browser(ctx: &mut ToolContext) -> Result<&mut crate::ds4web::WebBrowser, String> {
     if ctx.web_browser.is_none() {
         let home = std::env::var_os("HOME")
@@ -253,6 +264,29 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
     Ok(())
 }
 
+/// Fetches page HTML through the configured transport: the embedded obscura
+/// headless browser when the `use_obscura` feature is on, else curl. The body
+/// is capped at [`MAX_HTML_BYTES`] on a UTF-8 boundary either way.
+///
+/// # Errors
+///
+/// Returns a message when the fetch fails.
+#[cfg_attr(all(ds4_engine, not(feature = "use_obscura")), allow(dead_code))]
+fn fetch_html(url: &str) -> Result<String, String> {
+    #[cfg(feature = "use_obscura")]
+    let mut body = crate::obscura_web::fetch(url)?;
+    #[cfg(not(feature = "use_obscura"))]
+    let mut body = curl_fetch(url)?;
+    if body.len() > MAX_HTML_BYTES {
+        let mut end = MAX_HTML_BYTES;
+        while !body.is_char_boundary(end) {
+            end -= 1;
+        }
+        body.truncate(end);
+    }
+    Ok(body)
+}
+
 /// Fetches a URL with curl, returning the response body as lossy UTF-8.
 ///
 /// Deviation from the C: transport is `curl -sL --max-time 20` instead of a
@@ -261,6 +295,7 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
 /// # Errors
 ///
 /// Returns a message when curl cannot be spawned or exits nonzero.
+#[cfg(not(feature = "use_obscura"))]
 #[cfg_attr(ds4_engine, allow(dead_code))]
 fn curl_fetch(url: &str) -> Result<String, String> {
     let out = Command::new("curl")
@@ -1414,9 +1449,10 @@ let y = 2;</pre>
         assert!(!is_ddg_challenge(DDG_FIXTURE));
     }
 
-    // Domain filtering is a property of the curl fallback path only; on
-    // ds4_engine builds google_search goes through the C browser instead.
-    #[cfg(not(ds4_engine))]
+    // Domain filtering is a property of the Rust fetch path (obscura or
+    // curl); on ds4_engine builds without obscura google_search goes through
+    // the C browser instead.
+    #[cfg(any(not(ds4_engine), feature = "use_obscura"))]
     #[test]
     fn google_search_rejects_both_domain_lists() {
         let (mut ctx, dir) = test_ctx();

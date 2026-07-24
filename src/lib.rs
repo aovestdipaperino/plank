@@ -33,6 +33,8 @@ pub mod logo;
 pub mod memory;
 pub mod names;
 pub mod notify;
+#[cfg(feature = "use_obscura")]
+pub mod obscura_web;
 pub mod remote;
 pub mod render;
 pub mod repro;

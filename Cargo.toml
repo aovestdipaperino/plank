@@ -8,13 +8,19 @@ description = "Rust port of the ds4 agent (macOS only)"
 license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
-exclude = ["assets/*", "refs/ds4/*", "*.gguf", "ds4flash.gguf"]
+exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "*.gguf", "ds4flash.gguf"]
 
 [features]
+default = ["use_obscura"]
 # Image pasting (Cmd-V clipboard images, image file paths) is disabled until
 # the model's handling of image-file references is understood; build with
 # `--features images` to re-enable.
 images = []
+# Web tools (google_search / visit_page) fetch pages through the embedded
+# obscura headless browser (refs/obscura submodule, statically linked — no
+# external binary) instead of curl or the ds4 C engine's visible Chrome.
+# Disable with `--no-default-features` when the submodule is absent.
+use_obscura = ["dep:obscura", "dep:tokio"]
 
 [dependencies]
 libc = "0.2"
@@ -37,6 +43,12 @@ nucleo-matcher = "0.3"
 git2 = { version = "0.21.0", default-features = false }
 similar = "3.1.1"
 crt-off = "0.1"
+# Embedded headless browser for the web tools (feature `use_obscura`); the
+# path points into the refs/obscura git submodule so the browser is compiled
+# into the plank binary rather than shipped separately.
+obscura = { path = "refs/obscura/crates/obscura", optional = true }
+# Minimal runtime to drive obscura's async API from plank's sync tool code.
+tokio = { version = "1", features = ["rt"], optional = true }
 
 [lints.rust]
 missing_debug_implementations = "warn"
