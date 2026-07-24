@@ -371,7 +371,15 @@ fn next_event(
     if !event::poll(timeout).map_err(|e| e.to_string())? {
         return Ok(None);
     }
-    event::read().map(Some).map_err(|e| e.to_string())
+    let ev = event::read().map_err(|e| e.to_string())?;
+    // Track window focus for the "unfocused" notification mode; the event
+    // still flows to the caller (which ignores focus events).
+    match ev {
+        Event::FocusGained => crate::notify::set_focused(true),
+        Event::FocusLost => crate::notify::set_focused(false),
+        _ => {}
+    }
+    Ok(Some(ev))
 }
 
 /// Stdout writer that flushes after every write so tokens appear as streamed.
@@ -731,6 +739,8 @@ fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color: bool) -> S
 }
 
 /// Shared turn state for the interactive and headless front-ends.
+// The bools are independent UI/turn latches, not a disguised state machine.
+#[allow(clippy::struct_excessive_bools)]
 struct Agent<'a> {
     engine: Box<dyn Engine>,
     cfg: &'a AgentConfig,
@@ -750,6 +760,9 @@ struct Agent<'a> {
     /// no generation has run against the current transcript. Anchors the
     /// `/context` report to the real context usage.
     last_ctx_used: i32,
+    /// Whether the most recent turn ended by user interrupt, so the turn-end
+    /// notification says "interrupted" instead of "finished".
+    last_turn_interrupted: bool,
     /// Context content collected at session start (git, AGENTS.md, date).
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
@@ -1001,6 +1014,20 @@ impl Agent<'_> {
     /// actually delegates.
     fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
         use std::fmt::Write as _;
+        if !calls.is_empty() {
+            let names = calls
+                .iter()
+                .map(|c| {
+                    if c.name.is_empty() {
+                        "unknown"
+                    } else {
+                        c.name.as_str()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            crate::status::set_flash_tip_for(format!("🔧 {names}"), crate::status::TOOL_FLASH_MS);
+        }
         if !calls.iter().any(|c| c.name == "agent") {
             return dispatch_all(calls, &mut self.tool_ctx);
         }
@@ -1207,6 +1234,8 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
+        crate::title::set(Some(self.last_user_prompt()));
+        self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         // The session owns the persisted task list; load it into the live tool
         // context so the `task` tool mutates the copy that renders and saves.
@@ -1254,6 +1283,13 @@ impl Agent<'_> {
                 }
                 if self.show_footer && !self.editor_owns_footer {
                     print_footer(&st, self.color);
+                }
+                self.last_turn_interrupted = true;
+                if crate::notify::should_notify_complete(
+                    turn_start.elapsed(),
+                    crate::settings::active().ui.notify_after_secs,
+                ) {
+                    self.notify_task_complete();
                 }
                 return Ok(());
             }
@@ -2963,8 +2999,12 @@ impl Agent<'_> {
             std::io::stdout(),
             EnableMouseCapture,
             EnableBracketedPaste,
+            event::EnableFocusChange,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
+        // The window the user just launched plank in is focused; focus events
+        // track changes from here for the "unfocused" notification mode.
+        crate::notify::set_focused(true);
         let result = self.tui_loop(&mut terminal);
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
@@ -2989,6 +3029,7 @@ impl Agent<'_> {
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
             PopKeyboardEnhancementFlags,
+            event::DisableFocusChange,
             DisableBracketedPaste,
             DisableMouseCapture
         );
@@ -3200,7 +3241,7 @@ impl Agent<'_> {
                             if !text.trim().is_empty() {
                                 tui::copy_to_clipboard(&text);
                                 let chars = text.chars().count();
-                                crate::status::set_flash_tip(format!("Copied {chars} chars"));
+                                crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
                             }
                         } else if let Some((col, row)) = selection.map(|(a, _)| a) {
                             // A plain click (no drag): copy a fenced code block
@@ -3216,7 +3257,7 @@ impl Agent<'_> {
                             {
                                 tui::copy_to_clipboard(&code);
                                 let chars = code.chars().count();
-                                crate::status::set_flash_tip(format!("Copied {chars} chars"));
+                                crate::status::set_flash_tip(format!("📋 Copied {chars} chars"));
                             }
                             selection = None;
                         } else {
@@ -3537,9 +3578,24 @@ impl Agent<'_> {
     }
 
     /// Idle status line (plain text; the TUI styles the bar itself).
-    /// Disk checkpoint path for the system-prompt KV cache.
+    /// Disk checkpoint path for the system-prompt KV cache. With the
+    /// `per_project_kv` feature the file is keyed by project directory so
+    /// per-project prompt inputs (AGENTS.md, local MCP config) don't
+    /// invalidate other projects' snapshots; by default a single shared
+    /// `sysprompt.kv` is used.
     fn sysprompt_checkpoint(&self) -> std::path::PathBuf {
-        self.store.dir().join("sysprompt.kv")
+        let dir = self.store.dir();
+        #[cfg(feature = "per_project_kv")]
+        {
+            // Drop the pre-per-project shared checkpoint; it would never be
+            // read again and a stale KV snapshot can be large.
+            let _ = std::fs::remove_file(dir.join("sysprompt.kv"));
+            dir.join(crate::session::sysprompt_checkpoint_name(
+                &self.tool_ctx.cwd,
+            ))
+        }
+        #[cfg(not(feature = "per_project_kv"))]
+        dir.join("sysprompt.kv")
     }
 
     /// Warms the system-prompt KV cache at startup, drawing prefill progress.
@@ -3825,6 +3881,8 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        crate::title::set(Some(self.last_user_prompt()));
+        self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
         let mut note = |s: String| {
@@ -3893,6 +3951,7 @@ impl Agent<'_> {
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
                 crate::interrupt::clear();
+                self.last_turn_interrupted = true;
                 let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                 // Drain point 3 (BTW-DESIGN §4.4): the user asked mid-turn;
                 // answer even though the main turn was interrupted.
@@ -4247,20 +4306,34 @@ impl Agent<'_> {
         })
     }
 
-    /// Fires the "task complete" desktop notification for a finished turn: the
-    /// user's prompt as the (bold) headline, with a "Task Complete" subtitle.
+    /// The turn's triggering prompt: the last real user message, skipping the
+    /// tool results that are stored as user turns.
+    fn last_user_prompt(&self) -> &str {
+        self.session
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::session::Role::User && !m.is_tool_user())
+            .map_or("", |m| m.text.as_str())
+    }
+
+    /// Fires the turn-end desktop notification: `'<prompt...>' finished` (or
+    /// `interrupted`, per [`Self::last_turn_interrupted`]) as the (bold)
+    /// headline and the tail of the assistant's final output as the body.
     fn notify_task_complete(&self) {
-        let prompt = self
+        let interrupted = self.last_turn_interrupted;
+        let prompt = self.last_user_prompt();
+        let output = self
             .session
             .transcript
             .iter()
             .rev()
-            .find(|m| m.role == crate::session::Role::User)
+            .find(|m| m.role == crate::session::Role::Assistant)
             .map_or("", |m| m.text.as_str());
-        crate::notify::notify_full(
-            &crate::notify::prompt_summary(prompt),
-            Some("Task Complete"),
-            "",
+        crate::notify::notify_sticky(
+            &crate::notify::finished_title(prompt, interrupted),
+            None,
+            &crate::notify::latest_output_body(output, interrupted),
         );
     }
 
@@ -5233,6 +5306,7 @@ fn new_agent(
         show_footer,
         editor_owns_footer: false,
         last_ctx_used: 0,
+        last_turn_interrupted: false,
         context_content,
         skills,
         agents,
@@ -5259,7 +5333,7 @@ pub fn run_interactive(
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
     // one entry point, so this covers both).
-    crate::notify::set_enabled(crate::settings::active().ui.notifications);
+    crate::notify::set_mode(crate::settings::active().ui.notifications);
 
     // `plank /resume [prefix]` loads a prior session before the loop starts.
     let resumed = cfg.resume.is_some();
@@ -5548,7 +5622,7 @@ pub fn run_non_interactive(
     let mut agent = new_agent(engine, cfg, false, remote)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
-    crate::notify::set_enabled(crate::settings::active().ui.notifications);
+    crate::notify::set_mode(crate::settings::active().ui.notifications);
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {
@@ -6075,6 +6149,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7065,6 +7140,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7177,6 +7253,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7257,6 +7334,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7352,6 +7430,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7428,6 +7507,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7497,6 +7577,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),
@@ -7553,6 +7634,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             agents: Vec::new(),

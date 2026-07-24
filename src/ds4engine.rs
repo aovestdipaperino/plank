@@ -405,19 +405,21 @@ impl Ds4Model {
         }
     }
 
-    fn token_text(&self, token: i32) -> String {
+    /// Raw detokenized bytes for one token. Byte-level BPE splits multi-byte
+    /// characters across tokens, so a single token's bytes may not be valid
+    /// UTF-8 — decode across tokens with [`Utf8Stream`], never per token.
+    fn token_bytes(&self, token: i32) -> Vec<u8> {
         let mut len: usize = 0;
         // SAFETY: engine valid; len is a valid out-ptr.
         let p = unsafe { ffi::ds4_token_text(self.engine, token, &raw mut len) };
         if p.is_null() {
-            return String::new();
+            return Vec::new();
         }
         // SAFETY: p points to len bytes owned by us; we copy then free.
-        let bytes = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) };
-        let text = String::from_utf8_lossy(bytes).into_owned();
+        let bytes = unsafe { std::slice::from_raw_parts(p.cast::<u8>(), len) }.to_vec();
         // SAFETY: p was allocated by ds4_token_text for the caller to free.
         unsafe { libc::free(p.cast()) };
-        text
+        bytes
     }
 
     /// Approximate token count of `text`, excluding chat-template overhead.
@@ -713,6 +715,7 @@ impl Engine for Ds4Session {
         let mut generated = 0;
         let mut reply_tokens: Vec<i32> = Vec::new();
         let mut reply_text = String::new();
+        let mut utf8 = crate::engine::Utf8Stream::default();
         let start = std::time::Instant::now();
 
         while generated < max_tokens {
@@ -743,11 +746,18 @@ impl Engine for Ds4Session {
             if eval_rc != 0 {
                 return Err(EngineError::new(cstr_message(&err, "decode failed")));
             }
-            let text = self.model.token_text(token);
+            let text = utf8.push(self.model.token_bytes(token));
             reply_tokens.push(token);
-            reply_text.push_str(&text);
-            on_event(EngineEvent::Text(text));
+            if !text.is_empty() {
+                reply_text.push_str(&text);
+                on_event(EngineEvent::Text(text));
+            }
             generated += 1;
+        }
+        let tail = utf8.flush();
+        if !tail.is_empty() {
+            reply_text.push_str(&tail);
+            on_event(EngineEvent::Text(tail));
         }
 
         // Remember the sampled reply so the next prompt build can splice these
@@ -995,6 +1005,8 @@ struct GenState {
     max_tokens: i32,
     reply_tokens: Vec<i32>,
     reply_text: String,
+    /// Cross-token UTF-8 carry — see [`Ds4Model::token_bytes`].
+    utf8: crate::engine::Utf8Stream,
     start: std::time::Instant,
 }
 
@@ -1098,17 +1110,21 @@ impl Ds4HostSession {
             max_tokens,
             reply_tokens: Vec::new(),
             reply_text: String::new(),
+            utf8: crate::engine::Utf8Stream::default(),
             start: std::time::Instant::now(),
         }))
     }
 
     /// Builds the terminal stats and records the sampled reply for KV splicing.
     fn finalize(&mut self, interrupted: bool) -> GenerationStats {
-        let st = self
+        let mut st = self
             .active
             .take()
             .expect("finalize called without an active generation");
         let mut reply_text = st.reply_text;
+        // An incomplete trailing sequence at end of stream decodes lossily;
+        // mid-stream characters were already reassembled by the carry.
+        reply_text.push_str(&st.utf8.flush());
         reply_text.truncate(reply_text.trim_end().len());
         self.inner.last_reply = if st.reply_tokens.is_empty() {
             None
@@ -1199,10 +1215,12 @@ impl HostSession for Ds4HostSession {
                 self.active = None;
                 return Err(EngineError::new(cstr_message(&err, "decode failed")));
             }
-            let text = self.inner.model.token_text(token);
+            let text = st.utf8.push(self.inner.model.token_bytes(token));
             st.reply_tokens.push(token);
-            st.reply_text.push_str(&text);
-            sink(EngineEvent::Text(text));
+            if !text.is_empty() {
+                st.reply_text.push_str(&text);
+                sink(EngineEvent::Text(text));
+            }
             st.generated += 1;
             produced += 1;
         }

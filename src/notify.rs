@@ -19,19 +19,98 @@
 //! right-side content image. macOS gives no way to set an *arbitrary* main icon
 //! for an unbundled process, so borrowing the terminal's is the reliable win.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-static ENABLED: AtomicBool = AtomicBool::new(true);
-
-/// Enable or disable notifications for the rest of the session.
-pub fn set_enabled(on: bool) {
-    ENABLED.store(on, Ordering::Relaxed);
+/// When desktop notifications fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NotifyMode {
+    /// On every qualifying turn event.
+    #[default]
+    Always,
+    /// Only while the terminal window is not focused — the case where a
+    /// banner is informative rather than redundant.
+    Unfocused,
+    /// Never.
+    Never,
 }
 
-/// Whether notifications are currently enabled.
+impl NotifyMode {
+    /// The settings-file spelling of the mode.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotifyMode::Always => "always",
+            NotifyMode::Unfocused => "unfocused",
+            NotifyMode::Never => "never",
+        }
+    }
+
+    /// Parses a settings value; `true`/`false` are accepted as the pre-mode
+    /// boolean spellings (always/never).
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "always" | "true" | "on" => Some(NotifyMode::Always),
+            "unfocused" => Some(NotifyMode::Unfocused),
+            "never" | "false" | "off" => Some(NotifyMode::Never),
+            _ => None,
+        }
+    }
+}
+
+static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Whether the terminal window is focused. Only the TUI receives focus
+/// events; it seeds this true at startup and tracks changes. The plain REPL
+/// never sets it, so it stays false there and `Unfocused` behaves like
+/// `Always` — better a redundant banner than a silently missing one.
+static FOCUSED: AtomicBool = AtomicBool::new(false);
+
+/// Sets the notification mode for the rest of the session.
+pub fn set_mode(mode: NotifyMode) {
+    MODE.store(mode as u8, Ordering::Relaxed);
+}
+
+/// The current notification mode.
+#[must_use]
+pub fn mode() -> NotifyMode {
+    match MODE.load(Ordering::Relaxed) {
+        1 => NotifyMode::Unfocused,
+        2 => NotifyMode::Never,
+        _ => NotifyMode::Always,
+    }
+}
+
+/// Enable (`Always`) or disable (`Never`) notifications for the rest of the
+/// session — the `/notify` toggle.
+pub fn set_enabled(on: bool) {
+    set_mode(if on {
+        NotifyMode::Always
+    } else {
+        NotifyMode::Never
+    });
+}
+
+/// Whether notifications are currently enabled at all (any mode but `Never`).
+#[must_use]
 pub fn enabled() -> bool {
-    ENABLED.load(Ordering::Relaxed)
+    mode() != NotifyMode::Never
+}
+
+/// Records whether the terminal window is focused (TUI focus events).
+pub fn set_focused(focused: bool) {
+    FOCUSED.store(focused, Ordering::Relaxed);
+}
+
+/// Whether a notification should be delivered right now under the current
+/// mode and focus state.
+fn should_deliver() -> bool {
+    match mode() {
+        NotifyMode::Always => true,
+        NotifyMode::Never => false,
+        NotifyMode::Unfocused => !FOCUSED.load(Ordering::Relaxed),
+    }
 }
 
 /// True when a completed turn lasting `elapsed` should notify given the
@@ -114,7 +193,24 @@ pub fn notify(title: &str, body: &str) {
 /// as `summary`. The subtitle is ignored by notification servers that lack the
 /// concept.
 pub fn notify_full(summary: &str, subtitle: Option<&str>, body: &str) {
-    if !enabled() {
+    deliver(summary, subtitle, body, false);
+}
+
+/// Like [`notify_full`], but the banner stays on screen until the user
+/// dismisses it instead of auto-fading after a few seconds.
+///
+/// macOS gives no public control over banner duration — it is a per-app style
+/// choice in System Settings. The escape hatch (the same one terminal-notifier
+/// uses) is that a notification carrying dropdown actions makes the helper set
+/// the private `_showsButtons` key, which forces the persistent *alert* style
+/// regardless of the borrowed app's setting. The actions themselves do nothing;
+/// they exist only to trigger that style.
+pub fn notify_sticky(summary: &str, subtitle: Option<&str>, body: &str) {
+    deliver(summary, subtitle, body, true);
+}
+
+fn deliver(summary: &str, subtitle: Option<&str>, body: &str, sticky: bool) {
+    if !should_deliver() {
         return;
     }
     #[cfg(target_os = "macos")]
@@ -131,6 +227,13 @@ pub fn notify_full(summary: &str, subtitle: Option<&str>, body: &str) {
             if let Some(sub) = &subtitle {
                 n.subtitle(sub);
             }
+            if sticky {
+                // Two actions → a dropdown → `_showsButtons` → alert style.
+                // One action alone only sets `hasActionButton`, which does not
+                // flip the style.
+                n.action("dismiss", "Dismiss");
+                n.action("close", "Close");
+            }
             if let Some(path) = logo_path() {
                 n.image_path(&path.to_string_lossy());
             }
@@ -139,7 +242,7 @@ pub fn notify_full(summary: &str, subtitle: Option<&str>, body: &str) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (summary, subtitle, body);
+        let _ = (summary, subtitle, body, sticky);
     }
 }
 
@@ -158,6 +261,57 @@ pub fn prompt_summary(prompt: &str) -> String {
         Some((i, _)) => format!("{}…", &collapsed[..i]),
         None => collapsed,
     }
+}
+
+/// Formats the "task finished" notification headline: the prompt (collapsed to
+/// one line) wrapped in single quotes and truncated with `...` past
+/// [`TITLE_PROMPT_MAX`] characters, followed by the outcome verb (`finished`,
+/// or `interrupted` for a user-aborted turn) — e.g.
+/// `'add .DS_Store to .gitignor...' finished`. Empty prompts fall back to
+/// `"plank"` via [`prompt_summary`]'s convention.
+#[must_use]
+pub fn finished_title(prompt: &str, interrupted: bool) -> String {
+    const TITLE_PROMPT_MAX: usize = 26;
+    let verb = if interrupted {
+        "interrupted"
+    } else {
+        "finished"
+    };
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return format!("plank {verb}");
+    }
+    match collapsed.char_indices().nth(TITLE_PROMPT_MAX) {
+        Some((i, _)) => format!("'{}...' {verb}", collapsed[..i].trim_end()),
+        None => format!("'{collapsed}' {verb}"),
+    }
+}
+
+/// Formats the "task finished" notification body: `Latest output: ` followed
+/// by the *tail* of the assistant's final output (the end is where the
+/// conclusion lives), prefixed with `...` when the head was cut. Newlines and
+/// whitespace runs collapse to single spaces. Empty output yields a plain
+/// `Task complete` (or `Task interrupted`).
+#[must_use]
+pub fn latest_output_body(output: &str, interrupted: bool) -> String {
+    const BODY_TAIL_MAX: usize = 160;
+    let collapsed = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return if interrupted {
+            "Task interrupted".to_string()
+        } else {
+            "Task complete".to_string()
+        };
+    }
+    let total = collapsed.chars().count();
+    if total <= BODY_TAIL_MAX {
+        return format!("Latest output: {collapsed}");
+    }
+    let start = collapsed
+        .char_indices()
+        .nth(total - BODY_TAIL_MAX)
+        .map_or(0, |(i, _)| i);
+    format!("Latest output: ...{}", &collapsed[start..])
 }
 
 /// Serializes tests that touch the process-global `ENABLED` flag, so
@@ -212,6 +366,51 @@ mod tests {
     }
 
     #[test]
+    fn finished_title_quotes_and_truncates() {
+        assert_eq!(
+            finished_title("fix the bug", false),
+            "'fix the bug' finished"
+        );
+        assert_eq!(
+            finished_title("add .DS_Store to .gitignore and untrack copies", false),
+            "'add .DS_Store to .gitignor...' finished"
+        );
+        assert_eq!(finished_title("  ", false), "plank finished");
+        assert_eq!(
+            finished_title("fix the bug", true),
+            "'fix the bug' interrupted"
+        );
+    }
+
+    #[test]
+    fn latest_output_body_takes_tail() {
+        assert_eq!(latest_output_body("", false), "Task complete");
+        assert_eq!(latest_output_body("", true), "Task interrupted");
+        assert_eq!(
+            latest_output_body("all done\nok", false),
+            "Latest output: all done ok"
+        );
+        let long = format!("{} THE END", "x".repeat(300));
+        let body = latest_output_body(&long, false);
+        assert!(body.starts_with("Latest output: ..."));
+        assert!(body.ends_with("THE END"));
+    }
+
+    #[test]
+    fn mode_parses_and_round_trips() {
+        assert_eq!(NotifyMode::parse("always"), Some(NotifyMode::Always));
+        assert_eq!(NotifyMode::parse("Unfocused"), Some(NotifyMode::Unfocused));
+        assert_eq!(NotifyMode::parse("never"), Some(NotifyMode::Never));
+        // Pre-mode boolean spellings stay accepted.
+        assert_eq!(NotifyMode::parse("true"), Some(NotifyMode::Always));
+        assert_eq!(NotifyMode::parse("false"), Some(NotifyMode::Never));
+        assert_eq!(NotifyMode::parse("sometimes"), None);
+        for m in [NotifyMode::Always, NotifyMode::Unfocused, NotifyMode::Never] {
+            assert_eq!(NotifyMode::parse(m.as_str()), Some(m));
+        }
+    }
+
+    #[test]
     fn enable_flag_round_trips() {
         let _g = TEST_LOCK
             .lock()
@@ -220,5 +419,15 @@ mod tests {
         assert!(!enabled());
         set_enabled(true);
         assert!(enabled());
+
+        // Unfocused delivers only while the window is not focused.
+        set_mode(NotifyMode::Unfocused);
+        set_focused(true);
+        assert!(!should_deliver());
+        set_focused(false);
+        assert!(should_deliver());
+        // Restore the process-global defaults for other tests.
+        set_mode(NotifyMode::Always);
+        set_focused(false);
     }
 }

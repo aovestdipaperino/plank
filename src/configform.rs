@@ -164,7 +164,7 @@ pub static FIELDS: &[Field] = &[
         FieldId::UiNotifications,
         "ui",
         "notifications",
-        "macOS desktop notifications on turn events",
+        "macOS desktop notifications: always, unfocused, never",
         Kind::Bool,
     ),
     f(
@@ -278,7 +278,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls.to_string(),
         FieldId::UiShowToolResults => s.ui.show_tool_results.to_string(),
         FieldId::UiShowThinking => s.ui.show_thinking.to_string(),
-        FieldId::UiNotifications => s.ui.notifications.to_string(),
+        FieldId::UiNotifications => s.ui.notifications.as_str().to_string(),
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
         FieldId::SafetySandbox => tri_str(s.safety.sandbox),
@@ -306,7 +306,15 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = !s.ui.show_tool_calls,
         FieldId::UiShowToolResults => s.ui.show_tool_results = !s.ui.show_tool_results,
         FieldId::UiShowThinking => s.ui.show_thinking = !s.ui.show_thinking,
-        FieldId::UiNotifications => s.ui.notifications = !s.ui.notifications,
+        // Cycles the three notification modes like Tri fields cycle.
+        FieldId::UiNotifications => {
+            use crate::notify::NotifyMode;
+            s.ui.notifications = match s.ui.notifications {
+                NotifyMode::Always => NotifyMode::Unfocused,
+                NotifyMode::Unfocused => NotifyMode::Never,
+                NotifyMode::Never => NotifyMode::Always,
+            };
+        }
         FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
         FieldId::ToolsTask => s.tools.task = !s.tools.task,
         FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
@@ -379,11 +387,16 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
                 usize::try_from(parse_pos(ASK_MIN_OPTIONS as u64)?).unwrap_or(usize::MAX);
         }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
+        // Accepts always/unfocused/never, plus the legacy true/false.
+        FieldId::UiNotifications => {
+            s.ui.notifications = crate::notify::NotifyMode::parse(raw).ok_or_else(|| {
+                format!("notifications must be always, unfocused, or never (got {raw})")
+            })?;
+        }
         FieldId::UiRespectGitignore
         | FieldId::UiShowToolCalls
         | FieldId::UiShowToolResults
         | FieldId::UiShowThinking
-        | FieldId::UiNotifications
         | FieldId::UiCrtOff
         | FieldId::ToolsTask
         | FieldId::ToolsAgent
@@ -403,7 +416,6 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = b,
         FieldId::UiShowToolResults => s.ui.show_tool_results = b,
         FieldId::UiShowThinking => s.ui.show_thinking = b,
-        FieldId::UiNotifications => s.ui.notifications = b,
         FieldId::UiCrtOff => s.ui.crt_off = b,
         FieldId::ToolsTask => s.tools.task = b,
         FieldId::ToolsAgent => s.tools.agent = b,

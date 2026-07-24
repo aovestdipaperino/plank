@@ -1,13 +1,17 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! MCP client: external tools from stdio MCP servers.
+//! MCP client: external tools from stdio and Streamable HTTP MCP servers.
 //!
 //! Port of the "MCP Client" section of `ds4_agent.c` (mcp-support branch).
-//! Servers listed in a `.mcp.json` file are spawned as long-lived
+//! Servers listed in a `.mcp.json` file are either spawned as long-lived
 //! subprocesses speaking newline-delimited JSON-RPC 2.0 on stdin/stdout (the
-//! MCP stdio transport). The client is intentionally synchronous: one tool
-//! call blocks the worker for one round trip, exactly like every other tool.
+//! MCP stdio transport, `"command"` entries) or reached over the Streamable
+//! HTTP transport (`"url"` entries): each JSON-RPC message is one POST, and
+//! the reply comes back as plain JSON or as a short SSE stream; a server-
+//! assigned `Mcp-Session-Id` is echoed on every subsequent request. The
+//! client is intentionally synchronous: one tool call blocks the worker for
+//! one round trip, exactly like every other tool.
 //!
 //! Tool names are namespaced `mcp__<server>__<tool>` so they never collide
 //! across servers or with native tools. Tools listed in a server's
@@ -380,17 +384,47 @@ pub fn resource_candidates(servers: &[McpServer]) -> Vec<crate::complete::Candid
 pub struct McpServerConfig {
     /// Server name (the key in `mcpServers`); never contains `__`.
     pub name: String,
-    /// Executable to spawn.
+    /// Executable to spawn (stdio transport). Empty when `url` is set.
     pub command: String,
     /// Argv tail.
     pub args: Vec<String>,
     /// Extra environment `(key, value)` pairs.
     pub env: Vec<(String, String)>,
+    /// Endpoint for the Streamable HTTP transport (`"type": "http"` entries).
+    /// Empty for stdio servers.
+    pub url: String,
+    /// Extra HTTP headers `(name, value)` sent with every request (e.g. an
+    /// `Authorization` bearer token). HTTP transport only.
+    pub headers: Vec<(String, String)>,
     /// Tool names granted a full schema in the prompt; `None` = all primary.
     pub primary_tools: Option<Vec<String>>,
 }
 
-/// A live MCP server subprocess with its advertised tools.
+/// The wire a server is reached over: a spawned subprocess speaking
+/// newline-delimited JSON-RPC (stdio), or a Streamable HTTP endpoint where
+/// each request is one POST answered with JSON or a short SSE stream.
+enum Transport {
+    Stdio(StdioTransport),
+    Http(HttpTransport),
+}
+
+struct StdioTransport {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+    rbuf: Vec<u8>,
+}
+
+struct HttpTransport {
+    url: String,
+    headers: Vec<(String, String)>,
+    /// `Mcp-Session-Id` echoed back on every request once the server assigns
+    /// one on `initialize` (Streamable HTTP session binding).
+    session_id: Option<String>,
+    agent: ureq::Agent,
+}
+
+/// A live MCP server connection with its advertised tools.
 pub struct McpServer {
     /// Server name used in `mcp__<server>__<tool>`.
     pub name: String,
@@ -401,12 +435,9 @@ pub struct McpServer {
     pub instructions: String,
     /// Resources advertised at handshake time.
     resources: Vec<McpResource>,
-    child: Child,
-    stdin: ChildStdin,
-    stdout: ChildStdout,
+    transport: Transport,
     alive: bool,
     next_id: i64,
-    rbuf: Vec<u8>,
 }
 
 impl std::fmt::Debug for McpServer {
@@ -422,52 +453,75 @@ impl std::fmt::Debug for McpServer {
 impl Drop for McpServer {
     fn drop(&mut self) {
         // Mirror agent_mcp_server_close: SIGTERM, up to 1s grace, then SIGKILL.
+        // HTTP servers are remote — nothing to reap.
+        let Transport::Stdio(t) = &mut self.transport else {
+            return;
+        };
         if self.alive {
             #[allow(clippy::cast_possible_wrap)]
-            let pid = self.child.id() as libc::pid_t;
+            let pid = t.child.id() as libc::pid_t;
             unsafe { libc::kill(pid, libc::SIGTERM) };
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(1) {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
+                if matches!(t.child.try_wait(), Ok(Some(_))) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let _ = t.child.kill();
+            let _ = t.child.wait();
         }
     }
 }
 
 impl McpServer {
-    /// Spawns the server process with stdin/stdout piped and stderr dropped.
+    /// Connects to the server: spawns the subprocess for a `command` config
+    /// (stdin/stdout piped, stderr dropped), or sets up a Streamable HTTP
+    /// client for a `url` config. No I/O happens for HTTP until
+    /// [`handshake`](Self::handshake).
     ///
     /// # Errors
     /// Returns a message when the executable cannot be started.
     pub fn spawn(cfg: &McpServerConfig) -> Result<Self, String> {
-        let mut child = Command::new(&cfg.command)
-            .args(&cfg.args)
-            .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // stderr to /dev/null so stdout carries only JSON-RPC.
-            .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()
-            .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
-        let stdin = child.stdin.take().ok_or("no stdin pipe")?;
-        let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+        let transport = if cfg.url.is_empty() {
+            let mut child = Command::new(&cfg.command)
+                .args(&cfg.args)
+                .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                // stderr to /dev/null so stdout carries only JSON-RPC.
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()
+                .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
+            let stdin = child.stdin.take().ok_or("no stdin pipe")?;
+            let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+            Transport::Stdio(StdioTransport {
+                child,
+                stdin,
+                stdout,
+                rbuf: Vec::new(),
+            })
+        } else {
+            let agent: ureq::Agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(mcp_timeout_sec())))
+                .build()
+                .into();
+            Transport::Http(HttpTransport {
+                url: cfg.url.clone(),
+                headers: cfg.headers.clone(),
+                session_id: None,
+                agent,
+            })
+        };
         Ok(Self {
             name: cfg.name.clone(),
             tools: Vec::new(),
             instructions: String::new(),
             resources: Vec::new(),
-            child,
-            stdin,
-            stdout,
+            transport,
             alive: true,
             next_id: 0,
-            rbuf: Vec::new(),
         })
     }
 
@@ -481,52 +535,6 @@ impl McpServer {
     #[must_use]
     pub fn resources(&self) -> &[McpResource] {
         &self.resources
-    }
-
-    /// Reads one newline-delimited message, blocking up to `deadline`.
-    ///
-    /// Returns `None` (and marks the server dead) on timeout, EOF, or error.
-    fn read_line(&mut self, deadline: Instant) -> Option<String> {
-        loop {
-            if let Some(nl) = self.rbuf.iter().position(|&b| b == b'\n') {
-                let line = String::from_utf8_lossy(&self.rbuf[..nl]).into_owned();
-                self.rbuf.drain(..=nl);
-                return Some(line);
-            }
-            let remaining = deadline.checked_duration_since(Instant::now())?;
-            let mut pfd = libc::pollfd {
-                fd: self.stdout.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let timeout_ms = (remaining.as_millis() as libc::c_int).saturating_add(1);
-            let pr = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
-            if pr <= 0 {
-                self.alive = false;
-                return None;
-            }
-            let mut chunk = [0u8; 4096];
-            let n = std::io::Read::read(&mut self.stdout, &mut chunk).unwrap_or(0);
-            if n == 0 {
-                self.alive = false;
-                return None;
-            }
-            self.rbuf.extend_from_slice(&chunk[..n]);
-        }
-    }
-
-    fn write_line(&mut self, line: &str) -> bool {
-        let ok = self
-            .stdin
-            .write_all(line.as_bytes())
-            .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .is_ok();
-        if !ok {
-            self.alive = false;
-        }
-        ok
     }
 
     /// Sends a JSON-RPC request and waits for the matching reply.
@@ -544,37 +552,32 @@ impl McpServer {
         req.push_str(",\"params\":");
         req.push_str(params_json);
         req.push('}');
-        if !self.write_line(&req) {
-            return Err("failed to write to server".to_string());
-        }
-
-        // The deadline covers the whole exchange, not each line: a server
-        // that streams notifications forever must still answer in time.
-        let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
-        loop {
-            let Some(line) = self.read_line(deadline) else {
-                return Err("no response from server (timeout or closed pipe)".to_string());
-            };
-            // Ignore unparsable/log lines on stdout.
-            let Some(resp) = json_parse(&line) else {
-                continue;
-            };
-            #[allow(clippy::cast_possible_truncation)]
-            let matches_id = matches!(resp.get("id"), Some(Json::Num(n)) if *n as i64 == id);
-            if !matches_id {
-                continue; // a notification or a reply to an older call
+        match &mut self.transport {
+            Transport::Stdio(t) => {
+                let resp = t.round_trip(&req, id);
+                if resp.is_err() {
+                    self.alive = false;
+                }
+                resp
             }
-            if let Some(error) = resp.get("error") {
-                return Err(error.str_or("message", "MCP error").to_string());
-            }
-            return Ok(resp.get("result").cloned().unwrap_or(Json::Null));
+            Transport::Http(t) => t.round_trip(&req, Some(id)),
         }
     }
 
     fn notify(&mut self, method: &str) -> bool {
-        self.write_line(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{{}}}}"
-        ))
+        let body = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{{}}}}");
+        match &mut self.transport {
+            Transport::Stdio(t) => {
+                let ok = t.write_line(&body);
+                if !ok {
+                    self.alive = false;
+                }
+                ok
+            }
+            // Streamable HTTP: a notification is a plain POST the server
+            // acknowledges with 202 Accepted; any reply body is ignored.
+            Transport::Http(t) => t.round_trip(&body, None).is_ok(),
+        }
     }
 
     /// Full startup handshake: initialize, initialized, `tools/list`.
@@ -637,6 +640,157 @@ impl McpServer {
     }
 }
 
+impl StdioTransport {
+    /// Reads one newline-delimited message, blocking up to `deadline`.
+    ///
+    /// Returns `None` on timeout, EOF, or error (the caller marks the server
+    /// dead).
+    fn read_line(&mut self, deadline: Instant) -> Option<String> {
+        loop {
+            if let Some(nl) = self.rbuf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&self.rbuf[..nl]).into_owned();
+                self.rbuf.drain(..=nl);
+                return Some(line);
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let mut pfd = libc::pollfd {
+                fd: self.stdout.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let timeout_ms = (remaining.as_millis() as libc::c_int).saturating_add(1);
+            let pr = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if pr <= 0 {
+                return None;
+            }
+            let mut chunk = [0u8; 4096];
+            let n = std::io::Read::read(&mut self.stdout, &mut chunk).unwrap_or(0);
+            if n == 0 {
+                return None;
+            }
+            self.rbuf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    fn write_line(&mut self, line: &str) -> bool {
+        self.stdin
+            .write_all(line.as_bytes())
+            .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.flush())
+            .is_ok()
+    }
+
+    /// Writes one request and reads replies until the one matching `id`.
+    fn round_trip(&mut self, req: &str, id: i64) -> Result<Json, String> {
+        if !self.write_line(req) {
+            return Err("failed to write to server".to_string());
+        }
+        // The deadline covers the whole exchange, not each line: a server
+        // that streams notifications forever must still answer in time.
+        let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
+        loop {
+            let Some(line) = self.read_line(deadline) else {
+                return Err("no response from server (timeout or closed pipe)".to_string());
+            };
+            // Ignore unparsable/log lines on stdout.
+            let Some(resp) = json_parse(&line) else {
+                continue;
+            };
+            if let Some(result) = extract_reply(&resp, id)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
+/// If `resp` is the reply to request `id`, returns its `result`
+/// (`Ok(Some(..))`) or propagates its `error` (`Err`). Notifications and
+/// replies to other ids yield `Ok(None)` so the caller keeps reading.
+fn extract_reply(resp: &Json, id: i64) -> Result<Option<Json>, String> {
+    #[allow(clippy::cast_possible_truncation)]
+    let matches_id = matches!(resp.get("id"), Some(Json::Num(n)) if *n as i64 == id);
+    if !matches_id {
+        return Ok(None); // a notification or a reply to an older call
+    }
+    if let Some(error) = resp.get("error") {
+        return Err(error.str_or("message", "MCP error").to_string());
+    }
+    Ok(Some(resp.get("result").cloned().unwrap_or(Json::Null)))
+}
+
+impl HttpTransport {
+    /// One Streamable HTTP exchange: POST the JSON-RPC message, then decode
+    /// the reply as plain JSON or as a short SSE stream, whichever the server
+    /// chose. `id` is `None` for notifications (expects 202 Accepted, ignores
+    /// any body).
+    fn round_trip(&mut self, body: &str, id: Option<i64>) -> Result<Json, String> {
+        let mut req = self
+            .agent
+            .post(&self.url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json, text/event-stream");
+        for (k, v) in &self.headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        if let Some(sid) = &self.session_id {
+            req = req.header("Mcp-Session-Id", sid.as_str());
+        }
+        let mut resp = req.send(body).map_err(|e| format!("http: {e}"))?;
+        // The server may assign a session on `initialize`; echo it back on
+        // every later request so it can correlate the session.
+        if let Some(sid) = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+        {
+            self.session_id = Some(sid.to_string());
+        }
+        let Some(id) = id else {
+            return Ok(Json::Null); // notification: 2xx is all we need
+        };
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.starts_with("text/event-stream") {
+            // The reply arrives as SSE events; the matching JSON-RPC response
+            // is one of them (the server may interleave notifications).
+            let mut found: Option<Result<Json, String>> = None;
+            let reader = resp.body_mut().as_reader();
+            crate::remote::read_sse(reader, |data| {
+                let Some(msg) = json_parse(data) else {
+                    return true;
+                };
+                match extract_reply(&msg, id) {
+                    Ok(None) => true,
+                    Ok(Some(result)) => {
+                        found = Some(Ok(result));
+                        false
+                    }
+                    Err(e) => {
+                        found = Some(Err(e));
+                        false
+                    }
+                }
+            })
+            .map_err(|e| format!("http stream: {e}"))?;
+            return found.unwrap_or_else(|| Err("no response in event stream".to_string()));
+        }
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .map_err(|e| format!("http body: {e}"))?;
+        let msg = json_parse(&text).ok_or("invalid JSON response")?;
+        match extract_reply(&msg, id)? {
+            Some(result) => Ok(result),
+            None => Err("response id mismatch".to_string()),
+        }
+    }
+}
+
 // ============================================================================
 // Config loading
 // ============================================================================
@@ -666,8 +820,9 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
     };
     for (name, sv) in servers {
         let command = sv.str_or("command", "");
-        if command.is_empty() {
-            eprintln!("plank: MCP server \"{name}\" has no command, skipping");
+        let url = sv.str_or("url", "");
+        if command.is_empty() && url.is_empty() {
+            eprintln!("plank: MCP server \"{name}\" has no command or url, skipping");
             continue;
         }
         if name.contains("__") {
@@ -679,6 +834,8 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
             command: command.to_string(),
             args: Vec::new(),
             env: Vec::new(),
+            url: url.to_string(),
+            headers: Vec::new(),
             primary_tools: None,
         };
         if let Some(Json::Arr(args)) = sv.get("args") {
@@ -692,6 +849,13 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
             for (k, v) in env {
                 if let Json::Str(s) = v {
                     cfg.env.push((k.clone(), s.clone()));
+                }
+            }
+        }
+        if let Some(Json::Obj(headers)) = sv.get("headers") {
+            for (k, v) in headers {
+                if let Json::Str(s) = v {
+                    cfg.headers.push((k.clone(), s.clone()));
                 }
             }
         }
@@ -1187,6 +1351,8 @@ mod tests {
             command: "cat".to_string(),
             args: Vec::new(),
             env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
             primary_tools: None,
         };
         let mut s = McpServer::spawn(&cfg).expect("spawn cat");
@@ -1331,6 +1497,156 @@ mod tests {
             Some(vec!["alpha".to_string(), "beta".to_string()])
         );
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn config_load_parses_http_servers() {
+        let path = write_temp_config(
+            "{\"mcpServers\":{\"web\":{\"type\":\"http\",\"url\":\"http://127.0.0.1:9/mcp\",\
+             \"headers\":{\"Authorization\":\"Bearer tok\"}},\
+             \"empty\":{}}}",
+        );
+        let list = config_load(&path);
+        std::fs::remove_file(&path).ok();
+        // The entry with neither command nor url is skipped.
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, "web");
+        assert_eq!(list[0].url, "http://127.0.0.1:9/mcp");
+        assert!(list[0].command.is_empty());
+        assert_eq!(
+            list[0].headers,
+            vec![("Authorization".to_string(), "Bearer tok".to_string())]
+        );
+    }
+
+    /// A minimal single-threaded Streamable HTTP MCP server on a loopback
+    /// port: answers initialize (assigning a session id) and tools/list as
+    /// plain JSON, notifications with 202, and tools/call as an SSE stream
+    /// with a leading notification event before the reply — exercising both
+    /// response encodings and the session echo.
+    fn spawn_scripted_http_server() -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen_sessions = Vec::new();
+            // initialize, notifications/initialized, tools/list, tools/call.
+            for _ in 0..4 {
+                let (stream, _) = listener.accept().expect("accept");
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut content_len = 0usize;
+                let mut session = String::new();
+                loop {
+                    let mut h = String::new();
+                    reader.read_line(&mut h).unwrap();
+                    let h = h.trim_end().to_string();
+                    if h.is_empty() {
+                        break;
+                    }
+                    let lower = h.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_len = v.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(v) = lower.strip_prefix("mcp-session-id:") {
+                        session = v.trim().to_string();
+                    }
+                }
+                seen_sessions.push(session);
+                let mut body = vec![0u8; content_len];
+                reader.read_exact(&mut body).unwrap();
+                let body = String::from_utf8_lossy(&body).into_owned();
+                let id = body
+                    .split("\"id\":")
+                    .nth(1)
+                    .and_then(|s| s.split([',', '}']).next())
+                    .unwrap_or("0")
+                    .trim()
+                    .to_string();
+                let mut stream = reader.into_inner();
+                let respond = |stream: &mut std::net::TcpStream,
+                               ct: &str,
+                               extra: &str,
+                               body: &str| {
+                    let msg = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: {ct}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(msg.as_bytes()).unwrap();
+                };
+                if body.contains("\"initialize\"") {
+                    respond(
+                        &mut stream,
+                        "application/json",
+                        "mcp-session-id: sess-42\r\n",
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"protocolVersion\":\"2024-11-05\",\"instructions\":\"Be brief.\"}}}}"
+                        ),
+                    );
+                } else if body.contains("\"notifications/initialized\"") {
+                    stream
+                        .write_all(b"HTTP/1.1 202 Accepted\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .unwrap();
+                } else if body.contains("\"tools/list\"") {
+                    respond(
+                        &mut stream,
+                        "application/json",
+                        "",
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[{{\"name\":\"echo\",\"description\":\"Echo.\",\"inputSchema\":{{\"type\":\"object\"}}}}]}}}}"
+                        ),
+                    );
+                } else {
+                    // tools/call: SSE with an interleaved notification first.
+                    let sse = format!(
+                        "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{{}}}}\n\n\
+                         data: {{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"content\":[{{\"type\":\"text\",\"text\":\"echoed: hi\"}}]}}}}\n\n"
+                    );
+                    respond(&mut stream, "text/event-stream", "", &sse);
+                }
+            }
+            seen_sessions
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn end_to_end_against_scripted_http_server() {
+        let (url, handle) = spawn_scripted_http_server();
+        let cfg = McpServerConfig {
+            name: "web".to_string(),
+            command: String::new(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url,
+            headers: Vec::new(),
+            primary_tools: None,
+        };
+        let mut servers = start_servers(vec![cfg]);
+        assert_eq!(servers.len(), 1, "http server should handshake");
+        assert_eq!(servers[0].tools.len(), 1);
+        assert_eq!(servers[0].tools[0].name, "echo");
+        assert_eq!(servers[0].instructions, "Be brief.");
+
+        let call = ToolCall {
+            name: "mcp__web__echo".to_string(),
+            args: vec![ToolArg {
+                name: "text".to_string(),
+                value: "hi".to_string(),
+                is_string: true,
+            }],
+        };
+        let out = tool_mcp_call(&mut servers, &call);
+        assert_eq!(out, "echoed: hi\n");
+
+        let sessions = handle.join().expect("server thread");
+        // No session before initialize assigns one; echoed on every request after.
+        assert_eq!(sessions[0], "");
+        assert!(
+            sessions[1..].iter().all(|s| s == "sess-42"),
+            "session id must be echoed: {sessions:?}"
+        );
     }
 
     #[test]
@@ -1576,6 +1892,8 @@ done
             command: "cat".to_string(),
             args: Vec::new(),
             env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
             primary_tools: None,
         };
         let mut s = McpServer::spawn(&cfg).expect("spawn cat");

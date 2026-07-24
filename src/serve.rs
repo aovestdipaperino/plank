@@ -49,7 +49,7 @@ type Cancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 pub fn run(engine: Box<dyn Engine>, cfg: &ServeConfig) -> Result<(), String> {
     // Seed the notification enable flag once at server startup so headless
     // `plank serve` honors `ui.notifications`, mirroring `run_interactive`.
-    crate::notify::set_enabled(crate::settings::active().ui.notifications);
+    crate::notify::set_mode(crate::settings::active().ui.notifications);
     let listener =
         TcpListener::bind(&cfg.listen).map_err(|e| format!("serve: bind {}: {e}", cfg.listen))?;
     eprintln!(
@@ -85,7 +85,7 @@ pub fn run(engine: Box<dyn Engine>, cfg: &ServeConfig) -> Result<(), String> {
 pub fn run_shared(host: EngineHost, cfg: &ServeConfig) -> Result<(), String> {
     // Seed the notification enable flag once at server startup so headless
     // `plank serve` honors `ui.notifications`, mirroring `run_interactive`.
-    crate::notify::set_enabled(crate::settings::active().ui.notifications);
+    crate::notify::set_mode(crate::settings::active().ui.notifications);
     let listener =
         TcpListener::bind(&cfg.listen).map_err(|e| format!("serve: bind {}: {e}", cfg.listen))?;
     eprintln!(

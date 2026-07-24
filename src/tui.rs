@@ -1812,7 +1812,7 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
     if let Some(flash) = crate::status::flash_tip() {
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(
-            format!("📋 {flash}"),
+            flash,
             base.fg(Color::Green).add_modifier(Modifier::BOLD),
         ));
     } else {

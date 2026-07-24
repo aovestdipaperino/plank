@@ -98,9 +98,12 @@ pub struct UiSettings {
     /// default; when off, thinking is hidden from the display but the model
     /// still produces it.
     pub show_thinking: bool,
-    /// Fire native macOS desktop notifications at turn lifecycle points
-    /// (turn complete past the threshold, and awaiting input). On by default.
-    pub notifications: bool,
+    /// When native macOS desktop notifications fire at turn lifecycle points
+    /// (turn complete/interrupted past the threshold, and awaiting input):
+    /// `always`, `unfocused` (only while the terminal window is not focused),
+    /// or `never`. `true`/`false` are accepted as legacy spellings of
+    /// always/never. Default `always`.
+    pub notifications: crate::notify::NotifyMode,
     /// Minimum turn duration, in seconds, before a completed turn notifies.
     /// Awaiting-input notifications ignore this. Default 10.
     pub notify_after_secs: u64,
@@ -119,7 +122,7 @@ impl Default for UiSettings {
             show_tool_calls: false,
             show_tool_results: false,
             show_thinking: true,
-            notifications: true,
+            notifications: crate::notify::NotifyMode::Always,
             notify_after_secs: 10,
             crt_off: true,
         }
@@ -280,7 +283,17 @@ impl Settings {
         if let Some(v) = boolean(ui, "showThinking") {
             self.ui.show_thinking = v;
         }
+        // `notifications` accepts a mode string (always/unfocused/never) or
+        // the legacy booleans (true=always, false=never).
         if let Some(v) = boolean(ui, "notifications") {
+            self.ui.notifications = if v {
+                crate::notify::NotifyMode::Always
+            } else {
+                crate::notify::NotifyMode::Never
+            };
+        } else if let Some(v) =
+            string(ui, "notifications").and_then(|s| crate::notify::NotifyMode::parse(&s))
+        {
             self.ui.notifications = v;
         }
         if let Some(v) = num(ui, "notifyAfterSecs") {
@@ -427,7 +440,7 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
         parts.push(format!("showThinking={}", s.ui.show_thinking));
     }
     if s.ui.notifications != d.ui.notifications {
-        parts.push(format!("notifications={}", s.ui.notifications));
+        parts.push(format!("notifications={}", s.ui.notifications.as_str()));
     }
     if s.ui.notify_after_secs != d.ui.notify_after_secs {
         parts.push(format!("notifyAfterSecs={}", s.ui.notify_after_secs));
@@ -597,7 +610,11 @@ impl Settings {
             upsert(u, "showToolCalls", Json::Bool(self.ui.show_tool_calls));
             upsert(u, "showToolResults", Json::Bool(self.ui.show_tool_results));
             upsert(u, "showThinking", Json::Bool(self.ui.show_thinking));
-            upsert(u, "notifications", Json::Bool(self.ui.notifications));
+            upsert(
+                u,
+                "notifications",
+                Json::Str(self.ui.notifications.as_str().to_string()),
+            );
             upsert(u, "notifyAfterSecs", unum(self.ui.notify_after_secs));
             upsert(u, "crtOff", Json::Bool(self.ui.crt_off));
         }
@@ -908,14 +925,23 @@ mod tests {
 
     #[test]
     fn notification_defaults_and_overlay() {
+        use crate::notify::NotifyMode;
         let s = Settings::default();
-        assert!(s.ui.notifications);
+        assert_eq!(s.ui.notifications, NotifyMode::Always);
         assert_eq!(s.ui.notify_after_secs, 10);
 
+        // Legacy boolean spelling still parses.
         let mut s = Settings::default();
         s.overlay(r#"{ "ui": { "notifications": false, "notifyAfterSecs": 30 } }"#);
-        assert!(!s.ui.notifications);
+        assert_eq!(s.ui.notifications, NotifyMode::Never);
         assert_eq!(s.ui.notify_after_secs, 30);
+
+        let mut s = Settings::default();
+        s.overlay(r#"{ "ui": { "notifications": "unfocused" } }"#);
+        assert_eq!(s.ui.notifications, NotifyMode::Unfocused);
+        // A bad mode string is ignored, keeping the default.
+        s.overlay(r#"{ "ui": { "notifications": "sometimes" } }"#);
+        assert_eq!(s.ui.notifications, NotifyMode::Unfocused);
 
         // Bad value ignored, default retained.
         let mut s = Settings::default();

@@ -8,6 +8,51 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **MCP Streamable HTTP transport**: `.mcp.json` entries with a `"url"` (plus
+  optional `"headers"`, e.g. an `Authorization` token) connect over Streamable
+  HTTP — each JSON-RPC message is one POST answered with plain JSON or a short
+  SSE stream, and a server-assigned `Mcp-Session-Id` is echoed on later
+  requests. Stdio `"command"` servers work exactly as before.
+- **Native macOS desktop notifications**: a turn that ran past
+  `ui.notifyAfterSecs` (default 10) ends with a banner reading
+  `'<prompt...>' finished` — the prompt as the bold headline, the tail of the
+  answer as the body (`'...' interrupted` / "Task interrupted" for a
+  user-aborted turn) — that persists until dismissed; the `ask` tool and
+  awaiting-input also notify. Banners wear the host terminal's icon with
+  plank's logo as the content image. `ui.notifications` picks when they fire:
+  `always` (default), `unfocused` (only while the terminal window isn't
+  focused, tracked via TUI focus events), or `never`; `/notify` toggles at
+  runtime. Warp gets native OSC 777 agent notifications too.
+- **Window title**: the terminal title shows `🪵 plank`, extended with the
+  current prompt (`🪵 plank - fix the bug…`) while a turn runs.
+- **Interactive `/config` editor** (#52): a TUI form (and
+  `/config <section>.<key> <value>` from the prompt) over every settings key;
+  changes write `./.plank/settings.json` and apply immediately. New keys since
+  2.0.2: `ui.notifications`, `ui.notifyAfterSecs`, `ui.crtOff`, and the
+  `tools.task` / `tools.agent` / `tools.planMode` gates.
+- **Status-bar tips and tool flash**: rotating 💡 hints at the tail of the
+  status bar (auto-hiding after 10 s); dispatched tools show as a transient
+  `🔧 <names>` flash for 5 s; clipboard copies confirm with 📋.
+- **Mouse copy**: click-to-copy fenced code blocks (`⧉ copy`), and
+  content-anchored drag selection that survives scrolling and copies the full
+  underlying text (code blocks verbatim, not soft-wrapped rows). The
+  jump-to-bottom hint is clickable.
+- **CRT power-off exit animation** on clean TUI exit, colors included
+  (`ui.crtOff`, default on) (#54).
+- **Web tools**: `google_search` is a client-side DuckDuckGo search;
+  `visit_page` fetches pages through the embedded obscura headless browser
+  (feature `use_obscura`, statically linked — no external binary) instead of
+  curl. Web access asks for consent with an "Always allow" option; failures
+  dump details to `~/.plank/errors.log`.
+- **System-prompt cache-miss diagnostics**: a rebuild at launch explains why
+  (cache missing / prompt changed) with a sanitized red/green diff snippet
+  below the warm-up progress bar; `PLANK_DEBUG_SYSPROMPT` instruments the
+  cache decisions.
+- **`per_project_kv` cargo feature** (off by default): keys the system-prompt
+  KV checkpoint by project directory (`sysprompt-<hash>.kv`) so per-project
+  prompt inputs (AGENTS.md, local MCP config) don't invalidate other projects'
+  snapshots.
+- The single-instance error now names the PID holding the lock.
 - **Sub-agent tool (`agent`)** (#50): the model delegates a bounded task to a
   fresh scoped sub-agent (a sidechain fork of the transcript) and gets back only
   its final report; nesting is bounded (`SUBAGENT_DEPTH_CAP = 1`). An optional
@@ -37,9 +82,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   behind a simple progress bar before the full UI is shown.
 - The prompt input word-wraps to the next line instead of scrolling
   horizontally.
+- Prefill runs in chunks (fixed at 256 tokens) so Ctrl-C interrupts a long
+  prefill promptly; the interim `--prefill-chunk` flag was dropped.
+- Tools the DS4 model wasn't trained on (`task`, `agent`, plan mode) are gated
+  behind settings and off by default.
+- The Homebrew formulas were renamed `plank` → `plank-agent` and
+  `plank-beta` → `plank-agent-beta`.
 
 ### Fixed
 
+- The turn-end notification headline sometimes showed the last tool result
+  instead of the user's prompt (tool results are stored as user-role
+  transcript messages and were not filtered out).
+- KV caches (`sysprompt.kv`, session payloads) survive plank version changes;
+  co-installed stable/beta versions no longer churn the checkpoint on every
+  switch — the fingerprint and payload format-version already validate them.
+- Sessions with no real activity no longer leave a resume point.
+- The TUI no longer freezes on the web-access approval prompt.
 - **Provider engine no longer aborts on an HTTP error.** A 4xx/5xx from an
   OpenAI/Anthropic-compatible provider used to propagate out as a fatal
   `EngineError` (crashing the plain-REPL / non-interactive / `-p` paths).

@@ -216,3 +216,17 @@ test` and review the diff before committing.
   (strip the `│ ` gutter, trim trailing space) — the same philosophy as
   `selection_text`, and it needs no back-reference to the markdown source,
   which `OutputLog` discards once a streaming segment closes.
+
+- **A single sampled token's detokenized bytes are not necessarily valid
+  UTF-8.** DeepSeek's byte-level BPE splits multi-byte characters (emoji,
+  CJK) across tokens — 🦀 (`F0 9F A6 80`) commonly arrives as `F0 9F` in one
+  token and `A6 80` in the next. Calling `String::from_utf8_lossy` per token
+  turns each fragment into replacement characters (rendered as `???` in the
+  output window) even though the concatenated byte stream is perfectly valid.
+  Decode across tokens: `ds4_token_text` output is carried through
+  `engine::Utf8Stream`, which emits only the complete UTF-8 prefix and holds
+  an unfinished trailing sequence (≤3 bytes) for the next token, flushing
+  lossily only at end of generation. The same applies to any byte-chunked
+  stream (EchoEngine's 8-byte chunking deliberately splits a 🦀 to keep the
+  stub honest); `viz::StreamRenderer` already had its own carry for the same
+  reason.

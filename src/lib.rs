@@ -51,6 +51,7 @@ pub mod statusbar;
 pub mod stderrline;
 pub mod sysprompt;
 pub mod tasks;
+pub mod title;
 pub mod tools;
 pub mod trace;
 pub mod tui;

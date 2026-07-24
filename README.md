@@ -85,6 +85,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **`@` file completion, `glob`, and a model-visible task list** that survives compaction.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
 - **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
+- **Desktop notifications & live window title** — long turns end with a persistent macOS banner (`'<prompt>' finished` and the tail of the answer; `interrupted` for aborted turns), configurable to fire `always`, only while `unfocused`, or `never`; the terminal title tracks the task (`🪵 plank - fix the bug…`).
 
 See **[docs/FEATURES.md](docs/FEATURES.md)** for the complete list.
 
@@ -108,6 +109,12 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/btw-panel.png" alt="The plank TUI split screen: a counting task on the left, a /btw side answer on the right" width="700">
 </p>
 
+Long turns end with a native macOS notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon and plank's logo. `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`:
+
+<p align="center">
+  <img src="assets/notification.png" alt="macOS desktop notification: a finished plank task with the prompt as headline and the answer tail as body" width="500">
+</p>
+
 ### Settings file
 
 Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works. Edit it in-session with `/config` (an interactive TUI form, or `/config <section>.<key> <value>` from the prompt, e.g. `/config ui.showThinking false`); changes write `./.plank/settings.json` and apply immediately.
@@ -118,7 +125,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
               "backend": "metal", "power": 80, "ctx": 262144 },
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-              "showThinking": true },
+              "showThinking": true, "notifications": "always", "notifyAfterSecs": 10 },
   "tools":  { "task": false, "agent": false, "planMode": false },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
@@ -140,6 +147,9 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `showToolCalls` | `false` | Show the model's `🛠️` tool-call banners. Off keeps the UI uncluttered; the tools still run. |
 | | `showToolResults` | `false` | Echo tool result text into the scrollback. Off keeps the UI clean; the model still receives the results. |
 | | `showThinking` | `true` | Render the model's thinking (dimmed) in the scrollback. Off hides it from the display; the model still produces it. |
+| | `notifications` | `always` | When desktop notifications fire: `always`, `unfocused` (only while the terminal window isn't focused), or `never`. |
+| | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
+| | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
 | `safety` | `sandbox` | on (macOS) | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
@@ -171,7 +181,7 @@ A broken settings file never stops plank from starting: malformed JSON, a wrongl
 
 ### MCP servers
 
-Plank can load external tools from stdio MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format:
+Plank can load external tools from stdio and Streamable HTTP MCP servers. Configs are hierarchical like Claude Code's user and project scopes: `~/.plank/.mcp.json` applies globally, and `./.mcp.json` in the working directory (or the file given with `--mcp-config`) overrides same-named servers and adds new ones. Both use the standard `mcpServers` format — a `command` entry is spawned as a stdio subprocess, a `url` entry is reached over Streamable HTTP (optional `headers` carry e.g. an `Authorization` token):
 
 ```json
 {
@@ -181,6 +191,11 @@ Plank can load external tools from stdio MCP servers. Configs are hierarchical l
       "args": ["--flag"],
       "env": {"KEY": "value"},
       "primaryTools": ["tool_a"]
+    },
+    "remote": {
+      "type": "http",
+      "url": "http://127.0.0.1:6510/mcp",
+      "headers": {"Authorization": "Bearer <token>"}
     }
   }
 }

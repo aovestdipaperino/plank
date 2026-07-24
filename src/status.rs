@@ -451,9 +451,18 @@ pub const TIPS: &[&str] = &[
     "your session is saved automatically — /resume brings it back",
 ];
 
-/// The tip to show for the given animation clock, or `""` when none exist.
+/// How long each rotating tip stays *visible* within its [`TIP_ROTATE_MS`]
+/// window before the tip section auto-hides until the next rotation.
+pub const TIP_VISIBLE_MS: u64 = 10_000;
+
+/// The tip to show for the given animation clock, or `""` when none exist or
+/// the current tip's [`TIP_VISIBLE_MS`] visibility window has lapsed (the tip
+/// section disappears until the next rotation).
 #[must_use]
 pub fn rotating_tip(tick_ms: u64) -> &'static str {
+    if tick_ms % TIP_ROTATE_MS >= TIP_VISIBLE_MS {
+        return "";
+    }
     // TIPS is a non-empty compile-time table, so the modulo never divides by zero.
     let idx = usize::try_from(tick_ms / TIP_ROTATE_MS).unwrap_or(0) % TIPS.len();
     TIPS[idx]
@@ -463,26 +472,38 @@ pub fn rotating_tip(tick_ms: u64) -> &'static str {
 /// status bar before it reverts to the rotating tip. Fixed, not configurable.
 pub const FLASH_TIP_MS: u64 = 10_000;
 
-/// A transient status-bar message shown in place of the rotating tip until it
-/// expires, then cleared automatically on the next read. Process-global so any
-/// call site (e.g. a clipboard copy in the mouse handler) can post one without
+/// How long the "tool usage" flash (posted when the model dispatches tools)
+/// stays in the status bar.
+pub const TOOL_FLASH_MS: u64 = 5_000;
+
+/// A transient status-bar message (with its display window in ms) shown in
+/// place of the rotating tip until it expires, then cleared automatically on
+/// the next read. Process-global so any call site (e.g. a clipboard copy in
+/// the mouse handler, tool dispatch on the worker thread) can post one without
 /// threading state through the draw path.
-static FLASH_TIP: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+static FLASH_TIP: std::sync::Mutex<Option<(String, std::time::Instant, u64)>> =
     std::sync::Mutex::new(None);
 
-/// Whether a flash tip posted `elapsed` ago is still within its window.
+/// Whether a flash tip posted `elapsed` ago is still within a `window_ms`
+/// display window.
 #[must_use]
-pub fn flash_active(elapsed: std::time::Duration) -> bool {
-    elapsed < std::time::Duration::from_millis(FLASH_TIP_MS)
+pub fn flash_active(elapsed: std::time::Duration, window_ms: u64) -> bool {
+    elapsed < std::time::Duration::from_millis(window_ms)
 }
 
-/// Posts a transient status-bar tip, replacing any current one and restarting
-/// the window.
+/// Posts a transient status-bar tip with the default [`FLASH_TIP_MS`] window,
+/// replacing any current one and restarting the window.
 pub fn set_flash_tip(msg: String) {
+    set_flash_tip_for(msg, FLASH_TIP_MS);
+}
+
+/// Posts a transient status-bar tip shown for `window_ms`, replacing any
+/// current one and restarting the window.
+pub fn set_flash_tip_for(msg: String, window_ms: u64) {
     let mut guard = FLASH_TIP
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *guard = Some((msg, std::time::Instant::now()));
+    *guard = Some((msg, std::time::Instant::now(), window_ms));
 }
 
 /// Clears any active flash tip immediately.
@@ -501,7 +522,7 @@ pub fn flash_tip() -> Option<String> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     match guard.as_ref() {
-        Some((msg, at)) if flash_active(at.elapsed()) => Some(msg.clone()),
+        Some((msg, at, window_ms)) if flash_active(at.elapsed(), *window_ms) => Some(msg.clone()),
         Some(_) => {
             *guard = None;
             None
@@ -854,9 +875,12 @@ mod tests {
     #[test]
     fn rotating_tip_advances_and_wraps() {
         assert_eq!(rotating_tip(0), TIPS[0]);
-        // Halfway through the first window still shows the first tip.
-        assert_eq!(rotating_tip(TIP_ROTATE_MS - 1), TIPS[0]);
-        // The next window advances by one.
+        // Within the visibility window the first tip shows.
+        assert_eq!(rotating_tip(TIP_VISIBLE_MS - 1), TIPS[0]);
+        // Past the visibility window the tip section auto-hides.
+        assert_eq!(rotating_tip(TIP_VISIBLE_MS), "");
+        assert_eq!(rotating_tip(TIP_ROTATE_MS - 1), "");
+        // The next window advances by one and is visible again.
         assert_eq!(rotating_tip(TIP_ROTATE_MS), TIPS[1 % TIPS.len()]);
         // After a full cycle it wraps back to the first.
         let cycle = TIP_ROTATE_MS * TIPS.len() as u64;
@@ -866,10 +890,25 @@ mod tests {
     #[test]
     fn flash_active_respects_window() {
         use std::time::Duration;
-        assert!(flash_active(Duration::from_millis(0)));
-        assert!(flash_active(Duration::from_millis(FLASH_TIP_MS - 1)));
-        assert!(!flash_active(Duration::from_millis(FLASH_TIP_MS)));
-        assert!(!flash_active(Duration::from_millis(FLASH_TIP_MS + 5_000)));
+        assert!(flash_active(Duration::from_millis(0), FLASH_TIP_MS));
+        assert!(flash_active(
+            Duration::from_millis(FLASH_TIP_MS - 1),
+            FLASH_TIP_MS
+        ));
+        assert!(!flash_active(
+            Duration::from_millis(FLASH_TIP_MS),
+            FLASH_TIP_MS
+        ));
+        assert!(!flash_active(
+            Duration::from_millis(FLASH_TIP_MS + 5_000),
+            FLASH_TIP_MS
+        ));
+        // The tool-usage window is shorter.
+        assert!(flash_active(Duration::from_millis(4_999), TOOL_FLASH_MS));
+        assert!(!flash_active(
+            Duration::from_millis(TOOL_FLASH_MS),
+            TOOL_FLASH_MS
+        ));
     }
 
     #[test]

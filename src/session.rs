@@ -563,9 +563,9 @@ impl SessionStore {
     }
 
     /// Enumerates `<name>.kv` session files: memorable `adjective-celebrity`
-    /// names, plus legacy `<40-hex>.kv` ids. The system prompt checkpoint
-    /// (`sysprompt.kv`) and temp files (`*.kv.tmp.*`, which don't end in
-    /// `.kv`) are skipped.
+    /// names, plus legacy `<40-hex>.kv` ids. The system prompt checkpoints
+    /// (`sysprompt-*.kv`, plus the legacy shared `sysprompt.kv`) and temp
+    /// files (`*.kv.tmp.*`, which don't end in `.kv`) are skipped.
     fn session_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
@@ -575,7 +575,7 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(FILE_EXT) else {
                 continue;
             };
-            if stem == SYSPROMPT_STEM || !is_valid_id_prefix(stem) {
+            if stem.starts_with(SYSPROMPT_STEM) || !is_valid_id_prefix(stem) {
                 continue;
             }
             out.push((stem.to_ascii_lowercase(), entry.path()));
@@ -584,9 +584,23 @@ impl SessionStore {
     }
 }
 
-/// File stem of the system-prompt KV checkpoint, which shares the cache dir
-/// with session files but is not one.
+/// File-stem prefix of the system-prompt KV checkpoints, which share the
+/// cache dir with session files but are not sessions.
 const SYSPROMPT_STEM: &str = "sysprompt";
+
+/// File name of the per-project system-prompt KV checkpoint:
+/// `sysprompt-<12 hex of sha1(project path)>.kv`.
+///
+/// The system prompt embeds per-project inputs (AGENTS.md, the local MCP
+/// config, the session-start context), so a single shared checkpoint would be
+/// invalidated and rebuilt on nearly every project switch — and two projects
+/// used alternately would thrash it. Keying the file by project directory
+/// gives each project its own stable snapshot.
+#[must_use]
+pub fn sysprompt_checkpoint_name(project_dir: &Path) -> String {
+    let hash = sha1_hex(project_dir.to_string_lossy().as_bytes());
+    format!("{SYSPROMPT_STEM}-{}{FILE_EXT}", &hash[..12])
+}
 
 /// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
 /// chars, ASCII alphanumeric or `-`. Covers both memorable names and legacy
@@ -1365,6 +1379,34 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn sysprompt_checkpoint_name_is_stable_and_project_keyed() {
+        let a = sysprompt_checkpoint_name(Path::new("/proj/a"));
+        let b = sysprompt_checkpoint_name(Path::new("/proj/b"));
+        assert_ne!(a, b, "different projects must not share a checkpoint");
+        assert_eq!(a, sysprompt_checkpoint_name(Path::new("/proj/a")));
+        assert!(a.starts_with("sysprompt-") && a.ends_with(FILE_EXT), "{a}");
+    }
+
+    #[test]
+    fn per_project_sysprompt_checkpoints_are_not_listed_as_sessions() {
+        let dir = temp_dir("syspromptskip");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        store.save(&mut s).unwrap();
+        fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
+        fs::write(
+            dir.join(sysprompt_checkpoint_name(Path::new("/proj/a"))),
+            b"kv",
+        )
+        .unwrap();
+        let entries = store.list().unwrap();
+        assert_eq!(entries.len(), 1, "checkpoints must be skipped: {entries:?}");
+        assert_eq!(entries[0].id, s.id);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

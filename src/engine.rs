@@ -396,6 +396,63 @@ pub trait Engine: Debug + Send {
     }
 }
 
+/// Incremental UTF-8 decoder for byte-level token streams.
+///
+/// Byte-level BPE tokenizers split multi-byte characters (emoji, CJK) across
+/// tokens; decoding each token independently mangles them into replacement
+/// characters. [`push`](Self::push) emits only the complete prefix and carries
+/// an unfinished trailing sequence (at most 3 bytes) into the next call;
+/// [`flush`](Self::flush) drains whatever remains — lossily — at end of stream.
+#[derive(Debug, Default)]
+pub struct Utf8Stream {
+    carry: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// Appends `bytes` and returns the decoded complete prefix.
+    ///
+    /// Genuinely invalid sequences decode to U+FFFD; only a *possibly
+    /// incomplete* trailing sequence is withheld for the next call.
+    pub fn push(&mut self, bytes: impl AsRef<[u8]>) -> String {
+        self.carry.extend_from_slice(bytes.as_ref());
+        let keep = Self::incomplete_tail_len(&self.carry);
+        let split = self.carry.len() - keep;
+        let out = String::from_utf8_lossy(&self.carry[..split]).into_owned();
+        self.carry.drain(..split);
+        out
+    }
+
+    /// Decodes any carried bytes lossily and resets the stream.
+    pub fn flush(&mut self) -> String {
+        let out = String::from_utf8_lossy(&self.carry).into_owned();
+        self.carry.clear();
+        out
+    }
+
+    /// Length of a trailing byte run that could still become a valid UTF-8
+    /// sequence once more bytes arrive; 0 when the tail is complete or
+    /// already irrecoverably invalid.
+    fn incomplete_tail_len(bytes: &[u8]) -> usize {
+        // A lead byte sits at most 3 bytes from the end of an incomplete
+        // sequence (a 4-byte sequence missing its last byte).
+        let scan = bytes.len().min(3);
+        for dist in 1..=scan {
+            let b = bytes[bytes.len() - dist];
+            if b & 0xC0 == 0x80 {
+                continue; // continuation byte — keep looking for the lead
+            }
+            let expected = match b {
+                0xC0..=0xDF => 2,
+                0xE0..=0xEF => 3,
+                0xF0..=0xF7 => 4,
+                _ => 1, // ASCII or invalid lead: nothing to wait for
+            };
+            return if expected > dist { dist } else { 0 };
+        }
+        0
+    }
+}
+
 /// Stub engine that echoes a canned reply; keeps the agent runnable without a model.
 #[derive(Debug, Default)]
 pub struct EchoEngine {
@@ -436,10 +493,15 @@ impl Engine for EchoEngine {
                 tps: 0.0,
             }));
         }
+        // The 🦀 straddles the 8-byte chunk boundary below, keeping the
+        // stub honest about split multi-byte characters.
         let reply = format!(
-            "(echo engine) no model loaded; transcript is {} bytes\n",
+            "(echo engine 🦀) no model loaded; transcript is {} bytes\n",
             transcript.len()
         );
+        // Chunk at byte boundaries like a byte-level tokenizer would, carrying
+        // split multi-byte characters across chunks via `Utf8Stream`.
+        let mut utf8 = Utf8Stream::default();
         for piece in reply.as_bytes().chunks(8) {
             if interrupt() {
                 return Ok(GenerationStats {
@@ -447,9 +509,14 @@ impl Engine for EchoEngine {
                     ..GenerationStats::default()
                 });
             }
-            on_event(EngineEvent::Text(
-                String::from_utf8_lossy(piece).into_owned(),
-            ));
+            let text = utf8.push(piece);
+            if !text.is_empty() {
+                on_event(EngineEvent::Text(text));
+            }
+        }
+        let tail = utf8.flush();
+        if !tail.is_empty() {
+            on_event(EngineEvent::Text(tail));
         }
         Ok(GenerationStats {
             generated: self.count_tokens(&reply),
@@ -467,7 +534,64 @@ impl Engine for EchoEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{EchoEngine, Engine, EngineError, GenerationOptions};
+    use super::{EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, Utf8Stream};
+
+    // Feeds a 🦀 (4 UTF-8 bytes) split the way a byte-level tokenizer emits
+    // it: each fragment alone is invalid UTF-8 and must be carried, not
+    // lossy-decoded into replacement chars (the "???" bug).
+    #[test]
+    fn utf8_stream_reassembles_split_emoji() {
+        let crab = "🦀".as_bytes(); // F0 9F A6 80
+        for split in 1..crab.len() {
+            let mut s = Utf8Stream::default();
+            let first = s.push(&crab[..split]);
+            let second = s.push(&crab[split..]);
+            assert_eq!(format!("{first}{second}"), "🦀", "split at {split}");
+            assert_eq!(s.flush(), "");
+        }
+    }
+
+    #[test]
+    fn utf8_stream_passes_ascii_through() {
+        let mut s = Utf8Stream::default();
+        assert_eq!(s.push(b"hello "), "hello ");
+        assert_eq!(s.push("🦀!".as_bytes()), "🦀!");
+        assert_eq!(s.flush(), "");
+    }
+
+    // Genuinely invalid bytes must not stall the stream waiting for a
+    // continuation that never comes.
+    #[test]
+    fn utf8_stream_lossy_on_invalid_bytes() {
+        let mut s = Utf8Stream::default();
+        assert_eq!(s.push([0x80, 0x80]), "\u{FFFD}\u{FFFD}");
+        // A truncated sequence still pending at end of stream flushes lossily.
+        assert_eq!(s.push([0xF0, 0x9F]), "");
+        assert_eq!(s.flush(), "\u{FFFD}");
+    }
+
+    // The echo stub chunks its reply at 8-byte boundaries; emoji spanning a
+    // boundary must survive intact in the streamed events.
+    #[test]
+    fn echo_engine_streams_emoji_intact() {
+        let mut engine = EchoEngine::new(4096);
+        let mut streamed = String::new();
+        engine
+            .generate(
+                super::Prompt::Flat("[user]\nhi\n"),
+                &GenerationOptions::default(),
+                &|| false,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        streamed.push_str(&t);
+                    }
+                },
+            )
+            .expect("echo generate");
+        assert!(streamed.contains('🦀'), "emoji mangled: {streamed:?}");
+        assert!(!streamed.contains('\u{FFFD}'), "lossy bytes: {streamed:?}");
+    }
 
     #[test]
     fn unsupported_error_flag() {

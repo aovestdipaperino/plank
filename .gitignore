@@ -9,3 +9,4 @@ docs/superpowers/
 
 # macOS Finder metadata
 .DS_Store
+.wrangler/

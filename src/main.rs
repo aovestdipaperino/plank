@@ -526,6 +526,7 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     if cfg.non_interactive {
         return plank::ui::run_non_interactive(engine, cfg, remote_state);
     }
+    plank::title::set(None);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
     // so the banner is only printed for the plain piped fallback.
     let tui = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();

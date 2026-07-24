@@ -16,6 +16,12 @@ default = ["use_obscura"]
 # the model's handling of image-file references is understood; build with
 # `--features images` to re-enable.
 images = []
+# Key the system-prompt KV checkpoint by project directory
+# (`sysprompt-<hash>.kv`) so per-project prompt inputs (AGENTS.md, local MCP
+# config) don't invalidate other projects' snapshots. Off by default: the
+# shared single `sysprompt.kv` is kept until the per-project scheme has more
+# mileage.
+per_project_kv = []
 # Web tools (google_search / visit_page) fetch pages through the embedded
 # obscura headless browser (refs/obscura submodule, statically linked — no
 # external binary) instead of curl or the ds4 C engine's visible Chrome.
