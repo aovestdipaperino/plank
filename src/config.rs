@@ -220,10 +220,9 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Prefill chunk size from `--prefill-chunk`; 0 = engine default (whole
-    /// prompt in one chunk). Defaults to [`DEFAULT_PREFILL_CHUNK`] so prefill is
-    /// chunked and Ctrl-C is observed at chunk boundaries instead of only after
-    /// the entire prompt is prefilled.
+    /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
+    /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
+    /// prompt is prefilled. Not user-configurable (no CLI flag).
     pub prefill_chunk: u32,
     /// Quality mode from `--quality`.
     pub quality: bool,
@@ -387,8 +386,6 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --prefill-chunk N    prefill chunk in tokens (default 256; 0 = whole prompt,
-                           less responsive to Ctrl-C)
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
@@ -622,9 +619,6 @@ fn parse_engine_option(
         "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
-        "--prefill-chunk" => {
-            e.prefill_chunk = u32::try_from(parse_int(v, arg)?).unwrap_or(0);
-        }
         "--ssd-streaming-cache-experts" => {
             let (experts, bytes) = parse_streaming_cache_experts_arg(v)
                 .ok_or_else(|| format!("{arg} must be a positive count or <number>GB: {v}"))?;
@@ -862,7 +856,6 @@ pub fn parse_options_with(
             "--mtp"
             | "--mtp-draft"
             | "--mtp-margin"
-            | "--prefill-chunk"
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
@@ -1279,8 +1272,6 @@ mod tests {
             "2",
             "--mtp-margin",
             "5.5",
-            "--prefill-chunk",
-            "512",
             "--quality",
             "--warm-weights",
             "--ssd-streaming",
@@ -1294,7 +1285,7 @@ mod tests {
         assert_eq!(c.engine.mtp_path, Some(PathBuf::from("draft.gguf")));
         assert_eq!(c.engine.mtp_draft_tokens, 2);
         assert!((c.engine.mtp_margin - 5.5).abs() < 1e-6);
-        assert_eq!(c.engine.prefill_chunk, 512);
+        assert_eq!(c.engine.prefill_chunk, DEFAULT_PREFILL_CHUNK);
         assert!(c.engine.quality);
         assert!(c.engine.warm_weights);
         assert!(c.engine.ssd_streaming);
