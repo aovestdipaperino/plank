@@ -5,6 +5,9 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/aovestdipaperino/plank/stargazers"><img src="https://img.shields.io/github/stars/aovestdipaperino/plank?logo=github&color=brightgreen" alt="GitHub stars"></a>
+  <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85+-orange.svg" alt="Rust"></a>
   <a href="https://ai.enzolombardi.net/"><img src="https://img.shields.io/badge/built%20with-AI-D97757?style=flat-square&labelColor=101010&logo=anthropic&logoColor=white" alt="Built with AI — part of Enzo Lombardi's AI portfolio"></a>
 </p>
 
