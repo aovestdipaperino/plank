@@ -2239,6 +2239,10 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            "/export" => match self.write_export(arg) {
+                Ok(path) => println!("exported session to {}", path.display()),
+                Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
+            },
             "/repro" => match self.write_repro(arg) {
                 Ok(path) => println!(
                     "{}",
@@ -2660,6 +2664,47 @@ impl Agent<'_> {
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered);
         crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)
+    }
+
+    /// Writes a `/export` transcript dump (issue #66). `arg` is
+    /// `[md|html] [path]`: the format defaults to markdown and the path to an
+    /// auto-named file in the working directory. Read-only: the live session
+    /// is untouched.
+    fn write_export(&self, arg: &str) -> Result<std::path::PathBuf, String> {
+        let mut parts = arg.trim().splitn(2, char::is_whitespace);
+        let first = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
+        let (format, path_arg) = match crate::export::parse_format(first) {
+            Some(f) => (f, rest),
+            None => (crate::export::Format::Markdown, arg.trim()),
+        };
+
+        let title = if self.session.title.trim().is_empty() {
+            crate::session::title_from_transcript(&self.session.transcript, 60)
+        } else {
+            self.session.title.clone()
+        };
+        let body = crate::export::render(&self.session.transcript, &title, format);
+
+        let auto = || crate::export::default_filename(&title, now_secs(), format);
+        let mut path = if path_arg.is_empty() {
+            self.tool_ctx.cwd.join(auto())
+        } else {
+            let given = std::path::PathBuf::from(path_arg);
+            if given.is_absolute() {
+                given
+            } else {
+                self.tool_ctx.cwd.join(given)
+            }
+        };
+        if path.is_dir() {
+            path = path.join(auto());
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(path)
     }
 
     /// Starts a `/subagent` fork: appends the framed task to the live
@@ -4818,6 +4863,13 @@ impl Agent<'_> {
                 Err(e) => {
                     log.push_plain(e);
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
+                }
+            },
+            "/export" => match self.write_export(arg) {
+                Ok(path) => log.push_plain(format!("exported session to {}", path.display())),
+                Err(e) => {
+                    log.push_plain(format!("export failed: {e}"));
+                    log.push_dim("usage: /export [md|html] [path]".to_owned());
                 }
             },
             "/repro" => match self.write_repro(arg) {

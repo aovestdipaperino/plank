@@ -426,6 +426,9 @@ Options:
   -p, --prompt TEXT        run one prompt and exit after the reply
   /resume [prefix]         resume a saved session at startup (a sha prefix or
                            list number; omit to resume the most recent)
+  /export [md|html] [path] write the current transcript to a shareable file
+                           (default: markdown, auto-named in the working
+                           directory); HTML output is standalone
       --non-interactive    disable the interactive UI
       --ui-remote[=PORT]   accept TUI remote control on 127.0.0.1:PORT
                            (omit PORT for an ephemeral one, printed to stderr)
@@ -596,6 +599,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
+        || slash_command_with_args(cmd, "/export")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/power")
@@ -1432,6 +1436,9 @@ mod tests {
         assert!(slash_command_known("/repro"));
         assert!(slash_command_known("/repro looping bug"));
         assert!(!slash_command_known("/reprox"));
+        assert!(slash_command_known("/export"));
+        assert!(slash_command_known("/export html notes.html"));
+        assert!(!slash_command_known("/exports"));
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
         assert!(!slash_command_known("/helpme"));
