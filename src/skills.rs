@@ -31,7 +31,7 @@ pub struct Skill {
 
 /// Splits leading `---` frontmatter from a SKILL.md; returns (frontmatter
 /// lines, body). Files without frontmatter yield an empty first element.
-fn split_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
+pub(crate) fn split_frontmatter(text: &str) -> (Vec<(String, String)>, String) {
     let Some(rest) = text.strip_prefix("---\n") else {
         return (Vec::new(), text.to_string());
     };
