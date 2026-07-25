@@ -233,27 +233,117 @@ pub fn plural(n: usize) -> &'static str {
 pub fn first_change_snippet(old: &str, new: &str, max_lines: usize) -> Option<String> {
     const WIDTH: usize = 80;
     let preview = edit_preview("", old, new, false);
+    let rows = &preview.rows;
     let mut lines = Vec::new();
-    for row in &preview.rows {
-        let rendered = match row {
-            DiffRow::Del { text, .. } => format!("- {}", sanitize_line(text, WIDTH)),
-            DiffRow::Add { text, .. } => format!("+ {}", sanitize_line(text, WIDTH)),
-            _ => continue,
-        };
-        lines.push(rendered);
-        if lines.len() >= max_lines {
-            break;
+    // Count only changed (Del/Add) rows against `max_lines`; the caret pointer a
+    // windowed pair emits is decoration, not another change.
+    let mut changed = 0;
+    let mut i = 0;
+    while i < rows.len() && changed < max_lines {
+        match &rows[i] {
+            // A Del immediately followed by an Add is a line replacement: window
+            // both sides around the characters that actually differ (with a caret
+            // pointing at them) so a change past the truncation column is visible
+            // instead of hidden behind an identical-looking `…`.
+            DiffRow::Del { text: del, .. } => {
+                if let Some(DiffRow::Add { text: add, .. }) = rows.get(i + 1) {
+                    let (dline, aline, caret) = windowed_change_pair(del, add, WIDTH);
+                    lines.push(format!("- {dline}"));
+                    lines.push(format!("+ {aline}"));
+                    lines.push(caret);
+                    changed += 2;
+                    i += 2;
+                    continue;
+                }
+                lines.push(format!("- {}", sanitize_line(del, WIDTH)));
+                changed += 1;
+            }
+            DiffRow::Add { text, .. } => {
+                lines.push(format!("+ {}", sanitize_line(text, WIDTH)));
+                changed += 1;
+            }
+            _ => {}
         }
+        i += 1;
     }
     if lines.is_empty() {
         return None;
     }
     let total = preview.added + preview.removed;
-    if total > lines.len() {
-        let extra = total - lines.len();
+    if total > changed {
+        let extra = total - changed;
         lines.push(format!("… (+{extra} more changed {})", plural(extra)));
     }
     Some(lines.join("\n"))
+}
+
+/// Renders a replaced line as an aligned `(old, new, caret)` triple, each window
+/// centered on the characters that differ. Both sides are stripped of control
+/// characters, then a common-prefix/suffix scan locates the changed span; if the
+/// new line is longer than `width`, the window slides to keep that span on-screen
+/// (elided head/tail marked with `…`). The caret row underlines the changed
+/// characters beneath the rendered `+ ` line.
+#[cfg_attr(not(ds4_engine), allow(dead_code))]
+fn windowed_change_pair(old: &str, new: &str, width: usize) -> (String, String, String) {
+    let o: Vec<char> = old.chars().filter(|c| !c.is_control()).collect();
+    let n: Vec<char> = new.chars().filter(|c| !c.is_control()).collect();
+
+    // Longest common prefix, then longest common suffix that does not overlap it.
+    let prefix = o.iter().zip(&n).take_while(|(a, b)| a == b).count();
+    let max_suffix = o.len().min(n.len()) - prefix;
+    let mut suffix = 0;
+    while suffix < max_suffix && o[o.len() - 1 - suffix] == n[n.len() - 1 - suffix] {
+        suffix += 1;
+    }
+    // Changed span in the new line: [prefix, change_end).
+    let change_end = n.len() - suffix;
+
+    // Slide the window so the change stays visible, keeping a little lead-in.
+    let mut start = 0;
+    if n.len() > width {
+        // Keep a little lead-in context before the change.
+        const LEAD: usize = 16;
+        start = prefix.saturating_sub(LEAD);
+        if change_end > start + width {
+            start = change_end - width;
+        }
+        start = start.min(n.len() - width);
+    }
+
+    // Column where the change begins on the rendered `+ ` line: the "+ " gutter,
+    // plus a leading `…` when the head was elided, plus the in-window offset.
+    let gutter = 2;
+    let lead_ellipsis = usize::from(start > 0);
+    let caret_col = gutter + lead_ellipsis + (prefix - start);
+    let visible_change_end = change_end.min(start + width);
+    let caret_len = visible_change_end.saturating_sub(prefix).max(1);
+    let caret = format!("{}{}", " ".repeat(caret_col), "^".repeat(caret_len));
+
+    (window(&o, start, width), window(&n, start, width), caret)
+}
+
+/// Slices `width` characters of `chars` starting at `start`, marking an elided
+/// head and/or tail with `…`. `start` is a character index shared with the
+/// paired line so their common prefix stays column-aligned.
+#[cfg_attr(not(ds4_engine), allow(dead_code))]
+fn window(chars: &[char], start: usize, width: usize) -> String {
+    if start >= chars.len() {
+        return if start > 0 {
+            "…".to_string()
+        } else {
+            String::new()
+        };
+    }
+    let end = (start + width).min(chars.len());
+    let mut out = String::new();
+    if start > 0 {
+        out.push('…');
+    }
+    out.extend(&chars[start..end]);
+    if end < chars.len() {
+        out.push('…');
+    }
+    out
 }
 
 /// One diff line made safe for a single terminal row: control characters
@@ -320,6 +410,38 @@ mod tests {
 
         // Identical texts have no change to show.
         assert!(first_change_snippet(old, old, 5).is_none());
+    }
+
+    #[test]
+    fn snippet_windows_a_change_past_the_truncation_column() {
+        // A long line whose only edit sits well past column 80: the naive
+        // truncate-from-start rendering showed both sides identically (the change
+        // hidden behind `…`). The window must slide so the differing text is
+        // visible, with a caret pointing at it.
+        let head = "\"description\": \"Build an AI-ready context for a task description. Returns ";
+        let old = format!("{head}relevant symbols and Xold snippets.\"\n");
+        let new = format!("{head}relevant symbols and Ynew snippets.\"\n");
+        let snip = first_change_snippet(&old, &new, 5).expect("differs");
+
+        let minus = snip.lines().find(|l| l.starts_with("- ")).expect("del");
+        let plus = snip.lines().find(|l| l.starts_with("+ ")).expect("add");
+        // The two rendered change lines must not look identical anymore.
+        assert_ne!(minus, plus, "change is visible, not hidden: {snip:?}");
+        assert!(minus.contains("Xold"), "old change shown: {minus:?}");
+        assert!(plus.contains("Ynew"), "new change shown: {plus:?}");
+
+        // A caret row points at the changed characters under the `+` line.
+        let caret = snip
+            .lines()
+            .find(|l| l.trim_start().starts_with('^'))
+            .expect("caret");
+        let caret_col = caret.find('^').unwrap();
+        // The caret sits under the first differing char ('Y') of the `+` line.
+        assert_eq!(
+            plus.chars().nth(caret_col),
+            Some('Y'),
+            "caret under the change: plus={plus:?} caret={caret:?}"
+        );
     }
 
     #[test]
