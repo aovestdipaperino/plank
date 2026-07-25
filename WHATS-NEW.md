@@ -5,9 +5,9 @@ see the GitHub releases and commit history.
 
 ## 2.6.0
 
-The 2.5 beta line, promoted. Six weeks of the cache learning to keep what it
-already knows, plus session branching, a handful of commands, and a lot of
-progress-reporting that finally tells the truth.
+The 2.5 beta line, promoted: five betas' worth of the cache learning to keep
+what it already knows, plus session branching, a handful of commands, and a lot
+of progress-reporting that finally tells the truth.
 
 ⚡ **`/new` is fast again.** Starting a fresh session used to throw away the
 system-prompt cache and rebuild it from scratch — thousands of tokens, twenty
