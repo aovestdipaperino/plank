@@ -21,7 +21,7 @@ pub enum Ds4Backend {
 
 /// Reasoning mode, mirroring `ds4_think_mode`.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ds4ThinkMode {
     None = 0,
     High = 1,

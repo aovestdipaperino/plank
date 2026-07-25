@@ -516,12 +516,12 @@ fn now_secs() -> u64 {
 fn render_transcript(session: &Session, system: &str) -> String {
     use std::fmt::Write as _;
     let mut out = format!("[system]\n{system}\n");
-    // The task list (issue #35) is injected fresh every turn from session
-    // state, so it costs a fixed few tokens and is never summarized away by
-    // compaction. An empty list adds nothing.
-    if let Some(block) = session.tasks.inject_block() {
-        let _ = write!(out, "[user]\n{block}\n");
-    }
+    // Append-only invariant (matching the C's token transcript): nothing is
+    // ever injected between the system prompt and the messages, or the
+    // engine's KV common-prefix probe would stop right after the system
+    // prompt and re-prefill the whole conversation every turn. The task list
+    // (issue #35) reaches the model through appended `task` tool observations
+    // and a one-time re-injection after compaction instead.
     for m in &session.transcript {
         let tag = match m.role {
             crate::session::Role::User => "user",
@@ -1559,6 +1559,12 @@ impl Agent<'_> {
             &mut |s| self.engine.count_tokens(s),
         );
         if let Some(block) = reinject {
+            self.session.push(Message::user(block));
+        }
+        // The rebuild already invalidated the KV prefix, so re-surfacing the
+        // task list here is free — and afterwards the transcript is append-only
+        // again, keeping the engine's cached prefix valid (issue #35).
+        if let Some(block) = self.session.tasks.inject_block() {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
@@ -5724,28 +5730,29 @@ mod tests {
     use std::rc::Rc;
 
     #[test]
-    fn render_transcript_injects_the_task_list_after_the_system_block() {
+    fn render_transcript_never_injects_the_task_list_mid_transcript() {
+        // Append-only invariant: a task-list change must not rewrite the
+        // rendered prompt between the system block and the messages, or the
+        // engine's KV common-prefix reuse dies at the top of the transcript
+        // and every turn re-prefills the whole conversation.
         let mut s = Session::new();
         s.push(Message::user("hello"));
-        // Empty list: no injection, nothing extra in the prompt.
-        assert!(!render_transcript(&s, "SYS").contains("Task list"));
+        let before = render_transcript(&s, "SYS");
         s.tasks.add("do the thing", None);
         s.tasks
             .update(1, Some(crate::tasks::TaskStatus::InProgress), None, None)
             .unwrap();
-        let rendered = render_transcript(&s, "SYS");
-        assert!(rendered.starts_with("[system]\nSYS\n"));
-        assert!(rendered.contains("# Task list"), "{rendered}");
-        assert!(
-            rendered.contains("- [1] in_progress: do the thing"),
-            "{rendered}"
-        );
+        let after = render_transcript(&s, "SYS");
+        assert_eq!(before, after, "task state must not perturb the rendering");
+        assert!(after.starts_with("[system]\nSYS\n[user]\nhello\n"));
+        assert!(!after.contains("# Task list"), "{after}");
     }
 
     #[test]
     fn task_list_survives_transcript_compaction() {
-        // Compaction rewrites the transcript but never the task list, so the
-        // per-turn injection keeps showing it (issue #35 acceptance).
+        // Compaction rewrites the transcript but never the task list state
+        // (issue #35 acceptance); the model re-sees it via the one-time
+        // re-injection in `rebuild_after_compact`, not via render_transcript.
         let mut s = Session::new();
         for i in 0..40 {
             s.push(Message::user(format!(
@@ -5759,7 +5766,24 @@ mod tests {
         let cleared = crate::compact::microcompact(&mut s.transcript);
         assert!(cleared > 0, "compaction should clear some large results");
         assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
-        assert!(render_transcript(&s, "SYS").contains("keep me across compaction"));
+        let block = s.tasks.inject_block().expect("non-empty list has a block");
+        assert!(block.contains("keep me across compaction"));
+    }
+
+    #[test]
+    fn rebuild_after_compact_reinjects_the_task_list_once() {
+        let dir = scratch_dir("compact-tasks");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("old context"));
+        agent.session.tasks.add("still pending after compact", None);
+        agent.rebuild_after_compact("<summary>did things</summary>");
+        let rendered = render_transcript(&agent.session, "SYS");
+        assert!(
+            rendered.contains("# Task list") && rendered.contains("still pending after compact"),
+            "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A `Write` sink backed by a shared buffer so a test can inspect the exact

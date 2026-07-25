@@ -63,27 +63,86 @@ test` and review the diff before committing.
 - **KV-cache identity is textual, not structural.** The sysprompt checkpoint
   fingerprint is SHA-1(model name ‖ NUL ‖ system prompt text); a mismatched
   fingerprint means rebuild, never trust (`src/ds4engine.rs`,
-  `checkpoint_fingerprint`). Retokenizing the previous reply's *text* does
-  not reproduce its sampled token ids, so the engine remembers the exact
-  sampled tokens of the last reply and splices them into the next prompt —
-  otherwise the KV common-prefix probe diverges at the start of the reply and
-  the whole tail re-prefills (`src/ds4engine.rs`, `build_tokens`).
+  `checkpoint_fingerprint`). Retokenizing a previous reply's *text* does
+  not reproduce its sampled token ids: BPE encoding is many-to-one, and the
+  tokenizer picks *one* canonical segmentation (its merge order), while the
+  sampler is free to emit any of the equivalent sequences — it can sample
+  `"in"`+`"to"` where the encoder would produce `"into"`, split a number or
+  identifier at a different boundary, or emit a rare standalone token the
+  merge rules would have absorbed. Detokenize-then-retokenize is therefore
+  not the identity on token ids even though it is on text (and trailing-
+  whitespace trimming plus multi-byte characters split across tokens add
+  further drift at the edges). One different id shifts every byte after it,
+  so the KV common-prefix probe diverges at the first such reply. The C never
+  faces this because it is token-first: `w->transcript` is the append-only
+  *token* buffer — sampled tokens are appended to it directly during
+  generation and it is what gets persisted in the session `.kv` — while text
+  is always *derived* from tokens (`ds4_kvstore_render_tokens_text`) for
+  display and export, never the reverse. The C retokenizes text
+  (`ds4_tokenize_rendered_chat`) only when loading a *stripped* session whose
+  token payload was deleted ("rebuilt from text" in `ds4_agent.c`), accepting
+  the one-time full re-prefill that implies. Plank inverts the
+  representation — the text transcript is primary — so it must carry the
+  sampled tokens alongside as splice state instead. That inversion is
+  deliberate, not an accident of porting: token ids only mean anything to the
+  one ds4 vocabulary, while plank's `Engine` trait spans backends with no
+  shared token space (`EchoEngine` in every CI run, remote provider engines
+  that take text or structured messages and tokenize server-side), so text is
+  the only representation every engine can consume. Everything above the
+  engine boundary also wants text: compaction feeds the transcript back
+  through the model as prose and splices summaries in, `render_transcript`
+  is the C-parity surface the fixtures byte-compare, and the v1 session
+  format keeps transcripts readable/greppable on disk rather than as an
+  id dump that dies with its vocabulary. The cost of that choice is exactly
+  this entry: the one token-exact backend must remember its sampled ids on
+  the side (`replies` + the payload wrap) instead of getting exactness for
+  free from an append-only token buffer. Could the token buffer be the
+  source of truth instead, since token → text is deterministic and text
+  could always be derived (the C's model)? For the ds4 backend alone, yes —
+  that is literally the C design. As plank's global source of truth, no:
+  a token transcript is bound to one vocabulary, so provider engines (which
+  never see ids) and any model/engine switch would need the derived-text
+  path anyway, making text the de-facto interchange format with tokens as a
+  cache — which is the current design viewed from the other side. Note that
+  text-shaped mutations are *not* a blocker for token-primary: rewrite ops
+  (compaction, tool-result clearing) can detokenize → edit the text →
+  retokenize back into the buffer, and the C does exactly this
+  (`ds4_kvstore_render_tokens_text` → rewrite → `ds4_tokenize_rendered_chat`).
+  The retokenized ids differ from the sampled ones, but a rewrite already
+  invalidates the KV at the rewrite point, so the re-prefill this forces
+  coincides with one that was due anyway — and rewrites are rare, so the
+  cost amortizes to nothing. The decisive argument is the vocabulary
+  binding alone: with multiple backends and no shared token space, tokens
+  cannot be the interchange format, only the ds4-local cache. That is why
+  the engine keeps the exact sampled tokens of *every* reply still present in
+  the transcript (`replies:
+  Vec<SampledReply>`, the Rust half of the C's append-only token transcript)
+  and splices each matching assistant section into the next prompt — otherwise
+  the KV common-prefix probe diverges at the start of the first re-templated
+  reply and the whole tail re-prefills (`src/ds4engine.rs`, `build_tokens` /
+  `plan_splices`). Replies whose text left the transcript (compaction,
+  rollback, sidechain truncation) are pruned after each build — text-matching
+  is exact, so they can never match again.
 - **Per-session KV payloads cannot share the transcript's `.kv` name, and a
-  restored payload must drop the spliced-reply cache.** The C stores the
-  engine payload inside the session `.kv` file; plank's v1 transcript format
-  already owns that name, so payloads live in a `<sha>.payload` sidecar
-  (fingerprint line + `ds4_session_save_snapshot` bytes, same layout as
+  restored payload must restore the reply history captured with it.** The C
+  stores the engine payload inside the session `.kv` file; plank's v1
+  transcript format already owns that name, so payloads live in a
+  `<sha>.payload` sidecar (fingerprint line + payload bytes, same layout as
   `sysprompt.kv`). The fingerprint covers model ‖ NUL ‖ system prompt ‖ NUL ‖
   rendered transcript, so a resave after more turns (or compaction) is
-  detected as stale. And because `Ds4Engine` splices the *previous* reply's
-  exact sampled tokens into the next prompt build, restoring a snapshot from
-  another conversation with `last_reply` still set would splice the wrong
-  tokens — `Ds4Session::restore_kv` clears it (`src/ds4engine.rs`), and the
-  payload load path (`Agent::load_session_payload` in `src/ui.rs`) goes
-  through `restore_kv` so it inherits that. The raw KV bytes are the shared
-  `snapshot_kv`/`restore_kv` primitive (`SessionSnapshot::as_bytes` /
-  `restore_bytes`); the `.payload` sidecar and fingerprint only wrap them, so
-  there is no second hand-rolled KV-serialize path.
+  detected as stale. Because prompt builds splice every remembered reply's
+  exact sampled tokens, the payload carries the serialized reply history in
+  front of the raw KV bytes (`plank-replies-v1\n` magic, `encode_replies` /
+  `decode_replies` in `src/ds4engine.rs`): `snapshot_kv` writes both
+  atomically and `restore_kv` restores both, so a resumed session splices the
+  restored KV's own replies (never another conversation's — the two travel
+  together) and only prefills genuinely new tokens. A legacy payload without
+  the magic restores with an empty history: correct, just re-prefills from
+  the first reply. The host idle-reclaim path (`snapshot_bytes` /
+  `restore_bytes` on `Ds4HostSession`) uses the same wrap. The raw KV bytes
+  remain the single `SessionSnapshot` primitive; the sidecar, fingerprint,
+  and reply header only wrap them, so there is no second hand-rolled
+  KV-serialize path.
 - **`count_tokens` must subtract chat-template overhead** so it reports
   text-only counts; the template wrapper is measured once at engine startup
   (`src/ds4engine.rs`).
@@ -101,19 +160,22 @@ test` and review the diff before committing.
   idempotent and lossless — the KV, cursor, and any partial reply come back
   byte-identical, which is what makes an unconditional-restore RAII guard
   (`RestoreOnDrop`) safe on the aside interrupt/error path.
-- **Resuming a suspended pass reuses the partial via `last_reply` splicing, not
+- **Resuming a suspended pass reuses the partial via reply splicing, not
   a longer prompt string.** After an in-pass `/btw` suspend (`--btw-suspend`),
   the worker resumes the frozen main pass by re-invoking `generate` with the
   prompt `render_transcript(...) + "[assistant]\n" + partial`. That extra
-  assistant section matters: `Ds4Engine::build_tokens` only splices the exact
-  sampled tokens of `last_reply` when the transcript's last assistant section's
-  text *equals* `last_reply.text`. Match, and `ds4_session_common_prefix` reaches
-  through the partial and only the closing EOS + new assistant prefix are
-  prefilled (≈2 tokens); mismatch (e.g. a trailing-whitespace drift, since
-  `last_reply.text` is `trim_end`-ed), and it silently falls back to
-  re-prefilling the partial's text — still correct output, just not free.
-  `generate_aside` preserves `last_reply` across the aside (save/restore) so the
-  splice is available on resume. The worker orchestration is straight-line in
+  assistant section matters: `Ds4Engine::build_tokens` only splices a
+  remembered reply's exact sampled tokens when an assistant section's text
+  *equals* that reply's text (`plan_splices`). Match, and
+  `ds4_session_common_prefix` reaches through the partial and only the closing
+  EOS + new assistant prefix are prefilled (≈2 tokens); mismatch (e.g. a
+  trailing-whitespace drift, since reply text is `trim_end`-ed), and it
+  silently falls back to re-prefilling the partial's text — still correct
+  output, just not free. After resume, the partial and its continuation sit in
+  the history as two entries while the transcript shows one merged section, so
+  that turn re-templates once and both entries prune — bounded, not
+  compounding. `generate_aside` restores a pre-aside copy of the history (the
+  aside still splices the shared prefix) so the splice is available on resume. The worker orchestration is straight-line in
   `Agent::worker_turn` (`src/ui.rs`): the engine owns the token loop, so
   "suspend" is `stop-at-boundary → generate_aside → resume`, not a callback
   interposed mid-loop.
@@ -230,3 +292,40 @@ test` and review the diff before committing.
   stream (EchoEngine's 8-byte chunking deliberately splits a 🦀 to keep the
   stub honest); `viz::StreamRenderer` already had its own carry for the same
   reason.
+
+- **The rendered transcript must be append-only — never inject or rewrite
+  anything between the system prompt and the newest message.** The C keeps
+  `w->transcript` as an append-only *token* buffer, so
+  `ds4_session_common_prefix` always reaches the previous turn's end and only
+  the new suffix is prefilled. Plank re-renders the transcript from text each
+  turn, so the same invariant must hold on the rendered bytes: any
+  mid-transcript mutation moves the first divergent token to that point and
+  everything after it is re-prefilled. Issue #35's task list broke this by
+  injecting a fresh `[user]` task block right after `[system]` every turn — one
+  `task add`/`update` changed the tokens at the very top and the *entire
+  conversation* re-prefilled on every subsequent turn. The fix: mutating `task`
+  ops append the current list to their tool observation (append-only by
+  construction), and the block is re-injected only inside
+  `rebuild_after_compact`, where the KV prefix is already invalidated. Apply
+  the same rule to any future "always visible" state: piggyback it on appended
+  messages, or accept a full re-prefill.
+
+- **The TUI must not re-render streamed markdown on every token — code-block
+  syntax highlighting is not free.** `OutputLog::visible_text` (`src/tui.rs`)
+  re-parses and re-renders the whole in-progress segment on each append so
+  partial fences/emphasis resolve as more text arrives. That is fine for prose,
+  but a fenced code block routes through `ratatui-markdown`'s tree-sitter
+  highlighter, whose `TreeSitterHighlighter::highlight` recompiles the
+  highlight query (`HighlightConfiguration::new`) on *every* call — no
+  per-language cache, ~44 ms per render for a Rust block in a debug build. Per
+  token that is O(tokens²) with a large constant: the UI thread never yields
+  back to paint and the whole TUI wedges at 100% CPU the instant a code block
+  streams (looks like a deadlock; it is a livelock). Fix: `md_render` is
+  throttled to at most once per `MD_RENDER_MIN_GAP` (100 ms) while streaming,
+  with a guaranteed `flush_md` at every segment boundary (`md_close`,
+  `end_line`) so no tail tokens are lost; `md_close` resets the throttle so a
+  new segment's first token still renders immediately. The upstream recompile
+  is the real bug (celestia-island/ratatui-markdown#18; already fixed on their
+  unreleased `master`, which also relicensed to SySL-1.0 — watch that before
+  upgrading). The throttle is worth keeping regardless: it bounds cost for
+  large blocks even once the config is cached.

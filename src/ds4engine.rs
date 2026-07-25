@@ -54,13 +54,21 @@ pub struct Ds4Model {
 unsafe impl Send for Ds4Model {}
 unsafe impl Sync for Ds4Model {}
 
-/// The most recent generated reply, kept so the next prompt can splice the
-/// exact sampled token sequence for that assistant turn instead of
-/// re-templating its text. Retokenized text is not guaranteed to reproduce
-/// the sampled tokens, and a mismatch invalidates the live KV prefix at the
-/// start of the reply, forcing it to be re-prefilled on the follow-up turn.
-#[derive(Debug)]
-struct LastReply {
+/// One generated reply, kept so later prompt builds splice the exact sampled
+/// token sequence for that assistant turn instead of re-templating its text.
+/// Retokenized text is not guaranteed to reproduce the sampled tokens — BPE
+/// segmentation is many-to-one, and the sampler may emit any equivalent
+/// sequence (e.g. `"in"`+`"to"`) while the encoder always picks its one
+/// canonical merge — and a mismatch invalidates the live KV prefix at the
+/// start of the reply, forcing everything after it to be re-prefilled on the
+/// follow-up turn.
+///
+/// The session keeps a `Vec` of these — the token-transcript half of the C's
+/// append-only `w->transcript` — so *every* assistant section still present in
+/// the rendered transcript re-enters the prompt as its original tokens and the
+/// KV common-prefix probe reaches the previous turn's end (full C parity).
+#[derive(Debug, Clone, PartialEq)]
+struct SampledReply {
     /// Concatenated token text, trailing-whitespace-trimmed to compare
     /// against `parse_sections` output.
     text: String,
@@ -328,35 +336,32 @@ impl Ds4Model {
     /// Builds chat-template tokens from a role-tagged transcript.
     ///
     /// The transcript uses `[system]`/`[user]`/`[assistant]` section markers
-    /// produced by the UI; each section becomes a ds4 chat message. When
-    /// `last_reply` matches the final assistant section, its exact sampled
-    /// tokens are spliced in so the live KV prefix reaches through it.
+    /// produced by the UI; each section becomes a ds4 chat message. Every
+    /// assistant section whose text matches a remembered sampled reply is
+    /// spliced in as its exact sampled tokens (see [`plan_splices`]), so the
+    /// KV common-prefix probe reaches through the whole unchanged prefix —
+    /// the same effect as the C's append-only token transcript.
+    ///
+    /// Returns the tokens and the (strictly increasing) indices of the
+    /// replies that matched, so the caller can prune the ones whose sections
+    /// left the transcript (compaction, checkpoint rollback, sidechain
+    /// truncation) — they can never match again.
     fn build_tokens(
         &self,
         transcript: &str,
         think: ThinkMode,
-        last_reply: Option<&LastReply>,
-    ) -> Ds4TokensGuard {
+        replies: &[SampledReply],
+    ) -> (Ds4TokensGuard, Vec<usize>) {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the whole build.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
         let sections = parse_sections(transcript);
-        // Splice the exact sampled tokens for the reply generated last turn
-        // (the final assistant section, when its text matches) so the KV
-        // common-prefix probe reaches through it instead of diverging on a
-        // retokenization of its text. Earlier assistant turns were prefilled
-        // from re-templated text already, so they stay text-rendered.
-        let splice_idx = last_reply.and_then(|last| {
-            sections
-                .iter()
-                .rposition(|(role, _)| *role == "assistant")
-                .filter(|&i| sections[i].1 == last.text)
-        });
+        let plan = plan_splices(&sections, replies);
+        let mut matched = Vec::new();
         for (i, (role, content)) in sections.iter().enumerate() {
-            if Some(i) == splice_idx
-                && let Some(last) = last_reply
-            {
-                Self::append_reply_tokens(self.engine, &mut tokens, last);
+            if let Some(j) = plan[i] {
+                Self::append_reply_tokens(self.engine, &mut tokens, &replies[j]);
+                matched.push(j);
                 continue;
             }
             let (Ok(c_role), Ok(c_content)) = (CString::new(*role), CString::new(content.clone()))
@@ -381,16 +386,16 @@ impl Ds4Model {
                 ds4_think(think),
             );
         }
-        tokens
+        (tokens, matched)
     }
 
-    /// Appends the last generated reply as its exact sampled token sequence:
+    /// Appends one remembered reply as its exact sampled token sequence:
     /// the assistant prefix it followed, the sampled tokens, and the closing
     /// EOS (which generation sampled but never evaluated).
     fn append_reply_tokens(
         engine: *mut ffi::Ds4Engine,
         tokens: &mut Ds4TokensGuard,
-        last: &LastReply,
+        last: &SampledReply,
     ) {
         // SAFETY: engine and tokens valid; think matches generation.
         unsafe { ffi::ds4_chat_append_assistant_prefix(engine, tokens.as_mut_ptr(), last.think) };
@@ -471,7 +476,7 @@ impl ModelHandle for Ds4Model {
         let inner = Ds4Session {
             model: Arc::clone(&self),
             session,
-            last_reply: None,
+            replies: Vec::new(),
         };
         Ok(Box::new(Ds4HostSession {
             inner,
@@ -503,7 +508,11 @@ impl ModelHandle for Ds4Model {
 pub struct Ds4Session {
     model: Arc<Ds4Model>,
     session: *mut ffi::Ds4Session,
-    last_reply: Option<LastReply>,
+    /// Sampled token history for every assistant reply still in the rendered
+    /// transcript, in chronological order — the Rust half of the C's
+    /// append-only token transcript. Persisted with the KV in
+    /// `snapshot_kv`/`restore_kv` so a resumed session keeps full prefix reuse.
+    replies: Vec<SampledReply>,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -547,7 +556,7 @@ impl Ds4Session {
         Self {
             model,
             session: std::ptr::null_mut(),
-            last_reply: None,
+            replies: Vec::new(),
         }
     }
 
@@ -633,9 +642,13 @@ impl Engine for Ds4Session {
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<GenerationStats, EngineError> {
         let transcript = prompt.flat();
-        let tokens = self
+        let (tokens, matched) = self
             .model
-            .build_tokens(transcript, opts.think_mode, self.last_reply.as_ref());
+            .build_tokens(transcript, opts.think_mode, &self.replies);
+        // Replies whose sections left the transcript (compaction, rollback,
+        // sidechain truncation) can never match again — drop them so the
+        // history tracks the live transcript.
+        retain_matched(&mut self.replies, &matched);
         let prompt_len = tokens.len();
 
         // Reuse the live session across turns so its cached KV prefix (the
@@ -760,19 +773,17 @@ impl Engine for Ds4Session {
             on_event(EngineEvent::Text(tail));
         }
 
-        // Remember the sampled reply so the next prompt build can splice these
-        // exact tokens for its assistant section, keeping the live KV prefix
-        // valid through the whole reply (see `build_tokens`).
+        // Append the sampled reply to the token history so every later prompt
+        // build splices these exact tokens for its assistant section, keeping
+        // the live KV prefix valid through the whole reply (see `build_tokens`).
         reply_text.truncate(reply_text.trim_end().len());
-        self.last_reply = if reply_tokens.is_empty() {
-            None
-        } else {
-            Some(LastReply {
+        if !reply_tokens.is_empty() {
+            self.replies.push(SampledReply {
                 text: reply_text,
                 tokens: reply_tokens,
                 think: ds4_think(opts.think_mode),
-            })
-        };
+            });
+        }
 
         let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
         let secs = start.elapsed().as_secs_f64();
@@ -813,10 +824,12 @@ impl Engine for Ds4Session {
         });
 
         // Step 4: the aside's tokens must not perturb the main context
-        // accounting. `last_reply` is the only mutable splice/accounting state
-        // `generate` touches; take it now and put it back afterwards so the
-        // main task's next prompt build splices its own reply, not the aside's.
-        let saved_reply = self.last_reply.take();
+        // accounting. The reply history is the only mutable splice/accounting
+        // state `generate` touches; keep it in place so the aside's prompt
+        // build still splices the shared transcript prefix, and restore this
+        // copy afterwards so the aside's own reply (and any pruning its
+        // divergent prompt caused) never leaks into the main task's history.
+        let saved_replies = self.replies.clone();
 
         // Step 2: answer destructively on the same session. `ds4_session_sync`
         // rolls the cursor back to the common prefix with the frozen KV (the
@@ -834,7 +847,7 @@ impl Engine for Ds4Session {
 
         // Restore the main task's accounting state regardless of the aside's
         // outcome; the KV itself is restored when `_restore` drops next.
-        self.last_reply = saved_reply;
+        self.replies = saved_replies;
         result
     }
 
@@ -963,22 +976,30 @@ impl Engine for Ds4Session {
         }
         // Reuse the single snapshot primitive (src/snapshot.rs) rather than
         // hand-rolling the FFI: capture owns an engine buffer and frees it on
-        // drop; we copy the payload out for the caller to persist.
+        // drop; we copy the payload out for the caller to persist. The reply
+        // history rides in front of the KV bytes so a restore reconstructs
+        // the same splice state the KV was captured with — without it, every
+        // reply re-templates and the resumed KV is largely wasted.
         let snap = SessionSnapshot::capture(self.session).ok()?;
-        Some(snap.as_bytes().to_vec())
+        let mut out = encode_replies(&self.replies);
+        out.extend_from_slice(snap.as_bytes());
+        Some(out)
     }
 
     fn restore_kv(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
         let session = self.ensure_session()?;
+        // Split off the reply history captured with this KV (legacy payloads
+        // have none: restorable, but the next turn re-templates every reply
+        // and re-prefills from the first divergence).
+        let (replies, kv) = match decode_replies(bytes) {
+            Some((replies, off)) => (replies, &bytes[off..]),
+            None => (Vec::new(), bytes),
+        };
         // Load our own persisted bytes through the non-owning restore path
         // (the engine copies from a transient struct and never frees it);
         // see snapshot.rs / FINDINGS.md.
-        SessionSnapshot::restore_bytes(session, bytes)?;
-        // The live session now holds the checkpoint's token state. The last
-        // sampled reply no longer describes the restored tail, so drop it;
-        // the next turn re-templates that final assistant turn from text
-        // (a small re-prefill), while the bulk of the prefix stays cached.
-        self.last_reply = None;
+        SessionSnapshot::restore_bytes(session, kv)?;
+        self.replies = replies;
         Ok(())
     }
 }
@@ -1033,11 +1054,11 @@ impl Ds4HostSession {
         interrupt: &AtomicBool,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<Result<GenState, GenerationStats>, EngineError> {
-        let tokens = self.inner.model.build_tokens(
-            transcript,
-            opts.think_mode,
-            self.inner.last_reply.as_ref(),
-        );
+        let (tokens, matched) =
+            self.inner
+                .model
+                .build_tokens(transcript, opts.think_mode, &self.inner.replies);
+        retain_matched(&mut self.inner.replies, &matched);
         let prompt_len = tokens.len();
         let session = self.inner.ensure_session()?;
 
@@ -1126,15 +1147,13 @@ impl Ds4HostSession {
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
         reply_text.truncate(reply_text.trim_end().len());
-        self.inner.last_reply = if st.reply_tokens.is_empty() {
-            None
-        } else {
-            Some(LastReply {
+        if !st.reply_tokens.is_empty() {
+            self.inner.replies.push(SampledReply {
                 text: reply_text,
                 tokens: st.reply_tokens,
                 think: ds4_think(st.opts.think_mode),
-            })
-        };
+            });
+        }
         let secs = st.start.elapsed().as_secs_f64();
         // SAFETY: session valid (created during prefill).
         let ctx_used = unsafe { ffi::ds4_session_pos(self.inner.session) };
@@ -1241,8 +1260,13 @@ impl HostSession for Ds4HostSession {
         // Reuse the single snapshot primitive; copy out an owned buffer so the
         // engine-owned snapshot is freed here (the returned Vec is Rust's, and
         // the disk-read restore path must never free it — FINDINGS double-free).
+        // The reply history rides in front of the KV bytes (same wrap as
+        // `snapshot_kv`) so an idle-reclaimed session resumes with its splice
+        // state intact and only prefills genuinely new tokens.
         let snap = SessionSnapshot::capture(self.inner.session).ok()?;
-        Some(snap.as_bytes().to_vec())
+        let mut out = encode_replies(&self.inner.replies);
+        out.extend_from_slice(snap.as_bytes());
+        Some(out)
     }
 
     fn restore_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
@@ -1250,9 +1274,14 @@ impl HostSession for Ds4HostSession {
         // shared system-prompt prefix). Disk-read bytes use the non-owning FFI
         // path so the engine never frees Rust's buffer (FINDINGS double-free).
         let session = self.inner.ensure_session()?;
-        SessionSnapshot::restore_bytes(session, bytes)?;
-        // The restored KV/cursor supersedes any Rust-side splice state.
-        self.inner.last_reply = None;
+        let (replies, kv) = match decode_replies(bytes) {
+            Some((replies, off)) => (replies, &bytes[off..]),
+            None => (Vec::new(), bytes),
+        };
+        SessionSnapshot::restore_bytes(session, kv)?;
+        // The restored KV/cursor and its captured reply history supersede any
+        // prior Rust-side splice state.
+        self.inner.replies = replies;
         self.pending = None;
         self.active = None;
         Ok(())
@@ -1363,6 +1392,105 @@ fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
 }
 
 /// Splits a role-tagged transcript into `(role, content)` chat messages.
+/// Maps each transcript section to the sampled reply it should splice:
+/// `plan[i] == Some(j)` when section `i` is an assistant section whose text
+/// equals `replies[j].text`. Sections and replies are both chronological, so
+/// matching scans forward with a cursor — a reply whose section was compacted
+/// or rolled away is skipped (and never reused), preserving order. Matched
+/// indices are therefore strictly increasing.
+fn plan_splices(sections: &[(&str, String)], replies: &[SampledReply]) -> Vec<Option<usize>> {
+    let mut next = 0;
+    sections
+        .iter()
+        .map(|(role, text)| {
+            if *role != "assistant" {
+                return None;
+            }
+            let j = (next..replies.len()).find(|&j| replies[j].text == *text)?;
+            next = j + 1;
+            Some(j)
+        })
+        .collect()
+}
+
+/// Keeps only the replies whose indices appear in `matched` (strictly
+/// increasing, as produced by [`Ds4Model::build_tokens`]), preserving order.
+fn retain_matched(replies: &mut Vec<SampledReply>, matched: &[usize]) {
+    let mut it = matched.iter().peekable();
+    let mut i = 0;
+    replies.retain(|_| {
+        let keep = it.peek() == Some(&&i);
+        if keep {
+            it.next();
+        }
+        i += 1;
+        keep
+    });
+}
+
+/// Magic prefix marking a KV payload that carries the serialized reply
+/// history ahead of the raw engine snapshot bytes. Payloads without it are
+/// legacy raw-KV files: still restorable, but with no splice history the next
+/// turn re-templates every reply and re-prefills from the first divergence.
+const REPLIES_MAGIC: &[u8] = b"plank-replies-v1\n";
+
+/// Serializes the reply history: count, then per reply the think mode, the
+/// sampled token IDs, and the trimmed text (all length-prefixed, little
+/// endian).
+fn encode_replies(replies: &[SampledReply]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(REPLIES_MAGIC);
+    out.extend_from_slice(&u32::try_from(replies.len()).unwrap_or(0).to_le_bytes());
+    for r in replies {
+        out.push(r.think as u8);
+        out.extend_from_slice(&u32::try_from(r.tokens.len()).unwrap_or(0).to_le_bytes());
+        for &t in &r.tokens {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out.extend_from_slice(&u32::try_from(r.text.len()).unwrap_or(0).to_le_bytes());
+        out.extend_from_slice(r.text.as_bytes());
+    }
+    out
+}
+
+/// Parses an [`encode_replies`] header, returning the history and the offset
+/// where the raw KV snapshot bytes begin. `None` when the magic is absent (a
+/// legacy raw-KV payload) or the header is malformed.
+fn decode_replies(bytes: &[u8]) -> Option<(Vec<SampledReply>, usize)> {
+    let rest = bytes.strip_prefix(REPLIES_MAGIC)?;
+    let mut pos = 0;
+    let take = |pos: &mut usize, n: usize| -> Option<&[u8]> {
+        let s = rest.get(*pos..*pos + n)?;
+        *pos += n;
+        Some(s)
+    };
+    let read_u32 = |pos: &mut usize| -> Option<usize> {
+        take(pos, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
+    };
+    let count = read_u32(&mut pos)?;
+    let mut replies = Vec::new();
+    for _ in 0..count {
+        let think = match take(&mut pos, 1)?[0] {
+            1 => ffi::Ds4ThinkMode::High,
+            2 => ffi::Ds4ThinkMode::Max,
+            _ => ffi::Ds4ThinkMode::None,
+        };
+        let ntok = read_u32(&mut pos)?;
+        let mut tokens = Vec::with_capacity(ntok);
+        for _ in 0..ntok {
+            tokens.push(i32::from_le_bytes(take(&mut pos, 4)?.try_into().unwrap()));
+        }
+        let text_len = read_u32(&mut pos)?;
+        let text = String::from_utf8(take(&mut pos, text_len)?.to_vec()).ok()?;
+        replies.push(SampledReply {
+            text,
+            tokens,
+            think,
+        });
+    }
+    Some((replies, REPLIES_MAGIC.len() + pos))
+}
+
 fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
     let mut out: Vec<(&str, String)> = Vec::new();
     let mut current: Option<&str> = None;
@@ -1393,7 +1521,91 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_sections;
+    use super::{
+        SampledReply, decode_replies, encode_replies, parse_sections, plan_splices, retain_matched,
+    };
+
+    fn reply(text: &str, tokens: &[i32]) -> SampledReply {
+        SampledReply {
+            text: text.to_string(),
+            tokens: tokens.to_vec(),
+            think: crate::ffi::Ds4ThinkMode::None,
+        }
+    }
+
+    fn sections(specs: &[(&'static str, &str)]) -> Vec<(&'static str, String)> {
+        specs.iter().map(|(r, t)| (*r, (*t).to_string())).collect()
+    }
+
+    #[test]
+    fn plan_splices_matches_every_reply_in_order() {
+        let s = sections(&[
+            ("system", "sys"),
+            ("user", "q1"),
+            ("assistant", "a1"),
+            ("user", "q2"),
+            ("assistant", "a2"),
+        ]);
+        let r = [reply("a1", &[1]), reply("a2", &[2])];
+        assert_eq!(
+            plan_splices(&s, &r),
+            vec![None, None, Some(0), None, Some(1)]
+        );
+    }
+
+    #[test]
+    fn plan_splices_skips_compacted_replies_without_reuse() {
+        // "a1" was compacted away; "a2" must still match (forward scan), and a
+        // repeated later section must not reuse an already-consumed reply.
+        let s = sections(&[
+            ("user", "summary"),
+            ("assistant", "a2"),
+            ("user", "q3"),
+            ("assistant", "a2"),
+        ]);
+        let r = [reply("a1", &[1]), reply("a2", &[2])];
+        assert_eq!(plan_splices(&s, &r), vec![None, Some(1), None, None]);
+    }
+
+    #[test]
+    fn plan_splices_never_matches_out_of_order() {
+        // A section matching an *earlier* reply than one already consumed
+        // re-templates instead of splicing out of chronological order.
+        let s = sections(&[("assistant", "a2"), ("assistant", "a1")]);
+        let r = [reply("a1", &[1]), reply("a2", &[2])];
+        assert_eq!(plan_splices(&s, &r), vec![Some(1), None]);
+    }
+
+    #[test]
+    fn retain_matched_prunes_vanished_replies() {
+        let mut r = vec![reply("a1", &[1]), reply("a2", &[2]), reply("a3", &[3])];
+        retain_matched(&mut r, &[0, 2]);
+        assert_eq!(r, vec![reply("a1", &[1]), reply("a3", &[3])]);
+        retain_matched(&mut r, &[]);
+        assert!(r.is_empty());
+    }
+
+    #[test]
+    fn reply_history_round_trips_through_the_payload_wrap() {
+        let replies = vec![
+            SampledReply {
+                text: "first ünïcode reply".to_string(),
+                tokens: vec![5, -1, 1 << 20],
+                think: crate::ffi::Ds4ThinkMode::High,
+            },
+            reply("", &[]),
+        ];
+        let kv = b"raw-engine-kv-bytes";
+        let mut wrapped = encode_replies(&replies);
+        wrapped.extend_from_slice(kv);
+        let (decoded, off) = decode_replies(&wrapped).expect("wrap decodes");
+        assert_eq!(decoded, replies);
+        assert_eq!(&wrapped[off..], kv);
+        // Legacy payloads (no magic) and truncated headers are rejected, not
+        // misparsed.
+        assert!(decode_replies(kv).is_none());
+        assert!(decode_replies(&wrapped[..wrapped.len() - kv.len() - 2]).is_none());
+    }
 
     #[test]
     fn splits_role_sections() {

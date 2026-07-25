@@ -13,9 +13,12 @@
 //!
 //! One `task` tool with an `op` argument (`add`, `update`, `list`) is the
 //! entire model-facing surface — the smallest table that works, since every
-//! tool costs a parity fixture entry (`tests/c_parity.rs`). The current list is
-//! injected into every turn ([`TaskList::inject_block`]), so `list` is a
-//! recovery path rather than the normal way to read state.
+//! tool costs a parity fixture entry (`tests/c_parity.rs`). Mutating ops
+//! append the fresh list to their tool observation (the transcript is
+//! append-only so the engine's KV prefix stays valid — never inject
+//! mid-transcript), and [`TaskList::inject_block`] re-surfaces it once after a
+//! compaction rebuild; `list` is a recovery path rather than the normal way to
+//! read state.
 
 use std::fmt::Write as _;
 
@@ -218,10 +221,11 @@ impl TaskList {
         out
     }
 
-    /// The per-turn injection block, or `None` when the list is empty so an
-    /// empty list adds nothing to the prompt. Regenerated every turn from
-    /// session state, so it survives compaction and never accumulates in the
-    /// transcript.
+    /// The task-list block re-injected once after a compaction rebuild, or
+    /// `None` when the list is empty. Never rendered mid-transcript on normal
+    /// turns: the transcript is append-only so the engine's KV prefix stays
+    /// valid, and mutating `task` ops instead carry the fresh list in their
+    /// appended tool observations.
     #[must_use]
     pub fn inject_block(&self) -> Option<String> {
         if self.tasks.is_empty() {
@@ -306,7 +310,10 @@ pub fn tool_task(
             }
             let active_form = call.arg_value("active_form").map(str::to_string);
             let id = tasks.add(subject, active_form);
-            format!("Added task [{id}]: {subject}\n")
+            format!(
+                "Added task [{id}]: {subject}\n\nCurrent task list:\n{}",
+                tasks.render_list()
+            )
         }
         "update" => {
             let Some(id) = call
@@ -346,10 +353,11 @@ pub fn tool_task(
                             completions.push(t.subject.clone());
                         }
                         format!(
-                            "Updated task [{}]: {} ({})\n",
+                            "Updated task [{}]: {} ({})\n\nCurrent task list:\n{}",
                             t.id,
                             t.subject,
-                            t.status.as_str()
+                            t.status.as_str(),
+                            tasks.render_list()
                         )
                     }
                     // Unreachable: `update` returned Ok, so the id exists.
@@ -511,7 +519,13 @@ mod tests {
             &mut done,
             &call(&[("op", "add"), ("subject", "do it")]),
         );
-        assert_eq!(out, "Added task [1]: do it\n");
+        // Mutating ops append the fresh list: the transcript is append-only,
+        // so the observation itself must carry the state the per-turn
+        // injection used to provide.
+        assert_eq!(
+            out,
+            "Added task [1]: do it\n\nCurrent task list:\n- [1] pending: do it\n"
+        );
         assert!(done.is_empty(), "add logs no completion");
 
         let out = tool_task(
@@ -521,6 +535,10 @@ mod tests {
         );
         assert!(
             out.starts_with("Updated task [1]: do it (completed)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("Current task list:\n- [1] completed: do it\n"),
             "{out}"
         );
         assert_eq!(done, vec!["do it".to_string()], "completion recorded once");
