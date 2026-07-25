@@ -50,15 +50,13 @@ impl ContextContent {
         }
     }
 
-    /// Returns the combined context content as a single string.
+    /// Tier 2 (project-stable) context: the discovered `AGENTS.md`/`CLAUDE.md`
+    /// set and persistent memory. These rarely change, so they form a reusable
+    /// KV prefix keyed by [`Self::stable_hash`] (`project.kv`, issue #60). Empty
+    /// when nothing stable was discovered.
     #[must_use]
-    pub fn combined(&self) -> String {
+    pub fn stable_context(&self) -> String {
         let mut out = String::new();
-
-        if let Some(git) = &self.git_content {
-            out.push_str(git);
-            out.push('\n');
-        }
 
         if let Some(agents_md) = &self.agents_md_content {
             out.push_str("Agent instructions:\n\n");
@@ -71,8 +69,54 @@ impl ContextContent {
             out.push('\n');
         }
 
+        out
+    }
+
+    /// Tier 3 (session-volatile) context: git status and the date line. These
+    /// always differ (git status per session, date per day), so this unit is
+    /// prefill-only and never cached — it sits *after* the stable prefix so it
+    /// only ever costs its own small prefill (issue #60). Kept as a single
+    /// cleanly-identifiable block for context warming (issue #63).
+    #[must_use]
+    pub fn volatile_context(&self) -> String {
+        let mut out = String::new();
+
+        if let Some(git) = &self.git_content {
+            out.push_str(git);
+            out.push('\n');
+        }
+
         out.push_str(&self.date_content);
 
+        out
+    }
+
+    /// Content hash of the Tier 2 (stable) context, used as the volatile part of
+    /// the `project.kv` fingerprint key (`fp2 = sha(fp1 ‖ stable-hash)`). `None`
+    /// when there is no stable content to cache. Pure function of the discovered
+    /// AGENTS.md/CLAUDE.md set and memory, so it is deterministic and
+    /// order-stable given the same inputs.
+    #[must_use]
+    pub fn stable_hash(&self) -> Option<String> {
+        let stable = self.stable_context();
+        if stable.is_empty() {
+            None
+        } else {
+            Some(crate::session::sha1_hex(stable.as_bytes()))
+        }
+    }
+
+    /// Returns the combined context content as a single string, ordered
+    /// **stable-then-volatile** (issue #60): the reusable project instructions
+    /// first, then the always-changing git status and date. This ordering is
+    /// what lets the stable prefix stay a valid, cacheable KV tier while the
+    /// volatile bytes sit after it. It is not parity-constrained (the C
+    /// reference does not fix this first-user-message ordering; see
+    /// `tests/c_parity.rs`).
+    #[must_use]
+    pub fn combined(&self) -> String {
+        let mut out = self.stable_context();
+        out.push_str(&self.volatile_context());
         out
     }
 }
@@ -366,6 +410,85 @@ mod tests {
         assert!(combined.contains("AGENTS.md content"));
         assert!(combined.contains("Persistent memory: prefers tabs"));
         assert!(combined.contains("Today's date is 2026-01-01."));
+    }
+
+    #[test]
+    fn combined_is_stable_then_volatile() {
+        // Issue #60: the stable project instructions must precede the volatile
+        // git/date block, and `combined` must be exactly their concatenation.
+        let content = ContextContent {
+            git_content: Some("GIT-STATUS".to_string()),
+            agents_md_content: Some("AGENTS".to_string()),
+            memory_content: Some("MEM".to_string()),
+            date_content: "DATE".to_string(),
+        };
+
+        let combined = content.combined();
+        assert_eq!(
+            combined,
+            format!("{}{}", content.stable_context(), content.volatile_context())
+        );
+
+        // Stable (AGENTS/MEM) appears before volatile (git/date).
+        let agents_at = combined.find("AGENTS").unwrap();
+        let git_at = combined.find("GIT-STATUS").unwrap();
+        let date_at = combined.find("DATE").unwrap();
+        assert!(agents_at < git_at, "stable must precede volatile");
+        assert!(git_at < date_at, "git precedes date within volatile");
+    }
+
+    #[test]
+    fn stable_and_volatile_partition_by_volatility() {
+        let content = ContextContent {
+            git_content: Some("GIT-STATUS".to_string()),
+            agents_md_content: Some("AGENTS".to_string()),
+            memory_content: Some("MEM".to_string()),
+            date_content: "DATE".to_string(),
+        };
+        let stable = content.stable_context();
+        let volatile = content.volatile_context();
+
+        assert!(stable.contains("AGENTS") && stable.contains("MEM"));
+        assert!(!stable.contains("GIT-STATUS") && !stable.contains("DATE"));
+        assert!(volatile.contains("GIT-STATUS") && volatile.contains("DATE"));
+        assert!(!volatile.contains("AGENTS") && !volatile.contains("MEM"));
+    }
+
+    #[test]
+    fn stable_hash_is_deterministic_and_content_keyed() {
+        let a = ContextContent {
+            git_content: Some("differs-every-session".to_string()),
+            agents_md_content: Some("AGENTS".to_string()),
+            memory_content: Some("MEM".to_string()),
+            date_content: "differs-every-day".to_string(),
+        };
+        // Same stable content, different volatile content → same stable hash.
+        let b = ContextContent {
+            git_content: Some("other-git".to_string()),
+            agents_md_content: Some("AGENTS".to_string()),
+            memory_content: Some("MEM".to_string()),
+            date_content: "other-date".to_string(),
+        };
+        assert_eq!(a.stable_hash(), b.stable_hash());
+        assert!(a.stable_hash().is_some());
+
+        // Changed stable content → changed hash.
+        let c = ContextContent {
+            agents_md_content: Some("AGENTS-CHANGED".to_string()),
+            ..a.clone()
+        };
+        assert_ne!(a.stable_hash(), c.stable_hash());
+    }
+
+    #[test]
+    fn stable_hash_none_without_stable_content() {
+        let content = ContextContent {
+            git_content: Some("git".to_string()),
+            agents_md_content: None,
+            memory_content: None,
+            date_content: "date".to_string(),
+        };
+        assert_eq!(content.stable_hash(), None);
     }
 
     #[test]
