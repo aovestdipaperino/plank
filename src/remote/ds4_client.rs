@@ -10,7 +10,7 @@
 //! - `generate` → `POST /generate`, then reads the SSE stream, mapping each
 //!   frame onto `on_event`, polling `interrupt` between frames and firing
 //!   `DELETE /generate/{id}` on interrupt.
-//! - warming (`warm_reset` / `warm_sync`) is a no-op: the KV lives on the
+//! - warming (`warm_reset` / `warm_append` / `warm_sync`) is a no-op: the KV lives on the
 //!   server, so there is no client-side cache to prefill and the trait
 //!   defaults are correct.
 //! - `count_tokens` → `POST /tokenize` (short LRU-free cache), degrading to the
@@ -85,8 +85,7 @@ impl RemoteDs4Engine {
     }
 
     /// Drives one streaming endpoint (`/generate` or `/warm`), mapping frames
-    /// onto `on_event`. Returns the terminal stats plus whether any `Text`/gen
-    /// frame was seen (used by `warm` to report a cache miss).
+    /// onto `on_event`. Returns the terminal stats.
     fn stream_turn(
         &mut self,
         path_body: (&str, &GenerateRequest),

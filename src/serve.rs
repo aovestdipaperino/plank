@@ -431,7 +431,7 @@ fn handle_generate(
         let greedy = || false;
         if warm {
             eng.warm_reset(&gen_req.transcript)
-                .and_then(|()| eng.warm_sync(None, &mut on_event))
+                .and_then(|()| eng.warm_sync(&mut on_event))
                 .map(|_| crate::engine::GenerationStats::default())
         } else {
             eng.generate(

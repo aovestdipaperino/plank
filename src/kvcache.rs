@@ -50,6 +50,14 @@ impl KVCache {
     }
 
     /// The token transcript captured with this KV (possibly empty).
+    ///
+    /// Not an invariant: it does **not** always describe the KV. Tier
+    /// checkpoints written by `kvtier::warm` deliberately carry an *empty*
+    /// transcript, because warming builds its own cumulative token buffer and
+    /// never touches the engine's `transcript`. That is harmless — `reconcile`
+    /// rebuilds spans from text and the C-side common-prefix probe does the
+    /// real matching, as the older transcript-less checkpoint format did — but
+    /// callers must not treat a transcript here as authoritative for the bytes.
     #[must_use]
     pub fn transcript(&self) -> &TokenTranscript {
         &self.transcript

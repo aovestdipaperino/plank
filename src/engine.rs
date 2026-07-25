@@ -440,9 +440,15 @@ pub trait Engine: Debug + Send {
         Ok(())
     }
 
-    /// Appends `text` to the warm buffer as one user message (nothing when
-    /// `None`, which is how the system tier syncs itself), then prefills the
-    /// session up to the buffer's end. Returns `true` when a prefill ran.
+    /// Appends `text` to the cumulative warm token buffer as one user message
+    /// (nothing when `None`, for the system tier, whose tokens [`warm_reset`]
+    /// already placed). Does **not** prefill.
+    ///
+    /// This must be called for *every* tier of the walk, including tiers whose
+    /// KV was already restored from disk and therefore need no sync: the buffer
+    /// has to describe the whole restored prefix, or the next sync would hand
+    /// the backend a token buffer missing the intermediate tiers and discard
+    /// the restored KV.
     ///
     /// Each tier is its own message, so a tier boundary is a clean
     /// chat-template message boundary and a snapshot taken there is a genuinely
@@ -451,13 +457,20 @@ pub trait Engine: Debug + Send {
     /// so the cached prefix ends exactly at the last tier and the first turn's
     /// common-prefix accounting is unperturbed (#63).
     ///
+    /// [`warm_reset`]: Engine::warm_reset
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend cannot tokenize the text.
+    fn warm_append(&mut self, _text: Option<&str>) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Prefills the session up to the cumulative warm buffer's end. Returns
+    /// `true` when a prefill actually ran.
+    ///
     /// # Errors
     /// Returns [`EngineError`] when the backend fails to prefill.
-    fn warm_sync(
-        &mut self,
-        _text: Option<&str>,
-        _on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
+    fn warm_sync(&mut self, _on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
         Ok(false)
     }
 
@@ -769,7 +782,8 @@ mod tests {
         assert!(e.set_kv(&crate::kvcache::KVCache::default()).is_err());
         // Warming must still run end-to-end against the stub: no prefill, no error.
         e.warm_reset("SYSTEM").unwrap();
-        assert!(!e.warm_sync(Some("tier text"), &mut |_| {}).unwrap());
+        e.warm_append(Some("tier text")).unwrap();
+        assert!(!e.warm_sync(&mut |_| {}).unwrap());
     }
 
     #[test]

@@ -17,7 +17,7 @@
 //! below Tier 1, canonicalizing the local MCP tool definitions that key Tier 2,
 //! and deciding — via [`warm`] — which tier to restore from and where prefill
 //! must resume. The walk itself is backend-agnostic: it drives the engine only
-//! through `warm_reset`/`warm_sync`/`get_kv`/`set_kv`, so it is always compiled
+//! through `warm_reset`/`warm_append`/`warm_sync`/`get_kv`/`set_kv`, so it is always compiled
 //! and unit tested against a spy engine.
 //!
 //! The walk rule is the one already used for `sysprompt.kv`, generalized:
@@ -251,15 +251,35 @@ pub fn warm(
     // this tier's key, which fingerprints cannot detect because the key would
     // be genuinely correct.
     let mut prefilled = false;
-    for (i, t) in tiers.iter().enumerate().skip(resume) {
+    for (i, t) in tiers.iter().enumerate() {
+        // Append for EVERY tier, including the ones already restored above: the
+        // engine's cumulative token buffer must describe the *whole* restored
+        // prefix. Skipping the append for restored tiers would leave a buffer
+        // with a hole in it, and the next sync — seeing a common prefix shorter
+        // than the buffer — would rewrite the session's checkpoint from that
+        // truncated buffer, throwing the restored KV away and making a deep hit
+        // strictly worse than a cold start.
+        //
         // The system tier's tokens are already in the warm buffer from
         // `warm_reset`; every other tier appends its text as a user message.
         let text = (i > 0).then_some(t.text.as_str());
-        prefilled |= engine.warm_sync(text, on_event)?;
+        engine.warm_append(text)?;
+        if i < resume {
+            // Already in KV via the restore above; extend the buffer, do not
+            // sync — and do not re-persist a checkpoint we just read.
+            continue;
+        }
+        prefilled |= engine.warm_sync(on_event)?;
         if let Some(key) = &t.key
             && let Some(store) = store
             && let Some(cache) = engine.get_kv()
         {
+            // Tier checkpoints intentionally carry an **empty**
+            // `TokenTranscript`: warming never touches `self.transcript`, and
+            // nothing needs it — `reconcile` rebuilds spans from text and the
+            // C-side common-prefix probe does the real matching, exactly as the
+            // older transcript-less checkpoint format did. Do not start
+            // trusting `cache.transcript()` for these.
             let _ = store.kv_store(key, &cache);
         }
     }
@@ -525,6 +545,10 @@ mod tests {
 #[derive(Default)]
 struct SpyEngine {
     reset_to: Option<String>,
+    /// Every `warm_append` call, in order — the model of the engine's
+    /// cumulative token buffer. Distinct from `synced` on purpose: a restored
+    /// tier must appear here and *not* there.
+    appended: Vec<Option<String>>,
     synced: Vec<Option<String>>,
     restored: Vec<Vec<u8>>,
     supports_kv: bool,
@@ -574,12 +598,18 @@ impl crate::engine::Engine for SpyEngine {
         self.reset_to = Some(system.to_owned());
         Ok(())
     }
+    fn warm_append(&mut self, text: Option<&str>) -> Result<(), crate::engine::EngineError> {
+        self.appended.push(text.map(str::to_owned));
+        Ok(())
+    }
     fn warm_sync(
         &mut self,
-        text: Option<&str>,
         _e: &mut dyn FnMut(crate::engine::EngineEvent),
     ) -> Result<bool, crate::engine::EngineError> {
-        self.synced.push(text.map(str::to_owned));
+        // A sync flushes whatever the matching append just put in the buffer,
+        // so record that text — it keeps `synced` readable as "which tiers were
+        // actually prefilled".
+        self.synced.push(self.appended.last().cloned().flatten());
         Ok(true)
     }
 }
@@ -661,6 +691,50 @@ mod warm_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: a restored tier is skipped for *prefill* only. Its tokens
+    /// must still be appended to the engine's cumulative warm buffer, because
+    /// the buffer is what the next `warm_sync` hands the backend. Drop the
+    /// restored tiers from it and the backend sees a shorter common prefix,
+    /// rewrites its checkpoint from the truncated buffer, and discards the KV
+    /// the restore just paid a disk read for — making a deep hit strictly worse
+    /// than a cold start.
+    #[test]
+    fn a_restored_tier_is_still_appended_to_the_token_buffer() {
+        let (store, dir) = spy_store("appended");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        for (t, byte) in tiers.iter().zip([10_u8, 20]) {
+            store
+                .kv_store(
+                    t.key.as_ref().unwrap(),
+                    &crate::kvcache::KVCache::new(
+                        vec![byte],
+                        crate::ds4tokens::TokenTranscript::new(),
+                    ),
+                )
+                .unwrap();
+        }
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+
+        // Premise: the project tier really was restored, so tiers 0 and 1 are
+        // the "skipped" ones this test is about.
+        assert_eq!(e.restored, vec![vec![20]], "deepest tier restored");
+        assert_eq!(e.synced, vec![Some("git".into())], "only tier 2 prefilled");
+
+        // The point: every tier reached the buffer, restored or not. The system
+        // tier appends `None` (its tokens came from `warm_reset`).
+        assert_eq!(
+            e.appended,
+            vec![None, Some("agents".into()), Some("git".into())],
+            "restored tiers must still extend the cumulative token buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_stale_deep_checkpoint_falls_back_to_the_shallower_tier() {
         let (store, dir) = spy_store("stale");
@@ -712,9 +786,17 @@ mod warm_tests {
     fn each_tier_is_snapshotted_at_its_own_boundary() {
         // The invariant that fingerprints cannot protect: persisting tier i after
         // prefilling tier i+1 would store tier i+1's KV under tier i's key, and the
-        // key would be genuinely correct. SpyEngine hands out an incrementing byte
-        // per get_kv call, so tier 0's stored byte must be strictly less than tier
-        // 1's — proving the capture happened before the next tier was synced.
+        // key would be genuinely correct.
+        //
+        // `SpyEngine::get_kv` keys its byte to `self.synced.len()` — how far the
+        // *session* has been prefilled — and that specific choice is what gives
+        // this test teeth. A plain get_kv call counter would also increase from
+        // tier to tier even if `warm` deferred every capture to a second pass
+        // after all syncing, so the assertion below would pass on exactly the
+        // implementation it exists to reject. Do not "simplify" that byte into a
+        // call counter: it silently disarms this test.
+        // Tier 0's stored byte must therefore be strictly less than tier 1's,
+        // proving the capture happened before the next tier was synced.
         let (store, dir) = spy_store("boundary");
         let tiers = tiers_for("SYSTEM", "agents", "");
         let mut e = SpyEngine {

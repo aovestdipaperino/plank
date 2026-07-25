@@ -234,7 +234,7 @@ impl Ds4Model {
             .is_some_and(|cache| boot.set_kv(&cache).is_ok());
         if !restored {
             boot.warm_reset(system)?;
-            boot.warm_sync(None, &mut |_| {})?;
+            boot.warm_sync(&mut |_| {})?;
             if let Some(path) = checkpoint
                 && let Some(cache) = boot.get_kv()
             {
@@ -858,15 +858,15 @@ impl Engine for Ds4Session {
         Ok(())
     }
 
-    fn warm_sync(
-        &mut self,
-        text: Option<&str>,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
+    fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
         if let Some(text) = text {
             let msg = self.model.message_tokens("user", text);
             self.warm_tokens.push_all(&msg);
         }
+        Ok(())
+    }
+
+    fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
         let total = self.warm_tokens.len();
         let session = self.ensure_session()?;
         // SAFETY: session and tokens are valid.
