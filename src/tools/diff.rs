@@ -14,6 +14,33 @@ use similar::{ChangeTag, TextDiff};
 const CONTEXT: usize = 3;
 /// Cap on rows rendered per card, so a whole-file rewrite stays compact.
 const MAX_ROWS: usize = 200;
+/// Changed fraction of a paired line's combined length above which intra-line
+/// (word/char) highlighting is skipped in favor of full-line Del/Add. Per the
+/// diff-rendering spec, a line that is effectively rewritten reads better fully
+/// highlighted than as noisy per-word emphasis.
+const INTRA_LINE_MAX_RATIO: f64 = 0.40;
+
+/// How a run of characters inside a paired line is classified for intra-line
+/// (word-level) highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegKind {
+    /// Text present on both sides of the pair — gets the row background but no
+    /// word emphasis.
+    Common,
+    /// Text only on the old (`-`) side — emphasized on the Del line.
+    Removed,
+    /// Text only on the new (`+`) side — emphasized on the Add line.
+    Added,
+}
+
+/// One intra-line segment: a maximal run of characters sharing a [`SegKind`].
+/// Segment text is already control-character-free (sanitize discipline), so it
+/// can be rendered directly without reflowing a row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub kind: SegKind,
+    pub text: String,
+}
 
 /// One rendered diff row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,10 +58,22 @@ pub enum DiffRow {
         new_no: usize,
         text: String,
     },
-    /// Removed line, with its 1-based old line number.
-    Del { old_no: usize, text: String },
-    /// Added line, with its 1-based new line number.
-    Add { new_no: usize, text: String },
+    /// Removed line, with its 1-based old line number. `segments` is `Some` when
+    /// this line was paired with an adjacent Add and the change is small enough
+    /// (below [`INTRA_LINE_MAX_RATIO`]) for word-level highlighting; `None` means
+    /// render the whole line as a removal.
+    Del {
+        old_no: usize,
+        text: String,
+        segments: Option<Vec<Segment>>,
+    },
+    /// Added line, with its 1-based new line number. `segments` mirrors
+    /// [`DiffRow::Del`] for the added side.
+    Add {
+        new_no: usize,
+        text: String,
+        segments: Option<Vec<Segment>>,
+    },
     /// A "… N more lines …" marker when the card was capped.
     Elision(usize),
 }
@@ -119,6 +158,7 @@ pub fn edit_preview(path: &str, old: &str, new: &str, created: bool) -> EditPrev
                         DiffRow::Del {
                             old_no: change.old_index().unwrap_or(0) + 1,
                             text: text.to_string(),
+                            segments: None,
                         }
                     }
                     ChangeTag::Insert => {
@@ -126,6 +166,7 @@ pub fn edit_preview(path: &str, old: &str, new: &str, created: bool) -> EditPrev
                         DiffRow::Add {
                             new_no: change.new_index().unwrap_or(0) + 1,
                             text: text.to_string(),
+                            segments: None,
                         }
                     }
                 };
@@ -140,6 +181,7 @@ pub fn edit_preview(path: &str, old: &str, new: &str, created: bool) -> EditPrev
     if capped {
         rows.push(DiffRow::Elision(added + removed + diff_equal(&diff)));
     }
+    annotate_intra_line(&mut rows);
 
     EditPreview {
         path: path.to_string(),
@@ -149,6 +191,130 @@ pub fn edit_preview(path: &str, old: &str, new: &str, created: bool) -> EditPrev
         bytes: None,
         rows,
     }
+}
+
+/// Pairs each maximal run of consecutive `Del` rows with the `Add` run that
+/// immediately follows it (a line replacement, as Myers emits for edits), and
+/// fills in word-level [`Segment`]s on both sides when the change is small
+/// enough. Rows are paired positionally (the k-th Del with the k-th Add);
+/// unpaired rows and rewrites above [`INTRA_LINE_MAX_RATIO`] keep `segments:
+/// None` and render at line granularity, as before.
+fn annotate_intra_line(rows: &mut [DiffRow]) {
+    let mut i = 0;
+    while i < rows.len() {
+        if !matches!(rows[i], DiffRow::Del { .. }) {
+            i += 1;
+            continue;
+        }
+        // Extent of the Del run [i, dend) and the Add run [dend, aend).
+        let mut dend = i;
+        while dend < rows.len() && matches!(rows[dend], DiffRow::Del { .. }) {
+            dend += 1;
+        }
+        let mut aend = dend;
+        while aend < rows.len() && matches!(rows[aend], DiffRow::Add { .. }) {
+            aend += 1;
+        }
+        let dels = dend - i;
+        let adds = aend - dend;
+        if adds == 0 {
+            // A pure deletion (no following Add run) — nothing to pair.
+            i = dend;
+            continue;
+        }
+        for k in 0..dels.min(adds) {
+            let old_text = match &rows[i + k] {
+                DiffRow::Del { text, .. } => text.clone(),
+                _ => continue,
+            };
+            let new_text = match &rows[dend + k] {
+                DiffRow::Add { text, .. } => text.clone(),
+                _ => continue,
+            };
+            if let Some((del_segs, add_segs)) = intra_line_segments(&old_text, &new_text) {
+                if let DiffRow::Del { segments, .. } = &mut rows[i + k] {
+                    *segments = Some(del_segs);
+                }
+                if let DiffRow::Add { segments, .. } = &mut rows[dend + k] {
+                    *segments = Some(add_segs);
+                }
+            }
+        }
+        i = aend;
+    }
+}
+
+/// Computes word-level intra-line highlighting for a replaced `(old, new)` line
+/// pair. Both sides are first stripped of control characters (sanitize
+/// discipline), then diffed at word granularity. Returns `(del_segments,
+/// add_segments)` where the Del side carries `Common`/`Removed` runs and the Add
+/// side `Common`/`Added` runs.
+///
+/// Returns `None` — signalling the caller to fall back to full-line Del/Add —
+/// when the lines are identical after sanitizing, or when the changed fraction
+/// of the combined length exceeds [`INTRA_LINE_MAX_RATIO`] (an effective
+/// rewrite, which reads better fully highlighted than word-by-word).
+///
+/// Pure function of its inputs; unit-tested directly.
+#[must_use]
+pub fn intra_line_segments(old: &str, new: &str) -> Option<(Vec<Segment>, Vec<Segment>)> {
+    let o: String = old.chars().filter(|c| !c.is_control()).collect();
+    let n: String = new.chars().filter(|c| !c.is_control()).collect();
+    if o == n {
+        return None;
+    }
+
+    let diff = TextDiff::from_words(o.as_str(), n.as_str());
+    let mut del: Vec<Segment> = Vec::new();
+    let mut add: Vec<Segment> = Vec::new();
+    let mut removed_chars = 0usize;
+    let mut added_chars = 0usize;
+    for change in diff.iter_all_changes() {
+        let value = change.value();
+        match change.tag() {
+            ChangeTag::Equal => {
+                push_segment(&mut del, SegKind::Common, value);
+                push_segment(&mut add, SegKind::Common, value);
+            }
+            ChangeTag::Delete => {
+                removed_chars += value.chars().count();
+                push_segment(&mut del, SegKind::Removed, value);
+            }
+            ChangeTag::Insert => {
+                added_chars += value.chars().count();
+                push_segment(&mut add, SegKind::Added, value);
+            }
+        }
+    }
+
+    let combined = o.chars().count() + n.chars().count();
+    if combined == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let ratio = (removed_chars + added_chars) as f64 / combined as f64;
+    if ratio > INTRA_LINE_MAX_RATIO {
+        return None;
+    }
+    Some((del, add))
+}
+
+/// Appends `text` to `segs`, coalescing with the trailing segment when it shares
+/// `kind` so adjacent same-class word tokens render as one run.
+fn push_segment(segs: &mut Vec<Segment>, kind: SegKind, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = segs.last_mut()
+        && last.kind == kind
+    {
+        last.text.push_str(text);
+        return;
+    }
+    segs.push(Segment {
+        kind,
+        text: text.to_string(),
+    });
 }
 
 impl EditPreview {
@@ -169,6 +335,16 @@ impl EditPreview {
             )
         } else {
             ("", "", "", "", "", "")
+        };
+        // Emphasis variants for the changed span of a word-diffed pair: a
+        // brighter background plus bold, so the common text (base bg) recedes.
+        let (del_emph, add_emph) = if color {
+            (
+                "\x1b[48;5;88m\x1b[38;5;231m\x1b[1m",
+                "\x1b[48;5;28m\x1b[38;5;231m\x1b[1m",
+            )
+        } else {
+            ("", "")
         };
         let size = self
             .bytes
@@ -199,11 +375,15 @@ impl EditPreview {
                 DiffRow::Context { text, .. } => {
                     let _ = writeln!(out, "{dim}{}{reset}   {text}", gutter(row.gutter()));
                 }
-                DiffRow::Del { text, .. } => {
-                    let _ = writeln!(out, "{del}{} - {text}{reset}", gutter(row.gutter()));
+                DiffRow::Del { text, segments, .. } => {
+                    let _ = write!(out, "{del}{} - ", gutter(row.gutter()));
+                    write_ansi_diff_line(&mut out, text, segments.as_deref(), del, del_emph, reset);
+                    let _ = writeln!(out, "{reset}");
                 }
-                DiffRow::Add { text, .. } => {
-                    let _ = writeln!(out, "{add}{} + {text}{reset}", gutter(row.gutter()));
+                DiffRow::Add { text, segments, .. } => {
+                    let _ = write!(out, "{add}{} + ", gutter(row.gutter()));
+                    write_ansi_diff_line(&mut out, text, segments.as_deref(), add, add_emph, reset);
+                    let _ = writeln!(out, "{reset}");
                 }
                 DiffRow::Elision(n) => {
                     let _ = writeln!(out, "{dim}      ⋯ {n} more lines ⋯{reset}");
@@ -218,6 +398,38 @@ impl EditPreview {
 #[must_use]
 pub fn plural(n: usize) -> &'static str {
     if n == 1 { "line" } else { "lines" }
+}
+
+/// Writes the text portion of a Del/Add ANSI row into `out`. With word-level
+/// `segments` and color enabled, each changed run is wrapped in `emph` while
+/// common runs use `base`; without segments (or without color) the raw line is
+/// written unchanged, so the plain path degrades to today's line-level output.
+/// The caller has already emitted the gutter/sigil in `base` and appends the
+/// final reset.
+fn write_ansi_diff_line(
+    out: &mut String,
+    text: &str,
+    segments: Option<&[Segment]>,
+    base: &str,
+    emph: &str,
+    reset: &str,
+) {
+    use std::fmt::Write as _;
+    match segments {
+        // No word emphasis available (plain path / rewrite): line-level as before.
+        Some(segs) if !base.is_empty() => {
+            for seg in segs {
+                let code = match seg.kind {
+                    SegKind::Removed | SegKind::Added => emph,
+                    SegKind::Common => base,
+                };
+                let _ = write!(out, "{reset}{code}{}", seg.text);
+            }
+        }
+        _ => {
+            let _ = write!(out, "{text}");
+        }
+    }
 }
 
 /// A compact multi-line summary of the first changes between `old` and `new`:
@@ -444,6 +656,113 @@ mod tests {
         );
     }
 
+    // Collapses a segment list into a `(kind, text)` vector for terse asserts.
+    fn segs(v: &[Segment]) -> Vec<(SegKind, &str)> {
+        v.iter().map(|s| (s.kind, s.text.as_str())).collect()
+    }
+
+    #[test]
+    fn intra_line_segments_isolates_a_word_change() {
+        let (del, add) =
+            intra_line_segments("foo bar baz", "foo qux baz").expect("minor change highlights");
+        assert_eq!(
+            segs(&del),
+            vec![
+                (SegKind::Common, "foo "),
+                (SegKind::Removed, "bar"),
+                (SegKind::Common, " baz"),
+            ]
+        );
+        assert_eq!(
+            segs(&add),
+            vec![
+                (SegKind::Common, "foo "),
+                (SegKind::Added, "qux"),
+                (SegKind::Common, " baz"),
+            ]
+        );
+        // The del line carries no Added spans and the add line no Removed spans.
+        assert!(del.iter().all(|s| s.kind != SegKind::Added));
+        assert!(add.iter().all(|s| s.kind != SegKind::Removed));
+    }
+
+    #[test]
+    fn intra_line_segments_handles_a_pure_insertion_at_the_end() {
+        let (del, add) = intra_line_segments("let x = 1;", "let x = 1; // note")
+            .expect("appended text highlights");
+        // Nothing removed on the old side; the whole old line is common.
+        assert_eq!(segs(&del), vec![(SegKind::Common, "let x = 1;")]);
+        assert_eq!(
+            segs(&add),
+            vec![
+                (SegKind::Common, "let x = 1;"),
+                (SegKind::Added, " // note"),
+            ]
+        );
+    }
+
+    #[test]
+    fn intra_line_segments_falls_back_above_the_ratio_threshold() {
+        // A near-total rewrite: the changed fraction exceeds 40%, so intra-line
+        // highlighting is declined and the caller paints full Del/Add.
+        assert!(intra_line_segments("abcdefghij", "0123456789").is_none());
+        // Identical lines have nothing to highlight.
+        assert!(intra_line_segments("same", "same").is_none());
+    }
+
+    #[test]
+    fn intra_line_segments_strips_control_characters() {
+        // Embedded CR/tab must never reach a rendered segment (sanitize discipline).
+        let (del, add) = intra_line_segments("value\tis old\r", "value\tis new\r")
+            .expect("differs after sanitizing");
+        for s in del.iter().chain(add.iter()) {
+            assert!(
+                !s.text.contains('\t') && !s.text.contains('\r'),
+                "no control chars leak: {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn edit_preview_annotates_a_minor_replacement_with_segments() {
+        let old = "aaa\nlet total = added + removed;\nzzz\n";
+        let new = "aaa\nlet total = added + kept;\nzzz\n";
+        let p = edit_preview("f.rs", old, new, false);
+        let del = p
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                DiffRow::Del { segments, .. } => segments.as_ref(),
+                _ => None,
+            })
+            .expect("del row carries segments");
+        assert!(del.iter().any(|s| s.kind == SegKind::Removed));
+        let add = p
+            .rows
+            .iter()
+            .find_map(|r| match r {
+                DiffRow::Add { segments, .. } => segments.as_ref(),
+                _ => None,
+            })
+            .expect("add row carries segments");
+        assert!(add.iter().any(|s| s.kind == SegKind::Added));
+    }
+
+    #[test]
+    fn edit_preview_declines_segments_for_a_full_line_rewrite() {
+        let old = "aaa\nabcdefghij\nzzz\n";
+        let new = "aaa\n0123456789\nzzz\n";
+        let p = edit_preview("f.rs", old, new, false);
+        for r in &p.rows {
+            match r {
+                DiffRow::Del { segments, .. } | DiffRow::Add { segments, .. } => {
+                    assert!(segments.is_none(), "rewrite stays full-line: {r:?}");
+                }
+                _ => {}
+            }
+        }
+    }
+
     #[test]
     fn replacement_shows_del_then_add_with_context_and_a_hunk_header() {
         let old = "a\nb\nc\nd\ne\n";
@@ -455,12 +774,12 @@ mod tests {
         assert!(
             p.rows
                 .iter()
-                .any(|r| matches!(r, DiffRow::Del { old_no: 3, text } if text == "c"))
+                .any(|r| matches!(r, DiffRow::Del { old_no: 3, text, .. } if text == "c"))
         );
         assert!(
             p.rows
                 .iter()
-                .any(|r| matches!(r, DiffRow::Add { new_no: 3, text } if text == "X"))
+                .any(|r| matches!(r, DiffRow::Add { new_no: 3, text, .. } if text == "X"))
         );
         let del = p
             .rows
