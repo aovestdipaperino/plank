@@ -8,6 +8,7 @@
 //! section of the original agent.
 
 pub mod agents;
+pub mod anim;
 pub mod checkpoint;
 pub mod compact;
 pub mod complete;

@@ -35,6 +35,7 @@ pub enum FieldId {
     UiNotifications,
     UiNotifyAfterSecs,
     UiCrtOff,
+    UiReducedMotion,
     SafetySandbox,
     SafetyBtwSuspend,
     McpTimeoutSecs,
@@ -182,6 +183,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::UiReducedMotion,
+        "ui",
+        "reducedMotion",
+        "reduce motion: freeze TUI animations",
+        Kind::Bool,
+    ),
+    f(
         FieldId::SafetySandbox,
         "safety",
         "sandbox",
@@ -281,6 +289,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiNotifications => s.ui.notifications.as_str().to_string(),
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
+        FieldId::UiReducedMotion => s.ui.reduced_motion.to_string(),
         FieldId::SafetySandbox => tri_str(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
@@ -316,6 +325,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
             };
         }
         FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
+        FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::ToolsTask => s.tools.task = !s.tools.task,
         FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
         FieldId::ToolsPlanMode => s.tools.plan_mode = !s.tools.plan_mode,
@@ -398,6 +408,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiShowToolResults
         | FieldId::UiShowThinking
         | FieldId::UiCrtOff
+        | FieldId::UiReducedMotion
         | FieldId::ToolsTask
         | FieldId::ToolsAgent
         | FieldId::ToolsPlanMode => {
@@ -417,6 +428,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiShowToolResults => s.ui.show_tool_results = b,
         FieldId::UiShowThinking => s.ui.show_thinking = b,
         FieldId::UiCrtOff => s.ui.crt_off = b,
+        FieldId::UiReducedMotion => s.ui.reduced_motion = b,
         FieldId::ToolsTask => s.tools.task = b,
         FieldId::ToolsAgent => s.tools.agent = b,
         FieldId::ToolsPlanMode => s.tools.plan_mode = b,

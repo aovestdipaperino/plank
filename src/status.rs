@@ -539,17 +539,18 @@ fn power_suffix(st: &Status) -> String {
     }
 }
 
-/// Braille throbber frame derived from wall-clock time, so any footer
-/// repaint advances the animation and a pegged progress bar still shows
-/// the worker is alive.
+/// Milliseconds per throbber frame (one Braille glyph of the ping-pong cycle).
+pub const THROBBER_STEP_MS: u64 = 100;
+
+/// Braille throbber frame, expressed in terms of the shared [`crate::anim`]
+/// clock so there is no duplicate timing logic. Any footer repaint advances the
+/// animation and a pegged progress bar still shows the worker is alive. In
+/// reduced-motion mode the clock returns `None` and the throbber freezes on its
+/// first frame (a stable, non-animated glyph).
 #[must_use]
 pub fn throbber() -> char {
-    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
-    #[allow(clippy::cast_possible_truncation)]
-    FRAMES[(ms / 100) as usize % FRAMES.len()]
+    let now = crate::anim::clock_ms().unwrap_or(0);
+    crate::anim::throbber_char(now, THROBBER_STEP_MS)
 }
 
 /// Renders the prefill progress bar with a t/s readout after the bar.

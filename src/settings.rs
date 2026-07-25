@@ -110,6 +110,9 @@ pub struct UiSettings {
     /// Play the CRT power-off animation of the final frame on clean TUI
     /// exit. On by default; see issue #54.
     pub crt_off: bool,
+    /// Collapse every TUI animation (throbber, shimmer, pulse, flash,
+    /// stall-fade) to a static fallback. Off by default; see issue #61.
+    pub reduced_motion: bool,
 }
 
 impl Default for UiSettings {
@@ -125,6 +128,7 @@ impl Default for UiSettings {
             notifications: crate::notify::NotifyMode::Always,
             notify_after_secs: 10,
             crt_off: true,
+            reduced_motion: false,
         }
     }
 }
@@ -319,6 +323,9 @@ impl Settings {
         if let Some(v) = boolean(ui, "crtOff") {
             self.ui.crt_off = v;
         }
+        if let Some(v) = boolean(ui, "reducedMotion") {
+            self.ui.reduced_motion = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -399,6 +406,7 @@ impl Settings {
 // each arm is a trivial compare-and-push, so the length is not complexity.
 #[allow(clippy::too_many_lines)]
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<String> {
     let d = Settings::default();
     let mut parts: Vec<String> = Vec::new();
@@ -471,6 +479,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.ui.crt_off != d.ui.crt_off {
         parts.push(format!("crtOff={}", s.ui.crt_off));
+    }
+    if s.ui.reduced_motion != d.ui.reduced_motion {
+        parts.push(format!("reducedMotion={}", s.ui.reduced_motion));
     }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
@@ -696,6 +707,7 @@ static ACTIVE: RwLock<Option<&'static Settings>> = RwLock::new(None);
 pub fn install(settings: Settings) {
     // Recover rather than panic on a poisoned lock: settings are advisory and a
     // stale guard is harmless here.
+    crate::anim::set_reduced_motion(settings.ui.reduced_motion);
     let mut slot = ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -707,6 +719,7 @@ pub fn install(settings: Settings) {
 /// Replaces the process-wide settings (used by `/config` after a save), so the
 /// current session picks up the change on its next [`active`] read.
 pub fn reinstall(settings: Settings) {
+    crate::anim::set_reduced_motion(settings.ui.reduced_motion);
     *ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));

@@ -62,6 +62,13 @@ fn log_tool_error(reason: &str, raw: &[u8]) {
 /// The stream renderer never emits raw DSML through this trait: DSML bytes are
 /// replaced by tool banners, which always arrive via
 /// [`visible_text`](Self::visible_text).
+///
+/// This trait is also the animation boundary. Motion is Ratatui-only: the
+/// Ratatui sink drives the [`crate::anim`] effects (throbber, shimmer, pulse,
+/// flash, stall-fade) off the shared 20 Hz clock, while the plain-stdout and
+/// `--non-interactive` sinks render the static/reduced-motion form. The stream
+/// renderer feeds bytes through here without knowing which sink animates, so the
+/// plain path stays untouched.
 pub trait RenderSink {
     /// Receives ordinary visible output.
     fn visible_text(&mut self, text: &str);

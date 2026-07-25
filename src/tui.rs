@@ -1748,17 +1748,11 @@ fn draw_jump_hint(frame: &mut Frame, area: Rect) -> Option<Rect> {
     Some(rect)
 }
 
-/// Milliseconds since the first frame, driving the shimmer sweep.
+/// Milliseconds off the shared 20 Hz animation clock, driving the shimmer
+/// sweep. Returns `0` (a frozen, static render) when reduced motion is active,
+/// so every effect collapses to its fallback from one branch point.
 fn anim_tick_ms() -> u64 {
-    use std::sync::OnceLock;
-    static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
-    u64::try_from(
-        EPOCH
-            .get_or_init(std::time::Instant::now)
-            .elapsed()
-            .as_millis(),
-    )
-    .unwrap_or(0)
+    crate::anim::clock_ms().unwrap_or(0)
 }
 
 /// Pushes the accent word with a shimmer: a 3-column bright highlight sweeps
