@@ -2664,17 +2664,20 @@ the original is frozen and listed in /tree"
     /// and never fails the `/save` itself.
     ///
     /// The KV comes from the shared [`Engine::get_kv`] primitive; this layer
-    /// only wraps it in the fingerprinted `<name>.payload` sidecar.
+    /// only picks the [`KvKey::Session`] it is stored under — the file is named
+    /// by session id but signed with the fingerprint, so a payload captured
+    /// under another model or system prompt reads back as a miss.
     fn save_session_payload(&mut self) -> Option<String> {
         if self.session.id.is_empty() {
             return None;
         }
         // No KV support (echo stub) or nothing prefilled yet: nothing to save.
         let cache = self.engine.get_kv()?;
-        let path = self.store.payload_path(&self.session.id);
-        let fingerprint = self.payload_fingerprint_for(&self.session);
-        let bytes = cache.encode(&fingerprint);
-        match crate::session::write_payload(&path, &fingerprint, &bytes) {
+        let key = crate::session::KvKey::Session {
+            id: self.session.id.clone(),
+            fp: self.payload_fingerprint_for(&self.session),
+        };
+        match self.store.kv_store(&key, &cache) {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
                 crate::session::to_mb(self.store.payload_bytes(&self.session.id))
@@ -2688,26 +2691,25 @@ the original is frozen and listed in /tree"
     /// there was a payload to consider; a stale, missing-fingerprint, or
     /// unloadable payload just falls back to re-prefill.
     ///
-    /// The staleness gate is [`session::read_payload`], which only returns
-    /// bytes when the on-disk fingerprint matches; matching bytes are then fed
-    /// back through the shared [`Engine::set_kv`] primitive
+    /// The staleness gate is [`SessionStore::kv_load`], which only returns a
+    /// cache when the stored signature equals the fingerprint; a matching cache
+    /// is then fed back through the shared [`Engine::set_kv`] primitive
     /// (`SessionSnapshot::restore_bytes`, the non-owning path — see
     /// `FINDINGS.md` on the double-free).
     fn load_session_payload(&mut self, s: &Session) -> Option<String> {
         if s.id.is_empty() {
             return None;
         }
-        let path = self.store.payload_path(&s.id);
-        if !path.exists() {
+        if !self.store.payload_path(&s.id).exists() {
             return None;
         }
-        let fingerprint = self.payload_fingerprint_for(s);
-        // read_payload returns None for both a missing file and a fingerprint
-        // mismatch; the file exists here, so None means stale => re-prefill.
-        let Some(bytes) = crate::session::read_payload(&path, &fingerprint) else {
-            return Some("KV payload is stale; the transcript will be re-prefilled".to_owned());
+        let key = crate::session::KvKey::Session {
+            id: s.id.clone(),
+            fp: self.payload_fingerprint_for(s),
         };
-        let Some(cache) = crate::kvcache::KVCache::decode(&bytes, &fingerprint) else {
+        // kv_load returns None for a missing file too; the file exists here, so
+        // None means stale/corrupt => re-prefill.
+        let Some(cache) = self.store.kv_load(&key) else {
             return Some("KV payload is stale; the transcript will be re-prefilled".to_owned());
         };
         match self.engine.set_kv(&cache) {
