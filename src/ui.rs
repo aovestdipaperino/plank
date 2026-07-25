@@ -2143,7 +2143,26 @@ impl Agent<'_> {
                 self.usage = SessionUsage::default();
                 // Reinstate the warm prefix; without it the next turn silently
                 // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
-                self.rewarm_after_reset();
+                // The plain REPL has no persistent prompt to replace, so the
+                // analogue of the TUI throbber is one transient stderr line,
+                // erased once the KV is back (matching `warm_plain`).
+                let color = self.color;
+                let mut announced = false;
+                self.rewarm_after_reset(&mut || {
+                    if !announced {
+                        announced = true;
+                        if color {
+                            eprint!("\x1b[33mstarting a new session…{ANSI_RESET}");
+                        } else {
+                            eprint!("starting a new session…");
+                        }
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    }
+                });
+                if announced {
+                    eprint!("\r\x1b[2K");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
                 self.fire_session_start("clear", &mut |w| println!("{w}"));
                 println!("started a new session");
             }
@@ -3974,9 +3993,20 @@ impl Agent<'_> {
     ///
     /// Best-effort and silent: on any failure the next turn just pays the
     /// rebuild it would have paid anyway.
-    fn rewarm_after_reset(&mut self) {
+    ///
+    /// `on_progress` is called before the walk starts and again for every engine
+    /// event, so a front-end can keep an indicator alive. It is *not* instant:
+    /// restoring the tier checkpoint reads a snapshot that runs to tens of
+    /// megabytes and loads it into the backend.
+    fn rewarm_after_reset(&mut self, on_progress: &mut dyn FnMut()) {
         let tiers = self.kv_tiers();
-        let _ = crate::kvtier::warm(&mut *self.engine, Some(&self.store), &tiers, &mut |_| {});
+        // Paint once up front: the restore leg is a single blocking read+load
+        // that emits no events, so without this the indicator would never
+        // appear in the common (checkpoint present) case.
+        on_progress();
+        let _ = crate::kvtier::warm(&mut *self.engine, Some(&self.store), &tiers, &mut |_| {
+            on_progress();
+        });
     }
 
     /// Warms the KV cache — system prompt and session-start context tiers — in
@@ -4882,7 +4912,22 @@ impl Agent<'_> {
                 self.tui_write_banner(log);
                 // Reinstate the warm prefix; without it the next turn silently
                 // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
-                self.rewarm_after_reset();
+                // It takes long enough to notice, so hide the prompt and pin a
+                // throbber in its place — the same "agent is busy" shape a turn
+                // uses (`draw` with `input: None`), so the fresh banner stays
+                // visible and no input can be typed into a session whose KV is
+                // still being restored.
+                self.rewarm_after_reset(&mut || {
+                    log.set_progress(Some(tui::progress_line(&format!(
+                        "{} starting a new session",
+                        crate::status::throbber()
+                    ))));
+                    let (l, v) = (&*log, &mut *view);
+                    let _ = terminal.draw(|f| {
+                        tui::draw(f, l, None, 0, "", v, None, &tui::TaskView::default());
+                    });
+                });
+                log.set_progress(None);
                 self.fire_session_start("clear", &mut |w| log.push_plain(w));
                 log.push_plain("started a new session");
             }
@@ -7884,6 +7929,56 @@ mod tests {
         assert_eq!(a.output_tokens, 5);
         assert_eq!(a.cache_read_tokens, 100);
         assert_eq!(a.cache_write_tokens, 7);
+    }
+
+    // The re-warm after `/new` restores a tier checkpoint: one blocking read
+    // plus a backend load that emits NO engine events. So the indicator can only
+    // appear if `rewarm_after_reset` ticks once on its own, before the walk.
+    // Without that guarantee the prompt would simply freeze for the duration.
+    #[test]
+    fn rewarm_after_reset_ticks_even_with_no_engine_events() {
+        let dir = std::env::temp_dir().join(format!("plank-rewarm-tick-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig::default();
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(crate::engine::EchoEngine::new(64)),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: "system prompt".to_string(),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            last_turn_interrupted: false,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            templates: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
+        };
+
+        // The stub engine has no KV support, so `kvtier::warm` emits nothing at
+        // all — exactly the shape of a checkpoint restore.
+        let mut ticks = 0_usize;
+        agent.rewarm_after_reset(&mut || ticks += 1);
+        assert!(
+            ticks >= 1,
+            "the indicator must be painted before the blocking restore, not only \
+             from engine events (got {ticks} ticks)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
