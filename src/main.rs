@@ -83,6 +83,13 @@ fn main() -> ExitCode {
         if t == plank::upgrade::Transition::Major {
             eprintln!("plank: major version change detected; cleared the image cache");
         }
+        // Best-effort, rate-limited (once/day), offline-safe check for a newer
+        // release. Never blocks startup; the notice is stashed for whichever
+        // front-end comes up to render non-intrusively (issue #56).
+        if settings.update.check {
+            let notice = plank::upgrade::check_for_update(&plank_dir, env!("CARGO_PKG_VERSION"));
+            plank::upgrade::set_update_notice(notice);
+        }
     }
 
     plank::interrupt::install();
@@ -533,6 +540,10 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     if !tui {
         print!("{}", plank::logo::banner());
         print!("{}", status::welcome_banner(cfg.generation.ctx_size, color));
+        // Non-intrusive one-time update hint (issue #56); silent when up to date.
+        if let Some(notice) = plank::upgrade::update_notice() {
+            println!("{notice}\n");
+        }
         // Only the echo stub has no model name; the TUI prints the same lines
         // into its own scrollback.
         if engine.model_name().is_empty() {

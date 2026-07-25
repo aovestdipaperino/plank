@@ -185,6 +185,21 @@ pub struct ToolSettings {
     pub plan_mode: bool,
 }
 
+/// Startup update-available detection (issue #56).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateSettings {
+    /// Whether to check the GitHub Releases API at startup for a newer plank
+    /// release. Best-effort, rate-limited to once/day, silent on failure; set
+    /// to `false` to disable the check (and its network request) entirely.
+    pub check: bool,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self { check: true }
+    }
+}
+
 /// The whole of `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -200,6 +215,8 @@ pub struct Settings {
     pub ask: AskSettings,
     /// Opt-in non-trained tools.
     pub tools: ToolSettings,
+    /// Startup update-available detection.
+    pub update: UpdateSettings,
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -331,6 +348,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "planMode") {
             self.tools.plan_mode = v;
         }
+
+        if let Some(v) = boolean(root.get("update"), "check") {
+            self.update.check = v;
+        }
     }
 
     /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
@@ -374,6 +395,9 @@ impl Settings {
 ///
 /// `cfg` is consulted so a setting a CLI flag overrode is *not* reported: the
 /// note lists what is in force, never what a file merely asked for.
+// A flat, one-line-per-setting audit of what is in force; long by nature, but
+// each arm is a trivial compare-and-push, so the length is not complexity.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<String> {
     let d = Settings::default();
@@ -462,6 +486,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.tools.plan_mode != d.tools.plan_mode {
         parts.push(format!("tools.planMode={}", s.tools.plan_mode));
+    }
+    if s.update.check != d.update.check {
+        parts.push(format!("update.check={}", s.update.check));
     }
 
     if parts.is_empty() {
@@ -639,6 +666,11 @@ impl Settings {
             upsert(t, "agent", Json::Bool(self.tools.agent));
             upsert(t, "planMode", Json::Bool(self.tools.plan_mode));
         }
+        upsert(
+            section(&mut root, "update"),
+            "check",
+            Json::Bool(self.update.check),
+        );
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -958,6 +990,25 @@ mod tests {
 
         let note = note_for(&s, &[]).expect("a note");
         assert!(note.contains("crtOff=false"), "{note}");
+    }
+
+    #[test]
+    fn update_check_defaults_on_and_can_be_disabled() {
+        assert!(Settings::default().update.check, "default is on");
+        let s = from_json(r#"{"update":{"check":false}}"#);
+        assert!(!s.update.check);
+        // Only the non-default (off) value surfaces in the startup note.
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("update.check=false"), "{note}");
+        // Round-trips through save.
+        let dir = std::env::temp_dir().join(format!("plank-update-chk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        s.save_to(&path).unwrap();
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&std::fs::read_to_string(&path).unwrap());
+        assert!(!reloaded.update.check);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
