@@ -319,6 +319,21 @@ impl SessionStore {
         fs::metadata(self.payload_path(id)).map_or(0, |m| m.len())
     }
 
+    /// Project-scope subdirectory for Tier 2+ checkpoints: `<dir>/<project-key>/`
+    /// (issue #60). Callers create it lazily before writing a `project.kv`.
+    #[must_use]
+    pub fn project_dir(&self, project: &Path) -> PathBuf {
+        self.dir.join(project_key(project))
+    }
+
+    /// Path of the Tier 2 project-stable KV checkpoint for `project` at the
+    /// chained fingerprint `fp2`: `<dir>/<project-key>/project-<fp2>.kv`. Shared
+    /// by all sessions of the project and read by every new session (issue #60).
+    #[must_use]
+    pub fn project_checkpoint_path(&self, project: &Path, fp2: &str) -> PathBuf {
+        self.project_dir(project).join(project_checkpoint_name(fp2))
+    }
+
     /// Strips the engine KV payload from the session matching the hex
     /// prefix, preserving its transcript (`/strip`). Returns the full id and
     /// whether a payload sidecar actually existed; stripping an already
@@ -600,6 +615,49 @@ const SYSPROMPT_STEM: &str = "sysprompt";
 pub fn sysprompt_checkpoint_name(project_dir: &Path) -> String {
     let hash = sha1_hex(project_dir.to_string_lossy().as_bytes());
     format!("{SYSPROMPT_STEM}-{}{FILE_EXT}", &hash[..12])
+}
+
+/// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
+/// `project-<fp2>.kv`, living under the per-project subdirectory.
+const PROJECT_STEM: &str = "project";
+
+/// Project-scope subdirectory name under `kvcache/`: 12 hex of `sha1(project
+/// path)`. Tier 2+ checkpoints live under here so they are *project-scoped*,
+/// while Tier 1 (`sysprompt-*.kv`) stays model-global at the cache root and is
+/// shared across every project (issue #60).
+#[must_use]
+pub fn project_key(project_dir: &Path) -> String {
+    let hash = sha1_hex(project_dir.to_string_lossy().as_bytes());
+    hash[..12].to_string()
+}
+
+/// Chains a child tier's fingerprint onto its parent's: `sha1(parent ‖ NUL ‖
+/// material)`.
+///
+/// This generalizes the system-prompt checkpoint key (`model ‖ NUL ‖ system`,
+/// [`crate::ds4engine`]) to an N-tier volatility hierarchy: each tier embeds its
+/// parent's fingerprint, so validation walks the chain top-down and the first
+/// mismatch at tier N rebuilds N and everything below it while tiers `1..N`
+/// stay reusable verbatim. Pure and order-deterministic (issue #60).
+///
+/// Example chain: `fp1 = sha(model ‖ system)` (Tier 1),
+/// `fp2 = tier_fingerprint(fp1, stable-context-hash ‖ local-tool-defs)` (Tier 2),
+/// `fp4 = tier_fingerprint(fp2, transcript)` (Tier 4). Tier 3 is prefill-only
+/// and never keyed.
+#[must_use]
+pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
+    let mut data = parent_fp.as_bytes().to_vec();
+    data.push(0);
+    data.extend_from_slice(material);
+    sha1_hex(&data)
+}
+
+/// File name of a Tier 2 project-stable checkpoint keyed by its chained
+/// fingerprint `fp2`: `project-<fp2>.kv`. One file per (project, AGENTS.md
+/// revision); shared by every session of the project (issue #60).
+#[must_use]
+pub fn project_checkpoint_name(fp2: &str) -> String {
+    format!("{PROJECT_STEM}-{fp2}{FILE_EXT}")
 }
 
 /// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
@@ -1405,6 +1463,109 @@ mod tests {
         .unwrap();
         let entries = store.list().unwrap();
         assert_eq!(entries.len(), 1, "checkpoints must be skipped: {entries:?}");
+        assert_eq!(entries[0].id, s.id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tier_fingerprint_chains_and_is_sensitive() {
+        // fp1 stands in for the Tier 1 (sysprompt) key.
+        let fp1 = sha1_hex(b"model\0system");
+        let fp2 = tier_fingerprint(&fp1, b"agents-hash");
+        // Deterministic.
+        assert_eq!(fp2, tier_fingerprint(&fp1, b"agents-hash"));
+        // A changed parent invalidates the child (chain property).
+        let fp1b = sha1_hex(b"model\0other-system");
+        assert_ne!(fp2, tier_fingerprint(&fp1b, b"agents-hash"));
+        // A changed material invalidates the child.
+        assert_ne!(fp2, tier_fingerprint(&fp1, b"agents-hash-2"));
+        // The NUL separator prevents boundary collisions (parent+material
+        // regrouping must not alias).
+        assert_ne!(
+            tier_fingerprint("ab", b"c"),
+            tier_fingerprint("a", b"bc"),
+            "NUL separator must make the boundary unambiguous"
+        );
+    }
+
+    #[test]
+    fn tier_which_change_invalidates() {
+        // Simulate the volatility hierarchy: fp1 (Tier1) → fp2 (Tier2) → fp4
+        // (Tier4). Assert exactly which tiers a given change rebuilds.
+        let sys = "model\0system";
+        let stable = b"agents-set".as_slice();
+        let transcript = b"turns".as_slice();
+
+        let build = |sys: &str, stable: &[u8], transcript: &[u8]| {
+            let fp1 = sha1_hex(sys.as_bytes());
+            let fp2 = tier_fingerprint(&fp1, stable);
+            let fp4 = tier_fingerprint(&fp2, transcript);
+            (fp1, fp2, fp4)
+        };
+
+        let (fp1, fp2, fp4) = build(sys, stable, transcript);
+
+        // Volatile-only change (Tier 3, not keyed) leaves the whole chain valid:
+        // nothing is rebuilt — this is the whole point of the reorder.
+        assert_eq!(
+            (fp1.clone(), fp2.clone(), fp4.clone()),
+            build(sys, stable, transcript)
+        );
+
+        // Changing AGENTS.md (Tier 2 material) rebuilds Tier 2 and Tier 4,
+        // but Tier 1 is reused verbatim.
+        let (n1, n2, n4) = build(sys, b"agents-set-v2", transcript);
+        assert_eq!(n1, fp1, "Tier 1 must survive an AGENTS.md change");
+        assert_ne!(n2, fp2, "Tier 2 must rebuild on AGENTS.md change");
+        assert_ne!(n4, fp4, "Tier 4 must rebuild below a rebuilt Tier 2");
+
+        // Changing the system prompt (Tier 1) cascades to every tier below.
+        let (m1, m2, m4) = build("model\0new-system", stable, transcript);
+        assert_ne!(m1, fp1);
+        assert_ne!(m2, fp2);
+        assert_ne!(m4, fp4);
+    }
+
+    #[test]
+    fn project_scoped_layout_paths() {
+        let dir = temp_dir("proj-layout");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/some/project");
+
+        // Tier 2 lives under a per-project subdir; Tier 1 stays at the root.
+        let pdir = store.project_dir(project);
+        assert_eq!(pdir, dir.join(project_key(project)));
+        assert_ne!(project_key(project), project_key(Path::new("/other")));
+
+        let fp2 = "deadbeefcafe0000";
+        let cp = store.project_checkpoint_path(project, fp2);
+        assert!(cp.starts_with(&pdir));
+        assert_eq!(
+            cp.file_name().unwrap().to_string_lossy(),
+            format!("project-{fp2}{FILE_EXT}")
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_checkpoints_are_not_listed_as_sessions() {
+        // Tier 2 files live in a subdir, so the flat session listing (which does
+        // not recurse) never mistakes them for sessions.
+        let dir = temp_dir("proj-skip");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        store.save(&mut s).unwrap();
+        let project = Path::new("/proj/x");
+        let pdir = store.project_dir(project);
+        fs::create_dir_all(&pdir).unwrap();
+        fs::write(store.project_checkpoint_path(project, "abc123"), b"kv").unwrap();
+        let entries = store.list().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "project checkpoints must be skipped: {entries:?}"
+        );
         assert_eq!(entries[0].id, s.id);
         let _ = fs::remove_dir_all(&dir);
     }
