@@ -3,10 +3,11 @@
 A short, human-readable highlight reel per release. For the full change list
 see the GitHub releases and commit history.
 
-## Beta (2.5.5)
+## 2.6.0
 
-A single fix you can feel, sitting on top of a refactor you shouldn't be able
-to.
+The 2.5 beta line, promoted. Six weeks of the cache learning to keep what it
+already knows, plus session branching, a handful of commands, and a lot of
+progress-reporting that finally tells the truth.
 
 ⚡ **`/new` is fast again.** Starting a fresh session used to throw away the
 system-prompt cache and rebuild it from scratch — thousands of tokens, twenty
@@ -16,62 +17,95 @@ indistinguishable from one. `/new` now puts the cache back to exactly the state
 a cold launch has, so the next turn only evaluates your question. On DeepSeek V4
 Flash the same `write a haiku` → `/new` → `write a haiku` flow went from 31.7s
 to 19.7s, and the token accounting dropped from a hidden 2509-token rebuild to a
-7-token prefill.
+7-token prefill. While the cache is being restored the prompt hides behind a
+throbber, so you can see the brief pause instead of typing into a frozen line.
 
-🧹 **The KV cache has one format instead of five.** Under the hood, saving and
-restoring the cache had grown three separate implementations of the same file
-header, two different payload layouts, and a legacy fallback. That is now one
-type with one format, one owner of where files live, and one code path for
-warming the cache at startup. Nothing about this is visible — which is the
-point — except that a whole class of "why did it re-prefill?" bug can no longer
-happen, and progress bars now tell the truth about what the engine is about to
-do rather than what merely matches.
+📊 **The prefill bar measures the work, not the prompt.** It used to run from
+the cached prefix to the end of the prompt, so a warm turn that reused 8000
+tokens and prefilled 200 opened at 97% and inched along, while the tok/s figure
+beside it already counted only the new tokens. Bar and throughput now describe
+the same 200 tokens.
 
-🗑️ **Old cache snapshots get cleaned up.** Each change to your system prompt,
-global MCP servers, or model produced a fresh multi-hundred-megabyte cache
-snapshot and kept the old one forever. Only the current one is kept now. Your
-existing caches are rebuilt once on first launch of this version; they are pure
-caches, so the only cost is one prefill.
+🌳 **Sessions branch.** A conversation is a tree now, not a line. `/fork [n]`
+starts a new branch from an earlier prompt of yours, `/clone` duplicates the
+branch you are on, and `/tree` shows the shape and which branch is live.
+Existing linear sessions load unchanged.
 
-## Beta (2.1, unreleased)
+🧠 **The cache is layered.** What rarely changes (system prompt, then your
+project's AGENTS.md/CLAUDE.md and local MCP tools) is checkpointed separately
+from what changes every session (git status, the date). At launch plank restores
+the deepest layer still valid and prefills only from the first thing that
+actually differs — and the project layer is shared across every session in that
+directory. Superseded snapshots are deleted instead of accumulating by the
+hundreds of megabytes.
 
-The 2.1 beta (`brew install plank-agent-beta`) is a round of "see what the agent is
-doing" polish, plus the first delegation tool.
+📤 **`/export [md|html]`** writes the transcript out as Markdown or a
+self-contained HTML file.
+
+📝 **Prompt templates.** Markdown files in `~/.plank/templates` or
+`./.plank/templates` become `/name` commands, with `{{var}}` interpolation.
+Built-in commands can never be shadowed.
+
+⌨️ **A real prompt line.** Ctrl+G opens `$EDITOR` on what you have typed and
+brings it back. Alt/Ctrl + arrows move by word, Alt/Ctrl + Backspace/Delete kill
+by word, and the emacs bindings (Alt+B/F/D) work too. Long input wraps instead
+of scrolling sideways.
 
 🧑‍🔧 **Delegate to a sub-agent.** The model can hand a bounded task to a fresh,
-scoped sub-agent with the new `agent` tool and get back only its conclusion,
-instead of filling the main transcript with the research. It runs as a sidechain
-off your conversation and rolls back out afterward, so the delegation is cheap.
-An optional `name` picks one of your `~/.plank/agents` personas.
+scoped sub-agent with the `agent` tool and get back only its conclusion, instead
+of filling the main transcript with the research. It runs as a sidechain off your
+conversation and rolls back out afterward. An optional `name` picks one of your
+`~/.plank/agents` personas.
 
-📝 **Plan mode.** `EnterPlanMode` puts the model in a read-only phase — it can
+📋 **Plan mode.** `EnterPlanMode` puts the model in a read-only phase — it can
 research with read/list/glob/search but `write`, `edit`, and `bash` are refused
 — until it proposes a plan with `ExitPlanMode` and you approve it. A cheap
-course-correction before any edits land.
+course-correction before any edits land. Like the `task` and `agent` tools, it
+is off by default: the DS4 model was not trained on it.
 
-📊 **File changes show as a git diff.** When the model edits a file (or
-overwrites one), plank now renders a git-style change card: an `Update(path)`
-header, an added/removed summary, and `@@` hunks with red/green line
-highlighting. A brand-new file instead streams its contents dimmed as it is
-written, so you always see what is going onto disk.
+🔍 **File changes show as a git diff.** Edits render as a change card — an
+`Update(path)` header, an added/removed summary, `@@` hunks in red and green —
+and highlighting narrows to the changed words within a line rather than painting
+the whole row. A brand-new file streams its contents dimmed as it is written.
 
-⏳ **Progress you can actually see.** The system-prompt cache, if it needs
-rebuilding at launch, now does so behind a simple progress bar before the full
-UI appears. During a turn the spinner, verb, and token stats sit on their own
-line right below the output — so even while thinking is hidden, you can tell the
-turn is alive. The status bar itself is quieter: it shows the working directory,
-git branch, and context as a percentage, framed above and below by a rule.
+🌐 **The web tools grew a browser.** `visit_page` fetches through an embedded
+headless browser rather than curl, and `google_search` runs client-side. Web
+access asks for consent first, with an "Always allow" option.
 
-🔎 **Run reports without waiting.** `/context`, `/usage`, `/mcp`, and `/help` now
-work while the model is still generating, answered from a turn-start snapshot —
-no need to interrupt to check where things stand.
+🔔 **Notifications and window title.** A turn that runs past 10 seconds ends with
+a macOS banner headlined by your prompt; `ui.notifications` picks `always`,
+`unfocused`, or `never`, and `/notify` toggles it live. The terminal title tracks
+what plank is doing.
 
-⌨️ **The prompt wraps.** Long input wraps onto the next line instead of scrolling
-sideways, so you can see the whole thing as you type.
+⚙️ **`/config`** is an interactive form over every setting (or
+`/config ui.showThinking false` straight from the prompt), writing
+`./.plank/settings.json` and applying immediately. `ui.showThinking: false`
+hides the model's reasoning; `ui.reducedMotion` turns off every animation.
 
-⚙️ **`showThinking` setting.** Set `ui.showThinking: false` to hide the model's
-dimmed thinking from the display (it still produces it); the on-screen progress
-line keeps the turn visible either way.
+✨ **Animation and polish.** A shared 20 Hz clock drives the throbber, glimmer,
+and flashes; thinking text is dim italic; tool dispatches flash in the status
+bar; fenced code blocks are click-to-copy and drag-selection survives scrolling;
+a CRT power-off animation plays on exit. The status bar shows context as a bare
+percentage, with the live progress line pinned below the output.
+
+🔌 **MCP over HTTP.** `.mcp.json` entries with a `"url"` (and optional
+`"headers"`) connect over Streamable HTTP; stdio servers work exactly as before.
+
+🆙 **Update checks.** A once-a-day, offline-safe peek at GitHub Releases hints
+when a newer plank exists. Disable with `update.check`.
+
+🧹 **Under the hood.** Saving and restoring the KV cache had grown three
+implementations of the same file header, two payload layouts, and a legacy
+fallback; it is now one type, one format, one owner. Two plank instances can no
+longer interleave into the same cache file. Prefill runs in chunks so Ctrl-C
+interrupts it promptly. The TUI no longer wedges at 100% CPU on a streaming code
+block, providers retry transient HTTP failures with backoff instead of crashing
+the run, and a task-list rewrite no longer invalidated the top of the prompt and
+re-prefilled the whole conversation every turn. Your existing caches are rebuilt
+once on first launch of this version; they are pure caches, so the cost is one
+prefill.
+
+The Homebrew formulas are `plank-agent` and `plank-agent-beta`.
 
 ## 2.0.2
 
