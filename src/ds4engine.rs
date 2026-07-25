@@ -1659,6 +1659,26 @@ mod tests {
         assert_eq!(s, vec![("user", "result text".to_string())]);
     }
 
+    /// Contract `kvtier::plan` depends on (#64): a message's trailing
+    /// whitespace does not survive the transcript round-trip, so the tiers the
+    /// warm path tokenizes are canonicalized to match. Two adjacent user
+    /// sections are the session-start shape (stable then volatile) and must
+    /// stay two sections, not merge. If this trimming ever changes, the tier
+    /// canonicalization in `kvtier::plan` has to change with it or the KV
+    /// common-prefix probe silently diverges and re-prefills every turn.
+    #[test]
+    fn adjacent_user_sections_stay_split_and_lose_trailing_whitespace() {
+        let s = parse_sections("[system]\nsys\n[user]\nstable\n\n[user]\nvolatile\n");
+        assert_eq!(
+            s,
+            vec![
+                ("system", "sys".to_string()),
+                ("user", "stable".to_string()),
+                ("user", "volatile".to_string()),
+            ]
+        );
+    }
+
     // Real-model round-trip proof (BTW-SUSPEND-DESIGN §5.3): snapshot the
     // session mid-reply, run an aside, restore, and assert the main task's
     // continuation is byte-identical to an uninterrupted seeded run — i.e. the

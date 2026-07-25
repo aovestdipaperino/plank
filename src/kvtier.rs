@@ -134,6 +134,15 @@ pub fn plan(
     project_checkpoint: Option<&dyn Fn(&str) -> PathBuf>,
 ) -> Vec<TierSpec> {
     let mut tiers = Vec::new();
+    // Canonicalize each tier to the exact text the turn will tokenize. A tier
+    // becomes one user message, and the turn rebuilds its tokens from the
+    // rendered transcript, where `parse_sections` trims every message's
+    // trailing whitespace. Tokenizing the untrimmed text at warm time would
+    // therefore diverge from the turn at the first tier and re-prefill
+    // everything below it — `stable_context()` ends with a newline, so that is
+    // the default case, not an edge case (#64).
+    let stable = stable.trim_end();
+    let volatile = volatile.trim_end();
     // Tier 2 exists only when there is stable text to cache. Local MCP tool
     // definitions key it but are *not* prefix text — they already reached the
     // model through the system prompt; folding them into fp2 (rather than fp1)
@@ -229,25 +238,73 @@ mod tests {
         Box::new(|fp: &str| PathBuf::from(format!("/cache/proj/project-{fp}.kv")))
     }
 
+    /// Regression (#64): a tier's text is tokenized twice — once at warm time
+    /// (`warm_tiers`, verbatim) and once per turn, where it has been through
+    /// `render_transcript` → `parse_sections`, which trims each message's
+    /// trailing whitespace. Trailing whitespace on a tier therefore tokenizes
+    /// differently in the two paths, the KV common-prefix probe diverges at
+    /// that tier, and every tier from there down is re-prefilled on the first
+    /// question. `stable_context()` ends with a newline, so this bit exactly
+    /// as soon as it became a message of its own.
+    #[test]
+    fn tier_text_is_canonical_for_the_transcript_round_trip() {
+        let content = crate::context::ContextContent {
+            git_content: Some("GIT-STATUS".to_string()),
+            agents_md_content: Some("AGENTS".to_string()),
+            memory_content: Some("MEM".to_string()),
+            date_content: "DATE".to_string(),
+        };
+        // Guard the premise: if this stops being true the bug is gone for a
+        // different reason and this test should be revisited, not deleted.
+        assert!(
+            content.stable_context().ends_with('\n'),
+            "premise: stable_context ends with a newline"
+        );
+
+        let tiers = plan(
+            "fp1",
+            &content.stable_context(),
+            &content.volatile_context(),
+            "",
+            None,
+        );
+        assert!(!tiers.is_empty(), "expected tiers for non-empty context");
+        for t in &tiers {
+            assert_eq!(
+                t.text,
+                t.text.trim_end(),
+                "{:?} tier text must match what parse_sections yields for it",
+                t.kind
+            );
+        }
+    }
+
     #[test]
     fn plan_orders_stable_before_volatile_and_only_caches_tier2() {
         let cp = cp();
         let tiers = plan("fp1", "agents\n", "git + date\n", "", Some(&*cp));
         assert_eq!(tiers.len(), 2);
         assert_eq!(tiers[0].kind, TierKind::ProjectStable);
-        assert_eq!(tiers[0].text, "agents\n");
+        // Trailing whitespace is trimmed: each tier is one user message, and
+        // the turn rebuilds it from the transcript, which trims (#64).
+        assert_eq!(tiers[0].text, "agents");
         assert!(tiers[0].cacheable(), "Tier 2 is checkpointed");
         assert_eq!(tiers[1].kind, TierKind::SessionVolatile);
-        assert_eq!(tiers[1].text, "git + date\n");
+        assert_eq!(tiers[1].text, "git + date");
         assert!(
             !tiers[1].cacheable(),
             "Tier 3 is prefill-only and must never be checkpointed"
         );
-        // The concatenation is exactly what a single combined context message
-        // would have carried: splitting adds no text of its own.
+        // Splitting adds no text of its own: the tiers rejoined by the single
+        // newline `render_transcript` puts between messages are exactly the
+        // combined context as the turn sees it (i.e. after its own trim).
         assert_eq!(
-            format!("{}{}", tiers[0].text, tiers[1].text),
-            "agents\ngit + date\n"
+            tiers
+                .iter()
+                .map(|t| t.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+            "agents\ngit + date\n".trim_end()
         );
     }
 
