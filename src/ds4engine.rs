@@ -706,11 +706,9 @@ impl Engine for Ds4Session {
             )
         });
         // Prime the progress bar so it reflects the cached prefix immediately.
-        on_event(EngineEvent::Prefill(PrefillProgress {
-            done: cached.clamp(0, (prompt_len - 1).max(0)),
-            total: prompt_len,
-            tps: 0.0,
-        }));
+        on_event(EngineEvent::Prefill(PrefillProgress::primed(
+            cached, prompt_len,
+        )));
 
         // Prefill: sync the session to the prompt tokens, streaming progress
         // events so the caller can paint a live progress bar.

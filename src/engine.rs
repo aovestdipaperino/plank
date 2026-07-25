@@ -97,6 +97,39 @@ impl PrefillProgress {
             tps,
         }
     }
+
+    /// The priming event emitted before a turn's sync, reporting how much of
+    /// the prompt the live KV already holds.
+    ///
+    /// A partially cached prompt is held one token short of `total`: the bar
+    /// must not read 100% before any work has happened. A *fully* cached
+    /// prompt is the opposite case — there is no work to do, so it reports
+    /// `done == total`. Clamping that one short too would freeze the bar at
+    /// 99.99% for the whole time-to-first-token with no further event ever
+    /// arriving to correct it, which reads as a hung prefill (#64 follow-up).
+    #[must_use]
+    pub fn primed(cached: i32, total: i32) -> Self {
+        let total = total.max(0);
+        let done = if cached >= total {
+            total
+        } else {
+            cached.clamp(0, (total - 1).max(0))
+        };
+        Self {
+            done,
+            total,
+            tps: 0.0,
+        }
+    }
+
+    /// Whether this progress reports a finished prefill — i.e. the engine is
+    /// now sampling, not prefilling. Drives the status line so a fully cached
+    /// turn does not claim to be "prefilling" while it waits for the first
+    /// token.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.done >= self.total
+    }
 }
 
 /// Role of a structured chat message handed to a provider engine.
@@ -657,6 +690,40 @@ mod tests {
         assert_eq!(p.done, 101);
         assert_eq!(p.total, 106);
         assert_eq!(total, 106);
+    }
+
+    /// Regression (#64 follow-up): with the tier cache working, a turn whose
+    /// prompt is entirely in KV is the *normal* case, not a rare one. The
+    /// priming event is then the only prefill event of the turn — nothing
+    /// follows it, because there is nothing to prefill. Reporting it one token
+    /// short leaves the status bar parked at 99.99% for the whole
+    /// time-to-first-token, which is indistinguishable from a hang.
+    #[test]
+    fn a_fully_cached_prompt_primes_as_complete() {
+        let p = PrefillProgress::primed(13121, 13121);
+        assert_eq!(p.done, 13121, "nothing to prefill: report it finished");
+        assert_eq!(p.total, 13121);
+        assert!(p.is_complete());
+
+        // Over-cached (the KV holds more than this prompt) is still complete.
+        assert!(PrefillProgress::primed(20000, 13121).is_complete());
+    }
+
+    #[test]
+    fn a_partially_cached_prompt_primes_short_of_complete() {
+        let p = PrefillProgress::primed(13110, 13121);
+        assert_eq!(p.done, 13110);
+        assert!(
+            !p.is_complete(),
+            "real work remains; the bar must not read 100%"
+        );
+
+        // A cold prompt primes at zero and is only complete if there is
+        // genuinely nothing to do.
+        let cold = PrefillProgress::primed(0, 13121);
+        assert_eq!(cold.done, 0);
+        assert!(!cold.is_complete());
+        assert!(PrefillProgress::primed(0, 0).is_complete());
     }
 
     // Feeds a 🦀 (4 UTF-8 bytes) split the way a byte-level tokenizer emits

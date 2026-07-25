@@ -1073,7 +1073,16 @@ impl Agent<'_> {
                     }
                     EngineEvent::Prefill(p) => {
                         bar.show(&Status {
-                            state: WorkerState::Prefill,
+                            // A finished prefill means the engine is sampling,
+                            // not prefilling. Saying "prefilling" through the
+                            // whole time-to-first-token reads as a hang, and a
+                            // fully cached turn has no further event coming to
+                            // correct it (#64 follow-up).
+                            state: if p.is_complete() {
+                                WorkerState::Generating
+                            } else {
+                                WorkerState::Prefill
+                            },
                             prefill_done: p.done,
                             prefill_total: p.total,
                             prefill_label: verb,
@@ -4611,7 +4620,13 @@ impl Agent<'_> {
                     }
                 }
                 EngineEvent::Prefill(p) => Status {
-                    state: WorkerState::Prefill,
+                    // See the plain-REPL path: a completed prefill is the
+                    // sampling wait, not prefilling (#64 follow-up).
+                    state: if p.is_complete() {
+                        WorkerState::Generating
+                    } else {
+                        WorkerState::Prefill
+                    },
                     prefill_done: p.done,
                     prefill_total: p.total,
                     prefill_label: verb,
