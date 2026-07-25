@@ -311,6 +311,34 @@ pub struct SessionEntry {
     pub path: PathBuf,
 }
 
+/// Identifies one persisted KV cache: its signature plus whatever scope the
+/// signature alone cannot supply.
+///
+/// The project variant carries its own directory because two projects can hold
+/// the same `fp2` only by coincidence of identical context — they must still
+/// not share a file, and GC sweeps per project directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvKey {
+    /// Tier 1: model + system prompt. `sysprompt-<fp>.kv`, shared across projects.
+    System { fp: String },
+    /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv`.
+    Project { dir: PathBuf, fp: String },
+    /// A saved conversation's KV payload. `<id>.payload`.
+    Session { id: String },
+}
+
+impl KvKey {
+    /// The signature this key is stored under — the value a loaded file must
+    /// carry for the load to be trusted.
+    #[must_use]
+    pub fn signature(&self) -> &str {
+        match self {
+            Self::System { fp } | Self::Project { fp, .. } => fp,
+            Self::Session { id } => id,
+        }
+    }
+}
+
 /// Directory-backed store of saved sessions.
 #[derive(Debug, Clone)]
 pub struct SessionStore {
@@ -405,6 +433,32 @@ impl SessionStore {
             }
         }
         removed
+    }
+
+    /// Filesystem location backing a [`KvKey`].
+    fn kv_path(&self, key: &KvKey) -> PathBuf {
+        match key {
+            KvKey::System { fp } => self.dir.join(format!("sysprompt-{fp}{FILE_EXT}")),
+            KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),
+            KvKey::Session { id } => self.payload_path(id),
+        }
+    }
+
+    /// Loads the cache stored under `key`, or `None` on any miss — absent,
+    /// stale, corrupt, or written by an older format version.
+    #[must_use]
+    pub fn kv_load(&self, key: &KvKey) -> Option<crate::kvcache::KVCache> {
+        crate::kvcache::KVCache::from_file(&self.kv_path(key), key.signature())
+    }
+
+    /// Persists `cache` under `key`, creating parent directories as needed.
+    ///
+    /// # Errors
+    /// Returns the underlying [`io::Error`] when the write fails. Callers treat
+    /// a failure as best-effort: the live session is correct either way and
+    /// only the next launch pays.
+    pub fn kv_store(&self, key: &KvKey, cache: &crate::kvcache::KVCache) -> io::Result<()> {
+        cache.persist(&self.kv_path(key), key.signature())
     }
 
     /// Strips the engine KV payload from the session matching the hex
@@ -2250,5 +2304,52 @@ hello\n";
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, d);
+    }
+
+    #[test]
+    #[allow(clippy::cast_possible_truncation)]
+    fn kv_store_and_load_roundtrip_per_key_kind() {
+        use crate::ds4tokens::TokenTranscript;
+        use crate::kvcache::KVCache;
+
+        let dir = std::env::temp_dir().join(format!("plank-kvkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let project = std::path::PathBuf::from("/tmp/some-project");
+
+        let keys = [
+            KvKey::System { fp: "fp1".into() },
+            KvKey::Project {
+                dir: project.clone(),
+                fp: "fp2".into(),
+            },
+            KvKey::Session {
+                id: "abc123".into(),
+            },
+        ];
+        for (i, key) in keys.iter().enumerate() {
+            let cache = KVCache::new(vec![i as u8; 4], TokenTranscript::new());
+            store.kv_store(key, &cache).unwrap();
+            let back = store.kv_load(key).expect("stored key loads back");
+            assert_eq!(back.kv(), &[i as u8; 4], "key {i} roundtrips");
+        }
+
+        // A key that was never written is a miss, not an error.
+        assert!(
+            store
+                .kv_load(&KvKey::System { fp: "other".into() })
+                .is_none()
+        );
+        // A different project dir is a different namespace, even at the same fp.
+        assert!(
+            store
+                .kv_load(&KvKey::Project {
+                    dir: "/tmp/elsewhere".into(),
+                    fp: "fp2".into()
+                })
+                .is_none(),
+            "project checkpoints must not collide across projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
