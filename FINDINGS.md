@@ -136,26 +136,41 @@ test` and review the diff before committing.
   inversion is unverified in the porting environment (no submodule/model);
   compaction/rollback rewrite ops still `truncate_spans`+re-append rather than
   detokenize→edit→`reset`, which `TokenTranscript::reset` is staged for.
-- **Per-session KV payloads cannot share the transcript's `.kv` name, and a
-  restored payload must restore the reply history captured with it.** The C
-  stores the engine payload inside the session `.kv` file; plank's v1
-  transcript format already owns that name, so payloads live in a
-  `<sha>.payload` sidecar (fingerprint line + payload bytes, same layout as
-  `sysprompt.kv`). The fingerprint covers model ‖ NUL ‖ system prompt ‖ NUL ‖
-  rendered transcript, so a resave after more turns (or compaction) is
-  detected as stale. The payload carries the serialized token transcript in
-  front of the raw KV bytes (`plank-tokens-v1\n` magic, `ds4tokens::encode` /
-  `decode`; **was** `plank-replies-v1\n` per issue #58): `snapshot_kv` writes
-  both atomically and `restore_kv` restores both, so a resumed session keeps
-  the restored KV's own token buffer (never another conversation's — the two
-  travel together) and only prefills genuinely new tokens. A legacy
-  `plank-replies-v1` payload (skipped to the raw KV by `strip_legacy`, kept one
-  release) or a stripped payload restores with an empty buffer: correct, just
-  rebuilds from text and re-prefills from the first reply. The host idle-reclaim path (`snapshot_bytes` /
-  `restore_bytes` on `Ds4HostSession`) uses the same wrap. The raw KV bytes
-  remain the single `SessionSnapshot` primitive; the sidecar, fingerprint,
-  and reply header only wrap them, so there is no second hand-rolled
-  KV-serialize path.
+- **Every persisted KV is one `KVCache` in one format, and a restored payload
+  must restore the token transcript captured with it.** The C stores the engine
+  payload inside the session `.kv` file; plank's v1 transcript format already
+  owns that name, so session payloads live in a `<sha>.payload` sidecar. All of
+  them — the system-prompt checkpoint, the per-project tier checkpoints, and
+  session payloads — are written by `KVCache::persist` and read by
+  `KVCache::from_file` (`src/kvcache.rs`) in a single layout:
+  `<signature>\n<version:u8><encoded transcript><raw KV bytes>`. `SessionStore`
+  owns every path via `KvKey` (`System` / `Project` / `Session`), so no other
+  code constructs a KV filename. Reads are `Option`-valued and a miss is
+  indistinguishable by design: absent, signature mismatch, truncated body, and
+  an unrecognized version byte all mean "prefill instead", so nothing else in the
+  tree makes a trust decision about cached bytes. Writes are best-effort — a
+  failed persist costs the next launch one prefill and must never abort startup.
+  For a session payload the signature is `payload_fingerprint` = model ‖ NUL ‖
+  system prompt ‖ NUL ‖ rendered transcript, so a resave after more turns (or
+  compaction) is detected as stale; keying on the session id alone would make a
+  payload captured under a *different model* a cache hit rather than a rejection.
+  The token transcript travels inside the value rather than as a hand-rolled
+  prefix (it **was** `plank-replies-v1\n`, then `plank-tokens-v1\n`; issue #58),
+  so a resumed session keeps the restored KV's own token buffer — never another
+  conversation's — and prefills only genuinely new tokens; an empty buffer is
+  still correct, it just rebuilds from text and re-prefills from the first reply.
+  Tier checkpoints deliberately carry an **empty** transcript, so "the transcript
+  describes this KV" holds for session payloads but *not* for tier checkpoints —
+  do not start trusting it there. This one type replaced five divergent paths
+  (three separately reimplementing `<fingerprint>\n<bytes>`, two different
+  payload shapes, plus the legacy fallback). The only KV bytes still framed by
+  hand are the host idle-reclaim swap file (`snapshot_bytes` / `restore_bytes` on
+  `Ds4HostSession`): a process-scoped temp file with no signature and no
+  staleness question, which is the sole remaining reason `strip_legacy` exists.
+  Temp files are `<name>.tmp.<pid>` — the pid matters, because two processes
+  persisting the same path would otherwise interleave into a file whose signature
+  line and version byte are intact but whose KV region is spliced, which
+  `decode` would accept.
 - **A KV cache tier boundary must fall on a chat-template *message* boundary,
   and a tier's checkpoint must be taken while the cursor sits exactly at that
   boundary.** The tiered cache (#60/#64) makes the project-stable context a
@@ -168,9 +183,56 @@ test` and review the diff before committing.
   concatenated text is unchanged, and the system prompt (the only
   parity-pinned part) is untouched, so `tests/c_parity.rs` is unaffected.
   Likewise, `SessionSnapshot::capture` serializes the *whole* session, not a
-  prefix of it, so `warm_tiers` syncs to one tier's end, writes that tier's
+  prefix of it, so `kvtier::warm` syncs to one tier's end, writes that tier's
   checkpoint, and only then syncs the next — never build the full prefix first
-  and try to checkpoint a tier retroactively.
+  and try to checkpoint a tier retroactively. Fingerprints cannot catch a
+  violation here: persisting tier *i* after prefilling tier *i+1* stores tier
+  *i+1*'s KV under a key that is genuinely correct for tier *i*.
+- **The token buffer handed to `ds4_session_sync` must always *extend* the live
+  checkpoint's end. Anything else silently discards the entire KV.** This one
+  rule caused two separate bugs, and it is the thing to check first whenever a
+  turn is unexpectedly slow. `ds4_session_sync` reuses the live KV only when
+  `prompt->len >= checkpoint.len && ds4_tokens_starts_with(prompt,
+  &s->checkpoint)`; every other case — a divergence *or* a prompt that is a
+  strict **prefix** of the live checkpoint — falls through to
+  `metal_graph_reset_prefill_state` and re-prefills from zero. The C states why
+  next to `ds4_session_rewrite_requires_rebuild`: "Extending exactly at the live
+  end is safe; rewriting behind it is not an in-place operation" — the backend
+  still holds raw SWA rows, compressed KV rows, indexer rows, and compressor
+  frontiers for the old suffix, and shortening the token vector
+  (`ds4_session_rewind`) cannot roll those back. **So the only safe way to move
+  *back* to a shorter prefix is to restore a real frontier snapshot (`set_kv`),
+  never to truncate.** `/rollback` and `/switch` are correct precisely because
+  they do that.
+  The corollary trap is that **`ds4_session_common_prefix` answers "how many
+  tokens match", not "how many will be reused"** — the two diverge in exactly
+  the reset cases, and believing the former turns a full rebuild into a silent
+  one. `engine::reusable_prefix(pos, common)` is the honest predicate:
+  `common == pos` or nothing.
+  *Instance 1 — `/new` and `/clear`.* A fresh session's rendered transcript is
+  the head of the one it replaced (same system prompt, same session context), so
+  the next prompt is a strict prefix of the live KV. `common_prefix` returned the
+  whole prompt while the engine threw the KV away, and because
+  `PrefillProgress::primed` treats a fully-cached prompt as complete, a
+  ~2500-token prefill ran with the bar already at 100% and no further event ever
+  arriving — indistinguishable from a hang. `Agent::rewarm_after_reset` now
+  re-runs `kvtier::warm` after a reset, restoring the tier checkpoint (a genuine
+  frontier snapshot at the warm boundary) so the next turn extends it. Measured
+  on DeepSeek V4 Flash for `haiku; /new; haiku`: a 2509-token rebuild reported as
+  `prefill=0 (100.0% reused)` became a 7-token prefill, 31.7s → 19.7s. The
+  post-`/new` trace is now byte-identical to a cold launch's first turn, which is
+  what `/new` should mean.
+  *Instance 2 — the tier walk.* `kvtier::warm` must call `warm_append` for
+  **every** tier and skip only the *sync* for tiers below the resume point. An
+  early version skipped the append too (`.skip(resume)`), so after restoring the
+  project checkpoint the buffer read `[system, volatile]` while the live KV held
+  `[system, project]` — no longer an extension, so `sync` discarded the
+  just-restored KV and the deep-hit path became *slower* than a cold start. Hence
+  the split between `warm_append` (extend the buffer, no prefill) and `warm_sync`
+  (prefill to the buffer's end); a single combined call cannot express it. Note
+  that a spy/echo engine which models no token buffer cannot catch this class of
+  bug — it is invisible to `kvtier`'s unit tests by construction, and only the
+  `PLANK_KV_DEBUG` trace or a real-model timing shows it.
 - **`count_tokens` must subtract chat-template overhead** so it reports
   text-only counts; the template wrapper is measured once at engine startup
   (`src/ds4engine.rs`).
