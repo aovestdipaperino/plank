@@ -132,6 +132,33 @@ impl PrefillProgress {
     }
 }
 
+/// How many prompt tokens the engine will *actually* reuse, given the matching
+/// prefix length `common` and the live checkpoint length `pos`.
+///
+/// `ds4_session_common_prefix` answers "how many leading tokens match?", which
+/// is **not** the same as "how many will be kept". `ds4_session_sync` reuses the
+/// live KV only when the prompt *extends* the live end
+/// (`prompt_len >= pos && starts_with(prompt, checkpoint)`); anything else takes
+/// the reset branch and re-prefills from zero. The C is explicit about why:
+/// "Extending exactly at the live end is safe; rewriting behind it is not an
+/// in-place operation" — the backend still holds raw SWA rows, compressed KV
+/// rows, indexer rows, and compressor frontiers for the old suffix, and a token
+/// count cannot roll those back.
+///
+/// The case that matters is a prompt that is a strict *prefix* of the live
+/// checkpoint, which `/new` and `/clear` produce: a fresh session's rendered
+/// transcript is a prefix of the one it replaced. There `common` equals the full
+/// prompt length while the engine silently rebuilds everything, so reporting
+/// `common` primes the progress bar as complete and the ensuing multi-thousand
+/// token prefill runs with no feedback at all — a hung-looking stall.
+///
+/// `common == pos` is the whole test: it implies both that every live token
+/// matched (so `starts_with` holds) and that `prompt_len >= pos`.
+#[must_use]
+pub fn reusable_prefix(pos: i32, common: i32) -> i32 {
+    if pos > 0 && common == pos { pos } else { 0 }
+}
+
 /// Role of a structured chat message handed to a provider engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -623,7 +650,7 @@ impl Engine for EchoEngine {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        Utf8Stream,
+        Utf8Stream, reusable_prefix,
     };
 
     // Cold prefill: nothing cached, so the absolute position is the progress
@@ -687,6 +714,37 @@ mod tests {
     /// follows it, because there is nothing to prefill. Reporting it one token
     /// short leaves the status bar parked at 99.99% for the whole
     /// time-to-first-token, which is indistinguishable from a hang.
+    // A prompt that is a strict PREFIX of the live checkpoint — what `/new` and
+    // `/clear` produce — reuses NOTHING: `ds4_session_sync` cannot rewrite
+    // behind the live end, so it resets and re-prefills. Reporting the matching
+    // prefix here is what made a ~20s rebuild look like "100% reused" with a
+    // progress bar primed as complete.
+    #[test]
+    fn a_prompt_shorter_than_the_live_kv_reuses_nothing() {
+        // /new: 2509-token fresh prompt, 2760 tokens live, all 2509 match.
+        assert_eq!(
+            reusable_prefix(2760, 2509),
+            0,
+            "a strict prefix of the live KV is rebuilt from zero, not reused"
+        );
+        // The bar must therefore NOT prime as complete for that turn.
+        assert!(!PrefillProgress::primed(reusable_prefix(2760, 2509), 2509).is_complete());
+    }
+
+    #[test]
+    fn a_prompt_extending_the_live_kv_reuses_the_whole_checkpoint() {
+        // The normal turn: live KV is 2810, prompt is 2818, all 2810 match.
+        assert_eq!(reusable_prefix(2810, 2810), 2810);
+        // A divergence behind the live end also rebuilds: 2653 of 2760 matched.
+        assert_eq!(
+            reusable_prefix(2760, 2653),
+            0,
+            "diverging before the live end forces a full rebuild"
+        );
+        // No live checkpoint at all.
+        assert_eq!(reusable_prefix(0, 0), 0);
+    }
+
     #[test]
     fn a_fully_cached_prompt_primes_as_complete() {
         let p = PrefillProgress::primed(13121, 13121);

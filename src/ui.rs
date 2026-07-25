@@ -2141,6 +2141,9 @@ impl Agent<'_> {
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
+                // Reinstate the warm prefix; without it the next turn silently
+                // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
+                self.rewarm_after_reset();
                 self.fire_session_start("clear", &mut |w| println!("{w}"));
                 println!("started a new session");
             }
@@ -3957,6 +3960,25 @@ impl Agent<'_> {
         }
     }
 
+    /// Re-establishes the warm KV prefix after the transcript is reset by
+    /// `/new` or `/clear`.
+    ///
+    /// A reset makes the next prompt a strict *prefix* of the live KV (the fresh
+    /// transcript is the old one's head: same system prompt, same session
+    /// context). `ds4_session_sync` cannot rewrite behind its live end, so it
+    /// would silently discard the whole KV and re-prefill the system prompt from
+    /// scratch — thousands of tokens, with the progress bar primed as complete
+    /// because every token "matched". Restoring the tier checkpoint instead
+    /// installs a genuine frontier snapshot at the warm boundary, so the next
+    /// turn extends it and prefills only the new question.
+    ///
+    /// Best-effort and silent: on any failure the next turn just pays the
+    /// rebuild it would have paid anyway.
+    fn rewarm_after_reset(&mut self) {
+        let tiers = self.kv_tiers();
+        let _ = crate::kvtier::warm(&mut *self.engine, Some(&self.store), &tiers, &mut |_| {});
+    }
+
     /// Warms the KV cache — system prompt and session-start context tiers — in
     /// one walk before the full TUI is shown. When the cache is already current
     /// nothing prefills and nothing is drawn; otherwise a minimal centered
@@ -4858,6 +4880,9 @@ impl Agent<'_> {
                 log.clear();
                 *view = tui::OutputView::default();
                 self.tui_write_banner(log);
+                // Reinstate the warm prefix; without it the next turn silently
+                // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
+                self.rewarm_after_reset();
                 self.fire_session_start("clear", &mut |w| log.push_plain(w));
                 log.push_plain("started a new session");
             }

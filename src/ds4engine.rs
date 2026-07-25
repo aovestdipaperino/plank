@@ -636,16 +636,31 @@ impl Engine for Ds4Session {
         // SAFETY: session valid; cancel_cb reads a thread-local flag.
         unsafe { ffi::ds4_session_set_cancel(session, Some(cancel_cb), std::ptr::null_mut()) };
 
-        // How many prompt tokens the live KV already holds; the sync below only
-        // evaluates the suffix beyond this cached prefix.
+        // How many prompt tokens match the live KV, and how many the sync below
+        // will actually *keep*. These differ: the engine reuses the live KV only
+        // when the prompt extends its end, so a prompt that is a strict prefix
+        // of the checkpoint (what `/new` produces) matches fully yet is rebuilt
+        // from zero. Reporting `common` there primes the bar as complete and
+        // hides the whole rebuild — see `engine::reusable_prefix`.
         // SAFETY: session and tokens are valid.
-        let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        let common = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        // SAFETY: session valid.
+        let pos = unsafe { ffi::ds4_session_pos(session) };
+        let cached = crate::engine::reusable_prefix(pos, common);
         kv_debug(|| {
-            format!(
+            let mut s = format!(
                 "generate: prompt={prompt_len} cached={cached} prefill={} ({:.1}% reused)",
                 prompt_len - cached,
                 f64::from(cached) * 100.0 / f64::from(prompt_len.max(1))
-            )
+            );
+            if cached != common {
+                let _ = write!(
+                    s,
+                    "\n  full rebuild: prompt is a {common}-token prefix of a {pos}-token \
+                     live KV; sync cannot rewrite behind the live end"
+                );
+            }
+            s
         });
         // Prime the progress bar so it reflects the cached prefix immediately.
         on_event(EngineEvent::Prefill(PrefillProgress::primed(
