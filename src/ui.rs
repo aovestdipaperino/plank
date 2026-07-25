@@ -806,6 +806,70 @@ fn fmt_int(n: i32) -> String {
     out
 }
 
+/// Renders the joke "invoice" `/usage` prints when inference is running on a
+/// local engine, where there is no provider bill to report. Real token counts
+/// are accurate; every monetary/physical unit below is deliberately absurd,
+/// and the closing line states the real cost plainly so the gag can never be
+/// mistaken for a charge.
+///
+/// Pure: usage numbers in, rendered block out — no engine, no terminal.
+fn render_local_invoice(model: &str, input_tokens: u64, output_tokens: u64, color: bool) -> String {
+    use std::fmt::Write as _;
+    let dim = |s: &str| {
+        if color {
+            format!("\x1b[38;5;238m{s}{ANSI_RESET}")
+        } else {
+            s.to_owned()
+        }
+    };
+    let total = input_tokens.saturating_add(output_tokens);
+    // Entirely made-up conversion factors. Do not cite these anywhere.
+    // Integer math only: milli-watt-hours and thousandths of an espresso.
+    let milli_wh = total / 5;
+    let milli_espresso = total / 100;
+    let fan_revs = total.saturating_mul(11);
+    let knee_minutes = total / 900;
+    let gpu_tears = output_tokens / 1_000;
+
+    let model = if model.is_empty() {
+        "local model"
+    } else {
+        model
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "{}",
+        dim(&format!("Local Inference Invoice — {model}"))
+    );
+    let _ = writeln!(out, "  tokens in     {}", fmt_u64(input_tokens));
+    let _ = writeln!(out, "  tokens out    {}", fmt_u64(output_tokens));
+    let _ = writeln!(
+        out,
+        "  electricity   {}.{:03} Wh ({}.{:03} espressos)",
+        milli_wh / 1_000,
+        milli_wh % 1_000,
+        milli_espresso / 1_000,
+        milli_espresso % 1_000
+    );
+    let _ = writeln!(
+        out,
+        "  fan service   {} revolutions of quiet dignity",
+        fmt_u64(fan_revs)
+    );
+    let _ = writeln!(out, "  lap heat      {knee_minutes} toasty-knee-minutes");
+    let _ = writeln!(out, "  GPU tears     {gpu_tears} (shed silently, in Metal)");
+    let _ = writeln!(out, "  amount due    0 (zero) dollars");
+    let _ = writeln!(
+        out,
+        "{}",
+        dim(
+            "This invoice is a joke. Real cost is $0.00 — inference ran locally on your own hardware, so nobody is billing you."
+        )
+    );
+    out
+}
+
 /// Formats a `u64` token count with thousands separators, for the run stats.
 fn fmt_u64(n: u64) -> String {
     let s = n.to_string();
@@ -1702,13 +1766,19 @@ impl Agent<'_> {
             }
         };
         if self.usage.turns == 0 {
-            let provider = self.cfg.provider.is_some();
-            let msg = if provider {
-                "No provider usage yet this session — run a turn first."
-            } else {
-                "Usage tracking applies to online models (--provider); this session uses a local engine."
-            };
-            return format!("{}\n", dim(msg));
+            if self.cfg.provider.is_none() {
+                // Local engine: there is no bill, so bill the user in nonsense.
+                return render_local_invoice(
+                    &self.engine.model_name(),
+                    self.stats.input_tokens,
+                    self.stats.output_tokens,
+                    color,
+                );
+            }
+            return format!(
+                "{}\n",
+                dim("No provider usage yet this session — run a turn first.")
+            );
         }
         let t = self.usage.total;
         let model = self
@@ -7194,6 +7264,52 @@ mod tests {
         assert_eq!(fmt_int(1_000), "1,000");
         assert_eq!(fmt_int(17_859), "17,859");
         assert_eq!(fmt_int(-5), "0");
+    }
+
+    #[test]
+    fn local_invoice_states_real_cost_is_zero() {
+        let out = super::render_local_invoice("deepseek-v4-flash", 12_345, 6_789, false);
+        // The gag must never be mistakable for a real charge.
+        assert!(
+            out.contains("Real cost is $0.00"),
+            "missing real-cost disclaimer:\n{out}"
+        );
+        assert!(out.contains("This invoice is a joke"), "{out}");
+        assert!(out.contains("ran locally"), "{out}");
+        // No other dollar figure may appear anywhere in the block.
+        assert_eq!(out.matches('$').count(), 1, "{out}");
+    }
+
+    #[test]
+    fn local_invoice_reports_real_token_counts() {
+        let out = super::render_local_invoice("m", 12_345, 6_789, false);
+        assert!(out.contains("tokens in     12,345"), "{out}");
+        assert!(out.contains("tokens out    6,789"), "{out}");
+        assert!(out.starts_with("Local Inference Invoice — m\n"), "{out}");
+    }
+
+    #[test]
+    fn local_invoice_units_are_absurd_and_deterministic() {
+        let out = super::render_local_invoice("m", 4_000, 1_000, false);
+        // 5,000 tokens: 1.000 Wh, 0.050 espressos, 55,000 revs, 5 knee-min.
+        assert!(
+            out.contains("electricity   1.000 Wh (0.050 espressos)"),
+            "{out}"
+        );
+        assert!(out.contains("fan service   55,000 revolutions"), "{out}");
+        assert!(out.contains("lap heat      5 toasty-knee-minutes"), "{out}");
+        assert!(out.contains("GPU tears     1 "), "{out}");
+    }
+
+    #[test]
+    fn local_invoice_handles_empty_model_and_zero_usage() {
+        let out = super::render_local_invoice("", 0, 0, false);
+        assert!(
+            out.contains("Local Inference Invoice — local model"),
+            "{out}"
+        );
+        assert!(out.contains("0.000 Wh"), "{out}");
+        assert!(out.contains("Real cost is $0.00"), "{out}");
     }
 
     #[test]
