@@ -441,10 +441,50 @@ impl SessionStore {
         removed
     }
 
+    /// Deletes every Tier 1 system-prompt checkpoint except the one keyed
+    /// `keep_fp`, returning how many files were removed (issue #64).
+    ///
+    /// A `sysprompt-<fp1>.kv` is only ever readable at one (model, system
+    /// prompt) revision, so a plank upgrade, a global MCP server added or
+    /// removed, or a model switch orphans the previous one permanently — and
+    /// these snapshots run to hundreds of megabytes. GC is by fingerprint, not
+    /// by mtime: the current revision is the only one any future launch can
+    /// hit. The legacy bare `sysprompt.kv` (overwritten in place before the
+    /// checkpoint became content-keyed) goes too — nothing writes that name
+    /// any more, so it can never be read again. Best-effort; a failed unlink
+    /// is ignored (the next launch retries).
+    #[must_use]
+    pub fn gc_system_checkpoints(&self, keep_fp: &str) -> usize {
+        let keep_name = sysprompt_checkpoint_name(keep_fp);
+        let legacy_name = format!("{SYSPROMPT_STEM}{FILE_EXT}");
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // `sysprompt-*.kv` only: the same directory holds `<id>.payload`
+            // sidecars, `<id>.kv` session files, per-project subdirectories,
+            // and `<name>.kv.tmp.<pid>` writes still in flight.
+            let collect = name == legacy_name
+                || (name.starts_with(SYSPROMPT_PREFIX)
+                    && name.ends_with(FILE_EXT)
+                    && name != keep_name);
+            if !collect || !entry.file_type().is_ok_and(|t| t.is_file()) {
+                continue;
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Filesystem location backing a [`KvKey`].
     fn kv_path(&self, key: &KvKey) -> PathBuf {
         match key {
-            KvKey::System { fp } => self.dir.join(format!("sysprompt-{fp}{FILE_EXT}")),
+            KvKey::System { fp } => self.dir.join(sysprompt_checkpoint_name(fp)),
             KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),
             KvKey::Session { id, .. } => self.payload_path(id),
         }
@@ -754,6 +794,10 @@ impl SessionStore {
 /// cache dir with session files but are not sessions.
 const SYSPROMPT_STEM: &str = "sysprompt";
 
+/// File-name prefix of a content-keyed system-prompt checkpoint,
+/// `sysprompt-<fp1>.kv`.
+const SYSPROMPT_PREFIX: &str = "sysprompt-";
+
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
 /// `project-<fp2>.kv`, living under the per-project subdirectory.
 const PROJECT_STEM: &str = "project";
@@ -795,6 +839,13 @@ pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
 #[must_use]
 pub fn project_checkpoint_name(fp2: &str) -> String {
     format!("{PROJECT_STEM}-{fp2}{FILE_EXT}")
+}
+
+/// File name of the Tier 1 system-prompt checkpoint keyed by its fingerprint
+/// `fp1`: `sysprompt-<fp1>.kv`. Model-global, at the cache root.
+#[must_use]
+pub fn sysprompt_checkpoint_name(fp1: &str) -> String {
+    format!("{SYSPROMPT_PREFIX}{fp1}{FILE_EXT}")
 }
 
 /// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
@@ -1811,6 +1862,48 @@ hello\n";
             "project checkpoints must be skipped: {entries:?}"
         );
         assert_eq!(entries[0].id, s.id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_keeps_only_the_current_system_checkpoint() {
+        let dir = temp_dir("sys-gc");
+        let store = SessionStore::open(&dir).unwrap();
+
+        for fp in ["aaa", "bbb", "ccc"] {
+            fs::write(dir.join(sysprompt_checkpoint_name(fp)), b"fp\nkv").unwrap();
+        }
+        // The pre-content-keyed checkpoint: unreadable now, so it goes too.
+        fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
+        // Neighbours in the same root that must survive: a payload sidecar, a
+        // session file, an in-flight temp write, and a project subdirectory.
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        store.save(&mut s).unwrap();
+        let payload = store.payload_path(&s.id);
+        fs::write(&payload, b"payload").unwrap();
+        let tmp = dir.join(format!("{}.tmp.4242", sysprompt_checkpoint_name("ddd")));
+        fs::write(&tmp, b"in flight").unwrap();
+        let project = Path::new("/proj/sys");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+        fs::write(store.project_checkpoint_path(project, "aaa"), b"fp\nkv").unwrap();
+
+        assert_eq!(store.gc_system_checkpoints("bbb"), 3);
+        assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
+        assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
+        assert!(!dir.join(sysprompt_checkpoint_name("ccc")).exists());
+        assert!(!dir.join("sysprompt.kv").exists());
+        assert!(payload.exists());
+        assert!(store.path_for_id(&s.id).exists());
+        assert!(tmp.exists());
+        assert!(store.project_checkpoint_path(project, "aaa").exists());
+
+        // Idempotent, and harmless when there is nothing to collect.
+        assert_eq!(store.gc_system_checkpoints("bbb"), 0);
+        let empty = temp_dir("sys-gc-empty");
+        let empty_store = SessionStore::open(&empty).unwrap();
+        assert_eq!(empty_store.gc_system_checkpoints("bbb"), 0);
+        let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -3943,6 +3943,12 @@ impl Agent<'_> {
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
         if let Some(t) = tiers
             .iter()
+            .find(|t| t.kind == crate::kvtier::TierKind::System)
+        {
+            let _removed = self.store.gc_system_checkpoints(&t.fingerprint);
+        }
+        if let Some(t) = tiers
+            .iter()
             .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
         {
             let _removed = self

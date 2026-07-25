@@ -116,7 +116,15 @@ impl KVCache {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension("tmp");
+        // Pid-suffixed, and built from the *whole* file name rather than
+        // `with_extension`: two plank processes persisting the same path must
+        // not share a temp file (an interleaved write splices two snapshots
+        // into a body `decode` cannot tell from a good one), and `t.kv`'s temp
+        // must not collide with a sibling `t.payload`'s.
+        let name = path.file_name().unwrap_or_default();
+        let mut tmp_name = name.to_os_string();
+        tmp_name.push(format!(".tmp.{}", std::process::id()));
+        let tmp = path.with_file_name(tmp_name);
         std::fs::write(&tmp, self.encode(signature))?;
         std::fs::rename(&tmp, path)
     }
@@ -181,7 +189,7 @@ mod tests {
     #[test]
     fn persist_leaves_no_partial_file_behind() {
         // The temp file must not survive a successful persist: a stray
-        // `t.kv.tmp` would eventually be read as a checkpoint by a future
+        // `t.kv.tmp.<pid>` would eventually be read as a checkpoint by a
         // globbing GC pass.
         let dir = std::env::temp_dir().join(format!("plank-kvcache-tmp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -195,6 +203,12 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["t.kv".to_owned()]);
+        // The name it *would* have had is the pid-unique one, and it is gone.
+        assert!(
+            !dir.join(format!("t.kv.tmp.{}", std::process::id()))
+                .exists(),
+            "the pid-suffixed temp file must be renamed away"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
