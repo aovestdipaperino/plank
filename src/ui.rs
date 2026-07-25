@@ -3914,7 +3914,6 @@ impl Agent<'_> {
         }
     }
 
-    /// Idle status line (plain text; the TUI styles the bar itself).
     /// Plans the KV cache tiers below the system prompt for this launch
     /// (issue #64): Tier 2 (project-stable context, checkpointed per project at
     /// `kvcache/<project-key>/project-<fp2>.kv`) and Tier 3 (session-volatile

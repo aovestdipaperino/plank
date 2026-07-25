@@ -500,7 +500,6 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             cfg.power_percent,
             &cfg.engine,
             &cfg.system,
-            None,
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);

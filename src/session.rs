@@ -2278,7 +2278,6 @@ hello\n";
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
     fn kv_store_and_load_roundtrip_per_key_kind() {
         use crate::ds4tokens::TokenTranscript;
         use crate::kvcache::KVCache;
@@ -2300,10 +2299,11 @@ hello\n";
             },
         ];
         for (i, key) in keys.iter().enumerate() {
-            let cache = KVCache::new(vec![i as u8; 4], TokenTranscript::new());
+            let i = u8::try_from(i).expect("index fits in u8");
+            let cache = KVCache::new(vec![i; 4], TokenTranscript::new());
             store.kv_store(key, &cache).unwrap();
             let back = store.kv_load(key).expect("stored key loads back");
-            assert_eq!(back.kv(), &[i as u8; 4], "key {i} roundtrips");
+            assert_eq!(back.kv(), &[i; 4], "key {i} roundtrips");
         }
 
         // A key that was never written is a miss, not an error.

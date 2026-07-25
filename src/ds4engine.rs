@@ -213,7 +213,6 @@ impl Ds4Model {
         power_percent: i32,
         tuning: &crate::config::EngineTuning,
         system: &str,
-        checkpoint: Option<&Path>,
     ) -> Result<Arc<Self>, EngineError> {
         let model = Arc::new(Self::open(
             model_path,
@@ -225,22 +224,8 @@ impl Ds4Model {
         )?);
         // Warm on a throwaway bootstrap session, then capture its KV.
         let mut boot = Ds4Session::from_model(Arc::clone(&model));
-        // Restore a matching on-disk checkpoint when there is one; otherwise
-        // prefill the system prompt and persist a fresh checkpoint. Best-effort
-        // on both ends: a cache miss only costs one prefill.
-        let fingerprint = model.checkpoint_fingerprint(system);
-        let restored = checkpoint
-            .and_then(|path| crate::kvcache::KVCache::from_file(path, &fingerprint))
-            .is_some_and(|cache| boot.set_kv(&cache).is_ok());
-        if !restored {
-            boot.warm_reset(system)?;
-            boot.warm_sync(&mut |_| {})?;
-            if let Some(path) = checkpoint
-                && let Some(cache) = boot.get_kv()
-            {
-                let _ = cache.persist(path, &fingerprint);
-            }
-        }
+        boot.warm_reset(system)?;
+        boot.warm_sync(&mut |_| {})?;
         let session = boot.ensure_session()?;
         let snap = SessionSnapshot::capture(session)?;
         *model.warm.lock().unwrap() = Some(snap);
@@ -394,13 +379,6 @@ impl Ds4Model {
             // NUL bytes (or a failed overhead probe) fall back to the estimate.
             _ => i32::try_from(text.len() / 4).unwrap_or(i32::MAX),
         }
-    }
-
-    /// Fingerprint tying a checkpoint to this exact model and system prompt —
-    /// Tier 1 of the KV cache chain, and the parent every deeper tier's key
-    /// hangs off. Shared with the tier planner so the two cannot disagree.
-    fn checkpoint_fingerprint(&self, system: &str) -> String {
-        crate::kvtier::system_fingerprint(&self.model_name(), system)
     }
 }
 
@@ -1619,7 +1597,6 @@ mod tests {
             100,
             &tuning,
             "you are a helpful assistant",
-            None,
         )
         .unwrap();
         let host = EngineHost::new(model, HostConfig::default());
@@ -1665,7 +1642,6 @@ mod tests {
             100,
             &tuning,
             "you are a helpful assistant",
-            None,
         )
         .unwrap();
         let host = EngineHost::new(model, HostConfig::default());
@@ -1718,7 +1694,6 @@ mod tests {
             100,
             &tuning,
             "you are a helpful assistant",
-            None,
         )
         .unwrap();
         let host = EngineHost::new(model, HostConfig::default());
@@ -1781,7 +1756,6 @@ mod tests {
             100,
             &tuning,
             "you are a helpful assistant",
-            None,
         )
         .unwrap();
         let host = EngineHost::new(
@@ -2013,7 +1987,6 @@ mod tests {
             100,
             &tuning,
             "you are a helpful assistant",
-            None,
         )
         .unwrap();
         let host = EngineHost::new(
