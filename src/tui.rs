@@ -1263,6 +1263,16 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
     let add = Style::default()
         .bg(Color::Indexed(22))
         .fg(Color::Indexed(194));
+    // Emphasis for the changed span of a word-diffed pair: brighter bg + bold so
+    // the surrounding common text (base bg) recedes. Mirrors `EditPreview::to_ansi`.
+    let del_emph = Style::default()
+        .bg(Color::Indexed(88))
+        .fg(Color::Indexed(231))
+        .add_modifier(Modifier::BOLD);
+    let add_emph = Style::default()
+        .bg(Color::Indexed(28))
+        .fg(Color::Indexed(231))
+        .add_modifier(Modifier::BOLD);
     for row in &p.rows {
         match row {
             DiffRow::Hunk {
@@ -1278,20 +1288,54 @@ pub fn render_diff_card(log: &mut OutputLog, p: &crate::tools::diff::EditPreview
                 Span::styled(format!("{}   ", gutter(row.gutter())), dim),
                 Span::raw(text.clone()),
             ]),
-            DiffRow::Del { text, .. } => log.push_spans(vec![Span::styled(
-                format!("{} - {text}", gutter(row.gutter())),
+            DiffRow::Del { text, segments, .. } => log.push_spans(diff_line_spans(
+                &format!("{} - ", gutter(row.gutter())),
+                text,
+                segments.as_deref(),
                 del,
-            )]),
-            DiffRow::Add { text, .. } => log.push_spans(vec![Span::styled(
-                format!("{} + {text}", gutter(row.gutter())),
+                del_emph,
+            )),
+            DiffRow::Add { text, segments, .. } => log.push_spans(diff_line_spans(
+                &format!("{} + ", gutter(row.gutter())),
+                text,
+                segments.as_deref(),
                 add,
-            )]),
+                add_emph,
+            )),
             DiffRow::Elision(n) => {
                 log.push_spans(vec![Span::styled(format!("      ⋯ {n} more lines ⋯"), dim)]);
             }
         }
     }
     log.push_spans(vec![]);
+}
+
+/// Builds the styled spans for one Del/Add diff row. With word-level `segments`,
+/// the `prefix` (gutter + sigil) and common runs take `base` while changed runs
+/// take `emph`; without segments the whole line is one `base` span, matching the
+/// prior line-level rendering.
+fn diff_line_spans(
+    prefix: &str,
+    text: &str,
+    segments: Option<&[crate::tools::diff::Segment]>,
+    base: Style,
+    emph: Style,
+) -> Vec<Span<'static>> {
+    use crate::tools::diff::SegKind;
+    match segments {
+        Some(segs) => {
+            let mut spans = vec![Span::styled(prefix.to_string(), base)];
+            for seg in segs {
+                let style = match seg.kind {
+                    SegKind::Removed | SegKind::Added => emph,
+                    SegKind::Common => base,
+                };
+                spans.push(Span::styled(seg.text.clone(), style));
+            }
+            spans
+        }
+        None => vec![Span::styled(format!("{prefix}{text}"), base)],
+    }
 }
 
 /// Minimal pre-UI screen shown while the system-prompt KV cache is (re)built at
