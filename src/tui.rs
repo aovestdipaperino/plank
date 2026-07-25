@@ -1762,32 +1762,43 @@ fn anim_tick_ms() -> u64 {
     crate::anim::clock_ms().unwrap_or(0)
 }
 
-/// Pushes the accent word with a shimmer: a 3-column bright highlight sweeps
+/// Pushes the accent word with a shimmer: a graded highlight sweeps
 /// right-to-left across the word, one column per `SHIMMER_STEP_MS`, over a
 /// cycle of word width + 20 columns (so the highlight rests off-text between
 /// sweeps).
+///
+/// Each column inside the window takes its own shade from
+/// [`crate::status::SHIMMER_RAMP`] by distance from the center — brightest in
+/// the middle, easing back into the theme color at the edges — so the sweep
+/// looks like light travelling over the word rather than a white block sliding
+/// along it.
 fn push_shimmered(spans: &mut Vec<Span<'static>>, word: &str, tick_ms: u64, theme: Style) {
-    let shimmer = theme.fg(Color::Indexed(crate::status::SHIMMER_COLOR));
+    let ramp = crate::status::SHIMMER_RAMP;
+    let half = i64::try_from(ramp.len().saturating_sub(1)).unwrap_or(0);
     let width = i64::try_from(word.chars().count()).unwrap_or(0);
     let cycle = width + 20;
     let step = i64::try_from(tick_ms / crate::status::SHIMMER_STEP_MS).unwrap_or(0);
     let center = width + 10 - step % cycle;
-    // Split into before / shimmer / after segments by char column.
-    let (mut before, mut shim, mut after) = (String::new(), String::new(), String::new());
+    // One shade per column, then coalesce equal-styled neighbours so a sweep
+    // costs a handful of spans rather than one per character.
+    let mut runs: Vec<(String, Style)> = Vec::new();
     for (col, ch) in word.chars().enumerate() {
         let col = i64::try_from(col).unwrap_or(i64::MAX);
-        if col < center - 1 {
-            before.push(ch);
-        } else if col <= center + 1 {
-            shim.push(ch);
+        let dist = (col - center).abs();
+        let style = if dist <= half {
+            // dist 0 is the center, which takes the last (brightest) shade.
+            let idx = ramp.len() - 1 - usize::try_from(dist).unwrap_or(0);
+            theme.fg(Color::Indexed(ramp[idx]))
         } else {
-            after.push(ch);
+            theme
+        };
+        match runs.last_mut() {
+            Some((text, prev)) if *prev == style => text.push(ch),
+            _ => runs.push((ch.to_string(), style)),
         }
     }
-    for (text, style) in [(before, theme), (shim, shimmer), (after, theme)] {
-        if !text.is_empty() {
-            spans.push(Span::styled(text, style));
-        }
+    for (text, style) in runs {
+        spans.push(Span::styled(text, style));
     }
 }
 
@@ -2519,7 +2530,12 @@ mod tests {
     #[test]
     fn verb_shimmer_sweeps_across_the_word() {
         let base = Style::default();
-        let shimmer = Color::Indexed(crate::status::SHIMMER_COLOR);
+        // Any shade of the ramp counts as highlighted: the window is graded, so
+        // no single color covers the whole highlight any more.
+        let shades: Vec<Color> = crate::status::SHIMMER_RAMP
+            .iter()
+            .map(|&i| Color::Indexed(i))
+            .collect();
         // Collect the shimmer segment text at each step of one full cycle.
         let text = "◆ Pondering… 3s";
         let mut highlights = Vec::new();
@@ -2533,7 +2549,7 @@ mod tests {
             let hit: String = line
                 .spans
                 .iter()
-                .filter(|s| s.style.fg == Some(shimmer))
+                .filter(|s| s.style.fg.is_some_and(|c| shades.contains(&c)))
                 .map(|s| s.content.as_ref())
                 .collect();
             highlights.push(hit);
@@ -2545,6 +2561,61 @@ mod tests {
         assert!(highlights.len() > 3, "static shimmer: {highlights:?}");
         assert!(highlights.iter().any(String::is_empty));
         assert!(highlights.iter().any(|h| h.contains("nde")));
+    }
+
+    // The highlight is a gradient, not a flat block: when it sits fully on the
+    // word, every shade of the ramp is on screen at once and the brightest one
+    // is in the middle. A regression to a single flat color (white or otherwise)
+    // fails here even though the sweep would still animate.
+    #[test]
+    fn verb_shimmer_is_graded_not_a_flat_block() {
+        let base = Style::default();
+        let ramp = crate::status::SHIMMER_RAMP;
+        let text = "◆ Pondering… 3s";
+        let brightest = Color::Indexed(ramp[ramp.len() - 1]);
+        let dimmest = Color::Indexed(ramp[0]);
+        let lines: Vec<_> = (0..40u64)
+            .map(|step| {
+                status_bar_line(
+                    text,
+                    step * crate::status::SHIMMER_STEP_MS,
+                    base,
+                    &TaskView::default(),
+                )
+            })
+            .collect();
+
+        // Mid-sweep the window sits wholly inside the word, and there the bright
+        // center is flanked by the dimmest shade on *both* sides. (At the ends of
+        // the travel the window overhangs the word, so only part of the ramp is
+        // on screen — which is why this looks for the interior step.)
+        let flanked = lines.iter().any(|line| {
+            let first = line.spans.iter().position(|s| s.style.fg == Some(dimmest));
+            let bright = line
+                .spans
+                .iter()
+                .position(|s| s.style.fg == Some(brightest));
+            let last = line.spans.iter().rposition(|s| s.style.fg == Some(dimmest));
+            match (first, bright, last) {
+                (Some(f), Some(b), Some(l)) => f < b && b < l,
+                _ => false,
+            }
+        });
+        assert!(
+            flanked,
+            "no step showed a bright center flanked by dimmer shades; \
+             the highlight is not graded"
+        );
+
+        // And no pure white at any point in the cycle.
+        for line in &lines {
+            assert!(
+                !line.spans.iter().any(|s| {
+                    s.style.fg == Some(Color::Indexed(231)) || s.style.fg == Some(Color::White)
+                }),
+                "the shimmer uses shades of the theme hue, never pure white"
+            );
+        }
     }
 
     #[test]

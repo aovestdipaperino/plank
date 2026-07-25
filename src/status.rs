@@ -15,8 +15,19 @@ pub const STATUS_STYLE_END: &str = "\x1b[0m";
 /// such as the filled portion of the progress bar.
 pub const THEME_COLOR: u8 = 106;
 
-/// Bright highlight color for the shimmer sweeping across the spinner verb.
-pub const SHIMMER_COLOR: u8 = 231;
+/// Shades swept across the spinner verb, ordered outermost column first so the
+/// last entry lands on the center of the highlight.
+///
+/// These are lightness steps of the theme's own hue rather than a flat white
+/// flash: pure white against the military green reads as a blown-out glitch and
+/// draws the eye harder than the text it decorates, while a graded ramp reads as
+/// light moving across the word. The window is
+/// `2 * (SHIMMER_RAMP.len() - 1) + 1` columns wide, so adding a shade widens and
+/// softens the sweep in one edit.
+///
+/// 143 `#afaf5f` → 149 `#afd75f` → 192 `#d7ff87`, all in the same
+/// olive/green family as [`THEME_COLOR`] (106 `#87af5f`).
+pub const SHIMMER_RAMP: [u8; 3] = [143, 149, 192];
 
 /// Milliseconds per shimmer step (one display column of travel).
 pub const SHIMMER_STEP_MS: u64 = 200;
