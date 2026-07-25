@@ -16,6 +16,7 @@
 //! over one shared `Ds4Model`.
 
 use std::ffi::{CStr, CString};
+use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -532,6 +533,37 @@ impl Ds4Session {
             })
             .collect();
         let keep = self.transcript.common_prefix(&keys);
+        kv_debug(|| {
+            let mut s = format!(
+                "reconcile: {} spans held, {} sections in, kept {}",
+                self.transcript.spans().len(),
+                keys.len(),
+                keep
+            );
+            // The first divergent span is the whole story: everything from here
+            // is retokenized and re-prefilled. Show both sides so a mismatch in
+            // invisible characters (trailing whitespace, #64) is diagnosable.
+            if keep < keys.len() {
+                let k = &keys[keep];
+                let _ = write!(
+                    s,
+                    "\n  diverged at {keep}: incoming {:?} len={} head={:?}",
+                    k.role,
+                    k.text.len(),
+                    k.text.chars().take(60).collect::<String>()
+                );
+                if let Some(held) = self.transcript.spans().get(keep) {
+                    let _ = write!(
+                        s,
+                        "\n              held     {:?} len={} head={:?}",
+                        held.role,
+                        held.text.len(),
+                        held.text.chars().take(60).collect::<String>()
+                    );
+                }
+            }
+            s
+        });
         self.transcript.truncate_spans(keep);
         for (role, text) in sections.iter().skip(keep) {
             let Some(span_role) = SpanRole::from_tag(role) else {
@@ -666,6 +698,13 @@ impl Engine for Ds4Session {
         // evaluates the suffix beyond this cached prefix.
         // SAFETY: session and tokens are valid.
         let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        kv_debug(|| {
+            format!(
+                "generate: prompt={prompt_len} cached={cached} prefill={} ({:.1}% reused)",
+                prompt_len - cached,
+                f64::from(cached) * 100.0 / f64::from(prompt_len.max(1))
+            )
+        });
         // Prime the progress bar so it reflects the cached prefix immediately.
         on_event(EngineEvent::Prefill(PrefillProgress {
             done: cached.clamp(0, (prompt_len - 1).max(0)),
@@ -1588,6 +1627,27 @@ fn strip_legacy(bytes: &[u8]) -> &[u8] {
         // Malformed legacy header: fall back to treating the whole payload as
         // raw KV (best effort; a load failure just forces a cold prefill).
         None => bytes,
+    }
+}
+
+/// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
+///
+/// KV prefix reuse is the one part of the engine whose failures are silent and
+/// expensive: a mismatch costs a full re-prefill and looks exactly like "the
+/// model is slow today". The closure is only called when the variable is set,
+/// so this costs an env lookup per turn otherwise. Diagnostic only — nothing
+/// reads these files back.
+fn kv_debug(f: impl FnOnce() -> String) {
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("PLANK_KV_DEBUG") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", f());
     }
 }
 
