@@ -29,6 +29,7 @@ pub mod dsml;
 pub mod editor;
 pub mod engine;
 pub mod errlog;
+pub mod export;
 #[cfg(ds4_engine)]
 pub mod ffi;
 pub mod hooks;
