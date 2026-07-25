@@ -9,6 +9,7 @@
 
 pub mod agents;
 pub mod anim;
+pub mod branch;
 pub mod checkpoint;
 pub mod compact;
 pub mod complete;

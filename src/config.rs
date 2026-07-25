@@ -590,7 +590,10 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/remote"
             | "/grant"
             | "/version"
+            | "/tree"
+            | "/clone"
     ) || slash_command_with_args(cmd, "/config")
+        || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
         || slash_command_with_args(cmd, "/remember")

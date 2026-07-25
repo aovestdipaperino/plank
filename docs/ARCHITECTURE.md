@@ -162,6 +162,11 @@ See `docs/SYSTEM-PROMPT.md` for the full story of how the system prompt is
 built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `session.rs` — save/load/list/switch/delete with SHA-1 identities and history
   rendering under `~/.plank/kvcache`.
+- `branch.rs` — the session *tree* behind `/tree`, `/fork` and `/clone`: one
+  node per message, one active path (the live transcript), and the pure
+  fork/clone/common-prefix operations. Off-path branches serialize as extra
+  `node` records, so a linear session's file is unchanged and older files load
+  as a single-branch tree.
 - `compact.rs` — the durable-summary + verbatim-tail rebuild and its pressure
   thresholds.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
