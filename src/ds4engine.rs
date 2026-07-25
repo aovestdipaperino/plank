@@ -1457,7 +1457,7 @@ fn strip_legacy(bytes: &[u8]) -> &[u8] {
         *pos = end;
         Some(())
     };
-    let parse = || -> Option<usize> {
+    let mut parse = || -> Option<usize> {
         let count = read_u32(&mut pos)?;
         for _ in 0..count {
             skip(&mut pos, 1)?; // think
