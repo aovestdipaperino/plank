@@ -1410,57 +1410,6 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Opt
     }
 }
 
-/// Draws the "warming cache" screen shown while the session-start context is
-/// prefilled into the KV, before the input prompt appears (issue #63). The
-/// title carries a glimmer sweep from the shared animation clock (#61); under
-/// reduced motion the clock returns `None` and the title renders static. A
-/// progress bar tracks the prefill when `total > 0`.
-pub fn draw_warming_cache(frame: &mut Frame, done: i32, total: i32, tps: f64) {
-    const TITLE: &str = "Warming cache…";
-    let base = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    // Per-character glimmer: columns inside the sweep window brighten. With no
-    // clock (reduced motion) every column stays on the base style.
-    let window = crate::anim::clock_ms().map(|now| {
-        crate::anim::sweep_window(TITLE.chars().count(), now, crate::anim::TICK_MS, 6, false)
-    });
-    let title: Vec<Span> = TITLE
-        .chars()
-        .enumerate()
-        .map(|(i, c)| {
-            let lit = window.is_some_and(|w| {
-                crate::anim::sweep_contains(i64::try_from(i).unwrap_or(i64::MAX), w)
-            });
-            let style = if lit {
-                Style::default()
-                    .fg(Color::Rgb(255, 255, 220))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                base
-            };
-            Span::styled(c.to_string(), style)
-        })
-        .collect();
-
-    let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Percentage(45),
-        Constraint::Length(2),
-        Constraint::Min(0),
-    ])
-    .split(area);
-    let mut lines = vec![Line::from(title).centered()];
-    if total > 0 {
-        let total = total.max(1);
-        let done = done.clamp(0, total);
-        let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
-        let bar = crate::status::progress_bar(done, total, tps, false);
-        lines.push(Line::from(format!("{bar}  {pct}%")).centered());
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)), rows[1]);
-}
-
 /// Draws the interactive `/config` editor as a centered modal overlay.
 ///
 /// Rows come from [`crate::configform::ConfigForm::rows`]: section headers are
@@ -2717,47 +2666,6 @@ mod tests {
             c.symbol() == "─" && c.style().fg == Some(THEME_GREEN)
         });
         assert!(!has_rule, "no separator while the prompt is hidden");
-    }
-
-    #[test]
-    fn warming_cache_screen_shows_title_and_progress() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
-            (0..buf.area.width)
-                .map(|x| buf[(x, y)].symbol().to_owned())
-                .collect::<String>()
-        }
-        fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
-            (0..buf.area.height)
-                .map(|y| row_text(buf, y))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-
-        // Reduced motion keeps the title static (deterministic), independent of
-        // the wall clock.
-        crate::anim::set_reduced_motion(true);
-
-        // total == 0: title only, no percent.
-        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| draw_warming_cache(f, 0, 0, 0.0)).unwrap();
-        let text = buffer_text(term.backend().buffer());
-        assert!(text.contains("Warming cache"), "title present: {text:?}");
-        assert!(
-            !text.contains('%'),
-            "no progress bar when total is 0: {text:?}"
-        );
-
-        // total > 0: a percent readout appears with the title.
-        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
-        term.draw(|f| draw_warming_cache(f, 1, 4, 0.0)).unwrap();
-        let text = buffer_text(term.backend().buffer());
-        assert!(text.contains("Warming cache"), "title present: {text:?}");
-        assert!(text.contains("25%"), "progress shown: {text:?}");
-
-        crate::anim::set_reduced_motion(false);
     }
 
     #[test]

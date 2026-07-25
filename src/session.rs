@@ -748,20 +748,6 @@ impl SessionStore {
 /// cache dir with session files but are not sessions.
 const SYSPROMPT_STEM: &str = "sysprompt";
 
-/// File name of the per-project system-prompt KV checkpoint:
-/// `sysprompt-<12 hex of sha1(project path)>.kv`.
-///
-/// The system prompt embeds per-project inputs (AGENTS.md, the local MCP
-/// config, the session-start context), so a single shared checkpoint would be
-/// invalidated and rebuilt on nearly every project switch — and two projects
-/// used alternately would thrash it. Keying the file by project directory
-/// gives each project its own stable snapshot.
-#[must_use]
-pub fn sysprompt_checkpoint_name(project_dir: &Path) -> String {
-    let hash = sha1_hex(project_dir.to_string_lossy().as_bytes());
-    format!("{SYSPROMPT_STEM}-{}{FILE_EXT}", &hash[..12])
-}
-
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
 /// `project-<fp2>.kv`, living under the per-project subdirectory.
 const PROJECT_STEM: &str = "project";
@@ -1742,15 +1728,6 @@ hello\n";
     }
 
     #[test]
-    fn sysprompt_checkpoint_name_is_stable_and_project_keyed() {
-        let a = sysprompt_checkpoint_name(Path::new("/proj/a"));
-        let b = sysprompt_checkpoint_name(Path::new("/proj/b"));
-        assert_ne!(a, b, "different projects must not share a checkpoint");
-        assert_eq!(a, sysprompt_checkpoint_name(Path::new("/proj/a")));
-        assert!(a.starts_with("sysprompt-") && a.ends_with(FILE_EXT), "{a}");
-    }
-
-    #[test]
     fn per_project_sysprompt_checkpoints_are_not_listed_as_sessions() {
         let dir = temp_dir("syspromptskip");
         let store = SessionStore::open(&dir).unwrap();
@@ -1758,11 +1735,7 @@ hello\n";
         s.push(Message::user("hi"));
         store.save(&mut s).unwrap();
         fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
-        fs::write(
-            dir.join(sysprompt_checkpoint_name(Path::new("/proj/a"))),
-            b"kv",
-        )
-        .unwrap();
+        fs::write(dir.join("sysprompt-0123456789ab.kv"), b"kv").unwrap();
         let entries = store.list().unwrap();
         assert_eq!(entries.len(), 1, "checkpoints must be skipped: {entries:?}");
         assert_eq!(entries[0].id, s.id);

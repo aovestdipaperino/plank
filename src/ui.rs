@@ -2544,7 +2544,7 @@ impl Agent<'_> {
     /// Captures a named checkpoint: the current transcript plus the engine KV
     /// snapshot (when the engine supports it). Returns a status line.
     fn checkpoint_create(&mut self, name: &str) -> String {
-        let kv = self.engine.snapshot_kv();
+        let kv = self.engine.get_kv();
         let had_kv = kv.is_some();
         let replaced = self.checkpoints.save(name, &self.session, kv);
         let verb = if replaced { "updated" } else { "saved" };
@@ -2565,13 +2565,13 @@ impl Agent<'_> {
             return Err(format!("no checkpoint named {name} (see /checkpoint)"));
         };
         // Snapshot the current tail before discarding it.
-        let tail_kv = self.engine.snapshot_kv();
+        let tail_kv = self.engine.get_kv();
         self.checkpoints
             .save(PRE_ROLLBACK_CHECKPOINT, &self.session, tail_kv);
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.last_ctx_used = 0;
         let note = match &cp.kv {
-            Some(bytes) if self.engine.restore_kv(bytes).is_ok() => {
+            Some(cache) if self.engine.set_kv(cache).is_ok() => {
                 " (engine KV restored, zero re-prefill)"
             }
             _ => " (transcript restored, re-prefill on next turn)",
@@ -2663,17 +2663,17 @@ the original is frozen and listed in /tree"
     /// the backend has no KV to persist (echo stub) — saving is best-effort
     /// and never fails the `/save` itself.
     ///
-    /// The raw KV bytes come from the shared [`Engine::snapshot_kv`] primitive
-    /// (`SessionSnapshot::as_bytes` under the hood); this layer only wraps them
-    /// in the fingerprinted `<name>.payload` sidecar.
+    /// The KV comes from the shared [`Engine::get_kv`] primitive; this layer
+    /// only wraps it in the fingerprinted `<name>.payload` sidecar.
     fn save_session_payload(&mut self) -> Option<String> {
         if self.session.id.is_empty() {
             return None;
         }
         // No KV support (echo stub) or nothing prefilled yet: nothing to save.
-        let bytes = self.engine.snapshot_kv()?;
+        let cache = self.engine.get_kv()?;
         let path = self.store.payload_path(&self.session.id);
         let fingerprint = self.payload_fingerprint_for(&self.session);
+        let bytes = cache.encode(&fingerprint);
         match crate::session::write_payload(&path, &fingerprint, &bytes) {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
@@ -2690,7 +2690,7 @@ the original is frozen and listed in /tree"
     ///
     /// The staleness gate is [`session::read_payload`], which only returns
     /// bytes when the on-disk fingerprint matches; matching bytes are then fed
-    /// back through the shared [`Engine::restore_kv`] primitive
+    /// back through the shared [`Engine::set_kv`] primitive
     /// (`SessionSnapshot::restore_bytes`, the non-owning path — see
     /// `FINDINGS.md` on the double-free).
     fn load_session_payload(&mut self, s: &Session) -> Option<String> {
@@ -2707,7 +2707,10 @@ the original is frozen and listed in /tree"
         let Some(bytes) = crate::session::read_payload(&path, &fingerprint) else {
             return Some("KV payload is stale; the transcript will be re-prefilled".to_owned());
         };
-        match self.engine.restore_kv(&bytes) {
+        let Some(cache) = crate::kvcache::KVCache::decode(&bytes, &fingerprint) else {
+            return Some("KV payload is stale; the transcript will be re-prefilled".to_owned());
+        };
+        match self.engine.set_kv(&cache) {
             Ok(()) => Some("restored KV payload; resume skips re-prefill".to_owned()),
             Err(e) => Some(format!(
                 "KV payload load failed: {e}; the transcript will be re-prefilled"
@@ -3910,26 +3913,6 @@ impl Agent<'_> {
     }
 
     /// Idle status line (plain text; the TUI styles the bar itself).
-    /// Disk checkpoint path for the system-prompt KV cache. With the
-    /// `per_project_kv` feature the file is keyed by project directory so
-    /// per-project prompt inputs (AGENTS.md, local MCP config) don't
-    /// invalidate other projects' snapshots; by default a single shared
-    /// `sysprompt.kv` is used.
-    fn sysprompt_checkpoint(&self) -> std::path::PathBuf {
-        let dir = self.store.dir();
-        #[cfg(feature = "per_project_kv")]
-        {
-            // Drop the pre-per-project shared checkpoint; it would never be
-            // read again and a stale KV snapshot can be large.
-            let _ = std::fs::remove_file(dir.join("sysprompt.kv"));
-            dir.join(crate::session::sysprompt_checkpoint_name(
-                &self.tool_ctx.cwd,
-            ))
-        }
-        #[cfg(not(feature = "per_project_kv"))]
-        dir.join("sysprompt.kv")
-    }
-
     /// Plans the KV cache tiers below the system prompt for this launch
     /// (issue #64): Tier 2 (project-stable context, checkpointed per project at
     /// `kvcache/<project-key>/project-<fp2>.kv`) and Tier 3 (session-volatile
@@ -3967,19 +3950,21 @@ impl Agent<'_> {
         }
     }
 
-    /// Warms the system-prompt KV cache at startup, drawing prefill progress.
-    /// Warms the system-prompt KV cache before the full TUI is shown. When the
-    /// cache is already current no prefill runs and nothing is drawn; when it
-    /// needs rebuilding, a minimal centered progress bar is shown until it is
-    /// done, then the caller renders the real UI over it.
+    /// Warms the KV cache — system prompt and session-start context tiers — in
+    /// one walk before the full TUI is shown. When the cache is already current
+    /// nothing prefills and nothing is drawn; otherwise a minimal centered
+    /// progress bar covers the rebuild, and the caller renders the real UI over
+    /// it.
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
-        let checkpoint = self.sysprompt_checkpoint();
-        let system = self.system.clone();
-        // The rebuild reason (cache missing / prompt changed + diff) arrives as a
-        // Notice before prefill; keep it and render it below the progress bar.
+        let tiers = self.kv_tiers();
+        // The rebuild reason arrives as a Notice before prefill; keep it and
+        // render it below the bar.
         let mut notice: Option<String> = None;
-        self.engine
-            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| match ev {
+        crate::kvtier::warm(
+            &mut *self.engine,
+            Some(&self.store),
+            &tiers,
+            &mut |ev| match ev {
                 EngineEvent::Notice(msg) => {
                     notice = Some(msg);
                     let _ = terminal.draw(|f| tui::draw_warm(f, 0, 1, 0.0, notice.as_deref()));
@@ -3989,38 +3974,24 @@ impl Agent<'_> {
                         .draw(|f| tui::draw_warm(f, p.done, p.total, p.tps, notice.as_deref()));
                 }
                 EngineEvent::Text(_) => {}
-            })
-            .map_err(|e| e.to_string())?;
-        // Then prefill the session-start context on top of the system prompt so
-        // the first turn evaluates only the question suffix (issue #63). The
-        // input prompt appears only once this completes, so a "warming cache"
-        // screen (glimmer title + progress bar) covers the wait; no-op engines
-        // return instantly with nothing drawn, so the prompt appears at once.
-        let tiers = self.kv_tiers();
-        // Paint an initial frame so the animation is visible even before the
-        // first prefill event (or if there are none).
-        let _ = terminal.draw(|f| tui::draw_warming_cache(f, 0, 0, 0.0));
-        self.engine
-            .warm_tiers(&system, &tiers, &mut |ev| {
-                if let EngineEvent::Prefill(p) = ev {
-                    let _ = terminal.draw(|f| tui::draw_warming_cache(f, p.done, p.total, p.tps));
-                }
-            })
-            .map_err(|e| e.to_string())?;
+            },
+        )
+        .map_err(|e| e.to_string())?;
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
 
-    /// Warms the system-prompt KV cache for non-TUI runs (stderr message).
+    /// Warms the KV cache for non-TUI runs, announcing a rebuild on stderr.
     fn warm_plain(&mut self) -> Result<(), String> {
-        let checkpoint = self.sysprompt_checkpoint();
-        let system = self.system.clone();
-        let mut announced = false;
+        let tiers = self.kv_tiers();
         let color = self.color;
-        // Reason for the rebuild, printed under the "Updating…" line.
+        let mut announced = false;
         let mut notice: Option<String> = None;
-        self.engine
-            .warm_system_prompt(&system, Some(&checkpoint), &mut |ev| match ev {
+        crate::kvtier::warm(
+            &mut *self.engine,
+            Some(&self.store),
+            &tiers,
+            &mut |ev| match ev {
                 EngineEvent::Notice(msg) => notice = Some(msg),
                 EngineEvent::Prefill(_) if !announced => {
                     announced = true;
@@ -4046,23 +4017,14 @@ impl Agent<'_> {
                     }
                 }
                 EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
-            })
-            .map_err(|e| e.to_string())?;
-        // Erase the transient "Updating…" note once the warm-up finishes. The
-        // reason lines (if any) are left in the scrollback on purpose.
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        // Erase the transient "Updating…" note. Reason lines, if any, stay in
+        // the scrollback on purpose.
         if announced && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
-        // Run the tier loop on top of the system prompt so the first turn
-        // evaluates only the question suffix (issues #63, #64). Silent: no
-        // output, so the plain/non-interactive front-ends are unchanged. The
-        // plain REPL blocks on stdin single-threaded (no idle loop to defer to),
-        // but its dominant uses — a `-p` one-shot or piped input — have the
-        // question in hand already, so this is a bounded prefill and not a pure
-        // latency relocation. No-op engines return `false`.
-        let system = self.system.clone();
-        let tiers = self.kv_tiers();
-        let _ = self.engine.warm_tiers(&system, &tiers, &mut |_| {});
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
@@ -8083,10 +8045,13 @@ mod tests {
         fn model_name(&self) -> String {
             "kv-test-model".to_owned()
         }
-        fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
-            Some(b"fake-kv-bytes".to_vec())
+        fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
+            Some(crate::kvcache::KVCache::new(
+                b"fake-kv-bytes".to_vec(),
+                crate::ds4tokens::TokenTranscript::new(),
+            ))
         }
-        fn restore_kv(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
+        fn set_kv(&mut self, _cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
             Ok(())
         }
     }
