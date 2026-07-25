@@ -3,6 +3,36 @@
 A short, human-readable highlight reel per release. For the full change list
 see the GitHub releases and commit history.
 
+## Beta (2.5.5)
+
+A single fix you can feel, sitting on top of a refactor you shouldn't be able
+to.
+
+⚡ **`/new` is fast again.** Starting a fresh session used to throw away the
+system-prompt cache and rebuild it from scratch — thousands of tokens, twenty
+seconds on a large prompt — while the progress bar sat at 100% claiming there
+was nothing to do. It looked like a hang because, from the outside, it was
+indistinguishable from one. `/new` now puts the cache back to exactly the state
+a cold launch has, so the next turn only evaluates your question. On DeepSeek V4
+Flash the same `write a haiku` → `/new` → `write a haiku` flow went from 31.7s
+to 19.7s, and the token accounting dropped from a hidden 2509-token rebuild to a
+7-token prefill.
+
+🧹 **The KV cache has one format instead of five.** Under the hood, saving and
+restoring the cache had grown three separate implementations of the same file
+header, two different payload layouts, and a legacy fallback. That is now one
+type with one format, one owner of where files live, and one code path for
+warming the cache at startup. Nothing about this is visible — which is the
+point — except that a whole class of "why did it re-prefill?" bug can no longer
+happen, and progress bars now tell the truth about what the engine is about to
+do rather than what merely matches.
+
+🗑️ **Old cache snapshots get cleaned up.** Each change to your system prompt,
+global MCP servers, or model produced a fresh multi-hundred-megabyte cache
+snapshot and kept the old one forever. Only the current one is kept now. Your
+existing caches are rebuilt once on first launch of this version; they are pure
+caches, so the only cost is one prefill.
+
 ## Beta (2.1, unreleased)
 
 The 2.1 beta (`brew install plank-agent-beta`) is a round of "see what the agent is

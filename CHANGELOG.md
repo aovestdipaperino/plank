@@ -6,6 +6,60 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.5] - 2026-07-25
+
+Beta patch bump on the 2.5 series. One internal refactor with one user-visible
+payoff: `/new` no longer stalls, because the KV cache now has a single owner of
+its on-disk format instead of five.
+
+### Fixed
+
+- **`/new` and `/clear` no longer rebuild the system-prompt KV cache.** A reset
+  makes the next prompt a strict *prefix* of the live KV — a fresh session's
+  transcript is the head of the one it replaced — and `ds4_session_sync` cannot
+  rewrite behind its live end, so it discarded the whole cache and re-prefilled
+  the system prompt from scratch. Worse, `ds4_session_common_prefix` reported
+  every token as matching, so the progress bar primed as complete and a
+  multi-thousand-token prefill ran with no feedback at all, indistinguishable
+  from a hang. A reset now restores the tier checkpoint, so the next turn extends
+  it. Measured on DeepSeek V4 Flash for `haiku` → `/new` → `haiku`: a
+  2509-token rebuild reported as "100% reused" became a 7-token prefill, and the
+  flow went from 31.7s to 19.7s. The post-`/new` state is now identical to a cold
+  launch's.
+- Prefill progress and the `PLANK_KV_DEBUG` trace no longer conflate "how many
+  tokens match the live KV" with "how many will actually be reused". The two
+  differ precisely when the engine is about to throw the cache away, so a rebuild
+  that genuinely cannot be avoided is now reported honestly instead of as fully
+  cached.
+- Stale system-prompt checkpoints are garbage-collected. Keying `sysprompt-*.kv`
+  by content means every upgrade, global MCP change, or model switch minted a new
+  multi-hundred-megabyte snapshot and orphaned the previous one forever; only the
+  current one is kept now, and the legacy `sysprompt.kv` is removed.
+- KV cache temp files are per-process, so two plank instances persisting the same
+  session can no longer interleave into a file that passes its own signature and
+  version checks with a spliced body.
+
+### Changed
+
+- **One KV cache format, one owner.** The system-prompt checkpoint, per-project
+  tier checkpoints, and session payloads were five code paths — three
+  separately reimplementing the same `<fingerprint>\n<bytes>` framing, two
+  carrying different payload shapes, plus a legacy `plank-replies-v1` fallback.
+  They are now a single `KVCache` value type with one on-disk format, with
+  `SessionStore` owning every path and the engine no longer touching the
+  filesystem at all. The `Engine` trait shrinks to `get_kv` / `set_kv` /
+  `warm_reset` / `warm_append` / `warm_sync`, and startup warming is one generic
+  walk over the tier chain (the system prompt is now simply tier 0) instead of
+  two separate phases.
+- The on-disk cache format carries a version byte, so caches written by earlier
+  builds are rebuilt once on first launch. They are pure caches; the cost is a
+  single re-prefill.
+- Remote runs no longer issue `POST /warm` at startup; the system-prompt prefill
+  happens inside the first generation instead. No work is duplicated, but the
+  first remote reply shows a longer prefill phase.
+- The "system prompt changed" notice no longer includes a diff of what changed.
+  It depended on a sidecar file that only the removed warm path wrote.
+
 ## [2.5.4] - 2026-07-25
 
 Beta patch bump on the 2.5 series, landing the rest of the 2.6.0 work: session
