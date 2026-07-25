@@ -27,23 +27,24 @@
 //! the leading valid run" coincide, and a stale checkpoint is rebuilt, never
 //! trusted.
 
-use std::path::PathBuf;
+use std::path::Path;
 
+use crate::session::KvKey;
 use crate::session::tier_fingerprint;
 
-/// Which volatility tier a [`TierSpec`] describes. Tier 1 (system prompt) is
-/// handled by [`crate::engine::Engine::warm_system_prompt`] and is therefore not
-/// represented here; planning starts below it.
+/// Which volatility tier a [`TierSpec`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierKind {
+    /// Tier 1: model + system prompt. Cached globally, shared across projects.
+    System,
     /// Tier 2: project-stable context, shared by every session of a project.
     ProjectStable,
     /// Tier 3: session-volatile context. Prefill-only, never checkpointed.
     SessionVolatile,
 }
 
-/// One tier below the system prompt: the text it contributes to the prefix, its
-/// chained fingerprint, and where (if anywhere) its KV checkpoint lives.
+/// One tier of the prefix: the text it contributes, its chained fingerprint,
+/// and where (if anywhere) its KV checkpoint lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TierSpec {
     /// Which tier this is.
@@ -53,15 +54,16 @@ pub struct TierSpec {
     /// The text this tier contributes, injected as its own user message so the
     /// tier boundary falls on a clean chat-template message boundary.
     pub text: String,
-    /// On-disk checkpoint path, or `None` for a prefill-only tier.
-    pub checkpoint: Option<PathBuf>,
+    /// Where this tier's KV checkpoint is stored, or `None` for a prefill-only
+    /// tier (Tier 3) or when there is no session store.
+    pub key: Option<KvKey>,
 }
 
 impl TierSpec {
     /// Whether this tier is persisted as a KV checkpoint. Tier 3 never is.
     #[must_use]
     pub fn cacheable(&self) -> bool {
-        self.checkpoint.is_some()
+        self.key.is_some()
     }
 }
 
@@ -118,22 +120,35 @@ fn tier2_material(stable_hash: &str, local_tool_defs: &str) -> Vec<u8> {
     data
 }
 
-/// Builds the tier list below the system prompt, ordered most-stable-first.
+/// Builds the tier list, ordered most-stable-first, with Tier 1 (the system
+/// prompt) leading it.
 ///
 /// `fp1` is the Tier 1 (system prompt) fingerprint the chain hangs off;
-/// `project_checkpoint` maps a computed `fp2` to the path its checkpoint should
-/// live at (`None` disables Tier 2 caching, e.g. when there is no session
-/// store). Tiers whose text is empty are omitted entirely, so a project with no
+/// `project_dir` is the project directory that keys Tier 2's checkpoint
+/// (`None` disables Tier 2 caching, e.g. when there is no session store).
+/// Tiers whose text is empty are omitted entirely, so a project with no
 /// `AGENTS.md` simply has no Tier 2 and pays nothing for it.
 #[must_use]
 pub fn plan(
     fp1: &str,
+    system: &str,
     stable: &str,
     volatile: &str,
     local_tool_defs: &str,
-    project_checkpoint: Option<&dyn Fn(&str) -> PathBuf>,
+    project_dir: Option<&Path>,
 ) -> Vec<TierSpec> {
-    let mut tiers = Vec::new();
+    // Tier 1 leads the list so the warm walk is one uniform loop over tiers
+    // rather than a system-prompt phase plus a tier phase. Its text is NOT
+    // trimmed: the system prompt is tokenized as a `system`-role message by
+    // `build_system_tokens`, not by the user-message path that `parse_sections`
+    // trims, so trimming here would change `fp1` and invalidate every existing
+    // system checkpoint for no reason.
+    let mut tiers = vec![TierSpec {
+        kind: TierKind::System,
+        fingerprint: fp1.to_owned(),
+        text: system.to_owned(),
+        key: Some(KvKey::System { fp: fp1.to_owned() }),
+    }];
     // Canonicalize each tier to the exact text the turn will tokenize. A tier
     // becomes one user message, and the turn rebuilds its tokens from the
     // rendered transcript, where `parse_sections` trims every message's
@@ -154,7 +169,10 @@ pub fn plan(
         let fp = tier_fingerprint(fp1, &tier2_material(&stable_hash, local_tool_defs));
         tiers.push(TierSpec {
             kind: TierKind::ProjectStable,
-            checkpoint: project_checkpoint.map(|f| f(&fp)),
+            key: project_dir.map(|d| KvKey::Project {
+                dir: d.to_path_buf(),
+                fp: fp.clone(),
+            }),
             fingerprint: fp.clone(),
             text: stable.to_owned(),
         });
@@ -167,7 +185,7 @@ pub fn plan(
             kind: TierKind::SessionVolatile,
             fingerprint: tier_fingerprint(&fp2, volatile.as_bytes()),
             text: volatile.to_owned(),
-            checkpoint: None,
+            key: None,
         });
     }
     tiers
@@ -234,8 +252,45 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    fn cp() -> Box<dyn Fn(&str) -> PathBuf> {
-        Box::new(|fp: &str| PathBuf::from(format!("/cache/proj/project-{fp}.kv")))
+    #[test]
+    fn plan_emits_the_system_tier_first_and_keys_each_tier() {
+        let fp1 = system_fingerprint("model-a", "SYSTEM");
+        let tiers = plan(
+            &fp1,
+            "SYSTEM",
+            "agents\n",
+            "git status\n",
+            "",
+            Some(Path::new("/p")),
+        );
+
+        assert_eq!(tiers.len(), 3, "system + project-stable + volatile");
+        assert_eq!(tiers[0].kind, TierKind::System);
+        assert_eq!(tiers[0].text, "SYSTEM");
+        assert_eq!(tiers[0].fingerprint, fp1);
+        assert_eq!(tiers[0].key, Some(KvKey::System { fp: fp1.clone() }));
+
+        assert_eq!(tiers[1].kind, TierKind::ProjectStable);
+        assert_eq!(
+            tiers[1].key,
+            Some(KvKey::Project {
+                dir: "/p".into(),
+                fp: tiers[1].fingerprint.clone()
+            })
+        );
+
+        // Tier 3 stays prefill-only: keying it on volatile bytes would write a
+        // checkpoint no launch could ever hit.
+        assert_eq!(tiers[2].kind, TierKind::SessionVolatile);
+        assert_eq!(tiers[2].key, None);
+    }
+
+    #[test]
+    fn plan_without_a_project_dir_still_caches_the_system_tier() {
+        let fp1 = system_fingerprint("m", "SYSTEM");
+        let tiers = plan(&fp1, "SYSTEM", "agents\n", "", "", None);
+        assert_eq!(tiers[0].key, Some(KvKey::System { fp: fp1 }));
+        assert_eq!(tiers[1].key, None, "no store, no project checkpoint");
     }
 
     /// Regression (#64): a tier's text is tokenized twice — once at warm time
@@ -263,6 +318,7 @@ mod tests {
 
         let tiers = plan(
             "fp1",
+            "SYSTEM",
             &content.stable_context(),
             &content.volatile_context(),
             "",
@@ -281,25 +337,31 @@ mod tests {
 
     #[test]
     fn plan_orders_stable_before_volatile_and_only_caches_tier2() {
-        let cp = cp();
-        let tiers = plan("fp1", "agents\n", "git + date\n", "", Some(&*cp));
-        assert_eq!(tiers.len(), 2);
-        assert_eq!(tiers[0].kind, TierKind::ProjectStable);
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            "agents\n",
+            "git + date\n",
+            "",
+            Some(Path::new("/p")),
+        );
+        assert_eq!(tiers.len(), 3);
+        assert_eq!(tiers[1].kind, TierKind::ProjectStable);
         // Trailing whitespace is trimmed: each tier is one user message, and
         // the turn rebuilds it from the transcript, which trims (#64).
-        assert_eq!(tiers[0].text, "agents");
-        assert!(tiers[0].cacheable(), "Tier 2 is checkpointed");
-        assert_eq!(tiers[1].kind, TierKind::SessionVolatile);
-        assert_eq!(tiers[1].text, "git + date");
+        assert_eq!(tiers[1].text, "agents");
+        assert!(tiers[1].cacheable(), "Tier 2 is checkpointed");
+        assert_eq!(tiers[2].kind, TierKind::SessionVolatile);
+        assert_eq!(tiers[2].text, "git + date");
         assert!(
-            !tiers[1].cacheable(),
+            !tiers[2].cacheable(),
             "Tier 3 is prefill-only and must never be checkpointed"
         );
         // Splitting adds no text of its own: the tiers rejoined by the single
         // newline `render_transcript` puts between messages are exactly the
         // combined context as the turn sees it (i.e. after its own trim).
         assert_eq!(
-            tiers
+            tiers[1..]
                 .iter()
                 .map(|t| t.text.as_str())
                 .collect::<Vec<_>>()
@@ -310,86 +372,114 @@ mod tests {
 
     #[test]
     fn plan_omits_empty_tiers() {
-        let cp = cp();
-        let tiers = plan("fp1", "", "git\n", "", Some(&*cp));
-        assert_eq!(tiers.len(), 1);
-        assert_eq!(tiers[0].kind, TierKind::SessionVolatile);
+        let tiers = plan("fp1", "SYSTEM", "", "git\n", "", Some(Path::new("/p")));
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[1].kind, TierKind::SessionVolatile);
 
-        let tiers = plan("fp1", "agents\n", "", "", Some(&*cp));
-        assert_eq!(tiers.len(), 1);
-        assert_eq!(tiers[0].kind, TierKind::ProjectStable);
+        let tiers = plan("fp1", "SYSTEM", "agents\n", "", "", Some(Path::new("/p")));
+        assert_eq!(tiers.len(), 2);
+        assert_eq!(tiers[1].kind, TierKind::ProjectStable);
 
-        assert!(plan("fp1", "", "", "", Some(&*cp)).is_empty());
+        assert_eq!(
+            plan("fp1", "SYSTEM", "", "", "", Some(Path::new("/p"))).len(),
+            1,
+            "only the system tier remains"
+        );
     }
 
     #[test]
     fn tier2_key_chains_off_tier1_and_folds_in_local_tool_defs() {
-        let cp = cp();
-        let base = plan("fp1", "agents\n", "v", "", Some(&*cp));
-        let other_parent = plan("fp1-changed", "agents\n", "v", "", Some(&*cp));
-        let other_stable = plan("fp1", "agents2\n", "v", "", Some(&*cp));
-        let other_tools = plan("fp1", "agents\n", "v", "srv/tool\u{1}{}\n", Some(&*cp));
+        let base = plan("fp1", "SYSTEM", "agents\n", "v", "", Some(Path::new("/p")));
+        let other_parent = plan(
+            "fp1-changed",
+            "SYSTEM",
+            "agents\n",
+            "v",
+            "",
+            Some(Path::new("/p")),
+        );
+        let other_stable = plan("fp1", "SYSTEM", "agents2\n", "v", "", Some(Path::new("/p")));
+        let other_tools = plan(
+            "fp1",
+            "SYSTEM",
+            "agents\n",
+            "v",
+            "srv/tool\u{1}{}\n",
+            Some(Path::new("/p")),
+        );
 
-        assert_ne!(base[0].fingerprint, other_parent[0].fingerprint);
-        assert_ne!(base[0].fingerprint, other_stable[0].fingerprint);
+        assert_ne!(base[1].fingerprint, other_parent[1].fingerprint);
+        assert_ne!(base[1].fingerprint, other_stable[1].fingerprint);
         assert_ne!(
-            base[0].fingerprint, other_tools[0].fingerprint,
+            base[1].fingerprint, other_tools[1].fingerprint,
             "local MCP tool definitions must key Tier 2"
         );
         // Deterministic.
         assert_eq!(
-            base[0].fingerprint,
-            plan("fp1", "agents\n", "v", "", Some(&*cp))[0].fingerprint
+            base[1].fingerprint,
+            plan("fp1", "SYSTEM", "agents\n", "v", "", Some(Path::new("/p")))[1].fingerprint
         );
-        // And the checkpoint path follows the fingerprint.
+        // And the checkpoint key follows the fingerprint.
         assert_eq!(
-            base[0].checkpoint.as_deref(),
-            Some(Path::new(&format!(
-                "/cache/proj/project-{}.kv",
-                base[0].fingerprint
-            )))
+            base[1].key,
+            Some(KvKey::Project {
+                dir: "/p".into(),
+                fp: base[1].fingerprint.clone()
+            })
         );
     }
 
     #[test]
     fn volatile_tier_never_gets_a_checkpoint_even_with_a_path_fn() {
-        let cp = cp();
-        let tiers = plan("fp1", "s", "v", "", Some(&*cp));
+        let tiers = plan("fp1", "SYSTEM", "s", "v", "", Some(Path::new("/p")));
         assert!(
-            tiers
-                .iter()
-                .all(|t| t.cacheable() == (t.kind == TierKind::ProjectStable))
+            tiers.iter().all(|t| t.cacheable()
+                == (t.kind == TierKind::System || t.kind == TierKind::ProjectStable))
         );
     }
 
     #[test]
     fn tier2_is_uncached_without_a_checkpoint_path() {
-        let tiers = plan("fp1", "agents\n", "v", "", None);
-        assert_eq!(tiers[0].kind, TierKind::ProjectStable);
-        assert!(!tiers[0].cacheable());
+        let tiers = plan("fp1", "SYSTEM", "agents\n", "v", "", None);
+        assert_eq!(tiers[1].kind, TierKind::ProjectStable);
+        assert!(!tiers[1].cacheable());
         // Still keyed, so a caller that later gains a store can reuse the fp.
-        assert!(!tiers[0].fingerprint.is_empty());
+        assert!(!tiers[1].fingerprint.is_empty());
     }
 
     #[test]
     fn resume_point_restores_the_deepest_valid_tier() {
-        let cp = cp();
-        let tiers = plan("fp1", "agents\n", "git\n", "", Some(&*cp));
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            "agents\n",
+            "git\n",
+            "",
+            Some(Path::new("/p")),
+        );
         // Tier 2 hits: restore it, prefill only Tier 3.
-        let p = resume_point(&tiers, |t| t.kind == TierKind::ProjectStable);
+        let p = resume_point(&tiers, |t| {
+            t.kind == TierKind::System || t.kind == TierKind::ProjectStable
+        });
         assert_eq!(
             p,
             ResumePlan {
-                restore: Some(0),
-                prefill_from: 1
+                restore: Some(1),
+                prefill_from: 2
             }
         );
     }
 
     #[test]
     fn resume_point_falls_back_to_full_prefill_on_the_first_mismatch() {
-        let cp = cp();
-        let tiers = plan("fp1", "agents\n", "git\n", "", Some(&*cp));
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            "agents\n",
+            "git\n",
+            "",
+            Some(Path::new("/p")),
+        );
         let p = resume_point(&tiers, |_| false);
         assert_eq!(
             p,
@@ -405,11 +495,17 @@ mod tests {
     fn resume_point_stops_at_the_first_uncacheable_tier() {
         // Tier 3 is never cacheable, so even an always-true probe cannot make
         // the walk claim it as reusable.
-        let cp = cp();
-        let tiers = plan("fp1", "agents\n", "git\n", "", Some(&*cp));
+        let tiers = plan(
+            "fp1",
+            "SYSTEM",
+            "agents\n",
+            "git\n",
+            "",
+            Some(Path::new("/p")),
+        );
         let p = resume_point(&tiers, |_| true);
-        assert_eq!(p.restore, Some(0));
-        assert_eq!(p.prefill_from, 1, "the volatile tier always prefills");
+        assert_eq!(p.restore, Some(1));
+        assert_eq!(p.prefill_from, 2, "the volatile tier always prefills");
     }
 
     #[test]

@@ -666,6 +666,25 @@ fn debug_log_sysprompt(checkpoint: &Path, system: &str, computed: &str, stored: 
     );
 }
 
+/// Resolves a [`crate::session::KvKey`] to its on-disk checkpoint path.
+///
+/// TODO(task-4): `warm_tiers` — the only caller — is deleted once the uniform
+/// tier-warm loop lands, and this helper goes with it. Until then it is a
+/// stand-in for `SessionStore::kv_path`, which `warm_tiers` cannot call
+/// directly because it is handed pre-resolved tiers rather than a
+/// `SessionStore`. Mirrors `kv_path` exactly, rooted at
+/// `SessionStore::default_dir()` (the store's usual location).
+fn kv_key_checkpoint_path(key: &crate::session::KvKey) -> std::path::PathBuf {
+    let dir = crate::session::SessionStore::default_dir();
+    match key {
+        crate::session::KvKey::System { fp } => dir.join(format!("sysprompt-{fp}.kv")),
+        crate::session::KvKey::Project { dir: project, fp } => dir
+            .join(crate::session::project_key(project))
+            .join(crate::session::project_checkpoint_name(fp)),
+        crate::session::KvKey::Session { id } => dir.join(format!("{id}.kv")),
+    }
+}
+
 impl Engine for Ds4Session {
     #[allow(clippy::too_many_lines)]
     fn generate(
@@ -1024,9 +1043,10 @@ impl Engine for Ds4Session {
         // Walk the tiers most-stable-first and reuse KV up to the first
         // fingerprint mismatch (pure logic, unit tested in `kvtier`).
         let plan = crate::kvtier::resume_point(tiers, |t| {
-            t.checkpoint
-                .as_deref()
-                .is_some_and(|p| crate::kvtier::checkpoint_matches(p, &t.fingerprint))
+            t.key
+                .as_ref()
+                .map(kv_key_checkpoint_path)
+                .is_some_and(|p| crate::kvtier::checkpoint_matches(&p, &t.fingerprint))
         });
         let mut prefill_from = plan.prefill_from;
 
@@ -1039,8 +1059,9 @@ impl Engine for Ds4Session {
         // than trust it.
         if let Some(i) = plan.restore {
             let restored = tiers[i]
-                .checkpoint
-                .as_deref()
+                .key
+                .as_ref()
+                .map(kv_key_checkpoint_path)
                 .and_then(|p| std::fs::read(p).ok())
                 .and_then(|bytes| {
                     crate::kvtier::split_checkpoint(&bytes)
@@ -1110,12 +1131,13 @@ impl Engine for Ds4Session {
                 }
             }
             // Persist this tier for the next session in the project. Tier 3
-            // carries no checkpoint path, so it is never written here.
-            if let Some(path) = tiers[i].checkpoint.as_deref() {
+            // carries no key, so it is never written here.
+            if let Some(key) = tiers[i].key.as_ref() {
+                let path = kv_key_checkpoint_path(key);
                 if let Some(dir) = path.parent() {
                     let _ = std::fs::create_dir_all(dir);
                 }
-                Self::save_checkpoint(session, path, &tiers[i].fingerprint);
+                Self::save_checkpoint(session, &path, &tiers[i].fingerprint);
             }
         }
         Ok(prefilled)

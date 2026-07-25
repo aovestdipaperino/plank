@@ -3944,14 +3944,13 @@ impl Agent<'_> {
         let local_names = crate::tools::mcp::local_server_names(None);
         let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
         let local_material = crate::kvtier::tool_defs_material(&local_defs);
-        let cwd = self.tool_ctx.cwd.clone();
-        let checkpoint = |fp2: &str| self.store.project_checkpoint_path(&cwd, fp2);
         crate::kvtier::plan(
             &fp1,
+            &self.system,
             &self.context_content.stable_context(),
             &self.context_content.volatile_context(),
             &local_material,
-            Some(&checkpoint),
+            Some(&self.tool_ctx.cwd),
         )
     }
 

@@ -790,8 +790,8 @@ mod tests {
     fn warm_tiers_defaults_to_noop() {
         let mut engine = EchoEngine::new(4096);
         let mut events = Vec::new();
-        let tiers = crate::kvtier::plan("fp1", "agents\n", "git + date\n", "", None);
-        assert_eq!(tiers.len(), 2, "both tiers planned");
+        let tiers = crate::kvtier::plan("fp1", "sys", "agents\n", "git + date\n", "", None);
+        assert_eq!(tiers.len(), 3, "system + both tiers planned");
         let warmed = engine
             .warm_tiers("[system]\nsys\n", &tiers, &mut |e| {
                 events.push(e);
