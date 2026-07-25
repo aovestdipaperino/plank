@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- `/new` and `/clear` hide the input prompt and show a throbber while the KV
+  cache is restored, instead of letting the prompt sit frozen. Restoring the
+  tier checkpoint reads a snapshot in the tens of megabytes and loads it into the
+  backend, so it is brief but visible. Hiding the prompt also prevents typing
+  into a session whose KV is still loading. The plain REPL, which has no
+  persistent prompt, prints one transient line and erases it.
+
 ## [2.5.5] - 2026-07-25
 
 Beta patch bump on the 2.5 series. One internal refactor with one user-visible
