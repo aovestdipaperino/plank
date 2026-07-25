@@ -156,6 +156,21 @@ test` and review the diff before committing.
   remain the single `SessionSnapshot` primitive; the sidecar, fingerprint,
   and reply header only wrap them, so there is no second hand-rolled
   KV-serialize path.
+- **A KV cache tier boundary must fall on a chat-template *message* boundary,
+  and a tier's checkpoint must be taken while the cursor sits exactly at that
+  boundary.** The tiered cache (#60/#64) makes the project-stable context a
+  reusable prefix, but a snapshot only replays if the tokens ahead of it are
+  reproducible: byte-level BPE merges across a mid-message seam mean
+  `tokenize(stable)` is not necessarily a prefix of `tokenize(stable ‖
+  volatile)`, and the per-message template wrapper closes at the end of a
+  message anyway. So the session-start context enters as **two** user messages
+  (stable then volatile, `ui::push_session_context`) rather than one — the
+  concatenated text is unchanged, and the system prompt (the only
+  parity-pinned part) is untouched, so `tests/c_parity.rs` is unaffected.
+  Likewise, `SessionSnapshot::capture` serializes the *whole* session, not a
+  prefix of it, so `warm_tiers` syncs to one tier's end, writes that tier's
+  checkpoint, and only then syncs the next — never build the full prefix first
+  and try to checkpoint a tier retroactively.
 - **`count_tokens` must subtract chat-template overhead** so it reports
   text-only counts; the template wrapper is measured once at engine startup
   (`src/ds4engine.rs`).

@@ -376,6 +376,37 @@ impl SessionStore {
         self.project_dir(project).join(project_checkpoint_name(fp2))
     }
 
+    /// Deletes every Tier 2 checkpoint of `project` except the one keyed `keep`,
+    /// returning how many files were removed (issue #64).
+    ///
+    /// A `project-<fp2>.kv` is only ever readable at one `AGENTS.md`/local-MCP
+    /// revision, so the moment a new `fp2` is written the old ones are dead
+    /// weight — and these snapshots are large. GC is by fingerprint, not by
+    /// mtime: the file is shared by every session of the project, so it must
+    /// survive session deletion, and the current revision is the only one any
+    /// future launch can hit. Best-effort; a failed unlink is ignored (the next
+    /// launch retries).
+    #[must_use]
+    pub fn gc_project_checkpoints(&self, project: &Path, keep: &str) -> usize {
+        let dir = self.project_dir(project);
+        let keep_name = project_checkpoint_name(keep);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return 0;
+        };
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(PROJECT_STEM) || !name.ends_with(FILE_EXT) || name == keep_name {
+                continue;
+            }
+            if fs::remove_file(entry.path()).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Strips the engine KV payload from the session matching the hex
     /// prefix, preserving its transcript (`/strip`). Returns the full id and
     /// whether a payload sidecar actually existed; stripping an already
@@ -1784,6 +1815,37 @@ hello\n";
             "project checkpoints must be skipped: {entries:?}"
         );
         assert_eq!(entries[0].id, s.id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gc_keeps_only_the_current_project_checkpoint() {
+        let dir = temp_dir("proj-gc");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/proj/gc");
+        let other = Path::new("/proj/other");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+        fs::create_dir_all(store.project_dir(other)).unwrap();
+
+        for fp in ["aaa", "bbb", "ccc"] {
+            fs::write(store.project_checkpoint_path(project, fp), b"fp\nkv").unwrap();
+        }
+        // A neighbouring project's checkpoint and a non-checkpoint file must
+        // both survive: GC is scoped to one project's Tier 2 files.
+        fs::write(store.project_checkpoint_path(other, "aaa"), b"fp\nkv").unwrap();
+        let stray = store.project_dir(project).join("notes.txt");
+        fs::write(&stray, b"keep me").unwrap();
+
+        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 2);
+        assert!(store.project_checkpoint_path(project, "bbb").exists());
+        assert!(!store.project_checkpoint_path(project, "aaa").exists());
+        assert!(!store.project_checkpoint_path(project, "ccc").exists());
+        assert!(store.project_checkpoint_path(other, "aaa").exists());
+        assert!(stray.exists());
+
+        // Idempotent, and harmless for a project with no checkpoint dir yet.
+        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 0);
+        assert_eq!(store.gc_project_checkpoints(Path::new("/nope"), "bbb"), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

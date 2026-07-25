@@ -512,6 +512,32 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Injects the session-start context as **two** user messages — project-stable
+/// first, then session-volatile — so Tier 2 and Tier 3 of the KV cache are
+/// distinct, separately-checkpointable spans (issues #60, #64).
+///
+/// The split is a cache boundary, not a content change: the concatenation is
+/// exactly the old `combined()` block, in the same stable-then-volatile order
+/// #60 already established, and it stays out of the system prompt (so
+/// `tests/c_parity.rs`, which pins the system prompt and the tool wire formats,
+/// is untouched). Splitting at a message boundary is what makes the Tier 2
+/// snapshot a reproducible token prefix — a mid-message boundary could shift
+/// under BPE merges across the seam. An empty half is skipped, so a project
+/// with no `AGENTS.md` still injects exactly one message, as before.
+///
+/// Shared by `new_agent` and both front-ends' `/clear` handlers so the plain
+/// REPL and the TUI cannot drift apart.
+fn push_session_context(session: &mut Session, content: &ContextContent) {
+    let stable = content.stable_context();
+    if !stable.is_empty() {
+        session.push(Message::user(stable));
+    }
+    let volatile = content.volatile_context();
+    if !volatile.is_empty() {
+        session.push(Message::user(volatile));
+    }
+}
+
 /// Renders the session transcript as plain text for the engine.
 fn render_transcript(session: &Session, system: &str) -> String {
     use std::fmt::Write as _;
@@ -2029,8 +2055,7 @@ impl Agent<'_> {
                 self.session = Session::new();
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
-                let combined = self.context_content.combined();
-                self.session.push(Message::user(combined));
+                push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
                 self.session.dirty = false;
@@ -3826,6 +3851,44 @@ impl Agent<'_> {
         dir.join("sysprompt.kv")
     }
 
+    /// Plans the KV cache tiers below the system prompt for this launch
+    /// (issue #64): Tier 2 (project-stable context, checkpointed per project at
+    /// `kvcache/<project-key>/project-<fp2>.kv`) and Tier 3 (session-volatile
+    /// context, prefill-only).
+    ///
+    /// Tier 2's key folds in the **project-local** MCP tool definitions but not
+    /// the global ones — those already live inside the system prompt that keys
+    /// Tier 1, and moving them down would needlessly fork Tier 2 while moving
+    /// local ones up would fork the model-global Tier 1 per project.
+    fn kv_tiers(&self) -> Vec<crate::kvtier::TierSpec> {
+        let fp1 = crate::kvtier::system_fingerprint(&self.engine.model_name(), &self.system);
+        let local_names = crate::tools::mcp::local_server_names(None);
+        let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
+        let local_material = crate::kvtier::tool_defs_material(&local_defs);
+        let cwd = self.tool_ctx.cwd.clone();
+        let checkpoint = |fp2: &str| self.store.project_checkpoint_path(&cwd, fp2);
+        crate::kvtier::plan(
+            &fp1,
+            &self.context_content.stable_context(),
+            &self.context_content.volatile_context(),
+            &local_material,
+            Some(&checkpoint),
+        )
+    }
+
+    /// Drops superseded Tier 2 checkpoints for this project once the current
+    /// one is known good; they can never be read again and are large.
+    fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
+        if let Some(t) = tiers
+            .iter()
+            .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
+        {
+            let _removed = self
+                .store
+                .gc_project_checkpoints(&self.tool_ctx.cwd, &t.fingerprint);
+        }
+    }
+
     /// Warms the system-prompt KV cache at startup, drawing prefill progress.
     /// Warms the system-prompt KV cache before the full TUI is shown. When the
     /// cache is already current no prefill runs and nothing is drawn; when it
@@ -3855,17 +3918,18 @@ impl Agent<'_> {
         // input prompt appears only once this completes, so a "warming cache"
         // screen (glimmer title + progress bar) covers the wait; no-op engines
         // return instantly with nothing drawn, so the prompt appears at once.
-        let context = self.context_content.combined();
+        let tiers = self.kv_tiers();
         // Paint an initial frame so the animation is visible even before the
         // first prefill event (or if there are none).
         let _ = terminal.draw(|f| tui::draw_warming_cache(f, 0, 0, 0.0));
         self.engine
-            .warm_context(&system, &context, &mut |ev| {
+            .warm_tiers(&system, &tiers, &mut |ev| {
                 if let EngineEvent::Prefill(p) = ev {
                     let _ = terminal.draw(|f| tui::draw_warming_cache(f, p.done, p.total, p.tps));
                 }
             })
             .map_err(|e| e.to_string())?;
+        self.gc_kv_tiers(&tiers);
         Ok(())
     }
 
@@ -3911,16 +3975,17 @@ impl Agent<'_> {
         if announced && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
-        // Prefill the session-start context on top of the system prompt so the
-        // first turn evaluates only the question suffix (issue #63). Silent: no
+        // Run the tier loop on top of the system prompt so the first turn
+        // evaluates only the question suffix (issues #63, #64). Silent: no
         // output, so the plain/non-interactive front-ends are unchanged. The
         // plain REPL blocks on stdin single-threaded (no idle loop to defer to),
         // but its dominant uses — a `-p` one-shot or piped input — have the
         // question in hand already, so this is a bounded prefill and not a pure
-        // latency relocation. No-op engines return `false`. Not checkpointed.
+        // latency relocation. No-op engines return `false`.
         let system = self.system.clone();
-        let context = self.context_content.combined();
-        let _ = self.engine.warm_context(&system, &context, &mut |_| {});
+        let tiers = self.kv_tiers();
+        let _ = self.engine.warm_tiers(&system, &tiers, &mut |_| {});
+        self.gc_kv_tiers(&tiers);
         Ok(())
     }
 
@@ -4728,8 +4793,7 @@ impl Agent<'_> {
                 self.session = Session::new();
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
-                let combined = self.context_content.combined();
-                self.session.push(Message::user(combined));
+                push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
                 self.session.dirty = false;
@@ -5614,9 +5678,8 @@ fn new_agent(
     // Collect context at session start
     let context_content = ContextContent::new();
     // Inject context into the session transcript
-    let combined = context_content.combined();
-    trace.text("context", &combined);
-    session.push(Message::user(combined));
+    trace.text("context", &context_content.combined());
+    push_session_context(&mut session, &context_content);
     // Session-start context is scaffolding, not user activity: a session that
     // only ever holds it (no ds4_engine invocation) is not worth a resume point,
     // so it must not count as dirty. A real turn re-dirties it. (See
@@ -7504,6 +7567,54 @@ mod tests {
             "a report-only session gets no resume point"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Tier 2 and Tier 3 must be distinct KV spans, so the session-start context
+    // enters as two user messages — but the concatenation must still be exactly
+    // the old single block, in the same stable-then-volatile order (#60, #64).
+    #[test]
+    fn session_context_splits_into_stable_then_volatile_messages() {
+        let content = ContextContent {
+            git_content: Some("[git]\nbranch main".to_owned()),
+            agents_md_content: Some("do the thing".to_owned()),
+            memory_content: None,
+            date_content: "[date]\n2026-07-25".to_owned(),
+        };
+        let mut session = Session::new();
+        push_session_context(&mut session, &content);
+        assert_eq!(session.transcript.len(), 2, "one message per tier");
+        assert!(
+            session
+                .transcript
+                .iter()
+                .all(|m| m.role == crate::session::Role::User)
+        );
+        assert_eq!(session.transcript[0].text, content.stable_context());
+        assert_eq!(session.transcript[1].text, content.volatile_context());
+        // No bytes added, dropped, or reordered by the split.
+        assert_eq!(
+            format!(
+                "{}{}",
+                session.transcript[0].text, session.transcript[1].text
+            ),
+            content.combined()
+        );
+
+        // No AGENTS.md: no Tier 2, so exactly one message — the pre-split shape.
+        let mut only_volatile = ContextContent {
+            agents_md_content: None,
+            ..content.clone()
+        };
+        only_volatile.memory_content = None;
+        let mut session = Session::new();
+        push_session_context(&mut session, &only_volatile);
+        assert_eq!(session.transcript.len(), 1);
+        assert_eq!(session.transcript[0].text, only_volatile.combined());
+
+        // Nothing at all: no scaffolding message is invented.
+        let mut session = Session::new();
+        push_session_context(&mut session, &ContextContent::default());
+        assert!(session.transcript.is_empty());
     }
 
     #[test]
