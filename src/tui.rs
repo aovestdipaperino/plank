@@ -20,6 +20,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use ratatui_markdown::ThemeConfig;
 use ratatui_markdown::highlight::{HighlightHooks, TreeSitterHighlighter};
@@ -27,14 +28,22 @@ use ratatui_markdown::markdown::{MarkdownBlock, MarkdownRenderer};
 
 use crate::viz::RenderSink;
 
+/// Minimum wall-clock gap between markdown re-renders of a streaming segment.
+/// Bounds highlighting cost to a fixed cadence regardless of token rate (see
+/// [`OutputLog::md_render_throttled`]); ~10 renders/sec keeps live syntax
+/// highlighting smooth without re-highlighting every token.
+const MD_RENDER_MIN_GAP: Duration = Duration::from_millis(100);
+
 /// Style for ordinary assistant/visible output.
 fn visible_style() -> Style {
     Style::default()
 }
 
-/// Barely-visible gray for thinking text.
+/// Barely-visible gray, italic, for thinking text.
 fn think_style() -> Style {
-    Style::default().fg(Color::Indexed(238))
+    Style::default()
+        .fg(Color::Indexed(238))
+        .add_modifier(Modifier::ITALIC)
 }
 
 /// Bold red for error banners, matching the C renderer's `\x1b[1;31m`.
@@ -143,6 +152,16 @@ pub struct OutputLog {
     /// each append so partial emphasis/fences resolve as more text arrives.
     md_buf: String,
     md_start: Option<usize>,
+    /// Wall-clock of the last markdown re-render, and whether tokens have been
+    /// appended since. The render is throttled to [`MD_RENDER_MIN_GAP`] while
+    /// streaming (see [`OutputLog::md_render_throttled`]); a boundary
+    /// [`OutputLog::flush_md`] guarantees the deferred tail still renders.
+    last_md_render: Option<Instant>,
+    md_dirty: bool,
+    /// Count of actual re-renders performed — test-only observability that the
+    /// throttle collapses a token burst into few renders, not one per token.
+    #[cfg(test)]
+    renders: usize,
     /// Transient progress line pinned below the scrollback (throbber + verb +
     /// stats), shown while the worker runs so activity stays visible even when
     /// no text is streaming. Not part of the persistent `lines`; cleared when
@@ -174,9 +193,40 @@ impl OutputLog {
     }
 
     /// Ends the streaming markdown segment; later appends start a new one.
+    /// Flushes any throttle-deferred render first so the committed lines hold
+    /// the complete segment before the buffer is dropped.
     fn md_close(&mut self) {
+        self.flush_md();
         self.md_buf.clear();
         self.md_start = None;
+        self.last_md_render = None;
+        self.md_dirty = false;
+    }
+
+    /// Re-renders the streaming segment at most once per [`MD_RENDER_MIN_GAP`].
+    /// Highlighting a code block recompiles a tree-sitter query per render in
+    /// the markdown crate (tens of ms), so rendering on every streamed token is
+    /// quadratic in the block's length and pins the UI. Rendering on a bounded
+    /// cadence keeps highlighting live; deferred tokens ride the `md_dirty` flag
+    /// until the next render or a [`flush_md`](Self::flush_md) boundary.
+    fn md_render_throttled(&mut self) {
+        let due = self
+            .last_md_render
+            .is_none_or(|t| t.elapsed() >= MD_RENDER_MIN_GAP);
+        if due {
+            self.md_render();
+        } else {
+            self.md_dirty = true;
+        }
+    }
+
+    /// Forces a render when the throttle has deferred appended tokens, so a
+    /// segment boundary (tool/think text, end of turn, checkpoint) always
+    /// commits the full buffer. No-op when nothing is pending.
+    fn flush_md(&mut self) {
+        if self.md_dirty && self.md_start.is_some() {
+            self.md_render();
+        }
     }
 
     /// Re-renders the whole in-progress markdown segment in place.
@@ -212,6 +262,12 @@ impl OutputLog {
         self.code_blocks.retain(|r| r.header < start);
         self.code_blocks
             .extend(annotate_code_blocks(&mut self.lines, start, &raw_codes));
+        self.last_md_render = Some(Instant::now());
+        self.md_dirty = false;
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
     }
 
     /// Appends a fully-styled standalone line (e.g. the user echo).
@@ -246,8 +302,11 @@ impl OutputLog {
         self.lines.pop();
     }
 
-    /// Ensures the streamed output ends on a fresh line.
+    /// Ensures the streamed output ends on a fresh line. Flushes any
+    /// throttle-deferred markdown render first so the turn's final tokens are
+    /// committed (the worker sends `EndLine` at the end of every segment).
     pub fn end_line(&mut self) {
+        self.flush_md();
         if !self.current.is_empty() {
             self.newline();
         }
@@ -332,7 +391,8 @@ impl RenderSink for OutputLog {
             self.md_start = Some(self.lines.len());
         }
         self.md_buf.push_str(text);
-        self.md_render();
+        self.md_dirty = true;
+        self.md_render_throttled();
     }
     fn think_text(&mut self, text: &str) {
         self.md_close();
@@ -2142,6 +2202,55 @@ mod tests {
             colors.len() >= 2,
             "expected multi-color highlighted code: {:?}",
             log.lines
+        );
+    }
+
+    #[test]
+    fn streaming_bursts_are_throttled_but_flush_completely() {
+        // Regression: a code block used to be re-highlighted on every streamed
+        // token — the markdown crate recompiles a tree-sitter query per render,
+        // so an N-token block cost N expensive renders and wedged the TUI.
+        // A same-segment burst must collapse to few renders, and a boundary
+        // (EndLine) must still commit every token.
+        let mut log = OutputLog::new();
+        let toks = [
+            "```rust\n",
+            "fn ",
+            "main",
+            "() ",
+            "{\n",
+            "    let x = 1;\n",
+            "}\n",
+            "```\n",
+        ];
+        for t in toks {
+            log.visible_text(t);
+        }
+        // The whole burst runs in far under MD_RENDER_MIN_GAP, so only the
+        // first token renders eagerly; the rest defer behind the throttle.
+        assert!(
+            log.renders < toks.len(),
+            "expected throttled renders, got {} for {} tokens",
+            log.renders,
+            toks.len()
+        );
+        assert!(
+            log.md_dirty,
+            "deferred tokens should leave the buffer dirty"
+        );
+
+        // The end-of-segment flush commits the full, highlighted block.
+        log.end_line();
+        assert!(!log.md_dirty, "flush clears the dirty flag");
+        let joined: String = log
+            .lines
+            .iter()
+            .flat_map(|l| &l.spans)
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            joined.contains("let x = 1;"),
+            "final render must contain every streamed token: {joined:?}"
         );
     }
 

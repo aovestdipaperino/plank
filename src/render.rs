@@ -1314,8 +1314,9 @@ enum MdPending {
 const UPTO_MARKER: &[u8] = b"[upto]";
 const FENCE_LANG_MAX: usize = 31;
 
-/// SGR for thinking text: a barely-visible dark gray (256-color index 238).
-const THINK_GREY: &[u8] = b"\x1b[38;5;238m";
+/// SGR for thinking text: italic, in a barely-visible dark gray (256-color
+/// index 238). Italic (`3`) sets it apart from the assistant's real output.
+const THINK_GREY: &[u8] = b"\x1b[3;38;5;238m";
 
 /// True for control bytes that must not reach the terminal from model text.
 /// Tab, newline, and carriage return are layout the renderer relies on.
@@ -2292,8 +2293,8 @@ mod tests {
         r.finish();
         let out = output(r);
         assert!(
-            out.contains("\x1b[38;5;238mpondering"),
-            "grey think: {out:?}"
+            out.contains("\x1b[3;38;5;238mpondering"),
+            "italic grey think: {out:?}"
         );
         assert!(!out.contains("<think>"));
         assert!(!out.contains("</think>"));
