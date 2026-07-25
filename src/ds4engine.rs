@@ -969,6 +969,75 @@ impl Engine for Ds4Session {
         Ok(true)
     }
 
+    fn warm_context(
+        &mut self,
+        system: &str,
+        context: &str,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        if context.is_empty() {
+            return Ok(false);
+        }
+        // Build exactly the token prefix the first turn will reuse:
+        // `[begin+system]` (matching `build_system_tokens`) followed by the
+        // session-start context as one user message. This is byte-for-byte the
+        // prefix `generate`/`build_prompt` reconstructs for `[system][context]`,
+        // so the next turn's `ds4_session_common_prefix` reuses all of it and
+        // evaluates only the question suffix. Crucially, NO trailing assistant
+        // prefix is appended here — the cached prefix ends exactly at the
+        // context, so common-prefix accounting and the progress-bar totals on
+        // the first turn are unperturbed (issue #63).
+        let mut tokens = self.model.build_system_tokens(system);
+        tokens.push_all(&self.model.message_tokens("user", context));
+        let prompt_len = tokens.len();
+
+        let session = self.ensure_session()?;
+
+        // How much the live KV already holds — the system prefix warmed by
+        // `warm_system_prompt`. Only the context suffix beyond it is evaluated.
+        // SAFETY: session and tokens are valid.
+        let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        if cached >= prompt_len {
+            // Nothing new to prefill (e.g. an initial `-p` turn already ran and
+            // the KV extends past the context). No-op, no progress drawn.
+            return Ok(false);
+        }
+        on_event(EngineEvent::Prefill(PrefillProgress {
+            done: cached.clamp(0, (prompt_len - 1).max(0)),
+            total: prompt_len,
+            tps: 0.0,
+        }));
+
+        // Prefill-only: sync the session to `[system][context]` with no
+        // sampling. Not checkpointed — the context is per-session volatile.
+        let mut progress = ProgressCtx {
+            on_event,
+            interrupt: &|| false,
+            start: std::time::Instant::now(),
+            base: cached.clamp(0, prompt_len),
+            total: prompt_len,
+        };
+        let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
+        // SAFETY: session valid; progress outlives the sync and the callback is
+        // cleared right after.
+        unsafe {
+            ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+        }
+        let mut err = [0_i8; 512];
+        // SAFETY: session, tokens, and err buffer are valid.
+        let rc =
+            unsafe { ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        // SAFETY: session valid; clearing before ProgressCtx drops.
+        unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
+        if rc != 0 {
+            return Err(EngineError::new(cstr_message(
+                &err,
+                "context prefill failed",
+            )));
+        }
+        Ok(true)
+    }
+
     fn count_tokens(&self, text: &str) -> i32 {
         self.model.count_tokens(text)
     }

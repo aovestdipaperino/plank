@@ -365,6 +365,32 @@ pub trait Engine: Debug + Send {
         Ok(false)
     }
 
+    /// Warms the KV cache with the session-start context turn *on top of* the
+    /// already-warmed system prompt, so the first real turn reuses
+    /// `[system][context]` and prefills only the user's question suffix.
+    ///
+    /// Unlike [`warm_system_prompt`](Self::warm_system_prompt) this is
+    /// prefill-only and **never checkpointed**: `context` is per-session volatile
+    /// (git status, date), so folding it into the `sysprompt.kv` fingerprint
+    /// would force a rebuild every launch (issue #63). It appends no trailing
+    /// assistant prefix, so the cached prefix stays exactly `[system][context]`
+    /// and the next turn's common-prefix accounting is unperturbed. Returns
+    /// `true` when a prefill actually happened.
+    ///
+    /// The default implementation is a no-op returning `false`, so
+    /// [`EchoEngine`] and remote/provider engines are unaffected.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to prefill.
+    fn warm_context(
+        &mut self,
+        _system: &str,
+        _context: &str,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        Ok(false)
+    }
+
     /// Captures the live session KV as serialized bytes for a checkpoint.
     ///
     /// Returns `None` when the engine has no snapshot support (the stub echo
@@ -591,6 +617,22 @@ mod tests {
             .expect("echo generate");
         assert!(streamed.contains('🦀'), "emoji mangled: {streamed:?}");
         assert!(!streamed.contains('\u{FFFD}'), "lossy bytes: {streamed:?}");
+    }
+
+    // The context-warm capability is opt-in: engines without a KV to prefill
+    // (EchoEngine, remote/provider) must inherit the no-op default so both
+    // front-end warm paths degrade cleanly (issue #63).
+    #[test]
+    fn warm_context_defaults_to_noop() {
+        let mut engine = EchoEngine::new(4096);
+        let mut events = Vec::new();
+        let warmed = engine
+            .warm_context("[system]\nsys\n", "[context]\ngit + date\n", &mut |e| {
+                events.push(e);
+            })
+            .expect("default warm_context never errors");
+        assert!(!warmed, "no-op default must report no prefill happened");
+        assert!(events.is_empty(), "the default impl streams nothing");
     }
 
     #[test]
