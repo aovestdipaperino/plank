@@ -43,7 +43,7 @@ impl<F: FnMut()> Drop for RestoreOnDrop<F> {
 }
 
 #[cfg(ds4_engine)]
-pub use ds4::SessionSnapshot;
+pub(crate) use ds4::SessionSnapshot;
 
 #[cfg(ds4_engine)]
 mod ds4 {

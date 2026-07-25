@@ -10,9 +10,9 @@
 //! - `generate` → `POST /generate`, then reads the SSE stream, mapping each
 //!   frame onto `on_event`, polling `interrupt` between frames and firing
 //!   `DELETE /generate/{id}` on interrupt.
-//! - `warm_system_prompt` → `POST /warm`; the `checkpoint` path is ignored (it
-//!   is a server-side file), progress streams through, returns whether a
-//!   prefill happened.
+//! - warming (`warm_reset` / `warm_sync`) is a no-op: the KV lives on the
+//!   server, so there is no client-side cache to prefill and the trait
+//!   defaults are correct.
 //! - `count_tokens` → `POST /tokenize` (short LRU-free cache), degrading to the
 //!   trait default (`len()/4`) on transport error so accounting never aborts.
 //! - `ctx_size` / `model_name` → cached from the `/info` handshake.
@@ -211,25 +211,6 @@ impl Engine for RemoteDs4Engine {
             opts: WireOptions::from(opts),
         };
         self.stream_turn(("/generate", &body), interrupt, on_event)
-    }
-
-    fn warm_system_prompt(
-        &mut self,
-        system: &str,
-        _checkpoint: Option<&std::path::Path>,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
-        let session_id = format!("warm-{}", TURN_SEQ.fetch_add(1, Ordering::Relaxed));
-        let body = GenerateRequest {
-            session_id,
-            transcript: system.to_string(),
-            opts: WireOptions::from(&GenerationOptions::default()),
-        };
-        // Never interrupted; warm is a fast prefill.
-        let never = || false;
-        let stats = self.stream_turn(("/warm", &body), &never, on_event)?;
-        // A cache miss prefilled tokens; a hit returns generated == 0.
-        Ok(stats.generated > 0 || stats.ctx_used > 0)
     }
 
     fn count_tokens(&self, text: &str) -> i32 {

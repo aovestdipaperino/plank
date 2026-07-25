@@ -430,7 +430,8 @@ fn handle_generate(
         // stanza determinism is reproduced by the engine's own streaming parser.
         let greedy = || false;
         if warm {
-            eng.warm_system_prompt(&gen_req.transcript, None, &mut on_event)
+            eng.warm_reset(&gen_req.transcript)
+                .and_then(|()| eng.warm_sync(None, &mut on_event))
                 .map(|_| crate::engine::GenerationStats::default())
         } else {
             eng.generate(

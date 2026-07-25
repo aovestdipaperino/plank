@@ -38,9 +38,9 @@ pub struct Checkpoint {
     pub transcript: Vec<Message>,
     /// Task list snapshot, restored alongside the transcript (issue #35).
     pub tasks: crate::tasks::TaskList,
-    /// Serialized engine KV state; `None` when the engine has no snapshot
+    /// Captured engine KV state; `None` when the engine has no snapshot
     /// support, in which case rollback re-prefills.
-    pub kv: Option<Vec<u8>>,
+    pub kv: Option<crate::kvcache::KVCache>,
 }
 
 /// In-memory, per-session set of named checkpoints (insertion order).
@@ -85,7 +85,12 @@ impl CheckpointStore {
     ///
     /// An existing checkpoint with the same name is overwritten in place;
     /// returns `true` when it replaced an existing one.
-    pub fn save(&mut self, name: &str, session: &Session, kv: Option<Vec<u8>>) -> bool {
+    pub fn save(
+        &mut self,
+        name: &str,
+        session: &Session,
+        kv: Option<crate::kvcache::KVCache>,
+    ) -> bool {
         let cp = Checkpoint {
             name: name.to_owned(),
             created_at: unix_now(),
@@ -214,7 +219,14 @@ mod tests {
         let s = session_with(&[Message::user("fix the parser"), Message::assistant("on it")]);
         assert!(!store.save("before-fix", &s, None));
         assert_eq!(store.len(), 1);
-        assert!(!store.save("second", &s, Some(vec![1, 2, 3])));
+        assert!(!store.save(
+            "second",
+            &s,
+            Some(crate::kvcache::KVCache::new(
+                vec![1, 2, 3],
+                crate::ds4tokens::TokenTranscript::new(),
+            ))
+        ));
         assert_eq!(store.len(), 2);
 
         let cp = store.get("before-fix").unwrap();

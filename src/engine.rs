@@ -412,77 +412,53 @@ pub trait Engine: Debug + Send {
         i32::try_from(text.len() / 4).unwrap_or(i32::MAX)
     }
 
-    /// Warms the KV cache with the system prompt before the first turn.
+    /// Captures the live session KV, or `None` when the engine has no snapshot
+    /// support (the stub echo engine, remote engines) or no live session yet.
     ///
-    /// Restores a disk checkpoint at `checkpoint` when its stored fingerprint
-    /// still matches this model and system prompt; otherwise prefills the
-    /// system prompt (streaming progress via `on_event`) and saves a fresh
-    /// checkpoint. Returns `true` when a prefill happened (cache miss).
-    ///
-    /// The default implementation is a no-op returning `false`.
-    ///
-    /// # Errors
-    /// Returns [`EngineError`] when the backend fails to prefill.
-    fn warm_system_prompt(
-        &mut self,
-        _system: &str,
-        _checkpoint: Option<&std::path::Path>,
-        _on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
-        Ok(false)
-    }
-
-    /// Warms the KV cache with the session-start context tiers *on top of* the
-    /// already-warmed system prompt, so the first real turn reuses
-    /// `[system][stable][volatile]` and prefills only the user's question suffix.
-    ///
-    /// Runs the **restore → extend → snapshot** loop over `tiers` (built by
-    /// [`crate::kvtier::plan`], ordered most-stable-first, each carried as its
-    /// own user message): reuse the deepest tier whose on-disk checkpoint
-    /// fingerprint still matches, then prefill only the tiers below it,
-    /// snapshotting each cacheable tier as its boundary is reached (issue #64).
-    ///
-    /// Tier 3 (git status, date, hook output) is prefill-only and **never
-    /// checkpointed** — folding volatile bytes into a cache key would force a
-    /// rebuild every launch (issue #63). No trailing assistant prefix is
-    /// appended, so the cached prefix ends exactly at the last tier and the next
-    /// turn's common-prefix accounting is unperturbed. Returns `true` when a
-    /// prefill actually happened.
-    ///
-    /// The default implementation is a no-op returning `false`, so
-    /// [`EchoEngine`] and remote/provider engines are unaffected.
-    ///
-    /// # Errors
-    /// Returns [`EngineError`] when the backend fails to prefill.
-    fn warm_tiers(
-        &mut self,
-        _system: &str,
-        _tiers: &[crate::kvtier::TierSpec],
-        _on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
-        Ok(false)
-    }
-
-    /// Captures the live session KV as serialized bytes for a checkpoint.
-    ///
-    /// Returns `None` when the engine has no snapshot support (the stub echo
-    /// engine) or has no live session yet; callers then fall back to a
-    /// transcript-only checkpoint that re-prefills on rollback.
-    fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
+    /// The returned cache carries the token transcript the KV was captured
+    /// with, so a later [`set_kv`](Self::set_kv) resumes with the exact token
+    /// buffer rather than rebuilding from text and re-prefilling.
+    fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
         None
     }
 
-    /// Restores session KV previously captured by [`Engine::snapshot_kv`],
-    /// so the next turn resumes with (near-)zero re-prefill.
-    ///
-    /// The default implementation reports lack of support; the echo engine and
-    /// any transcript-only rollback rely on it returning an error rather than
-    /// pretending to restore.
+    /// Restores session KV previously captured by [`get_kv`](Self::get_kv).
     ///
     /// # Errors
-    /// Returns [`EngineError`] when the engine cannot restore KV state.
-    fn restore_kv(&mut self, _bytes: &[u8]) -> Result<(), EngineError> {
+    /// Returns [`EngineError`] when the engine cannot restore KV state. The
+    /// default reports lack of support rather than pretending to restore.
+    fn set_kv(&mut self, _cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
         Err(EngineError::new("engine does not support KV snapshots"))
+    }
+
+    /// Begins a warm walk: resets the cumulative warm token buffer to the
+    /// system prompt's tokens. No prefill happens yet.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend cannot open a session.
+    fn warm_reset(&mut self, _system: &str) -> Result<(), EngineError> {
+        Ok(())
+    }
+
+    /// Appends `text` to the warm buffer as one user message (nothing when
+    /// `None`, which is how the system tier syncs itself), then prefills the
+    /// session up to the buffer's end. Returns `true` when a prefill ran.
+    ///
+    /// Each tier is its own message, so a tier boundary is a clean
+    /// chat-template message boundary and a snapshot taken there is a genuinely
+    /// reproducible token prefix — never a mid-message split whose tokenization
+    /// could shift under BPE merges. No trailing assistant prefix is appended,
+    /// so the cached prefix ends exactly at the last tier and the first turn's
+    /// common-prefix accounting is unperturbed (#63).
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the backend fails to prefill.
+    fn warm_sync(
+        &mut self,
+        _text: Option<&str>,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<bool, EngineError> {
+        Ok(false)
     }
 
     /// Context window size in tokens.
@@ -787,18 +763,13 @@ mod tests {
     // (EchoEngine, remote/provider) must inherit the no-op default so both
     // front-end warm paths degrade cleanly (issues #63, #64).
     #[test]
-    fn warm_tiers_defaults_to_noop() {
-        let mut engine = EchoEngine::new(4096);
-        let mut events = Vec::new();
-        let tiers = crate::kvtier::plan("fp1", "sys", "agents\n", "git + date\n", "", None);
-        assert_eq!(tiers.len(), 3, "system + both tiers planned");
-        let warmed = engine
-            .warm_tiers("[system]\nsys\n", &tiers, &mut |e| {
-                events.push(e);
-            })
-            .expect("default warm_tiers never errors");
-        assert!(!warmed, "no-op default must report no prefill happened");
-        assert!(events.is_empty(), "the default impl streams nothing");
+    fn echo_engine_reports_no_kv_support_and_warms_as_a_no_op() {
+        let mut e = EchoEngine::new(4096);
+        assert!(e.get_kv().is_none(), "the stub engine has no KV to capture");
+        assert!(e.set_kv(&crate::kvcache::KVCache::default()).is_err());
+        // Warming must still run end-to-end against the stub: no prefill, no error.
+        e.warm_reset("SYSTEM").unwrap();
+        assert!(!e.warm_sync(Some("tier text"), &mut |_| {}).unwrap());
     }
 
     #[test]

@@ -1188,22 +1188,6 @@ impl Engine for ProviderEngine {
         })
     }
 
-    /// No-op for providers: there is no client-side KV to prefill (§4.5). The
-    /// Anthropic path relies on **server-side** prompt caching instead — the
-    /// FIRST real [`generate`](Self::generate) request already carries the
-    /// `cache_control` breakpoints (see [`build_anthropic_request`]), so it
-    /// establishes the cache and every subsequent turn reads it. Returning
-    /// `false` (no prefill happened) is correct and matches the trait default;
-    /// this override exists to document the behavior.
-    fn warm_system_prompt(
-        &mut self,
-        _system: &str,
-        _checkpoint: Option<&std::path::Path>,
-        _on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
-        Ok(false)
-    }
-
     fn ctx_size(&self) -> i32 {
         self.ctx_size
     }

@@ -225,7 +225,22 @@ impl Ds4Model {
         )?);
         // Warm on a throwaway bootstrap session, then capture its KV.
         let mut boot = Ds4Session::from_model(Arc::clone(&model));
-        boot.warm_system_prompt(system, checkpoint, &mut |_| {})?;
+        // Restore a matching on-disk checkpoint when there is one; otherwise
+        // prefill the system prompt and persist a fresh checkpoint. Best-effort
+        // on both ends: a cache miss only costs one prefill.
+        let fingerprint = model.checkpoint_fingerprint(system);
+        let restored = checkpoint
+            .and_then(|path| crate::kvcache::KVCache::from_file(path, &fingerprint))
+            .is_some_and(|cache| boot.set_kv(&cache).is_ok());
+        if !restored {
+            boot.warm_reset(system)?;
+            boot.warm_sync(None, &mut |_| {})?;
+            if let Some(path) = checkpoint
+                && let Some(cache) = boot.get_kv()
+            {
+                let _ = cache.persist(path, &fingerprint);
+            }
+        }
         let session = boot.ensure_session()?;
         let snap = SessionSnapshot::capture(session)?;
         *model.warm.lock().unwrap() = Some(snap);
@@ -413,6 +428,7 @@ impl ModelHandle for Ds4Model {
             model: Arc::clone(&self),
             session,
             transcript: TokenTranscript::new(),
+            warm_tokens: Ds4TokensGuard::new(),
         };
         Ok(Box::new(Ds4HostSession {
             inner,
@@ -448,9 +464,12 @@ pub struct Ds4Session {
     /// prompt prefix, mirroring the C's `w->transcript` (issue #58). Each turn
     /// reconciles the UI's rendered transcript against it structurally (keep the
     /// matching span prefix verbatim, retokenize the divergent tail) instead of
-    /// re-templating from text. Persisted with the KV in
-    /// `snapshot_kv`/`restore_kv` so a resumed session keeps full prefix reuse.
+    /// re-templating from text. Persisted with the KV in `get_kv`/`set_kv` so a
+    /// resumed session keeps full prefix reuse.
     transcript: TokenTranscript,
+    /// Cumulative token buffer for an in-progress warm walk (`warm_reset` /
+    /// `warm_sync`). Empty outside a walk.
+    warm_tokens: Ds4TokensGuard,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -495,6 +514,7 @@ impl Ds4Session {
             model,
             session: std::ptr::null_mut(),
             transcript: TokenTranscript::new(),
+            warm_tokens: Ds4TokensGuard::new(),
         }
     }
 
@@ -608,80 +628,6 @@ impl Ds4Session {
         span.push(eos);
         self.transcript
             .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
-    }
-
-    /// Serializes the session KV to `path`, prefixed by its fingerprint line.
-    ///
-    /// Best-effort: a failure to save just means the next launch re-prefills.
-    fn save_checkpoint(session: *mut ffi::Ds4Session, path: &Path, fingerprint: &str) {
-        let Ok(snap) = SessionSnapshot::capture(session) else {
-            return;
-        };
-        let bytes = snap.as_bytes();
-        let mut file = Vec::with_capacity(bytes.len() + 41);
-        file.extend_from_slice(fingerprint.as_bytes());
-        file.push(b'\n');
-        file.extend_from_slice(bytes);
-        let _ = std::fs::write(path, &file);
-    }
-}
-
-/// Changed lines shown in the first-change diff when a system-prompt cache
-/// miss is reported (plus a one-line "+N more" summary when there are more).
-const SYSPROMPT_SNIPPET_LINES: usize = 5;
-
-/// Debug aid for the sysprompt-cache churn investigation (gated behind
-/// `PLANK_DEBUG_SYSPROMPT`). Dumps the exact system prompt that produced
-/// `computed` to `<cache-dir>/sysprompt-debug-<fp8>.txt` and appends a line to
-/// `sysprompt-debug.log`, so two launches leave two diffable prompt files and a
-/// running record of computed-vs-stored fingerprints. Best-effort; never fails
-/// the warm-up.
-fn debug_log_sysprompt(checkpoint: &Path, system: &str, computed: &str, stored: Option<&str>) {
-    let Some(dir) = checkpoint.parent() else {
-        return;
-    };
-    let fp8 = &computed[..computed.len().min(8)];
-    let dump = dir.join(format!("sysprompt-debug-{fp8}.txt"));
-    let _ = std::fs::write(&dump, system);
-    let hit = stored == Some(computed);
-    let line = format!(
-        "pid={} decision={} computed={} stored={} system_len={} dump={}\n",
-        std::process::id(),
-        if hit { "HIT" } else { "MISS" },
-        computed,
-        stored.unwrap_or("<none>"),
-        system.len(),
-        dump.display(),
-    );
-    let _ = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("sysprompt-debug.log"))
-        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
-    eprintln!(
-        "[sysprompt-debug] {} computed={computed} stored={} (prompt dumped to {})",
-        if hit { "HIT" } else { "MISS" },
-        stored.unwrap_or("<none>"),
-        dump.display()
-    );
-}
-
-/// Resolves a [`crate::session::KvKey`] to its on-disk checkpoint path.
-///
-/// TODO(task-4): `warm_tiers` — the only caller — is deleted once the uniform
-/// tier-warm loop lands, and this helper goes with it. Until then it is a
-/// stand-in for `SessionStore::kv_path`, which `warm_tiers` cannot call
-/// directly because it is handed pre-resolved tiers rather than a
-/// `SessionStore`. Mirrors `kv_path` exactly, rooted at
-/// `SessionStore::default_dir()` (the store's usual location).
-fn kv_key_checkpoint_path(key: &crate::session::KvKey) -> std::path::PathBuf {
-    let dir = crate::session::SessionStore::default_dir();
-    match key {
-        crate::session::KvKey::System { fp } => dir.join(format!("sysprompt-{fp}.kv")),
-        crate::session::KvKey::Project { dir: project, fp } => dir
-            .join(crate::session::project_key(project))
-            .join(crate::session::project_checkpoint_name(fp)),
-        crate::session::KvKey::Session { id } => dir.join(format!("{id}.kv")),
     }
 }
 
@@ -907,240 +853,64 @@ impl Engine for Ds4Session {
         true
     }
 
-    fn warm_system_prompt(
+    fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
+        self.warm_tokens = self.model.build_system_tokens(system);
+        Ok(())
+    }
+
+    fn warm_sync(
         &mut self,
-        system: &str,
-        checkpoint: Option<&Path>,
+        text: Option<&str>,
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<bool, EngineError> {
-        let tokens = self.model.build_system_tokens(system);
-        let fingerprint = self.model.checkpoint_fingerprint(system);
-        let debug = std::env::var_os("PLANK_DEBUG_SYSPROMPT").is_some();
-        let session = self.ensure_session()?;
-
-        // Fast path: restore a matching on-disk checkpoint, skipping prefill.
-        // On any miss, tell the user *why* it is rebuilding — a missing cache,
-        // a changed prompt (with a compact diff so a benign change like a
-        // ticking counter is obvious), or an incompatible snapshot.
-        if let Some(path) = checkpoint {
-            let file = std::fs::read(path).ok();
-            let stored = file.as_ref().and_then(|bytes| {
-                let nl = bytes.iter().position(|&b| b == b'\n')?;
-                std::str::from_utf8(&bytes[..nl]).ok().map(str::to_owned)
-            });
-            if debug {
-                debug_log_sysprompt(path, system, &fingerprint, stored.as_deref());
-            }
-            if stored.as_deref() == Some(fingerprint.as_str()) {
-                // Key matches: restore, skipping prefill.
-                if let Some(bytes) = &file {
-                    let nl = bytes.iter().position(|&b| b == b'\n').unwrap_or(0);
-                    if SessionSnapshot::restore_bytes(session, &bytes[nl + 1..]).is_ok() {
-                        if debug {
-                            eprintln!("[sysprompt-debug] HIT: restored snapshot fp={fingerprint}");
-                        }
-                        return Ok(false);
-                    }
-                }
-                // Key matched but the bytes would not load: a format change.
-                on_event(EngineEvent::Notice(
-                    "system prompt cache is incompatible with this build; rebuilding it".to_owned(),
-                ));
-            } else if let Some(stored_fp) = stored.as_deref() {
-                // Genuine key mismatch: the prompt text changed. Attach a compact
-                // diff of the first change so the user can judge if it is benign.
-                let mut msg = "system prompt changed; rebuilding cache".to_owned();
-                if let Ok(old) = std::fs::read_to_string(path.with_extension("prompt"))
-                    && let Some(snip) = crate::tools::diff::first_change_snippet(
-                        &old,
-                        system,
-                        SYSPROMPT_SNIPPET_LINES,
-                    )
-                {
-                    msg.push('\n');
-                    msg.push_str(&snip);
-                }
-                on_event(EngineEvent::Notice(msg));
-                if debug {
-                    eprintln!(
-                        "[sysprompt-debug] MISS: fingerprint mismatch (stored={stored_fp} computed={fingerprint})"
-                    );
-                }
-            } else {
-                // No readable checkpoint: first run, or the cache was cleared.
-                on_event(EngineEvent::Notice(
-                    "system prompt cache missing; building it (first run, or the cache was cleared)"
-                        .to_owned(),
-                ));
-            }
+        if let Some(text) = text {
+            let msg = self.model.message_tokens("user", text);
+            self.warm_tokens.push_all(&msg);
         }
-
-        // Cache miss: prefill the system prompt, streaming progress.
+        let total = self.warm_tokens.len();
+        let session = self.ensure_session()?;
+        // SAFETY: session and tokens are valid.
+        let cached = unsafe { ffi::ds4_session_common_prefix(session, self.warm_tokens.as_ptr()) };
+        if cached >= total {
+            return Ok(false);
+        }
+        on_event(EngineEvent::Prefill(PrefillProgress {
+            done: cached.clamp(0, (total - 1).max(0)),
+            total,
+            tps: 0.0,
+        }));
         let mut progress = ProgressCtx {
-            on_event,
+            on_event: &mut *on_event,
             interrupt: &|| false,
             start: std::time::Instant::now(),
-            base: 0,
-            total: tokens.len(),
+            base: cached.clamp(0, total),
+            total,
         };
         let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
-        // SAFETY: session valid; progress outlives the sync and the callback is cleared after.
+        // SAFETY: session valid; progress outlives the sync and the callback is
+        // cleared right after.
         unsafe {
             ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
         }
         let mut err = [0_i8; 512];
         // SAFETY: session, tokens, and err buffer are valid.
-        let rc =
-            unsafe { ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
+        let rc = unsafe {
+            ffi::ds4_session_sync(
+                session,
+                self.warm_tokens.as_ptr(),
+                err.as_mut_ptr(),
+                err.len(),
+            )
+        };
         // SAFETY: session valid; clearing before ProgressCtx drops.
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         if rc != 0 {
             return Err(EngineError::new(cstr_message(
                 &err,
-                "system prompt prefill failed",
+                "context prefill failed",
             )));
         }
-
-        // Persist a fresh checkpoint for the next launch, plus a sidecar copy of
-        // the prompt text so the next mismatch can show what changed.
-        if let Some(path) = checkpoint {
-            Self::save_checkpoint(session, path, &fingerprint);
-            let _ = std::fs::write(path.with_extension("prompt"), system);
-        }
         Ok(true)
-    }
-
-    fn warm_tiers(
-        &mut self,
-        system: &str,
-        tiers: &[crate::kvtier::TierSpec],
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<bool, EngineError> {
-        if tiers.is_empty() {
-            return Ok(false);
-        }
-
-        // The token prefix the first turn will reuse: `[begin+system]`
-        // (matching `build_system_tokens`) followed by one user message per
-        // tier, most-stable-first. Each tier is its own message, so a tier
-        // boundary is a clean chat-template message boundary and the snapshot
-        // taken there is a genuinely reproducible token prefix — never a
-        // mid-message split whose tokenization could shift under BPE merges.
-        //
-        // Crucially, NO trailing assistant prefix is appended — the cached
-        // prefix ends exactly at the last tier, so the first turn's
-        // common-prefix accounting and progress totals are unperturbed (#63).
-        let msgs: Vec<Vec<i32>> = tiers
-            .iter()
-            .map(|t| self.model.message_tokens("user", &t.text))
-            .collect();
-        let mut tokens = self.model.build_system_tokens(system);
-        let mut total = tokens.len();
-        for m in &msgs {
-            total = total.saturating_add(i32::try_from(m.len()).unwrap_or(0));
-        }
-
-        // Walk the tiers most-stable-first and reuse KV up to the first
-        // fingerprint mismatch (pure logic, unit tested in `kvtier`).
-        let plan = crate::kvtier::resume_point(tiers, |t| {
-            t.key
-                .as_ref()
-                .map(kv_key_checkpoint_path)
-                .is_some_and(|p| crate::kvtier::checkpoint_matches(&p, &t.fingerprint))
-        });
-        let mut prefill_from = plan.prefill_from;
-
-        let session = self.ensure_session()?;
-
-        // Restore: load the deepest still-valid tier checkpoint, which brings
-        // back every tier above it too (the keys are chained, so a valid tier
-        // implies valid ancestors). A checkpoint whose key matched but whose
-        // bytes will not load is a format change: say so and rebuild rather
-        // than trust it.
-        if let Some(i) = plan.restore {
-            let restored = tiers[i]
-                .key
-                .as_ref()
-                .map(kv_key_checkpoint_path)
-                .and_then(|p| std::fs::read(p).ok())
-                .and_then(|bytes| {
-                    crate::kvtier::split_checkpoint(&bytes)
-                        .map(|(_, snap)| SessionSnapshot::restore_bytes(session, snap).is_ok())
-                })
-                .unwrap_or(false);
-            if !restored {
-                on_event(EngineEvent::Notice(
-                    "project context cache is incompatible with this build; rebuilding it"
-                        .to_owned(),
-                ));
-                prefill_from = 0;
-            }
-        }
-
-        // Extend + snapshot: sync to each remaining tier's boundary in turn,
-        // prefilling only what the live KV does not already hold, and
-        // checkpointing each cacheable tier exactly at its own boundary (a
-        // snapshot captures the whole session, so it must be taken while the
-        // cursor sits at the end of that tier and no further).
-        let mut prefilled = false;
-        for (i, msg) in msgs.iter().enumerate() {
-            tokens.push_all(msg);
-            if i < prefill_from {
-                // Already in KV via the restore above; nothing to sync.
-                continue;
-            }
-            // SAFETY: session and tokens are valid.
-            let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
-            let end = tokens.len();
-            if cached < end {
-                prefilled = true;
-                on_event(EngineEvent::Prefill(PrefillProgress {
-                    done: cached.clamp(0, (total - 1).max(0)),
-                    total,
-                    tps: 0.0,
-                }));
-                // Reborrow rather than move: the loop needs `on_event` again on
-                // the next tier.
-                let mut progress = ProgressCtx {
-                    on_event: &mut *on_event,
-                    interrupt: &|| false,
-                    start: std::time::Instant::now(),
-                    base: cached.clamp(0, total),
-                    total,
-                };
-                let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
-                // SAFETY: session valid; progress outlives the sync and the
-                // callback is cleared right after.
-                unsafe {
-                    ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
-                }
-                let mut err = [0_i8; 512];
-                // SAFETY: session, tokens, and err buffer are valid.
-                let rc = unsafe {
-                    ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len())
-                };
-                // SAFETY: session valid; clearing before ProgressCtx drops.
-                unsafe {
-                    ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut());
-                }
-                if rc != 0 {
-                    return Err(EngineError::new(cstr_message(
-                        &err,
-                        "context prefill failed",
-                    )));
-                }
-            }
-            // Persist this tier for the next session in the project. Tier 3
-            // carries no key, so it is never written here.
-            if let Some(key) = tiers[i].key.as_ref() {
-                let path = kv_key_checkpoint_path(key);
-                if let Some(dir) = path.parent() {
-                    let _ = std::fs::create_dir_all(dir);
-                }
-                Self::save_checkpoint(session, &path, &tiers[i].fingerprint);
-            }
-        }
-        Ok(prefilled)
     }
 
     fn count_tokens(&self, text: &str) -> i32 {
@@ -1155,39 +925,29 @@ impl Engine for Ds4Session {
         self.model.model_name()
     }
 
-    fn snapshot_kv(&mut self) -> Option<Vec<u8>> {
+    fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
         if self.session.is_null() {
             return None;
         }
         // Reuse the single snapshot primitive (src/snapshot.rs) rather than
         // hand-rolling the FFI: capture owns an engine buffer and frees it on
         // drop; we copy the payload out for the caller to persist. The token
-        // transcript rides in front of the KV bytes so a restore reconstructs
-        // the exact token buffer the KV was captured with — without it, the
-        // resumed session rebuilds from text and re-prefills from the first
-        // assistant reply.
+        // transcript rides in the value so a restore reconstructs the exact
+        // token buffer the KV was captured with.
         let snap = SessionSnapshot::capture(self.session).ok()?;
-        let mut out = ds4tokens::encode(&self.transcript);
-        out.extend_from_slice(snap.as_bytes());
-        Some(out)
+        Some(crate::kvcache::KVCache::new(
+            snap.as_bytes().to_vec(),
+            self.transcript.clone(),
+        ))
     }
 
-    fn restore_kv(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+    fn set_kv(&mut self, cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
         let session = self.ensure_session()?;
-        // Split off the token transcript captured with this KV. Legacy payloads
-        // (`plank-replies-v1`) and stripped sessions carry none: the KV still
-        // restores, but with an empty transcript the next turn rebuilds from
-        // text and pays one full re-prefill (the C's "rebuilt from text"
-        // fallback).
-        let (transcript, kv) = match ds4tokens::decode(bytes) {
-            Some((transcript, off)) => (transcript, &bytes[off..]),
-            None => (TokenTranscript::new(), strip_legacy(bytes)),
-        };
-        // Load our own persisted bytes through the non-owning restore path
-        // (the engine copies from a transient struct and never frees it);
-        // see snapshot.rs / FINDINGS.md.
-        SessionSnapshot::restore_bytes(session, kv)?;
-        self.transcript = transcript;
+        // Persisted bytes go through the non-owning restore path: the engine
+        // copies from a transient struct and never frees it (snapshot.rs,
+        // FINDINGS.md).
+        SessionSnapshot::restore_bytes(session, cache.kv())?;
+        self.transcript = cache.transcript().clone();
         Ok(())
     }
 }
@@ -1443,7 +1203,7 @@ impl HostSession for Ds4HostSession {
         // engine-owned snapshot is freed here (the returned Vec is Rust's, and
         // the disk-read restore path must never free it — FINDINGS double-free).
         // The token transcript rides in front of the KV bytes (same wrap as
-        // `snapshot_kv`) so an idle-reclaimed session resumes with its exact
+        // `get_kv`) so an idle-reclaimed session resumes with its exact
         // token buffer intact and only prefills genuinely new tokens.
         let snap = SessionSnapshot::capture(self.inner.session).ok()?;
         let mut out = ds4tokens::encode(&self.inner.transcript);
@@ -2109,7 +1869,7 @@ mod tests {
     // #29 — /checkpoint + /rollback does zero re-prefill. Establish a
     // conversation, capture its KV via the snapshot path (the /checkpoint
     // mechanism), diverge onto a different turn, then restore the checkpoint
-    // via `restore_kv` (the /rollback mechanism) and prove the next generation
+    // via `set_kv` (the /rollback mechanism) and prove the next generation
     // reuses the checkpoint KV wholesale instead of re-prefilling the
     // transcript. Runtime signal: the first Prefill event's reused count.
     #[cfg(ds4_engine)]
@@ -2136,9 +1896,7 @@ mod tests {
 
         // Establish the checkpoint conversation, then capture its KV.
         let _ = gen_capture_prefill(&mut engine, transcript1, &opts);
-        let checkpoint = engine
-            .snapshot_kv()
-            .expect("snapshot_kv yields a checkpoint payload");
+        let checkpoint = engine.get_kv().expect("get_kv yields a checkpoint payload");
 
         // Diverge onto a different single-user turn: only the system prompt is
         // reusable, so this turn does real re-prefill (the control).
@@ -2150,7 +1908,7 @@ mod tests {
 
         // Roll back to the checkpoint, then re-run the checkpoint's own turn.
         // The live KV already holds these exact tokens, so re-prefill ~ 0.
-        engine.restore_kv(&checkpoint).unwrap();
+        engine.set_kv(&checkpoint).unwrap();
         let (np_restored, _cached_r) = gen_capture_prefill(&mut engine, transcript1, &opts);
         assert!(
             np_restored <= 2,
@@ -2163,7 +1921,7 @@ mod tests {
     }
 
     // #12 — /switch payload resume prefills only the new suffix. Capture a
-    // session payload (snapshot_kv bytes), drop the engine, open a *fresh*
+    // session payload (get_kv bytes), drop the engine, open a *fresh*
     // engine, restore the bytes, and prove the follow-up generation reuses the
     // whole restored prefix (system prompt + prior transcript) rather than
     // re-prefilling it: reused ~ prompt_len, new prefill ~ 0.
@@ -2191,7 +1949,7 @@ mod tests {
             let mut a =
                 super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
             let _ = gen_capture_prefill(&mut a, transcript, &opts);
-            a.snapshot_kv().expect("snapshot_kv yields a payload")
+            a.get_kv().expect("get_kv yields a payload")
         };
 
         // Cold-baseline control: a fresh engine with an empty KV must prefill
@@ -2206,7 +1964,7 @@ mod tests {
         // reuse the restored prefix instead of re-prefilling it.
         let mut b =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
-        b.restore_kv(&payload).unwrap();
+        b.set_kv(&payload).unwrap();
         let (np, cached) = gen_capture_prefill(&mut b, transcript, &opts);
         assert!(
             np <= 2,
