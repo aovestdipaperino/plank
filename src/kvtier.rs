@@ -15,10 +15,10 @@
 //!
 //! This module owns the **pure** part of that machinery: building the tier list
 //! below Tier 1, canonicalizing the local MCP tool definitions that key Tier 2,
-//! and deciding — given a "is this checkpoint usable?" probe — which tier to
-//! restore from and where prefill must resume. It is always compiled and unit
-//! tested; the `#[cfg(ds4_engine)]` engine merely executes the plan it returns
-//! (`Engine::warm_tiers`).
+//! and deciding — via [`warm`] — which tier to restore from and where prefill
+//! must resume. The walk itself is backend-agnostic: it drives the engine only
+//! through `warm_reset`/`warm_sync`/`get_kv`/`set_kv`, so it is always compiled
+//! and unit tested against a spy engine.
 //!
 //! The walk rule is the one already used for `sysprompt.kv`, generalized:
 //! *reuse KV until the first fingerprint mismatch, then prefill only from
@@ -29,7 +29,9 @@
 
 use std::path::Path;
 
+use crate::engine::{Engine, EngineError, EngineEvent};
 use crate::session::KvKey;
+use crate::session::SessionStore;
 use crate::session::tier_fingerprint;
 
 /// Which volatility tier a [`TierSpec`] describes.
@@ -191,60 +193,77 @@ pub fn plan(
     tiers
 }
 
-/// Where a tier walk lands: which checkpoint to restore, and the first tier
-/// that must actually be prefilled.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ResumePlan {
-    /// Index into the tier list of the checkpoint to restore before prefilling,
-    /// or `None` when nothing above is reusable and prefill starts at tier 0.
-    pub restore: Option<usize>,
-    /// Index of the first tier to prefill. Equals `tiers.len()` when every tier
-    /// was reusable (nothing to do).
-    pub prefill_from: usize,
-}
-
-/// Walks `tiers` most-stable-first and decides where to resume.
+/// Warms the KV cache over `tiers` (built by [`plan`], most-stable-first).
 ///
-/// `usable` is the caller's probe: "does this tier's checkpoint exist on disk
-/// with a matching stored fingerprint?" The walk stops at the first tier that
-/// is not cacheable or whose probe fails; the last cacheable tier before that
-/// point is the one to restore, and prefill resumes immediately after it.
-/// Non-cacheable tiers (Tier 3) therefore terminate the reusable run without
-/// invalidating what precedes them.
-pub fn resume_point(tiers: &[TierSpec], mut usable: impl FnMut(&TierSpec) -> bool) -> ResumePlan {
-    let mut plan = ResumePlan {
-        restore: None,
-        prefill_from: 0,
+/// Walks deepest-first for the first tier whose checkpoint loads clean,
+/// restores it, then prefills only the tiers below it — persisting each
+/// cacheable tier exactly at its own boundary. Returns `true` when any prefill
+/// ran.
+///
+/// Deepest-first is sound without independently revalidating ancestors: each
+/// tier's fingerprint chains its parent's (see [`tier_fingerprint`]), so a deep
+/// tier matching *proves* its ancestors match.
+///
+/// A checkpoint that keys correctly but fails to load is a miss, not an error:
+/// the walk simply falls back to the previous tier. No corrupt cache file can
+/// abort startup.
+///
+/// # Errors
+/// Returns [`EngineError`] only when the engine itself fails to restore or
+/// prefill. Cache IO failures are best-effort and never propagate.
+pub fn warm(
+    engine: &mut dyn Engine,
+    store: Option<&SessionStore>,
+    tiers: &[TierSpec],
+    on_event: &mut dyn FnMut(EngineEvent),
+) -> Result<bool, EngineError> {
+    let Some(system) = tiers.first().filter(|t| t.kind == TierKind::System) else {
+        return Ok(false);
     };
-    for (i, tier) in tiers.iter().enumerate() {
-        if !tier.cacheable() || !usable(tier) {
+    engine.warm_reset(&system.text)?;
+
+    // Restore: deepest tier whose checkpoint loads clean.
+    let mut resume = 0;
+    for (i, t) in tiers.iter().enumerate().rev() {
+        let Some(cache) = t
+            .key
+            .as_ref()
+            .zip(store)
+            .and_then(|(key, store)| store.kv_load(key))
+        else {
+            continue;
+        };
+        if engine.set_kv(&cache).is_ok() {
+            resume = i + 1;
             break;
         }
-        plan.restore = Some(i);
-        plan.prefill_from = i + 1;
+        // Keyed correctly but the bytes would not load into this build: say so
+        // and keep walking upward rather than trusting them.
+        on_event(EngineEvent::Notice(
+            "context cache is incompatible with this build; rebuilding it".to_owned(),
+        ));
     }
-    plan
-}
 
-/// Fingerprint line prefixed to a tier checkpoint file, matching the
-/// `sysprompt.kv` layout: `<fingerprint>\n<raw snapshot bytes>`. Returns the
-/// stored fingerprint and the snapshot payload, or `None` when `bytes` is not a
-/// well-formed checkpoint.
-#[must_use]
-pub fn split_checkpoint(bytes: &[u8]) -> Option<(&str, &[u8])> {
-    let nl = bytes.iter().position(|&b| b == b'\n')?;
-    let fp = std::str::from_utf8(&bytes[..nl]).ok()?;
-    Some((fp, &bytes[nl + 1..]))
-}
-
-/// Whether the checkpoint file at `path` stores exactly `fingerprint`.
-/// Best-effort: an unreadable or malformed file is simply "not usable".
-#[must_use]
-pub fn checkpoint_matches(path: &std::path::Path, fingerprint: &str) -> bool {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| split_checkpoint(&bytes).map(|(fp, _)| fp == fingerprint))
-        .unwrap_or(false)
+    // Extend: prefill each remaining tier, persisting cacheable ones at their
+    // own boundary. A snapshot captures the *whole* session, so the capture
+    // must happen while the cursor sits at the end of this tier and no further
+    // — persisting after the next sync would store the next tier's KV under
+    // this tier's key, which fingerprints cannot detect because the key would
+    // be genuinely correct.
+    let mut prefilled = false;
+    for (i, t) in tiers.iter().enumerate().skip(resume) {
+        // The system tier's tokens are already in the warm buffer from
+        // `warm_reset`; every other tier appends its text as a user message.
+        let text = (i > 0).then_some(t.text.as_str());
+        prefilled |= engine.warm_sync(text, on_event)?;
+        if let Some(key) = &t.key
+            && let Some(store) = store
+            && let Some(cache) = engine.get_kv()
+        {
+            let _ = store.kv_store(key, &cache);
+        }
+    }
+    Ok(prefilled)
 }
 
 #[cfg(test)]
@@ -294,7 +313,7 @@ mod tests {
     }
 
     /// Regression (#64): a tier's text is tokenized twice — once at warm time
-    /// (`warm_tiers`, verbatim) and once per turn, where it has been through
+    /// (`warm`, verbatim) and once per turn, where it has been through
     /// `render_transcript` → `parse_sections`, which trims each message's
     /// trailing whitespace. Trailing whitespace on a tier therefore tokenizes
     /// differently in the two paths, the KV common-prefix probe diverges at
@@ -448,79 +467,6 @@ mod tests {
     }
 
     #[test]
-    fn resume_point_restores_the_deepest_valid_tier() {
-        let tiers = plan(
-            "fp1",
-            "SYSTEM",
-            "agents\n",
-            "git\n",
-            "",
-            Some(Path::new("/p")),
-        );
-        // Tier 2 hits: restore it, prefill only Tier 3.
-        let p = resume_point(&tiers, |t| {
-            t.kind == TierKind::System || t.kind == TierKind::ProjectStable
-        });
-        assert_eq!(
-            p,
-            ResumePlan {
-                restore: Some(1),
-                prefill_from: 2
-            }
-        );
-    }
-
-    #[test]
-    fn resume_point_falls_back_to_full_prefill_on_the_first_mismatch() {
-        let tiers = plan(
-            "fp1",
-            "SYSTEM",
-            "agents\n",
-            "git\n",
-            "",
-            Some(Path::new("/p")),
-        );
-        let p = resume_point(&tiers, |_| false);
-        assert_eq!(
-            p,
-            ResumePlan {
-                restore: None,
-                prefill_from: 0
-            },
-            "a stale Tier 2 rebuilds itself and everything below it"
-        );
-    }
-
-    #[test]
-    fn resume_point_stops_at_the_first_uncacheable_tier() {
-        // Tier 3 is never cacheable, so even an always-true probe cannot make
-        // the walk claim it as reusable.
-        let tiers = plan(
-            "fp1",
-            "SYSTEM",
-            "agents\n",
-            "git\n",
-            "",
-            Some(Path::new("/p")),
-        );
-        let p = resume_point(&tiers, |_| true);
-        assert_eq!(p.restore, Some(1));
-        assert_eq!(p.prefill_from, 2, "the volatile tier always prefills");
-    }
-
-    #[test]
-    fn resume_point_on_an_empty_plan_prefills_nothing() {
-        let p = resume_point(&[], |_| true);
-        assert_eq!(
-            p,
-            ResumePlan {
-                restore: None,
-                prefill_from: 0
-            }
-        );
-    }
-
-    #[test]
     fn tool_defs_material_is_order_independent_and_content_keyed() {
         let a = vec![
             (
@@ -571,27 +517,218 @@ mod tests {
         expect.extend_from_slice(b"sys");
         assert_eq!(a, crate::session::sha1_hex(&expect));
     }
+}
 
-    #[test]
-    fn split_checkpoint_reads_the_fingerprint_line() {
-        assert_eq!(split_checkpoint(b"abc\nRAW"), Some(("abc", &b"RAW"[..])));
-        assert_eq!(split_checkpoint(b"abc\n"), Some(("abc", &b""[..])));
-        assert_eq!(split_checkpoint(b"no-newline"), None);
-        assert_eq!(split_checkpoint(b""), None);
+/// Records what a warm walk asked the engine to do, so the walk's logic can be
+/// tested with no model and no filesystem-backed engine.
+#[cfg(test)]
+#[derive(Default)]
+struct SpyEngine {
+    reset_to: Option<String>,
+    synced: Vec<Option<String>>,
+    restored: Vec<Vec<u8>>,
+    supports_kv: bool,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for SpyEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpyEngine")
+    }
+}
+
+#[cfg(test)]
+impl crate::engine::Engine for SpyEngine {
+    fn generate(
+        &mut self,
+        _p: crate::engine::Prompt<'_>,
+        _o: &crate::engine::GenerationOptions,
+        _i: &dyn Fn() -> bool,
+        _g: &dyn Fn() -> bool,
+        _e: &mut dyn FnMut(crate::engine::EngineEvent),
+    ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
+        unreachable!("warm never generates")
+    }
+    fn ctx_size(&self) -> i32 {
+        4096
+    }
+    fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
+        if !self.supports_kv {
+            return None;
+        }
+        // The byte is *how far the session has been synced*, not a call
+        // counter: a call counter would still increase if every tier were
+        // persisted in a deferred second pass, so it could not detect a capture
+        // that slipped past its tier's boundary.
+        let synced = u8::try_from(self.synced.len()).unwrap_or(u8::MAX);
+        Some(crate::kvcache::KVCache::new(
+            vec![synced],
+            crate::ds4tokens::TokenTranscript::new(),
+        ))
+    }
+    fn set_kv(&mut self, c: &crate::kvcache::KVCache) -> Result<(), crate::engine::EngineError> {
+        self.restored.push(c.kv().to_vec());
+        Ok(())
+    }
+    fn warm_reset(&mut self, system: &str) -> Result<(), crate::engine::EngineError> {
+        self.reset_to = Some(system.to_owned());
+        Ok(())
+    }
+    fn warm_sync(
+        &mut self,
+        text: Option<&str>,
+        _e: &mut dyn FnMut(crate::engine::EngineEvent),
+    ) -> Result<bool, crate::engine::EngineError> {
+        self.synced.push(text.map(str::to_owned));
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::{TierSpec, plan, system_fingerprint, warm};
+    use std::path::Path;
+
+    use super::SpyEngine;
+
+    fn spy_store(name: &str) -> (crate::session::SessionStore, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("plank-warm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (crate::session::SessionStore::open(&dir).unwrap(), dir)
+    }
+
+    fn tiers_for(system: &str, stable: &str, volatile: &str) -> Vec<TierSpec> {
+        let fp1 = system_fingerprint("m", system);
+        plan(&fp1, system, stable, volatile, "", Some(Path::new("/p")))
     }
 
     #[test]
-    fn checkpoint_matches_only_on_an_exact_stored_fingerprint() {
-        let dir = std::env::temp_dir().join(format!("plank-kvtier-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("project-abc.kv");
-        std::fs::write(&path, b"abc\nsnapshot-bytes").unwrap();
-        assert!(checkpoint_matches(&path, "abc"));
-        assert!(!checkpoint_matches(&path, "abd"));
-        assert!(!checkpoint_matches(&dir.join("missing.kv"), "abc"));
-        // Malformed (no fingerprint line) is never trusted.
-        std::fs::write(&path, b"garbage").unwrap();
-        assert!(!checkpoint_matches(&path, "garbage"));
-        std::fs::remove_dir_all(&dir).ok();
+    fn cold_warm_prefills_every_tier_and_persists_the_cacheable_ones() {
+        let (store, dir) = spy_store("cold");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert!(warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap());
+        assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
+        // System tier syncs with no appended message; the rest append their text.
+        assert_eq!(
+            e.synced,
+            vec![None, Some("agents".into()), Some("git".into())]
+        );
+        assert!(e.restored.is_empty(), "nothing on disk, nothing to restore");
+        // Both cacheable tiers were persisted; the volatile tier was not.
+        assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_some());
+        assert!(store.kv_load(tiers[1].key.as_ref().unwrap()).is_some());
+        assert_eq!(tiers[2].key, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_full_hit_restores_the_deepest_tier_and_prefills_only_below_it() {
+        let (store, dir) = spy_store("hit");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        // Seed both cacheable tiers, with distinguishable bytes.
+        store
+            .kv_store(
+                tiers[0].key.as_ref().unwrap(),
+                &crate::kvcache::KVCache::new(vec![10], crate::ds4tokens::TokenTranscript::new()),
+            )
+            .unwrap();
+        store
+            .kv_store(
+                tiers[1].key.as_ref().unwrap(),
+                &crate::kvcache::KVCache::new(vec![20], crate::ds4tokens::TokenTranscript::new()),
+            )
+            .unwrap();
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+
+        // Deepest cacheable tier wins: the project checkpoint, not the system one.
+        assert_eq!(
+            e.restored,
+            vec![vec![20]],
+            "restore the deepest valid tier only"
+        );
+        // Only the volatile tier below it is prefilled.
+        assert_eq!(e.synced, vec![Some("git".into())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_deep_checkpoint_falls_back_to_the_shallower_tier() {
+        let (store, dir) = spy_store("stale");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        store
+            .kv_store(
+                tiers[0].key.as_ref().unwrap(),
+                &crate::kvcache::KVCache::new(vec![10], crate::ds4tokens::TokenTranscript::new()),
+            )
+            .unwrap();
+        // Corrupt the project checkpoint: right path, unreadable content.
+        let key = tiers[1].key.clone().unwrap();
+        let crate::session::KvKey::Project { dir: pdir, fp } = &key else {
+            unreachable!()
+        };
+        let cpath = store.project_checkpoint_path(pdir, fp);
+        std::fs::create_dir_all(cpath.parent().unwrap()).unwrap();
+        std::fs::write(cpath, b"garbage").unwrap();
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+
+        assert_eq!(e.restored, vec![vec![10]], "fall back to the system tier");
+        assert_eq!(e.synced, vec![Some("agents".into()), Some("git".into())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_engine_without_kv_support_prefills_and_persists_nothing() {
+        // Remote engines: get_kv returns None. Warming must still prefill every
+        // tier and must never write an empty checkpoint.
+        let (store, dir) = spy_store("nokv");
+        let tiers = tiers_for("SYSTEM", "agents", "");
+        let mut e = SpyEngine {
+            supports_kv: false,
+            ..Default::default()
+        };
+
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        assert_eq!(e.synced, vec![None, Some("agents".into())]);
+        assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn each_tier_is_snapshotted_at_its_own_boundary() {
+        // The invariant that fingerprints cannot protect: persisting tier i after
+        // prefilling tier i+1 would store tier i+1's KV under tier i's key, and the
+        // key would be genuinely correct. SpyEngine hands out an incrementing byte
+        // per get_kv call, so tier 0's stored byte must be strictly less than tier
+        // 1's — proving the capture happened before the next tier was synced.
+        let (store, dir) = spy_store("boundary");
+        let tiers = tiers_for("SYSTEM", "agents", "");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        let t0 = store.kv_load(tiers[0].key.as_ref().unwrap()).unwrap();
+        let t1 = store.kv_load(tiers[1].key.as_ref().unwrap()).unwrap();
+        assert!(
+            t0.kv()[0] < t1.kv()[0],
+            "each tier must be captured at its own boundary, before the next sync"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
