@@ -3146,13 +3146,6 @@ impl Agent<'_> {
         // otherwise the per-tick capture is pure waste.
         let capture_crt = crate::settings::active().ui.crt_off && std::io::stdout().is_terminal();
         let mut crt_frame: Option<image::RgbaImage> = None;
-        // Whether the session-start context has been warmed into the KV yet
-        // (issue #63). Done once, lazily, on the first idle tick *after* the UI
-        // is painted — never before first paint — so it is genuine idle warming,
-        // not a launch-latency relocation. If an initial `-p` turn already ran,
-        // its `generate` prefilled the context, so warming is redundant; mark it
-        // done to skip the wasted common-prefix probe.
-        let mut context_warmed = self.cfg.prompt.as_deref().is_some_and(|p| !p.is_empty());
         loop {
             if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
@@ -3212,18 +3205,6 @@ impl Agent<'_> {
             remote_service(rem);
 
             let Some(ev) = next_event(rem, Duration::from_millis(200))? else {
-                // First idle tick after the UI is up: warm the session-start
-                // context into the KV off the critical path, so the first real
-                // turn prefills only the question (issue #63). Single-shot,
-                // bounded, and silent (no progress drawn over the live UI); it
-                // runs while the user is reading the welcome screen. No-op
-                // engines return `false`. Not checkpointed (volatile context).
-                if !context_warmed {
-                    context_warmed = true;
-                    let system = self.system.clone();
-                    let context = self.context_content.combined();
-                    let _ = self.engine.warm_context(&system, &context, &mut |_| {});
-                }
                 // Remote-driven input (issue #25): a remote controller's
                 // `prompt`/`command` frames start a local turn just as if typed
                 // here, so the local screen and the remote mirror stay in sync.
@@ -3681,6 +3662,22 @@ impl Agent<'_> {
                         .draw(|f| tui::draw_warm(f, p.done, p.total, p.tps, notice.as_deref()));
                 }
                 EngineEvent::Text(_) => {}
+            })
+            .map_err(|e| e.to_string())?;
+        // Then prefill the session-start context on top of the system prompt so
+        // the first turn evaluates only the question suffix (issue #63). The
+        // input prompt appears only once this completes, so a "warming cache"
+        // screen (glimmer title + progress bar) covers the wait; no-op engines
+        // return instantly with nothing drawn, so the prompt appears at once.
+        let context = self.context_content.combined();
+        // Paint an initial frame so the animation is visible even before the
+        // first prefill event (or if there are none).
+        let _ = terminal.draw(|f| tui::draw_warming_cache(f, 0, 0, 0.0));
+        self.engine
+            .warm_context(&system, &context, &mut |ev| {
+                if let EngineEvent::Prefill(p) = ev {
+                    let _ = terminal.draw(|f| tui::draw_warming_cache(f, p.done, p.total, p.tps));
+                }
             })
             .map_err(|e| e.to_string())?;
         Ok(())
