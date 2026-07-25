@@ -65,6 +65,40 @@ pub struct PrefillProgress {
     pub tps: f64,
 }
 
+impl PrefillProgress {
+    /// Build progress from an *absolute* engine position.
+    ///
+    /// The ds4 backend reports `cur` as the absolute position within the
+    /// prompt — the cached prefix (`base`) is already included (see
+    /// `ds4_cli.c:251`, which subtracts it). So `base` is a floor for the bar
+    /// and the subtrahend for per-prefill throughput, never an offset to add.
+    ///
+    /// `total` is taken by mutable reference because the backend can genuinely
+    /// re-evaluate a few tokens the common-prefix probe counted as cached; on
+    /// overshoot the estimated total grows with ~5% headroom so the bar keeps
+    /// advancing instead of parking at 100%. Reaching `total` exactly is a
+    /// completed prefill, not an overshoot.
+    pub fn from_absolute(base: i32, cur: i32, total: &mut i32, elapsed_secs: f64) -> Self {
+        let floor = base.max(0).min((*total).max(0));
+        let done = cur.max(floor);
+        if done > *total {
+            *total = done + ((*total) / 20).max(1);
+        }
+        // Only the tokens actually evaluated in this pass count toward tok/s.
+        let processed = (cur - base).max(0);
+        let tps = if elapsed_secs > 0.0 {
+            f64::from(processed) / elapsed_secs
+        } else {
+            0.0
+        };
+        Self {
+            done,
+            total: *total,
+            tps,
+        }
+    }
+}
+
 /// Role of a structured chat message handed to a provider engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -560,7 +594,65 @@ impl Engine for EchoEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, Utf8Stream};
+    use super::{
+        EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
+        Utf8Stream,
+    };
+
+    // Cold prefill: nothing cached, so the absolute position is the progress
+    // and throughput counts every token.
+    #[test]
+    fn prefill_progress_cold_tracks_absolute_position() {
+        let mut total = 100;
+        for cur in 0..=99 {
+            let p = PrefillProgress::from_absolute(0, cur, &mut total, 1.0);
+            assert_eq!(p.done, cur);
+            assert_eq!(p.total, 100);
+            assert!((p.tps - f64::from(cur)).abs() < 1e-9);
+        }
+    }
+
+    // Regression for #74: with a warm KV the reported position already
+    // includes the cached prefix, so it must not be added again — `done` stays
+    // inside [base, total] and tok/s reflects only this pass.
+    #[test]
+    fn prefill_progress_warm_does_not_double_count_base() {
+        let base = 8000;
+        let mut total = 8200;
+        for cur in base..=8200 {
+            let p = PrefillProgress::from_absolute(base, cur, &mut total, 2.0);
+            assert!(p.done >= base, "done {} below base", p.done);
+            assert!(p.done <= 8200, "done {} overshoots total", p.done);
+            assert_eq!(p.total, 8200);
+            let expected = f64::from(cur - base) / 2.0;
+            assert!((p.tps - expected).abs() < 1e-9);
+        }
+    }
+
+    // A priming callback can report a position below the cached base; the bar
+    // must clamp to the floor rather than go backwards or negative.
+    #[test]
+    fn prefill_progress_clamps_below_base() {
+        let mut total = 500;
+        let p = PrefillProgress::from_absolute(300, 120, &mut total, 1.0);
+        assert_eq!(p.done, 300);
+        assert!((p.tps - 0.0).abs() < 1e-9);
+        assert_eq!(p.total, 500);
+    }
+
+    // Genuine overshoot (the backend re-evaluates tokens the common-prefix
+    // probe counted as cached) still grows the estimated total with headroom.
+    #[test]
+    fn prefill_progress_grows_total_on_overshoot() {
+        let mut total = 100;
+        let p = PrefillProgress::from_absolute(0, 100, &mut total, 1.0);
+        assert_eq!(p.done, 100);
+        assert_eq!(p.total, 100, "reaching total exactly is completion");
+        let p = PrefillProgress::from_absolute(0, 101, &mut total, 1.0);
+        assert_eq!(p.done, 101);
+        assert_eq!(p.total, 106);
+        assert_eq!(total, 106);
+    }
 
     // Feeds a 🦀 (4 UTF-8 bytes) split the way a byte-level tokenizer emits
     // it: each fragment alone is invalid UTF-8 and must be carried, not

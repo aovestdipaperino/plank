@@ -65,8 +65,10 @@ unsafe extern "C" fn cancel_cb(_ud: *mut std::os::raw::c_void) -> bool {
 
 /// Bridges ds4's C display-progress callback to the Rust event sink.
 ///
-/// `base` is the count of cached tokens reused from the live KV prefix, so the
-/// progress bar starts partially filled and reflects the whole prompt.
+/// `base` is the count of cached tokens reused from the live KV prefix. The C
+/// backend already reports absolute prompt positions, so `base` is the bar's
+/// floor and the subtrahend for per-prefill throughput — never an offset added
+/// to the reported position (see `PrefillProgress::from_absolute`).
 struct ProgressCtx<'a> {
     on_event: &'a mut dyn FnMut(EngineEvent),
     interrupt: &'a dyn Fn() -> bool,
@@ -92,25 +94,9 @@ unsafe extern "C" fn progress_cb(
     if (ctx.interrupt)() {
         INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
     }
-    // `base + cur` can overshoot `total` when the backend re-evaluates tokens
-    // the common-prefix probe counted as cached. Grow the estimated total with
-    // ~5% headroom on overshoot so the bar keeps advancing smoothly instead of
-    // parking at 100% while prefill is still going.
-    let done = (ctx.base + cur).max(0);
-    if done >= ctx.total {
-        ctx.total = done + (ctx.total / 20).max(1);
-    }
     let secs = ctx.start.elapsed().as_secs_f64();
-    let tps = if secs > 0.0 {
-        f64::from(cur) / secs
-    } else {
-        0.0
-    };
-    (ctx.on_event)(EngineEvent::Prefill(PrefillProgress {
-        done,
-        total: ctx.total,
-        tps,
-    }));
+    let progress = PrefillProgress::from_absolute(ctx.base, cur, &mut ctx.total, secs);
+    (ctx.on_event)(EngineEvent::Prefill(progress));
 }
 
 impl Ds4Model {
