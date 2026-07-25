@@ -3394,6 +3394,9 @@ impl Agent<'_> {
                 continue;
             }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
+            // into word-wise operations.
+            let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
                 KeyCode::Char('c') if ctrl => {
                     if !input.buf.text().is_empty() {
@@ -3420,14 +3423,33 @@ impl Agent<'_> {
                     input.hist_idx = None;
                     input.buf.insert(c.to_string());
                 }
+                // Alt/Ctrl+Backspace deletes the previous word. Terminals that
+                // cannot report the modifier send Ctrl-W, handled above.
+                KeyCode::Backspace if word_mod => input.buf.delete_prev_word(),
                 KeyCode::Backspace => {
                     input.buf.backspace();
                 }
+                KeyCode::Delete if word_mod => input.buf.delete_next_word(),
                 KeyCode::Delete => {
                     input.buf.delete();
                 }
+                KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    input.buf.delete_next_word();
+                }
+                KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    input.buf.move_prev_word();
+                }
+                KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    input.buf.move_next_word();
+                }
+                KeyCode::Left if word_mod => {
+                    input.buf.move_prev_word();
+                }
                 KeyCode::Left => {
                     input.buf.move_left();
+                }
+                KeyCode::Right if word_mod => {
+                    input.buf.move_next_word();
                 }
                 KeyCode::Right => {
                     input.buf.move_right();
@@ -5170,6 +5192,9 @@ fn busy_ui_loop(
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                // Alt (Option on macOS) or Ctrl turns arrows and
+                // Backspace/Delete into word-wise operations.
+                let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
@@ -5259,14 +5284,31 @@ fn busy_ui_loop(
                         input.hist_idx = None;
                         input.buf.insert(c.to_string());
                     }
+                    KeyCode::Backspace if word_mod => input.buf.delete_prev_word(),
                     KeyCode::Backspace => {
                         input.buf.backspace();
                     }
+                    KeyCode::Delete if word_mod => input.buf.delete_next_word(),
                     KeyCode::Delete => {
                         input.buf.delete();
                     }
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        input.buf.delete_next_word();
+                    }
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        input.buf.move_prev_word();
+                    }
+                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                        input.buf.move_next_word();
+                    }
+                    KeyCode::Left if word_mod => {
+                        input.buf.move_prev_word();
+                    }
                     KeyCode::Left => {
                         input.buf.move_left();
+                    }
+                    KeyCode::Right if word_mod => {
+                        input.buf.move_next_word();
                     }
                     KeyCode::Right => {
                         input.buf.move_right();
