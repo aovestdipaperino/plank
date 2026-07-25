@@ -414,6 +414,7 @@ pub const TIPS: &[&str] = &[
     "try /new to start a fresh session",
     "try /mcp to see connected MCP servers and their tools",
     "try /skills to list the skills available to the model",
+    "try /templates to list your {{var}} prompt templates",
     "try /tasks to see the model's todo list",
     "try /agent to list sub-agents you can delegate to",
     "try /hooks to see which hooks are configured",

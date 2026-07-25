@@ -767,6 +767,9 @@ struct Agent<'a> {
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
     skills: Vec<crate::skills::Skill>,
+    /// Prompt templates loaded from ~/.plank/templates overlaid by
+    /// ./.plank/templates (issue #67).
+    templates: Vec<crate::templates::Template>,
     /// Named agent definitions loaded from ~/.plank/agents overlaid by
     /// ./.plank/agents; dispatched via `/subagent <name> <task>`.
     agents: Vec<crate::agents::AgentDef>,
@@ -2218,6 +2221,7 @@ impl Agent<'_> {
             "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/compact" => self.compact("user request")?,
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
@@ -2270,15 +2274,15 @@ impl Agent<'_> {
                 }
             }
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
-            _ => {
-                if let Some(message) = self.skill_message(cmd, arg) {
+            _ => match self.slash_message(cmd, arg) {
+                Some(Ok(message)) => {
                     print!("{}", status::format_user_prompt_echo(input, self.color));
                     self.session.push(Message::user(message));
                     self.run_turn()?;
-                } else {
-                    println!("unknown command: {cmd}");
                 }
-            }
+                Some(Err(e)) => println!("{e}"),
+                None => println!("unknown command: {cmd}"),
+            },
         }
         Ok(true)
     }
@@ -2727,6 +2731,18 @@ impl Agent<'_> {
         let name = cmd.strip_prefix('/')?;
         let skill = self.skills.iter().find(|s| s.name == name)?;
         Some(crate::skills::render(skill, arg))
+    }
+
+    /// Resolves an unrecognized `/name args` against the user's extensions:
+    /// skills first, then prompt templates (issue #67). `None` means no
+    /// match — the caller reports an unknown command; `Some(Err)` is a
+    /// matched template whose variables could not be bound.
+    fn slash_message(&self, cmd: &str, arg: &str) -> Option<Result<String, String>> {
+        if let Some(message) = self.skill_message(cmd, arg) {
+            return Some(Ok(message));
+        }
+        let tpl = crate::templates::resolve(&self.templates, cmd)?;
+        Some(crate::templates::render(tpl, arg))
     }
 }
 
@@ -4770,6 +4786,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/templates" => {
+                for line in crate::templates::render_list(&self.templates).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/tasks" => {
                 for line in self.session.tasks.render_list().lines() {
                     log.push_plain(line.to_owned());
@@ -4832,17 +4853,17 @@ impl Agent<'_> {
             _ if slash_command_known(cmd) => {
                 log.push_plain(format!("{cmd}: not implemented yet"));
             }
-            _ => {
-                if let Some(message) = self.skill_message(cmd, arg) {
+            _ => match self.slash_message(cmd, arg) {
+                Some(Ok(message)) => {
                     log.push_spans(tui::user_echo_spans(line));
                     self.session.push(Message::user(message));
                     if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
                         log.push_plain(format!("{cmd} failed: {e}"));
                     }
-                } else {
-                    log.push_plain(format!("unknown command: {cmd}"));
                 }
-            }
+                Some(Err(e)) => log.push_plain(e),
+                None => log.push_plain(format!("unknown command: {cmd}")),
+            },
         }
         true
     }
@@ -5489,6 +5510,7 @@ fn new_agent(
     }
     let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
     let skills = crate::skills::load_default(&tool_ctx.cwd);
+    let templates = crate::templates::load_default(&tool_ctx.cwd);
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
@@ -5510,6 +5532,7 @@ fn new_agent(
         last_turn_interrupted: false,
         context_content,
         skills,
+        templates,
         agents,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote,
@@ -6371,6 +6394,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7055,6 +7079,49 @@ mod tests {
     }
 
     #[test]
+    fn slash_message_prefers_skills_then_templates_and_never_shadows_builtins() {
+        let dir = scratch_dir("slash-templates");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.skills.push(crate::skills::Skill {
+            name: "dual".into(),
+            description: String::new(),
+            argument_hint: String::new(),
+            body: "skill body $ARGUMENTS".into(),
+            dir: std::path::PathBuf::new(),
+        });
+        let template = |name: &str, body: &str| crate::templates::Template {
+            name: name.to_string(),
+            description: String::new(),
+            argument_hint: String::new(),
+            body: body.to_string(),
+            path: std::path::PathBuf::new(),
+        };
+        agent.templates.push(template("dual", "template body"));
+        agent.templates.push(template("review", "Review {{path}}."));
+        agent.templates.push(template("help", "shadow attempt"));
+
+        // A skill of the same name wins over a template.
+        assert_eq!(
+            agent.slash_message("/dual", "x").unwrap().unwrap(),
+            "skill body x"
+        );
+        assert_eq!(
+            agent
+                .slash_message("/review", "src/ui.rs")
+                .unwrap()
+                .unwrap(),
+            "Review src/ui.rs."
+        );
+        // Missing variables surface as an error, not an empty substitution.
+        let err = agent.slash_message("/review", "").unwrap().unwrap_err();
+        assert!(err.contains("missing value for path"), "{err}");
+        // Built-ins win: /help never reaches the template.
+        assert!(agent.slash_message("/help", "").is_none());
+        assert!(agent.slash_message("/nope", "").is_none());
+    }
+
+    #[test]
     fn live_commands_allow_read_only_reports_and_reject_the_rest() {
         let live = LiveCommands {
             context: "CTX".to_owned(),
@@ -7362,6 +7429,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7475,6 +7543,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7556,6 +7625,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7652,6 +7722,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7729,6 +7800,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7799,6 +7871,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
@@ -7856,6 +7929,7 @@ mod tests {
             last_turn_interrupted: false,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
+            templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
