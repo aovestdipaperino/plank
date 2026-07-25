@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-07-25
+
+### Fixed
+
+- **Prefill no longer re-feeds the whole conversation** (#57): the model-visible
+  task list (#35) was injected as a `[user]` block right after the system
+  prompt and rebuilt every turn, so any `task` add/update rewrote the tokens at
+  the top of the prompt and broke the engine's KV common-prefix reuse — the
+  entire conversation re-prefilled on the next turn (accidental O(turns²)). The
+  rendered transcript is now strictly append-only, matching the C reference's
+  token transcript: the task list rides in the `task` tool's own observations
+  and a one-time re-injection after compaction, never mid-transcript.
+- **KV reuse now spans every assistant turn, not just the last one**: the engine
+  keeps the exact sampled token ids of every reply still in the transcript
+  (retokenizing reply *text* does not reproduce the sampled ids — BPE
+  segmentation is many-to-one) and splices each back in, so only the genuinely
+  new suffix prefills each turn. The token history is persisted with the KV
+  payload, so `/resume` and idle reclaim keep full prefix reuse.
+- **TUI no longer hangs on fenced code blocks** (#59): streaming a ```code```
+  block wedged the UI at 100% CPU because the markdown segment was
+  re-highlighted on every token and `ratatui-markdown`'s tree-sitter
+  highlighter recompiles its query per call. Markdown re-rendering is now
+  throttled to ~10/second while streaming, with a guaranteed flush at each
+  segment boundary; live syntax highlighting is preserved.
+
+### Changed
+
+- **Thinking text is now italic** as well as dim grey, in both the Ratatui TUI
+  and the plain stdout renderer, so reasoning reads as background muttering
+  distinct from the assistant's real output.
+
 ## [2.5.1] - 2026-07-24
 
 ### Added
