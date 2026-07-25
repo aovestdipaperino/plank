@@ -119,10 +119,23 @@ test` and review the diff before committing.
   Vec<SampledReply>`, the Rust half of the C's append-only token transcript)
   and splices each matching assistant section into the next prompt — otherwise
   the KV common-prefix probe diverges at the start of the first re-templated
-  reply and the whole tail re-prefills (`src/ds4engine.rs`, `build_tokens` /
-  `plan_splices`). Replies whose text left the transcript (compaction,
-  rollback, sidechain truncation) are pruned after each build — text-matching
-  is exact, so they can never match again.
+  reply and the whole tail re-prefills.
+  **Update (issue #58): the ds4 backend is now token-primary.** `Ds4Session`
+  owns an append-only token buffer (`ds4tokens::TokenTranscript`, mirroring the
+  C's `w->transcript`) instead of the `replies: Vec<SampledReply>` splice cache.
+  Each turn *reconciles* the UI's rendered transcript against the buffer's spans
+  by a structural common-prefix on (role, text) keys (`build_prompt` →
+  `reconcile` in `src/ds4engine.rs`): the matching prefix keeps its exact tokens
+  verbatim; at the first divergence the tail is dropped and retokenized (user/
+  system/tool retokenize deterministically; a re-appended assistant section pays
+  one re-prefill the KV was already going to force). This is robust to any text
+  drift instead of exact-match fragile, and replaces `build_tokens` /
+  `plan_splices` / `retain_matched` (removed). The reconciliation and
+  persistence logic lives FFI-free in `src/ds4tokens.rs` and is unit-tested in
+  CI without the native engine. NOTE: the native/Metal runtime behavior of this
+  inversion is unverified in the porting environment (no submodule/model);
+  compaction/rollback rewrite ops still `truncate_spans`+re-append rather than
+  detokenize→edit→`reset`, which `TokenTranscript::reset` is staged for.
 - **Per-session KV payloads cannot share the transcript's `.kv` name, and a
   restored payload must restore the reply history captured with it.** The C
   stores the engine payload inside the session `.kv` file; plank's v1
@@ -130,15 +143,15 @@ test` and review the diff before committing.
   `<sha>.payload` sidecar (fingerprint line + payload bytes, same layout as
   `sysprompt.kv`). The fingerprint covers model ‖ NUL ‖ system prompt ‖ NUL ‖
   rendered transcript, so a resave after more turns (or compaction) is
-  detected as stale. Because prompt builds splice every remembered reply's
-  exact sampled tokens, the payload carries the serialized reply history in
-  front of the raw KV bytes (`plank-replies-v1\n` magic, `encode_replies` /
-  `decode_replies` in `src/ds4engine.rs`): `snapshot_kv` writes both
-  atomically and `restore_kv` restores both, so a resumed session splices the
-  restored KV's own replies (never another conversation's — the two travel
-  together) and only prefills genuinely new tokens. A legacy payload without
-  the magic restores with an empty history: correct, just re-prefills from
-  the first reply. The host idle-reclaim path (`snapshot_bytes` /
+  detected as stale. The payload carries the serialized token transcript in
+  front of the raw KV bytes (`plank-tokens-v1\n` magic, `ds4tokens::encode` /
+  `decode`; **was** `plank-replies-v1\n` per issue #58): `snapshot_kv` writes
+  both atomically and `restore_kv` restores both, so a resumed session keeps
+  the restored KV's own token buffer (never another conversation's — the two
+  travel together) and only prefills genuinely new tokens. A legacy
+  `plank-replies-v1` payload (skipped to the raw KV by `strip_legacy`, kept one
+  release) or a stripped payload restores with an empty buffer: correct, just
+  rebuilds from text and re-prefills from the first reply. The host idle-reclaim path (`snapshot_bytes` /
   `restore_bytes` on `Ds4HostSession`) uses the same wrap. The raw KV bytes
   remain the single `SessionSnapshot` primitive; the sidecar, fingerprint,
   and reply header only wrap them, so there is no second hand-rolled

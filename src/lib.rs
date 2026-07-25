@@ -18,6 +18,10 @@ pub mod context;
 pub mod download;
 #[cfg(ds4_engine)]
 pub mod ds4engine;
+/// Token-primary transcript core for the ds4 backend (issue #58). FFI-free and
+/// always compiled so its reconciliation/persistence logic is CI-tested; the
+/// gated `ds4engine` drives it.
+pub mod ds4tokens;
 #[cfg(ds4_engine)]
 pub mod ds4web;
 pub mod dsml;
