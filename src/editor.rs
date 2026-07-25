@@ -1021,6 +1021,126 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
     out.flush()
 }
 
+// ---------------------------------------------------------------------------
+// External editor escape hatch (Ctrl-G in the TUI prompt)
+// ---------------------------------------------------------------------------
+
+/// Editor fallback when neither `$EDITOR` nor `$VISUAL` is set.
+const DEFAULT_EDITOR: &str = "vi";
+
+/// A resolved external-editor invocation: the program plus any fixed arguments
+/// that came with it (`EDITOR="code -w"` → `code` + `["-w"]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EditorCommand {
+    /// Program to spawn.
+    pub program: String,
+    /// Arguments preceding the temp-file path.
+    pub args: Vec<String>,
+}
+
+/// Resolves the external editor from `$EDITOR`, then `$VISUAL`, then `vi`.
+///
+/// Pure in its inputs so the precedence is testable without touching the
+/// process environment. Values are split on whitespace, which covers the
+/// common `EDITOR="code -w"` / `EDITOR="emacs -nw"` forms; quoting and shell
+/// metacharacters are deliberately not supported (the editor is spawned
+/// directly, never through a shell). Blank or whitespace-only values are
+/// treated as unset.
+#[must_use]
+pub fn resolve_editor_command(editor: Option<&str>, visual: Option<&str>) -> EditorCommand {
+    let pick = [editor, visual]
+        .into_iter()
+        .flatten()
+        .find(|v| !v.trim().is_empty());
+    let mut parts = pick
+        .unwrap_or(DEFAULT_EDITOR)
+        .split_whitespace()
+        .map(str::to_owned);
+    let program = parts.next().unwrap_or_else(|| DEFAULT_EDITOR.to_owned());
+    EditorCommand {
+        program,
+        args: parts.collect(),
+    }
+}
+
+/// Resolves the external editor from the live process environment.
+#[must_use]
+pub fn editor_command_from_env() -> EditorCommand {
+    let editor = std::env::var("EDITOR").ok();
+    let visual = std::env::var("VISUAL").ok();
+    resolve_editor_command(editor.as_deref(), visual.as_deref())
+}
+
+/// Path of the scratch file handed to the external editor. The `.md` suffix
+/// makes editors syntax-highlight the prompt as Markdown.
+fn scratch_path(dir: &Path) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    dir.join(format!("plank-prompt-{}-{nanos}.md", std::process::id()))
+}
+
+/// Normalizes what came back from the editor into a prompt, or `None` when the
+/// user saved nothing meaningful. Trailing whitespace (including the newline
+/// most editors add on save) is stripped; a blank file leaves the prompt alone.
+#[must_use]
+fn normalize_edited(text: &str) -> Option<String> {
+    let trimmed = text.trim_end();
+    (!trimmed.trim().is_empty()).then(|| trimmed.to_owned())
+}
+
+/// Round-trips `initial` through a scratch `.md` file in `dir`, handing the
+/// path to `run` and reading the result back.
+///
+/// `run` reports whether the editor exited successfully; on a non-zero exit,
+/// an empty/blank file, or any I/O error the result is `None` and the caller
+/// keeps the prompt it had. The scratch file is always removed, including when
+/// `run` fails. Split out from [`edit_text_externally`] so the file handling
+/// is testable with a stub editor.
+///
+/// # Errors
+///
+/// Returns an error when the scratch file cannot be written, or when `run`
+/// itself fails (the editor could not be spawned).
+pub fn edit_text_with<F>(initial: &str, dir: &Path, run: F) -> io::Result<Option<String>>
+where
+    F: FnOnce(&Path) -> io::Result<bool>,
+{
+    let path = scratch_path(dir);
+    fs::write(&path, initial)?;
+    let outcome = run(&path);
+    let edited = match &outcome {
+        Ok(true) => fs::read_to_string(&path).ok(),
+        Ok(false) | Err(_) => None,
+    };
+    let _ = fs::remove_file(&path);
+    outcome?;
+    Ok(edited.as_deref().and_then(normalize_edited))
+}
+
+/// Opens `$EDITOR` on a scratch file seeded with `initial` and returns the
+/// edited prompt, or `None` to keep the existing input.
+///
+/// The caller is responsible for leaving raw mode and the alternate screen
+/// first: this function hands the terminal straight to the child process.
+///
+/// # Errors
+///
+/// Returns an error when the scratch file cannot be written or the editor
+/// cannot be spawned (typically `$EDITOR` naming a program that is not on
+/// `PATH`). A non-zero editor exit is not an error — it yields `None`.
+pub fn edit_text_externally(initial: &str) -> io::Result<Option<String>> {
+    let cmd = editor_command_from_env();
+    edit_text_with(initial, &std::env::temp_dir(), |path| {
+        let status = std::process::Command::new(&cmd.program)
+            .args(&cmd.args)
+            .arg(path)
+            .status()?;
+        Ok(status.success())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,5 +1378,91 @@ mod tests {
     fn render_frame_truncates_footer() {
         let f = render_frame("> ", "", 0, "0123456789", 5);
         assert!(f.contains("\r\n01234\x1b[K"));
+    }
+
+    // ---- external editor ----
+
+    #[test]
+    fn editor_precedence_editor_then_visual_then_default() {
+        assert_eq!(
+            resolve_editor_command(Some("nano"), Some("emacs")).program,
+            "nano"
+        );
+        assert_eq!(resolve_editor_command(None, Some("emacs")).program, "emacs");
+        assert_eq!(resolve_editor_command(None, None).program, "vi");
+        // Blank / whitespace-only values count as unset.
+        assert_eq!(resolve_editor_command(Some("  "), None).program, "vi");
+        assert_eq!(
+            resolve_editor_command(Some(""), Some("emacs")).program,
+            "emacs"
+        );
+    }
+
+    #[test]
+    fn editor_command_splits_arguments() {
+        let cmd = resolve_editor_command(Some("code -w --new-window"), None);
+        assert_eq!(cmd.program, "code");
+        assert_eq!(cmd.args, vec!["-w", "--new-window"]);
+        assert!(resolve_editor_command(Some("vim"), None).args.is_empty());
+    }
+
+    #[test]
+    fn scratch_file_has_markdown_suffix() {
+        let p = scratch_path(Path::new("/tmp"));
+        assert_eq!(p.extension().and_then(|e| e.to_str()), Some("md"));
+        assert!(p.starts_with("/tmp"));
+    }
+
+    #[test]
+    fn edit_round_trip_seeds_and_reads_back() {
+        let dir = std::env::temp_dir();
+        let seen = std::cell::RefCell::new(String::new());
+        let out = edit_text_with("hello", &dir, |p| {
+            *seen.borrow_mut() = fs::read_to_string(p)?;
+            fs::write(p, "hello world\n")?;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(seen.into_inner(), "hello");
+        // The newline the editor appended on save is stripped.
+        assert_eq!(out.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn edit_returns_none_on_failure_or_blank() {
+        let dir = std::env::temp_dir();
+        // Non-zero editor exit: keep the existing prompt.
+        let out = edit_text_with("keep me", &dir, |p| {
+            fs::write(p, "discard me")?;
+            Ok(false)
+        })
+        .unwrap();
+        assert_eq!(out, None);
+        // Emptied file: keep the existing prompt.
+        let out = edit_text_with("keep me", &dir, |p| {
+            fs::write(p, "   \n\n")?;
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn edit_cleans_up_scratch_file() {
+        let dir = std::env::temp_dir();
+        let path = std::cell::RefCell::new(PathBuf::new());
+        let _ = edit_text_with("x", &dir, |p| {
+            *path.borrow_mut() = p.to_path_buf();
+            Ok(true)
+        });
+        assert!(!path.borrow().exists());
+        // Also on an editor spawn error.
+        let path = std::cell::RefCell::new(PathBuf::new());
+        let err = edit_text_with("x", &dir, |p| {
+            *path.borrow_mut() = p.to_path_buf();
+            Err(io::Error::other("boom"))
+        });
+        assert!(err.is_err());
+        assert!(!path.borrow().exists());
     }
 }

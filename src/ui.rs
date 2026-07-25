@@ -3446,6 +3446,24 @@ impl Agent<'_> {
                     input.hist_idx = None;
                     input.buf.insert("\n");
                 }
+                // Ctrl-G hands the half-typed prompt to `$EDITOR` — the escape
+                // hatch for prompts too long to comfortably edit inline.
+                KeyCode::Char('g') if ctrl => {
+                    let current = input.buf.text().to_owned();
+                    let edited = with_tui_suspended(terminal, || {
+                        crate::editor::edit_text_externally(&current)
+                    });
+                    match edited {
+                        Ok(Some(text)) => {
+                            input.hist_idx = None;
+                            input.buf.set_text(text);
+                        }
+                        // Non-zero exit or an emptied file: keep what was typed.
+                        Ok(None) => {}
+                        Err(e) => log.push_dim(format!("[editor failed: {e}]")),
+                    }
+                    input.sync_popup();
+                }
                 KeyCode::Enter => {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
@@ -4851,6 +4869,53 @@ fn run_ask_panel(
             _ => {}
         }
     }
+}
+
+/// Runs `f` with the TUI fully torn down: raw mode off, alternate screen left,
+/// and every input mode we pushed at startup popped, so a child process gets a
+/// pristine terminal. Everything is put back before returning and the screen is
+/// cleared so the next `draw` repaints from scratch.
+///
+/// The restore runs from a `Drop` guard, so a panic inside `f` still leaves the
+/// user's terminal usable rather than stuck in raw mode on the alternate
+/// screen. Every terminal call is best-effort: a failure to, say, pop the
+/// keyboard flags must not stop the rest of the restore from running.
+fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce() -> T) -> T {
+    use ratatui::crossterm::terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    };
+
+    /// Puts the TUI back on drop — mirrors the setup in `Agent::run_tui`.
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = enable_raw_mode();
+            let _ = ratatui::crossterm::execute!(
+                std::io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste,
+                event::EnableFocusChange,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            );
+        }
+    }
+
+    let _ = ratatui::crossterm::execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        event::DisableFocusChange,
+        DisableBracketedPaste,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
+    let _ = disable_raw_mode();
+    let out = {
+        let _restore = Restore;
+        f()
+    };
+    let _ = terminal.clear();
+    out
 }
 
 /// Pre-rendered output for the read-only slash commands that stay usable while
