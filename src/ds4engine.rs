@@ -204,7 +204,6 @@ impl Ds4Model {
     /// # Panics
     /// Panics if the warm-snapshot mutex is poisoned (a prior panic while it was
     /// held) — impossible during single-threaded bootstrap.
-    #[allow(clippy::too_many_arguments)]
     pub fn open_shared(
         model_path: impl AsRef<Path>,
         backend: ffi::Ds4Backend,
