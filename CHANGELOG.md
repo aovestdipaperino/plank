@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The prefill progress bar now spans only the tokens the current pass actually
+  evaluates. It previously ran from the cached prefix to the end of the prompt,
+  so a warm turn reusing 8000 tokens and prefilling 200 opened at 97% and
+  crawled, while the tok/s figure beside it already counted just the new
+  tokens. Bar and throughput now describe the same work.
 - `/new` and `/clear` hide the input prompt and show a throbber while the KV
   cache is restored, instead of letting the prompt sit frozen. Restoring the
   tier checkpoint reads a snapshot in the tens of megabytes and loads it into the

@@ -55,11 +55,16 @@ impl Default for GenerationOptions {
 }
 
 /// Progress reported by the engine while prefilling a prompt.
+///
+/// Both counts are relative to the cached prefix: they describe *this pass's*
+/// work, not the absolute position in the prompt. A turn that reuses 8000
+/// cached tokens and prefills 200 new ones reports `total == 200`, so the bar
+/// spans `[0, 200]` and matches the throughput figure beside it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PrefillProgress {
-    /// Tokens prefilled so far.
+    /// Tokens prefilled so far in this pass (cached prefix excluded).
     pub done: i32,
-    /// Total tokens to prefill.
+    /// Total tokens this pass must prefill (cached prefix excluded).
     pub total: i32,
     /// Prefill throughput in tokens per second.
     pub tps: f64,
@@ -72,28 +77,31 @@ impl PrefillProgress {
     /// prompt — the cached prefix (`base`) is already included (see
     /// `ds4_cli.c:251`, which subtracts it). So `base` is a floor for the bar
     /// and the subtrahend for per-prefill throughput, never an offset to add.
+    /// Both reported counts are then rebased to `base`, so the bar spans only
+    /// the tokens this pass actually evaluates.
     ///
-    /// `total` is taken by mutable reference because the backend can genuinely
-    /// re-evaluate a few tokens the common-prefix probe counted as cached; on
-    /// overshoot the estimated total grows with ~5% headroom so the bar keeps
-    /// advancing instead of parking at 100%. Reaching `total` exactly is a
-    /// completed prefill, not an overshoot.
+    /// `total` is taken by mutable reference and stays *absolute* because the
+    /// backend can genuinely re-evaluate a few tokens the common-prefix probe
+    /// counted as cached; on overshoot the estimated total grows with ~5%
+    /// headroom so the bar keeps advancing instead of parking at 100%.
+    /// Reaching `total` exactly is a completed prefill, not an overshoot.
     pub fn from_absolute(base: i32, cur: i32, total: &mut i32, elapsed_secs: f64) -> Self {
         let floor = base.max(0).min((*total).max(0));
-        let done = cur.max(floor);
-        if done > *total {
-            *total = done + ((*total) / 20).max(1);
+        let abs_done = cur.max(floor);
+        if abs_done > *total {
+            *total = abs_done + ((*total) / 20).max(1);
         }
-        // Only the tokens actually evaluated in this pass count toward tok/s.
-        let processed = (cur - base).max(0);
+        // Only the tokens actually evaluated in this pass count toward tok/s —
+        // and toward the bar.
+        let done = abs_done - floor;
         let tps = if elapsed_secs > 0.0 {
-            f64::from(processed) / elapsed_secs
+            f64::from(done) / elapsed_secs
         } else {
             0.0
         };
         Self {
             done,
-            total: *total,
+            total: *total - floor,
             tps,
         }
     }
@@ -101,23 +109,21 @@ impl PrefillProgress {
     /// The priming event emitted before a turn's sync, reporting how much of
     /// the prompt the live KV already holds.
     ///
-    /// A partially cached prompt is held one token short of `total`: the bar
-    /// must not read 100% before any work has happened. A *fully* cached
-    /// prompt is the opposite case — there is no work to do, so it reports
-    /// `done == total`. Clamping that one short too would freeze the bar at
-    /// 99.99% for the whole time-to-first-token with no further event ever
-    /// arriving to correct it, which reads as a hung prefill (#64 follow-up).
+    /// `cached` and `total` are absolute prompt counts; the event reports the
+    /// remainder, so a partially cached prompt starts at `done == 0` out of
+    /// the tokens still to prefill — the bar must not read 100% before any
+    /// work has happened. A *fully* cached prompt is the opposite case: there
+    /// is no work to do, so it reports an empty (already complete) range.
+    /// Clamping that one short instead would freeze the bar at 99.99% for the
+    /// whole time-to-first-token with no further event ever arriving to
+    /// correct it, which reads as a hung prefill (#64 follow-up).
     #[must_use]
     pub fn primed(cached: i32, total: i32) -> Self {
         let total = total.max(0);
-        let done = if cached >= total {
-            total
-        } else {
-            cached.clamp(0, (total - 1).max(0))
-        };
+        let remaining = (total - cached.clamp(0, total)).max(0);
         Self {
-            done,
-            total,
+            done: 0,
+            total: remaining,
             tps: 0.0,
         }
     }
@@ -675,9 +681,9 @@ mod tests {
         let mut total = 8200;
         for cur in base..=8200 {
             let p = PrefillProgress::from_absolute(base, cur, &mut total, 2.0);
-            assert!(p.done >= base, "done {} below base", p.done);
-            assert!(p.done <= 8200, "done {} overshoots total", p.done);
-            assert_eq!(p.total, 8200);
+            assert!(p.done >= 0, "done {} below zero", p.done);
+            assert!(p.done <= 200, "done {} overshoots total", p.done);
+            assert_eq!(p.total, 200, "the bar spans only the new tokens");
             let expected = f64::from(cur - base) / 2.0;
             assert!((p.tps - expected).abs() < 1e-9);
         }
@@ -689,9 +695,9 @@ mod tests {
     fn prefill_progress_clamps_below_base() {
         let mut total = 500;
         let p = PrefillProgress::from_absolute(300, 120, &mut total, 1.0);
-        assert_eq!(p.done, 300);
+        assert_eq!(p.done, 0);
         assert!((p.tps - 0.0).abs() < 1e-9);
-        assert_eq!(p.total, 500);
+        assert_eq!(p.total, 200);
     }
 
     // Genuine overshoot (the backend re-evaluates tokens the common-prefix
@@ -748,8 +754,8 @@ mod tests {
     #[test]
     fn a_fully_cached_prompt_primes_as_complete() {
         let p = PrefillProgress::primed(13121, 13121);
-        assert_eq!(p.done, 13121, "nothing to prefill: report it finished");
-        assert_eq!(p.total, 13121);
+        assert_eq!(p.done, 0, "nothing to prefill: report it finished");
+        assert_eq!(p.total, 0);
         assert!(p.is_complete());
 
         // Over-cached (the KV holds more than this prompt) is still complete.
@@ -759,7 +765,8 @@ mod tests {
     #[test]
     fn a_partially_cached_prompt_primes_short_of_complete() {
         let p = PrefillProgress::primed(13110, 13121);
-        assert_eq!(p.done, 13110);
+        assert_eq!(p.done, 0);
+        assert_eq!(p.total, 11, "only the uncached remainder is on the bar");
         assert!(
             !p.is_complete(),
             "real work remains; the bar must not read 100%"
@@ -769,6 +776,7 @@ mod tests {
         // genuinely nothing to do.
         let cold = PrefillProgress::primed(0, 13121);
         assert_eq!(cold.done, 0);
+        assert_eq!(cold.total, 13121);
         assert!(!cold.is_complete());
         assert!(PrefillProgress::primed(0, 0).is_complete());
     }

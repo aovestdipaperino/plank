@@ -866,11 +866,7 @@ impl Engine for Ds4Session {
         if cached >= total {
             return Ok(false);
         }
-        on_event(EngineEvent::Prefill(PrefillProgress {
-            done: cached.clamp(0, (total - 1).max(0)),
-            total,
-            tps: 0.0,
-        }));
+        on_event(EngineEvent::Prefill(PrefillProgress::primed(cached, total)));
         let mut progress = ProgressCtx {
             on_event: &mut *on_event,
             interrupt: &|| false,
@@ -1006,11 +1002,9 @@ impl Ds4HostSession {
 
         // SAFETY: session and tokens are valid.
         let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
-        on_event(EngineEvent::Prefill(PrefillProgress {
-            done: cached.clamp(0, (prompt_len - 1).max(0)),
-            total: prompt_len,
-            tps: 0.0,
-        }));
+        on_event(EngineEvent::Prefill(PrefillProgress::primed(
+            cached, prompt_len,
+        )));
 
         let poll = || interrupt.load(Ordering::SeqCst);
         let mut err = [0_i8; 512];
