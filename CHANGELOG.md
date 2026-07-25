@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-07-25
+
+Beta patch bump on the 2.5 series, landing the first wave of the 2.6.0 work.
+
+### Added
+
+- **Update-available detection** (#56): a best-effort, once-per-day check of the
+  GitHub Releases API surfaces a non-intrusive hint when a newer plank exists.
+  Offline-safe (silent on failure), cached under `~/.plank`, and disableable via
+  the `update.check` setting.
+- **Word/character-level diff highlighting** (#62): edit diffs now highlight only
+  the changed spans within a line, pairing adjacent removed/added lines and
+  falling back to full-line highlighting once the change ratio exceeds ~40%.
+- **TUI animation subsystem** (#61): a shared 20 Hz clock drives glimmer, pulse,
+  flash, a ping-pong Braille throbber, and a stall-fade, with a hard
+  reduced-motion fallback (`ui.reducedMotion`, also in `/config`).
+- **Startup context warming** (#63): the session-start context is prefilled into
+  the KV so the first turn prefills only the question. The TUI input prompt now
+  appears only once warming completes, behind an animated "warming cache" screen.
+
+### Changed
+
+- **ds4 engine transcript is token-primary** (#58): the token buffer is now the
+  source of truth (C-parity append-only transcript), with text derived from
+  tokens, replacing the text-primary reply-splice cache.
+- **Hierarchical KV cache tier foundation** (#60): the session-start context is
+  split into a project-stable tier and a session-volatile tier, with
+  tier-fingerprint chaining and project-scoped checkpoint paths. (Native
+  restore-loop wiring tracked in #64.)
+
 ## [2.5.2] - 2026-07-25
 
 ### Fixed
