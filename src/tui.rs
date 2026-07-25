@@ -329,6 +329,13 @@ impl OutputLog {
         self.code_blocks.retain(|r| r.header < len);
     }
 
+    /// Drops every line, code block, and in-flight streaming state, returning
+    /// the log to its freshly-constructed form. Used by `/clear` and `/new`, so
+    /// the screen reflects the fresh session rather than the old conversation.
+    pub fn clear(&mut self) {
+        *self = Self::new();
+    }
+
     /// Sets (or clears) the transient progress line pinned below the output.
     pub fn set_progress(&mut self, line: Option<Line<'static>>) {
         self.progress = line;
@@ -1980,6 +1987,25 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
 #[cfg(test)]
 mod tests {
     use unicode_width::UnicodeWidthStr;
+
+    /// Issue #72: `/clear` and `/new` must wipe the TUI scrollback, including
+    /// an unfinished streaming line, a pinned progress line, and the code-block
+    /// registry that backs click-to-copy.
+    #[test]
+    fn clear_empties_the_output_log() {
+        use crate::viz::RenderSink;
+        let mut log = super::OutputLog::new();
+        log.push_plain("older conversation");
+        log.visible_text("```rust\nfn main() {}\n```\nstreaming tail");
+        log.set_progress(Some(ratatui::text::Line::from("working…")));
+        assert!(!log.to_text().lines.is_empty());
+
+        log.clear();
+
+        assert!(log.to_text().lines.is_empty(), "{:?}", log.to_text());
+        assert!(log.code_copy_at(80, 0, 0, 0).is_none());
+        assert_eq!(log.checkpoint(), 0);
+    }
 
     #[test]
     fn elide_left_keeps_the_basename_visible() {

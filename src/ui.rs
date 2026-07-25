@@ -3053,31 +3053,10 @@ impl Agent<'_> {
         result.map(|_| ())
     }
 
-    #[allow(clippy::too_many_lines)]
-    /// Returns the final rendered frame as an image (when the CRT-off effect is
-    /// enabled and stdout is a TTY) so the caller can animate a power-off of the
-    /// last visible screen. `None` otherwise. The image is captured from the
-    /// live draw each tick — ratatui swaps buffers after `draw`, so by the time
-    /// the loop returns `current_buffer_mut` is the blank incoming buffer, not
-    /// what the user last saw.
-    fn tui_loop(
-        &mut self,
-        terminal: &mut ratatui::DefaultTerminal,
-    ) -> Result<Option<image::RgbaImage>, String> {
-        // Cloned out of `self` so the remote state stays reachable while the
-        // loop hands `&mut self` to a turn.
-        let ui_remote = self.ui_remote.clone();
-        let rem = ui_remote.as_deref();
-        let mut input = TuiInput::new();
-        input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
-        let hist_path = default_history_path();
-        input.history.load(&hist_path).ok();
-
-        // Rebuild the system-prompt cache first, behind a simple progress bar,
-        // so the full UI appears only once the one slow launch step is done.
-        self.tui_warm(terminal)?;
-
-        let mut log = OutputLog::new();
+    /// Writes the startup banner (logo art, version/context line, hints) into
+    /// `log`. Used both at launch and after `/clear` and `/new`, so a cleared
+    /// screen looks exactly like a fresh start.
+    fn tui_write_banner(&self, log: &mut OutputLog) {
         for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 144 / 100)) {
             log.push_spans(line.spans);
         }
@@ -3110,6 +3089,34 @@ impl Agent<'_> {
             }
         }
         log.push_plain(String::new());
+    }
+
+    #[allow(clippy::too_many_lines)]
+    /// Returns the final rendered frame as an image (when the CRT-off effect is
+    /// enabled and stdout is a TTY) so the caller can animate a power-off of the
+    /// last visible screen. `None` otherwise. The image is captured from the
+    /// live draw each tick — ratatui swaps buffers after `draw`, so by the time
+    /// the loop returns `current_buffer_mut` is the blank incoming buffer, not
+    /// what the user last saw.
+    fn tui_loop(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Option<image::RgbaImage>, String> {
+        // Cloned out of `self` so the remote state stays reachable while the
+        // loop hands `&mut self` to a turn.
+        let ui_remote = self.ui_remote.clone();
+        let rem = ui_remote.as_deref();
+        let mut input = TuiInput::new();
+        input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
+        let hist_path = default_history_path();
+        input.history.load(&hist_path).ok();
+
+        // Rebuild the system-prompt cache first, behind a simple progress bar,
+        // so the full UI appears only once the one slow launch step is done.
+        self.tui_warm(terminal)?;
+
+        let mut log = OutputLog::new();
+        self.tui_write_banner(&mut log);
 
         // A `plank /resume` startup shows the recovered conversation so far,
         // rendered like the live stream (markdown + thinking gray).
@@ -4550,6 +4557,11 @@ impl Agent<'_> {
                 self.last_ctx_used = 0;
                 self.checkpoints.clear();
                 self.usage = SessionUsage::default();
+                // Issue #72: the screen must reflect the fresh session, so drop
+                // the old conversation and re-render what a launch shows.
+                log.clear();
+                *view = tui::OutputView::default();
+                self.tui_write_banner(log);
                 self.fire_session_start("clear", &mut |w| log.push_plain(w));
                 log.push_plain("started a new session");
             }
