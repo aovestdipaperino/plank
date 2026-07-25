@@ -6,6 +6,55 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.5.4] - 2026-07-25
+
+Beta patch bump on the 2.5 series, landing the rest of the 2.6.0 work: session
+branching, the native KV cache tier loop, and the Pi-parity quality-of-life
+commands.
+
+### Added
+
+- **Session branching** (#65): sessions are now a tree rather than a line.
+  `/tree` navigates and marks the active branch, `/fork [n]` branches from an
+  earlier user prompt, and `/clone` duplicates the active branch. Existing
+  linear sessions load unchanged and, while they stay linear, are written
+  byte-identically to before.
+- **Native KV cache tiers** (#64): `warm_tiers` walks the cache tiers
+  most-stable-first, restoring the deepest still-valid checkpoint and
+  prefilling only from the first fingerprint mismatch. The project-stable
+  context (AGENTS.md/CLAUDE.md plus local MCP tool definitions) is checkpointed
+  per project at `kvcache/<project-key>/project-<fp2>.kv` and shared across
+  sessions; the volatile git/date context is prefill-only and never cached.
+  Superseded per-project checkpoints are garbage-collected.
+- **Session export** (#66): `/export [md|html] [path]` renders the transcript to
+  Markdown or a self-contained HTML file.
+- **Prompt templates** (#67): Markdown files in `~/.plank/templates` and
+  `./.plank/templates` become `/name` commands with `{{var}}` interpolation.
+  Built-in commands can never be shadowed.
+- **External editor** (#68): Ctrl+G opens `$EDITOR` on the current prompt,
+  suspending and restoring the TUI around it.
+- **Word-wise prompt navigation** (#73): Alt/Ctrl + Left/Right move by word,
+  Alt/Ctrl+Backspace and Alt/Ctrl+Delete kill by word, plus emacs-style
+  Alt+B/F/D. Word boundaries are UTF-8 safe and treat all whitespace as
+  separators.
+- A joke local-inference invoice for `/usage` when running without a provider.
+  Token counts stay real; only the billing framing is the gag.
+
+### Fixed
+
+- **Prefill progress double-counted the cached prefix** (#74): the engine
+  reports the absolute prompt position, but the callback added the cached base
+  to it again. Warm prefills therefore overshot the total, tripped the
+  progress-bar headroom clause, and displayed cumulative numbers with inflated
+  tok/s. The base is now the bar's floor and the subtrahend for throughput.
+- **Warm prefill was discarded on the first question** (#64): tier text was
+  tokenized verbatim at warm time but trimmed on the transcript round-trip the
+  turn rebuilds its tokens from, so the KV common-prefix probe diverged at the
+  first tier and re-prefilled the entire context. Tier text is now canonical.
+- **`/clear` and `/new` left the old conversation on screen** (#72): the TUI
+  output log is cleared and the banner re-rendered so the display matches the
+  fresh session.
+
 ## [2.5.3] - 2026-07-25
 
 Beta patch bump on the 2.5 series, landing the first wave of the 2.6.0 work.
