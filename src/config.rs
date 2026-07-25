@@ -589,6 +589,7 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/hooks"
             | "/remote"
             | "/grant"
+            | "/version"
     ) || slash_command_with_args(cmd, "/config")
         || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
@@ -1397,7 +1398,7 @@ mod tests {
     fn slash_commands() {
         for cmd in [
             "/help", "/save", "/compact", "/list", "/quit", "/exit", "/new", "/clear", "/mcp",
-            "/context", "/usage", "/init", "/skills", "/tasks", "/agent", "/hooks",
+            "/context", "/usage", "/init", "/skills", "/tasks", "/agent", "/hooks", "/version",
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }

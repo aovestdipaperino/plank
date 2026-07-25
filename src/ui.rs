@@ -2034,6 +2034,7 @@ impl Agent<'_> {
                 println!("started a new session");
             }
             "/help" => print!("{}", crate::config::usage()),
+            "/version" => println!("plank {}", crate::logo::version_label()),
             "/checkpoint" => {
                 if arg.is_empty() {
                     print!(
@@ -3023,11 +3024,11 @@ impl Agent<'_> {
         let result = self.tui_loop(&mut terminal);
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
-        // real turn outcome (`result`) is what we return. Skipped on error
-        // exits (keep error text readable), non-TTY stdout, or when disabled.
-        if result.is_ok() && crate::settings::active().ui.crt_off && std::io::stdout().is_terminal()
-        {
-            let img = frame_to_image(terminal.current_buffer_mut());
+        // real turn outcome (`result`) is what we return. `tui_loop` hands back
+        // the last frame it drew (already captured pre-buffer-swap); skipped on
+        // error exits (keep error text readable), non-TTY stdout, or when
+        // disabled (in which case the image is `None`).
+        if let Ok(Some(img)) = &result {
             let cfg = crt_off::Config {
                 hold_secs: 0.0,
                 vstretch_secs: 0.35,
@@ -3039,7 +3040,7 @@ impl Agent<'_> {
             // `use_alt_screen: false` — we already own the alternate screen; the
             // effect repaints the final frame in place and restores raw mode on
             // drop before our own teardown runs.
-            let _ = crt_off::animate(&img, false, &cfg);
+            let _ = crt_off::animate(img, false, &cfg);
         }
         let _ = ratatui::crossterm::execute!(
             std::io::stdout(),
@@ -3049,11 +3050,20 @@ impl Agent<'_> {
             DisableMouseCapture
         );
         ratatui::restore();
-        result
+        result.map(|_| ())
     }
 
     #[allow(clippy::too_many_lines)]
-    fn tui_loop(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
+    /// Returns the final rendered frame as an image (when the CRT-off effect is
+    /// enabled and stdout is a TTY) so the caller can animate a power-off of the
+    /// last visible screen. `None` otherwise. The image is captured from the
+    /// live draw each tick — ratatui swaps buffers after `draw`, so by the time
+    /// the loop returns `current_buffer_mut` is the blank incoming buffer, not
+    /// what the user last saw.
+    fn tui_loop(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) -> Result<Option<image::RgbaImage>, String> {
         // Cloned out of `self` so the remote state stays reachable while the
         // loop hands `&mut self` to a turn.
         let ui_remote = self.ui_remote.clone();
@@ -3124,6 +3134,10 @@ impl Agent<'_> {
         // out to osascript, so it must not run on every 200ms poll tick).
         let mut clip_has_image = IMAGES_ENABLED && crate::imagepaste::clipboard_has_image();
         let mut clip_checked = Instant::now();
+        // Only rasterize the frame when the CRT-off power-down will actually run;
+        // otherwise the per-tick capture is pure waste.
+        let capture_crt = crate::settings::active().ui.crt_off && std::io::stdout().is_terminal();
+        let mut crt_frame: Option<image::RgbaImage> = None;
         loop {
             if IMAGES_ENABLED && clip_checked.elapsed() >= Duration::from_secs(3) {
                 clip_has_image = crate::imagepaste::clipboard_has_image();
@@ -3137,7 +3151,7 @@ impl Agent<'_> {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
             let task_view = tui::TaskView::from(&self.session.tasks);
-            terminal
+            let completed = terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
                     // split view even while idle; text selection falls back to
@@ -3175,6 +3189,11 @@ impl Agent<'_> {
                     remote_capture(rem, f);
                 })
                 .map_err(|e| e.to_string())?;
+            // Snapshot the just-drawn buffer (ratatui has already swapped, so
+            // `completed.buffer` is the frame the user sees, not the blank one).
+            if capture_crt {
+                crt_frame = Some(frame_to_image(completed.buffer));
+            }
             remote_service(rem);
 
             let Some(ev) = next_event(rem, Duration::from_millis(200))? else {
@@ -3201,7 +3220,7 @@ impl Agent<'_> {
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
-                                return Ok(());
+                                return Ok(crt_frame);
                             }
                         } else {
                             r.bus.broadcast(UiEvent::UserEcho(line.clone()));
@@ -3490,7 +3509,7 @@ impl Agent<'_> {
             input.sync_popup();
         }
         input.history.save(&hist_path).ok();
-        Ok(())
+        Ok(crt_frame)
     }
 
     /// Runs a `!` immediate shell command: output lands only in the TUI log,
@@ -4526,6 +4545,7 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/version" => log.push_plain(format!("plank {}", crate::logo::version_label())),
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
             "/usage" => log.push_ansi(&self.render_usage_report(true)),
@@ -4833,6 +4853,10 @@ impl LiveCommands {
             "/usage" => Some(Cow::Borrowed(self.usage.as_str())),
             "/mcp" => Some(Cow::Borrowed(self.mcp.as_str())),
             "/help" => Some(Cow::Owned(crate::config::usage())),
+            "/version" => Some(Cow::Owned(format!(
+                "plank {}",
+                crate::logo::version_label()
+            ))),
             "/config" => Some(Cow::Owned(crate::configform::render_text_list(
                 crate::settings::active(),
             ))),

@@ -27,6 +27,36 @@ const DSML_BAR: &[u8] = "｜".as_bytes();
 const THINK_OPEN: &[u8] = b"<think>";
 const THINK_CLOSE: &[u8] = b"</think>";
 
+/// Best-effort append of a rejected tool call to `$HOME/.plank/tool-call-errors.log`.
+///
+/// Records the rejection reason plus the raw DSML stanza the model emitted so a
+/// rejected tool call can be inspected after the fact. Always on; any IO error
+/// (missing HOME, unwritable dir, …) is silently swallowed so the parse path is
+/// never affected.
+fn log_tool_error(reason: &str, raw: &[u8]) {
+    use std::io::Write;
+
+    let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let dir = std::path::PathBuf::from(home).join(".plank");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let snippet = String::from_utf8_lossy(raw);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tool-call-errors.log"))
+    {
+        // Ignore write failures; logging must never break parsing.
+        let _ = writeln!(f, "[{secs}] {reason}\n---\n{snippet}\n===");
+    }
+}
+
 /// Destination for rendered output; the UI layer routes this to its renderer.
 ///
 /// The stream renderer never emits raw DSML through this trait: DSML bytes are
@@ -998,6 +1028,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                     } else {
                         self.parser.error()
                     };
+                    log_tool_error(err, self.parser.raw());
                     let status = format!("[invalid tool call: {err}]\n");
                     self.viz_drop_invalid_dsml();
                     self.viz_finish(Some(&status));
@@ -1050,6 +1081,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn finish_ignored_dsml(&mut self, msg: &str) {
+        log_tool_error(msg, self.parser.raw());
         self.dsml_in_think = true;
         self.dsml_in_think_reported = true;
         self.viz_newline_if_open();
@@ -1065,6 +1097,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             return;
         }
         self.stream_error = Some(msg.to_string());
+        log_tool_error(msg, self.parser.raw());
         self.viz_newline_if_open();
         let line = format!("[invalid tool call: {msg}]\n");
         self.viz_error_puts(&line);
