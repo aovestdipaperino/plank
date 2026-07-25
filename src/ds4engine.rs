@@ -394,12 +394,11 @@ impl Ds4Model {
         }
     }
 
-    /// Fingerprint tying a checkpoint to this exact model and system prompt.
+    /// Fingerprint tying a checkpoint to this exact model and system prompt —
+    /// Tier 1 of the KV cache chain, and the parent every deeper tier's key
+    /// hangs off. Shared with the tier planner so the two cannot disagree.
     fn checkpoint_fingerprint(&self, system: &str) -> String {
-        let mut data = self.model_name().into_bytes();
-        data.push(0);
-        data.extend_from_slice(system.as_bytes());
-        crate::session::sha1_hex(&data)
+        crate::kvtier::system_fingerprint(&self.model_name(), system)
     }
 }
 
@@ -969,73 +968,134 @@ impl Engine for Ds4Session {
         Ok(true)
     }
 
-    fn warm_context(
+    fn warm_tiers(
         &mut self,
         system: &str,
-        context: &str,
+        tiers: &[crate::kvtier::TierSpec],
         on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<bool, EngineError> {
-        if context.is_empty() {
+        if tiers.is_empty() {
             return Ok(false);
         }
-        // Build exactly the token prefix the first turn will reuse:
-        // `[begin+system]` (matching `build_system_tokens`) followed by the
-        // session-start context as one user message. This is byte-for-byte the
-        // prefix `generate`/`build_prompt` reconstructs for `[system][context]`,
-        // so the next turn's `ds4_session_common_prefix` reuses all of it and
-        // evaluates only the question suffix. Crucially, NO trailing assistant
-        // prefix is appended here — the cached prefix ends exactly at the
-        // context, so common-prefix accounting and the progress-bar totals on
-        // the first turn are unperturbed (issue #63).
+
+        // The token prefix the first turn will reuse: `[begin+system]`
+        // (matching `build_system_tokens`) followed by one user message per
+        // tier, most-stable-first. Each tier is its own message, so a tier
+        // boundary is a clean chat-template message boundary and the snapshot
+        // taken there is a genuinely reproducible token prefix — never a
+        // mid-message split whose tokenization could shift under BPE merges.
+        //
+        // Crucially, NO trailing assistant prefix is appended — the cached
+        // prefix ends exactly at the last tier, so the first turn's
+        // common-prefix accounting and progress totals are unperturbed (#63).
+        let msgs: Vec<Vec<i32>> = tiers
+            .iter()
+            .map(|t| self.model.message_tokens("user", &t.text))
+            .collect();
         let mut tokens = self.model.build_system_tokens(system);
-        tokens.push_all(&self.model.message_tokens("user", context));
-        let prompt_len = tokens.len();
+        let mut total = tokens.len();
+        for m in &msgs {
+            total = total.saturating_add(i32::try_from(m.len()).unwrap_or(0));
+        }
+
+        // Walk the tiers most-stable-first and reuse KV up to the first
+        // fingerprint mismatch (pure logic, unit tested in `kvtier`).
+        let plan = crate::kvtier::resume_point(tiers, |t| {
+            t.checkpoint
+                .as_deref()
+                .is_some_and(|p| crate::kvtier::checkpoint_matches(p, &t.fingerprint))
+        });
+        let mut prefill_from = plan.prefill_from;
 
         let session = self.ensure_session()?;
 
-        // How much the live KV already holds — the system prefix warmed by
-        // `warm_system_prompt`. Only the context suffix beyond it is evaluated.
-        // SAFETY: session and tokens are valid.
-        let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
-        if cached >= prompt_len {
-            // Nothing new to prefill (e.g. an initial `-p` turn already ran and
-            // the KV extends past the context). No-op, no progress drawn.
-            return Ok(false);
+        // Restore: load the deepest still-valid tier checkpoint, which brings
+        // back every tier above it too (the keys are chained, so a valid tier
+        // implies valid ancestors). A checkpoint whose key matched but whose
+        // bytes will not load is a format change: say so and rebuild rather
+        // than trust it.
+        if let Some(i) = plan.restore {
+            let restored = tiers[i]
+                .checkpoint
+                .as_deref()
+                .and_then(|p| std::fs::read(p).ok())
+                .and_then(|bytes| {
+                    crate::kvtier::split_checkpoint(&bytes)
+                        .map(|(_, snap)| SessionSnapshot::restore_bytes(session, snap).is_ok())
+                })
+                .unwrap_or(false);
+            if !restored {
+                on_event(EngineEvent::Notice(
+                    "project context cache is incompatible with this build; rebuilding it"
+                        .to_owned(),
+                ));
+                prefill_from = 0;
+            }
         }
-        on_event(EngineEvent::Prefill(PrefillProgress {
-            done: cached.clamp(0, (prompt_len - 1).max(0)),
-            total: prompt_len,
-            tps: 0.0,
-        }));
 
-        // Prefill-only: sync the session to `[system][context]` with no
-        // sampling. Not checkpointed — the context is per-session volatile.
-        let mut progress = ProgressCtx {
-            on_event,
-            interrupt: &|| false,
-            start: std::time::Instant::now(),
-            base: cached.clamp(0, prompt_len),
-            total: prompt_len,
-        };
-        let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
-        // SAFETY: session valid; progress outlives the sync and the callback is
-        // cleared right after.
-        unsafe {
-            ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+        // Extend + snapshot: sync to each remaining tier's boundary in turn,
+        // prefilling only what the live KV does not already hold, and
+        // checkpointing each cacheable tier exactly at its own boundary (a
+        // snapshot captures the whole session, so it must be taken while the
+        // cursor sits at the end of that tier and no further).
+        let mut prefilled = false;
+        for (i, msg) in msgs.iter().enumerate() {
+            tokens.push_all(msg);
+            if i < prefill_from {
+                // Already in KV via the restore above; nothing to sync.
+                continue;
+            }
+            // SAFETY: session and tokens are valid.
+            let cached = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+            let end = tokens.len();
+            if cached < end {
+                prefilled = true;
+                on_event(EngineEvent::Prefill(PrefillProgress {
+                    done: cached.clamp(0, (total - 1).max(0)),
+                    total,
+                    tps: 0.0,
+                }));
+                // Reborrow rather than move: the loop needs `on_event` again on
+                // the next tier.
+                let mut progress = ProgressCtx {
+                    on_event: &mut *on_event,
+                    interrupt: &|| false,
+                    start: std::time::Instant::now(),
+                    base: cached.clamp(0, total),
+                    total,
+                };
+                let progress_ptr = (&raw mut progress).cast::<std::os::raw::c_void>();
+                // SAFETY: session valid; progress outlives the sync and the
+                // callback is cleared right after.
+                unsafe {
+                    ffi::ds4_session_set_display_progress(session, Some(progress_cb), progress_ptr);
+                }
+                let mut err = [0_i8; 512];
+                // SAFETY: session, tokens, and err buffer are valid.
+                let rc = unsafe {
+                    ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len())
+                };
+                // SAFETY: session valid; clearing before ProgressCtx drops.
+                unsafe {
+                    ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut());
+                }
+                if rc != 0 {
+                    return Err(EngineError::new(cstr_message(
+                        &err,
+                        "context prefill failed",
+                    )));
+                }
+            }
+            // Persist this tier for the next session in the project. Tier 3
+            // carries no checkpoint path, so it is never written here.
+            if let Some(path) = tiers[i].checkpoint.as_deref() {
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                Self::save_checkpoint(session, path, &tiers[i].fingerprint);
+            }
         }
-        let mut err = [0_i8; 512];
-        // SAFETY: session, tokens, and err buffer are valid.
-        let rc =
-            unsafe { ffi::ds4_session_sync(session, tokens.as_ptr(), err.as_mut_ptr(), err.len()) };
-        // SAFETY: session valid; clearing before ProgressCtx drops.
-        unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
-        if rc != 0 {
-            return Err(EngineError::new(cstr_message(
-                &err,
-                "context prefill failed",
-            )));
-        }
-        Ok(true)
+        Ok(prefilled)
     }
 
     fn count_tokens(&self, text: &str) -> i32 {

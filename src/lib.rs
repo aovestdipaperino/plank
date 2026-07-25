@@ -35,6 +35,9 @@ pub mod hooks;
 pub mod host;
 pub mod imagepaste;
 pub mod interrupt;
+/// Volatility-tiered KV cache planning (issues #60, #64). FFI-free and always
+/// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
+pub mod kvtier;
 pub mod logo;
 pub mod memory;
 pub mod names;

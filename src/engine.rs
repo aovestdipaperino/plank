@@ -365,27 +365,32 @@ pub trait Engine: Debug + Send {
         Ok(false)
     }
 
-    /// Warms the KV cache with the session-start context turn *on top of* the
+    /// Warms the KV cache with the session-start context tiers *on top of* the
     /// already-warmed system prompt, so the first real turn reuses
-    /// `[system][context]` and prefills only the user's question suffix.
+    /// `[system][stable][volatile]` and prefills only the user's question suffix.
     ///
-    /// Unlike [`warm_system_prompt`](Self::warm_system_prompt) this is
-    /// prefill-only and **never checkpointed**: `context` is per-session volatile
-    /// (git status, date), so folding it into the `sysprompt.kv` fingerprint
-    /// would force a rebuild every launch (issue #63). It appends no trailing
-    /// assistant prefix, so the cached prefix stays exactly `[system][context]`
-    /// and the next turn's common-prefix accounting is unperturbed. Returns
-    /// `true` when a prefill actually happened.
+    /// Runs the **restore → extend → snapshot** loop over `tiers` (built by
+    /// [`crate::kvtier::plan`], ordered most-stable-first, each carried as its
+    /// own user message): reuse the deepest tier whose on-disk checkpoint
+    /// fingerprint still matches, then prefill only the tiers below it,
+    /// snapshotting each cacheable tier as its boundary is reached (issue #64).
+    ///
+    /// Tier 3 (git status, date, hook output) is prefill-only and **never
+    /// checkpointed** — folding volatile bytes into a cache key would force a
+    /// rebuild every launch (issue #63). No trailing assistant prefix is
+    /// appended, so the cached prefix ends exactly at the last tier and the next
+    /// turn's common-prefix accounting is unperturbed. Returns `true` when a
+    /// prefill actually happened.
     ///
     /// The default implementation is a no-op returning `false`, so
     /// [`EchoEngine`] and remote/provider engines are unaffected.
     ///
     /// # Errors
     /// Returns [`EngineError`] when the backend fails to prefill.
-    fn warm_context(
+    fn warm_tiers(
         &mut self,
         _system: &str,
-        _context: &str,
+        _tiers: &[crate::kvtier::TierSpec],
         _on_event: &mut dyn FnMut(EngineEvent),
     ) -> Result<bool, EngineError> {
         Ok(false)
@@ -619,18 +624,20 @@ mod tests {
         assert!(!streamed.contains('\u{FFFD}'), "lossy bytes: {streamed:?}");
     }
 
-    // The context-warm capability is opt-in: engines without a KV to prefill
+    // The tier-warm capability is opt-in: engines without a KV to prefill
     // (EchoEngine, remote/provider) must inherit the no-op default so both
-    // front-end warm paths degrade cleanly (issue #63).
+    // front-end warm paths degrade cleanly (issues #63, #64).
     #[test]
-    fn warm_context_defaults_to_noop() {
+    fn warm_tiers_defaults_to_noop() {
         let mut engine = EchoEngine::new(4096);
         let mut events = Vec::new();
+        let tiers = crate::kvtier::plan("fp1", "agents\n", "git + date\n", "", None);
+        assert_eq!(tiers.len(), 2, "both tiers planned");
         let warmed = engine
-            .warm_context("[system]\nsys\n", "[context]\ngit + date\n", &mut |e| {
+            .warm_tiers("[system]\nsys\n", &tiers, &mut |e| {
                 events.push(e);
             })
-            .expect("default warm_context never errors");
+            .expect("default warm_tiers never errors");
         assert!(!warmed, "no-op default must report no prefill happened");
         assert!(events.is_empty(), "the default impl streams nothing");
     }

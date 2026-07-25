@@ -920,6 +920,47 @@ fn merge_configs(
     merged
 }
 
+/// Names of the servers defined in the **local** (project) MCP config only.
+///
+/// Scope decides which KV tier a server's tool definitions key (issue #60):
+/// global servers belong to Tier 1 (already inside the system prompt
+/// fingerprint, shared across every project), while project-local ones must key
+/// Tier 2 instead — folding them into Tier 1 would fork the expensive
+/// system-prompt tier per project and destroy the cross-project sharing that is
+/// the whole point of it.
+#[must_use]
+pub fn local_server_names(local_path: Option<&Path>) -> Vec<String> {
+    let default = Path::new(".mcp.json");
+    config_load(local_path.unwrap_or(default))
+        .into_iter()
+        .map(|c| c.name)
+        .collect()
+}
+
+/// Tool definitions of the locally-defined servers, as `(server, [(tool,
+/// schema)])` ready for [`crate::kvtier::tool_defs_material`] to canonicalize
+/// into Tier 2 key material. A locally-named server that failed to start
+/// contributes nothing, which is correct: it also contributed no tool schemas
+/// to the prompt.
+#[must_use]
+pub fn local_tool_defs(
+    servers: &[McpServer],
+    local_names: &[String],
+) -> Vec<(String, Vec<(String, String)>)> {
+    servers
+        .iter()
+        .filter(|s| local_names.iter().any(|n| n == &s.name))
+        .map(|s| {
+            let tools = s
+                .tools
+                .iter()
+                .map(|t| (t.name.clone(), t.schema_json.clone()))
+                .collect();
+            (s.name.clone(), tools)
+        })
+        .collect()
+}
+
 /// Loads the config hierarchy, spawns and handshakes each server.
 ///
 /// Mirrors `agent_mcp_load_and_start`: a server that cannot start or
@@ -1459,6 +1500,31 @@ mod tests {
         let path = write_temp_config("{\"mcpServers\":{\"bad__name\":{\"command\":\"echo\"}}}");
         assert!(config_load(&path).is_empty());
         std::fs::remove_file(path).ok();
+    }
+
+    // Tier 2 key material: only *locally* defined servers may key the
+    // project tier; a global server must stay in Tier 1 so the expensive
+    // system-prompt tier keeps being shared across projects (issues #60, #64).
+    #[test]
+    fn local_tool_defs_cover_only_locally_defined_servers() {
+        let local = write_temp_config("{\"mcpServers\":{\"demo\":{\"command\":\"cat\"}}}");
+        let names = local_server_names(Some(&local));
+        assert_eq!(names, vec!["demo".to_string()]);
+
+        let servers = vec![make_split_server()];
+        let defs = local_tool_defs(&servers, &names);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].0, "demo");
+        let tools: Vec<&str> = defs[0].1.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(tools, ["alpha", "omega"]);
+        // Schemas are part of the material, so a schema change invalidates.
+        assert!(defs[0].1[0].1.contains("\"a\""));
+
+        // The same server known only globally contributes nothing to Tier 2.
+        assert!(local_tool_defs(&servers, &[]).is_empty());
+        let material = crate::kvtier::tool_defs_material(&defs);
+        assert!(material.starts_with("demo/alpha\u{1}"), "{material:?}");
+        std::fs::remove_file(local).ok();
     }
 
     #[test]
