@@ -406,7 +406,6 @@ impl Settings {
 // each arm is a trivial compare-and-push, so the length is not complexity.
 #[allow(clippy::too_many_lines)]
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<String> {
     let d = Settings::default();
     let mut parts: Vec<String> = Vec::new();
