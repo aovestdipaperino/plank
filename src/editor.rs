@@ -46,6 +46,48 @@ pub enum ReadOutcome {
 // Line buffer (pure, testable)
 // ---------------------------------------------------------------------------
 
+/// Returns the byte offset of the start of the word before `cursor`.
+///
+/// Readline semantics: skip any whitespace immediately left of the cursor,
+/// then skip the run of non-whitespace characters. Returns `cursor` itself
+/// only when already at the start of the line.
+#[must_use]
+pub fn prev_word_boundary(text: &str, cursor: usize) -> usize {
+    let head = &text[..cursor];
+    let trimmed = head.trim_end_matches(char::is_whitespace);
+    match trimmed.rfind(char::is_whitespace) {
+        // `rfind` gives the byte offset of a whitespace char; the word starts
+        // at the next char boundary after it.
+        Some(i) => i + trimmed[i..].chars().next().map_or(1, char::len_utf8),
+        None => 0,
+    }
+}
+
+/// Returns the byte offset just past the end of the word after `cursor`.
+///
+/// Mirror of [`prev_word_boundary`]: skip whitespace, then the word.
+#[must_use]
+pub fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    let tail = &text[cursor..];
+    let skipped = tail.len() - tail.trim_start_matches(char::is_whitespace).len();
+    let rest = &tail[skipped..];
+    let word = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    cursor + skipped + word
+}
+
+/// Whether a CSI parameter string like `"1;3"` carries an Alt or Ctrl
+/// modifier, the ones that turn an arrow key into a word-wise motion.
+///
+/// xterm encodes the modifier as `1 + bitmask` (shift 1, alt 2, ctrl 4), so
+/// Alt is 3, Ctrl 5, Ctrl+Alt 7, and 9/13 appear when Meta is also set.
+#[must_use]
+fn is_word_modifier(params: &str) -> bool {
+    matches!(
+        params.rsplit(';').next(),
+        Some("3" | "5" | "7" | "9" | "13")
+    )
+}
+
 /// An editable UTF-8 line with a cursor, mirroring linenoise's edit ops.
 #[derive(Debug, Default, Clone)]
 pub struct LineBuffer {
@@ -158,19 +200,35 @@ impl LineBuffer {
         self.cursor = 0;
     }
 
-    /// Deletes the word before the cursor (Ctrl-W), linenoise style.
+    /// Deletes the word before the cursor (Ctrl-W / Alt-Backspace).
     pub fn delete_prev_word(&mut self) {
-        let bytes = self.text.as_bytes();
-        let mut start = self.cursor;
-        while start > 0 && bytes[start - 1] == b' ' {
-            start -= 1;
-        }
-        while start > 0 && bytes[start - 1] != b' ' {
-            start -= 1;
-        }
-        // `start` lands after a space (or 0), so it is a char boundary.
+        let start = prev_word_boundary(&self.text, self.cursor);
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
+    }
+
+    /// Deletes the word after the cursor (Alt-D / Alt-Delete).
+    pub fn delete_next_word(&mut self) {
+        let end = next_word_boundary(&self.text, self.cursor);
+        self.text.replace_range(self.cursor..end, "");
+    }
+
+    /// Moves the cursor to the start of the previous word (Alt-Left).
+    /// Returns whether it moved.
+    pub fn move_prev_word(&mut self) -> bool {
+        let b = prev_word_boundary(&self.text, self.cursor);
+        let moved = b != self.cursor;
+        self.cursor = b;
+        moved
+    }
+
+    /// Moves the cursor past the end of the next word (Alt-Right).
+    /// Returns whether it moved.
+    pub fn move_next_word(&mut self) -> bool {
+        let b = next_word_boundary(&self.text, self.cursor);
+        let moved = b != self.cursor;
+        self.cursor = b;
+        moved
     }
 
     /// Returns the byte range of the word ending at the cursor.
@@ -856,19 +914,28 @@ impl Editor {
                         let Some(b) = read_byte(self.in_fd)? else {
                             return Ok(());
                         };
-                        if b.is_ascii_digit() {
+                        if b.is_ascii_digit() || b == b';' {
                             num.push(b as char);
                         } else {
-                            if b == b'~' {
-                                match num.as_str() {
+                            match b {
+                                b'~' => match num.as_str() {
                                     "1" | "7" => self.buf.move_home(),
                                     "3" => {
                                         self.buf.delete();
                                     }
+                                    "3;3" | "3;5" => self.buf.delete_next_word(),
                                     "4" | "8" => self.buf.move_end(),
                                     "200" => self.read_paste()?,
                                     _ => {}
+                                },
+                                // ESC [ 1 ; <mod> C/D — Alt/Ctrl + arrow.
+                                b'C' if is_word_modifier(&num) => {
+                                    self.buf.move_next_word();
                                 }
+                                b'D' if is_word_modifier(&num) => {
+                                    self.buf.move_prev_word();
+                                }
+                                _ => {}
                             }
                             break;
                         }
@@ -880,6 +947,19 @@ impl Editor {
             match read_byte(self.in_fd)? {
                 Some(b'H') => self.buf.move_home(),
                 Some(b'F') => self.buf.move_end(),
+                _ => {}
+            }
+        } else {
+            // ESC-prefixed (Meta/Alt) word operations.
+            match b1 {
+                b'b' => {
+                    self.buf.move_prev_word();
+                }
+                b'f' => {
+                    self.buf.move_next_word();
+                }
+                b'd' => self.buf.delete_next_word(),
+                0x08 | 0x7f => self.buf.delete_prev_word(),
                 _ => {}
             }
         }
@@ -1024,6 +1104,106 @@ fn write_stdout(bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- word boundaries ----
+
+    #[test]
+    fn prev_word_boundary_skips_whitespace_then_word() {
+        assert_eq!(prev_word_boundary("", 0), 0);
+        assert_eq!(prev_word_boundary("hello", 0), 0);
+        assert_eq!(prev_word_boundary("hello", 5), 0);
+        assert_eq!(prev_word_boundary("hello", 3), 0);
+        assert_eq!(prev_word_boundary("foo bar", 7), 4);
+        // Trailing whitespace is skipped before the word is consumed.
+        assert_eq!(prev_word_boundary("foo bar   ", 10), 4);
+        assert_eq!(prev_word_boundary("foo   bar", 6), 0);
+        // Leading whitespace collapses to the start of the line.
+        assert_eq!(prev_word_boundary("   foo", 6), 3);
+        assert_eq!(prev_word_boundary("   foo", 3), 0);
+        // Tabs and newlines count as whitespace.
+        assert_eq!(prev_word_boundary("foo\tbar", 7), 4);
+        assert_eq!(prev_word_boundary("foo\nbar", 7), 4);
+    }
+
+    #[test]
+    fn prev_word_boundary_lands_on_char_boundaries() {
+        // "é" is two bytes; the returned offset must be sliceable.
+        let s = "héllo wörld";
+        let b = prev_word_boundary(s, s.len());
+        assert!(s.is_char_boundary(b));
+        assert_eq!(&s[b..], "wörld");
+        let b2 = prev_word_boundary(s, b);
+        assert_eq!(b2, 0);
+        // A non-ASCII separator (NBSP) is whitespace too.
+        let t = "foo\u{a0}bar";
+        let b3 = prev_word_boundary(t, t.len());
+        assert!(t.is_char_boundary(b3));
+        assert_eq!(&t[b3..], "bar");
+    }
+
+    #[test]
+    fn next_word_boundary_skips_whitespace_then_word() {
+        assert_eq!(next_word_boundary("", 0), 0);
+        assert_eq!(next_word_boundary("hello", 0), 5);
+        assert_eq!(next_word_boundary("hello", 5), 5);
+        assert_eq!(next_word_boundary("foo bar", 0), 3);
+        assert_eq!(next_word_boundary("foo bar", 3), 7);
+        assert_eq!(next_word_boundary("foo   bar", 3), 9);
+        assert_eq!(next_word_boundary("foo   ", 3), 6);
+        let s = "héllo wörld";
+        let b = next_word_boundary(s, 0);
+        assert!(s.is_char_boundary(b));
+        assert_eq!(&s[..b], "héllo");
+    }
+
+    #[test]
+    fn word_motions_and_deletes() {
+        let mut b = LineBuffer::new();
+        b.set_text("alpha beta gamma");
+        assert!(b.move_prev_word());
+        assert_eq!(b.cursor(), 11);
+        assert!(b.move_prev_word());
+        assert_eq!(b.cursor(), 6);
+        assert!(b.move_prev_word());
+        assert_eq!(b.cursor(), 0);
+        assert!(!b.move_prev_word());
+
+        assert!(b.move_next_word());
+        assert_eq!(b.cursor(), 5);
+        assert!(b.move_next_word());
+        assert_eq!(b.cursor(), 10);
+        assert!(b.move_next_word());
+        assert_eq!(b.cursor(), 16);
+        assert!(!b.move_next_word());
+
+        // Alt-Backspace at end of line eats the last word.
+        b.delete_prev_word();
+        assert_eq!(b.text(), "alpha beta ");
+        assert_eq!(b.cursor(), 11);
+
+        // Alt-D from the start eats the word ahead, cursor unmoved.
+        b.move_home();
+        b.delete_next_word();
+        assert_eq!(b.text(), " beta ");
+        assert_eq!(b.cursor(), 0);
+        b.delete_next_word();
+        assert_eq!(b.text(), " ");
+        // Nothing left but whitespace: the delete consumes it and stops.
+        b.delete_next_word();
+        assert_eq!(b.text(), "");
+        b.delete_next_word();
+        assert_eq!(b.text(), "");
+    }
+
+    #[test]
+    fn csi_word_modifier_detection() {
+        assert!(is_word_modifier("1;3")); // Alt
+        assert!(is_word_modifier("1;5")); // Ctrl
+        assert!(is_word_modifier("1;7")); // Ctrl+Alt
+        assert!(!is_word_modifier("1;2")); // Shift
+        assert!(!is_word_modifier("1"));
+        assert!(!is_word_modifier(""));
+    }
 
     // ---- LineBuffer ----
 
