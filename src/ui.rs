@@ -1552,6 +1552,10 @@ impl Agent<'_> {
         }
         let tail: Vec<Message> = self.session.transcript[tail_start..].to_vec();
         self.session.transcript = Vec::new();
+        // Off-path branches index into the transcript being replaced here, so
+        // they cannot survive the rewrite; drop them rather than let them
+        // point at the wrong messages (issue #65).
+        self.session.clear_branches();
         self.session.push(Message::user(format!(
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
@@ -2058,6 +2062,15 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/tree" => print!("{}", self.tree_view(self.color)),
+            "/fork" => match self.fork_branch(arg, self.color) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => println!("{e}"),
+            },
+            "/clone" => match self.clone_branch() {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => println!("{e}"),
+            },
             "/save" => match self.store.save(&mut self.session) {
                 Ok(id) => {
                     println!("saved session {}", &id[..8]);
@@ -2461,6 +2474,71 @@ impl Agent<'_> {
         };
         Ok(format!(
             "rolled back to {name}{note}; tail saved as \"{PRE_ROLLBACK_CHECKPOINT}\""
+        ))
+    }
+
+    /// Renders the session tree for `/tree` (issue #65).
+    fn tree_view(&self, color: bool) -> String {
+        crate::branch::render_tree(&self.session.tree(), color)
+    }
+
+    /// Forks the session at a previous user message (`/fork [n]`).
+    ///
+    /// `n` is a 1-based index into the fork points `/tree` lists (the real
+    /// user prompts on the active branch); with no argument the tree view is
+    /// returned instead, so the user can pick one. Forking rewinds the live
+    /// transcript to just before that prompt and keeps everything after it as
+    /// a sibling branch, so the next prompt explores a different path without
+    /// losing the old one.
+    ///
+    /// The new transcript is a strict *prefix* of the old one, so the engine's
+    /// token common-prefix probe still reuses the cached KV up to the fork
+    /// point — no KV bytes are copied or restored here.
+    fn fork_branch(&mut self, arg: &str, color: bool) -> Result<String, String> {
+        let mut tree = self.session.tree();
+        let points = tree.fork_points();
+        if points.is_empty() {
+            return Err("nothing to fork from yet; send a prompt first".to_owned());
+        }
+        if arg.is_empty() {
+            return Ok(self.tree_view(color).trim_end().to_owned());
+        }
+        let n: usize = arg
+            .parse()
+            .ok()
+            .filter(|n| (1..=points.len()).contains(n))
+            .ok_or_else(|| {
+                format!(
+                    "usage: /fork <1..{}> (see /tree for the fork points)",
+                    points.len()
+                )
+            })?;
+        let before = self.session.transcript.len();
+        tree.fork_at(points[n - 1])?;
+        self.session.set_tree(&tree);
+        self.last_ctx_used = 0;
+        let kept = self.session.transcript.len();
+        Ok(format!(
+            "forked at fork point {n}: {kept} of {before} messages kept (cached prefix reused); \
+the previous branch is still in /tree"
+        ))
+    }
+
+    /// Duplicates the active branch (`/clone`).
+    ///
+    /// The copy becomes the live transcript and is byte-identical to what it
+    /// was, so the engine's cached prefix stays valid in full; the original
+    /// branch is frozen where it stands and remains visible in `/tree`.
+    fn clone_branch(&mut self) -> Result<String, String> {
+        let mut tree = self.session.tree();
+        if tree.clone_active().is_none() {
+            return Err("nothing to clone yet; send a prompt first".to_owned());
+        }
+        self.session.set_tree(&tree);
+        let n = self.session.transcript.len();
+        Ok(format!(
+            "cloned the active branch ({n} messages, cached prefix reused in full); \
+the original is frozen and listed in /tree"
         ))
     }
 
@@ -4687,6 +4765,15 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/tree" => log.push_ansi(&self.tree_view(true)),
+            "/fork" => match self.fork_branch(arg, true) {
+                Ok(msg) => log.push_ansi(&msg),
+                Err(e) => log.push_plain(e),
+            },
+            "/clone" => match self.clone_branch() {
+                Ok(msg) => log.push_plain(msg),
+                Err(e) => log.push_plain(e),
+            },
             "/help" => {
                 for line in crate::config::usage().lines() {
                     log.push_plain(line.to_owned());
@@ -7276,6 +7363,116 @@ mod tests {
         // A new turn makes it dirty again, and it saves.
         agent.session.push(Message::user("another"));
         assert!(agent.save_for_exit().is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn branch_agent<'a>(dir: &std::path::Path, cfg: &'a crate::config::AgentConfig) -> Agent<'a> {
+        let mut agent = test_agent(dir, ScriptedEngine::default(), cfg);
+        agent.session.push(Message::user("first"));
+        agent.session.push(Message::assistant("a1"));
+        agent.session.push(Message::user("second"));
+        agent.session.push(Message::assistant("a2"));
+        agent
+    }
+
+    #[test]
+    fn fork_rewinds_to_a_user_message_and_keeps_the_old_branch() {
+        let dir = scratch_dir("fork-branch");
+        let cfg = test_cfg();
+        let mut agent = branch_agent(&dir, &cfg);
+
+        // Fork point 2 is "second"; forking there drops it and everything
+        // after from the live transcript.
+        let msg = agent.fork_branch("2", false).unwrap();
+        assert!(msg.contains("2 of 4 messages kept"), "{msg}");
+        assert_eq!(
+            agent
+                .session
+                .transcript
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "a1"]
+        );
+        // The forked-away turns survive as a branch, and the tree shows both.
+        assert_eq!(agent.session.branches.len(), 2);
+        let tree = agent.session.tree();
+        assert_eq!(tree.branch_count(), 2);
+        assert_eq!(tree.len(), 4);
+        let view = agent.tree_view(false);
+        assert!(view.contains("2 branches"), "{view}");
+
+        // Continuing writes into the new branch only.
+        agent.session.push(Message::user("second-prime"));
+        assert_eq!(agent.session.tree().branch_count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fork_rejects_out_of_range_and_missing_points() {
+        let dir = scratch_dir("fork-range");
+        let cfg = test_cfg();
+        let mut agent = branch_agent(&dir, &cfg);
+        assert!(agent.fork_branch("0", false).is_err());
+        assert!(agent.fork_branch("3", false).is_err());
+        assert!(agent.fork_branch("x", false).is_err());
+        // Nothing changed after a rejected fork.
+        assert_eq!(agent.session.transcript.len(), 4);
+        // No argument shows the tree instead of forking.
+        let shown = agent.fork_branch("", false).unwrap();
+        assert!(shown.contains("fork points"), "{shown}");
+        assert_eq!(agent.session.transcript.len(), 4);
+
+        let mut empty = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(empty.fork_branch("1", false).is_err());
+        assert!(empty.clone_branch().is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clone_duplicates_the_branch_and_leaves_the_transcript_identical() {
+        let dir = scratch_dir("clone-branch");
+        let cfg = test_cfg();
+        let mut agent = branch_agent(&dir, &cfg);
+        let before = agent.session.transcript.clone();
+
+        let msg = agent.clone_branch().unwrap();
+        assert!(msg.contains("4 messages"), "{msg}");
+        // Identical transcript: the engine's cached prefix stays valid in full.
+        assert_eq!(agent.session.transcript, before);
+        assert_eq!(agent.session.branches.len(), 4);
+        assert_eq!(agent.session.tree().branch_count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn branch_commands_round_trip_through_save_and_load() {
+        let dir = scratch_dir("branch-persist");
+        let cfg = test_cfg();
+        let mut agent = branch_agent(&dir, &cfg);
+        agent.fork_branch("2", false).unwrap();
+        agent.session.push(Message::user("second-prime"));
+        let id = agent.store.save(&mut agent.session).unwrap();
+
+        let loaded = agent.store.load(&id).unwrap();
+        assert_eq!(loaded.transcript, agent.session.transcript);
+        assert_eq!(loaded.branches, agent.session.branches);
+        assert_eq!(loaded.tree().branch_count(), 2);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn compaction_drops_branches_rather_than_leaving_them_dangling() {
+        let dir = scratch_dir("branch-compact");
+        let cfg = test_cfg();
+        let mut agent = branch_agent(&dir, &cfg);
+        agent.fork_branch("2", false).unwrap();
+        assert!(!agent.session.branches.is_empty());
+        agent.rebuild_after_compact("summary");
+        assert!(
+            agent.session.branches.is_empty(),
+            "branch parents index the transcript compaction just replaced"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

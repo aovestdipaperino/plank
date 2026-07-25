@@ -31,6 +31,9 @@
 //! msg <user|assistant> <byte-len>
 //! <message bytes>
 //! ...
+//! node <id> <parent-id|-> <user|assistant> <byte-len>
+//! <message bytes>
+//! ...
 //! meta <tag-byte-len> <last-prompt-byte-len>
 //! <tag bytes>
 //! <last prompt bytes>
@@ -41,6 +44,13 @@
 //! user prompt) at the end of the file so `list()` can read it with a
 //! bounded tail read instead of parsing the whole transcript; files written
 //! before it existed simply lack the record.
+//!
+//! The `msg` records are the session tree's *active branch*; the optional
+//! `node` records describe the off-path branches left by `/fork` and `/clone`
+//! (issue #65), numbering the active branch `0..n` and continuing from there.
+//! A linear session writes no `node` records at all, and a file without them
+//! loads as a single-branch tree — that is what keeps every pre-branching
+//! session readable.
 
 use std::error::Error;
 use std::fmt::{self, Write as _};
@@ -202,8 +212,15 @@ pub struct Session {
     pub created_at: u64,
     /// User-assigned tag shown in listings (`/tag`); empty when unset.
     pub tag: String,
-    /// Alternating role-tagged messages.
+    /// Alternating role-tagged messages: the *active branch* of the session
+    /// tree (issue #65). Every existing caller keeps treating this as the
+    /// whole conversation.
     pub transcript: Vec<Message>,
+    /// Off-path nodes of the session tree — the branches `/fork` and `/clone`
+    /// left behind ([`crate::branch`]). Empty for a linear session, in which
+    /// case nothing extra is written and the file stays byte-identical to one
+    /// written before branching existed.
+    pub branches: Vec<crate::branch::OffNode>,
     /// Model-visible task list (issue #35), persisted next to the transcript so
     /// it survives compaction, `/resume`, and checkpoint rollback.
     pub tasks: crate::tasks::TaskList,
@@ -221,6 +238,7 @@ impl Session {
             created_at: 0,
             tag: String::new(),
             transcript: Vec::new(),
+            branches: Vec::new(),
             tasks: crate::tasks::TaskList::new(),
             dirty: false,
         }
@@ -230,6 +248,30 @@ impl Session {
     pub fn push(&mut self, message: Message) {
         self.transcript.push(message);
         self.dirty = true;
+    }
+
+    /// The session as a tree: the active branch plus the off-path nodes.
+    #[must_use]
+    pub fn tree(&self) -> crate::branch::BranchTree {
+        crate::branch::BranchTree::from_parts(&self.transcript, &self.branches)
+    }
+
+    /// Replaces the transcript and off-path nodes from a tree, marking the
+    /// session dirty. The active branch becomes the live transcript.
+    pub fn set_tree(&mut self, tree: &crate::branch::BranchTree) {
+        let (path, off) = tree.into_parts();
+        self.transcript = path;
+        self.branches = off;
+        self.dirty = true;
+    }
+
+    /// Drops every off-path branch.
+    ///
+    /// Branch parents are transcript indices, so a wholesale transcript
+    /// rewrite (compaction) invalidates them; the branches are dropped rather
+    /// than left pointing at the wrong messages.
+    pub fn clear_branches(&mut self) {
+        self.branches.clear();
     }
 
     /// Total transcript size in bytes (listing shows this instead of tokens).
@@ -401,6 +443,24 @@ impl SessionStore {
             body.extend_from_slice(m.text.as_bytes());
             body.push(b'\n');
         }
+        // Session-tree records (issue #65): the active branch is already
+        // written above as plain `msg` records, so only the off-path nodes
+        // need describing. Omitted entirely for a linear session, keeping
+        // pre-branching files byte-identical.
+        let branches = crate::branch::canonicalize(&session.transcript, &session.branches);
+        for n in &branches {
+            let parent = n.parent.map_or_else(|| "-".to_owned(), |p| p.to_string());
+            let _ = writeln!(
+                body,
+                "node {} {parent} {} {}",
+                n.id,
+                n.message.role.tag(),
+                n.message.text.len()
+            );
+            body.extend_from_slice(n.message.text.as_bytes());
+            body.push(b'\n');
+        }
+        session.branches = branches;
         // Task list records (issue #35): omitted entirely when the list is
         // empty so pre-feature files stay byte-identical.
         if !session.tasks.is_empty() {
@@ -1141,6 +1201,44 @@ fn corrupt() -> SessionError {
     SessionError::new("invalid session file")
 }
 
+/// Reads a length-prefixed record body of `len` bytes plus its terminating
+/// newline, advancing `pos`.
+fn take_body(data: &[u8], pos: &mut usize, len: usize) -> Result<String> {
+    if data.len() < *pos + len + 1 || data[*pos + len] != b'\n' {
+        return Err(corrupt());
+    }
+    let s = String::from_utf8(data[*pos..*pos + len].to_vec()).map_err(|_| corrupt())?;
+    *pos += len + 1;
+    Ok(s)
+}
+
+/// Parses one `node <id> <parent|-> <role> <len>` record (the off-path nodes
+/// of the session tree, issue #65) and its body.
+fn parse_node_record(
+    header_rest: &str,
+    data: &[u8],
+    pos: &mut usize,
+) -> Result<crate::branch::OffNode> {
+    let mut it = header_rest.split(' ');
+    let id: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+    let parent = match it.next().ok_or_else(corrupt)? {
+        "-" => None,
+        v => Some(v.parse::<usize>().map_err(|_| corrupt())?),
+    };
+    let role = match it.next().ok_or_else(corrupt)? {
+        "user" => Role::User,
+        "assistant" => Role::Assistant,
+        _ => return Err(corrupt()),
+    };
+    let len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+    let text = take_body(data, pos, len)?;
+    Ok(crate::branch::OffNode {
+        id,
+        parent,
+        message: Message { role, text },
+    })
+}
+
 /// Parses the on-disk session format documented in the module docs.
 fn read_session_file(path: &Path) -> Result<Session> {
     let data = fs::read(path)?;
@@ -1168,22 +1266,22 @@ fn read_session_file(path: &Path) -> Result<Session> {
         .and_then(|l| l.strip_prefix("title ").map(str::to_owned))
         .and_then(|v| v.parse().ok())
         .ok_or_else(corrupt)?;
-    let take = |data: &[u8], pos: &mut usize, len: usize| -> Result<String> {
-        if data.len() < *pos + len + 1 || data[*pos + len] != b'\n' {
-            return Err(corrupt());
-        }
-        let s = String::from_utf8(data[*pos..*pos + len].to_vec()).map_err(|_| corrupt())?;
-        *pos += len + 1;
-        Ok(s)
-    };
+    let take = take_body;
     let title = take(&data, &mut pos, title_len)?;
 
     let mut transcript = Vec::new();
     let mut tag = String::new();
     let mut tasks: Vec<crate::tasks::Task> = Vec::new();
     let mut tasks_next_id: u32 = 0;
+    let mut branches: Vec<crate::branch::OffNode> = Vec::new();
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
+        // Session-tree off-path nodes (issue #65); absent in linear sessions
+        // and in every file written before branching existed.
+        if let Some(rest) = header.strip_prefix("node ") {
+            branches.push(parse_node_record(rest, &data, &mut pos)?);
+            continue;
+        }
         // Task list records (issue #35): a `tasks <next_id>` marker followed by
         // one `task <id> <status> <subject-len> <active-form-len>` record per
         // task. Files written before the feature simply lack them.
@@ -1234,12 +1332,16 @@ fn read_session_file(path: &Path) -> Result<Session> {
         transcript.push(Message { role, text });
     }
 
+    // Off-path nodes are a cache of structure, never trusted blindly: any
+    // node whose parent did not survive is dropped with its descendants.
+    let branches = crate::branch::canonicalize(&transcript, &branches);
     Ok(Session {
         id: String::new(),
         title,
         created_at,
         tag,
         transcript,
+        branches,
         tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
         dirty: false,
     })
@@ -1437,6 +1539,121 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// A session file exactly as plank wrote them before branching existed
+    /// (issue #65): magic, header, `msg` records, `meta` trailer — and no
+    /// `node` records at all.
+    const LEGACY_SESSION: &[u8] = b"plank-session 1\n\
+created 1700000000\n\
+used 1700000100\n\
+title 5\n\
+hello\n\
+msg user 5\n\
+hello\n\
+msg assistant 2\n\
+hi\n\
+meta 3 5\n\
+wip\n\
+hello\n";
+
+    #[test]
+    fn a_pre_branching_session_file_loads_as_a_single_branch_tree() {
+        let dir = temp_dir("legacyload");
+        let store = SessionStore::open(&dir).unwrap();
+        fs::write(dir.join("old-session.kv"), LEGACY_SESSION).unwrap();
+
+        let s = store.load("old-session").unwrap();
+        assert_eq!(s.title, "hello");
+        assert_eq!(s.created_at, 1_700_000_000);
+        assert_eq!(s.tag, "wip");
+        assert_eq!(s.transcript.len(), 2);
+        assert_eq!(s.transcript[0], Message::user("hello"));
+        assert_eq!(s.transcript[1], Message::assistant("hi"));
+        // The hard backward-compat requirement: no branches on disk, and the
+        // linear transcript reads back as a one-branch tree whose active path
+        // is the whole transcript.
+        assert!(s.branches.is_empty());
+        let tree = s.tree();
+        assert_eq!(tree.branch_count(), 1);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree.active_messages(), s.transcript);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_linear_session_writes_no_node_records() {
+        let dir = temp_dir("linearbytes");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hello"));
+        s.push(Message::assistant("hi"));
+        let id = store.save(&mut s).unwrap();
+        let bytes = fs::read(dir.join(format!("{id}.kv"))).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("\nnode "), "{text}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_forked_session_round_trips_its_branches() {
+        let dir = temp_dir("forkroundtrip");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("first"));
+        s.push(Message::assistant("a1"));
+        s.push(Message::user("second"));
+        s.push(Message::assistant("a2"));
+
+        let mut tree = s.tree();
+        tree.fork_at(2).unwrap();
+        tree.append(Message::user("second-prime"));
+        s.set_tree(&tree);
+        assert_eq!(s.transcript.len(), 3);
+        assert_eq!(s.branches.len(), 2);
+        let id = store.save(&mut s).unwrap();
+
+        let back = store.load(&id).unwrap();
+        assert_eq!(back.transcript, s.transcript);
+        assert_eq!(back.branches, s.branches);
+        let tree = back.tree();
+        assert_eq!(tree.branch_count(), 2);
+        assert_eq!(tree.len(), 5);
+        // The old branch is still reachable and still ends with "a2".
+        let old_tip = tree
+            .leaves()
+            .into_iter()
+            .find(|&n| tree.node(n).unwrap().message.text == "a2");
+        assert!(old_tip.is_some(), "the forked-away branch must survive");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_node_record_is_rejected_like_any_other_record() {
+        let dir = temp_dir("badnode");
+        let store = SessionStore::open(&dir).unwrap();
+        fs::write(
+            dir.join("bad-session.kv"),
+            b"plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 2\nhi\nnode 2 - bogus 1\nx\n",
+        )
+        .unwrap();
+        assert!(store.load("bad-session").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn node_records_with_dangling_parents_are_dropped_on_load() {
+        let dir = temp_dir("danglingnode");
+        let store = SessionStore::open(&dir).unwrap();
+        fs::write(
+            dir.join("dangle-session.kv"),
+            b"plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 2\nhi\nnode 9 7 user 4\nlost\n",
+        )
+        .unwrap();
+        let s = store.load("dangle-session").unwrap();
+        assert_eq!(s.transcript.len(), 1);
+        assert!(s.branches.is_empty(), "{:?}", s.branches);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
