@@ -478,6 +478,19 @@ fn tool_error_payload(preflight: bool, err: &str) -> String {
     }
 }
 
+/// Closes a `<think>` block the model left open when it stopped to call a tool.
+///
+/// The model emits a stanza mid-thought and generation ends there, so the
+/// recorded reply has no `</think>`. Appending one keeps the transcript
+/// well-formed before the `<tool_result>` user message; the chat template
+/// re-opens thinking on the next pass, so reasoning resumes. Cheap in KV terms:
+/// the divergence is at the very end of the reply, so only that tail reprefills.
+fn close_open_think(text: &mut String, ended_in_think: bool) {
+    if ended_in_think && !text.ends_with("</think>") {
+        text.push_str("</think>");
+    }
+}
+
 /// Builds the mid-stream edit preflight hook for a [`StreamRenderer`]: it
 /// validates an `edit` call's `old` selector against the file on disk the
 /// moment that parameter closes (the C's `agent_stream_preflight_closed_param`).
@@ -1007,6 +1020,7 @@ impl Agent<'_> {
         let mut stream = StreamRenderer::new(sink);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
+        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
@@ -1259,6 +1273,7 @@ impl Agent<'_> {
     ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
         let mut stream = StreamRenderer::new(NullSink);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
+        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         if !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -1314,11 +1329,14 @@ impl Agent<'_> {
             return Err("interrupted".to_string());
         }
         let finished = stream.finished();
+        let ended_in_think = finished.ended_in_think;
         if let Some(err) = preflight_error.as_deref().or(finished.error) {
             let payload = tool_error_payload(preflight_error.is_some(), err);
+            close_open_think(&mut assistant_text, ended_in_think);
             return Ok((Vec::new(), assistant_text, Some(payload)));
         }
         let calls = finished.calls.to_vec();
+        close_open_think(&mut assistant_text, ended_in_think);
         Ok((calls, assistant_text, None))
     }
 
@@ -1359,6 +1377,8 @@ impl Agent<'_> {
             let (stream, assistant_text, stats) =
                 self.stream_generation(&prompt_text, turn_start)?;
 
+            let mut assistant_text = assistant_text;
+            close_open_think(&mut assistant_text, stream.finished().ended_in_think);
             self.session.push(Message::assistant(assistant_text));
             let st = Status {
                 state: if stats.interrupted {
@@ -3027,6 +3047,9 @@ struct TurnOutput {
     /// partial output, answers the side question, and re-runs the pass.
     preempted: bool,
     assistant_text: String,
+    /// The pass ended with a `<think>` block still open (a tool call fired
+    /// mid-thought); the turn loop closes it before pushing the message.
+    ended_in_think: bool,
     calls: Vec<ToolCall>,
     error: Option<String>,
 }
@@ -4366,11 +4389,12 @@ impl Agent<'_> {
             }
             // Splice any suspended-and-resumed prefix back onto the final
             // continuation so the transcript holds the whole reply.
-            let assistant_text = if resumed_prefix.is_empty() {
+            let mut assistant_text = if resumed_prefix.is_empty() {
                 out.assistant_text
             } else {
                 format!("{resumed_prefix}{}", out.assistant_text)
             };
+            close_open_think(&mut assistant_text, out.ended_in_think);
             self.session.push(Message::assistant(assistant_text));
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
@@ -4583,6 +4607,7 @@ impl Agent<'_> {
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
+        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
@@ -4731,6 +4756,7 @@ impl Agent<'_> {
             interrupted,
             preempted,
             assistant_text,
+            ended_in_think: finished.ended_in_think,
             calls,
             error,
         })
@@ -8157,6 +8183,91 @@ mod tests {
             tool_result.contains("DSML syntax reminder:"),
             "got: {tool_result}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn close_open_think_appends_only_when_needed() {
+        let mut open = "let me check".to_string();
+        close_open_think(&mut open, true);
+        assert_eq!(open, "let me check</think>");
+
+        let mut closed = "done</think>answer".to_string();
+        close_open_think(&mut closed, false);
+        assert_eq!(closed, "done</think>answer");
+
+        // Already closed by the model on the final byte: no second tag.
+        let mut exact = "done</think>".to_string();
+        close_open_think(&mut exact, true);
+        assert_eq!(exact, "done</think>");
+    }
+
+    #[test]
+    fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-think-tool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec![
+                // A call fired mid-thought: no </think> before the stanza.
+                concat!(
+                    "<think>I should list the directory",
+                    "<｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"bash\">",
+                    "<｜DSML｜parameter name=\"command\">echo hello</｜DSML｜parameter｜>",
+                    "</｜DSML｜invoke｜>",
+                    "</｜DSML｜tool_calls｜>",
+                )
+                .to_string(),
+                "Done.\n".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            last_turn_interrupted: false,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            templates: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
+        };
+        agent.session.push(Message::user("go"));
+        agent.run_turn().unwrap();
+
+        // user, assistant(in-think call), user(tool result), assistant(final)
+        assert_eq!(agent.session.transcript.len(), 4);
+        let assistant = &agent.session.transcript[1].text;
+        assert!(
+            assistant.ends_with("</think>"),
+            "the open think block is closed before the tool result: {assistant:?}"
+        );
+        let result = &agent.session.transcript[2].text;
+        assert!(
+            result.contains("Tool result 1 (bash)"),
+            "the in-think call was dispatched: {result:?}"
+        );
+        assert!(result.contains("hello"), "{result:?}");
+        assert!(!result.contains("tool call ignored"), "{result:?}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
