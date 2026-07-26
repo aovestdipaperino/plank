@@ -7565,11 +7565,13 @@ mod tests {
     /// Regression: `/resume` replays a stored assistant message whose tool
     /// call was dispatched from inside `<think>`. The replay renderer must
     /// pick up `thinking_tool_calls` from settings the same way the live
-    /// turn paths do, or the banner is suppressed and history contradicts
-    /// itself: an "ignored" notice immediately followed by that call's
-    /// stored tool result.
+    /// turn paths do, or the stanza is flagged with an "ignored" notice
+    /// immediately followed by that call's own stored tool result. Under
+    /// default settings `show_tool_calls` is off, so this asserts what is
+    /// actually observable rather than the banner text (see
+    /// `bash_stanza_hides_dsml_and_shows_banner` in `viz.rs` for that case).
     #[test]
-    fn replay_history_shows_banner_for_in_think_tool_call() {
+    fn replay_history_consumes_in_think_tool_call_instead_of_ignoring_it() {
         let dir = scratch_dir("resume-replay-in-think");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -7594,6 +7596,19 @@ mod tests {
         let rendered: Vec<String> = text.lines.iter().map(line_text).collect();
         let joined = rendered.join("\n");
 
+        // Under default settings `ui.show_tool_calls` is false, so the banner
+        // itself legitimately does not render here — this pins down what
+        // *is* observable: the stanza was parsed and consumed as a tool call
+        // (thinking text survives, no raw DSML markup leaks), not printed
+        // verbatim or flagged as ignored.
+        assert!(
+            joined.contains("I should list the directory"),
+            "the thinking text preceding the call should still render: {joined:?}"
+        );
+        assert!(
+            !joined.contains("DSML"),
+            "the DSML stanza should be parsed away, not leaked verbatim: {joined:?}"
+        );
         assert!(
             !joined.contains("tool call ignored"),
             "the replay must not report the in-think call as ignored: {joined:?}"
