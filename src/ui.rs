@@ -1387,8 +1387,15 @@ impl Agent<'_> {
             // error to feed back to the model, not a user abort.
             let preflight_error = stream.preflight_error().map(str::to_owned);
             let finished = stream.finished();
-            let turn_continues =
-                !finished.calls.is_empty() || preflight_error.is_some() || finished.error.is_some();
+            let real_interrupt = stats.interrupted && preflight_error.is_none();
+            // A real interrupt lands regardless of what the parser made of
+            // the partial stanza it cut off (often an "incomplete DSML tool
+            // call" parse error): it never continues with a <tool_result>,
+            // so it must win over `finished.error` here.
+            let turn_continues = !real_interrupt
+                && (!finished.calls.is_empty()
+                    || preflight_error.is_some()
+                    || finished.error.is_some());
             close_open_think(
                 &mut assistant_text,
                 finished.ended_in_think && turn_continues,
@@ -1407,7 +1414,7 @@ impl Agent<'_> {
                 power_percent: self.power_percent,
                 ..Status::default()
             };
-            if stats.interrupted && preflight_error.is_none() {
+            if real_interrupt {
                 crate::interrupt::clear();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
@@ -4406,7 +4413,9 @@ impl Agent<'_> {
             } else {
                 format!("{resumed_prefix}{}", out.assistant_text)
             };
-            let turn_continues = !out.calls.is_empty() || out.error.is_some();
+            // A real interrupt never continues with a <tool_result>, even
+            // when the partial stanza it cut off reads as a parse error.
+            let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             self.session.push(Message::assistant(assistant_text));
             let _ = tx.send(UiEvent::EndLine);
@@ -8369,6 +8378,133 @@ mod tests {
         );
         assert!(result.contains("hello"), "{result:?}");
         assert!(!result.contains("tool call ignored"), "{result:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn interrupted_mid_think_stanza_leaves_block_open() {
+        // A user interrupt lands while a DSML stanza is being streamed inside
+        // <think>, cutting it off incomplete. The stream reports both
+        // `stats.interrupted` and a parse error for the truncated stanza —
+        // but a real interrupt never continues with a <tool_result>, so
+        // `close_open_think` must not append a synthetic `</think>` here
+        // (finding 1's second named case, distinct from parity-mode discard).
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-think-interrupt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec![
+                concat!(
+                    "<think>let me check",
+                    "<｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"bash\">",
+                    "<｜DSML｜parameter name=\"command\">echo hi",
+                )
+                .to_string(),
+            ],
+            interrupt_at: Some(0),
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            last_turn_interrupted: false,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            templates: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
+        };
+        agent.session.push(Message::user("go"));
+        agent.run_turn().unwrap();
+
+        assert!(agent.last_turn_interrupted);
+        // user, assistant(cut-off reply) — the turn stopped, no <tool_result>
+        // ever follows, so no synthetic </think> should have been appended.
+        assert_eq!(agent.session.transcript.len(), 2);
+        let assistant = &agent.session.transcript[1].text;
+        assert!(
+            !assistant.ends_with("</think>"),
+            "an interrupted stanza must not gain a synthetic close: {assistant:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn open_think_with_no_call_or_error_is_not_synthetically_closed() {
+        // The counterpart to `tool_call_inside_think_is_dispatched_and_the_
+        // block_is_closed`: the model stops with <think> still open but
+        // produces no DSML at all (no call, no parse error, no interrupt) —
+        // there is nothing to continue with, so `run_turn` must not append a
+        // synthetic </think> here either. This exercises the production gate
+        // in `run_turn` directly (not a re-derived copy), and would fail the
+        // same way a regression to unconditional `ended_in_think` would.
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-think-no-call-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec!["<think>nothing to do here, done for now".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let store = SessionStore::open(&dir).unwrap();
+        let mut agent = Agent {
+            engine: Box::new(engine),
+            cfg: &cfg,
+            session: Session::new(),
+            store,
+            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
+            reminder: SystemPromptReminder::new(),
+            power_percent: 0,
+            trace: Trace::open(None).unwrap(),
+            color: false,
+            show_footer: false,
+            editor_owns_footer: false,
+            last_ctx_used: 0,
+            last_turn_interrupted: false,
+            context_content: crate::context::ContextContent::new(),
+            skills: Vec::new(),
+            templates: Vec::new(),
+            agents: Vec::new(),
+            checkpoints: crate::checkpoint::CheckpointStore::new(),
+            remote: None,
+            ui_remote: None,
+            usage: SessionUsage::default(),
+            stats: SessionStats::default(),
+            session_start: std::time::Instant::now(),
+        };
+        agent.session.push(Message::user("go"));
+        agent.run_turn().unwrap();
+
+        // user, assistant(final) — the turn ended normally with no call and
+        // no tool result to follow.
+        assert_eq!(agent.session.transcript.len(), 2);
+        let assistant = &agent.session.transcript[1].text;
+        assert!(
+            !assistant.ends_with("</think>"),
+            "an open think block with nothing to continue must stay open: {assistant:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

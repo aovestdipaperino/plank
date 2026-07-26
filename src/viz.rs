@@ -1616,6 +1616,11 @@ mod tests {
         for sr in [run_chunked(&text), run_charwise(&text)] {
             let fin = sr.finished();
             assert!(fin.dsml_in_think);
+            // An ignored stanza must never surface as an executable call:
+            // if `feed_dsml_byte`'s `Done` arm ever syncs `self.calls` before
+            // checking `dsml_ignored` again, this call would leak through and
+            // the turn loop would dispatch it despite the "ignored" notice.
+            assert!(fin.calls.is_empty(), "{:?}", fin.calls);
             assert!(
                 sr.sink().visible.contains(
                     "[tool call ignored: tool calling is not allowed inside <think></think>]"
