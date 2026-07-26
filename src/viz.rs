@@ -1039,10 +1039,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         match self.parser.state() {
             DsmlState::Done => {
-                self.calls = self.parser.calls().to_vec();
                 if self.dsml_ignored {
+                    // A discarded in-think stanza must never surface as an
+                    // executable call: this parser instance is shared across
+                    // the whole stream, so leaving `self.calls` unset here
+                    // (rather than syncing it from the parser, which parsed
+                    // the ignored stanza too) keeps a prior real call intact
+                    // and never lets the ignored one leak into dispatch.
                     self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
                 } else {
+                    self.calls = self.parser.calls().to_vec();
                     self.viz_finish(None);
                     self.dsml_active = false;
                 }
@@ -1683,6 +1689,13 @@ mod tests {
         let closed = run_allowing_in_think(&format!("<think>done</think>{BASH_STANZA}"));
         assert!(!closed.finished().ended_in_think);
         assert!(!run_chunked("plain answer").finished().ended_in_think);
+
+        // A stanza inside a think block that then closes: the DSML marker
+        // sets `dsml_active` mid-block, but `</think>` still arrives before
+        // the stream ends, so the block is not open at finish.
+        let stanza_then_close =
+            run_allowing_in_think(&format!("<think>a{BASH_STANZA}</think>tail"));
+        assert!(!stanza_then_close.finished().ended_in_think);
     }
 
     #[test]

@@ -478,13 +478,18 @@ fn tool_error_payload(preflight: bool, err: &str) -> String {
     }
 }
 
-/// Closes a `<think>` block the model left open when it stopped to call a tool.
+/// Closes a `<think>` block the model left open when the turn is about to
+/// continue with a `<tool_result>` user message.
 ///
-/// The model emits a stanza mid-thought and generation ends there, so the
-/// recorded reply has no `</think>`. Appending one keeps the transcript
-/// well-formed before the `<tool_result>` user message; the chat template
-/// re-opens thinking on the next pass, so reasoning resumes. Cheap in KV terms:
-/// the divergence is at the very end of the reply, so only that tail reprefills.
+/// Callers pass `ended_in_think` already gated on whether the pass actually
+/// produced tool calls or a tool-error payload to feed back — never on
+/// `ended_in_think` alone. An in-think stanza that gets discarded (parity
+/// mode) or a stream cut short by user interrupt produces no continuation,
+/// so the C reference never appends `</think>` there either; appending one
+/// keeps the transcript well-formed only for the continuing case. The chat
+/// template re-opens thinking on the next pass, so reasoning resumes. Cheap
+/// in KV terms: the divergence is at the very end of the reply, so only that
+/// tail reprefills.
 fn close_open_think(text: &mut String, ended_in_think: bool) {
     if ended_in_think && !text.ends_with("</think>") {
         text.push_str("</think>");
@@ -1336,7 +1341,7 @@ impl Agent<'_> {
             return Ok((Vec::new(), assistant_text, Some(payload)));
         }
         let calls = finished.calls.to_vec();
-        close_open_think(&mut assistant_text, ended_in_think);
+        close_open_think(&mut assistant_text, ended_in_think && !calls.is_empty());
         Ok((calls, assistant_text, None))
     }
 
@@ -1378,7 +1383,16 @@ impl Agent<'_> {
                 self.stream_generation(&prompt_text, turn_start)?;
 
             let mut assistant_text = assistant_text;
-            close_open_think(&mut assistant_text, stream.finished().ended_in_think);
+            // A preflight stop reads as an engine interrupt, but it is a tool
+            // error to feed back to the model, not a user abort.
+            let preflight_error = stream.preflight_error().map(str::to_owned);
+            let finished = stream.finished();
+            let turn_continues =
+                !finished.calls.is_empty() || preflight_error.is_some() || finished.error.is_some();
+            close_open_think(
+                &mut assistant_text,
+                finished.ended_in_think && turn_continues,
+            );
             self.session.push(Message::assistant(assistant_text));
             let st = Status {
                 state: if stats.interrupted {
@@ -1393,9 +1407,6 @@ impl Agent<'_> {
                 power_percent: self.power_percent,
                 ..Status::default()
             };
-            // A preflight stop reads as an engine interrupt, but it is a tool
-            // error to feed back to the model, not a user abort.
-            let preflight_error = stream.preflight_error().map(str::to_owned);
             if stats.interrupted && preflight_error.is_none() {
                 crate::interrupt::clear();
                 let mut renderer = stream.into_sink().renderer;
@@ -1415,7 +1426,6 @@ impl Agent<'_> {
                 }
                 return Ok(());
             }
-            let finished = stream.finished();
             if let Some(err) = preflight_error.as_deref().or(finished.error) {
                 let payload = tool_error_payload(preflight_error.is_some(), err);
                 self.session.push(Message::user(format!(
@@ -4396,7 +4406,8 @@ impl Agent<'_> {
             } else {
                 format!("{resumed_prefix}{}", out.assistant_text)
             };
-            close_open_think(&mut assistant_text, out.ended_in_think);
+            let turn_continues = !out.calls.is_empty() || out.error.is_some();
+            close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             self.session.push(Message::assistant(assistant_text));
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
@@ -8256,6 +8267,40 @@ mod tests {
         let mut exact = "done</think>".to_string();
         close_open_think(&mut exact, true);
         assert_eq!(exact, "done</think>");
+    }
+
+    #[test]
+    fn close_open_think_skips_discarded_in_think_stanza() {
+        // Parity mode (`StreamRenderer` default: thinking tool calls not
+        // allowed): a stanza fired mid-thought is discarded, so the pass
+        // produces no calls and no continuation follows. The gate the three
+        // turn paths apply (`ended_in_think && turn_continues`) must not
+        // append a synthetic `</think>` here, or a parity-mode transcript
+        // gains a byte the C reference never produces.
+        const BASH_STANZA: &str = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls -la</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let mut stream = StreamRenderer::new(NullSink);
+        stream.push(format!("<think>let me look{BASH_STANZA}"));
+        stream.finish();
+        let finished = stream.finished();
+        assert!(finished.ended_in_think, "block should still be open");
+        assert!(finished.calls.is_empty(), "call must be discarded");
+
+        let turn_continues = !finished.calls.is_empty() || finished.error.is_some();
+        let mut assistant_text = format!("let me look{BASH_STANZA}");
+        close_open_think(
+            &mut assistant_text,
+            finished.ended_in_think && turn_continues,
+        );
+        assert!(
+            !assistant_text.ends_with("</think>"),
+            "got: {assistant_text}"
+        );
     }
 
     #[test]
