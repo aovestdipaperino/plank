@@ -296,6 +296,10 @@ pub struct Finished<'a> {
     pub error: Option<&'a str>,
     /// True when a DSML marker was seen inside a `<think>` block.
     pub dsml_in_think: bool,
+    /// True when the stream ended with a `<think>` block still open — the model
+    /// emitted a tool call mid-thought and stopped for the dispatch. The caller
+    /// closes the block in the transcript before appending the tool result.
+    pub ended_in_think: bool,
 }
 
 /// Streaming display state machine for assistant output.
@@ -367,6 +371,13 @@ pub struct StreamRenderer<S> {
     /// state) but never emitted to the sink. Gated by `ui.showThinking`;
     /// defaults true. See [`StreamRenderer::set_show_thinking`].
     show_thinking: bool,
+    /// When true, a DSML stanza opened inside `<think>` is parsed and dispatched
+    /// like any other. Defaults **false**, which is strict `refs/ds4` parity:
+    /// the stanza is discarded with a `[tool call ignored: ...]` notice.
+    /// Production wires this from `engine.thinkingToolCalls`, whose default is
+    /// the opposite (allow); the struct default stays parity so existing callers
+    /// and tests keep the C behavior unless they ask for otherwise.
+    thinking_tool_calls: bool,
 }
 
 /// Hook validating a partially-parsed tool call mid-stream.
@@ -414,6 +425,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             preflight_error: None,
             show_tool_calls: true,
             show_thinking: true,
+            thinking_tool_calls: false,
         }
     }
 
@@ -430,6 +442,14 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// emitted to the sink.
     pub fn set_show_thinking(&mut self, show: bool) {
         self.show_thinking = show;
+    }
+
+    /// Sets whether tool calls emitted inside `<think></think>` are dispatched
+    /// (default false = strict C parity). Production wires this from
+    /// `engine.thinkingToolCalls`. When false an in-think stanza is discarded
+    /// with a `[tool call ignored: ...]` notice, exactly as the C agent does.
+    pub fn set_thinking_tool_calls(&mut self, allow: bool) {
+        self.thinking_tool_calls = allow;
     }
 
     /// Installs the mid-stream preflight hook: called with the pending call
@@ -492,6 +512,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             calls: &self.calls,
             error,
             dsml_in_think: self.dsml_in_think,
+            ended_in_think: self.in_think,
         }
     }
 
@@ -1170,7 +1191,9 @@ impl<S: RenderSink> StreamRenderer<S> {
             let (mut complete, mut implicit_invoke) = (false, false);
             if dsml_start_match(&self.dsml_start_tail, &mut complete, &mut implicit_invoke) {
                 if complete {
-                    self.start_dsml(self.in_think);
+                    // Parity mode discards an in-think stanza; otherwise it is
+                    // an ordinary tool call that happens to sit inside a thought.
+                    self.start_dsml(self.in_think && !self.thinking_tool_calls);
                     if implicit_invoke {
                         for &b in CANONICAL_INVOKE {
                             self.feed_dsml_byte(b);
@@ -1262,7 +1285,11 @@ impl<S: RenderSink> StreamRenderer<S> {
                     self.dsml_active = false;
                 }
             }
-            if self.dsml_in_think && !self.dsml_in_think_reported {
+            // In allow mode, `dsml_in_think` is set by `note_thinking_dsml_byte`
+            // as soon as a real in-think stanza is detected, even though it
+            // dispatches normally instead of being ignored; guard against
+            // re-reporting a stanza that already completed via `Done`.
+            if self.dsml_in_think && !self.dsml_in_think_reported && !self.thinking_tool_calls {
                 self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
             }
         }
@@ -1592,6 +1619,70 @@ mod tests {
             );
             assert!(!sr.sink().think.contains("DSML"), "{:?}", sr.sink().think);
         }
+    }
+
+    fn run_allowing_in_think(text: &str) -> StreamRenderer<Cap> {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_thinking_tool_calls(true);
+        sr.push(text);
+        sr.finish();
+        sr
+    }
+
+    fn run_allowing_in_think_charwise(text: &str) -> StreamRenderer<Cap> {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_thinking_tool_calls(true);
+        for ch in text.chars() {
+            sr.push(ch.to_string());
+        }
+        sr.finish();
+        sr
+    }
+
+    #[test]
+    fn dsml_inside_think_is_executed_when_allowed() {
+        let text = format!("<think>{BASH_STANZA}</think>ok");
+        for sr in [
+            run_allowing_in_think(&text),
+            run_allowing_in_think_charwise(&text),
+        ] {
+            let fin = sr.finished();
+            assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
+            assert_eq!(fin.calls[0].name, "bash");
+            assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
+            assert!(fin.error.is_none(), "{:?}", fin.error);
+            assert!(
+                !sr.sink().visible.contains("[tool call ignored:"),
+                "{:?}",
+                sr.sink().visible
+            );
+            // The banner renders like any other tool call, and raw DSML never
+            // reaches either sink.
+            assert!(
+                sr.sink().visible.contains("🛠️ $ ls -la"),
+                "{:?}",
+                sr.sink().visible
+            );
+            assert!(
+                !sr.sink().visible.contains("DSML"),
+                "{:?}",
+                sr.sink().visible
+            );
+            assert!(!sr.sink().think.contains("DSML"), "{:?}", sr.sink().think);
+        }
+    }
+
+    #[test]
+    fn ended_in_think_reports_an_open_block() {
+        // A stanza fired mid-thought: the stream ends with <think> still open.
+        let sr = run_allowing_in_think(&format!("<think>let me look{BASH_STANZA}"));
+        assert!(sr.finished().ended_in_think);
+
+        // A closed block, and a stream that never thought at all, both report
+        // false.
+        let closed = run_allowing_in_think(&format!("<think>done</think>{BASH_STANZA}"));
+        assert!(!closed.finished().ended_in_think);
+        assert!(!run_chunked("plain answer").finished().ended_in_think);
     }
 
     #[test]
