@@ -406,6 +406,10 @@ pub struct McpServerConfig {
 enum Transport {
     Stdio(StdioTransport),
     Http(HttpTransport),
+    /// No wire at all: a server whose advertisement was restored from cache
+    /// because it failed to start. Rendered into the prompt like any other
+    /// server so Tier 1 stays byte-stable; every request fails immediately.
+    Offline,
 }
 
 struct StdioTransport {
@@ -525,6 +529,43 @@ impl McpServer {
         })
     }
 
+    /// Builds a server that renders into the prompt from a cached
+    /// advertisement but has no transport.
+    ///
+    /// Used when a globally-configured server fails to start: dropping it would
+    /// change the system prompt text and invalidate the Tier 1 KV snapshot, so
+    /// its last-known-good advertisement stands in and its tools report the
+    /// server as not running when called.
+    #[must_use]
+    pub fn offline(rec: &crate::tools::mcp_advert::AdvertRecord) -> Self {
+        Self {
+            name: rec.server.clone(),
+            tools: rec.tools.clone(),
+            instructions: rec.instructions.clone(),
+            resources: rec.resources.clone(),
+            transport: Transport::Offline,
+            alive: false,
+            next_id: 0,
+        }
+    }
+
+    /// True when this server is a cached-advertisement stand-in with no wire.
+    #[must_use]
+    pub fn is_offline(&self) -> bool {
+        matches!(self.transport, Transport::Offline)
+    }
+
+    /// Snapshots everything this server contributes to the system prompt.
+    #[must_use]
+    pub fn advert_record(&self) -> crate::tools::mcp_advert::AdvertRecord {
+        crate::tools::mcp_advert::AdvertRecord {
+            server: self.name.clone(),
+            instructions: self.instructions.clone(),
+            tools: self.tools.clone(),
+            resources: self.resources.clone(),
+        }
+    }
+
     /// True when the transport has not failed.
     #[must_use]
     pub fn alive(&self) -> bool {
@@ -545,6 +586,9 @@ impl McpServer {
     /// # Errors
     /// Returns a message on transport failure or a JSON-RPC `error` reply.
     fn request(&mut self, method: &str, params_json: &str) -> Result<Json, String> {
+        // Bound before the match: the match mutably borrows `self.transport`,
+        // so `self.name` is not readable inside an arm.
+        let name = self.name.clone();
         self.next_id += 1;
         let id = self.next_id;
         let mut req = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":");
@@ -561,6 +605,7 @@ impl McpServer {
                 resp
             }
             Transport::Http(t) => t.round_trip(&req, Some(id)),
+            Transport::Offline => Err(offline_error(&name)),
         }
     }
 
@@ -577,6 +622,7 @@ impl McpServer {
             // Streamable HTTP: a notification is a plain POST the server
             // acknowledges with 202 Accepted; any reply body is ignored.
             Transport::Http(t) => t.round_trip(&body, None).is_ok(),
+            Transport::Offline => false,
         }
     }
 
@@ -1097,13 +1143,18 @@ pub fn append_tool_schemas(out: &mut String, servers: &[McpServer]) {
 /// per connected server that provided a non-empty `instructions` field in
 /// its initialize response. Emits nothing when no server did.
 /// Appends the `mcp_list_resources` / `mcp_read_resource` schemas, but only
-/// when some live server advertises resources.
+/// when some server advertises resources.
 ///
 /// Gating on presence keeps the tools out of every prompt when nothing
 /// publishes resources, and keeps `build_tools_prompt(&[])` — the parity and
 /// fixture path — byte-unchanged.
 pub fn append_resource_tool_schemas(out: &mut String, servers: &[McpServer]) {
-    let any = servers.iter().any(|s| s.alive && !s.resources().is_empty());
+    // Deliberately NOT gated on `alive`: a server that flapped is represented
+    // by an offline shadow carrying its cached resources, and dropping these
+    // two schemas would move `fp1` — the exact Tier 1 miss the advertisement
+    // cache exists to prevent. `build_tools_prompt(&[])` is still unaffected,
+    // so the parity fixtures do not move.
+    let any = servers.iter().any(|s| !s.resources().is_empty());
     if !any {
         return;
     }
@@ -1203,6 +1254,18 @@ fn split_name(full_name: &str) -> Option<(&str, &str)> {
     let rest = full_name.strip_prefix("mcp__")?;
     let sep = rest.find("__")?;
     Some((&rest[..sep], &rest[sep + 2..]))
+}
+
+/// The error a call against a cached-advertisement server reports.
+///
+/// Phrased as a transient server problem, not a bad tool name: the model's
+/// recovery differs — a dead server means report it or work around it, an
+/// unknown tool means the name was wrong.
+fn offline_error(server: &str) -> String {
+    format!(
+        "MCP server \"{server}\" is not running (it failed to start this session). \
+         Its tools are unavailable."
+    )
 }
 
 /// Executes one `mcp__<server>__<tool>` call, mirroring `agent_tool_mcp_call`.
@@ -2114,6 +2177,77 @@ done
         let mut out2 = String::new();
         append_resource_tool_schemas(&mut out2, &without);
         assert!(out2.is_empty(), "no schemas without resources: {out2:?}");
+    }
+
+    // The feature works if and only if a shadow built from a live server's
+    // record renders byte-identically — same prompt text, same fp1, same
+    // sysprompt.kv hit. Everything else in this feature is decoration.
+    #[test]
+    fn an_offline_shadow_renders_byte_identically_to_the_live_server() {
+        let live = make_split_server();
+        let mut live_prompt = String::new();
+        append_tool_schemas(&mut live_prompt, std::slice::from_ref(&live));
+        append_resource_tool_schemas(&mut live_prompt, std::slice::from_ref(&live));
+        append_server_instructions(&mut live_prompt, std::slice::from_ref(&live));
+
+        let shadow = McpServer::offline(&live.advert_record());
+        let mut shadow_prompt = String::new();
+        append_tool_schemas(&mut shadow_prompt, std::slice::from_ref(&shadow));
+        append_resource_tool_schemas(&mut shadow_prompt, std::slice::from_ref(&shadow));
+        append_server_instructions(&mut shadow_prompt, std::slice::from_ref(&shadow));
+
+        assert_eq!(shadow_prompt, live_prompt);
+        assert_eq!(
+            crate::kvtier::system_fingerprint("m", &shadow_prompt),
+            crate::kvtier::system_fingerprint("m", &live_prompt),
+            "fp1 must not move across a flap"
+        );
+        assert!(shadow.is_offline());
+        assert!(
+            !shadow.alive(),
+            "a shadow must not accept resource completions"
+        );
+    }
+
+    // A record survives instructions too, which land in their own prompt block.
+    #[test]
+    fn a_shadow_reproduces_server_instructions() {
+        let mut live = make_split_server();
+        live.instructions = "Call alpha before omega.".to_string();
+        let shadow = McpServer::offline(&live.advert_record());
+        let mut out = String::new();
+        append_server_instructions(&mut out, std::slice::from_ref(&shadow));
+        assert!(out.contains("## demo"), "{out}");
+        assert!(out.contains("Call alpha before omega."), "{out}");
+    }
+
+    // The resource-derived tool schemas are gated on *some* server having
+    // resources. Gating that on `alive` too would drop two tool schemas from
+    // Tier 1 the moment the only resource-bearing server flapped — exactly the
+    // miss this feature exists to prevent.
+    #[test]
+    fn resource_tool_schemas_survive_a_flap_of_the_resource_bearing_server() {
+        let live = server_with_resources("res", vec![res("file:///a", "a", "text/plain")]);
+        let mut live_prompt = String::new();
+        append_resource_tool_schemas(&mut live_prompt, std::slice::from_ref(&live));
+        assert!(live_prompt.contains("mcp_list_resources"), "baseline");
+
+        let shadow = McpServer::offline(&live.advert_record());
+        let mut shadow_prompt = String::new();
+        append_resource_tool_schemas(&mut shadow_prompt, std::slice::from_ref(&shadow));
+        assert_eq!(shadow_prompt, live_prompt);
+    }
+
+    // The message is built from a `\`-continued literal; the continuation must
+    // leave exactly one space before "Its", not a run of indentation.
+    #[test]
+    fn offline_error_message_has_no_indentation_run() {
+        let msg = offline_error("demo");
+        assert!(
+            msg.contains("this session). Its tools are unavailable."),
+            "{msg}"
+        );
+        assert!(!msg.contains("  "), "no double space: {msg:?}");
     }
 
     #[test]
