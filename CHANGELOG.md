@@ -16,10 +16,11 @@ Beta patch bump on the 2.6 series.
   prompt and force the most expensive re-prefill there is. plank now remembers
   each global server's last successful tool advertisement under
   `~/.plank/mcp-advert/` and renders it when that server cannot start, keeping
-  the prompt byte-identical and the cache warm. Startup says which server is
-  running on cached definitions, and calling one of its tools reports the server
-  as not running rather than the tool as unknown — the two need different
-  recovery. Project-local servers are untouched: they key the cheap Tier 2 and
+  the prompt byte-identical and the cache warm. Startup names the server it is
+  serving from cache and warns that its tools will report it as down, `/mcp`
+  shows the same alongside the cached tool count, and calling one of those tools
+  reports the server as not running rather than the tool as unknown — the two
+  need different recovery. Project-local servers are untouched: they key the cheap Tier 2 and
   never get cached definitions, so a project prompt cannot advertise a dead tool.
   Records are dropped when the server leaves `~/.plank/.mcp.json`, and never
   when that file is merely unreadable.
