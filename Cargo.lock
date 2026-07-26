@@ -487,9 +487,9 @@ dependencies = [
 
 [[package]]
 name = "crt-off"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9df811a2bc3c943d89e3a6083d78240ad8631037e3aaebaad18db6d5f4d966"
+checksum = "6e0ff760e201f127001706ed83543aed3fe3c35423a909253011b3a3a5e53c85"
 dependencies = [
  "crossterm",
  "image",

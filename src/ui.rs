@@ -3303,7 +3303,10 @@ impl Agent<'_> {
                 hold_secs: 0.0,
                 vstretch_secs: 0.35,
                 hstretch_secs: 0.25,
-                dot_fade_secs: 0.2,
+                // Long enough that the phosphor dot visibly dims away instead
+                // of blinking out: crt-off ramps its brightness linearly to
+                // black across this window.
+                dot_fade_secs: 0.9,
                 black_secs: 0.1,
                 fps: 60.0,
             };
