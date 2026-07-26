@@ -8,6 +8,16 @@
 //! [`Glyph`]s. The frog hops between whole rows (that is the feel of the game)
 //! but everything it dodges or rides moves continuously.
 
+// Every numeric conversion in this file turns a board index or a small
+// dimension constant into `f32` for the geometry, or back for an array index.
+// The board is a couple of dozen cells across; none of these can lose a bit.
+// Declared once rather than as a per-function allow on nearly every function.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 
 use super::{GLIDE_MS, Glyph, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};

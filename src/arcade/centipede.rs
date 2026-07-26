@@ -9,6 +9,16 @@
 //! on a **discrete grid**, because a centipede that turns on a mushroom has to
 //! agree with the player about where that mushroom is.
 
+// Every numeric conversion in this file turns a board index or a small
+// dimension constant into `f32` for the geometry, or back for an array index.
+// The board is a couple of dozen cells across; none of these can lose a bit.
+// Declared once rather than as a per-function allow on nearly every function.
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 
 use super::{GLIDE_MS, Glyph, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};
@@ -412,12 +422,15 @@ impl Centipede {
     }
 
     /// Walks every segment one cell, turning down at a wall or a mushroom.
+    #[allow(clippy::cast_possible_wrap)] // COLS is 30; nothing here can wrap
     fn crawl(&mut self) {
         for i in 0..self.body.len() {
             let seg = self.body[i];
-            let next = i64::from(seg.dir) + seg.col as i64;
-            let blocked =
-                next < 0 || next >= COLS as i64 || self.shrooms[seg.row * COLS + next as usize] > 0;
+            // Signed arithmetic on purpose: the step off column 0 going left is
+            // the wall test, and it has to be representable to be tested.
+            let next = isize::from(seg.dir) + seg.col as isize;
+            let blocked = !(0..COLS as isize).contains(&next)
+                || self.shrooms[seg.row * COLS + next.unsigned_abs()] > 0;
             if blocked {
                 // Down one row and back the other way; off the bottom, wrap to
                 // the top so the game never simply runs out of centipede.
