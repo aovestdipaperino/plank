@@ -481,6 +481,24 @@ impl SessionStore {
         removed
     }
 
+    /// The system-prompt text the last Tier 1 checkpoint was built from, or
+    /// `None` when no sidecar has been written yet (first run, or a cleared
+    /// cache). Used only to explain a Tier 1 miss — never to validate a cache.
+    #[must_use]
+    pub fn system_prompt_note(&self) -> Option<String> {
+        fs::read_to_string(self.dir.join(SYSPROMPT_NOTE_NAME)).ok()
+    }
+
+    /// Records `system` as the prompt text behind the current Tier 1
+    /// checkpoint.
+    ///
+    /// # Errors
+    /// Returns the underlying [`io::Error`] when the write fails. Best-effort:
+    /// losing the sidecar costs only the explanation on the next miss.
+    pub fn store_system_prompt_note(&self, system: &str) -> io::Result<()> {
+        fs::write(self.dir.join(SYSPROMPT_NOTE_NAME), system)
+    }
+
     /// Filesystem location backing a [`KvKey`].
     fn kv_path(&self, key: &KvKey) -> PathBuf {
         match key {
@@ -797,6 +815,13 @@ const SYSPROMPT_STEM: &str = "sysprompt";
 /// File-name prefix of a content-keyed system-prompt checkpoint,
 /// `sysprompt-<fp1>.kv`.
 const SYSPROMPT_PREFIX: &str = "sysprompt-";
+
+/// Sidecar holding the system-prompt text that the most recent Tier 1
+/// checkpoint was built from. Deliberately *not* keyed by `fp1` — a changed
+/// prompt yields a different key, so the point of this file is to be findable
+/// after the fingerprint has already moved. Its name ends in `.prompt`, not
+/// `.kv`, so [`SessionStore::gc_system_checkpoints`] leaves it alone.
+const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
 /// `project-<fp2>.kv`, living under the per-project subdirectory.

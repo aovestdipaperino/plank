@@ -438,9 +438,6 @@ fn write_ansi_diff_line(
 /// CR/NL from MCP tool schemas — are stripped, and long lines are truncated
 /// with `…`). Built on the same [`edit_preview`] machinery as the code-diff
 /// cards. Returns `None` when the texts are identical.
-// Consumed only by the ds4_engine warm-up path; the echo-only build (CI) has no
-// caller, so silence dead_code there. Tests exercise it in every configuration.
-#[cfg_attr(not(ds4_engine), allow(dead_code))]
 #[must_use]
 pub fn first_change_snippet(old: &str, new: &str, max_lines: usize) -> Option<String> {
     const WIDTH: usize = 80;

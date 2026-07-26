@@ -4,6 +4,21 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.1] - 2026-07-26
+
+Beta patch bump on the 2.6 series.
+
+### Added
+
+- A system-prompt cache miss now explains itself. Tier 1 is the priciest prefix
+  to rebuild — everything below it re-prefills too — so instead of silently
+  re-prefilling, plank reports that the system prompt changed and shows the
+  first few differing lines, diffed against the prompt text behind the previous
+  checkpoint. A benign cause (a ticking MCP tool count, a new date) is obvious
+  at a glance. The comparison text lives in a `sysprompt-last.prompt` sidecar
+  that is only ever used to explain a miss, never to validate a cache, and it
+  is refreshed only after a rebuild actually completes.
+
 ## [2.6.0] - 2026-07-25
 
 Stable release: the 2.5 beta line promoted. Two visible fixes to how a turn's

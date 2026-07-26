@@ -34,6 +34,11 @@ use crate::session::KvKey;
 use crate::session::SessionStore;
 use crate::session::tier_fingerprint;
 
+/// Changed lines shown in the first-change snippet that explains a Tier 1
+/// (system-prompt) cache miss. Small on purpose: the point is to recognize the
+/// change, not to read the whole diff.
+const SYSPROMPT_SNIPPET_LINES: usize = 6;
+
 /// Which volatility tier a [`TierSpec`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TierKind {
@@ -244,6 +249,22 @@ pub fn warm(
         ));
     }
 
+    // A Tier 1 miss is the expensive one — the system prompt is the largest
+    // prefix and everything below it re-prefills too — so explain it before the
+    // bar starts moving, diffing against the prompt text behind the previous
+    // checkpoint so a benign change (a ticking MCP tool count, a new date) is
+    // obvious at a glance. Only Tier 1 gets this treatment: the cheaper tiers
+    // are not worth a sidecar of their own.
+    if resume == 0
+        && let Some(old) = store.and_then(SessionStore::system_prompt_note)
+        && let Some(snip) =
+            crate::tools::diff::first_change_snippet(&old, &system.text, SYSPROMPT_SNIPPET_LINES)
+    {
+        on_event(EngineEvent::Notice(format!(
+            "system prompt changed; rebuilding cache\n{snip}"
+        )));
+    }
+
     // Extend: prefill each remaining tier, persisting cacheable ones at their
     // own boundary. A snapshot captures the *whole* session, so the capture
     // must happen while the cursor sits at the end of this tier and no further
@@ -282,6 +303,14 @@ pub fn warm(
             // trusting `cache.transcript()` for these.
             let _ = store.kv_store(key, &cache);
         }
+    }
+    // Refresh the sidecar only after a Tier 1 rebuild actually completed: a
+    // prefill that fails leaves no new checkpoint, so the *old* text is still
+    // the one the next launch will be missing against.
+    if resume == 0
+        && let Some(store) = store
+    {
+        let _ = store.store_system_prompt_note(&system.text);
     }
     Ok(prefilled)
 }
@@ -653,6 +682,102 @@ mod warm_tests {
         assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_some());
         assert!(store.kv_load(tiers[1].key.as_ref().unwrap()).is_some());
         assert_eq!(tiers[2].key, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system prompt is the priciest prefix to rebuild, so a Tier 1 miss
+    /// must say *what changed* rather than silently re-prefilling: the first
+    /// cold warm records the prompt text, and the next warm with a different
+    /// prompt diffs against it.
+    #[test]
+    fn a_changed_system_prompt_reports_the_first_change() {
+        let (store, dir) = spy_store("sysdiff");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        // First run: nothing to diff against, so no notice — but the prompt text
+        // is recorded for next time.
+        let mut notices = Vec::new();
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers_for("You are plank. Tools: 7", "", ""),
+            &mut |ev| {
+                if let crate::engine::EngineEvent::Notice(m) = ev {
+                    notices.push(m);
+                }
+            },
+        )
+        .unwrap();
+        assert!(notices.is_empty(), "first run has nothing to compare");
+        assert_eq!(
+            store.system_prompt_note().as_deref(),
+            Some("You are plank. Tools: 7")
+        );
+
+        // Second run, one character different: the notice names the change and
+        // carries a -/+ pair the warm-up display colors like a diff card.
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers_for("You are plank. Tools: 8", "", ""),
+            &mut |ev| {
+                if let crate::engine::EngineEvent::Notice(m) = ev {
+                    notices.push(m);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(notices.len(), 1, "one notice for the changed prompt");
+        let msg = &notices[0];
+        assert!(
+            msg.starts_with("system prompt changed; rebuilding cache\n"),
+            "{msg}"
+        );
+        assert!(
+            msg.lines()
+                .any(|l| l.starts_with("- ") && l.contains("Tools: 7")),
+            "{msg}"
+        );
+        assert!(
+            msg.lines()
+                .any(|l| l.starts_with("+ ") && l.contains("Tools: 8")),
+            "{msg}"
+        );
+        assert_eq!(
+            store.system_prompt_note().as_deref(),
+            Some("You are plank. Tools: 8"),
+            "the sidecar advances to the prompt just cached"
+        );
+
+        // Third run, unchanged: a Tier 1 hit, so no notice at all.
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut e,
+            Some(&store),
+            &tiers_for("You are plank. Tools: 8", "", ""),
+            &mut |ev| {
+                if let crate::engine::EngineEvent::Notice(m) = ev {
+                    notices.push(m);
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(notices.len(), 1, "a hit explains nothing");
+        assert_eq!(
+            e.synced,
+            Vec::<Option<String>>::new(),
+            "nothing re-prefilled"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
