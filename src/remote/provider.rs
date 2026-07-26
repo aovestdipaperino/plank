@@ -729,6 +729,15 @@ pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11"
 /// the whole cached prefix. The 1h tier costs 2x base input on the *write* (vs
 /// 1.25x for 5m) but keeps reads at 0.1x, a clear win when turns are re-read
 /// far more often than the prefix changes. Requires [`EXTENDED_CACHE_TTL_BETA`].
+/// Whether this key marks an endpoint that must not receive `top_p`.
+///
+/// A key carrying the `DEADBEEF` sentinel denotes a mock or stubbed provider
+/// rather than a real one, so the sampling parameter is left off the wire.
+/// The match is literal and case-sensitive: only the exact sentinel counts.
+fn key_omits_top_p(api_key: &str) -> bool {
+    api_key.contains("DEADBEEF")
+}
+
 fn cache_control() -> serde_json::Value {
     serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
 }
@@ -1014,6 +1023,18 @@ impl ProviderEngine {
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
     /// prompt (e.g. compaction) becomes a single user message with no tools.
     fn request_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
+        let mut body = self.body_for(prompt, opts);
+        // Sentinel keys mark a mock endpoint that rejects `top_p`.
+        if key_omits_top_p(&self.api_key)
+            && let Some(obj) = body.as_object_mut()
+        {
+            obj.remove("top_p");
+        }
+        body
+    }
+
+    /// The provider-shaped request body, before any key-driven filtering.
+    fn body_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
         match (self.kind, prompt) {
             (ProviderKind::OpenAi, Prompt::Structured(turn)) => {
                 build_openai_request(&self.model, turn.system, turn.messages, turn.tools, opts)
@@ -1424,6 +1445,36 @@ mod tests {
         assert_eq!(body["messages"][0]["role"], "tool");
         assert_eq!(body["messages"][0]["tool_call_id"], "call_1");
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    // A DEADBEEF sentinel key marks a mock endpoint, so `top_p` is dropped
+    // from the wire body for both providers; every other param survives, and
+    // an ordinary key keeps `top_p`.
+    #[test]
+    fn deadbeef_key_omits_top_p() {
+        let opts = GenerationOptions::default();
+        for kind in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
+            let mock = ProviderEngine::new(
+                kind,
+                None,
+                "sk-test-DEADBEEF-01".into(),
+                "m".into(),
+                0,
+                true,
+            )
+            .unwrap();
+            let body = mock.request_for(Prompt::Flat("hi"), &opts);
+            assert!(body.get("top_p").is_none(), "{kind:?} must omit top_p");
+            assert!(
+                body.get("temperature").is_some(),
+                "{kind:?} kept temperature"
+            );
+
+            let real =
+                ProviderEngine::new(kind, None, "sk-live-01".into(), "m".into(), 0, true).unwrap();
+            let body = real.request_for(Prompt::Flat("hi"), &opts);
+            assert!(body.get("top_p").is_some(), "{kind:?} must send top_p");
+        }
     }
 
     // A missing key falls back to DUMMY so key-less endpoints (local ollama,
