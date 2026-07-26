@@ -1029,29 +1029,96 @@ pub fn local_tool_defs(
         .collect()
 }
 
+/// Names of global servers eligible for an advertisement record: declared in
+/// `~/.plank/.mcp.json` and not overridden by, or defined in, the local config.
+///
+/// A local entry shadowing a global name resolves to the local definition in
+/// [`merge_configs`], so that server is local for this session and keys Tier 2
+/// rather than Tier 1.
+#[must_use]
+pub fn global_eligible_names(local_path: Option<&Path>) -> Vec<String> {
+    let local = local_server_names(local_path);
+    global_config_names()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|n| !local.iter().any(|l| l == n))
+        .collect()
+}
+
 /// Loads the config hierarchy, spawns and handshakes each server.
 ///
-/// Mirrors `agent_mcp_load_and_start`: a server that cannot start or
-/// handshake is reported to stderr and skipped rather than aborting the
-/// whole agent. `path` overrides the local config location; the global
-/// `~/.plank/.mcp.json` always applies underneath (see
+/// Mirrors `agent_mcp_load_and_start`, with one addition: a global server that
+/// cannot start is replaced by an offline shadow built from its cached
+/// advertisement, so the system prompt — and hence the Tier 1 KV snapshot —
+/// stays byte-identical across a flap. `path` overrides the local config
+/// location; the global `~/.plank/.mcp.json` always applies underneath (see
 /// [`config_load_hierarchy`]).
 #[must_use]
 pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
-    start_servers(config_load_hierarchy(path))
+    let eligible = global_eligible_names(path);
+    let root = crate::tools::mcp_advert::default_root();
+    // Prune only against the *global* config, and only when it parsed: a
+    // missing or unreadable config must not read as "every server deleted".
+    if let (Some(root), Some(names)) = (root.as_deref(), global_config_names()) {
+        crate::tools::mcp_advert::prune(root, &names);
+    }
+    let mut start = |cfg: &McpServerConfig| -> Result<McpServer, String> {
+        let mut s = McpServer::spawn(cfg)?;
+        s.handshake(cfg.primary_tools.as_deref())?;
+        Ok(s)
+    };
+    start_servers_with(
+        config_load_hierarchy(path),
+        &eligible,
+        root.as_deref(),
+        &mut start,
+    )
 }
 
-/// Spawns and handshakes each configured server, dropping failures.
-fn start_servers(configs: Vec<McpServerConfig>) -> Vec<McpServer> {
+/// Starts each configured server, substituting a cached advertisement for a
+/// failed global one.
+///
+/// `start` is injected so tests can simulate handshake failures without a real
+/// subprocess. A shadow is pushed at the failing config's own index, never
+/// appended: `append_tool_schemas` iterates in order, so position is part of
+/// the prompt bytes.
+fn start_servers_with(
+    configs: Vec<McpServerConfig>,
+    global_eligible: &[String],
+    advert_root: Option<&Path>,
+    start: &mut dyn FnMut(&McpServerConfig) -> Result<McpServer, String>,
+) -> Vec<McpServer> {
     let mut servers = Vec::new();
     for cfg in configs {
-        let started = McpServer::spawn(&cfg).and_then(|mut s| {
-            s.handshake(cfg.primary_tools.as_deref())?;
-            Ok(s)
-        });
-        match started {
-            Ok(s) => servers.push(s),
-            Err(err) => eprintln!("plank: MCP server \"{}\" unavailable: {err}", cfg.name),
+        let eligible = global_eligible.iter().any(|n| n == &cfg.name);
+        match start(&cfg) {
+            Ok(s) => {
+                if eligible && let Some(root) = advert_root {
+                    // Best-effort: a record that cannot be written just means
+                    // no shadow is available on the next flap.
+                    let _ = crate::tools::mcp_advert::save(root, &s.advert_record());
+                }
+                servers.push(s);
+            }
+            Err(err) => {
+                let cached = if eligible {
+                    advert_root.and_then(|root| crate::tools::mcp_advert::load(root, &cfg.name))
+                } else {
+                    None
+                };
+                match cached {
+                    Some(rec) => {
+                        eprintln!(
+                            "plank: MCP server \"{}\" unavailable: {err} — using cached tool definitions to preserve the prompt cache",
+                            cfg.name
+                        );
+                        servers.push(McpServer::offline(&rec));
+                    }
+                    None => {
+                        eprintln!("plank: MCP server \"{}\" unavailable: {err}", cfg.name);
+                    }
+                }
+            }
         }
     }
     servers
@@ -1467,6 +1534,156 @@ mod tests {
         ));
         std::fs::write(&path, contents).expect("write test config");
         path
+    }
+
+    /// The pre-shadow `start_servers` behaviour: spawn + handshake, drop
+    /// failures, consult no advertisement store. Kept as a test helper so the
+    /// existing startup tests stay unchanged.
+    fn start_servers(configs: Vec<McpServerConfig>) -> Vec<McpServer> {
+        let mut start = |cfg: &McpServerConfig| -> Result<McpServer, String> {
+            let mut s = McpServer::spawn(cfg)?;
+            s.handshake(cfg.primary_tools.as_deref())?;
+            Ok(s)
+        };
+        start_servers_with(configs, &[], None, &mut start)
+    }
+
+    fn cfg_named(name: &str) -> McpServerConfig {
+        McpServerConfig {
+            name: name.to_string(),
+            command: "cat".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }
+    }
+
+    fn advert_temp_root(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "plank_advert_start_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).expect("create root");
+        root
+    }
+
+    /// A named server, one primary tool, for ordering assertions.
+    fn one_tool_server(name: &str) -> McpServer {
+        let mut s = McpServer::spawn(&cfg_named(name)).expect("spawn cat");
+        s.tools = vec![McpTool {
+            name: "t".to_string(),
+            description: "Tool.".to_string(),
+            schema_json: "{\"type\":\"object\",\"properties\":{}}".to_string(),
+            primary: true,
+        }];
+        s
+    }
+
+    // Position is part of the prompt bytes: `append_tool_schemas` iterates
+    // `servers` in order, so a shadow appended at the end instead of
+    // substituted in place produces a reordered prompt that hits no cache
+    // while looking like it worked.
+    #[test]
+    fn a_shadow_takes_the_failed_servers_place_in_order() {
+        let root = advert_temp_root("order");
+        for name in ["a", "b", "c"] {
+            assert!(crate::tools::mcp_advert::save(
+                &root,
+                &one_tool_server(name).advert_record()
+            ));
+        }
+        let names = ["a".to_string(), "b".to_string(), "c".to_string()];
+        let configs: Vec<McpServerConfig> = names.iter().map(|n| cfg_named(n)).collect();
+
+        let mut all_live = |c: &McpServerConfig| Ok(one_tool_server(&c.name));
+        let live = start_servers_with(configs.clone(), &names, Some(&root), &mut all_live);
+        let mut live_prompt = String::new();
+        append_tool_schemas(&mut live_prompt, &live);
+
+        // "b" fails; its cached advertisement must appear where "b" was.
+        let mut b_fails = |c: &McpServerConfig| {
+            if c.name == "b" {
+                Err("boom".to_string())
+            } else {
+                Ok(one_tool_server(&c.name))
+            }
+        };
+        let flapped = start_servers_with(configs, &names, Some(&root), &mut b_fails);
+        assert_eq!(
+            flapped.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["a", "b", "c"]
+        );
+        assert!(flapped[1].is_offline());
+        let mut flapped_prompt = String::new();
+        append_tool_schemas(&mut flapped_prompt, &flapped);
+        assert_eq!(flapped_prompt, live_prompt);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_successful_handshake_refreshes_the_record_for_global_servers_only() {
+        let root = advert_temp_root("refresh");
+        let mut ok = |c: &McpServerConfig| Ok(one_tool_server(&c.name));
+        start_servers_with(
+            vec![cfg_named("glob"), cfg_named("loc")],
+            &["glob".to_string()],
+            Some(&root),
+            &mut ok,
+        );
+        assert!(
+            crate::tools::mcp_advert::load(&root, "glob").is_some(),
+            "a global server records its advertisement"
+        );
+        assert!(
+            crate::tools::mcp_advert::load(&root, "loc").is_none(),
+            "a local server must never get a record"
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_failure_without_a_usable_record_is_dropped_as_before() {
+        let root = advert_temp_root("norecord");
+        let mut fails = |_: &McpServerConfig| Err("boom".to_string());
+
+        // Global-eligible but never recorded: nothing to stand in with.
+        let out = start_servers_with(
+            vec![cfg_named("glob")],
+            &["glob".to_string()],
+            Some(&root),
+            &mut fails,
+        );
+        assert!(out.is_empty());
+
+        // Recorded, but the server is not global-eligible (it is local, or is a
+        // local entry shadowing a global name): the record is not consulted.
+        assert!(crate::tools::mcp_advert::save(
+            &root,
+            &one_tool_server("loc").advert_record()
+        ));
+        let out = start_servers_with(vec![cfg_named("loc")], &[], Some(&root), &mut fails);
+        assert!(out.is_empty(), "local servers get no shadow");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    // A local entry shadowing a global name resolves to the local definition in
+    // `merge_configs`, so that server is local for the session and must not be
+    // global-eligible.
+    #[test]
+    fn a_locally_shadowed_global_name_is_not_global_eligible() {
+        let local = write_temp_config(
+            "{\"mcpServers\":{\"shared\":{\"command\":\"local-cmd\"},\
+             \"only_local\":{\"command\":\"l\"}}}",
+        );
+        let eligible = global_eligible_names(Some(&local));
+        assert!(!eligible.iter().any(|n| n == "shared"));
+        assert!(!eligible.iter().any(|n| n == "only_local"));
+        std::fs::remove_file(local).ok();
     }
 
     /// Builds an in-memory two-tool server (one primary, one directory-only)
