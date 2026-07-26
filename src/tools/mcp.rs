@@ -795,28 +795,28 @@ impl HttpTransport {
 // Config loading
 // ============================================================================
 
-/// Parses a `.mcp.json` file's `mcpServers` object into server configs.
+/// Parses `.mcp.json`, distinguishing "no config" from "no servers".
 ///
-/// Returns an empty list (not an error) if the file is missing; prints a
-/// warning and returns an empty list if it exists but is malformed. Server
-/// names containing `__` are rejected up front: tool names are advertised as
+/// Returns `None` when the file cannot be read or does not parse as JSON, and
+/// `Some` (possibly empty) when it does. Pruning the advertisement cache
+/// depends on that distinction: an unreadable config must never be mistaken
+/// for a config in which every server was deleted. Server names containing
+/// `__` are rejected up front: tool names are advertised as
 /// `mcp__<server>__<tool>` and split at the first `__` on dispatch, so such a
 /// name could never be routed back.
 #[must_use]
-pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
+pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
+    let text = std::fs::read_to_string(path).ok()?;
     let Some(root) = json_parse(&text) else {
         eprintln!(
             "plank: {}: invalid JSON, ignoring MCP config",
             path.display()
         );
-        return Vec::new();
+        return None;
     };
     let mut out = Vec::new();
     let Some(Json::Obj(servers)) = root.get("mcpServers") else {
-        return out;
+        return Some(out);
     };
     for (name, sv) in servers {
         let command = sv.str_or("command", "");
@@ -876,7 +876,13 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
         }
         out.push(cfg);
     }
-    out
+    Some(out)
+}
+
+/// Parses `.mcp.json`, treating an absent or invalid file as "no servers".
+#[must_use]
+pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
+    config_load_checked(path).unwrap_or_default()
 }
 
 /// Global MCP config location: `.mcp.json` inside plank's home directory.
@@ -886,6 +892,22 @@ pub fn config_load(path: &Path) -> Vec<McpServerConfig> {
 pub fn global_config_path() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(Path::new(&home).join(".plank").join(".mcp.json"))
+}
+
+/// Every server name declared in the global `~/.plank/.mcp.json`.
+///
+/// `None` when that file is missing or unreadable, which callers must treat as
+/// "unknown" rather than "empty" — pruning is skipped in that case so a
+/// transient read failure cannot delete valid advertisement records.
+#[must_use]
+pub fn global_config_names() -> Option<Vec<String>> {
+    let path = global_config_path()?;
+    Some(
+        config_load_checked(&path)?
+            .into_iter()
+            .map(|c| c.name)
+            .collect(),
+    )
 }
 
 /// Merges the global and local MCP configs, local overriding by server name.
@@ -1487,6 +1509,31 @@ mod tests {
         assert_eq!(list[0].args, vec!["hi".to_string()]);
         assert_eq!(list[0].env, vec![("FOO".to_string(), "bar".to_string())]);
         std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn config_load_checked_separates_absent_from_empty() {
+        // Absent file: None, so callers can tell "no config" from "no servers".
+        assert!(config_load_checked(Path::new("/tmp/plank_mcp_absent_xyz.json")).is_none());
+
+        // Invalid JSON: also None — a transient truncated write must not read
+        // as "the user deleted every server".
+        let bad = write_temp_config("{not json");
+        assert!(config_load_checked(&bad).is_none());
+        std::fs::remove_file(bad).ok();
+
+        // Present and valid but with no servers: Some(empty).
+        let empty = write_temp_config("{\"mcpServers\":{}}");
+        assert_eq!(config_load_checked(&empty).map(|v| v.len()), Some(0));
+        std::fs::remove_file(empty).ok();
+
+        // Present with servers: Some, and config_load still agrees with it.
+        let full = write_temp_config("{\"mcpServers\":{\"demo\":{\"command\":\"cat\"}}}");
+        let checked = config_load_checked(&full).expect("some");
+        assert_eq!(checked.len(), 1);
+        assert_eq!(checked[0].name, "demo");
+        assert_eq!(config_load(&full).len(), 1);
+        std::fs::remove_file(full).ok();
     }
 
     #[test]
