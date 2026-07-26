@@ -1349,10 +1349,16 @@ pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
     };
     let Some(server) = servers
         .iter_mut()
-        .find(|s| s.name == server_name && s.alive)
+        .find(|s| s.name == server_name && (s.alive || s.is_offline()))
     else {
         return "Tool error: mcp server not available\n".to_string();
     };
+    // Checked before the tool lookup: a shadow's tool list is only as fresh as
+    // its last handshake, so "the server is down" is both the more accurate and
+    // the more actionable fact.
+    if server.is_offline() {
+        return format!("Tool error: {}\n", offline_error(&server.name));
+    }
     if server.find_tool(tool_name).is_none() {
         return format!("Tool error: unknown mcp tool: {}\n", call.name);
     }
@@ -2086,6 +2092,42 @@ mod tests {
         assert!(out.contains("\"name\": \"mcp__demo__omega\""));
         assert!(out.contains("\"o\":{\"type\":\"number\"}"));
         assert!(out.contains("unknown mcp tool: mcp__demo__nope"));
+    }
+
+    #[test]
+    fn calling_a_shadow_reports_the_server_as_not_running() {
+        let live = make_split_server();
+        let mut servers = vec![McpServer::offline(&live.advert_record())];
+        let call = ToolCall {
+            name: "mcp__demo__alpha".to_string(),
+            args: Vec::new(),
+        };
+        let out = tool_mcp_call(&mut servers, &call);
+        assert!(out.contains("is not running"), "{out}");
+        assert!(out.contains("demo"), "must name the server: {out}");
+        assert!(
+            !out.contains("unknown mcp tool"),
+            "must not read as a hallucinated tool name: {out}"
+        );
+
+        // An unlisted tool on an offline server also reports the server: the
+        // server being down is the more useful fact, and its tool list is only
+        // as fresh as the last handshake.
+        let bogus = ToolCall {
+            name: "mcp__demo__nope".to_string(),
+            args: Vec::new(),
+        };
+        assert!(tool_mcp_call(&mut servers, &bogus).contains("is not running"));
+
+        // A server that is not present at all keeps the old generic message.
+        let missing = ToolCall {
+            name: "mcp__gone__alpha".to_string(),
+            args: Vec::new(),
+        };
+        assert!(
+            tool_mcp_call(&mut servers, &missing).contains("mcp server not available"),
+            "an absent server is a different situation"
+        );
     }
 
     #[test]
