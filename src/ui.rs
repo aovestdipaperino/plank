@@ -2541,6 +2541,7 @@ impl Agent<'_> {
         log.push_dim("--- session history ---");
         let show_tool_calls = crate::settings::active().ui.show_tool_calls;
         let show_thinking = crate::settings::active().ui.show_thinking;
+        let thinking_tool_calls = crate::settings::active().engine.thinking_tool_calls;
         let pre_open_think = !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -2571,6 +2572,7 @@ impl Agent<'_> {
                     let mut stream = StreamRenderer::new(std::mem::take(log));
                     stream.set_show_tool_calls(show_tool_calls);
                     stream.set_show_thinking(show_thinking);
+                    stream.set_thinking_tool_calls(thinking_tool_calls);
                     if pre_open_think {
                         stream.begin_in_think();
                     }
@@ -7557,6 +7559,45 @@ mod tests {
             })
         });
         assert!(has_bold, "visible markdown should be rendered (bold)");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Regression: `/resume` replays a stored assistant message whose tool
+    /// call was dispatched from inside `<think>`. The replay renderer must
+    /// pick up `thinking_tool_calls` from settings the same way the live
+    /// turn paths do, or the banner is suppressed and history contradicts
+    /// itself: an "ignored" notice immediately followed by that call's
+    /// stored tool result.
+    #[test]
+    fn replay_history_shows_banner_for_in_think_tool_call() {
+        let dir = scratch_dir("resume-replay-in-think");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = "deadbeef".repeat(5);
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant(concat!(
+            "<think>I should list the directory",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">echo hello</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+            "</think>",
+        )));
+
+        let mut log = OutputLog::new();
+        agent.replay_history_into_log(&mut log);
+        let text = log.to_text();
+        let line_text = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let rendered: Vec<String> = text.lines.iter().map(line_text).collect();
+        let joined = rendered.join("\n");
+
+        assert!(
+            !joined.contains("tool call ignored"),
+            "the replay must not report the in-think call as ignored: {joined:?}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
