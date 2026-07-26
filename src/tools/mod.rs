@@ -16,6 +16,7 @@ pub mod diff;
 pub mod edit;
 pub mod files;
 pub mod mcp;
+pub mod mcp_advert;
 pub mod web;
 
 use std::fmt::Write as _;

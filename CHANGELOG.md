@@ -10,6 +10,20 @@ Beta patch bump on the 2.6 series.
 
 ### Added
 
+- A globally-configured MCP server that fails to start no longer throws away the
+  system-prompt cache. Tier 1 is keyed on the prompt text, and that text carries
+  every connected server's tool schemas, so one flaky server used to change the
+  prompt and force the most expensive re-prefill there is. plank now remembers
+  each global server's last successful tool advertisement under
+  `~/.plank/mcp-advert/` and renders it when that server cannot start, keeping
+  the prompt byte-identical and the cache warm. Startup names the server it is
+  serving from cache and warns that its tools will report it as down, `/mcp`
+  shows the same alongside the cached tool count, and calling one of those tools
+  reports the server as not running rather than the tool as unknown — the two
+  need different recovery. Project-local servers are untouched: they key the cheap Tier 2 and
+  never get cached definitions, so a project prompt cannot advertise a dead tool.
+  Records are dropped when the server leaves `~/.plank/.mcp.json`, and never
+  when that file is merely unreadable.
 - A system-prompt cache miss now explains itself. Tier 1 is the priciest prefix
   to rebuild — everything below it re-prefills too — so instead of silently
   re-prefilling, plank reports that the system prompt changed and shows the
