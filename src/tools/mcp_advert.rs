@@ -74,7 +74,7 @@ pub fn default_root() -> Option<PathBuf> {
 }
 
 /// File name for one server's record: the name with every character outside
-/// `[A-Za-z0-9._-]` replaced by `_`, plus a short hash of the original name so
+/// `[A-Za-z0-9_-]` replaced by `_`, plus a short hash of the original name so
 /// two distinct names cannot sanitize onto the same file.
 #[must_use]
 pub fn record_file_name(server: &str) -> String {
