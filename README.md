@@ -125,7 +125,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 ```json
 {
   "engine": { "model": "~/models/ds4.gguf", "threads": 8,
-              "backend": "metal", "power": 80, "ctx": 262144 },
+              "backend": "metal", "power": 80, "ctx": 262144,
+              "thinkingToolCalls": true },
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
               "showThinking": true, "notifications": "always", "notifyAfterSecs": 10 },
@@ -143,6 +144,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `backend` | platform default | `metal`, `cuda`, or `cpu`. Same as `--backend`. |
 | | `power` | unset | GPU power cap percent. Same as `--power`. |
 | | `ctx` | 1048576 | Context window in tokens. Same as `-c`. |
+| | `thinkingToolCalls` | `true` | Dispatch tool calls the model emits inside its thinking block. Set `false` for strict `refs/ds4` parity. |
 | `ui` | `respectGitignore` | `true` | Whether `@` completion honours `.gitignore` for untracked files. |
 | | `popupRows` | 15 | Rows the `@` completion popup offers. |
 | | `indexRefreshSecs` | 5 | How long the file index is trusted before a rebuild. |

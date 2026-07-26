@@ -763,11 +763,16 @@ mod tests {
             !permissive.contains("Tool calls are not allowed inside"),
             "the prohibition must be gone in permissive mode"
         );
-        // Exactly that line and its trailing blank line are removed; the rest of
-        // the prompt is untouched.
+        // The prohibition appears exactly once in the parity prompt, so the
+        // `.replace` in `build_tools_prompt_base` is anchored to a single,
+        // unambiguous occurrence rather than risking a multi-match strip.
+        assert_eq!(parity.matches(IN_THINK_PROHIBITION).count(), 1);
+        // Independent of the strip logic itself: permissive is shorter by
+        // exactly the prohibition line plus the two newlines that separated
+        // it from the next paragraph, and nothing else.
         assert_eq!(
-            parity.replace(&format!("{IN_THINK_PROHIBITION}\n\n"), ""),
-            permissive
+            parity.len() - permissive.len(),
+            IN_THINK_PROHIBITION.len() + 2
         );
         // The layered builders inherit the behavior.
         assert!(!build_tools_prompt(&[], false).contains("Tool calls are not allowed inside"));

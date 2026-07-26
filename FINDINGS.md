@@ -283,6 +283,9 @@ test` and review the diff before committing.
   (`close_open_think` in `src/ui.rs`). No engine change is needed to resume
   reasoning: the local chat template re-opens `<think>` in the prefill prefix on
   every assistant pass, so the continuation is already inside a think block.
+  This is expected to be cheap in KV-cache terms since the divergence sits at
+  the very tail of the reply, but that is unmeasured — worth a manual macOS
+  run against a real GGUF model before release.
 
 ## Part 2 — Environment & tooling
 
