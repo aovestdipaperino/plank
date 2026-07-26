@@ -144,7 +144,9 @@ Model text is fed byte-by-byte through a pipeline:
    inside `<think>` blocks), suppresses raw markup, and emits human-friendly
    tool banners. It routes output to a `RenderSink` (visible, thinking, and
    red-styled error banners; raw DSML never reaches the screen, even on parse
-   failure).
+   failure). `StreamRenderer` treats a DSML stanza opened inside `<think>` as an
+   ordinary tool call unless `engine.thinkingToolCalls` is off, in which case it
+   discards it with a `[tool call ignored: ...]` notice exactly as the C does.
 2. `render.rs` (stdout path) turns that into ANSI: markdown, syntax
    highlighting, and gray thinking text.
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable

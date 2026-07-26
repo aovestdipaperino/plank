@@ -269,6 +269,20 @@ test` and review the diff before committing.
   `Agent::worker_turn` (`src/ui.rs`): the engine owns the token loop, so
   "suspend" is `stop-at-boundary → generate_aside → resume`, not a callback
   interposed mid-loop.
+- **Tool calls inside `<think>` are a deliberate divergence.** The C reference
+  forbids them in two places: the tools-prompt line at `ds4_agent.c:718` and the
+  stream-time discard at `ds4_agent.c:3107` and friends. plank dispatches them by
+  default instead (`engine.thinkingToolCalls`, on), which means the prompt line is
+  stripped from the built prompt — the C string constants in `src/sysprompt.rs`
+  are still verbatim, so `tests/c_parity.rs` keeps passing; only the assembled
+  output differs. Set `engine.thinkingToolCalls: false` for strict parity when
+  diffing against the reference.
+
+  A call fired mid-thought leaves the reply with an unterminated `<think>`. plank
+  appends a synthetic `</think>` before the `<tool_result>` message
+  (`close_open_think` in `src/ui.rs`). No engine change is needed to resume
+  reasoning: the local chat template re-opens `<think>` in the prefill prefix on
+  every assistant pass, so the continuation is already inside a think block.
 
 ## Part 2 — Environment & tooling
 
