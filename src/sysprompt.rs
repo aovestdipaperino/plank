@@ -200,9 +200,11 @@ pub fn provider_tool_registry(
     });
     push_agent_and_plan_specs(&mut specs);
     for server in mcp_servers {
-        if !server.alive() {
-            continue;
-        }
+        // No `alive` filter, deliberately: a non-alive server is either an
+        // offline shadow — whose tools must stay advertised so this registry
+        // and the text prompt agree, letting dispatch answer with the "not
+        // running" message instead of the provider rejecting an unknown tool —
+        // or a mid-session death, where dispatch reports the failure.
         for tool in &server.tools {
             let parameters = serde_json::from_str::<serde_json::Value>(&tool.schema_json)
                 .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} }));
@@ -215,10 +217,7 @@ pub fn provider_tool_registry(
     }
     // Resource tools, advertised only when a server actually publishes
     // resources — mirroring `append_resource_tool_schemas` for the text path.
-    if mcp_servers
-        .iter()
-        .any(|s| s.alive() && !s.resources().is_empty())
-    {
+    if mcp_servers.iter().any(|s| !s.resources().is_empty()) {
         specs.push(crate::engine::ToolSpec {
             name: "mcp_list_resources".to_string(),
             description: "List resources published by connected MCP servers, as {server}:{uri}. Optional 'server' filters to one server.".to_string(),
