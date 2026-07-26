@@ -954,6 +954,7 @@ mod tests {
                 backend: Some("cpu".to_string()),
                 power: Some(50),
                 ctx: Some(4096),
+                thinking_tool_calls: true,
             },
             safety: crate::settings::SafetySettings {
                 sandbox: Some(true),

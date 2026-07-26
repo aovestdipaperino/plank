@@ -60,7 +60,7 @@ pub const ASK_MIN_OPTIONS: usize = 2;
 ///
 /// `model` replaces what used to be a hardcoded convention — plank falls back
 /// to `~/.plank/ds4flash.gguf` only when neither this key nor `-m` is given.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EngineSettings {
     /// Model file to load; overridden by `-m`/`--model`.
     pub model: Option<PathBuf>,
@@ -72,6 +72,27 @@ pub struct EngineSettings {
     pub power: Option<i32>,
     /// Context window in tokens; overridden by `-c`/`--ctx`.
     pub ctx: Option<i32>,
+    /// Whether DSML tool calls the model emits inside `<think></think>` are
+    /// dispatched. Default true.
+    ///
+    /// `false` restores strict `refs/ds4` parity: an in-think stanza is
+    /// discarded with a `[tool call ignored: ...]` notice, and the tools prompt
+    /// keeps the line forbidding such calls. The C agent only ever behaved this
+    /// way, so set it when diffing plank against the reference.
+    pub thinking_tool_calls: bool,
+}
+
+impl Default for EngineSettings {
+    fn default() -> Self {
+        Self {
+            model: None,
+            threads: None,
+            backend: None,
+            power: None,
+            ctx: None,
+            thinking_tool_calls: true,
+        }
+    }
 }
 
 /// UI behaviour that used to be magic numbers in the source.
@@ -278,6 +299,9 @@ impl Settings {
         }
         if let Some(v) = num(engine, "ctx") {
             self.engine.ctx = Some(v);
+        }
+        if let Some(v) = boolean(engine, "thinkingToolCalls") {
+            self.engine.thinking_tool_calls = v;
         }
 
         let ui = root.get("ui");
@@ -637,6 +661,11 @@ impl Settings {
             upsert_opt(e, "backend", self.engine.backend.clone().map(Json::Str));
             upsert_opt(e, "power", self.engine.power.map(inum));
             upsert_opt(e, "ctx", self.engine.ctx.map(inum));
+            upsert(
+                e,
+                "thinkingToolCalls",
+                Json::Bool(self.engine.thinking_tool_calls),
+            );
         }
         {
             let u = section(&mut root, "ui");
@@ -1039,5 +1068,20 @@ mod tests {
         assert!(!reloaded.ui.crt_off);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn thinking_tool_calls_defaults_on_and_overlays_off() {
+        let mut s = Settings::default();
+        assert!(
+            s.engine.thinking_tool_calls,
+            "tool calls inside <think> are dispatched by default"
+        );
+        s.overlay(r#"{"engine":{"thinkingToolCalls":false}}"#);
+        assert!(!s.engine.thinking_tool_calls);
+        // A non-boolean value is ignored rather than flipping the default.
+        let mut s2 = Settings::default();
+        s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
+        assert!(s2.engine.thinking_tool_calls);
     }
 }
