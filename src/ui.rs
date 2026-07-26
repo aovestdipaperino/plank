@@ -1359,7 +1359,7 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
-        crate::title::set(Some(self.last_user_prompt()));
+        crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         // The session owns the persisted task list; load it into the live tool
@@ -1494,6 +1494,8 @@ impl Agent<'_> {
             ) {
                 self.notify_task_complete();
             }
+            // Turn over: the front end is back at the prompt.
+            crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             return Ok(());
         }
@@ -3336,6 +3338,8 @@ impl Agent<'_> {
         // The window the user just launched plank in is focused; focus events
         // track changes from here for the "unfocused" notification mode.
         crate::notify::set_focused(true);
+        // The full-screen UI is up and accepting input.
+        crate::title::set(crate::title::State::Idle);
         let result = self.tui_loop(&mut terminal);
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
@@ -4237,6 +4241,8 @@ impl Agent<'_> {
                 ) {
                     self.notify_task_complete();
                 }
+                // Turn over: the front end is back at the prompt.
+                crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 return Ok(());
             }
@@ -4292,6 +4298,8 @@ impl Agent<'_> {
             ) {
                 self.notify_task_complete();
             }
+            // Turn over: the front end is back at the prompt.
+            crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
         }
         result
@@ -4347,7 +4355,7 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
-        crate::title::set(Some(self.last_user_prompt()));
+        crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
@@ -6015,6 +6023,8 @@ fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String
     // reading a line from stdin (issue #34).
     agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
     agent.warm_plain()?;
+    // The plain REPL is up and accepting input.
+    crate::title::set(crate::title::State::Idle);
     if let Some(history) = agent.resumed_history() {
         print!("{history}");
     }
