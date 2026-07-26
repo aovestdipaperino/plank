@@ -9,6 +9,7 @@
 
 pub mod agents;
 pub mod anim;
+pub mod arcade;
 pub mod branch;
 pub mod checkpoint;
 pub mod compact;
