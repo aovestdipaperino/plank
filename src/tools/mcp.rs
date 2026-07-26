@@ -2678,6 +2678,49 @@ done
         assert!(!msg.contains("  "), "no double space: {msg:?}");
     }
 
+    // `/mcp` must tell three stories apart: a connected server, a
+    // cached-advertisement shadow (still in the prompt, calls fail), and a
+    // server that plainly died mid-session (no cached tools reported).
+    #[test]
+    fn mcp_report_distinguishes_connected_shadow_and_failed() {
+        let connected = one_tool_server("alpha");
+
+        let shadow_source = one_tool_server("beta");
+        let shadow = McpServer::offline(&shadow_source.advert_record());
+
+        let mut dead = one_tool_server("gamma");
+        dead.alive = false;
+
+        let servers = [connected, shadow, dead];
+        let out = crate::ui::render_mcp_report(&servers, false);
+
+        let beta_line = out
+            .lines()
+            .find(|l| l.contains("beta"))
+            .expect("beta row present");
+        assert!(beta_line.contains("beta"), "{beta_line}");
+        assert!(beta_line.contains('1'), "cached tool count: {beta_line}");
+        assert!(
+            beta_line.to_lowercase().contains("down")
+                || beta_line.to_lowercase().contains("not running"),
+            "must state calls report the server as down: {beta_line}"
+        );
+        assert!(
+            beta_line.to_lowercase().contains("advertis"),
+            "must state its cached tools are still advertised: {beta_line}"
+        );
+
+        let gamma_line = out
+            .lines()
+            .find(|l| l.contains("gamma"))
+            .expect("gamma row present");
+        assert!(gamma_line.contains("failed"), "{gamma_line}");
+        assert!(
+            !gamma_line.to_lowercase().contains("advertis"),
+            "a plain failed server must not claim anything is still advertised: {gamma_line}"
+        );
+    }
+
     #[test]
     fn read_resource_round_trips_text_and_flags_binary() {
         // A stdio server that advertises one resource and answers

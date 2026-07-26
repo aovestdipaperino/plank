@@ -752,7 +752,7 @@ const IMAGES_ENABLED: bool = cfg!(feature = "images");
 
 /// Renders the `/mcp` server report following Claude Code's layout: a header
 /// with the server count, then one `name · status · N tools` line each.
-fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color: bool) -> String {
+pub(crate) fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color: bool) -> String {
     use std::fmt::Write as _;
     let (green, red, reset) = if color {
         ("\x1b[38;5;42m", "\x1b[38;5;204m", ANSI_RESET)
@@ -772,6 +772,14 @@ fn render_mcp_report(servers: &[crate::tools::mcp::McpServer], color: bool) -> S
             let _ = writeln!(
                 out,
                 "  {} · {green}✔ connected{reset} · {} tool{plural}",
+                s.name,
+                s.tools.len()
+            );
+        } else if s.is_offline() {
+            let plural = if s.tools.len() == 1 { "" } else { "s" };
+            let _ = writeln!(
+                out,
+                "  {} · {red}✘ not running{reset} · {} cached tool{plural} still advertised · calls will report it as down",
                 s.name,
                 s.tools.len()
             );
