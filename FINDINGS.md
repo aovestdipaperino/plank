@@ -436,3 +436,27 @@ test` and review the diff before committing.
   unreleased `master`, which also relicensed to SySL-1.0 — watch that before
   upgrading). The throttle is worth keeping regardless: it bounds cost for
   large blocks even once the config is cached.
+
+- **An offline MCP shadow must be substituted in place, not appended.**
+  `append_tool_schemas` (`src/tools/mcp.rs`) iterates `servers` in order, so a
+  server's index is part of the system prompt bytes and therefore part of `fp1`.
+  When `start_servers_with` replaces a failed global server with a
+  cached-advertisement shadow (`McpServer::offline`), pushing that shadow at the
+  end of the vec instead of at the failed config's own index yields a reordered
+  prompt that matches no `sysprompt-*.kv` snapshot — while every test that only
+  checks "the tools are present" still passes. Verified the hard way: building
+  the append-at-end variant makes
+  `a_shadow_takes_the_failed_servers_place_in_order` fail with `["a", "c"]` vs
+  `["a", "b", "c"]`, which is why that test asserts the name order *before* it
+  compares prompt bytes.
+
+- **`append_resource_tool_schemas` must not gate on `alive`.** The gate was
+  `s.alive && !s.resources().is_empty()`. Every server is alive when the prompt
+  is first built — failures are dropped before that point — so the `alive` term
+  never did anything useful, but it silently removed the `mcp_list_resources` /
+  `mcp_read_resource` schemas from Tier 1 whenever the prompt was rebuilt after
+  the only resource-bearing server died, moving `fp1` for a reason that has
+  nothing to do with the tools the model can actually use. An offline shadow
+  carries its cached `resources` precisely so those two schemas stay, so the
+  gate is presence of resources alone. `build_tools_prompt(&[])` is unaffected
+  either way, so the C-parity fixtures do not move.

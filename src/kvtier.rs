@@ -8,10 +8,17 @@
 //!
 //! | Tier | Content | Key | Storage |
 //! |------|---------|-----|---------|
-//! | 1 | system prompt (+ global MCP tool defs) | `fp1 = sha(model ‖ system)` | `sysprompt-*.kv` (model-global) |
+//! | 1 | system prompt (+ global MCP tool defs, incl. cached ones) | `fp1 = sha(model ‖ system)` | `sysprompt-*.kv` (model-global) |
 //! | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md` set, memory, **local** MCP tool defs | `fp2 = tier(fp1, stable-hash ‖ local tool defs)` | `<project-key>/project-<fp2>.kv` |
 //! | 3 | session-volatile context: git status, date, hook output | — | never cached |
 //! | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.payload` |
+//!
+//! Tier 1's text depends on the set of global MCP servers **present in
+//! `~/.plank/.mcp.json`**, not the set that successfully handshook: a global
+//! server that fails to start is rendered from its cached advertisement
+//! ([`crate::tools::mcp_advert`]) so a flaky server cannot invalidate the most
+//! expensive tier. Tier 2 is unaffected — [`crate::tools::mcp::local_tool_defs`]
+//! sees only project-local servers, which never get cached advertisements.
 //!
 //! This module owns the **pure** part of that machinery: building the tier list
 //! below Tier 1, canonicalizing the local MCP tool definitions that key Tier 2,
