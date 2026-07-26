@@ -1062,17 +1062,24 @@ pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
     if let (Some(root), Some(names)) = (root.as_deref(), global_config_names()) {
         crate::tools::mcp_advert::prune(root, &names);
     }
-    let mut start = |cfg: &McpServerConfig| -> Result<McpServer, String> {
-        let mut s = McpServer::spawn(cfg)?;
-        s.handshake(cfg.primary_tools.as_deref())?;
-        Ok(s)
-    };
+    let mut start = spawn_and_handshake;
     start_servers_with(
         config_load_hierarchy(path),
         &eligible,
         root.as_deref(),
         &mut start,
     )
+}
+
+/// Spawns a server and completes its handshake.
+///
+/// Shared by [`load_and_start`] and the tests' `start_servers` helper so both
+/// exercise the same startup path: duplicating it would let a change here go
+/// unnoticed by every test that starts a server.
+fn spawn_and_handshake(cfg: &McpServerConfig) -> Result<McpServer, String> {
+    let mut s = McpServer::spawn(cfg)?;
+    s.handshake(cfg.primary_tools.as_deref())?;
+    Ok(s)
 }
 
 /// Starts each configured server, substituting a cached advertisement for a
@@ -1540,11 +1547,7 @@ mod tests {
     /// failures, consult no advertisement store. Kept as a test helper so the
     /// existing startup tests stay unchanged.
     fn start_servers(configs: Vec<McpServerConfig>) -> Vec<McpServer> {
-        let mut start = |cfg: &McpServerConfig| -> Result<McpServer, String> {
-            let mut s = McpServer::spawn(cfg)?;
-            s.handshake(cfg.primary_tools.as_deref())?;
-            Ok(s)
-        };
+        let mut start = spawn_and_handshake;
         start_servers_with(configs, &[], None, &mut start)
     }
 
