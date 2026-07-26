@@ -10,6 +10,15 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The tools-prompt line forbidding tool calls inside thinking, verbatim from
+/// the C (`ds4_agent.c:718`) and a substring of [`TOOLS_PROMPT_INTRO`].
+///
+/// Removed from the built prompt when `engine.thinkingToolCalls` is on, so the
+/// prompt matches the behavior. The C constants themselves are never edited —
+/// `tests/c_parity.rs` locks them against `refs/ds4`.
+pub const IN_THINK_PROHIBITION: &str =
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
+
 /// Introductory section of the tools prompt (verbatim from C).
 const TOOLS_PROMPT_INTRO: &str = "You are a coding agent running in a local workspace. Use tools for local file and system work. \
 Avoid printing large file contents or large code blocks as answers; create or edit files with tools, \
@@ -320,8 +329,8 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 /// Mirrors `agent_build_tools_prompt`: the three verbatim C string constants
 /// followed by the schemas of any MCP tools loaded at startup.
 #[must_use]
-pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> String {
-    let mut out = build_tools_prompt_base();
+pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: bool) -> String {
+    let mut out = build_tools_prompt_base(parity);
     append_native_extra_schemas(&mut out);
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -336,14 +345,22 @@ pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer]) -> Strin
 /// [`append_native_extra_schemas`]) and MCP tools are layered on top by
 /// [`build_tools_prompt`], the same way MCP has always extended it, so the
 /// trained-table parity guarantee stays intact for the base.
+///
+/// `parity` selects strict C output. With `parity` false the single
+/// [`IN_THINK_PROHIBITION`] line is stripped, because plank then dispatches
+/// those calls (see `engine.thinkingToolCalls`); everything else is identical.
 #[must_use]
-pub fn build_tools_prompt_base() -> String {
+pub fn build_tools_prompt_base(parity: bool) -> String {
     let mut out = String::with_capacity(
         TOOLS_PROMPT_INTRO.len() + TOOLS_PROMPT_EDIT_LINE.len() + TOOLS_PROMPT_AFTER_EDIT.len(),
     );
     out.push_str(TOOLS_PROMPT_INTRO);
     out.push_str(TOOLS_PROMPT_EDIT_LINE);
     out.push_str(TOOLS_PROMPT_AFTER_EDIT);
+    if !parity {
+        // The line and the blank line separating it from the next paragraph.
+        out = out.replace(&format!("{IN_THINK_PROHIBITION}\n\n"), "");
+    }
     out
 }
 
@@ -502,9 +519,12 @@ pub fn dsml_syntax_reminder() -> &'static str {
 /// Mirrors `agent_build_system_prompt_reminder`: the tools prompt wrapped in
 /// start/end reminder markers.
 #[must_use]
-pub fn build_system_prompt_reminder(mcp_servers: &[crate::tools::mcp::McpServer]) -> String {
+pub fn build_system_prompt_reminder(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    parity: bool,
+) -> String {
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
-    out.push_str(&build_tools_prompt(mcp_servers));
+    out.push_str(&build_tools_prompt(mcp_servers, parity));
     out.push_str("[End system prompt reminder.]\n\n");
     out
 }
@@ -526,8 +546,9 @@ pub fn build_system_prompt_reminder(mcp_servers: &[crate::tools::mcp::McpServer]
 pub fn build_system_prompt(
     user_system: &str,
     mcp_servers: &[crate::tools::mcp::McpServer],
+    parity: bool,
 ) -> String {
-    let mut out = build_tools_prompt(mcp_servers);
+    let mut out = build_tools_prompt(mcp_servers, parity);
     if !user_system.is_empty() {
         out.push_str("\n\n");
         out.push_str(user_system);
@@ -628,7 +649,7 @@ mod tests {
 
     #[test]
     fn tools_prompt_contains_verbatim_phrases() {
-        let p = build_tools_prompt(&[]);
+        let p = build_tools_prompt(&[], true);
         assert!(p.starts_with("You are a coding agent running in a local workspace."));
         assert!(p.contains("<｜DSML｜tool_calls>"));
         assert!(p.contains("Tool calls are not allowed inside <think></think>"));
@@ -641,7 +662,8 @@ mod tests {
         // The C-derived base ends with the rules text; native tools (glob) are
         // appended on top of it by `build_tools_prompt`.
         assert!(
-            build_tools_prompt_base().ends_with("unless explicitly asked otherwise by the user.\n")
+            build_tools_prompt_base(true)
+                .ends_with("unless explicitly asked otherwise by the user.\n")
         );
         assert!(
             p.contains("\"name\": \"glob\""),
@@ -656,8 +678,8 @@ mod tests {
     /// the first user turn (`context::ContextContent`), never here.
     #[test]
     fn fingerprinted_prompt_contains_no_volatile_bytes() {
-        let a = build_system_prompt("user -sys text", &[]);
-        let b = build_system_prompt("user -sys text", &[]);
+        let a = build_system_prompt("user -sys text", &[], true);
+        let b = build_system_prompt("user -sys text", &[], true);
         assert_eq!(a, b, "system prompt must be deterministic");
         let today = crate::context::current_local_iso_date();
         assert!(
@@ -715,7 +737,7 @@ mod tests {
 
     #[test]
     fn system_prompt_reminder_framing() {
-        let r = build_system_prompt_reminder(&[]);
+        let r = build_system_prompt_reminder(&[], true);
         assert!(r.starts_with("\n\n[System prompt reminder follows.]\n"));
         assert!(r.ends_with("[End system prompt reminder.]\n\n"));
         assert!(r.contains("## Tools"));
@@ -723,10 +745,37 @@ mod tests {
 
     #[test]
     fn system_prompt_composition() {
-        assert_eq!(build_system_prompt("", &[]), build_tools_prompt(&[]));
-        let with_extra = build_system_prompt("Be terse.", &[]);
-        assert!(with_extra.starts_with(&build_tools_prompt(&[])));
+        assert_eq!(
+            build_system_prompt("", &[], true),
+            build_tools_prompt(&[], true)
+        );
+        let with_extra = build_system_prompt("Be terse.", &[], true);
+        assert!(with_extra.starts_with(&build_tools_prompt(&[], true)));
         assert!(with_extra.ends_with("\n\nBe terse."));
+    }
+
+    #[test]
+    fn non_parity_prompt_drops_only_the_in_think_prohibition() {
+        let parity = build_tools_prompt_base(true);
+        let permissive = build_tools_prompt_base(false);
+        assert!(parity.contains(IN_THINK_PROHIBITION));
+        assert!(
+            !permissive.contains("Tool calls are not allowed inside"),
+            "the prohibition must be gone in permissive mode"
+        );
+        // Exactly that line and its trailing blank line are removed; the rest of
+        // the prompt is untouched.
+        assert_eq!(
+            parity.replace(&format!("{IN_THINK_PROHIBITION}\n\n"), ""),
+            permissive
+        );
+        // The layered builders inherit the behavior.
+        assert!(!build_tools_prompt(&[], false).contains("Tool calls are not allowed inside"));
+        assert!(build_tools_prompt(&[], true).contains(IN_THINK_PROHIBITION));
+        assert!(
+            !build_system_prompt_reminder(&[], false).contains("Tool calls are not allowed inside")
+        );
+        assert!(!build_system_prompt("", &[], false).contains("Tool calls are not allowed inside"));
     }
 
     #[test]

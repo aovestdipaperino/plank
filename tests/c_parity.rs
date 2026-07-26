@@ -115,7 +115,7 @@ fn assert_masked_eq(pattern: &str, actual: &str, what: &str) {
 fn tools_prompt_matches_fixture() {
     assert_fixture_eq(
         "tools_prompt.txt",
-        &plank::sysprompt::build_tools_prompt(&[]),
+        &plank::sysprompt::build_tools_prompt(&[], true),
     );
 }
 
@@ -131,7 +131,7 @@ fn dsml_syntax_reminder_matches_fixture() {
 fn system_prompt_reminder_matches_fixture() {
     assert_fixture_eq(
         "system_prompt_reminder.txt",
-        &plank::sysprompt::build_system_prompt_reminder(&[]),
+        &plank::sysprompt::build_system_prompt_reminder(&[], true),
     );
 }
 
@@ -268,7 +268,7 @@ fn tools_prompt_matches_c_source() {
     // trained table — see `append_native_extra_schemas`.
     assert_identical(
         &expected,
-        &plank::sysprompt::build_tools_prompt_base(),
+        &plank::sysprompt::build_tools_prompt_base(true),
         "tools prompt base vs C",
     );
 }

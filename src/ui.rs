@@ -1590,7 +1590,10 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(&self.tool_ctx.mcp);
+        let mut text = sysprompt::build_system_prompt_reminder(
+            &self.tool_ctx.mcp,
+            !crate::settings::active().engine.thinking_tool_calls,
+        );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
@@ -4827,7 +4830,10 @@ impl Agent<'_> {
         self.trace.line(&format!(
             "system prompt reminder injected at transcript={pos}"
         ));
-        let mut text = sysprompt::build_system_prompt_reminder(&self.tool_ctx.mcp);
+        let mut text = sysprompt::build_system_prompt_reminder(
+            &self.tool_ctx.mcp,
+            !crate::settings::active().engine.thinking_tool_calls,
+        );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
             text.push_str(&self.cfg.system);
@@ -5836,7 +5842,11 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
-    let system = sysprompt::build_system_prompt(&cfg.system, &tool_ctx.mcp);
+    let system = sysprompt::build_system_prompt(
+        &cfg.system,
+        &tool_ctx.mcp,
+        !crate::settings::active().engine.thinking_tool_calls,
+    );
     let skills = crate::skills::load_default(&tool_ctx.cwd);
     let templates = crate::templates::load_default(&tool_ctx.cwd);
     // The `skill` tool resolves names against the same set the slash command
@@ -6711,7 +6721,7 @@ mod tests {
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8114,7 +8124,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8199,7 +8209,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8296,7 +8306,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8374,7 +8384,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8445,7 +8455,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
@@ -8503,7 +8513,7 @@ mod tests {
             session: Session::new(),
             store,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             trace: Trace::open(None).unwrap(),
