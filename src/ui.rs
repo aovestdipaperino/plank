@@ -530,6 +530,40 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// Seeds an easter egg from the wall clock.
+///
+/// [`crate::arcade`] is deliberately clock-free — that is what makes a rally
+/// replayable in a test — so the one moment randomness enters is here, when the
+/// modal opens. Sub-second precision keeps two openings in the same second from
+/// producing the same sky.
+fn arcade_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()) << 20)
+}
+
+/// The arcade command `line` starts with, if any — `/pelota new` included.
+fn arcade_command(line: &str) -> Option<&'static str> {
+    crate::arcade::Arcade::COMMANDS
+        .into_iter()
+        .find(|cmd| crate::config::slash_command_with_args(line, cmd))
+}
+
+/// Turns any-motion mouse reporting (DECSET 1003) on or off.
+///
+/// `EnableMouseCapture` asks for buttons and drags but not free hover, which is
+/// what a paddle wants to follow. Crossterm has no command for 1003, so this
+/// writes it directly; it is additive over the capture already in place, and is
+/// switched back off when the arcade closes so the rest of the UI keeps
+/// receiving only the events it expects. Best-effort: a terminal that does not
+/// know the mode ignores it, and click-and-drag still steers.
+fn arcade_hover_reporting(on: bool) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = out.write_all(if on { b"\x1b[?1003h" } else { b"\x1b[?1003l" });
+    let _ = out.flush();
+}
+
 /// Injects the session-start context as **two** user messages — project-stable
 /// first, then session-volatile — so Tier 2 and Tier 3 of the KV cache are
 /// distinct, separately-checkpointable spans (issues #60, #64).
@@ -2129,6 +2163,7 @@ impl Agent<'_> {
     }
 
     /// Runs the /init command in TUI mode.
+    #[allow(clippy::too_many_arguments)]
     fn tui_run_init(
         &mut self,
         log: &mut OutputLog,
@@ -2136,6 +2171,7 @@ impl Agent<'_> {
         view: &mut tui::OutputView,
         input: &mut TuiInput,
         btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
     ) {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
@@ -2163,7 +2199,7 @@ impl Agent<'_> {
 
         log.push_spans(tui::user_echo_spans(prompt));
         self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
+        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
             log.push_plain(format!("/init failed: {e}"));
         }
     }
@@ -2218,6 +2254,16 @@ impl Agent<'_> {
             }
             "/help" => print!("{}", crate::config::usage()),
             "/version" => println!("plank {}", crate::logo::version_label()),
+            // Easter eggs. `anim.rs` keeps motion in the Ratatui front-end, so
+            // here the sky is a single still frame and pelota declines rather
+            // than growing a second game loop against raw stdout.
+            "/stars" => print!(
+                "{}",
+                crate::arcade::still_sky(arcade_seed(), 78, 20, self.color)
+            ),
+            _ if crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
+                println!("{cmd} needs the full-screen UI — run plank in a terminal");
+            }
             "/checkpoint" => {
                 if arg.is_empty() {
                     print!(
@@ -3457,10 +3503,26 @@ impl Agent<'_> {
         // once opened it stays until the user presses Esc, even after the main
         // task finishes and control returns to this idle loop.
         let mut btw_panel: BtwPanel = None;
+        // An open easter egg (`/stars`, `/pelota`), same modal contract as the
+        // `/config` form: while it is Some it owns the screen and every key.
+        // Owned here, like the `/btw` panel, so it survives the transition into
+        // and out of a turn — that is what lets it keep running while the model
+        // works. `arcade_last` measures the real frame delta to feed its
+        // simulation; the poll timeout alone would stall it whenever keys
+        // arrive.
+        let mut arcade = crate::arcade::Arcade::new();
+        let mut arcade_last = Instant::now();
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
-            self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
+            self.tui_turn(
+                terminal,
+                &mut log,
+                &mut view,
+                &mut input,
+                &mut btw_panel,
+                &mut arcade,
+            )?;
         }
 
         // Endpoints of a mouse drag selection over the output area, in content
@@ -3489,6 +3551,14 @@ impl Agent<'_> {
                 clip_checked = Instant::now();
             }
             remote_drain(rem);
+            // Advance an open easter egg by the real elapsed time. `step`
+            // clamps a long delta itself, so a modal that just opened (or a
+            // suspended terminal) resumes smoothly instead of jumping.
+            if arcade.is_open() {
+                let dt = arcade_last.elapsed();
+                arcade_last = Instant::now();
+                arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+            }
             input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
             let mut status = self.idle_status_text();
@@ -3531,6 +3601,10 @@ impl Agent<'_> {
                     if let Some(form) = &config_form {
                         tui::draw_config(f, form);
                     }
+                    // Drawn last: the arcade covers the whole frame.
+                    if arcade.is_open() {
+                        tui::draw_arcade(f, &arcade);
+                    }
                     remote_capture(rem, f);
                 })
                 .map_err(|e| e.to_string())?;
@@ -3541,7 +3615,15 @@ impl Agent<'_> {
             }
             remote_service(rem);
 
-            let Some(ev) = next_event(rem, Duration::from_millis(200))? else {
+            // 200 ms is five frames a second — fine for an idle prompt, far too
+            // slow for a game. An open easter egg polls at the shared 20 Hz
+            // animation tick instead.
+            let poll = if arcade.is_open() {
+                Duration::from_millis(crate::anim::TICK_MS)
+            } else {
+                Duration::from_millis(200)
+            };
+            let Some(ev) = next_event(rem, poll)? else {
                 // Remote-driven input (issue #25): a remote controller's
                 // `prompt`/`command` frames start a local turn just as if typed
                 // here, so the local screen and the remote mirror stay in sync.
@@ -3562,6 +3644,7 @@ impl Agent<'_> {
                                 &mut input,
                                 &mut btw_panel,
                                 &mut config_form,
+                                &mut arcade,
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
@@ -3575,11 +3658,30 @@ impl Agent<'_> {
                         }
                     }
                     if run {
-                        self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
+                        self.tui_turn(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                        )?;
                     }
                 }
                 continue;
             };
+            // An open easter egg takes the mouse (wheel, click and drag steer
+            // the paddle) and swallows everything else that is not a key, so
+            // nothing underneath it scrolls or accepts text while it is up.
+            if arcade.is_open() && !matches!(ev, Event::Key(_)) {
+                if let Event::Mouse(m) = ev {
+                    let (w, h) = terminal
+                        .size()
+                        .map_or((80, 23), |s| (s.width, s.height.saturating_sub(1)));
+                    arcade.handle_mouse(m, w, h);
+                }
+                continue;
+            }
             if let Event::Mouse(m) = &ev {
                 match m.kind {
                     MouseEventKind::ScrollUp => {
@@ -3689,6 +3791,16 @@ impl Agent<'_> {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // An open easter egg owns every key until Esc/q/Ctrl-C closes it.
+            if arcade.is_open() {
+                if let crate::arcade::Outcome::Close(line) = arcade.handle_key(key) {
+                    arcade_hover_reporting(false);
+                    if let Some(line) = line {
+                        log.push_dim(line);
+                    }
+                }
                 continue;
             }
             // The `/config` modal, when open, owns every key until it closes.
@@ -3862,6 +3974,7 @@ impl Agent<'_> {
                             &mut input,
                             &mut btw_panel,
                             &mut config_form,
+                            &mut arcade,
                         ) {
                             break;
                         }
@@ -3885,7 +3998,14 @@ impl Agent<'_> {
                         let echo = if line.is_empty() { &message } else { &line };
                         log.push_spans(tui::user_echo_spans(echo));
                         self.session.push(Message::user(&message));
-                        self.tui_turn(terminal, &mut log, &mut view, &mut input, &mut btw_panel)?;
+                        self.tui_turn(
+                            terminal,
+                            &mut log,
+                            &mut view,
+                            &mut input,
+                            &mut btw_panel,
+                            &mut arcade,
+                        )?;
                     }
                 }
                 _ => {}
@@ -4163,6 +4283,7 @@ impl Agent<'_> {
     /// One TUI turn: runs the generate → tools loop on a worker thread while
     /// the UI thread keeps the terminal live (typing, scrolling, interrupts),
     /// then feeds user lines queued during the turn into follow-up turns.
+    #[allow(clippy::too_many_arguments)]
     fn tui_turn(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
@@ -4170,6 +4291,7 @@ impl Agent<'_> {
         view: &mut tui::OutputView,
         input: &mut TuiInput,
         btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
     ) -> Result<(), String> {
         // The first iteration runs the main turn; later iterations run either
         // a follow-up turn (leftover queued user lines) or a btw-only drain
@@ -4214,6 +4336,7 @@ impl Agent<'_> {
                     view,
                     input,
                     btw,
+                    arcade,
                     shared,
                     bus_ref,
                     rem,
@@ -4228,6 +4351,7 @@ impl Agent<'_> {
                     view,
                     input,
                     btw,
+                    arcade,
                     shared,
                     bus_ref,
                     rem,
@@ -4910,6 +5034,7 @@ impl Agent<'_> {
     /// the same `drain_btw` path as a mid-turn `/btw`, so the answer streams
     /// into the (persistent) side panel and the panel stays open afterwards —
     /// dismissed only by Esc — exactly like the busy-time case.
+    #[allow(clippy::too_many_arguments)]
     fn tui_btw(
         &mut self,
         question: &str,
@@ -4918,6 +5043,7 @@ impl Agent<'_> {
         view: &mut tui::OutputView,
         input: &mut TuiInput,
         btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
     ) -> Result<(), String> {
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
@@ -4931,6 +5057,7 @@ impl Agent<'_> {
             view,
             input,
             btw,
+            arcade,
             &shared,
             bus.as_deref(),
             ui_remote.as_deref(),
@@ -4954,12 +5081,28 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         config_form: &mut Option<crate::configform::ConfigForm>,
+        arcade: &mut crate::arcade::Arcade,
     ) -> bool {
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
         let arg = parts.next().unwrap_or("").trim();
         match cmd {
             "/quit" | "/exit" => return false,
+            // Easter eggs: deliberately absent from `/help` and the completion
+            // popup, but known commands, so they run instead of being sent to
+            // the model. They take over the screen until Esc, and resume where
+            // they were left unless the argument asks for a new game.
+            _ if crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                let fresh = crate::arcade::Arcade::wants_new(arg);
+                let resuming = !fresh && arcade.has_parked(cmd);
+                arcade_hover_reporting(true);
+                arcade.open(cmd, fresh, arcade_seed(), w, h);
+                arcade.sound.set(crate::arcade::Sound::wanted(arg));
+                if resuming {
+                    log.push_dim(format!("{cmd}: ripresa la partita in corso"));
+                }
+            }
             "/config" => {
                 // Open the interactive modal; the run loop drives it and
                 // persists on close. `arg` is ignored (the form edits everything).
@@ -5043,7 +5186,7 @@ impl Agent<'_> {
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
             "/usage" => log.push_ansi(&self.render_usage_report(true)),
-            "/init" => self.tui_run_init(log, terminal, view, input, btw),
+            "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade),
             "/compact" => {
                 let result = {
                     let mut note = |s: String| log.push_dim(s);
@@ -5201,7 +5344,7 @@ impl Agent<'_> {
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
-                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input, btw) {
+                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input, btw, arcade) {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
@@ -5238,7 +5381,7 @@ impl Agent<'_> {
                 } else {
                     log.push_dim(started);
                     let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
-                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
                         log.push_plain(format!("/subagent failed: {e}"));
@@ -5256,7 +5399,7 @@ impl Agent<'_> {
                 Some(Ok(message)) => {
                     log.push_spans(tui::user_echo_spans(line));
                     self.session.push(Message::user(message));
-                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
                         log.push_plain(format!("{cmd} failed: {e}"));
                     }
                 }
@@ -5429,6 +5572,7 @@ fn run_worker_ui<T: Send>(
     view: &mut tui::OutputView,
     input: &mut TuiInput,
     btw: &mut BtwPanel,
+    arcade: &mut crate::arcade::Arcade,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
@@ -5445,6 +5589,7 @@ fn run_worker_ui<T: Send>(
             view,
             input,
             btw,
+            arcade,
             &rx,
             shared,
             bus,
@@ -5499,6 +5644,7 @@ fn busy_ui_loop(
     view: &mut tui::OutputView,
     input: &mut TuiInput,
     btw: &mut BtwPanel,
+    arcade: &mut crate::arcade::Arcade,
     rx: &Receiver<UiEvent>,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
@@ -5531,7 +5677,16 @@ fn busy_ui_loop(
     // Guards against `run_ask_panel` returning while still pending, which
     // would otherwise re-notify for the same question on the next iteration.
     let mut ask_notified = false;
+    // Wall-clock pacing for an easter egg opened mid-turn, same as the idle
+    // loop: render events arrive irregularly, so the frame delta has to be
+    // measured rather than inferred from the poll timeout.
+    let mut arcade_last = Instant::now();
     loop {
+        if arcade.is_open() {
+            let dt = arcade_last.elapsed();
+            arcade_last = Instant::now();
+            arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+        }
         // An `ask` question parked by the worker takes over the input region
         // until answered; the worker is blocked meanwhile, so no render events
         // arrive and the takeover is self-contained (issue #34).
@@ -5638,6 +5793,11 @@ fn busy_ui_loop(
                 if let Some(p) = &input.popup {
                     tui::draw_popup(f, input.buf.text(), p);
                 }
+                // Drawn last, over the live turn. Translucent by default here,
+                // so the model's output keeps streaming legibly underneath.
+                if arcade.is_open() {
+                    tui::draw_arcade(f, arcade);
+                }
                 remote_capture(remote, f);
             })
             .map_err(|e| e.to_string())?;
@@ -5666,9 +5826,39 @@ fn busy_ui_loop(
             log.set_progress(None);
             return Ok(());
         }
-        let Some(ev) = next_event(remote, Duration::from_millis(100))? else {
+        // An open easter egg wants the shared 20 Hz animation tick; the idle
+        // 100 ms poll would render it at ten frames a second.
+        let poll = if arcade.is_open() {
+            Duration::from_millis(crate::anim::TICK_MS)
+        } else {
+            Duration::from_millis(100)
+        };
+        let Some(ev) = next_event(remote, poll)? else {
             continue;
         };
+        // While it is up, the easter egg owns input — including the mouse.
+        // Ctrl-C closes it rather than interrupting the turn, so the first
+        // Ctrl-C puts the screen back and a second one stops the model.
+        if arcade.is_open() {
+            match ev {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    if let crate::arcade::Outcome::Close(line) = arcade.handle_key(key) {
+                        arcade_hover_reporting(false);
+                        if let Some(line) = line {
+                            log.push_dim(line);
+                        }
+                    }
+                }
+                Event::Mouse(m) => {
+                    let (w, h) = terminal
+                        .size()
+                        .map_or((80, 23), |s| (s.width, s.height.saturating_sub(1)));
+                    arcade.handle_mouse(m, w, h);
+                }
+                _ => {}
+            }
+            continue;
+        }
         match ev {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // Same precedence as `tui_loop`: the popup sees keys first, so
@@ -5748,6 +5938,23 @@ fn busy_ui_loop(
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_ansi(&out);
                             view.follow = true;
+                        } else if let Some(cmd) = arcade_command(&line) {
+                            // The whole point of these is the waiting, so they
+                            // are the commands that *do* run mid-turn.
+                            // Translucent, so the stream stays readable behind.
+                            input.history.add(&line);
+                            let arg = line[cmd.len()..].trim();
+                            let fresh = crate::arcade::Arcade::wants_new(arg);
+                            let resuming = !fresh && arcade.has_parked(cmd);
+                            let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                            arcade_hover_reporting(true);
+                            arcade.open(cmd, fresh, arcade_seed(), w, h);
+                            arcade.sound.set(crate::arcade::Sound::wanted(arg));
+                            arcade.veil();
+                            if resuming {
+                                log.push_dim(format!("{cmd}: ripresa la partita in corso"));
+                            }
+                            arcade_last = Instant::now();
                         } else if line.starts_with('/') || line.starts_with('!') {
                             log.push_dim(
                                 "[that command can't run mid-turn — wait for the model to finish]",

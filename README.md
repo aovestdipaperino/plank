@@ -259,6 +259,35 @@ plank --provider openai --model llama3.3 \
 
 **Notes** — `--provider` cannot be combined with `--remote` or the local backend selectors (`--metal`/`--cuda`/`--cpu`); it *is* the engine for that run. `/usage` reports billed token counts for the session, including Anthropic cache read/write and hit rate. The key is never written to `settings.json` — it stays on the environment or `--api-key` by design.
 
+## The arcade
+
+Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are six games behind undocumented-in-`/help` slash commands, and they are meant to be played **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
+
+| Command | |
+|---|---|
+| `/stars` | a perspective starfield; ↑↓ or the wheel take it to lightspeed |
+| `/pelota` | pong against a five-level CPU |
+| `/breakout` | knock the wall down, five walls deep |
+| `/invaders` | hold the line against the marching fleet |
+| `/centipede` | shoot it apart before it walks into you |
+| `/frogger` | cross the road, then ride the river home |
+
+Two arguments, combinable — `/breakout new sound`:
+
+- **`new`** (or `nuova`, `reset`) — deal a fresh game. Without it a command **resumes the game you left**: each one keeps its own slot, so you can close pelota, run three turns, open breakout, and come back to pelota exactly where it was. A finished game is not kept, so the next command deals a new one.
+- **`sound`** (or `suono`) — blips on. Off by default; `b` toggles it in-game.
+
+**Controls** — arrows (or `hjkl`/`wasd`), space to serve or fire, `p` to pause, `t` to switch between the translucent and opaque layer, `b` for sound, `Esc`/`q` to leave. The mouse works everywhere: the wheel and trackpad steer, click and drag place the paddle or the ship, and clicking fires in the two shooters. While a game is up, the first `Ctrl-C` closes it and a second one interrupts the model, so you are never locked out of stopping a turn.
+
+Two honest notes about what the terminal can and cannot do:
+
+- **Translucency is not alpha.** A cell holds one character and one pair of colors; there is nothing to composite. What happens instead is that these games are sparse, so the layer underneath is dimmed rather than erased and the glyphs land in the gaps. It reads as a veil, and the model's output stays legible behind it — but it is a trick, not blending.
+- **Sound is the terminal bell**, and nothing else. That is deliberate: it adds **zero bytes** to the binary, where real audio would mean a synthesis crate and a system audio dependency. The cost is that `BEL` has no pitch and no length, so the only thing distinguishing one cue from another is how many — one blip for a hit, two for a life lost, three for a level. Terminals set to a visual bell will flash instead, which is why it is off unless you ask.
+
+Pelota has one extra move worth knowing: hold **Shift** while steering and the paddle shrinks to a third of its length, but a hit that lands leaves at triple speed — usually past the CPU. The boost lasts exactly one crossing.
+
+None of these appear in `/help` or the completion popup. That is the point.
+
 ## Project layout
 
 Each module in `src/` maps to one functional section of the original `ds4_agent.c`:
@@ -267,6 +296,7 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `session.rs`, `compact.rs`, `sysprompt.rs` — conversation state, compaction, system prompt
 - `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
+- `arcade.rs`, `arcade/` — the six easter-egg games (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
 
 ## Star History

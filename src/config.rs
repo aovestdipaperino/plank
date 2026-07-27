@@ -596,7 +596,16 @@ pub fn slash_command_known(cmd: &str) -> bool {
             | "/version"
             | "/tree"
             | "/clone"
-    ) || slash_command_with_args(cmd, "/config")
+    )
+        // Easter eggs (`crate::arcade`). Known so the dispatcher runs them
+        // instead of forwarding the line to the model, but deliberately left
+        // out of `usage()` and the completion popup. They take an argument
+        // (`new`), so they go through the with-args form. Kept in sync with
+        // `Arcade::COMMANDS` by a test in that module.
+        || crate::arcade::Arcade::COMMANDS
+            .iter()
+            .any(|egg| slash_command_with_args(cmd, egg))
+        || slash_command_with_args(cmd, "/config")
         || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")
         || slash_command_with_args(cmd, "/subagent")
