@@ -3022,8 +3022,8 @@ mod tests {
         assert!(field.contains('─'), "walls missing:\n{field}");
         // The scoreboard owns the bottom row, outside the playing field.
         let footer = rows.last().unwrap();
-        assert!(footer.contains("livello 1/5"), "footer was {footer:?}");
-        assert!(footer.contains("tu 0 — 0 cpu"), "footer was {footer:?}");
+        assert!(footer.contains("level 1/5"), "footer was {footer:?}");
+        assert!(footer.contains("you 0 — 0 cpu"), "footer was {footer:?}");
     }
 
     #[test]
@@ -3135,6 +3135,6 @@ mod tests {
         assert!(painted.len() > 10, "only {} rows had stars", painted.len());
         assert!(painted[0] < 4, "nothing near the top: {painted:?}");
         assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
-        assert!(rows[23].contains("velocità"), "hint line missing");
+        assert!(rows[23].contains("speed"), "hint line missing");
     }
 }

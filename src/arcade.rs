@@ -887,13 +887,10 @@ impl Pelota {
     #[must_use]
     pub fn banner(&self) -> Option<String> {
         match self.phase {
-            Phase::LevelUp { .. } => Some(format!("LIVELLO {} SUPERATO", self.level())),
-            Phase::Paused => Some("PAUSA".to_string()),
-            Phase::GameOver => Some(format!(
-                "HAI PERSO AL LIVELLO {} — spazio per ricominciare",
-                self.level()
-            )),
-            Phase::Won => Some("HAI BATTUTO TUTTI I LIVELLI".to_string()),
+            Phase::LevelUp { .. } => Some(format!("LEVEL {} CLEARED", self.level())),
+            Phase::Paused => Some("PAUSED".to_string()),
+            Phase::GameOver => Some(format!("LOST ON LEVEL {} — space to restart", self.level())),
+            Phase::Won => Some("EVERY LEVEL BEATEN".to_string()),
             _ => None,
         }
     }
@@ -903,7 +900,7 @@ impl Pelota {
     pub fn hud(&self) -> String {
         let spec = self.spec();
         format!(
-            "livello {}/{}  ·  tu {} — {} cpu  (a {})",
+            "level {}/{}  ·  you {} — {} cpu  (to {})",
             self.level(),
             LEVELS.len(),
             self.score.0,
@@ -949,7 +946,7 @@ impl Sound {
     #[must_use]
     pub fn wanted(arg: &str) -> bool {
         arg.split_whitespace()
-            .any(|w| w.eq_ignore_ascii_case("sound") || w.eq_ignore_ascii_case("suono"))
+            .any(|w| w.eq_ignore_ascii_case("sound"))
     }
 
     /// Whether blips are currently on.
@@ -1042,32 +1039,32 @@ impl Game {
         match self {
             Self::Stars(_) => None,
             Self::Pelota(p) => Some(format!(
-                "pelota: livello {} — {} a {}{}",
+                "pelota: level {} — {} to {}{}",
                 p.level(),
                 p.score().0,
                 p.score().1,
                 resume_hint(p.finished(), "/pelota")
             )),
             Self::Breakout(b) => Some(format!(
-                "breakout: livello {} — {} mattoni in piedi{}",
+                "breakout: level {} — {} bricks standing{}",
                 b.level(),
                 b.remaining(),
                 resume_hint(b.finished(), "/breakout")
             )),
             Self::Invaders(i) => Some(format!(
-                "invaders: livello {} — {} alieni in volo{}",
+                "invaders: level {} — {} aliens flying{}",
                 i.level(),
                 i.remaining(),
                 resume_hint(i.finished(), "/invaders")
             )),
             Self::Centipede(c) => Some(format!(
-                "centipede: livello {} — {} segmenti{}",
+                "centipede: level {} — {} segments{}",
                 c.level(),
                 c.remaining(),
                 resume_hint(c.finished(), "/centipede")
             )),
             Self::Frogger(f) => Some(format!(
-                "frogger: livello {} — {} tane libere{}",
+                "frogger: level {} — {} bays open{}",
                 f.level(),
                 f.remaining(),
                 resume_hint(f.finished(), "/frogger")
@@ -1161,9 +1158,9 @@ fn cue_for(before: Vitals, after: Vitals) -> Option<Cue> {
 /// game they just left is still resumable.
 fn resume_hint(finished: bool, cmd: &str) -> String {
     if finished {
-        format!(" · {cmd} per una nuova partita")
+        format!(" · {cmd} for a new game")
     } else {
-        format!(" · {cmd} riprende, {cmd} new ricomincia")
+        format!(" · {cmd} resumes, {cmd} new restarts")
     }
 }
 
@@ -1208,7 +1205,7 @@ impl Arcade {
         "/frogger",
     ];
     /// The argument that throws the parked game away and deals a new one.
-    pub const NEW_ARGS: [&'static str; 3] = ["new", "nuova", "reset"];
+    pub const NEW_ARGS: [&'static str; 2] = ["new", "reset"];
 
     /// An empty cabinet.
     #[must_use]
@@ -1370,7 +1367,7 @@ impl Arcade {
     /// How to leave, kept out of [`Self::footer`] so the renderer can anchor it
     /// to the right edge. On a narrow terminal the hint line is the first thing
     /// to be truncated, and "how do I get out of this" must not be what is lost.
-    pub const EXIT_HINT: &'static str = "Esc/q esci";
+    pub const EXIT_HINT: &'static str = "Esc/q quit";
 
     /// The status and key hints along the bottom, without the exit hint.
     #[must_use]
@@ -1378,40 +1375,37 @@ impl Arcade {
         let Some(game) = self.open.as_ref() else {
             return String::new();
         };
-        let veil = if self.translucent { "opaco" } else { "velato" };
-        let blips = if self.sound.is_on() { "muto" } else { "suono" };
+        let veil = if self.translucent { "opaque" } else { "veiled" };
+        let blips = if self.sound.is_on() { "mute" } else { "sound" };
         match game {
             Game::Stars(s) => {
-                format!(
-                    "↑↓/rotella velocità ({:.2}×) · t {veil} · b {blips}",
-                    s.speed()
-                )
+                format!("↑↓/wheel speed ({:.2}×) · t {veil} · b {blips}", s.speed())
             }
             Game::Pelota(p) => {
                 let charge = if p.charged() {
-                    "⚡CARICO"
+                    "⚡CHARGED"
                 } else {
-                    "⇧ carica"
+                    "⇧ charge"
                 };
                 format!(
-                    "{} · ↑↓/mouse muovi · {charge} · p pausa · t {veil} · b {blips}",
+                    "{} · ↑↓/mouse move · {charge} · p pause · t {veil} · b {blips}",
                     p.hud()
                 )
             }
             Game::Breakout(b) => format!(
-                "{} · ←→/mouse muovi · spazio lancia · p pausa · t {veil} · b {blips}",
+                "{} · ←→/mouse move · space serve · p pause · t {veil} · b {blips}",
                 b.hud()
             ),
             Game::Invaders(i) => format!(
-                "{} · ←→/mouse muovi · spazio/click spara · p pausa · t {veil} · b {blips}",
+                "{} · ←→/mouse move · space/click fire · p pause · t {veil} · b {blips}",
                 i.hud()
             ),
             Game::Centipede(c) => format!(
-                "{} · ←→↑↓/mouse muovi · spazio/click spara · p pausa · t {veil} · b {blips}",
+                "{} · ←→↑↓/mouse move · space/click fire · p pause · t {veil} · b {blips}",
                 c.hud()
             ),
             Game::Frogger(f) => format!(
-                "{} · ←→↑↓/click salta · p pausa · t {veil} · b {blips}",
+                "{} · ←→↑↓/click hop · p pause · t {veil} · b {blips}",
                 f.hud()
             ),
         }
@@ -1933,7 +1927,7 @@ mod tests {
         let mut a = Arcade::new();
         a.open("/pelota", false, 1, 80, 24);
         match a.handle_key(key(KeyCode::Esc)) {
-            Outcome::Close(Some(line)) => assert!(line.starts_with("pelota: livello 1"), "{line}"),
+            Outcome::Close(Some(line)) => assert!(line.starts_with("pelota: level 1"), "{line}"),
             other => panic!("expected a closing score line, got {other:?}"),
         }
         assert!(!a.is_open());
@@ -2234,7 +2228,7 @@ mod tests {
 
     #[test]
     fn new_is_recognized_however_it_is_written() {
-        for arg in ["new", "NEW", " nuova ", "reset"] {
+        for arg in ["new", "NEW", " reset ", "RESET"] {
             assert!(Arcade::wants_new(arg), "{arg:?} did not read as new");
         }
         for arg in ["", "  ", "newton", "1"] {
@@ -2285,7 +2279,7 @@ mod tests {
         let mut a = Arcade::new();
         a.open("/invaders", false, 1, 80, 24);
         let line = a.close().expect("no closing line");
-        assert!(line.contains("/invaders riprende"), "{line}");
+        assert!(line.contains("/invaders resumes"), "{line}");
 
         a.open("/pelota", false, 1, 80, 24);
         match a.open.as_mut() {
@@ -2293,7 +2287,7 @@ mod tests {
             _ => panic!(),
         }
         let line = a.close().expect("no closing line");
-        assert!(line.contains("nuova partita"), "{line}");
+        assert!(line.contains("new game"), "{line}");
     }
 
     #[test]
@@ -2315,10 +2309,10 @@ mod tests {
 
     #[test]
     fn sound_is_off_unless_the_argument_asks_for_it() {
-        for arg in ["sound", "SUONO", "new sound", "sound new"] {
+        for arg in ["sound", "SOUND", "new sound", "sound new"] {
             assert!(Sound::wanted(arg), "{arg:?} did not ask for sound");
         }
-        for arg in ["", "new", "soundtrack", "nuova"] {
+        for arg in ["", "new", "soundtrack", "reset"] {
             assert!(!Sound::wanted(arg), "{arg:?} asked for sound");
         }
         assert!(!Sound::default().is_on());

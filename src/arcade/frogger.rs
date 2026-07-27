@@ -505,13 +505,13 @@ impl Frogger {
     #[must_use]
     pub fn banner(&self) -> Option<String> {
         match self.phase {
-            Phase::LevelUp { .. } => Some(format!("TUTTE A CASA — LIVELLO {}", self.level() + 1)),
-            Phase::Paused => Some("PAUSA".to_string()),
+            Phase::LevelUp { .. } => Some(format!("ALL HOME — LEVEL {}", self.level() + 1)),
+            Phase::Paused => Some("PAUSED".to_string()),
             Phase::GameOver => Some(format!(
-                "SPIACCICATA A {} PUNTI — spazio per ricominciare",
+                "SPLATTED AT {} POINTS — space to restart",
                 self.score
             )),
-            Phase::Won => Some(format!("TUTTE LE RANE A CASA — {} punti", self.score)),
+            Phase::Won => Some(format!("EVERY FROG HOME — {} points", self.score)),
             _ => None,
         }
     }
@@ -520,7 +520,7 @@ impl Frogger {
     #[must_use]
     pub fn hud(&self) -> String {
         format!(
-            "livello {}/{}  ·  {} punti  ·  {} vite  ·  {} tane libere",
+            "level {}/{}  ·  {} points  ·  {} lives  ·  {} bays open",
             self.level(),
             LEVELS.len(),
             self.score,

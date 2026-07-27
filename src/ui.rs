@@ -5100,7 +5100,7 @@ impl Agent<'_> {
                 arcade.open(cmd, fresh, arcade_seed(), w, h);
                 arcade.sound.set(crate::arcade::Sound::wanted(arg));
                 if resuming {
-                    log.push_dim(format!("{cmd}: ripresa la partita in corso"));
+                    log.push_dim(format!("{cmd}: resumed where you left off"));
                 }
             }
             "/config" => {
@@ -5952,7 +5952,7 @@ fn busy_ui_loop(
                             arcade.sound.set(crate::arcade::Sound::wanted(arg));
                             arcade.veil();
                             if resuming {
-                                log.push_dim(format!("{cmd}: ripresa la partita in corso"));
+                                log.push_dim(format!("{cmd}: resumed where you left off"));
                             }
                             arcade_last = Instant::now();
                         } else if line.starts_with('/') || line.starts_with('!') {

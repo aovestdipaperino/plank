@@ -263,6 +263,12 @@ plank --provider openai --model llama3.3 \
 
 Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are six games behind undocumented-in-`/help` slash commands, and they are meant to be played **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
 
+<p align="center">
+  <img src="assets/arcade-breakout.png" alt="/breakout played over a live plank turn: the brick wall, ball and paddle sit above the model's still-streaming poem, which stays readable through the dimmed layer" width="700">
+</p>
+
+That is a real turn underneath — the model is 1m 49s into writing a poem at 20.8 t/s, still streaming, and the wall, ball and paddle are on top of it. The dim line near the top is the resume notice: this game had been left open in an earlier turn and came back where it was.
+
 | Command | |
 |---|---|
 | `/stars` | a perspective starfield; ↑↓ or the wheel take it to lightspeed |
@@ -274,8 +280,8 @@ Waiting on a long generation is the one moment a coding agent has nothing for yo
 
 Two arguments, combinable — `/breakout new sound`:
 
-- **`new`** (or `nuova`, `reset`) — deal a fresh game. Without it a command **resumes the game you left**: each one keeps its own slot, so you can close pelota, run three turns, open breakout, and come back to pelota exactly where it was. A finished game is not kept, so the next command deals a new one.
-- **`sound`** (or `suono`) — blips on. Off by default; `b` toggles it in-game.
+- **`new`** (or `reset`) — deal a fresh game. Without it a command **resumes the game you left**: each one keeps its own slot, so you can close pelota, run three turns, open breakout, and come back to pelota exactly where it was. A finished game is not kept, so the next command deals a new one.
+- **`sound`** — blips on. Off by default; `b` toggles it in-game.
 
 **Controls** — arrows (or `hjkl`/`wasd`), space to serve or fire, `p` to pause, `t` to switch between the translucent and opaque layer, `b` for sound, `Esc`/`q` to leave. The mouse works everywhere: the wheel and trackpad steer, click and drag place the paddle or the ship, and clicking fires in the two shooters. While a game is up, the first `Ctrl-C` closes it and a second one interrupts the model, so you are never locked out of stopping a turn.
 

@@ -537,14 +537,14 @@ impl Centipede {
     pub fn banner(&self) -> Option<String> {
         match self.phase {
             Phase::LevelUp { .. } => {
-                Some(format!("CENTOPIEDI A PEZZI — LIVELLO {}", self.level() + 1))
+                Some(format!("CENTIPEDE IN PIECES — LEVEL {}", self.level() + 1))
             }
-            Phase::Paused => Some("PAUSA".to_string()),
+            Phase::Paused => Some("PAUSED".to_string()),
             Phase::GameOver => Some(format!(
-                "TI HA RAGGIUNTO A {} PUNTI — spazio per ricominciare",
+                "IT REACHED YOU AT {} POINTS — space to restart",
                 self.score
             )),
-            Phase::Won => Some(format!("BOSCO RIPULITO — {} punti", self.score)),
+            Phase::Won => Some(format!("FOREST CLEARED — {} points", self.score)),
             _ => None,
         }
     }
@@ -553,7 +553,7 @@ impl Centipede {
     #[must_use]
     pub fn hud(&self) -> String {
         format!(
-            "livello {}/{}  ·  {} punti  ·  {} vite  ·  {} segmenti",
+            "level {}/{}  ·  {} points  ·  {} lives  ·  {} segments",
             self.level(),
             LEVELS.len(),
             self.score,

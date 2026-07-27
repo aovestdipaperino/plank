@@ -446,13 +446,10 @@ impl Breakout {
     #[must_use]
     pub fn banner(&self) -> Option<String> {
         match self.phase {
-            Phase::LevelUp { .. } => Some(format!("MURO ABBATTUTO — LIVELLO {}", self.level() + 1)),
-            Phase::Paused => Some("PAUSA".to_string()),
-            Phase::GameOver => Some(format!(
-                "FINITO A {} PUNTI — spazio per ricominciare",
-                self.score
-            )),
-            Phase::Won => Some(format!("HAI PULITO TUTTI I MURI — {} punti", self.score)),
+            Phase::LevelUp { .. } => Some(format!("WALL DOWN — LEVEL {}", self.level() + 1)),
+            Phase::Paused => Some("PAUSED".to_string()),
+            Phase::GameOver => Some(format!("OVER AT {} POINTS — space to restart", self.score)),
+            Phase::Won => Some(format!("EVERY WALL CLEARED — {} points", self.score)),
             _ => None,
         }
     }
@@ -461,7 +458,7 @@ impl Breakout {
     #[must_use]
     pub fn hud(&self) -> String {
         format!(
-            "livello {}/{}  ·  {} punti  ·  {} vite  ·  {} mattoni",
+            "level {}/{}  ·  {} points  ·  {} lives  ·  {} bricks",
             self.level(),
             LEVELS.len(),
             self.score,
