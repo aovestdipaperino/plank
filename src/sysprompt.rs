@@ -330,6 +330,7 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 #[must_use]
 pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: bool) -> String {
     let mut out = build_tools_prompt_base(parity);
+    insert_marker_spelling_note(&mut out);
     append_native_extra_schemas(&mut out);
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -361,6 +362,29 @@ pub fn build_tools_prompt_base(parity: bool) -> String {
         out = out.replace(&format!("{IN_THINK_PROHIBITION}\n\n"), "");
     }
     out
+}
+
+/// The line warning the model off the `SSML` misspelling of the marker.
+///
+/// Not in the C constants, so it lives outside [`build_tools_prompt_base`] and
+/// the parity suite keeps locking the base byte-for-byte. See
+/// [`crate::dsml::MARKER_NAMES`]: `<｜SSML｜…>` is accepted as a recovery
+/// alias, and this line exists so the model does not learn it as a second
+/// legal syntax.
+const MARKER_SPELLING_NOTE: &str =
+    "The marker is spelled DSML. SSML is not supported; do not write <｜SSML｜…>.\n\n";
+
+/// Inserts [`MARKER_SPELLING_NOTE`] directly after the tool-call shape block.
+///
+/// Anchored on the shape's closing tag rather than appended at the end so the
+/// warning sits next to the syntax it is about, instead of behind the tool
+/// schemas. A missing anchor leaves the prompt untouched — the alias in
+/// `dsml.rs` still recovers the call, so this is advisory, not load-bearing.
+fn insert_marker_spelling_note(out: &mut String) {
+    const ANCHOR: &str = "</｜DSML｜tool_calls>\n\n";
+    if let Some(at) = out.find(ANCHOR) {
+        out.insert_str(at + ANCHOR.len(), MARKER_SPELLING_NOTE);
+    }
 }
 
 /// Appends the schemas of native tools plank adds beyond the C-trained table.
@@ -740,6 +764,26 @@ mod tests {
         assert!(r.starts_with("\n\n[System prompt reminder follows.]\n"));
         assert!(r.ends_with("[End system prompt reminder.]\n\n"));
         assert!(r.contains("## Tools"));
+    }
+
+    /// The marker-spelling warning must reach every prompt surface the model
+    /// sees, sit next to the shape it is about, and stay out of the C-locked
+    /// base so the parity suite keeps checking that base byte-for-byte.
+    #[test]
+    fn marker_spelling_note_lands_after_the_shape_but_not_in_the_base() {
+        for parity in [true, false] {
+            let base = build_tools_prompt_base(parity);
+            assert!(!base.contains("SSML"), "base must stay verbatim C");
+
+            let prompt = build_tools_prompt(&[], parity);
+            assert_eq!(prompt.matches(MARKER_SPELLING_NOTE).count(), 1);
+            let shape_end = prompt.find("</｜DSML｜tool_calls>\n\n").unwrap()
+                + "</｜DSML｜tool_calls>\n\n".len();
+            assert!(prompt[shape_end..].starts_with(MARKER_SPELLING_NOTE));
+            // The reminder re-sends the tools prompt, so it inherits the note.
+            assert!(build_system_prompt_reminder(&[], parity).contains(MARKER_SPELLING_NOTE));
+            assert!(build_system_prompt("", &[], parity).contains(MARKER_SPELLING_NOTE));
+        }
     }
 
     #[test]

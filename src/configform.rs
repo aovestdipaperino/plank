@@ -25,6 +25,7 @@ pub enum FieldId {
     EngineBackend,
     EnginePower,
     EngineCtx,
+    EngineThinkingToolCalls,
     UiRespectGitignore,
     UiPopupRows,
     UiIndexRefreshSecs,
@@ -112,6 +113,13 @@ pub static FIELDS: &[Field] = &[
         "ctx",
         "context window (tokens)",
         Kind::OptInt,
+    ),
+    f(
+        FieldId::EngineThinkingToolCalls,
+        "engine",
+        "thinkingToolCalls",
+        "dispatch tool calls made inside thinking",
+        Kind::Bool,
     ),
     f(
         FieldId::UiRespectGitignore,
@@ -287,6 +295,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
             .unwrap_or_else(|| "(unset)".to_string()),
         FieldId::EnginePower => optnum(s.engine.power),
         FieldId::EngineCtx => optnum(s.engine.ctx),
+        FieldId::EngineThinkingToolCalls => s.engine.thinking_tool_calls.to_string(),
         FieldId::UiRespectGitignore => s.ui.respect_gitignore.to_string(),
         FieldId::UiPopupRows => s.ui.popup_rows.to_string(),
         FieldId::UiIndexRefreshSecs => s.ui.index_refresh_secs.to_string(),
@@ -320,6 +329,9 @@ fn tri_str(v: Option<bool>) -> String {
 /// Toggles a `Bool`/`Tri` field in place; a no-op for other kinds.
 fn toggle(s: &mut Settings, id: FieldId) {
     match id {
+        FieldId::EngineThinkingToolCalls => {
+            s.engine.thinking_tool_calls = !s.engine.thinking_tool_calls;
+        }
         FieldId::UiRespectGitignore => s.ui.respect_gitignore = !s.ui.respect_gitignore,
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = !s.ui.show_tool_calls,
         FieldId::UiShowToolResults => s.ui.show_tool_results = !s.ui.show_tool_results,
@@ -413,7 +425,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
                 format!("notifications must be always, unfocused, or never (got {raw})")
             })?;
         }
-        FieldId::UiRespectGitignore
+        FieldId::EngineThinkingToolCalls
+        | FieldId::UiRespectGitignore
         | FieldId::UiShowToolCalls
         | FieldId::UiShowToolResults
         | FieldId::UiShowThinking
@@ -434,6 +447,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
 
 fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
     match id {
+        FieldId::EngineThinkingToolCalls => s.engine.thinking_tool_calls = b,
         FieldId::UiRespectGitignore => s.ui.respect_gitignore = b,
         FieldId::UiShowToolCalls => s.ui.show_tool_calls = b,
         FieldId::UiShowToolResults => s.ui.show_tool_results = b,

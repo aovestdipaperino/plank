@@ -449,6 +449,7 @@ pub const TIPS: &[&str] = &[
     "enable sub-agents with /config tools.agent true",
     "enable plan mode with /config tools.planMode true",
     "hide thinking text with /config ui.showThinking false",
+    "let the model act mid-thought with /config engine.thinkingToolCalls true",
     "show tool calls with /config ui.showToolCalls true",
     "echo tool results with /config ui.showToolResults true",
     "settings save to ./.plank/settings.json — commit it to share",

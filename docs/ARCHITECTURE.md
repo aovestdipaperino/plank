@@ -144,9 +144,10 @@ Model text is fed byte-by-byte through a pipeline:
    inside `<think>` blocks), suppresses raw markup, and emits human-friendly
    tool banners. It routes output to a `RenderSink` (visible, thinking, and
    red-styled error banners; raw DSML never reaches the screen, even on parse
-   failure). `StreamRenderer` treats a DSML stanza opened inside `<think>` as an
-   ordinary tool call unless `engine.thinkingToolCalls` is off, in which case it
-   discards it with a `[tool call ignored: ...]` notice exactly as the C does.
+   failure). A DSML stanza opened inside `<think>` is discarded with a
+   `[tool call ignored: ...]` notice exactly as the C does; turning on
+   `engine.thinkingToolCalls` (off by default, editable in `/config`) instead
+   dispatches it as an ordinary tool call.
 2. `render.rs` (stdout path) turns that into ANSI: markdown, syntax
    highlighting, and gray thinking text.
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable
@@ -318,8 +319,11 @@ On startup the agent warms the cache before the first turn:
    fingerprint = `SHA-1(model_name + "\0" + system_prompt)`.
 2. If `sysprompt.kv` exists and its stored fingerprint matches, the snapshot is
    restored (`ds4_session_load_snapshot`) — no prefill.
-3. Otherwise it shows **"Updating system prompt cache..."**, prefills the system
-   prompt (streaming the progress bar), and saves a fresh checkpoint.
+3. Otherwise it prefills the system prompt (streaming the progress bar) and saves
+   a fresh checkpoint. The note above the bar names the tier being rebuilt —
+   `TierKind::warm_label`, e.g. **"Updating system prompt cache…"** for Tier 1 or
+   **"Updating session context…"** when only the volatile tier prefills — and the
+   window title stays `🚀 launching...` until the UI accepts input.
 
 Within a run, the live session then makes each turn reuse the common prefix, so
 only the new user/assistant suffix is evaluated.

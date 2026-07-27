@@ -29,18 +29,22 @@ pub enum State<'a> {
 /// truncated with an ellipsis.
 const TITLE_PROMPT_MAX: usize = 20;
 
+/// Title shown while starting up — including the KV-cache prefill, which is the
+/// slowest launch step and the one most likely to be looked at.
+const LOADING: &str = "🚀 Plank loading...";
+
 /// Formats the window title for `state`. A [`State::Busy`] prompt is collapsed
 /// to one line and truncated past [`TITLE_PROMPT_MAX`] characters; a
 /// whitespace-only prompt degrades to the plain loading form.
 #[must_use]
 pub fn window_title(state: State<'_>) -> String {
     let prompt = match state {
-        State::Loading => return "🚀 Plank loading...".to_string(),
+        State::Loading => return LOADING.to_string(),
         State::Idle => return "🪵 Plank - READY.".to_string(),
         State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
     };
     if prompt.is_empty() {
-        return "🚀 Plank loading...".to_string();
+        return LOADING.to_string();
     }
     match prompt.char_indices().nth(TITLE_PROMPT_MAX) {
         Some((i, _)) => format!("🚀 {}…", prompt[..i].trim_end()),

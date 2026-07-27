@@ -1345,11 +1345,21 @@ fn diff_line_spans(
     }
 }
 
-/// Minimal pre-UI screen shown while the system-prompt KV cache is (re)built at
-/// launch: a centered note and a simple progress bar. The full UI is withheld
-/// until warming finishes, so the user sees clear progress instead of an idle
-/// screen during the one slow step.
-pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Option<&str>) {
+/// Minimal pre-UI screen shown while the KV cache is (re)built at launch: a
+/// centered note and a simple progress bar. The full UI is withheld until
+/// warming finishes, so the user sees clear progress instead of an idle screen
+/// during the one slow step. `stage` names the tier currently prefilling (see
+/// [`crate::kvtier::TierKind::warm_label`]) so the note does not claim the
+/// system prompt is being rebuilt while a cheaper context tier is the one
+/// running.
+pub fn draw_warm(
+    frame: &mut Frame,
+    done: i32,
+    total: i32,
+    tps: f64,
+    stage: &str,
+    notice: Option<&str>,
+) {
     let total = total.max(1);
     let done = done.clamp(0, total);
     let pct = u16::try_from(i64::from(done) * 100 / i64::from(total)).unwrap_or(100);
@@ -1363,7 +1373,7 @@ pub fn draw_warm(frame: &mut Frame, done: i32, total: i32, tps: f64, notice: Opt
     .split(area);
     let text = Text::from(vec![
         Line::from(Span::styled(
-            "Updating system prompt cache…",
+            format!("{stage}…"),
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),

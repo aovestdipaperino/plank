@@ -12,9 +12,45 @@
 //! Port of the `agent_dsml_*` family from `ds4_agent.c`.
 
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
-const DSML_OPEN_MARKER: &str = "<｜DSML｜";
-const DSML_CLOSE_MARKER: &[u8] = "</｜DSML｜".as_bytes();
+const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
+const CLOSE_MARKER_HEAD: &[u8] = "</｜".as_bytes();
 const DSML_BAR: &[u8] = "｜".as_bytes();
+
+/// Marker names accepted inside a tag: `<｜NAME｜invoke ...>`.
+///
+/// `DSML` is canonical and the only form the system prompt teaches. `SSML` is
+/// an alias for a misspelling the model actually emits: `｜DSML｜` is a
+/// dedicated vocab token, but plank composes the tools prompt as an ordinary
+/// system message, so the marker arrives as ordinary BPE pieces and the model
+/// spells it back out — where the far more common pretraining string "SSML"
+/// occasionally wins the "D". Without the alias the stanza parses as nothing,
+/// prints raw, and the turn ends with no tool error for the model to retry
+/// from. The prompt tells the model SSML is unsupported so this stays a
+/// recovery path rather than a second syntax.
+pub(crate) const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
+
+/// Matches an opening or closing tag prefix for `name` under any accepted
+/// marker, returning the matched length. All markers are the same width, so
+/// the length does not depend on which one matched.
+pub(crate) fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
+    MARKER_NAMES.iter().find_map(|marker| {
+        let prefix = tag_prefix(marker, closing, name);
+        s.starts_with(prefix.as_bytes()).then_some(prefix.len())
+    })
+}
+
+/// True when `s` is a (possibly incomplete) prefix of a tag opener for `name`
+/// under any accepted marker.
+pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
+    MARKER_NAMES
+        .iter()
+        .any(|marker| tag_prefix(marker, closing, name).as_bytes().starts_with(s))
+}
+
+fn tag_prefix(marker: &str, closing: bool, name: &str) -> String {
+    let slash = if closing { "/" } else { "" };
+    format!("<{slash}｜{marker}｜{name}")
+}
 
 /// One named argument of a parsed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,7 +192,8 @@ impl DsmlParser {
                     self.search_tail.remove(0);
                 }
                 self.search_tail.push(c);
-                if self.search_tail.ends_with(DSML_START) {
+                if self.search_tail.ends_with(DSML_START) || self.search_tail.ends_with(SSML_START)
+                {
                     self.start();
                 }
                 continue;
@@ -292,7 +329,7 @@ impl DsmlParser {
             return;
         };
         let tail = &value[lt..];
-        if tail.len() > 64 || !tail.starts_with(DSML_CLOSE_MARKER) {
+        if tail.len() > 64 || tag_prefix_len(tail, true, "").is_none() {
             return;
         }
         let mut complete = false;
@@ -302,10 +339,12 @@ impl DsmlParser {
 
 /// Checks whether `tag` is an opening DSML tag with the given element name.
 fn open_tag_is(tag: &str, name: &str) -> bool {
-    let prefix = format!("{DSML_OPEN_MARKER}{name}");
-    tag.strip_prefix(&prefix)
-        .and_then(|rest| rest.bytes().next())
-        .is_some_and(|c| c == b'>' || (c as char).is_ascii_whitespace())
+    let Some(len) = tag_prefix_len(tag.as_bytes(), false, name) else {
+        return false;
+    };
+    tag.as_bytes()
+        .get(len)
+        .is_some_and(|&c| c == b'>' || c.is_ascii_whitespace())
 }
 
 /// Recognizes a DSML closing tag at the start of `s`, returning its length.
@@ -314,12 +353,7 @@ fn open_tag_is(tag: &str, name: &str) -> bool {
 /// to emit (whitespace and an optional trailing `｜` before `>`). Opening tags
 /// stay strict so accidental prose does not become a tool call.
 fn close_tag_at(s: &[u8], name: &str) -> Option<usize> {
-    let prefix = format!("</｜DSML｜{name}");
-    let prefix = prefix.as_bytes();
-    if !s.starts_with(prefix) {
-        return None;
-    }
-    let mut i = prefix.len();
+    let mut i = tag_prefix_len(s, true, name)?;
     while i < s.len() && s[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -338,7 +372,7 @@ fn close_tag_at(s: &[u8], name: &str) -> Option<usize> {
 /// Finds a DSML closing tag for `name` in `s`; returns (offset, tag length).
 fn find_close_tag(s: &[u8], name: &str) -> Option<(usize, usize)> {
     let mut from = 0;
-    while let Some(pos) = find_bytes(&s[from..], DSML_CLOSE_MARKER) {
+    while let Some(pos) = find_bytes(&s[from..], CLOSE_MARKER_HEAD) {
         let at = from + pos;
         if let Some(tag_len) = close_tag_at(&s[at..], name) {
             return Some((at, tag_len));
@@ -359,15 +393,13 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// for the whole parameter to finish. Sets `complete` when the tail is a full
 /// close tag ending exactly at the last byte.
 fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
-    const PREFIX: &[u8] = "</｜DSML｜parameter".as_bytes();
     *complete = false;
-    if tail.len() <= PREFIX.len() {
-        return PREFIX.starts_with(tail);
+    if tag_prefix_partial(tail, true, "parameter") {
+        return true;
     }
-    if !tail.starts_with(PREFIX) {
+    let Some(mut i) = tag_prefix_len(tail, true, "parameter") else {
         return false;
-    }
-    let mut i = PREFIX.len();
+    };
     while i < tail.len() && tail[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -419,6 +451,40 @@ mod tests {
         for b in s.as_bytes() {
             p.feed([*b]);
         }
+    }
+
+    /// The SSML alias (see [`MARKER_NAMES`]) must parse identically to the
+    /// canonical spelling, including when only some tags drifted, and `raw()`
+    /// must stay usable for the diagnostics that quote it.
+    #[test]
+    fn ssml_alias_parses_like_dsml() {
+        let ssml = STANZA.replace("DSML", "SSML");
+        let mixed = STANZA.replacen("DSML", "SSML", 2);
+        for text in [ssml.as_str(), mixed.as_str()] {
+            for mut p in [DsmlParser::new(), DsmlParser::new()] {
+                feed_all(&mut p, text);
+                assert_eq!(p.state(), DsmlState::Done, "{text:?}");
+                assert_eq!(p.calls().len(), 1);
+                assert_eq!(p.calls()[0].name, "read_file");
+                assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
+                assert_eq!(p.calls()[0].arg_value("offset"), Some("42"));
+                assert!(!p.raw().is_empty());
+            }
+            let mut p = DsmlParser::new();
+            feed_bytewise(&mut p, text);
+            assert_eq!(p.state(), DsmlState::Done, "bytewise {text:?}");
+            assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
+        }
+    }
+
+    /// Only the one observed misspelling is an alias; other marker names stay
+    /// unrecognized so prose cannot open a stanza.
+    #[test]
+    fn other_marker_names_do_not_open_a_stanza() {
+        let mut p = DsmlParser::new();
+        feed_all(&mut p, &STANZA.replace("DSML", "XSML"));
+        assert_eq!(p.state(), DsmlState::Search);
+        assert!(p.calls().is_empty());
     }
 
     #[test]

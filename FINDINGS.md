@@ -271,12 +271,12 @@ test` and review the diff before committing.
   interposed mid-loop.
 - **Tool calls inside `<think>` are a deliberate divergence.** The C reference
   forbids them in two places: the tools-prompt line at `ds4_agent.c:718` and the
-  stream-time discard at `ds4_agent.c:3107` and friends. plank dispatches them by
-  default instead (`engine.thinkingToolCalls`, on), which means the prompt line is
-  stripped from the built prompt — the C string constants in `src/sysprompt.rs`
-  are still verbatim, so `tests/c_parity.rs` keeps passing; only the assembled
-  output differs. Set `engine.thinkingToolCalls: false` for strict parity when
-  diffing against the reference.
+  stream-time discard at `ds4_agent.c:3107` and friends. plank can dispatch them
+  instead, behind `engine.thinkingToolCalls` (`/config`), which is **off** by
+  default so the shipped behavior is strict parity. Turning it on strips the
+  prompt line from the built prompt — the C string constants in
+  `src/sysprompt.rs` are still verbatim, so `tests/c_parity.rs` keeps passing;
+  only the assembled output differs.
 
   A call fired mid-thought leaves the reply with an unterminated `<think>`. plank
   appends a synthetic `</think>` before the `<tool_result>` message
@@ -460,3 +460,28 @@ test` and review the diff before committing.
   carries its cached `resources` precisely so those two schemas stay, so the
   gate is presence of resources alone. `build_tools_prompt(&[])` is unaffected
   either way, so the C-parity fixtures do not move.
+
+- **`｜DSML｜` is a dedicated vocab token in C, but plain characters in plank —
+  hence the `SSML` misspelling.** `ds4_agent.c:986-990` tokenizes the tools
+  prompt with `ds4_tokenize_rendered_chat` explicitly "so the literal ｜DSML｜
+  markers in the examples become the model's dedicated DSML token"; the C
+  asserts the marker is one id at `ds4_agent.c:7408`. plank has no binding for
+  `ds4_tokenize_rendered_chat` (`src/ffi.rs`) and composes the tools prompt as
+  an ordinary `system` message, so the marker arrives as ordinary BPE pieces.
+  The model then spells it back out at generation time, and the "D" is just
+  another sampled character — with `SSML` (Speech Synthesis Markup Language) a
+  far more common pretraining string. Repro
+  `~/.plank/repro/repro-1785161356.md`: after ~18 correct calls, one came back
+  as `<｜SSML｜tool_calls>` with every other byte right. `engine.thinkingToolCalls`
+  amplifies it: stripping `IN_THINK_PROHIBITION` puts every tool call
+  off-distribution inside `<think>`, which flattens the distribution over those
+  spelled-out pieces. `src/ds4engine.rs:517` notes that a re-appended assistant
+  section retokenizes from text, so a compaction or resume converts the whole
+  call history from control-token DSML to the spelled-out form at once.
+  Mitigated, not fixed, by `dsml::MARKER_NAMES`: `SSML` is accepted as a parse
+  alias so the call dispatches instead of printing raw and silently ending the
+  turn with no error for the model to retry from, and `MARKER_SPELLING_NOTE`
+  tells the model the spelling is unsupported. The real fix is binding
+  `ds4_tokenize_rendered_chat` (public at `refs/ds4/ds4.h:203`) for the tools
+  prompt and the reminder. Note the alias is deliberately narrow — only the one
+  observed misspelling, not any four letters — so prose cannot open a stanza.

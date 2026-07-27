@@ -13,6 +13,8 @@ You have access to native DSML tools. Invoke tools by writing exactly this shape
 </｜DSML｜invoke>
 </｜DSML｜tool_calls>
 
+The marker is spelled DSML. SSML is not supported; do not write <｜SSML｜…>.
+
 Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.
 
 String parameters use raw text and string="true". Numbers and booleans use JSON text and string="false".

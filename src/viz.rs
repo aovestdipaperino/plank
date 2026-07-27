@@ -14,14 +14,14 @@
 //! Port of `agent_tool_visualizer`, `agent_dsml_marker_detector`, and
 //! `agent_stream_renderer` from `ds4_agent.c`.
 
-use crate::dsml::{DsmlParser, DsmlState, ToolCall};
+use crate::dsml::{
+    DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
+};
 
 /// The canonical DSML tool-call opening marker.
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 /// Canonical invoke opener, seeded when the model skips the outer wrapper.
 const CANONICAL_INVOKE: &[u8] = "<｜DSML｜invoke".as_bytes();
-/// Prefix of a parameter close tag, for online tail suppression.
-const PARAM_CLOSE_PREFIX: &[u8] = "</｜DSML｜parameter".as_bytes();
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
 const THINK_OPEN: &[u8] = b"<think>";
@@ -159,13 +159,12 @@ fn parse_attr(tag: &str, name: &str) -> Option<String> {
 /// full close tag ending exactly at the last byte.
 fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
     *complete = false;
-    if tail.len() <= PARAM_CLOSE_PREFIX.len() {
-        return PARAM_CLOSE_PREFIX.starts_with(tail);
+    if tag_prefix_partial(tail, true, "parameter") {
+        return true;
     }
-    if !tail.starts_with(PARAM_CLOSE_PREFIX) {
+    let Some(mut i) = tag_prefix_len(tail, true, "parameter") else {
         return false;
-    }
-    let mut i = PARAM_CLOSE_PREFIX.len();
+    };
     while i < tail.len() && tail[i].is_ascii_whitespace() {
         i += 1;
     }
@@ -194,15 +193,19 @@ fn parameter_close_tail(tail: &[u8], complete: &mut bool) -> bool {
 /// `complete` when a form matched fully and `implicit_invoke` when the form
 /// was a direct invoke opener without the outer `tool_calls` wrapper.
 fn dsml_start_match(tail: &[u8], complete: &mut bool, implicit_invoke: &mut bool) -> bool {
-    const FORMS: [(&str, bool); 4] = [
-        ("<｜DSML｜tool_calls>", false),
-        ("<DSML｜tool_calls>", false),
-        ("<｜DSML｜invoke", true),
-        ("<DSML｜invoke", true),
-    ];
     *complete = false;
     *implicit_invoke = false;
-    for (form, implicit) in FORMS {
+    // Each marker contributes the canonical form and the dropped-leading-bar
+    // typo, for both the wrapper and the bare invoke opener.
+    let forms = MARKER_NAMES.iter().flat_map(|m| {
+        [
+            (format!("<｜{m}｜tool_calls>"), false),
+            (format!("<{m}｜tool_calls>"), false),
+            (format!("<｜{m}｜invoke"), true),
+            (format!("<{m}｜invoke"), true),
+        ]
+    });
+    for (form, implicit) in forms {
         let form = form.as_bytes();
         if tail.len() <= form.len() && form[..tail.len()] == *tail {
             *complete = tail.len() == form.len();
@@ -225,16 +228,21 @@ struct MarkerDetector {
 
 impl MarkerDetector {
     const CAP: usize = 32;
-    const NEEDLES: [&'static str; 4] = ["｜DSML｜", "|DSML|", "<DSML｜", "</DSML｜"];
-
     fn feed(&mut self, c: u8) -> bool {
         if self.tail.len() == Self::CAP {
             self.tail.remove(0);
         }
         self.tail.push(c);
-        Self::NEEDLES
+        MARKER_NAMES.iter().any(|m| {
+            [
+                format!("｜{m}｜"),
+                format!("|{m}|"),
+                format!("<{m}｜"),
+                format!("</{m}｜"),
+            ]
             .iter()
             .any(|n| self.tail.ends_with(n.as_bytes()))
+        })
     }
 }
 
@@ -374,9 +382,8 @@ pub struct StreamRenderer<S> {
     /// When true, a DSML stanza opened inside `<think>` is parsed and dispatched
     /// like any other. Defaults **false**, which is strict `refs/ds4` parity:
     /// the stanza is discarded with a `[tool call ignored: ...]` notice.
-    /// Production wires this from `engine.thinkingToolCalls`, whose default is
-    /// the opposite (allow); the struct default stays parity so existing callers
-    /// and tests keep the C behavior unless they ask for otherwise.
+    /// Production wires this from `engine.thinkingToolCalls`, which defaults
+    /// off too, so callers and tests keep the C behavior unless they opt in.
     thinking_tool_calls: bool,
 }
 
@@ -1014,12 +1021,13 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     fn scan_dsml_tag(&mut self, tag: &[u8]) {
         let tag = String::from_utf8_lossy(tag).into_owned();
-        if tag.starts_with("</｜DSML｜invoke") {
+        let b = tag.as_bytes();
+        if tag_prefix_len(b, true, "invoke").is_some() {
             self.viz_invoke_end();
-        } else if tag.starts_with("<｜DSML｜invoke") {
+        } else if tag_prefix_len(b, false, "invoke").is_some() {
             let name = parse_attr(&tag, "name").unwrap_or_else(|| "tool".to_string());
             self.viz_tool(&name);
-        } else if tag.starts_with("<｜DSML｜parameter")
+        } else if tag_prefix_len(b, false, "parameter").is_some()
             && let Some(name) = parse_attr(&tag, "name")
         {
             self.viz_param_begin(&name);
@@ -1466,6 +1474,65 @@ mod tests {
         sr.finish();
         assert_eq!(sr.sink().visible, "just an answer, no thinking");
         assert_eq!(sr.sink().think, "");
+    }
+
+    /// Repro `~/.plank/repro/repro-1785161356.md`: mid-session the model wrote
+    /// `<｜SSML｜…>` for the whole stanza. Every other byte was correct, but the
+    /// call parsed as nothing, printed raw, and the turn ended with no tool
+    /// error — so the model could not even retry. `MARKER_NAMES` accepts SSML
+    /// as an alias; the stanza must dispatch exactly like the DSML spelling.
+    #[test]
+    fn ssml_misspelling_is_accepted_as_an_alias() {
+        let text = concat!(
+            "Let me look at the documents module.\n",
+            "<｜SSML｜tool_calls>\n",
+            "<｜SSML｜invoke name=\"bash\">\n",
+            "<｜SSML｜parameter name=\"command\" string=\"true\">cat documents.rs",
+            "</｜SSML｜parameter>\n",
+            "</｜SSML｜invoke>\n",
+            "</｜SSML｜tool_calls>",
+        );
+        for sr in [run_chunked(text), run_charwise(text)] {
+            let vis = &sr.sink().visible;
+            assert!(vis.contains("🛠️ $ cat documents.rs"), "{vis:?}");
+            assert!(!vis.contains("SSML"), "{vis:?}");
+            let fin = sr.finished();
+            assert_eq!(fin.calls.len(), 1);
+            assert_eq!(fin.calls[0].name, "bash");
+            assert_eq!(fin.calls[0].arg_value("command"), Some("cat documents.rs"));
+            assert!(fin.error.is_none(), "{:?}", fin.error);
+        }
+    }
+
+    /// The alias is per-tag, not per-stanza: the drift is a sampling slip on a
+    /// spelled-out marker, so it can hit one tag and not the next.
+    #[test]
+    fn dsml_and_ssml_tags_mix_within_one_stanza() {
+        let text = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜SSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls -la</｜SSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜SSML｜tool_calls>",
+        );
+        for sr in [run_chunked(text), run_charwise(text)] {
+            let fin = sr.finished();
+            assert_eq!(fin.calls.len(), 1);
+            assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
+            assert!(fin.error.is_none(), "{:?}", fin.error);
+        }
+    }
+
+    /// The alias must not widen to any four letters: only the one misspelling
+    /// the model actually produces is recovered, so unrelated markup in prose
+    /// still passes through as text rather than becoming a tool call.
+    #[test]
+    fn unrelated_marker_names_are_still_plain_text() {
+        let text = "<｜XSML｜tool_calls><｜XSML｜invoke name=\"bash\">";
+        for sr in [run_chunked(text), run_charwise(text)] {
+            assert!(sr.finished().calls.is_empty());
+            assert_eq!(sr.sink().visible, text);
+        }
     }
 
     #[test]

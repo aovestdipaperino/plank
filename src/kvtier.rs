@@ -57,6 +57,21 @@ pub enum TierKind {
     SessionVolatile,
 }
 
+impl TierKind {
+    /// What a front end should say while *this* tier is being prefilled, so the
+    /// progress note names the stage actually running instead of always
+    /// claiming the system prompt is being rebuilt. No trailing ellipsis: the
+    /// caller appends the one its output style uses.
+    #[must_use]
+    pub fn warm_label(self) -> &'static str {
+        match self {
+            Self::System => "Updating system prompt cache",
+            Self::ProjectStable => "Updating project context cache",
+            Self::SessionVolatile => "Updating session context",
+        }
+    }
+}
+
 /// One tier of the prefix: the text it contributes, its chained fingerprint,
 /// and where (if anywhere) its KV checkpoint lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +235,10 @@ pub fn plan(
 /// the walk simply falls back to the previous tier. No corrupt cache file can
 /// abort startup.
 ///
+/// `on_stage` is called with each tier's kind immediately before that tier is
+/// prefilled (never for a restored tier), so a front end can name the stage its
+/// progress bar is actually covering — see [`TierKind::warm_label`].
+///
 /// # Errors
 /// Returns [`EngineError`] only when the engine itself fails to restore or
 /// prefill. Cache IO failures are best-effort and never propagate.
@@ -228,6 +247,7 @@ pub fn warm(
     store: Option<&SessionStore>,
     tiers: &[TierSpec],
     on_event: &mut dyn FnMut(EngineEvent),
+    on_stage: &mut dyn FnMut(TierKind),
 ) -> Result<bool, EngineError> {
     let Some(system) = tiers.first().filter(|t| t.kind == TierKind::System) else {
         return Ok(false);
@@ -297,6 +317,7 @@ pub fn warm(
             // sync — and do not re-persist a checkpoint we just read.
             continue;
         }
+        on_stage(t.kind);
         prefilled |= engine.warm_sync(on_event)?;
         if let Some(key) = &t.key
             && let Some(store) = store
@@ -652,7 +673,7 @@ impl crate::engine::Engine for SpyEngine {
 
 #[cfg(test)]
 mod warm_tests {
-    use super::{TierSpec, plan, system_fingerprint, warm};
+    use super::{TierKind, TierSpec, plan, system_fingerprint, warm};
     use std::path::Path;
 
     use super::SpyEngine;
@@ -677,7 +698,7 @@ mod warm_tests {
             ..Default::default()
         };
 
-        assert!(warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap());
+        assert!(warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap());
         assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
         // System tier syncs with no appended message; the rest append their text.
         assert_eq!(
@@ -689,6 +710,57 @@ mod warm_tests {
         assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_some());
         assert!(store.kv_load(tiers[1].key.as_ref().unwrap()).is_some());
         assert_eq!(tiers[2].key, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The warm progress note must name the tier actually prefilling: a launch
+    /// that only has to redo the cheap session context should not claim it is
+    /// rebuilding the system prompt cache. Restored tiers report nothing,
+    /// because nothing is being rebuilt for them.
+    #[test]
+    fn stages_are_reported_only_for_the_tiers_that_prefill() {
+        let (store, dir) = spy_store("stages");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+
+        let mut cold = Vec::new();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |k| {
+            cold.push(k);
+        })
+        .unwrap();
+        assert_eq!(
+            cold,
+            vec![
+                TierKind::System,
+                TierKind::ProjectStable,
+                TierKind::SessionVolatile
+            ]
+        );
+        assert_eq!(
+            TierKind::System.warm_label(),
+            "Updating system prompt cache",
+            "the label the C-era note used, kept for the Tier 1 case"
+        );
+
+        // Second launch: the cold run persisted both cacheable tiers, so only
+        // the never-cached volatile tier is a stage now.
+        let mut warm_stages = Vec::new();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |k| {
+            warm_stages.push(k);
+        })
+        .unwrap();
+        assert_eq!(warm_stages, vec![TierKind::SessionVolatile]);
+        assert_ne!(
+            TierKind::SessionVolatile.warm_label(),
+            TierKind::System.warm_label()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -716,6 +788,7 @@ mod warm_tests {
                     notices.push(m);
                 }
             },
+            &mut |_| {},
         )
         .unwrap();
         assert!(notices.is_empty(), "first run has nothing to compare");
@@ -739,6 +812,7 @@ mod warm_tests {
                     notices.push(m);
                 }
             },
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(notices.len(), 1, "one notice for the changed prompt");
@@ -777,6 +851,7 @@ mod warm_tests {
                     notices.push(m);
                 }
             },
+            &mut |_| {},
         )
         .unwrap();
         assert_eq!(notices.len(), 1, "a hit explains nothing");
@@ -810,7 +885,7 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
 
         // Deepest cacheable tier wins: the project checkpoint, not the system one.
         assert_eq!(
@@ -850,7 +925,7 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
 
         // Premise: the project tier really was restored, so tiers 0 and 1 are
         // the "skipped" ones this test is about.
@@ -890,7 +965,7 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
 
         assert_eq!(e.restored, vec![vec![10]], "fall back to the system tier");
         assert_eq!(e.synced, vec![Some("agents".into()), Some("git".into())]);
@@ -908,7 +983,7 @@ mod warm_tests {
             ..Default::default()
         };
 
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
         assert_eq!(e.synced, vec![None, Some("agents".into())]);
         assert!(store.kv_load(tiers[0].key.as_ref().unwrap()).is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -936,7 +1011,7 @@ mod warm_tests {
             ..Default::default()
         };
 
-        warm(&mut e, Some(&store), &tiers, &mut |_| {}).unwrap();
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
         let t0 = store.kv_load(tiers[0].key.as_ref().unwrap()).unwrap();
         let t1 = store.kv_load(tiers[1].key.as_ref().unwrap()).unwrap();
         assert!(

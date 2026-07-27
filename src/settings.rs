@@ -27,7 +27,7 @@
 //! ```json
 //! {
 //!   "engine": { "model": "~/models/ds4.gguf", "threads": 8, "backend": "metal",
-//!               "power": 80, "ctx": 262144 },
+//!               "power": 80, "ctx": 262144, "thinkingToolCalls": false },
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
 //!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
 //!               "showThinking": true, "crtOff": true, "easterEggs": true },
@@ -60,7 +60,7 @@ pub const ASK_MIN_OPTIONS: usize = 2;
 ///
 /// `model` replaces what used to be a hardcoded convention — plank falls back
 /// to `~/.plank/ds4flash.gguf` only when neither this key nor `-m` is given.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineSettings {
     /// Model file to load; overridden by `-m`/`--model`.
     pub model: Option<PathBuf>,
@@ -73,26 +73,14 @@ pub struct EngineSettings {
     /// Context window in tokens; overridden by `-c`/`--ctx`.
     pub ctx: Option<i32>,
     /// Whether DSML tool calls the model emits inside `<think></think>` are
-    /// dispatched. Default true.
+    /// dispatched. Default false.
     ///
-    /// `false` restores strict `refs/ds4` parity: an in-think stanza is
-    /// discarded with a `[tool call ignored: ...]` notice, and the tools prompt
-    /// keeps the line forbidding such calls. The C agent only ever behaved this
-    /// way, so set it when diffing plank against the reference.
+    /// `false` is strict `refs/ds4` parity: an in-think stanza is discarded
+    /// with a `[tool call ignored: ...]` notice, and the tools prompt keeps the
+    /// line forbidding such calls. The C agent only ever behaved this way, so
+    /// it stays the default; turn it on (`/config engine.thinkingToolCalls
+    /// true`) to let the model act from inside its reasoning.
     pub thinking_tool_calls: bool,
-}
-
-impl Default for EngineSettings {
-    fn default() -> Self {
-        Self {
-            model: None,
-            threads: None,
-            backend: None,
-            power: None,
-            ctx: None,
-            thinking_tool_calls: true,
-        }
-    }
 }
 
 /// UI behaviour that used to be magic numbers in the source.
@@ -482,6 +470,15 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
         parts.push(format!("btwSuspend={v}"));
     }
 
+    // Read straight from settings at stream setup, so like the UI keys below
+    // any non-default value is in force.
+    if s.engine.thinking_tool_calls != d.engine.thinking_tool_calls {
+        parts.push(format!(
+            "thinkingToolCalls={}",
+            s.engine.thinking_tool_calls
+        ));
+    }
+
     // UI and MCP keys have no flag, so any non-default value is in force.
     if s.ui.respect_gitignore != d.ui.respect_gitignore {
         parts.push(format!("respectGitignore={}", s.ui.respect_gitignore));
@@ -767,10 +764,33 @@ pub fn reinstall(settings: Settings) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));
 }
 
+// Test-only settings override, scoped to the calling thread. The libtest
+// harness runs each test on its own thread, so this lets one test exercise a
+// non-default setting without disturbing the process-wide slot that tests
+// running concurrently read.
+#[cfg(test)]
+thread_local! {
+    static TEST_OVERRIDE: std::cell::Cell<Option<&'static Settings>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes [`active`] return `settings` for the current thread only.
+///
+/// The payload is leaked to keep [`active`]'s `&'static` contract; that is
+/// bounded and harmless in a test process.
+#[cfg(test)]
+pub fn install_for_test(settings: Settings) {
+    TEST_OVERRIDE.with(|c| c.set(Some(Box::leak(Box::new(settings)))));
+}
+
 /// The process-wide settings, or the built-in defaults before [`install`].
 #[must_use]
 pub fn active() -> &'static Settings {
     static FALLBACK: OnceLock<Settings> = OnceLock::new();
+    #[cfg(test)]
+    if let Some(s) = TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return s;
+    }
     // References are `Copy`, so the `&'static` escapes the read guard cleanly.
     if let Some(s) = *ACTIVE
         .read()
@@ -1107,17 +1127,17 @@ mod tests {
     }
 
     #[test]
-    fn thinking_tool_calls_defaults_on_and_overlays_off() {
+    fn thinking_tool_calls_defaults_off_and_overlays_on() {
         let mut s = Settings::default();
         assert!(
-            s.engine.thinking_tool_calls,
-            "tool calls inside <think> are dispatched by default"
+            !s.engine.thinking_tool_calls,
+            "tool calls inside <think> are ignored by default (C parity)"
         );
-        s.overlay(r#"{"engine":{"thinkingToolCalls":false}}"#);
-        assert!(!s.engine.thinking_tool_calls);
+        s.overlay(r#"{"engine":{"thinkingToolCalls":true}}"#);
+        assert!(s.engine.thinking_tool_calls);
         // A non-boolean value is ignored rather than flipping the default.
         let mut s2 = Settings::default();
         s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
-        assert!(s2.engine.thinking_tool_calls);
+        assert!(!s2.engine.thinking_tool_calls);
     }
 }

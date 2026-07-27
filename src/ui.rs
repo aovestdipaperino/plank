@@ -3392,8 +3392,9 @@ impl Agent<'_> {
         // The window the user just launched plank in is focused; focus events
         // track changes from here for the "unfocused" notification mode.
         crate::notify::set_focused(true);
-        // The full-screen UI is up and accepting input.
-        crate::title::set(crate::title::State::Idle);
+        // Still launching: `tui_loop` warms the KV cache before the real UI
+        // appears, and only flips the title to Idle once it accepts input.
+        crate::title::set(crate::title::State::Loading);
         let result = self.tui_loop(&mut terminal);
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
@@ -3490,6 +3491,9 @@ impl Agent<'_> {
         // Rebuild the system-prompt cache first, behind a simple progress bar,
         // so the full UI appears only once the one slow launch step is done.
         self.tui_warm(terminal)?;
+        // Warming is done: the full-screen UI is about to be up and accepting
+        // input, so the window title stops saying "launching".
+        crate::title::set(crate::title::State::Idle);
 
         let mut log = OutputLog::new();
         self.tui_write_banner(&mut log);
@@ -4184,9 +4188,13 @@ impl Agent<'_> {
         // that emits no events, so without this the indicator would never
         // appear in the common (checkpoint present) case.
         on_progress();
-        let _ = crate::kvtier::warm(&mut *self.engine, Some(&self.store), &tiers, &mut |_| {
-            on_progress();
-        });
+        let _ = crate::kvtier::warm(
+            &mut *self.engine,
+            Some(&self.store),
+            &tiers,
+            &mut |_| on_progress(),
+            &mut |_| {},
+        );
     }
 
     /// Warms the KV cache — system prompt and session-start context tiers — in
@@ -4199,6 +4207,11 @@ impl Agent<'_> {
         // The rebuild reason arrives as a Notice before prefill; keep it and
         // render it below the bar.
         let mut notice: Option<String> = None;
+        // Which tier the bar is covering right now. A `Cell` because the stage
+        // and event callbacks both need it and only one of them may hold the
+        // terminal mutably; the stage callback only records the label, and the
+        // prefill events that follow immediately paint it.
+        let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         crate::kvtier::warm(
             &mut *self.engine,
             Some(&self.store),
@@ -4206,14 +4219,17 @@ impl Agent<'_> {
             &mut |ev| match ev {
                 EngineEvent::Notice(msg) => {
                     notice = Some(msg);
-                    let _ = terminal.draw(|f| tui::draw_warm(f, 0, 1, 0.0, notice.as_deref()));
+                    let _ = terminal
+                        .draw(|f| tui::draw_warm(f, 0, 1, 0.0, stage.get(), notice.as_deref()));
                 }
                 EngineEvent::Prefill(p) => {
-                    let _ = terminal
-                        .draw(|f| tui::draw_warm(f, p.done, p.total, p.tps, notice.as_deref()));
+                    let _ = terminal.draw(|f| {
+                        tui::draw_warm(f, p.done, p.total, p.tps, stage.get(), notice.as_deref());
+                    });
                 }
                 EngineEvent::Text(_) => {}
             },
+            &mut |kind| stage.set(kind.warm_label()),
         )
         .map_err(|e| e.to_string())?;
         self.gc_kv_tiers(&tiers);
@@ -4224,7 +4240,12 @@ impl Agent<'_> {
     fn warm_plain(&mut self) -> Result<(), String> {
         let tiers = self.kv_tiers();
         let color = self.color;
-        let mut announced = false;
+        // Which tier is prefilling, and the label last printed for it: each
+        // stage announces itself once, so the note names the work actually
+        // running rather than always the system prompt.
+        let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
+        let mut shown: Option<&'static str> = None;
+        let mut announced = 0usize;
         let mut notice: Option<String> = None;
         crate::kvtier::warm(
             &mut *self.engine,
@@ -4232,14 +4253,18 @@ impl Agent<'_> {
             &tiers,
             &mut |ev| match ev {
                 EngineEvent::Notice(msg) => notice = Some(msg),
-                EngineEvent::Prefill(_) if !announced => {
-                    announced = true;
+                EngineEvent::Prefill(_) if shown != Some(stage.get()) => {
+                    let label = stage.get();
+                    shown = Some(label);
+                    announced += 1;
                     if color {
-                        eprintln!("\x1b[33mUpdating system prompt cache...{ANSI_RESET}");
+                        eprintln!("\x1b[33m{label}...{ANSI_RESET}");
                     } else {
-                        eprintln!("Updating system prompt cache...");
+                        eprintln!("{label}...");
                     }
-                    if let Some(msg) = &notice {
+                    // The rebuild reason belongs to the first (Tier 1) note
+                    // only; later stages must not reprint it.
+                    if let Some(msg) = notice.as_ref().filter(|_| announced == 1) {
                         for line in msg.lines() {
                             // Match the code-diff card colors on the -/+ rows.
                             let colored = match (color, line.as_bytes().first()) {
@@ -4257,11 +4282,13 @@ impl Agent<'_> {
                 }
                 EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
             },
+            &mut |kind| stage.set(kind.warm_label()),
         )
         .map_err(|e| e.to_string())?;
-        // Erase the transient "Updating…" note. Reason lines, if any, stay in
-        // the scrollback on purpose.
-        if announced && color && notice.is_none() {
+        // Erase the transient "Updating…" note. Only when a single stage
+        // announced itself and printed nothing under it; reason lines, if any,
+        // stay in the scrollback on purpose.
+        if announced == 1 && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
         self.gc_kv_tiers(&tiers);
@@ -7817,6 +7844,10 @@ mod tests {
     /// `bash_stanza_hides_dsml_and_shows_banner` in `viz.rs` for that case).
     #[test]
     fn replay_history_consumes_in_think_tool_call_instead_of_ignoring_it() {
+        // Opt this thread into in-think dispatch; the shipped default is off.
+        let mut settings = crate::settings::Settings::default();
+        settings.engine.thinking_tool_calls = true;
+        crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay-in-think");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -8539,6 +8570,10 @@ mod tests {
 
     #[test]
     fn tool_call_inside_think_is_dispatched_and_the_block_is_closed() {
+        // Opt this thread into in-think dispatch; the shipped default is off.
+        let mut settings = crate::settings::Settings::default();
+        settings.engine.thinking_tool_calls = true;
+        crate::settings::install_for_test(settings);
         let dir = std::env::temp_dir().join(format!("plank-ui-think-tool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let engine = ScriptedEngine {
@@ -9020,7 +9055,12 @@ mod tests {
             ],
             ..ScriptedEngine::default()
         };
-        let cfg = crate::config::AgentConfig::default();
+        // Plain (non-thinking) turn: with think on, the prefill opens `<think>`
+        // and the stanza would count as an in-think call, which the shipped
+        // `engine.thinkingToolCalls` default discards. That path has its own
+        // test (`tool_call_inside_think_is_dispatched_and_the_block_is_closed`).
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         let store = SessionStore::open(&dir).unwrap();
         let mut agent = Agent {
             engine: Box::new(engine),
