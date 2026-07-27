@@ -17,7 +17,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -1481,6 +1481,139 @@ pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
 }
 
+/// How far a veiled cell's color is pulled toward black.
+const VEIL_KEEP: f32 = 0.32;
+
+/// Pushes everything already drawn in `area` back into the background, so an
+/// overlay painted on top reads as the foreground layer.
+///
+/// RGB colors are scaled; the palette colors (named and indexed) have no
+/// numeric brightness to scale, so they collapse to one dim gray. Backgrounds
+/// and attributes are dropped outright — a leftover highlight or bold run would
+/// punch straight back through the veil.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // scaling a u8 down stays in u8
+fn veil(buf: &mut Buffer, area: Rect) {
+    const DIM: Color = Color::Indexed(236);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let Some(cell) = buf.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
+            // `Color::Reset` is the common case — ordinary output carries the
+            // terminal's default foreground — and it must dim like the rest,
+            // or most of the screen would shine straight through the veil.
+            let fg = match cell.fg {
+                Color::Rgb(r, g, b) => Color::Rgb(
+                    (f32::from(r) * VEIL_KEEP) as u8,
+                    (f32::from(g) * VEIL_KEEP) as u8,
+                    (f32::from(b) * VEIL_KEEP) as u8,
+                ),
+                _ => DIM,
+            };
+            cell.set_style(Style::reset().fg(fg));
+        }
+    }
+}
+
+/// Lays out the arcade's bottom line: status and key hints on the left, the
+/// exit hint pinned to the right edge.
+///
+/// A full status line runs past 80 columns, and plain truncation would cut off
+/// exactly the part that says how to get out. So the exit hint is placed first
+/// and the status is trimmed to whatever is left over.
+fn arcade_footer_line(arcade: &crate::arcade::Arcade, width: u16) -> String {
+    let exit = crate::arcade::Arcade::EXIT_HINT;
+    let width = usize::from(width);
+    if width <= exit.width() + 2 {
+        // Too narrow for both: the exit hint is the one that must survive.
+        return exit.chars().take(width).collect();
+    }
+    let room = width - exit.width() - 2;
+    let mut left = String::new();
+    for ch in arcade.footer().chars() {
+        if left.width() + ch.width().unwrap_or(0) > room {
+            break;
+        }
+        left.push(ch);
+    }
+    let pad = width - exit.width() - left.width();
+    format!("{left}{}{exit}", " ".repeat(pad))
+}
+
+/// Draws an open arcade easter egg (`/stars`, `/pelota`) over the whole frame.
+///
+/// The arcade hands back a flat list of [`crate::arcade::Glyph`]s in area
+/// coordinates; this paints them straight into the buffer rather than building
+/// `Line`s, because the content is sparse — a starfield touches a few hundred
+/// cells out of several thousand. The bottom row is reserved for the hint line
+/// and any centered banner is stamped over the middle.
+pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
+    let area = frame.area();
+    if arcade.translucent {
+        // No Clear: the frame already holds the live UI, and the glyphs land in
+        // the gaps between its characters. Pushing everything underneath down
+        // to a dim gray is what sells the layer — see `Arcade::translucent` for
+        // why this, and not alpha, is how a terminal does translucency.
+        veil(frame.buffer_mut(), area);
+    } else {
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(Color::Black)),
+            area,
+        );
+    }
+    if area.height < 2 {
+        return;
+    }
+    let play = Rect {
+        height: area.height - 1,
+        ..area
+    };
+
+    let buf = frame.buffer_mut();
+    for g in arcade.glyphs(play.width, play.height) {
+        let (x, y) = (play.x + g.x, play.y + g.y);
+        if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+            let (r, gr, b) = g.color;
+            cell.set_char(g.ch).set_fg(Color::Rgb(r, gr, b));
+        }
+    }
+
+    if let Some(text) = arcade.banner(play.width, play.height) {
+        let width = u16::try_from(text.width()).unwrap_or(u16::MAX);
+        let rect = Rect {
+            x: play.x + play.width.saturating_sub(width + 2) / 2,
+            y: play.y + play.height / 2,
+            width: (width + 2).min(play.width),
+            height: 1,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {text} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(255, 214, 120))
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            rect,
+        );
+    }
+
+    let footer = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            arcade_footer_line(arcade, footer.width),
+            Style::default().fg(Color::Indexed(245)),
+        ))),
+        footer,
+    );
+}
+
 /// Draws one frame: output log, input line, and status bar.
 ///
 /// `input` is the current prompt text and `cursor` its `(row, col)` position.
@@ -2852,5 +2985,156 @@ mod tests {
             u16::try_from(crate::complete::max_rows()).unwrap(),
         );
         assert_eq!(r.height, 15);
+    }
+
+    /// An arcade with `cmd` on screen.
+    fn opened(cmd: &str) -> crate::arcade::Arcade {
+        let mut a = crate::arcade::Arcade::new();
+        assert!(a.open(cmd, false, 7, 80, 24), "{cmd} did not open");
+        a
+    }
+
+    /// Draws one arcade frame and returns it as plain rows of text.
+    fn arcade_frame(arcade: &crate::arcade::Arcade, w: u16, h: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw_arcade(f, arcade)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arcade_draws_the_pelota_field_and_scoreboard() {
+        let rows = arcade_frame(&opened("/pelota"), 80, 26);
+        let field = rows.join("\n");
+        assert!(field.contains('█'), "paddles missing:\n{field}");
+        assert!(field.contains('●'), "ball missing:\n{field}");
+        assert!(field.contains('─'), "walls missing:\n{field}");
+        // The scoreboard owns the bottom row, outside the playing field.
+        let footer = rows.last().unwrap();
+        assert!(footer.contains("livello 1/5"), "footer was {footer:?}");
+        assert!(footer.contains("tu 0 — 0 cpu"), "footer was {footer:?}");
+    }
+
+    #[test]
+    fn arcade_tells_you_when_the_terminal_is_too_small() {
+        let rows = arcade_frame(&opened("/pelota"), 20, 6);
+        let field = rows.join("\n");
+        assert!(!field.contains('█'), "field drawn anyway:\n{field}");
+        assert!(field.contains("terminale"), "no explanation:\n{field}");
+    }
+
+    /// The translucent layer is the one piece with no equivalent elsewhere in
+    /// the UI, so it is worth pinning: text underneath must survive, and it
+    /// must come back dimmed rather than at full brightness.
+    #[test]
+    fn a_veiled_arcade_leaves_the_ui_visible_underneath() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut log = OutputLog::new();
+        for i in 0..40 {
+            log.visible_text(&format!("output line {i} still readable"));
+            log.end_line();
+        }
+        let draw = |translucent: bool| {
+            let mut arcade = opened("/stars");
+            arcade.translucent = translucent;
+            let mut view = OutputView::default();
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| {
+                render_output(f, f.area(), &log, &mut view, None);
+                draw_arcade(f, &arcade);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let veiled = draw(true);
+        let opaque = draw(false);
+        let text_of = |buf: &Buffer| {
+            (0..24)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text_of(&veiled).contains("still readable"),
+            "the veil erased the output underneath"
+        );
+        assert!(
+            !text_of(&opaque).contains("still readable"),
+            "the opaque layer let output through"
+        );
+        // Nothing underneath keeps the terminal's default foreground: every
+        // cell the veil touched was pushed back, or it would outshine the sky.
+        let bright = (0..23)
+            .flat_map(|y| (0..80).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                let cell = veiled.cell(Position::new(x, y)).unwrap();
+                cell.symbol() != " " && cell.fg == Color::Reset
+            })
+            .count();
+        assert_eq!(bright, 0, "{bright} cells shone through the veil");
+    }
+
+    /// The exit hint is the one thing on screen that must never be squeezed
+    /// out — without it a full-screen takeover has no visible way back.
+    #[test]
+    fn the_exit_hint_survives_any_terminal_width() {
+        let exit = crate::arcade::Arcade::EXIT_HINT;
+        for cmd in crate::arcade::Arcade::COMMANDS {
+            let mut a = opened(cmd);
+            a.translucent = true;
+            for width in [8u16, 12, 20, 40, 80, 200] {
+                let line = arcade_footer_line(&a, width);
+                assert!(
+                    line.width() <= usize::from(width),
+                    "{cmd} at {width}: line is {} wide",
+                    line.width()
+                );
+                if usize::from(width) > exit.width() + 2 {
+                    assert!(
+                        line.ends_with(exit),
+                        "{cmd} at {width}: lost the exit hint in {line:?}"
+                    );
+                }
+            }
+            // With room to spare the status is there too, not just the exit.
+            let wide = arcade_footer_line(&a, 200);
+            assert!(wide.trim_start().starts_with(|c: char| c != ' '));
+            assert!(wide.width() == 200);
+        }
+    }
+
+    #[test]
+    fn arcade_scatters_stars_over_the_whole_frame() {
+        let rows = arcade_frame(&opened("/stars"), 80, 24);
+        // Every row but the footer is playing field; stars should reach the
+        // top and the bottom of it, not clump in a band.
+        let painted: Vec<usize> = rows[..23]
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.trim().is_empty())
+            .map(|(i, _)| i)
+            .collect();
+        assert!(painted.len() > 10, "only {} rows had stars", painted.len());
+        assert!(painted[0] < 4, "nothing near the top: {painted:?}");
+        assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
+        assert!(rows[23].contains("velocità"), "hint line missing");
     }
 }
