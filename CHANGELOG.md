@@ -32,13 +32,18 @@ Beta patch bump on the 2.6 series.
   advances only through an injected delta and randomness comes from a seeded
   xorshift, so a whole rally replays identically from its seed and is testable
   without a terminal. See the README for controls.
-
-## [2.6.1] - 2026-07-26
-
-Beta patch bump on the 2.6 series.
-
-### Added
-
+- Tool calls the model emits inside `<think>` are now dispatched instead of
+  ignored, behind `engine.thinkingToolCalls` (default on). The system prompt
+  drops its in-think prohibition when the setting is on, so the prompt and the
+  renderer agree about what is allowed, and the stanza's `<think>` block is
+  closed before the `<tool_result>` that follows so the transcript stays
+  well-formed. Turning the setting off restores C-parity behaviour, where such a
+  stanza is reported as ignored and not run.
+- The window title now names plank's phase rather than always reading
+  `🪵 plank`: loading before a front end is up, `READY.` while idle at the
+  prompt, and the prompt itself (trimmed to 20 characters) while a turn runs.
+  Stamped at both front ends' ready points and all three turn-completion
+  boundaries, so the TUI and the plain REPL agree.
 - A globally-configured MCP server that fails to start no longer throws away the
   system-prompt cache. Tier 1 is keyed on the prompt text, and that text carries
   every connected server's tool schemas, so one flaky server used to change the
@@ -61,6 +66,52 @@ Beta patch bump on the 2.6 series.
   at a glance. The comparison text lives in a `sysprompt-last.prompt` sidecar
   that is only ever used to explain a miss, never to validate a cache, and it
   is refreshed only after a rebuild actually completes.
+
+### Changed
+
+- The CRT-off exit animation lets the final phosphor dot fade instead of
+  blinking out: crt-off 0.1.2 decays it on an exponential, gamma-encoded curve,
+  given a 0.9s window (was 0.2s, short enough that the old linear ramp read as an
+  instant cut) so the glow visibly dies away.
+- A `DEADBEEF` sentinel in an API key marks a mock or stubbed endpoint rather
+  than a real provider, so `top_p` is omitted from the request body. The filter
+  sits at the one place that has the key, covering both providers across
+  structured and flat prompts.
+
+### Fixed
+
+- A synthetic `</think>` is no longer appended when nothing was actually going to
+  follow it. The close exists only to keep the transcript well-formed ahead of a
+  `<tool_result>`, but it fired whenever the renderer's `<think>` was left open at
+  stream end — including a stanza discarded in parity mode and a stream cut short
+  by an interrupt, where a real abort gets no such close in the C reference. The
+  gate is now the reason the pass continues, and a real interrupt is
+  distinguished from an ordinary continuation identically on all three turn
+  paths. Two related bugs surfaced while testing it: an ignored in-think stanza
+  was synced into the renderer's call list before the ignore check ran, so it
+  would have been dispatched despite the notice, and the interrupt early-return
+  ran after the gate.
+- `/resume` replay no longer renders a stored in-think tool call as
+  `[tool call ignored]` directly above its own stored result — the replay
+  renderer never received the `thinkingToolCalls` setting that the live one did.
+- On a provider engine, the structured tool registry filtered servers on `alive`
+  while the text prompt deliberately did not, so an offline shadow was advertised
+  in the prompt but missing from the table: the model's call came back as an
+  unknown tool instead of the "server is not running" message. Both paths now
+  mirror each other, keeping the prompt byte-identical and fp1 stable.
+- An offline shadow server now reports as offline everywhere. Reading a cached
+  resource URI gave the generic "not available", and listing a shadow's resources
+  validated the name and then reported zero — both now return the same offline
+  sentence through one shared path so the framing cannot drift.
+- Startup read `~/.plank/.mcp.json` three times, and an unreadable first read
+  followed by a readable third silently yielded an empty eligible set, costing
+  every global server its record refresh and its shadow. It is read once now.
+
+## [2.6.1] - 2026-07-26
+
+Beta channel opened on the 2.6 series. No functional changes: the tag carries
+only the version bump, and the work drafted against this section during the
+series shipped in 2.6.2, where it is now documented.
 
 ## [2.6.0] - 2026-07-25
 
