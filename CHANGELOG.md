@@ -4,6 +4,28 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.3] - 2026-07-27
+
+Beta patch bump on the 2.6 series.
+
+### Changed
+
+- The arcade speaks English. The games shipped in 2.6.2 with Italian
+  user-facing text while the rest of the UI is English; every displayed string
+  is translated — the banners, the five scoreboards, the key-hint footers, the
+  exit hint, and the closing and resume lines left in the scrollback. The
+  `nuova` and `suono` argument aliases are dropped rather than translated, since
+  `new` and `sound` were already accepted and meant the same thing; `reset`
+  stays as the one real synonym for `new`. The English footers are longer, so
+  they truncate sooner on a narrow terminal, but the exit hint is still the last
+  thing to go.
+
+### Added
+
+- The README's arcade section leads with a screenshot, which carries the claim
+  prose struggles with: `/breakout` running over a turn that is still streaming,
+  with the model's output legible underneath the veil.
+
 ## [2.6.2] - 2026-07-27
 
 Beta patch bump on the 2.6 series.
