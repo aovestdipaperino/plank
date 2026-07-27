@@ -4,6 +4,35 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.2] - 2026-07-27
+
+Beta patch bump on the 2.6 series.
+
+### Added
+
+- Six games behind slash commands — `/stars`, `/pelota`, `/breakout`,
+  `/invaders`, `/centipede`, `/frogger` — meant to be played *while the model is
+  generating*, which is the point of them: waiting on a long turn is the one
+  moment a coding agent has nothing for you to do. They are the only commands
+  besides the read-only reports that run mid-turn, and they open as a layer over
+  the live output, which keeps streaming underneath. Each keeps its own slot, so
+  closing one and reopening it resumes where it was; `new` deals a fresh game and
+  `sound` turns on blips, and the two compose (`/breakout new sound`). Keyboard
+  and mouse both steer. While a game is up the first `Ctrl-C` closes it and a
+  second interrupts the model, so a turn can always be stopped. None of them
+  appear in `/help` or the completion popup — deliberately, though a test keeps
+  the command list in sync with the dispatcher so one can never be forwarded to
+  the model as a prompt. Two limits are worth stating plainly: "translucency" is
+  not alpha (a cell holds one character and one pair of colors, so the layer
+  underneath is dimmed rather than composited, and the sparse glyphs land in the
+  gaps), and "sound" is the terminal bell and nothing else — chosen because it
+  adds zero bytes to the binary, at the cost of having no pitch or length, so
+  cues differ only in count. Physics runs on a normalized field mapped to the
+  terminal at draw time, and follows the rule `anim.rs` already sets: state
+  advances only through an injected delta and randomness comes from a seeded
+  xorshift, so a whole rally replays identically from its seed and is testable
+  without a terminal. See the README for controls.
+
 ## [2.6.1] - 2026-07-26
 
 Beta patch bump on the 2.6 series.

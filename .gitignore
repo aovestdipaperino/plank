@@ -11,3 +11,4 @@ docs/superpowers/
 .DS_Store
 .wrangler/
 .tokensave/
+.vscode/
