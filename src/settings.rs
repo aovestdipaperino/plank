@@ -30,7 +30,7 @@
 //!               "power": 80, "ctx": 262144 },
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
 //!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-//!               "showThinking": true, "crtOff": true },
+//!               "showThinking": true, "crtOff": true, "easterEggs": true },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 }
@@ -134,6 +134,12 @@ pub struct UiSettings {
     /// Collapse every TUI animation (throbber, shimmer, pulse, flash,
     /// stall-fade) to a static fallback. Off by default; see issue #61.
     pub reduced_motion: bool,
+    /// Whether the arcade easter eggs (`/stars`, `/pelota`, …) exist. On by
+    /// default. Turned off they are not merely hidden — they stop being known
+    /// commands, so the line goes to the model like any other unrecognized
+    /// slash command, which is what a deployment that wants no games at all
+    /// needs. See [`crate::arcade`].
+    pub easter_eggs: bool,
 }
 
 impl Default for UiSettings {
@@ -150,6 +156,7 @@ impl Default for UiSettings {
             notify_after_secs: 10,
             crt_off: true,
             reduced_motion: false,
+            easter_eggs: true,
         }
     }
 }
@@ -350,6 +357,9 @@ impl Settings {
         if let Some(v) = boolean(ui, "reducedMotion") {
             self.ui.reduced_motion = v;
         }
+        if let Some(v) = boolean(ui, "easterEggs") {
+            self.ui.easter_eggs = v;
+        }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
@@ -505,6 +515,9 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.ui.reduced_motion != d.ui.reduced_motion {
         parts.push(format!("reducedMotion={}", s.ui.reduced_motion));
+    }
+    if s.ui.easter_eggs != d.ui.easter_eggs {
+        parts.push(format!("easterEggs={}", s.ui.easter_eggs));
     }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
@@ -683,6 +696,7 @@ impl Settings {
             );
             upsert(u, "notifyAfterSecs", unum(self.ui.notify_after_secs));
             upsert(u, "crtOff", Json::Bool(self.ui.crt_off));
+            upsert(u, "easterEggs", Json::Bool(self.ui.easter_eggs));
         }
         {
             let s = section(&mut root, "safety");
@@ -1031,6 +1045,28 @@ mod tests {
 
         let note = note_for(&s, &[]).expect("a note");
         assert!(note.contains("crtOff=false"), "{note}");
+    }
+
+    #[test]
+    fn easter_eggs_default_on_and_can_be_turned_off() {
+        assert!(Settings::default().ui.easter_eggs, "default is on");
+
+        let s = from_json(r#"{"ui":{"easterEggs":false}}"#);
+        assert!(!s.ui.easter_eggs);
+
+        // Only the non-default (off) value surfaces in the startup note, so a
+        // settings file that quietly removes the games cannot hide.
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("easterEggs=false"), "{note}");
+        assert!(
+            note_for(&Settings::default(), &[]).is_none(),
+            "the default surfaced a note"
+        );
+
+        // A non-boolean is ignored rather than read as off.
+        let mut bad = Settings::default();
+        bad.overlay(r#"{"ui":{"easterEggs":"nope"}}"#);
+        assert!(bad.ui.easter_eggs, "a bad value disabled the arcade");
     }
 
     #[test]

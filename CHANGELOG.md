@@ -4,6 +4,22 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-07-27
+
+Stable release: the 2.6 beta line promoted. One addition on top of it.
+
+### Added
+
+- **`ui.easterEggs`** (default `true`) decides whether the arcade exists. Off is
+  stronger than hidden: the six commands stop being known, so `/pelota` reaches
+  the model as an ordinary prompt exactly like any other unrecognized slash
+  command — which is what a shared or managed install that wants no games in it
+  actually needs, rather than a command that is recognized and then refused. Every
+  entry point checks it, not just the completion path, since a flag that only hid
+  them would leave them reachable by typing. The startup line names the setting
+  when it is off, so a `settings.json` cannot quietly remove them without saying
+  so, and `/config` exposes it as a toggle.
+
 ## [2.6.3] - 2026-07-27
 
 Beta patch bump on the 2.6 series.

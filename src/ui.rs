@@ -543,10 +543,10 @@ fn arcade_seed() -> u64 {
 }
 
 /// The arcade command `line` starts with, if any — `/pelota new` included.
+/// `None` when `ui.easterEggs` is off, which is what keeps them unreachable
+/// rather than merely unlisted.
 fn arcade_command(line: &str) -> Option<&'static str> {
-    crate::arcade::Arcade::COMMANDS
-        .into_iter()
-        .find(|cmd| crate::config::slash_command_with_args(line, cmd))
+    crate::arcade::command_of(line)
 }
 
 /// Turns any-motion mouse reporting (DECSET 1003) on or off.
@@ -2257,11 +2257,11 @@ impl Agent<'_> {
             // Easter eggs. `anim.rs` keeps motion in the Ratatui front-end, so
             // here the sky is a single still frame and pelota declines rather
             // than growing a second game loop against raw stdout.
-            "/stars" => print!(
+            "/stars" if crate::arcade::enabled() => print!(
                 "{}",
                 crate::arcade::still_sky(arcade_seed(), 78, 20, self.color)
             ),
-            _ if crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
+            _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
                 println!("{cmd} needs the full-screen UI — run plank in a terminal");
             }
             "/checkpoint" => {
@@ -5092,7 +5092,7 @@ impl Agent<'_> {
             // popup, but known commands, so they run instead of being sent to
             // the model. They take over the screen until Esc, and resume where
             // they were left unless the argument asks for a new game.
-            _ if crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
+            _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
                 let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 let fresh = crate::arcade::Arcade::wants_new(arg);
                 let resuming = !fresh && arcade.has_parked(cmd);

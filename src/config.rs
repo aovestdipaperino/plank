@@ -570,8 +570,18 @@ pub fn slash_command_with_args(cmd: &str, name: &str) -> bool {
 }
 
 /// True when `cmd` is one of the agent's known slash commands.
+///
+/// Reads `ui.easterEggs` for the arcade commands; see
+/// [`slash_command_known_with`] for the pure form the tests drive.
 #[must_use]
 pub fn slash_command_known(cmd: &str) -> bool {
+    slash_command_known_with(cmd, crate::settings::active().ui.easter_eggs)
+}
+
+/// [`slash_command_known`] with the `ui.easterEggs` decision passed in, so both
+/// answers are testable without touching the process-wide settings.
+#[must_use]
+pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
     matches!(
         cmd,
         "/help"
@@ -601,10 +611,13 @@ pub fn slash_command_known(cmd: &str) -> bool {
         // instead of forwarding the line to the model, but deliberately left
         // out of `usage()` and the completion popup. They take an argument
         // (`new`), so they go through the with-args form. Kept in sync with
-        // `Arcade::COMMANDS` by a test in that module.
-        || crate::arcade::Arcade::COMMANDS
-            .iter()
-            .any(|egg| slash_command_with_args(cmd, egg))
+        // `Arcade::COMMANDS` by a test in that module. With `ui.easterEggs`
+        // off they stop being known at all, so the line reaches the model as
+        // an ordinary prompt rather than being recognized and refused.
+        || (easter_eggs
+            && crate::arcade::Arcade::COMMANDS
+                .iter()
+                .any(|egg| slash_command_with_args(cmd, egg)))
         || slash_command_with_args(cmd, "/config")
         || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")

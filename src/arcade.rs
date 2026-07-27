@@ -1193,6 +1193,29 @@ pub struct Arcade {
     pub sound: Sound,
 }
 
+/// Whether the easter eggs exist this run (`ui.easterEggs`, on by default).
+///
+/// Off is stronger than hidden: the commands stop being known, so the line goes
+/// to the model like any other unrecognized one. Every entry point that could
+/// open a game checks this, not just the completion path — a flag that only hid
+/// them would still leave them reachable by typing.
+#[must_use]
+pub fn enabled() -> bool {
+    crate::settings::active().ui.easter_eggs
+}
+
+/// The arcade command `line` starts with, if any and if they exist at all —
+/// `/pelota new` included.
+#[must_use]
+pub fn command_of(line: &str) -> Option<&'static str> {
+    if !enabled() {
+        return None;
+    }
+    Arcade::COMMANDS
+        .into_iter()
+        .find(|cmd| crate::config::slash_command_with_args(line, cmd))
+}
+
 impl Arcade {
     /// Every command this module answers to. Kept next to [`Self::open`] so the
     /// dispatcher's list and the constructors cannot drift apart.
@@ -2152,6 +2175,57 @@ mod tests {
                 "{cmd} opens nothing"
             );
         }
+    }
+
+    /// `ui.easterEggs=false` has to make the games *not exist*, not merely stay
+    /// unlisted: an unknown slash command goes to the model as a prompt, which
+    /// is exactly what a deployment that wants no games at all asks for. Driven
+    /// through the pure form so neither answer depends on process-wide state.
+    #[test]
+    fn the_easter_eggs_flag_decides_whether_the_commands_exist() {
+        for cmd in Arcade::COMMANDS {
+            assert!(
+                crate::config::slash_command_known_with(cmd, true),
+                "{cmd} unknown with the flag on"
+            );
+            assert!(
+                crate::config::slash_command_known_with(&format!("{cmd} new"), true),
+                "{cmd} new unknown with the flag on"
+            );
+            assert!(
+                !crate::config::slash_command_known_with(cmd, false),
+                "{cmd} still known with the flag off"
+            );
+            assert!(
+                !crate::config::slash_command_known_with(&format!("{cmd} new"), false),
+                "{cmd} new still known with the flag off"
+            );
+        }
+        // A real command must not be collateral damage of the gate.
+        assert!(
+            crate::config::slash_command_known_with("/help", false),
+            "/help stopped working with the flag off"
+        );
+    }
+
+    /// The flag defaults on, so the eggs are there for anyone who has not asked
+    /// otherwise — and `command_of` agrees with the dispatcher about that.
+    #[test]
+    fn the_easter_eggs_are_on_by_default() {
+        assert!(
+            crate::settings::Settings::default().ui.easter_eggs,
+            "easter eggs are opt-out, not opt-in"
+        );
+        assert!(enabled(), "default settings disabled the arcade");
+        for cmd in Arcade::COMMANDS {
+            assert_eq!(command_of(cmd), Some(cmd), "{cmd} not recognized");
+            assert_eq!(
+                command_of(&format!("{cmd} new sound")),
+                Some(cmd),
+                "{cmd} with arguments not recognized"
+            );
+        }
+        assert_eq!(command_of("/helpful"), None, "matched a non-arcade command");
     }
 
     /// Easter eggs stay out of the help text and the completion popup. That is

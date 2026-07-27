@@ -294,6 +294,8 @@ Pelota has one extra move worth knowing: hold **Shift** while steering and the p
 
 None of these appear in `/help` or the completion popup. That is the point.
 
+They live behind `ui.easterEggs`, on by default. Setting it to `false` does more than hide them — it stops them being commands at all, so `/pelota` goes to the model as an ordinary prompt exactly like any other unrecognized slash command. That is the honest behaviour for a shared or managed install that wants no games in it, and the startup line names the setting when it is off, so a `settings.json` cannot quietly remove them without saying so.
+
 ## Project layout
 
 Each module in `src/` maps to one functional section of the original `ds4_agent.c`:
