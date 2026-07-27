@@ -536,6 +536,17 @@ fn now_secs() -> u64 {
 /// replayable in a test — so the one moment randomness enters is here, when the
 /// modal opens. Sub-second precision keeps two openings in the same second from
 /// producing the same sky.
+/// Whether `ev` is the user actually being present, for the idle clock behind
+/// `ui.screensaver`.
+///
+/// Keys, mouse and pastes are somebody at the machine. Focus and resize events
+/// are not: a window manager cycling focus, or another app resizing the
+/// terminal, would otherwise keep the idle timer pinned at zero and the
+/// screensaver would never come up on a busy desktop.
+fn is_user_activity(ev: &Event) -> bool {
+    matches!(ev, Event::Key(_) | Event::Mouse(_) | Event::Paste(_))
+}
+
 fn arcade_seed() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -2255,12 +2266,8 @@ impl Agent<'_> {
             "/help" => print!("{}", crate::config::usage()),
             "/version" => println!("plank {}", crate::logo::version_label()),
             // Easter eggs. `anim.rs` keeps motion in the Ratatui front-end, so
-            // here the sky is a single still frame and pelota declines rather
-            // than growing a second game loop against raw stdout.
-            "/stars" if crate::arcade::enabled() => print!(
-                "{}",
-                crate::arcade::still_sky(arcade_seed(), 78, 20, self.color)
-            ),
+            // the games decline here rather than growing a second game loop
+            // against raw stdout.
             _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
                 println!("{cmd} needs the full-screen UI — run plank in a terminal");
             }
@@ -3507,7 +3514,8 @@ impl Agent<'_> {
         // once opened it stays until the user presses Esc, even after the main
         // task finishes and control returns to this idle loop.
         let mut btw_panel: BtwPanel = None;
-        // An open easter egg (`/stars`, `/pelota`), same modal contract as the
+        // An open easter egg (`/pelota`, …) or the screensaver, same modal
+        // contract as the
         // `/config` form: while it is Some it owns the screen and every key.
         // Owned here, like the `/btw` panel, so it survives the transition into
         // and out of a turn — that is what lets it keep running while the model
@@ -3516,6 +3524,11 @@ impl Agent<'_> {
         // arrive.
         let mut arcade = crate::arcade::Arcade::new();
         let mut arcade_last = Instant::now();
+        // When the user was last heard from, for `ui.screensaver`. Only real
+        // input counts: a poll that times out is exactly the idleness the
+        // screensaver is waiting for. A running turn never reaches this loop,
+        // so a long generation cannot be mistaken for an idle user.
+        let mut last_activity = Instant::now();
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_spans(tui::user_echo_spans(initial));
             self.session.push(Message::user(initial));
@@ -3622,6 +3635,21 @@ impl Agent<'_> {
             // 200 ms is five frames a second — fine for an idle prompt, far too
             // slow for a game. An open easter egg polls at the shared 20 Hz
             // animation tick instead.
+            // Idle long enough? Put the stars up. Skipped while anything
+            // modal is on screen — a screensaver over a dialog would hide a
+            // question the user still has to answer.
+            if !arcade.is_open()
+                && config_form.is_none()
+                && let Some(after) = crate::settings::active().ui.screensaver.duration()
+                && last_activity.elapsed() >= after
+            {
+                let (w, h) = terminal
+                    .size()
+                    .map_or((80, 23), |sz| (sz.width, sz.height.saturating_sub(1)));
+                arcade.open_screensaver(arcade_seed(), w, h);
+                arcade_last = Instant::now();
+            }
+
             let poll = if arcade.is_open() {
                 Duration::from_millis(crate::anim::TICK_MS)
             } else {
@@ -3674,6 +3702,24 @@ impl Agent<'_> {
                 }
                 continue;
             };
+            // What counts as the user being here: keys, mouse, and pastes.
+            // Focus and resize events deliberately do not — a window manager
+            // moving focus around, or another app resizing the terminal, is
+            // not somebody at the keyboard, and treating it as activity means
+            // the screensaver never comes up on a busy desktop.
+            let from_user = is_user_activity(&ev);
+            if from_user {
+                last_activity = Instant::now();
+            }
+            // The screensaver is dismissed by any of those, not just a key:
+            // moving the mouse is a person coming back. The event that wakes
+            // it is consumed rather than acted on — waking a screensaver
+            // should not leave a stray character in the prompt or click a
+            // button the user could not see.
+            if arcade.is_screensaver() && from_user {
+                arcade.close();
+                continue;
+            }
             // An open easter egg takes the mouse (wheel, click and drag steer
             // the paddle) and swallows everything else that is not a key, so
             // nothing underneath it scrolls or accepts text while it is up.
@@ -3921,19 +3967,18 @@ impl Agent<'_> {
                     input.hist_idx = None;
                     input.buf.insert("\n");
                 }
-                // Ctrl-G hands the half-typed prompt to `$EDITOR` — the escape
-                // hatch for prompts too long to comfortably edit inline.
+                // Ctrl-G hands the half-typed prompt to the built-in editor or
+                // `$EDITOR` — the escape hatch for prompts too long to
+                // comfortably edit inline.
                 KeyCode::Char('g') if ctrl => {
                     let current = input.buf.text().to_owned();
-                    let edited = with_tui_suspended(terminal, || {
-                        crate::editor::edit_text_externally(&current)
-                    });
+                    let edited = with_tui_suspended(terminal, || open_editor(&current));
                     match edited {
                         Ok(Some(text)) => {
                             input.hist_idx = None;
                             input.buf.set_text(text);
                         }
-                        // Non-zero exit or an emptied file: keep what was typed.
+                        // Non-zero exit or cancelled: keep what was typed.
                         Ok(None) => {}
                         Err(e) => log.push_dim(format!("[editor failed: {e}]")),
                     }
@@ -5495,6 +5540,19 @@ fn run_ask_panel(
     }
 }
 
+/// Opens the prompt editor: the built-in one when it is compiled in and
+/// enabled, `$EDITOR` otherwise. Returns `None` when the user cancels.
+///
+/// The caller must have suspended the TUI — both editors take the raw
+/// terminal.
+fn open_editor(current: &str) -> std::io::Result<Option<String>> {
+    #[cfg(feature = "builtin_editor")]
+    if crate::settings::active().ui.builtin_editor {
+        return crate::miniedit::edit_text(current);
+    }
+    crate::editor::edit_text_externally(current)
+}
+
 /// Runs `f` with the TUI fully torn down: raw mode off, alternate screen left,
 /// and every input mode we pushed at startup popped, so a child process gets a
 /// pristine terminal. Everything is put back before returning and the screen is
@@ -6067,13 +6125,13 @@ fn busy_ui_loop(
                     // Clamped by draw, which re-enters follow mode at the bottom.
                     view.top = view.top.saturating_add(3);
                 }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // Clicking the jump-to-bottom hint resumes follow mode.
+                // Clicking the jump-to-bottom hint resumes follow mode.
+                MouseEventKind::Down(MouseButton::Left)
                     if view.jump_hint_rect.is_some_and(|r| {
                         r.contains(ratatui::layout::Position::new(m.column, m.row))
-                    }) {
-                        view.follow = true;
-                    }
+                    }) =>
+                {
+                    view.follow = true;
                 }
                 _ => {}
             },
@@ -7047,6 +7105,33 @@ mod tests {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         cfg
+    }
+
+    /// Regression: the screensaver's idle clock must not be reset by focus or
+    /// resize events. A window manager cycling focus (or, as it happens, an
+    /// agent driving the terminal) fires those constantly, and treating them
+    /// as activity pins the timer at zero so the screensaver never appears.
+    #[test]
+    fn only_keys_mouse_and_paste_count_as_user_activity() {
+        use ratatui::crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let key = Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        let paste = Event::Paste("text".to_string());
+        for ev in [key, mouse, paste] {
+            assert!(is_user_activity(&ev), "{ev:?} is the user");
+        }
+
+        for ev in [Event::FocusGained, Event::FocusLost, Event::Resize(80, 24)] {
+            assert!(!is_user_activity(&ev), "{ev:?} is not the user");
+        }
     }
 
     fn scratch_dir(name: &str) -> std::path::PathBuf {

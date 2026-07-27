@@ -662,8 +662,7 @@ fn jittered(base: std::time::Duration) -> std::time::Duration {
     }
     let entropy = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| u64::from(d.subsec_nanos()))
-        .unwrap_or(0);
+        .map_or(0, |d| u64::from(d.subsec_nanos()));
     let half = base_ns / 2;
     std::time::Duration::from_nanos(half + (entropy % (half + 1)))
 }
@@ -1262,18 +1261,18 @@ mod tests {
         use std::time::Duration;
         assert_eq!(backoff_base(0), Duration::from_millis(250));
         assert_eq!(backoff_base(1), Duration::from_millis(500));
-        assert_eq!(backoff_base(2), Duration::from_millis(1000));
-        assert_eq!(backoff_base(3), Duration::from_millis(2000));
-        assert_eq!(backoff_base(4), Duration::from_millis(4000));
+        assert_eq!(backoff_base(2), Duration::from_secs(1));
+        assert_eq!(backoff_base(3), Duration::from_secs(2));
+        assert_eq!(backoff_base(4), Duration::from_secs(4));
         // Capped, and no overflow on a large attempt count.
-        assert_eq!(backoff_base(9), Duration::from_millis(4000));
-        assert_eq!(backoff_base(u32::MAX), Duration::from_millis(4000));
+        assert_eq!(backoff_base(9), Duration::from_secs(4));
+        assert_eq!(backoff_base(u32::MAX), Duration::from_secs(4));
     }
 
     #[test]
     fn jitter_stays_within_half_to_full() {
         use std::time::Duration;
-        let base = Duration::from_millis(1000);
+        let base = Duration::from_secs(1);
         for _ in 0..64 {
             let d = jittered(base);
             assert!(d >= base / 2 && d <= base, "jitter {d:?} out of range");

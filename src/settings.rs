@@ -30,7 +30,8 @@
 //!               "power": 80, "ctx": 262144, "thinkingToolCalls": false },
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
 //!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-//!               "showThinking": true, "crtOff": true, "easterEggs": true },
+//!               "showThinking": true, "crtOff": true, "easterEggs": true,
+//!               "screensaver": "1m" },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 }
@@ -122,12 +123,20 @@ pub struct UiSettings {
     /// Collapse every TUI animation (throbber, shimmer, pulse, flash,
     /// stall-fade) to a static fallback. Off by default; see issue #61.
     pub reduced_motion: bool,
-    /// Whether the arcade easter eggs (`/stars`, `/pelota`, …) exist. On by
+    /// How long the TUI must sit idle before the starfield screensaver comes
+    /// up. Default one minute; `never` switches it off. Unlike the arcade
+    /// games this is not an easter egg, so `ui.easterEggs` does not gate it.
+    pub screensaver: crate::arcade::ScreensaverDelay,
+    /// Whether the arcade easter eggs (`/pelota`, …) exist. On by
     /// default. Turned off they are not merely hidden — they stop being known
     /// commands, so the line goes to the model like any other unrecognized
     /// slash command, which is what a deployment that wants no games at all
     /// needs. See [`crate::arcade`].
     pub easter_eggs: bool,
+    /// Use the built-in Ctrl-G editor (`crate::miniedit`) rather than shelling
+    /// out to `$EDITOR`. On by default. Ignored in builds without the
+    /// `builtin_editor` feature, which always use `$EDITOR`.
+    pub builtin_editor: bool,
 }
 
 impl Default for UiSettings {
@@ -144,7 +153,9 @@ impl Default for UiSettings {
             notify_after_secs: 10,
             crt_off: true,
             reduced_motion: false,
+            screensaver: crate::arcade::ScreensaverDelay::default(),
             easter_eggs: true,
+            builtin_editor: true,
         }
     }
 }
@@ -323,6 +334,11 @@ impl Settings {
         if let Some(v) = boolean(ui, "showThinking") {
             self.ui.show_thinking = v;
         }
+        if let Some(v) = string(ui, "screensaver")
+            && let Some(d) = crate::arcade::ScreensaverDelay::parse(&v)
+        {
+            self.ui.screensaver = d;
+        }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).
         if let Some(v) = boolean(ui, "notifications") {
@@ -347,6 +363,9 @@ impl Settings {
         }
         if let Some(v) = boolean(ui, "easterEggs") {
             self.ui.easter_eggs = v;
+        }
+        if let Some(v) = boolean(ui, "builtinEditor") {
+            self.ui.builtin_editor = v;
         }
 
         let safety = root.get("safety");
@@ -513,8 +532,14 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.ui.reduced_motion != d.ui.reduced_motion {
         parts.push(format!("reducedMotion={}", s.ui.reduced_motion));
     }
+    if s.ui.screensaver != d.ui.screensaver {
+        parts.push(format!("screensaver={}", s.ui.screensaver.as_str()));
+    }
     if s.ui.easter_eggs != d.ui.easter_eggs {
         parts.push(format!("easterEggs={}", s.ui.easter_eggs));
+    }
+    if s.ui.builtin_editor != d.ui.builtin_editor {
+        parts.push(format!("builtinEditor={}", s.ui.builtin_editor));
     }
     if s.mcp.timeout_secs != d.mcp.timeout_secs {
         parts.push(format!("timeoutSecs={}", s.mcp.timeout_secs));
@@ -693,7 +718,13 @@ impl Settings {
             );
             upsert(u, "notifyAfterSecs", unum(self.ui.notify_after_secs));
             upsert(u, "crtOff", Json::Bool(self.ui.crt_off));
+            upsert(
+                u,
+                "screensaver",
+                Json::Str(self.ui.screensaver.as_str().to_string()),
+            );
             upsert(u, "easterEggs", Json::Bool(self.ui.easter_eggs));
+            upsert(u, "builtinEditor", Json::Bool(self.ui.builtin_editor));
         }
         {
             let s = section(&mut root, "safety");
@@ -874,6 +905,35 @@ mod tests {
         assert!(note.contains("tools.task=true"), "{note}");
         assert!(note.contains("tools.agent=true"), "{note}");
         assert!(note.contains("tools.planMode=true"), "{note}");
+    }
+
+    #[test]
+    fn screensaver_defaults_to_one_minute_and_accepts_the_four_choices() {
+        use crate::arcade::ScreensaverDelay;
+        use std::time::Duration;
+
+        let s = Settings::default();
+        assert_eq!(s.ui.screensaver, ScreensaverDelay::M1);
+        assert_eq!(s.ui.screensaver.duration(), Some(Duration::from_mins(1)));
+
+        for (text, want) in [
+            ("1m", ScreensaverDelay::M1),
+            ("2m", ScreensaverDelay::M2),
+            ("5m", ScreensaverDelay::M5),
+            ("never", ScreensaverDelay::Never),
+        ] {
+            let mut s = Settings::default();
+            s.overlay(&format!(r#"{{"ui":{{"screensaver":"{text}"}}}}"#));
+            assert_eq!(s.ui.screensaver, want, "parsing {text}");
+        }
+
+        // Never means never: no idle stretch ever elapses.
+        assert_eq!(ScreensaverDelay::Never.duration(), None);
+
+        // An unknown value leaves the default rather than switching it off.
+        let mut s = Settings::default();
+        s.overlay(r#"{"ui":{"screensaver":"7m"}}"#);
+        assert_eq!(s.ui.screensaver, ScreensaverDelay::M1);
     }
 
     #[test]
@@ -1087,6 +1147,17 @@ mod tests {
         let mut bad = Settings::default();
         bad.overlay(r#"{"ui":{"easterEggs":"nope"}}"#);
         assert!(bad.ui.easter_eggs, "a bad value disabled the arcade");
+    }
+
+    #[test]
+    fn builtin_editor_defaults_on_and_overlays_off() {
+        let mut s = Settings::default();
+        assert!(
+            s.ui.builtin_editor,
+            "Ctrl-G uses the built-in editor by default"
+        );
+        s.overlay(r#"{"ui":{"builtinEditor":false}}"#);
+        assert!(!s.ui.builtin_editor);
     }
 
     #[test]

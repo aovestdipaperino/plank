@@ -175,7 +175,7 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
 
-### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`)
+### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`, `miniedit/`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`
   (a `RenderSink`), the frame layout, and the magenta-colored progress bar.
   `OutputView` tracks the scroll viewport: it follows the newest output by
@@ -190,6 +190,32 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   by the plain REPL.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
+- **Screensaver** (`arcade.rs` + the TUI input loop): after `ui.screensaver`
+  of idleness (`1m` by default; `2m`, `5m`, `never`) the perspective
+  starfield takes the whole screen, and the next key, click or paste puts
+  the UI back — consumed, not typed. Idleness is measured in the outer
+  input loop, which is the only place that can be idle: a running turn is
+  inside `tui_turn`, so a long generation is never mistaken for an absent
+  user. Focus and resize events deliberately do not count as activity, or a
+  window manager moving focus around would pin the timer at zero. It reuses
+  the arcade's draw and step path but is not an easter egg: no command, no
+  parking slot, no footer, and `ui.easterEggs` does not gate it.
+- **Built-in editor** (`miniedit/`, feature `builtin_editor`): Ctrl-G opens an
+  in-process, single-buffer fork of Microsoft Edit (`refs/edit`, MIT) on the
+  half-typed prompt. plank suspends its own TUI through `with_tui_suspended`
+  and miniedit takes the raw terminal, exactly as `$EDITOR` did. Ctrl-S accepts
+  and returns the text; Esc cancels, asking first when the text was edited.
+  F10 opens a menubar (Prompt / Edit / View) carrying undo, clipboard,
+  find/replace and the display toggles. No file I/O — the buffer starts from a
+  string and ends as one. `ui.builtinEditor` (or building without the feature)
+  falls back to `$EDITOR`.
+  Three things about `edit`'s immediate-mode TUI are load-bearing here and are
+  easy to get wrong: the first focusable widget takes the focus, so the text
+  area has to claim it explicitly or every keystroke lands on the closed
+  menubar; an `editline` collapses to nothing without an explicit
+  `attr_intrinsic_size`; and `TextBuffer::save_as_string` marks the buffer
+  clean, so "was it edited?" compares against the original string rather than
+  asking the buffer whether it is dirty.
 
 ### Remote control of the TUI (`uiremote.rs`)
 `--ui-remote[=PORT]` (bare form binds an ephemeral port; `=PORT` picks one)

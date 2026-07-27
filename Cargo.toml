@@ -8,10 +8,11 @@ description = "Rust port of the ds4 agent (macOS only)"
 license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
-exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "*.gguf", "ds4flash.gguf"]
+rust-version = "1.93"
+exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf"]
 
 [features]
-default = ["use_obscura"]
+default = ["use_obscura", "builtin_editor"]
 # Image pasting (Cmd-V clipboard images, image file paths) is disabled until
 # the model's handling of image-file references is understood; build with
 # `--features images` to re-enable.
@@ -27,6 +28,10 @@ per_project_kv = []
 # external binary) instead of curl or the ds4 C engine's visible Chrome.
 # Disable with `--no-default-features` when the submodule is absent.
 use_obscura = ["dep:obscura", "dep:tokio"]
+# Built-in Ctrl-G editor: an in-process, single-buffer fork of Microsoft Edit
+# (refs/edit submodule, MIT). With this off, Ctrl-G shells out to $EDITOR as
+# before. Disable with `--no-default-features` when the submodule is absent.
+builtin_editor = ["dep:edit", "dep:stdext"]
 
 [dependencies]
 libc = "0.2"
@@ -55,6 +60,12 @@ crt-off = "0.1.2"
 obscura = { path = "refs/obscura/crates/obscura", optional = true }
 # Minimal runtime to drive obscura's async API from plank's sync tool code.
 tokio = { version = "1", features = ["rt"], optional = true }
+# Text buffer, immediate-mode TUI framework, and VT input parser behind the
+# built-in Ctrl-G editor (feature `builtin_editor`); the paths point into the
+# refs/edit git submodule. MIT (c) Microsoft Corporation. `stdext` carries the
+# scratch arenas the buffer and TUI allocate from.
+edit = { path = "refs/edit/crates/edit", optional = true }
+stdext = { path = "refs/edit/crates/stdext", optional = true }
 
 [lints.rust]
 missing_debug_implementations = "warn"

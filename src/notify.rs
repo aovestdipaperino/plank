@@ -169,9 +169,7 @@ fn logo_path() -> Option<std::path::PathBuf> {
         std::fs::create_dir_all(&dir).ok()?;
         let path = dir.join("notify-logo.png");
         // Reuse an already-materialized copy of the right size; else (re)write.
-        let up_to_date = std::fs::metadata(&path)
-            .map(|m| m.len() == LOGO_PNG.len() as u64)
-            .unwrap_or(false);
+        let up_to_date = std::fs::metadata(&path).is_ok_and(|m| m.len() == LOGO_PNG.len() as u64);
         if !up_to_date {
             std::fs::write(&path, LOGO_PNG).ok()?;
         }

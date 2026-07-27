@@ -4,6 +4,52 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.1] - unreleased
+
+Beta channel on the 2.7 series.
+
+### Added
+
+- **A built-in prompt editor behind `Ctrl-G`**, replacing the shell-out to
+  `$EDITOR`. It is an in-process, single-buffer fork of
+  [Microsoft Edit](https://github.com/microsoft/edit) (MIT, vendored as the
+  `refs/edit` submodule and used as a library): plank suspends its own TUI and
+  hands over the raw terminal, exactly as it did for a child editor, but with
+  no temp file and no process spawn. Undo/redo, selection, clipboard, find and
+  replace, word wrap and line numbers, all reachable from an F10 menubar.
+  `Ctrl-S` returns the edited text to the prompt; `Esc` discards it, asking
+  first when the text actually changed. There is no Save: the buffer starts
+  from a string and ends as one. `ui.builtinEditor` (default `true`) or a build
+  without the `builtin_editor` feature falls back to `$EDITOR`.
+- **A starfield screensaver**, `ui.screensaver`: `1m` (default), `2m`, `5m`, or
+  `never`. After that much idle time at the prompt the perspective starfield
+  takes the screen, and the next key, click or paste puts the UI back — the
+  waking event is consumed, so it does not leave a stray character behind.
+  Idleness is measured only in the idle input loop, so it never appears
+  mid-turn, and focus or resize events do not count as activity: a window
+  manager moving focus around would otherwise keep it from ever appearing.
+  Unlike the games it is not an easter egg, so `ui.easterEggs` does not gate it.
+
+### Changed
+
+- **`/stars` is gone** — the starfield is the screensaver now, not a command.
+  The arcade is five games (`/pelota`, `/breakout`, `/invaders`, `/centipede`,
+  `/frogger`); the plain REPL's static-sky rendering went with the command.
+- **`engine.thinkingToolCalls` now defaults to `false`.** Tool calls the model
+  emits inside `<think></think>` are discarded with a `[tool call ignored: ...]`
+  notice, which is strict `refs/ds4` parity; turn the setting on (it is in
+  `/config`) to have plank dispatch them instead.
+- The KV warm-up names the tier it is prefilling ("Updating project context
+  cache") rather than always claiming the system prompt is being rebuilt.
+- `dsml.rs` accepts `SSML` as an alias for the `DSML` marker name. The model
+  occasionally spells the marker back with the far more common pretraining
+  string; without the alias the stanza parsed as nothing, printed raw, and
+  ended the turn with no tool error to retry from. The prompt still teaches
+  `DSML` only, so this stays a recovery path rather than a second syntax.
+- **Rust 1.93 is now the minimum.** The vendored `edit` crates require it.
+  CI already builds on stable; a local toolchain older than that will refuse to
+  build with a clear `rust-version` error.
+
 ## [2.7.0] - 2026-07-27
 
 Stable release: the 2.6 beta line promoted. One addition on top of it.
