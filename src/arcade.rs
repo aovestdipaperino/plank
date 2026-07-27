@@ -3,7 +3,7 @@
 
 //! Hidden arcade: a perspective starfield and a multi-level pelota match.
 //!
-//! Two easter eggs behind `/stars` and `/pelota`. Neither is listed in
+//! The games are easter eggs behind `/pelota` and friends. Neither is listed in
 //! [`crate::config::usage`] nor offered by the completion popup — that is the
 //! point — but both are known commands, so the dispatcher runs them instead of
 //! forwarding the line to the model.
@@ -24,9 +24,9 @@
 //!
 //! # Front-end boundary
 //!
-//! Motion is Ratatui-only, as `anim.rs` requires. The plain line REPL gets one
-//! static sky from [`still_sky`] and is told that pelota needs the TUI, rather
-//! than growing a second raw-mode game loop alongside the first.
+//! Motion is Ratatui-only, as `anim.rs` requires. The plain line REPL is told
+//! the games need the TUI, rather than growing a second raw-mode game loop
+//! alongside the first.
 
 pub mod breakout;
 pub mod centipede;
@@ -306,41 +306,6 @@ impl Starfield {
         }
         out
     }
-}
-
-/// Renders one static frame of sky as an ANSI string, for the plain REPL.
-///
-/// `anim.rs` reserves motion for the Ratatui front-end; the line REPL gets the
-/// still form rather than a second game loop written against raw stdout.
-#[must_use]
-pub fn still_sky(seed: u64, width: u16, height: u16, color: bool) -> String {
-    use std::fmt::Write as _;
-
-    let cells = usize::from(width) * usize::from(height);
-    let field = Starfield::new(seed, cells / 24);
-    let mut grid = vec![vec![None; usize::from(width)]; usize::from(height)];
-    for star in field.glyphs(width, height) {
-        grid[usize::from(star.y)][usize::from(star.x)] = Some(star);
-    }
-    let mut out = String::with_capacity(cells * 2);
-    for row in &grid {
-        for cell in row {
-            match cell {
-                Some(star) if color => {
-                    let (red, green, blue) = star.color;
-                    let _ = write!(out, "\x1b[38;2;{red};{green};{blue}m{}\x1b[0m", star.ch);
-                }
-                Some(star) => out.push(star.ch),
-                None => out.push(' '),
-            }
-        }
-        // Trailing blanks are pure noise in a scrollback buffer.
-        while out.ends_with(' ') {
-            out.pop();
-        }
-        out.push('\n');
-    }
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +970,7 @@ impl Sound {
 /// Which easter egg is open.
 #[derive(Debug)]
 pub enum Game {
-    /// `/stars`
+    /// The screensaver's starfield (`ui.screensaver`).
     Stars(Starfield),
     /// `/pelota`
     Pelota(Box<Pelota>),
@@ -1191,6 +1156,77 @@ pub struct Arcade {
     pub translucent: bool,
     /// Optional blips. Off unless a command was given the `sound` argument.
     pub sound: Sound,
+    /// True while the open starfield is the screensaver rather than a game.
+    /// It has no command and therefore no parking slot, and any key dismisses
+    /// it instead of steering.
+    screensaver: bool,
+}
+
+/// How long the TUI sits idle before the starfield screensaver comes up
+/// (`ui.screensaver`).
+///
+/// A short fixed menu rather than a free-form number: the useful range is
+/// small, and a cycling `/config` row beats typing minutes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScreensaverDelay {
+    /// One minute — the default.
+    #[default]
+    M1,
+    /// Two minutes.
+    M2,
+    /// Five minutes.
+    M5,
+    /// Never: no screensaver.
+    Never,
+}
+
+impl ScreensaverDelay {
+    /// The settings-file spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::M1 => "1m",
+            Self::M2 => "2m",
+            Self::M5 => "5m",
+            Self::Never => "never",
+        }
+    }
+
+    /// Parses a settings value. Bare minute counts are accepted alongside the
+    /// `1m` spellings, and `off`/`false`/`0` mean never.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "1m" | "1" => Some(Self::M1),
+            "2m" | "2" => Some(Self::M2),
+            "5m" | "5" => Some(Self::M5),
+            "never" | "off" | "false" | "0" => Some(Self::Never),
+            _ => None,
+        }
+    }
+
+    /// The idle stretch before the screensaver, or `None` when it is off.
+    #[must_use]
+    pub const fn duration(self) -> Option<std::time::Duration> {
+        let mins = match self {
+            Self::M1 => 1,
+            Self::M2 => 2,
+            Self::M5 => 5,
+            Self::Never => return None,
+        };
+        Some(std::time::Duration::from_secs(mins * 60))
+    }
+
+    /// The next value in the `/config` cycle.
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::M1 => Self::M2,
+            Self::M2 => Self::M5,
+            Self::M5 => Self::Never,
+            Self::Never => Self::M1,
+        }
+    }
 }
 
 /// Whether the easter eggs exist this run (`ui.easterEggs`, on by default).
@@ -1219,8 +1255,7 @@ pub fn command_of(line: &str) -> Option<&'static str> {
 impl Arcade {
     /// Every command this module answers to. Kept next to [`Self::open`] so the
     /// dispatcher's list and the constructors cannot drift apart.
-    pub const COMMANDS: [&'static str; 6] = [
-        "/stars",
+    pub const COMMANDS: [&'static str; 5] = [
         "/pelota",
         "/breakout",
         "/invaders",
@@ -1287,13 +1322,35 @@ impl Arcade {
             "/invaders" => Game::Invaders(Box::new(invaders::Invaders::new(seed))),
             "/centipede" => Game::Centipede(Box::new(centipede::Centipede::new(seed))),
             "/frogger" => Game::Frogger(Box::new(frogger::Frogger::new(seed))),
-            // `/stars` and anything unrecognized: the sky is the safe default,
-            // and `open` has already rejected commands that are not ours.
-            _ => {
-                let count = (usize::from(w) * usize::from(h) / 26).clamp(50, 900);
-                Game::Stars(Starfield::new(seed, count))
-            }
+            // `open` has already rejected commands that are not ours, and the
+            // starfield is no longer one of them — it is the screensaver now.
+            _ => Self::stars(seed, w, h),
         }
+    }
+
+    /// A starfield sized for a `w`x`h` terminal.
+    fn stars(seed: u64, w: u16, h: u16) -> Game {
+        let count = (usize::from(w) * usize::from(h) / 26).clamp(50, 900);
+        Game::Stars(Starfield::new(seed, count))
+    }
+
+    /// Opens the starfield as a screensaver: full screen rather than
+    /// translucent, dismissed by any key or mouse event rather than played.
+    ///
+    /// Not a command and not an easter egg — this is what `ui.screensaver`
+    /// runs after an idle stretch, so it stays available with
+    /// `ui.easterEggs` off.
+    pub fn open_screensaver(&mut self, seed: u64, w: u16, h: u16) {
+        self.park();
+        self.open = Some(Self::stars(seed, w, h));
+        self.screensaver = true;
+        self.translucent = false;
+    }
+
+    /// Whether what is on screen is the screensaver rather than a game.
+    #[must_use]
+    pub const fn is_screensaver(&self) -> bool {
+        self.screensaver
     }
 
     /// Takes the open game off screen and parks it for next time.
@@ -1305,6 +1362,12 @@ impl Arcade {
         let Some(game) = self.open.take() else {
             return;
         };
+        // The screensaver came from idleness, not a command: there is no slot
+        // to park it in, and resuming it would defeat the point.
+        if self.screensaver {
+            self.screensaver = false;
+            return;
+        }
         if !game.finished() {
             self.parked[self.open_slot] = Some(game);
         }
@@ -1480,6 +1543,11 @@ impl Arcade {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return Outcome::Close(self.close());
         }
+        // A screensaver is dismissed, not played: the first key of whatever
+        // the user came back to type puts the UI back.
+        if self.screensaver {
+            return Outcome::Close(self.close());
+        }
         // `t` veils or unveils the layer, whichever game is up. `s` would be a
         // natural toggle for sound but half these games steer with it, so the
         // blips are bound to `b` instead.
@@ -1620,14 +1688,6 @@ mod tests {
             sky.scale_speed(1.0 / 1.3);
         }
         assert!((sky.speed() - SPEED_MIN).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn still_sky_fills_exactly_the_requested_rows() {
-        let art = still_sky(11, 60, 12, false);
-        assert_eq!(art.lines().count(), 12);
-        assert!(art.lines().all(|l| l.chars().count() <= 60));
-        assert!(art.contains(|c: char| c != ' ' && c != '\n'));
     }
 
     #[test]
@@ -1956,14 +2016,48 @@ mod tests {
         assert!(!a.is_open());
     }
 
+    /// The screensaver is dismissed by whatever key the user came back to
+    /// type — not just Esc — and leaves nothing in the scrollback.
     #[test]
-    fn esc_closes_the_starfield_quietly() {
+    fn any_key_dismisses_the_screensaver_quietly() {
+        for code in [
+            KeyCode::Esc,
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Up,
+        ] {
+            let mut a = Arcade::new();
+            a.open_screensaver(1, 80, 24);
+            assert!(a.is_open() && a.is_screensaver());
+            assert!(
+                matches!(a.handle_key(key(code)), Outcome::Close(None)),
+                "{code:?} should have dismissed the screensaver"
+            );
+            assert!(!a.is_open() && !a.is_screensaver());
+        }
+    }
+
+    /// The screensaver has no command and so no parking slot: coming back to
+    /// an idle terminal a second time deals a fresh sky rather than resuming.
+    #[test]
+    fn the_screensaver_is_never_parked() {
         let mut a = Arcade::new();
-        a.open("/stars", false, 1, 80, 24);
-        assert!(matches!(
-            a.handle_key(key(KeyCode::Esc)),
-            Outcome::Close(None)
-        ));
+        a.open_screensaver(1, 80, 24);
+        a.handle_key(key(KeyCode::Char('x')));
+        assert!(!a.is_open());
+        assert!(
+            a.parked.iter().all(Option::is_none),
+            "the screensaver must not occupy a game's slot"
+        );
+    }
+
+    /// `/stars` is gone: it is the screensaver now, not a command.
+    #[test]
+    fn stars_is_no_longer_a_command() {
+        assert!(!Arcade::COMMANDS.contains(&"/stars"));
+        assert!(command_of("/stars").is_none());
+        let mut a = Arcade::new();
+        assert!(!a.open("/stars", false, 1, 80, 24));
     }
 
     #[test]
@@ -2483,7 +2577,7 @@ mod tests {
     #[test]
     fn the_starfield_never_blips() {
         let mut a = Arcade::new();
-        a.open("/stars", false, 1, 80, 24);
+        a.open_screensaver(1, 80, 24);
         a.sound.set(true);
         let before = a.open.as_ref().map(Game::vitals).unwrap();
         for _ in 0..100 {
@@ -2507,7 +2601,7 @@ mod tests {
         a.open("/pelota", false, 1, 80, 24);
         assert!(a.banner(10, 4).is_some_and(|b| b.contains("terminale")));
         let mut sky = Arcade::new();
-        sky.open("/stars", false, 1, 80, 24);
+        sky.open_screensaver(1, 80, 24);
         assert!(sky.banner(80, 24).is_none());
     }
 }

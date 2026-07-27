@@ -372,6 +372,36 @@ test` and review the diff before committing.
   header); it costs 2× base input on the cache *write* but keeps reads at
   0.1×, a clear win when the prefix is re-read far more than it changes.
 
+- **`refs/edit` needs Rust 1.93+.** `edit`, `lsh`, and `stdext` all declare
+  `rust-version = "1.93"`, and on 1.91 `stdext` genuinely fails to build
+  (`maybe_uninit_slice`, `vec_into_raw_parts`). CI's `stable` toolchain is
+  fine; a stale local `rustup` is not. Two further gotchas: `stdext`'s scratch
+  arenas are process-wide `static mut` singletons, so miniedit may only be
+  driven from the TUI thread, and `arena::init` must run once before any
+  `TextBuffer` exists. Search goes through ICU loaded at runtime, so it must
+  degrade to "unavailable" rather than fail the session.
+
+- **Three `edit` TUI traps, all found by driving the real binary.** Its TUI is
+  immediate mode, and each of these fails *silently* — the editor renders fine
+  and simply ignores you. (1) The first focusable widget takes the focus, which
+  is the menubar, so the text area has to claim it on the first frame or every
+  keystroke lands on a closed menu; the input is read and parsed, it just has
+  nowhere to go. (2) An `editline` collapses to zero width without an explicit
+  `attr_intrinsic_size(COORD_TYPE_SAFE_MAX, 1)` after it, so a search panel
+  renders as a bare label with nothing to type into. (3)
+  `TextBuffer::save_as_string` calls `mark_as_clean`, so reading the text out
+  clears the dirty flag — "has this been edited?" has to compare against the
+  original string, or a discard prompt stops appearing the moment anything
+  reads the buffer. `PLANK_MINIEDIT_DEBUG=<file>` logs session start/end and
+  every stdin read, which is how (1) was pinned down: the bytes arrived, the
+  screen never changed.
+
+- **A screensaver's idle clock must ignore focus and resize events.** Treating
+  every terminal event as "the user is here" means it never fires on a desktop
+  where anything moves focus around — a tiling WM, a notification, an agent
+  driving the terminal. Only keys, mouse and pastes count. Symptom: the idle
+  timer visibly resets every few seconds with nobody touching the keyboard.
+
 - **`ratatui-markdown` code-block headers can't be customized via the block's
   `header_override`.** When a `RenderHooks` impl (plank uses `HighlightHooks`)
   returns `Some` from `render_code_block`, the crate renders the whole block —

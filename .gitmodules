@@ -1,14 +1,12 @@
 [submodule "refs/ds4"]
 	path = refs/ds4
 	url = https://github.com/aovestdipaperino/ds4
-[submodule "refs/openclaw"]
-	path = refs/openclaw
-	url = https://github.com/openclaw/openclaw
-	shallow = true
-	update = none
 [submodule "refs/llms-sdk"]
 	path = refs/llms-sdk
 	url = https://github.com/AstraBert/llms-sdk
 [submodule "refs/obscura"]
 	path = refs/obscura
 	url = https://github.com/h4ckf0r0day/obscura
+[submodule "refs/edit"]
+	path = refs/edit
+	url = https://github.com/microsoft/edit

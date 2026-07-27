@@ -36,8 +36,10 @@ pub enum FieldId {
     UiNotifications,
     UiNotifyAfterSecs,
     UiCrtOff,
+    UiScreensaver,
     UiReducedMotion,
     UiEasterEggs,
+    UiBuiltinEditor,
     SafetySandbox,
     SafetyBtwSuspend,
     McpTimeoutSecs,
@@ -192,6 +194,13 @@ pub static FIELDS: &[Field] = &[
         Kind::Bool,
     ),
     f(
+        FieldId::UiScreensaver,
+        "ui",
+        "screensaver",
+        "idle starfield after: 1m, 2m, 5m, never",
+        Kind::Bool,
+    ),
+    f(
         FieldId::UiReducedMotion,
         "ui",
         "reducedMotion",
@@ -203,6 +212,13 @@ pub static FIELDS: &[Field] = &[
         "ui",
         "easterEggs",
         "arcade easter eggs exist as commands",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::UiBuiltinEditor,
+        "ui",
+        "builtinEditor",
+        "Ctrl-G opens the built-in editor",
         Kind::Bool,
     ),
     f(
@@ -306,8 +322,10 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiNotifications => s.ui.notifications.as_str().to_string(),
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
+        FieldId::UiScreensaver => s.ui.screensaver.as_str().to_string(),
         FieldId::UiReducedMotion => s.ui.reduced_motion.to_string(),
         FieldId::UiEasterEggs => s.ui.easter_eggs.to_string(),
+        FieldId::UiBuiltinEditor => s.ui.builtin_editor.to_string(),
         FieldId::SafetySandbox => tri_str(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
@@ -345,9 +363,12 @@ fn toggle(s: &mut Settings, id: FieldId) {
                 NotifyMode::Never => NotifyMode::Always,
             };
         }
+        // Cycles 1m -> 2m -> 5m -> never, like the notification modes.
+        FieldId::UiScreensaver => s.ui.screensaver = s.ui.screensaver.cycle(),
         FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
         FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
+        FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
         FieldId::ToolsTask => s.tools.task = !s.tools.task,
         FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
         FieldId::ToolsPlanMode => s.tools.plan_mode = !s.tools.plan_mode,
@@ -425,6 +446,10 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
                 format!("notifications must be always, unfocused, or never (got {raw})")
             })?;
         }
+        FieldId::UiScreensaver => {
+            s.ui.screensaver = crate::arcade::ScreensaverDelay::parse(raw)
+                .ok_or_else(|| format!("screensaver must be 1m, 2m, 5m, or never (got {raw})"))?;
+        }
         FieldId::EngineThinkingToolCalls
         | FieldId::UiRespectGitignore
         | FieldId::UiShowToolCalls
@@ -433,6 +458,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiCrtOff
         | FieldId::UiReducedMotion
         | FieldId::UiEasterEggs
+        | FieldId::UiBuiltinEditor
         | FieldId::ToolsTask
         | FieldId::ToolsAgent
         | FieldId::ToolsPlanMode => {
@@ -455,6 +481,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiCrtOff => s.ui.crt_off = b,
         FieldId::UiReducedMotion => s.ui.reduced_motion = b,
         FieldId::UiEasterEggs => s.ui.easter_eggs = b,
+        FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
         FieldId::ToolsTask => s.tools.task = b,
         FieldId::ToolsAgent => s.tools.agent = b,
         FieldId::ToolsPlanMode => s.tools.plan_mode = b,
@@ -827,6 +854,6 @@ mod tests {
             .map(|r| r.label.as_str())
             .collect();
         assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask", "tools"]);
-        assert!(rows.iter().filter(|r| !r.header).count() == FIELDS.len());
+        assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }
 }

@@ -44,6 +44,8 @@ pub mod kvcache;
 pub mod kvtier;
 pub mod logo;
 pub mod memory;
+#[cfg(feature = "builtin_editor")]
+pub mod miniedit;
 pub mod names;
 pub mod notify;
 #[cfg(feature = "use_obscura")]

@@ -1610,6 +1610,12 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
         );
     }
 
+    // The screensaver has no controls to hint at — any key puts the UI back —
+    // so it gets the whole screen, stars and nothing else.
+    if arcade.is_screensaver() {
+        return;
+    }
+
     let footer = Rect {
         y: area.y + area.height - 1,
         height: 1,
@@ -3004,6 +3010,13 @@ mod tests {
         a
     }
 
+    /// An arcade showing the starfield screensaver.
+    fn screensaver() -> crate::arcade::Arcade {
+        let mut a = crate::arcade::Arcade::new();
+        a.open_screensaver(7, 80, 24);
+        a
+    }
+
     /// Draws one arcade frame and returns it as plain rows of text.
     fn arcade_frame(arcade: &crate::arcade::Arcade, w: u16, h: u16) -> Vec<String> {
         use ratatui::Terminal;
@@ -3058,7 +3071,7 @@ mod tests {
             log.end_line();
         }
         let draw = |translucent: bool| {
-            let mut arcade = opened("/stars");
+            let mut arcade = screensaver();
             arcade.translucent = translucent;
             let mut view = OutputView::default();
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -3127,16 +3140,16 @@ mod tests {
             // With room to spare the status is there too, not just the exit.
             let wide = arcade_footer_line(&a, 200);
             assert!(wide.trim_start().starts_with(|c: char| c != ' '));
-            assert!(wide.width() == 200);
+            assert_eq!(wide.width(), 200);
         }
     }
 
     #[test]
     fn arcade_scatters_stars_over_the_whole_frame() {
-        let rows = arcade_frame(&opened("/stars"), 80, 24);
-        // Every row but the footer is playing field; stars should reach the
-        // top and the bottom of it, not clump in a band.
-        let painted: Vec<usize> = rows[..23]
+        let rows = arcade_frame(&screensaver(), 80, 24);
+        // The screensaver has no footer, so every row is sky; stars should
+        // reach the top and the bottom of it, not clump in a band.
+        let painted: Vec<usize> = rows
             .iter()
             .enumerate()
             .filter(|(_, r)| !r.trim().is_empty())
@@ -3145,6 +3158,11 @@ mod tests {
         assert!(painted.len() > 10, "only {} rows had stars", painted.len());
         assert!(painted[0] < 4, "nothing near the top: {painted:?}");
         assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
-        assert!(rows[23].contains("speed"), "hint line missing");
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("speed") || r.contains("quit")),
+            "the screensaver must not offer the games' controls: {rows:?}"
+        );
     }
 }

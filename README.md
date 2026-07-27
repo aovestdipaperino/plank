@@ -155,6 +155,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `notifications` | `always` | When desktop notifications fire: `always`, `unfocused` (only while the terminal window isn't focused), or `never`. |
 | | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
+| | `builtinEditor` | `true` | `Ctrl-G` opens the built-in editor (a fork of Microsoft Edit, in-process). `false` shells out to `$EDITOR` as before. |
+| | `screensaver` | `1m` | Idle time before the starfield screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
 | `safety` | `sandbox` | on (macOS) | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
@@ -261,7 +263,7 @@ plank --provider openai --model llama3.3 \
 
 ## The arcade
 
-Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are six games behind undocumented-in-`/help` slash commands, and they are meant to be played **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
+Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are five games behind undocumented-in-`/help` slash commands, and they are meant to be played **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
 
 <p align="center">
   <img src="assets/arcade-breakout.png" alt="/breakout played over a live plank turn: the brick wall, ball and paddle sit above the model's still-streaming poem, which stays readable through the dimmed layer" width="700">
@@ -271,7 +273,6 @@ That is a real turn underneath — the model is 1m 49s into writing a poem at 20
 
 | Command | |
 |---|---|
-| `/stars` | a perspective starfield; ↑↓ or the wheel take it to lightspeed |
 | `/pelota` | pong against a five-level CPU |
 | `/breakout` | knock the wall down, five walls deep |
 | `/invaders` | hold the line against the marching fleet |

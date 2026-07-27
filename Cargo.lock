@@ -764,6 +764,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "edit"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "lsh",
+ "stdext",
+ "toml-span",
+ "windows-sys 0.61.2",
+ "winresource",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1531,6 +1543,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lsh"
+version = "0.0.0"
+dependencies = [
+ "stdext",
+]
+
+[[package]]
 name = "mac"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2022,6 +2041,7 @@ name = "plank"
 version = "2.7.1"
 dependencies = [
  "crt-off",
+ "edit",
  "git2",
  "image",
  "libc",
@@ -2034,6 +2054,7 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "stdext",
  "tokio",
  "tungstenite",
  "unicode-width 0.2.0",
@@ -2779,6 +2800,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "stdext"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3118,6 +3146,15 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "toml_edit",
+]
+
+[[package]]
+name = "toml-span"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f22ba417d437b5fa5dcba6c27dbd6c14f38845315b724d89fed73b7a426451b7"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]
@@ -4197,6 +4234,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "winresource"
+version = "0.1.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0986a8b1d586b7d3e4fe3d9ea39fb451ae22869dcea4aa109d287a374d866087"
+dependencies = [
+ "version_check",
 ]
 
 [[package]]
