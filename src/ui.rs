@@ -1081,6 +1081,34 @@ const HISTORY_DEFAULT_TURNS: usize = 3;
 /// Sessions shown by the /resume picker.
 const RESUME_LIST_LIMIT: usize = 10;
 
+/// Outcome of `/insights`: a written report, or the user's decision to stop.
+///
+/// Cancelling is not a failure, and saying "insights failed" to someone who
+/// pressed Esc on purpose would be a small lie.
+#[derive(Debug)]
+enum Insights {
+    /// The report was written.
+    Done {
+        /// Where the HTML landed.
+        path: std::path::PathBuf,
+        /// Condensed summary for the terminal.
+        summary: Vec<String>,
+    },
+    /// Stopped before there was anything to write.
+    Cancelled,
+}
+
+/// Puts the window title back to idle when it drops, so a long-running
+/// command cannot leave the window describing work that has finished — on the
+/// early-return and error paths as much as the successful one.
+struct TitleRestore;
+
+impl Drop for TitleRestore {
+    fn drop(&mut self) {
+        crate::title::set(crate::title::State::Idle);
+    }
+}
+
 /// Token budget for one `/insights` narrative section, covering the model's
 /// reasoning and the JSON answer that follows it.
 ///
@@ -2582,12 +2610,13 @@ impl Agent<'_> {
                     }
                 };
                 match self.run_insights(arg, &mut note, &mut tick) {
-                    Ok((path, summary)) => {
+                    Ok(Insights::Done { path, summary }) => {
                         for line in summary {
                             println!("{line}");
                         }
                         println!("report written to {}", path.display());
                     }
+                    Ok(Insights::Cancelled) => println!("insights cancelled"),
                     Err(e) => println!("insights failed: {e}\nusage: /insights [fast]"),
                 }
             }
@@ -3018,28 +3047,46 @@ the original is frozen and listed in /tree"
         arg: &str,
         note: &mut dyn FnMut(String),
         tick: &mut dyn FnMut(String),
-    ) -> Result<(std::path::PathBuf, Vec<String>), String> {
+    ) -> Result<Insights, String> {
         use crate::insights;
 
         let fast = matches!(arg.trim(), "fast" | "--fast" | "quick");
         let root = insights::usage_dir();
         let tz = insights::local_utc_offset();
 
+        // The report reads back the user's whole history and can take minutes,
+        // so the window says so. Restored on every exit path, including the
+        // `?` below — a title left saying "introspecting" after the command
+        // failed would outlive the thing it describes.
+        crate::title::set(crate::title::State::Introspecting);
+        let _title = TitleRestore;
+
         let mut last_pct = usize::MAX;
-        let metas = insights::collect_metas(&self.store, &root, &mut |done, total| {
-            if total == 0 {
-                return;
-            }
-            let pct = done * 100 / total;
-            // One line per decile, not one per session: a 200-session first
-            // run should report progress, not scroll.
-            if pct / 10 != last_pct / 10 {
-                last_pct = pct;
-                // Transient: the scan is over in seconds and its deciles are
-                // not worth keeping in the log next to the report.
-                tick(format!("reading sessions… {done}/{total}"));
-            }
-        })?;
+        let scan = insights::collect_metas(
+            &self.store,
+            &root,
+            &mut |done, total| {
+                if total == 0 {
+                    return;
+                }
+                let pct = done * 100 / total;
+                // One line per decile, not one per session: a 200-session first
+                // run should report progress, not scroll.
+                if pct / 10 != last_pct / 10 {
+                    last_pct = pct;
+                    // Transient: the scan is over in seconds and its deciles are
+                    // not worth keeping in the log next to the report.
+                    tick(format!("reading sessions… {done}/{total}"));
+                }
+            },
+            &|| crate::interrupt::pending(),
+        )?;
+        let insights::Scan::Done(metas) = scan else {
+            // Stopped during the scan: nothing has been computed worth
+            // showing, and the half-filled cache makes the next run shorter.
+            crate::interrupt::clear();
+            return Ok(Insights::Cancelled);
+        };
         let agg = insights::aggregate(&metas, tz);
 
         let mut narrative = insights::Narrative::new();
@@ -3091,19 +3138,34 @@ the original is frozen and listed in /tree"
                     think_mode: crate::engine::ThinkMode::On,
                     ..self.cfg.generation.clone()
                 };
+                let stop = AtomicBool::new(false);
                 let generated = self.engine.generate_aside(
                     &prompt,
                     &opts,
-                    &|| crate::interrupt::pending(),
+                    &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
                     &mut |ev| {
                         if let crate::engine::EngineEvent::Text(t) = ev {
                             reply.push_str(&t);
                             for line in ticker.feed(&t) {
                                 tick(line);
                             }
+                            // `tick` is where the TUI reads the keyboard, so
+                            // polling here is what turns an Esc pressed
+                            // mid-sentence into a stopped generation rather
+                            // than one noticed at the next section boundary.
+                            if crate::interrupt::pending() {
+                                stop.store(true, Ordering::Relaxed);
+                            }
                         }
                     },
                 );
+                // A section the user stopped is not a section that failed:
+                // say nothing about it and leave the loop, rather than
+                // reporting it "unavailable" and trying the next one.
+                if generated.as_ref().is_ok_and(|s| s.interrupted) {
+                    note("[stopped; writing the report as it stands]".to_owned());
+                    break;
+                }
                 match generated.map_err(|e| e.to_string()).and_then(|_| {
                     insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
                 }) {
@@ -3118,9 +3180,27 @@ the original is frozen and listed in /tree"
             crate::interrupt::clear();
         }
 
-        let html = insights::render_html(&agg, &narrative, tz);
+        // The statistics are finished by this point even if the prose was
+        // interrupted, so the report is still written: throwing away a
+        // completed scan because the user stopped the writing would punish
+        // them for the part that was slow. The interrupt flag is therefore
+        // cleared first — the stop has been honoured, and it must not now be
+        // read as "abandon the render too".
+        crate::interrupt::clear();
+        tick("writing the report…".to_owned());
+        let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, &|| {
+            crate::interrupt::pending()
+        }) else {
+            // Stopped mid-render: nothing is written, so the report the user
+            // already had is still on disk, whole.
+            crate::interrupt::clear();
+            return Ok(Insights::Cancelled);
+        };
         let path = insights::write_report(&root, &html)?;
-        Ok((path, insights::render_summary(&agg, &narrative, tz)))
+        Ok(Insights::Done {
+            path,
+            summary: insights::render_summary(&agg, &narrative, tz),
+        })
     }
 
     /// Saves the live session, recording the project directory it ran in.
@@ -5729,11 +5809,29 @@ impl Agent<'_> {
                                 "{} {line}",
                                 crate::status::throbber()
                             ))));
-                        let l = log.borrow();
-                        let mut v = view.borrow_mut();
-                        let _ = terminal.borrow_mut().draw(|f| {
-                            tui::draw(f, *l, None, 0, "", *v, None, &tui::TaskView::default());
-                        });
+                        {
+                            let l = log.borrow();
+                            let mut v = view.borrow_mut();
+                            let _ = terminal.borrow_mut().draw(|f| {
+                                tui::draw(f, *l, None, 0, "", *v, None, &tui::TaskView::default());
+                            });
+                        }
+                        // Nothing else is reading the keyboard while the
+                        // command runs, so without this drain an Esc is not
+                        // merely slow to take effect — it is never seen at
+                        // all. Raising the shared interrupt flag lets both the
+                        // generation loop and the session scan stop by the
+                        // same route a Ctrl-C uses.
+                        while event::poll(Duration::ZERO).unwrap_or(false) {
+                            if let Ok(Event::Key(k)) = event::read()
+                                && k.kind == KeyEventKind::Press
+                                && (matches!(k.code, KeyCode::Esc)
+                                    || (matches!(k.code, KeyCode::Char('c'))
+                                        && k.modifiers.contains(KeyModifiers::CONTROL)))
+                            {
+                                crate::interrupt::request();
+                            }
+                        }
                     };
                     // Status lines are kept in the log; streamed reasoning
                     // only ever occupies the progress line, so a section's
@@ -5747,12 +5845,13 @@ impl Agent<'_> {
                 };
                 log.set_progress(None);
                 match result {
-                    Ok((path, summary)) => {
+                    Ok(Insights::Done { path, summary }) => {
                         for line in summary {
                             log.push_plain(line);
                         }
                         log.push_dim(format!("report written to {}", path.display()));
                     }
+                    Ok(Insights::Cancelled) => log.push_dim("insights cancelled".to_owned()),
                     Err(e) => {
                         log.push_plain(format!("insights failed: {e}"));
                         log.push_dim("usage: /insights [fast]".to_owned());

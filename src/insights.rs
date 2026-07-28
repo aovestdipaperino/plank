@@ -601,11 +601,28 @@ fn write_private(path: &Path, body: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Outcome of a scan: the statistics, or the user's decision to stop.
+///
+/// Cancellation is not an error. Everything already computed is still written
+/// to the cache on the way past, so a scan abandoned halfway makes the next
+/// run that much shorter rather than being wasted.
+#[derive(Debug)]
+pub enum Scan {
+    /// Every session was read.
+    Done(Vec<SessionMeta>),
+    /// The user interrupted partway through.
+    Cancelled,
+}
+
 /// Loads every session's statistics, computing and caching what is missing.
 ///
 /// `progress` is called with `(done, total)` after each session so a long
 /// first run can show movement. Sessions that fail to load are skipped: one
 /// corrupt file must not cost the user the whole report.
+///
+/// `cancel` is polled once per session so a long first run over a large
+/// history can be abandoned; it returns [`Scan::Cancelled`] rather than an
+/// error, since a user who asked to stop has not hit a failure.
 ///
 /// # Errors
 ///
@@ -614,11 +631,15 @@ pub fn collect_metas(
     store: &SessionStore,
     root: &Path,
     progress: &mut dyn FnMut(usize, usize),
-) -> Result<Vec<SessionMeta>, String> {
+    cancel: &dyn Fn() -> bool,
+) -> Result<Scan, String> {
     let entries = store.list().map_err(|e| e.to_string())?;
     let total = entries.len();
     let mut out = Vec::with_capacity(total);
     for (i, entry) in entries.iter().enumerate() {
+        if cancel() {
+            return Ok(Scan::Cancelled);
+        }
         progress(i, total);
         let mtime = mtime_secs(&entry.path);
         let cache = meta_cache_path(root, &entry.id);
@@ -640,7 +661,7 @@ pub fn collect_metas(
         out.push(meta);
     }
     progress(total, total);
-    Ok(out)
+    Ok(Scan::Done(out))
 }
 
 // ---------------------------------------------------------------------------
@@ -1529,6 +1550,25 @@ footer{color:var(--dim);font-size:.8rem;border-top:1px solid var(--line);padding
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> String {
+    render_html_cancellable(agg, narrative, tz_offset, &|| false).unwrap_or_default()
+}
+
+/// [`render_html`], abandoning the document if `cancel` goes true.
+///
+/// Rendering is normally milliseconds, but it is the last thing standing
+/// between the user and their prompt, and a history large enough to make the
+/// scan slow makes this slow too. Checked between sections rather than
+/// mid-string, so a cancelled render yields no document at all — never a
+/// truncated one, which paired with the rename in [`write_report`] is what
+/// keeps the previous report intact.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn render_html_cancellable(
+    agg: &Aggregated,
+    narrative: &Narrative,
+    tz_offset: i64,
+    cancel: &dyn Fn() -> bool,
+) -> Option<String> {
     let mut out = String::with_capacity(16 * 1024);
     out.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n");
     out.push_str("<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n");
@@ -1562,6 +1602,9 @@ pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> S
         }
     }
 
+    if cancel() {
+        return None;
+    }
     out.push_str("<div class=\"stats\">");
     let stats: [(String, &str); 6] = [
         (commas(u64::from(agg.human_messages)), "prompts"),
@@ -1619,6 +1662,9 @@ pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> S
     }
     charts.push_str("</div>");
     section(&mut out, "activity", "What you work on", &charts);
+    if cancel() {
+        return None;
+    }
 
     if !agg.projects.is_empty() {
         section(
@@ -1632,6 +1678,9 @@ pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> S
     // Activity by hour, with an explicit note when part of the history
     // predates timestamps — an honest gap beats a chart that silently covers
     // a fraction of the sessions.
+    if cancel() {
+        return None;
+    }
     if agg.by_hour.iter().any(|&n| n > 0) {
         let hours: Vec<(String, u32)> = agg
             .by_hour
@@ -1674,6 +1723,9 @@ message.",
         section(&mut out, "response", "How fast you reply", &body);
     }
 
+    if cancel() {
+        return None;
+    }
     if !agg.errors.is_empty() {
         let mut body = String::from("<div class=\"grid2\">");
         let _ = write!(
@@ -1727,21 +1779,37 @@ prompts.</p><ul>",
         section(&mut out, "overlap", "Running in parallel", &body);
     }
 
+    if cancel() {
+        return None;
+    }
     out.push_str(&narrative_html(narrative));
 
     out.push_str("<footer>Generated locally by plank. Nothing here left this machine.</footer>");
     out.push_str("\n</main>\n</body>\n</html>\n");
-    out
+    Some(out)
 }
 
 /// Writes the report and returns its path.
 ///
+/// Written to `report.html.tmp` and renamed into place, so the previous
+/// report survives intact until the new one is complete. A run that fails or
+/// is interrupted partway therefore costs the user nothing: the report they
+/// already had is still there, whole, rather than replaced by a truncated
+/// file. The rename is atomic on the same filesystem, so a reader never sees
+/// a half-written report either.
+///
 /// # Errors
 ///
-/// Returns the underlying I/O error's message if the file cannot be written.
+/// Returns the underlying I/O error's message if the file cannot be written
+/// or the rename fails; the temporary file is cleaned up in both cases.
 pub fn write_report(root: &Path, html: &str) -> Result<PathBuf, String> {
     let path = root.join("report.html");
-    write_private(&path, html).map_err(|e| format!("{}: {e}", path.display()))?;
+    let tmp = root.join("report.html.tmp");
+    write_private(&tmp, html).map_err(|e| format!("{}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
     Ok(path)
 }
 
@@ -2112,6 +2180,66 @@ Tool result 3 (read):\nfine\n</tool_result>",
         // Self-contained: no network references of any kind.
         assert!(!html.contains("http://") && !html.contains("https://"));
         assert!(html.contains("2023-11-14"));
+    }
+
+    #[test]
+    fn a_cancelled_render_yields_nothing_rather_than_a_partial_document() {
+        let agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                tools: [("bash".to_owned(), 3)].into_iter().collect(),
+                errors: [("Command failed".to_owned(), 2)].into_iter().collect(),
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        // Cancelled from the very first check.
+        assert!(render_html_cancellable(&agg, &Narrative::new(), 0, &|| true).is_none());
+
+        // Cancelled partway: still nothing, never a half-built document that
+        // could be written over a good report.
+        let seen = std::cell::Cell::new(0);
+        let out = render_html_cancellable(&agg, &Narrative::new(), 0, &|| {
+            seen.set(seen.get() + 1);
+            seen.get() > 2
+        });
+        assert!(out.is_none(), "a partial render must not be returned");
+        assert!(seen.get() > 2, "cancellation is checked more than once");
+
+        // Uncancelled, the document is whole.
+        let whole = render_html_cancellable(&agg, &Narrative::new(), 0, &|| false)
+            .expect("an uncancelled render");
+        assert!(whole.starts_with("<!DOCTYPE html>") && whole.ends_with("</html>\n"));
+    }
+
+    #[test]
+    fn writing_the_report_replaces_it_only_once_the_new_one_is_whole() {
+        let root = std::env::temp_dir().join(format!("plank-report-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let first = write_report(&root, "<html>one</html>").unwrap();
+        assert_eq!(first.file_name().unwrap(), "report.html");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "<html>one</html>");
+        // The scratch file does not survive a successful write.
+        assert!(!root.join("report.html.tmp").exists());
+
+        let second = write_report(&root, "<html>two</html>").unwrap();
+        assert_eq!(second, first, "same path, replaced in place");
+        assert_eq!(
+            std::fs::read_to_string(&second).unwrap(),
+            "<html>two</html>"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&second).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "the report is the user's alone");
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

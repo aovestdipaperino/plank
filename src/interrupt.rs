@@ -28,6 +28,15 @@ pub fn install() {
     }
 }
 
+/// Raises the interrupt flag from something other than a signal.
+///
+/// The TUI reads keys itself, so an `Esc` pressed during a long command has to
+/// reach the generation loop by the same route Ctrl-C takes — the loop polls
+/// one flag, and it should not care which of the two set it.
+pub fn request() {
+    SIGINT_PENDING.store(true, Ordering::SeqCst);
+}
+
 /// True when a Ctrl-C arrived since the last [`clear`].
 #[must_use]
 pub fn pending() -> bool {
@@ -42,6 +51,15 @@ pub fn clear() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_raises_the_same_flag_as_a_signal() {
+        clear();
+        assert!(!pending());
+        request();
+        assert!(pending(), "an Esc must look like a Ctrl-C to the poller");
+        clear();
+    }
 
     #[test]
     fn flag_roundtrip() {

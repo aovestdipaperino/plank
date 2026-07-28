@@ -3,9 +3,10 @@
 
 //! Terminal window title, kept in sync with what plank is doing.
 //!
-//! Three states, so the window (and tab) names plank's phase at a glance:
+//! Four states, so the window (and tab) names plank's phase at a glance:
 //! `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.` while
-//! idle at the prompt, and `🚀 <prompt>` while a turn runs. Set via the OSC 0
+//! idle at the prompt, `🚀 <prompt>` while a turn runs, and
+//! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
 //! escape (`ESC ] 0 ; title BEL`), written to **stderr** in a single write:
 //! stderr reaches the same tty as stdout but bypasses the Ratatui frame
 //! buffer, so a title change can never tear a frame even when emitted from the
@@ -23,6 +24,11 @@ pub enum State<'a> {
     Idle,
     /// Running a turn for the given user prompt.
     Busy(&'a str),
+    /// Building the `/insights` report. Its own state rather than a
+    /// [`State::Busy`] prompt because it is not a turn — no user prompt is
+    /// being answered — and it runs long enough that the window should say
+    /// what it is doing.
+    Introspecting,
 }
 
 /// Longest prompt (in characters) kept in a [`State::Busy`] title before it is
@@ -33,6 +39,9 @@ const TITLE_PROMPT_MAX: usize = 20;
 /// slowest launch step and the one most likely to be looked at.
 const LOADING: &str = "🚀 Plank loading...";
 
+/// Title shown while `/insights` is reading back the user's own history.
+const INTROSPECTING: &str = "👀 introspecting...";
+
 /// Formats the window title for `state`. A [`State::Busy`] prompt is collapsed
 /// to one line and truncated past [`TITLE_PROMPT_MAX`] characters; a
 /// whitespace-only prompt degrades to the plain loading form.
@@ -41,6 +50,7 @@ pub fn window_title(state: State<'_>) -> String {
     let prompt = match state {
         State::Loading => return LOADING.to_string(),
         State::Idle => return "🪵 Plank - READY.".to_string(),
+        State::Introspecting => return INTROSPECTING.to_string(),
         State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
     };
     if prompt.is_empty() {
@@ -74,6 +84,7 @@ mod tests {
     fn loading_and_idle_are_fixed_strings() {
         assert_eq!(window_title(State::Loading), "🚀 Plank loading...");
         assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
+        assert_eq!(window_title(State::Introspecting), "👀 introspecting...");
     }
 
     #[test]
