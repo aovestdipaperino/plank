@@ -1551,9 +1551,6 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
-        // Plain REPL: a headless sub-agent's output has nowhere else to go, so
-        // print it inline on stdout alongside the parent turn's own stream.
-        self.sub_sink = SubSinkTarget::Stdout;
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
@@ -6750,6 +6747,12 @@ pub fn run_interactive(
     // one entry point, so this covers both).
     crate::notify::set_mode(crate::settings::active().ui.notifications);
 
+    // Plain REPL: a headless sub-agent's output has nowhere else to go, so
+    // print it inline on stdout alongside the parent turn's own stream. The
+    // TUI overwrites this with `Events` per turn in `worker_turn`, so this
+    // value only ever survives on the plain-REPL path.
+    agent.sub_sink = SubSinkTarget::Stdout;
+
     // `plank /resume [prefix]` loads a prior session before the loop starts.
     let resumed = cfg.resume.is_some();
     if let Some(arg) = &cfg.resume {
@@ -7161,6 +7164,40 @@ mod tests {
         assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
         let block = s.tasks.inject_block().expect("non-empty list has a block");
         assert!(block.contains("keep me across compaction"));
+    }
+
+    /// Regression: `run_turn` must not force `sub_sink` to `Stdout`. It is
+    /// called by both the plain REPL and `run_non_interactive` (the `-p`
+    /// one-shot path and the stdin-protocol loop), and the headless path's
+    /// stdout carries the `+DWARFSTAR_WAITING` / one-shot machine protocol
+    /// that interleaved sub-agent model text would corrupt. An `Agent` built
+    /// the way `run_non_interactive` builds it (default `sub_sink`, i.e.
+    /// `Null`) must still have `sub_sink == Null` after a turn runs, and any
+    /// sub-agent output emitted through that sink must be silently dropped
+    /// rather than printed.
+    #[test]
+    fn run_turn_does_not_force_sub_sink_to_stdout() {
+        let dir = scratch_dir("sub-sink-headless");
+        let engine = ScriptedEngine {
+            replies: vec!["headless reply\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        // Sanity: this is the same default `new_agent`/`run_non_interactive`
+        // leave in place (no assignment on the non-interactive path).
+        assert!(matches!(agent.sub_sink, SubSinkTarget::Null));
+
+        agent.session.push(Message::user("hi"));
+        agent.run_turn().expect("turn runs");
+
+        assert!(
+            matches!(agent.sub_sink, SubSinkTarget::Null),
+            "run_turn must leave a headless agent's sub_sink as Null, got {:?}",
+            agent.sub_sink
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
