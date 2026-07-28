@@ -81,6 +81,20 @@ pub enum UiEvent {
     Sub(Box<UiEvent>),
 }
 
+impl UiEvent {
+    /// Whether this event belongs to the local sub-agent pane only and must not
+    /// go onto the [`BroadcastBus`]. A remote-side pane is out of scope, so
+    /// `ServerMsg::from_event` maps these three to `None` — broadcasting them
+    /// anyway would burn scrollback ring slots (one `Sub` per streamed chunk)
+    /// and evict the real transcript a reconnecting client replays. The remote
+    /// protocol does not require contiguous sequence ids, so simply not
+    /// broadcasting is safe.
+    #[must_use]
+    pub fn is_local_pane_only(&self) -> bool {
+        matches!(self, Self::SubStart(_) | Self::SubEnd | Self::Sub(_))
+    }
+}
+
 /// [`RenderSink`] forwarding render calls over the worker→UI channel.
 ///
 /// A receiver that hangs up mid-turn just drops the text: the worker keeps
@@ -410,6 +424,40 @@ mod tests {
                 && matches!(**d, UiEvent::Error(ref s) if s == "d")),
             "unexpected events: {got:?}"
         );
+    }
+
+    #[test]
+    fn sub_agent_events_are_local_pane_only_and_never_reach_the_bus() {
+        assert!(UiEvent::SubStart("agent".to_string()).is_local_pane_only());
+        assert!(UiEvent::SubEnd.is_local_pane_only());
+        assert!(UiEvent::Sub(Box::new(UiEvent::Visible("x".to_string()))).is_local_pane_only());
+        assert!(!UiEvent::Visible("v".to_string()).is_local_pane_only());
+        assert!(!UiEvent::Dim("d".to_string()).is_local_pane_only());
+
+        // The mirror sites filter on that predicate, so a chatty sub-agent run
+        // cannot evict the real transcript from the bounded scrollback ring.
+        let bus = BroadcastBus::new();
+        let rx = bus.subscribe();
+        let stream = [
+            UiEvent::Visible("before".to_string()),
+            UiEvent::SubStart("agent".to_string()),
+            UiEvent::Sub(Box::new(UiEvent::Visible("noise".to_string()))),
+            UiEvent::SubEnd,
+            UiEvent::Visible("after".to_string()),
+        ];
+        for ev in stream {
+            if !ev.is_local_pane_only() {
+                bus.broadcast(ev);
+            }
+        }
+        let got: Vec<UiEvent> = rx.try_iter().map(|s| s.event).collect();
+        assert!(
+            matches!(got.as_slice(), [UiEvent::Visible(a), UiEvent::Visible(b)]
+                if a == "before" && b == "after"),
+            "unexpected events: {got:?}"
+        );
+        // And the ring a reconnecting client replays holds only those two.
+        assert_eq!(bus.scrollback_since(None).0.len(), 2);
     }
 
     #[test]

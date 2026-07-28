@@ -1342,7 +1342,11 @@ impl Agent<'_> {
         all
     }
 
-    /// Sends a sub-agent lifecycle event when the front end is listening.
+    /// Sends an event on the worker→UI channel when the front end is listening.
+    /// The channel is the same one the parent turn renders through, so an
+    /// ordinary variant (e.g. [`UiEvent::Dim`](crate::worker::UiEvent::Dim))
+    /// sent here lands in the main log *and* on the remote bus, while the
+    /// sub-agent variants stay local to the pane.
     fn emit_sub(&self, ev: crate::worker::UiEvent) {
         if let SubSinkTarget::Events(tx) = &self.sub_sink {
             let _ = tx.send(ev);
@@ -1383,6 +1387,12 @@ impl Agent<'_> {
         } else {
             name.to_string()
         };
+        // The signpost goes out as an ordinary dim line so it lands in the main
+        // transcript by the normal route — and therefore reaches remote clients
+        // too, which never see the pane-only `Sub*` variants.
+        self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagent_signpost(
+            &label,
+        )));
         self.emit_sub(crate::worker::UiEvent::SubStart(label));
         self.tool_ctx.subagent_depth += 1;
         let result = self.run_subagent_loop();
@@ -1412,6 +1422,34 @@ impl Agent<'_> {
     /// forever. Nested `agent` calls route through [`run_tool_calls`], so the
     /// [`SUBAGENT_DEPTH_CAP`](crate::tools::SUBAGENT_DEPTH_CAP) guard applies.
     fn run_subagent_loop(&mut self) -> Result<(), String> {
+        // The parent turn's status sink writes bare `SystemStatus` events into
+        // the MAIN log; leaving it installed would scatter the sub-agent's
+        // "Searching Google for …" notices across the parent transcript while
+        // its model text goes to the pane. Same treatment as the neighbouring
+        // `edit_previews` / `task_completions` / `hook_warnings`: keep them off
+        // the parent's screen — routed into the pane when there is one, dropped
+        // otherwise — and restore the parent's sink on every exit path.
+        let parent_sink = self.tool_ctx.status_sink.take();
+        self.tool_ctx.status_sink = match &self.sub_sink {
+            SubSinkTarget::Events(tx) => {
+                let tx = tx.clone();
+                Some(Box::new(move |msg: &str| {
+                    let _ = tx.send(crate::worker::UiEvent::Sub(Box::new(
+                        crate::worker::UiEvent::SystemStatus(msg.to_owned()),
+                    )));
+                }))
+            }
+            SubSinkTarget::Null | SubSinkTarget::Stdout => None,
+        };
+        let result = self.run_subagent_rounds();
+        self.tool_ctx.status_sink = parent_sink;
+        result
+    }
+
+    /// The bounded generate→dispatch rounds of a sub-agent sidechain; see
+    /// [`run_subagent_loop`](Self::run_subagent_loop), which owns the
+    /// status-sink swap around it.
+    fn run_subagent_rounds(&mut self) -> Result<(), String> {
         const MAX_ROUNDS: usize = 40;
         let turn_start = Instant::now();
         for _ in 0..MAX_ROUNDS {
@@ -3962,6 +4000,13 @@ impl Agent<'_> {
             // Same pane selection as the busy loop, hoisted out of the draw
             // closure: a Ctrl-O pressed while idle has to be visible here too.
             let sub_active = sub_pane.active;
+            // Owned so the draw closure does not hold a borrow of `sub_pane`
+            // alongside the mutable borrow of its view.
+            let sub_title: Option<String> = if sub_active {
+                sub_pane.label.clone()
+            } else {
+                None
+            };
             let idle_status = if let (true, Some(label)) = (sub_active, sub_pane.label.as_deref()) {
                 format!("[sub-agent: {label}] {status}")
             } else {
@@ -4000,6 +4045,7 @@ impl Agent<'_> {
                             draw_view,
                             selection,
                             &task_view,
+                            sub_title.as_deref(),
                         );
                     }
                     if let Some(p) = &input.popup {
@@ -4560,6 +4606,7 @@ impl Agent<'_> {
                         view,
                         None,
                         &tui::TaskView::default(),
+                        None,
                     );
                 });
                 self.dirty = false;
@@ -4916,7 +4963,9 @@ impl Agent<'_> {
             let worker = s.spawn(|| self.worker_turn(&tx, shared));
             loop {
                 while let Ok(ev) = rx.try_recv() {
-                    bus.broadcast(ev);
+                    if !ev.is_local_pane_only() {
+                        bus.broadcast(ev);
+                    }
                 }
                 if worker.is_finished() {
                     break;
@@ -4925,7 +4974,9 @@ impl Agent<'_> {
             }
             // Drain anything sent between the last poll and the worker returning.
             while let Ok(ev) = rx.try_recv() {
-                bus.broadcast(ev);
+                if !ev.is_local_pane_only() {
+                    bus.broadcast(ev);
+                }
             }
             worker
                 .join()
@@ -5673,6 +5724,11 @@ impl Agent<'_> {
                 // the old conversation and re-render what a launch shows.
                 log.clear();
                 *view = tui::OutputView::default();
+                // The pane belongs to the old session. Left alone it would keep
+                // an obsolete sub-agent transcript on offer under Ctrl-O — and,
+                // while it is the active pane, would swallow the cleared log and
+                // every later turn behind the still-displayed old output.
+                sub.reset();
                 self.tui_write_banner(log);
                 // Reinstate the warm prefix; without it the next turn silently
                 // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
@@ -5688,7 +5744,7 @@ impl Agent<'_> {
                     ))));
                     let (l, v) = (&*log, &mut *view);
                     let _ = terminal.draw(|f| {
-                        tui::draw(f, l, None, 0, "", v, None, &tui::TaskView::default());
+                        tui::draw(f, l, None, 0, "", v, None, &tui::TaskView::default(), None);
                     });
                 });
                 log.set_progress(None);
@@ -5772,6 +5828,8 @@ impl Agent<'_> {
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
+                    // Same reason as `/clear`: the pane is the old session's.
+                    sub.reset();
                     self.replay_history_into_log(log);
                     if let Some(note) = note {
                         log.push_dim(note);
@@ -5799,6 +5857,8 @@ impl Agent<'_> {
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
+                    // Same reason as `/clear`: the pane is the old session's.
+                    sub.reset();
                     self.replay_history_into_log(log);
                     if let Some(note) = note {
                         log.push_dim(note);
@@ -5933,7 +5993,17 @@ impl Agent<'_> {
                             let l = log.borrow();
                             let mut v = view.borrow_mut();
                             let _ = terminal.borrow_mut().draw(|f| {
-                                tui::draw(f, *l, None, 0, "", *v, None, &tui::TaskView::default());
+                                tui::draw(
+                                    f,
+                                    *l,
+                                    None,
+                                    0,
+                                    "",
+                                    *v,
+                                    None,
+                                    &tui::TaskView::default(),
+                                    None,
+                                );
                             });
                         }
                         // Nothing else is reading the keyboard while the
@@ -6001,7 +6071,7 @@ impl Agent<'_> {
                         None => "sub-agent".to_string(),
                     };
                     let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
-                    log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
+                    log.push_dim(tui::subagent_signpost(&label));
                     sub.begin(label);
                     sub.adopt_turn = true;
                     let outcome = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
@@ -6354,7 +6424,9 @@ fn busy_ui_loop(
         while let Ok(ev) = rx.try_recv() {
             // Mirror every worker event onto the remote bus so remote clients
             // see the same stream as the local TUI (issue #25, dual-path).
-            if let Some(bus) = bus {
+            if let Some(bus) = bus
+                && !ev.is_local_pane_only()
+            {
                 bus.broadcast(ev.clone());
             }
             match ev {
@@ -6394,11 +6466,11 @@ fn busy_ui_loop(
                     log.truncate_to(main_checkpoint);
                     view.follow = true;
                 }
-                UiEvent::SubStart(label) => {
-                    log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
-                    sub.begin(label);
-                }
-                UiEvent::SubEnd => sub.end(),
+                // The signpost line is emitted by the worker as an ordinary
+                // `Dim`, so it reaches remote clients too; these arms only
+                // move the pane's state (and stand aside for an adopted run).
+                UiEvent::SubStart(label) => sub.on_sub_start(label),
+                UiEvent::SubEnd => sub.on_sub_end(),
                 UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
                 // Route to the panel only while an answer is streaming; once
                 // it finishes the main task's output goes to the main log even
@@ -6424,6 +6496,8 @@ fn busy_ui_loop(
         // borrowed by the event drain, so taking the two disjoint field
         // borrows here keeps the closure's capture to just those references.
         let sub_active = sub.active;
+        // Owned for the same reason: `sub.view` is borrowed mutably below.
+        let sub_title: Option<String> = if sub_active { sub.label.clone() } else { None };
         let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
             (&sub.log, &mut sub.view)
         } else {
@@ -6455,6 +6529,7 @@ fn busy_ui_loop(
                         draw_view,
                         None,
                         &task_view,
+                        sub_title.as_deref(),
                     );
                 }
                 if let Some(p) = &input.popup {
@@ -6479,11 +6554,8 @@ fn busy_ui_loop(
                     UiEvent::BtwBegin => btw_active = true,
                     UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
-                    UiEvent::SubStart(label) => {
-                        log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
-                        sub.begin(label);
-                    }
-                    UiEvent::SubEnd => sub.end(),
+                    UiEvent::SubStart(label) => sub.on_sub_start(label),
+                    UiEvent::SubEnd => sub.on_sub_end(),
                     UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
                     ev => {
                         if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
@@ -9761,9 +9833,20 @@ mod tests {
         let out = agent.run_agent_tool(&call);
         assert!(!out.starts_with("Tool error"), "{out}");
         let got: Vec<crate::worker::UiEvent> = rx.try_iter().collect();
+        // The signpost is an ordinary `Dim` (so it reaches the main log and
+        // remote clients alike), immediately followed by the pane-only
+        // lifecycle event.
         assert!(
-            matches!(got.first(), Some(crate::worker::UiEvent::SubStart(_))),
-            "first event should be SubStart: {got:?}"
+            matches!(
+                got.first(),
+                Some(crate::worker::UiEvent::Dim(d))
+                    if d == &crate::tui::subagent_signpost("sub-agent")
+            ),
+            "first event should be the Dim signpost: {got:?}"
+        );
+        assert!(
+            matches!(got.get(1), Some(crate::worker::UiEvent::SubStart(_))),
+            "second event should be SubStart: {got:?}"
         );
         assert!(
             matches!(got.last(), Some(crate::worker::UiEvent::SubEnd)),

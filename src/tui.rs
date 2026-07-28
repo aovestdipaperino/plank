@@ -174,6 +174,36 @@ impl SubPane {
         self.running = false;
     }
 
+    /// Handles a `SubStart` from the worker. A nested `agent` tool call made by
+    /// the model *inside* a `/subagent` turn also emits `SubStart`; honouring it
+    /// would clear the outer run's output, steal its label, and (through the
+    /// matching `SubEnd`) mark the still-streaming outer run as finished. While
+    /// `adopt_turn` is set the outer run owns the pane, so the nested lifecycle
+    /// is ignored and its output simply continues into the same buffer.
+    pub fn on_sub_start(&mut self, label: String) {
+        if self.adopt_turn {
+            return;
+        }
+        self.begin(label);
+    }
+
+    /// Handles a `SubEnd` from the worker; the counterpart of
+    /// [`Self::on_sub_start`] and ignored for the same reason.
+    pub fn on_sub_end(&mut self) {
+        if self.adopt_turn {
+            return;
+        }
+        self.end();
+    }
+
+    /// Drops everything the pane holds. Used by the session-resetting commands
+    /// (`/clear`, `/new`, `/resume`, `/switch`): a pane left over from the old
+    /// session would keep drawing (and, while `active`, would swallow the newly
+    /// cleared main log) as if it belonged to the new one.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
     /// The log the user is currently looking at: this pane's while it is on
     /// screen, otherwise `main`. Single decision point for input routing, so a
     /// selection or hit test never reads the pane that is not displayed.
@@ -198,6 +228,14 @@ impl SubPane {
         self.active = !self.active;
         true
     }
+}
+
+/// The one-shot dim line pushed into the main transcript when a sub-agent run
+/// starts. Single source of the wording so the `/subagent` command, the model's
+/// `agent` tool, and anything replaying the transcript all say the same thing.
+#[must_use]
+pub fn subagent_signpost(label: &str) -> String {
+    format!("[sub-agent: {label} — ctrl+o to follow]")
 }
 
 #[derive(Debug, Default)]
@@ -1710,6 +1748,8 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
 /// line renders empty and the cursor stays hidden until input is accepted again.
 /// `view` is the scroll state; it is clamped in place to the scrollable range
 /// and a jump-to-bottom hint is shown while it is pinned above the bottom.
+/// `sub_label` names the sub-agent whose pane is being shown, adding the frame
+/// title and the `ctrl+o: back to main` hint; `None` draws the main transcript.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     frame: &mut Frame,
@@ -1720,6 +1760,7 @@ pub fn draw(
     view: &mut OutputView,
     selection: Option<ContentSelection>,
     tasks: &TaskView,
+    sub_label: Option<&str>,
 ) {
     let area = frame.area();
     let tw = input_text_width(area.width);
@@ -1732,6 +1773,11 @@ pub fn draw(
     );
 
     render_output(frame, output, log, view, selection);
+    // `Some` only while the sub-agent pane is the one on screen; the main
+    // transcript draws exactly as before.
+    if let Some(label) = sub_label {
+        draw_sub_header(frame, output, label);
+    }
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
     if let Some(input) = input {
@@ -1956,6 +2002,43 @@ pub fn draw_btw_split(
         .style(status_style),
         status_row,
     );
+}
+
+/// Overlays the sub-agent pane's identity on the output area's top row: the
+/// frame title `[sub-agent: <label>]` on the left and the `ctrl+o: back to
+/// main` hint on the right. Drawn as an overlay (like [`draw_jump_hint`])
+/// rather than as a bordered block so the output area keeps its geometry —
+/// scroll math and mouse hit-testing map screen rows to content rows directly,
+/// and a consumed border row would shift both by one. Persistent while the
+/// pane is on screen, so a user who has scrolled past the one-shot signpost
+/// can still see the way back.
+fn draw_sub_header(frame: &mut Frame, area: Rect, label: &str) {
+    const HINT: &str = " ctrl+o: back to main ";
+    if area.height == 0 {
+        return;
+    }
+    let title = format!(" [sub-agent: {label}] ");
+    let title_width = u16::try_from(title.chars().count()).unwrap_or(u16::MAX);
+    let bar = Style::default()
+        .bg(Color::Indexed(238))
+        .fg(Color::Indexed(252));
+    if area.width >= title_width {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                title,
+                bar.fg(THEME_GREEN).add_modifier(Modifier::BOLD),
+            )),
+            Rect::new(area.x, area.y, title_width, 1),
+        );
+    }
+    let hint_width = u16::try_from(HINT.chars().count()).unwrap_or(u16::MAX);
+    // Only when both fit side by side: a truncated hint reads as noise.
+    if area.width >= title_width.saturating_add(hint_width) {
+        frame.render_widget(
+            Paragraph::new(Span::styled(HINT, bar)),
+            Rect::new(area.right() - hint_width, area.y, hint_width, 1),
+        );
+    }
 }
 
 /// Overlays the jump-to-bottom affordance on the output area's bottom-right
@@ -2217,6 +2300,107 @@ mod tests {
         assert_eq!(pane.view.top, 0);
         assert!(pane.view.follow);
         assert_eq!(pane.log.line_count(), 0);
+    }
+
+    #[test]
+    fn sub_start_and_end_never_clobber_an_adopted_run() {
+        // A `/subagent` turn owns the pane (`adopt_turn`). The model inside it
+        // may still call the `agent` tool, which emits SubStart/SubEnd; those
+        // must not clear the buffer, steal the label, or mark the outer run
+        // finished while it is still streaming.
+        let mut pane = SubPane::default();
+        pane.begin("reviewer".to_string());
+        pane.adopt_turn = true;
+        pane.log.push_plain("outer /subagent output");
+        let before = pane.log.line_count();
+
+        pane.on_sub_start("nested".to_string());
+        assert_eq!(pane.label.as_deref(), Some("reviewer"), "label kept");
+        assert_eq!(pane.log.line_count(), before, "buffer not cleared");
+        assert!(pane.running, "outer run still running");
+
+        pane.log.push_plain("more outer output");
+        pane.on_sub_end();
+        assert!(pane.running, "inner SubEnd must not end the outer run");
+        assert_eq!(pane.log.line_count(), before + 1);
+
+        // Outside an adopted run the events do their normal work.
+        pane.adopt_turn = false;
+        pane.on_sub_start("nested".to_string());
+        assert_eq!(pane.label.as_deref(), Some("nested"));
+        assert_eq!(pane.log.line_count(), 0);
+        assert!(pane.running);
+        pane.on_sub_end();
+        assert!(!pane.running);
+    }
+
+    #[test]
+    fn sub_pane_header_shows_the_label_and_the_way_back() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        fn render(sub_label: Option<&str>) -> String {
+            let mut log = OutputLog::new();
+            log.push_plain("sub output");
+            let mut view = OutputView::default();
+            let mut term = Terminal::new(TestBackend::new(60, 8)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &log,
+                    Some(""),
+                    0,
+                    "idle",
+                    &mut view,
+                    None,
+                    &TaskView::default(),
+                    sub_label,
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let with = render(Some("research"));
+        assert!(with.contains("[sub-agent: research]"), "{with}");
+        assert!(with.contains("ctrl+o: back to main"), "{with}");
+
+        // The main transcript is untouched: no title, no hint, and the output
+        // text still starts on the very first row.
+        let without = render(None);
+        assert!(!without.contains("sub-agent"), "{without}");
+        assert!(!without.contains("ctrl+o"), "{without}");
+        assert!(without.starts_with("sub output"), "{without}");
+    }
+
+    #[test]
+    fn reset_drops_everything_the_old_session_left_behind() {
+        let mut pane = SubPane::default();
+        pane.begin("research".to_string());
+        pane.log.push_plain("old session output");
+        pane.adopt_turn = true;
+        assert!(pane.toggle());
+        assert!(pane.active);
+
+        pane.reset();
+        assert_eq!(pane.log.line_count(), 0);
+        assert!(pane.label.is_none());
+        assert!(
+            !pane.active,
+            "a hidden pane must not swallow the new session"
+        );
+        assert!(!pane.running);
+        assert!(!pane.adopt_turn);
+        // Nothing to switch to again, exactly as at launch.
+        assert!(!pane.toggle());
     }
 
     #[test]
@@ -2957,6 +3141,7 @@ mod tests {
                 &mut view,
                 None,
                 &TaskView::default(),
+                None,
             );
         })
         .unwrap();
@@ -3005,6 +3190,7 @@ mod tests {
                 &mut view,
                 None,
                 &TaskView::default(),
+                None,
             );
         })
         .unwrap();
@@ -3028,6 +3214,7 @@ mod tests {
                 &mut view,
                 None,
                 &TaskView::default(),
+                None,
             );
         })
         .unwrap();
@@ -3058,6 +3245,7 @@ mod tests {
                 &mut view,
                 None,
                 &TaskView::default(),
+                None,
             );
         })
         .unwrap();
