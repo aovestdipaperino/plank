@@ -53,6 +53,17 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The cache above can be evicted while rust-cache's target/ stays warm,
+      # which puts us right back in the broken state: the build script is
+      # considered up to date, so it never re-downloads. Force it to re-run by
+      # discarding just that crate's artifacts when the download is missing.
+      - name: Ensure pdfium is downloadable
+        run: |
+          if [ ! -d "$HOME/.cache/pdfium-rs" ]; then
+            echo "pdfium cache absent; forcing liteparse-pdfium-sys to rebuild"
+            cargo clean -p liteparse-pdfium-sys --release || true
+          fi
+
       - name: Build
         run: cargo build --release --verbose
 
