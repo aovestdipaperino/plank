@@ -13,7 +13,7 @@
 
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
-const CLOSE_MARKER_HEAD: &[u8] = "</｜".as_bytes();
+const CLOSE_MARKER_HEAD: &[u8] = "</".as_bytes();
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
 /// Marker names accepted inside a tag: `<｜NAME｜invoke ...>`.
@@ -30,26 +30,39 @@ const DSML_BAR: &[u8] = "｜".as_bytes();
 pub(crate) const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
 
 /// Matches an opening or closing tag prefix for `name` under any accepted
-/// marker, returning the matched length. All markers are the same width, so
-/// the length does not depend on which one matched.
+/// marker, returning the matched length.
+///
+/// Both the canonical `<｜NAME｜tag` and the dropped-leading-bar `<NAME｜tag`
+/// typo are accepted, mirroring the tolerance `dsml_start_match` has always
+/// had on the stanza opener. The two forms differ in length, so the matched
+/// length is taken from the form that actually matched.
 pub(crate) fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
     MARKER_NAMES.iter().find_map(|marker| {
-        let prefix = tag_prefix(marker, closing, name);
-        s.starts_with(prefix.as_bytes()).then_some(prefix.len())
+        tag_prefixes(marker, closing, name)
+            .into_iter()
+            .find(|prefix| s.starts_with(prefix.as_bytes()))
+            .map(|prefix| prefix.len())
     })
 }
 
 /// True when `s` is a (possibly incomplete) prefix of a tag opener for `name`
-/// under any accepted marker.
+/// under any accepted marker, in either the canonical or dropped-bar form.
 pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
-    MARKER_NAMES
-        .iter()
-        .any(|marker| tag_prefix(marker, closing, name).as_bytes().starts_with(s))
+    MARKER_NAMES.iter().any(|marker| {
+        tag_prefixes(marker, closing, name)
+            .iter()
+            .any(|prefix| prefix.as_bytes().starts_with(s))
+    })
 }
 
-fn tag_prefix(marker: &str, closing: bool, name: &str) -> String {
+/// The accepted spellings of a tag prefix: canonical first, then the
+/// dropped-leading-bar typo the model actually emits.
+fn tag_prefixes(marker: &str, closing: bool, name: &str) -> [String; 2] {
     let slash = if closing { "/" } else { "" };
-    format!("<{slash}｜{marker}｜{name}")
+    [
+        format!("<{slash}｜{marker}｜{name}"),
+        format!("<{slash}{marker}｜{name}"),
+    ]
 }
 
 /// Byte offset of the earliest complete tool-call stanza opening in `s`, if any.
@@ -683,5 +696,39 @@ mod tests {
         feed_all(&mut p, "trailing garbage <b>");
         assert_eq!(p.state(), DsmlState::Done);
         assert_eq!(p.calls().len(), 1);
+    }
+
+    // The model drops the leading fullwidth bar on inner tags (~35 recorded
+    // occurrences). The opener matcher already tolerates it; without the same
+    // tolerance here the stanza opens and dies on its first inner tag, and the
+    // model reads "unexpected DSML tag" as a claim that its `｜` was wrong.
+    #[test]
+    fn inner_tags_tolerate_the_dropped_leading_bar() {
+        let mut p = super::DsmlParser::new();
+        p.feed(
+            "<｜DSML｜tool_calls><DSML｜invoke name=\"bash\">\
+             <DSML｜parameter name=\"command\" string=\"true\">ls</DSML｜parameter｜>\
+             </DSML｜invoke｜></｜DSML｜tool_calls｜>"
+                .as_bytes(),
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
+        let calls = p.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arg_value("command"), Some("ls"));
+    }
+
+    // The canonical form must keep parsing identically.
+    #[test]
+    fn canonical_inner_tags_still_parse() {
+        let mut p = super::DsmlParser::new();
+        p.feed(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">\
+             <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter｜>\
+             </｜DSML｜invoke｜></｜DSML｜tool_calls｜>"
+                .as_bytes(),
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
+        assert_eq!(p.calls()[0].arg_value("command"), Some("ls"));
     }
 }
