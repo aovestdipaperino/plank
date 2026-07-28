@@ -139,6 +139,52 @@ fn annotate_code_blocks(
     regions
 }
 
+/// The sub-agent output pane: a second [`OutputLog`] holding the most recent
+/// sub-agent run, plus its own scroll state so switching panes does not disturb
+/// the main transcript's position. Retention is last-run-only — [`Self::begin`]
+/// clears the buffer — and a finished run stays readable until the next one.
+#[derive(Debug, Default)]
+pub struct SubPane {
+    /// The sub-agent's rendered output.
+    pub log: OutputLog,
+    /// Scroll/follow state for `log`, independent of the main pane's.
+    pub view: OutputView,
+    /// Display label of the most recent run; `None` before any run.
+    pub label: Option<String>,
+    /// Whether a sub-agent is running right now.
+    pub running: bool,
+    /// Whether the pane is the one currently on screen.
+    pub active: bool,
+    /// Set while a `/subagent` turn is in flight: the turn's own render events
+    /// are applied to `log` instead of the main transcript.
+    pub adopt_turn: bool,
+}
+
+impl SubPane {
+    /// Starts a run: clears the buffer and records the label.
+    pub fn begin(&mut self, label: String) {
+        self.log = OutputLog::new();
+        self.view = OutputView::default();
+        self.label = Some(label);
+        self.running = true;
+    }
+
+    /// Ends a run, leaving the buffer readable.
+    pub fn end(&mut self) {
+        self.running = false;
+    }
+
+    /// Flips which pane is on screen. Returns `false` (changing nothing) when
+    /// no sub-agent has ever run, so there is nothing to switch to.
+    pub fn toggle(&mut self) -> bool {
+        if self.label.is_none() {
+            return false;
+        }
+        self.active = !self.active;
+        true
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct OutputLog {
     lines: Vec<Line<'static>>,
@@ -2107,7 +2153,39 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
 
 #[cfg(test)]
 mod tests {
+    use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn sub_pane_begin_clears_the_buffer_and_toggle_needs_a_run() {
+        let mut pane = SubPane::default();
+        // Nothing has run yet: there is nothing to switch to.
+        assert!(!pane.toggle());
+        assert!(!pane.active);
+
+        pane.begin("research".to_string());
+        assert_eq!(pane.label.as_deref(), Some("research"));
+        assert!(pane.running);
+        pane.log.push_plain("first run output");
+        let after_first = pane.log.line_count();
+        assert!(after_first > 0);
+
+        // Now it is followable, and toggling is reversible.
+        assert!(pane.toggle());
+        assert!(pane.active);
+        assert!(pane.toggle());
+        assert!(!pane.active);
+
+        pane.end();
+        assert!(!pane.running);
+        // The finished run stays readable.
+        assert_eq!(pane.log.line_count(), after_first);
+
+        // A second run starts from an empty buffer (last-run-only retention).
+        pane.begin("other".to_string());
+        assert_eq!(pane.log.line_count(), 0);
+        assert_eq!(pane.label.as_deref(), Some("other"));
+    }
 
     /// Issue #72: `/clear` and `/new` must wipe the TUI scrollback, including
     /// an unfinished streaming line, a pinned progress line, and the code-block

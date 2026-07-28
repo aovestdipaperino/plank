@@ -2335,6 +2335,7 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
     ) {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
@@ -2362,7 +2363,7 @@ impl Agent<'_> {
 
         log.push_spans(tui::user_echo_spans(prompt));
         self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
+        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
             log.push_plain(format!("/init failed: {e}"));
         }
     }
@@ -3877,6 +3878,10 @@ impl Agent<'_> {
         self.replay_history_into_log(&mut log);
 
         let mut view = tui::OutputView::default();
+        // The sub-agent output pane, owned here for the same reason as the
+        // `/btw` panel: a finished sub-agent run stays readable after the turn
+        // that produced it returns to this idle loop.
+        let mut sub_pane = tui::SubPane::default();
         // The `/btw` side panel, owned here so it outlives any single turn:
         // once opened it stays until the user presses Esc, even after the main
         // task finishes and control returns to this idle loop.
@@ -3906,6 +3911,7 @@ impl Agent<'_> {
                 &mut input,
                 &mut btw_panel,
                 &mut arcade,
+                &mut sub_pane,
             )?;
             // `--prompt` runs before the loop is ever idle: restart the clock
             // so the screensaver waits out a full idle stretch afterwards.
@@ -3953,31 +3959,45 @@ impl Agent<'_> {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
             let task_view = tui::TaskView::from(&self.session.tasks);
+            // Same pane selection as the busy loop, hoisted out of the draw
+            // closure: a Ctrl-O pressed while idle has to be visible here too.
+            let sub_active = sub_pane.active;
+            let idle_status = if let (true, Some(label)) = (sub_active, sub_pane.label.as_deref()) {
+                format!("[sub-agent: {label}] {status}")
+            } else {
+                status
+            };
+            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
+                (&sub_pane.log, &mut sub_pane.view)
+            } else {
+                (&log, &mut view)
+            };
             let completed = terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
                     // split view even while idle; text selection falls back to
-                    // the single-column path (no panel).
-                    if let Some((btw_log, btw_view)) = btw_panel.as_mut() {
+                    // the single-column path (no panel). The sub-agent pane
+                    // takes precedence: the split is about the main task.
+                    if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {
                         tui::draw_btw_split(
                             f,
-                            &log,
+                            draw_log,
                             btw_log,
                             btw_view,
                             Some(input.buf.text()),
                             input.cursor_char(),
-                            &status,
-                            &mut view,
+                            &idle_status,
+                            draw_view,
                             &task_view,
                         );
                     } else {
                         tui::draw(
                             f,
-                            &log,
+                            draw_log,
                             Some(input.buf.text()),
                             input.cursor_char(),
-                            &status,
-                            &mut view,
+                            &idle_status,
+                            draw_view,
                             selection,
                             &task_view,
                         );
@@ -4047,6 +4067,7 @@ impl Agent<'_> {
                                 &mut btw_panel,
                                 &mut config_form,
                                 &mut arcade,
+                                &mut sub_pane,
                             ) {
                                 input.history.save(&hist_path).ok();
                                 remote_abandon(rem);
@@ -4067,6 +4088,7 @@ impl Agent<'_> {
                             &mut input,
                             &mut btw_panel,
                             &mut arcade,
+                            &mut sub_pane,
                         )?;
                         // A remote-driven turn is time the user was not idle
                         // at the prompt: start the screensaver clock from the
@@ -4265,6 +4287,13 @@ impl Agent<'_> {
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
+                // Ctrl-O switches between the main transcript and the most
+                // recent sub-agent's output, while idle as well as mid-turn.
+                KeyCode::Char('o') if ctrl => {
+                    if !sub_pane.toggle() {
+                        log.push_dim("[no sub-agent has run yet]");
+                    }
+                }
                 KeyCode::Char('c') if ctrl => {
                     if !input.buf.text().is_empty() {
                         input.buf.clear();
@@ -4399,6 +4428,7 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut config_form,
                             &mut arcade,
+                            &mut sub_pane,
                         ) {
                             break;
                         }
@@ -4429,6 +4459,7 @@ impl Agent<'_> {
                             &mut input,
                             &mut btw_panel,
                             &mut arcade,
+                            &mut sub_pane,
                         )?;
                     }
                 }
@@ -4748,6 +4779,7 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
     ) -> Result<(), String> {
         // The first iteration runs the main turn; later iterations run either
         // a follow-up turn (leftover queued user lines) or a btw-only drain
@@ -4793,6 +4825,7 @@ impl Agent<'_> {
                     input,
                     btw,
                     arcade,
+                    sub,
                     shared,
                     bus_ref,
                     rem,
@@ -4808,6 +4841,7 @@ impl Agent<'_> {
                     input,
                     btw,
                     arcade,
+                    sub,
                     shared,
                     bus_ref,
                     rem,
@@ -5537,6 +5571,7 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
     ) -> Result<(), String> {
         let remote = self.remote.clone();
         let bus = remote.as_ref().map(|r| Arc::clone(&r.bus));
@@ -5551,6 +5586,7 @@ impl Agent<'_> {
             input,
             btw,
             arcade,
+            sub,
             &shared,
             bus.as_deref(),
             ui_remote.as_deref(),
@@ -5575,6 +5611,7 @@ impl Agent<'_> {
         btw: &mut BtwPanel,
         config_form: &mut Option<crate::configform::ConfigForm>,
         arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
     ) -> bool {
         let mut parts = line.splitn(2, char::is_whitespace);
         let cmd = parts.next().unwrap_or(line);
@@ -5679,7 +5716,7 @@ impl Agent<'_> {
             "/mcp" => log.push_ansi(&render_mcp_report(&self.tool_ctx.mcp, true)),
             "/context" => log.push_ansi(&self.render_context_report(true)),
             "/usage" => log.push_ansi(&self.render_usage_report(true)),
-            "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade),
+            "/init" => self.tui_run_init(log, terminal, view, input, btw, arcade, sub),
             "/compact" => {
                 let result = {
                     let mut note = |s: String| log.push_dim(s);
@@ -5839,7 +5876,9 @@ impl Agent<'_> {
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
-                } else if let Err(e) = self.tui_btw(arg, log, terminal, view, input, btw, arcade) {
+                } else if let Err(e) =
+                    self.tui_btw(arg, log, terminal, view, input, btw, arcade, sub)
+                {
                     log.push_plain(format!("/btw failed: {e}"));
                 }
             }
@@ -5940,7 +5979,7 @@ impl Agent<'_> {
                 } else {
                     log.push_dim(started);
                     let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
-                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
                         log.push_plain(format!("/subagent failed: {e}"));
@@ -5958,7 +5997,7 @@ impl Agent<'_> {
                 Some(Ok(message)) => {
                     log.push_spans(tui::user_echo_spans(line));
                     self.session.push(Message::user(message));
-                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade) {
+                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
                         log.push_plain(format!("{cmd} failed: {e}"));
                     }
                 }
@@ -6145,6 +6184,7 @@ fn run_worker_ui<T: Send>(
     input: &mut TuiInput,
     btw: &mut BtwPanel,
     arcade: &mut crate::arcade::Arcade,
+    sub: &mut tui::SubPane,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
     remote: Option<&Mutex<UiRemote>>,
@@ -6162,6 +6202,7 @@ fn run_worker_ui<T: Send>(
             input,
             btw,
             arcade,
+            sub,
             &rx,
             shared,
             bus,
@@ -6217,6 +6258,7 @@ fn busy_ui_loop(
     input: &mut TuiInput,
     btw: &mut BtwPanel,
     arcade: &mut crate::arcade::Arcade,
+    sub: &mut tui::SubPane,
     rx: &Receiver<UiEvent>,
     shared: &TurnShared,
     bus: Option<&BroadcastBus>,
@@ -6296,6 +6338,12 @@ fn busy_ui_loop(
                     log.set_progress(
                         status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
                     );
+                    // While the sub-agent pane is on screen the status line
+                    // must say so, or the user cannot tell which transcript
+                    // they are reading.
+                    if let (true, Some(label)) = (sub.active, sub.label.as_deref()) {
+                        status_line = format!("[sub-agent: {label}] {status_line}");
+                    }
                 }
                 UiEvent::Tasks(tv) => task_view = tv,
                 UiEvent::BtwBegin => {
@@ -6321,9 +6369,17 @@ fn busy_ui_loop(
                 // Route to the panel only while an answer is streaming; once
                 // it finishes the main task's output goes to the main log even
                 // though the (frozen) panel is still visible.
+                UiEvent::SubStart(label) => {
+                    log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
+                    sub.begin(label);
+                }
+                UiEvent::SubEnd => sub.end(),
+                UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
                 ev => {
                     if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                         worker::apply(btw_log, ev);
+                    } else if sub.adopt_turn {
+                        worker::apply(&mut sub.log, ev);
                     } else {
                         worker::apply(log, ev);
                     }
@@ -6336,28 +6392,39 @@ fn busy_ui_loop(
         let finished = done();
         remote_drain(remote);
         input.pump_popup();
+        // Pane selection is hoisted out of the draw closure: `sub` is also
+        // borrowed by the event drain, so taking the two disjoint field
+        // borrows here keeps the closure's capture to just those references.
+        let sub_active = sub.active;
+        let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
+            (&sub.log, &mut sub.view)
+        } else {
+            (log, view)
+        };
         terminal
             .draw(|f| {
-                if let Some((btw_log, btw_view)) = btw.as_mut() {
+                // The `/btw` split is about the main task, so it steps aside
+                // while the sub-agent pane is the one being followed.
+                if let (false, Some((btw_log, btw_view))) = (sub_active, btw.as_mut()) {
                     tui::draw_btw_split(
                         f,
-                        log,
+                        draw_log,
                         btw_log,
                         btw_view,
                         Some(input.buf.text()),
                         input.cursor_char(),
                         &status_line,
-                        view,
+                        draw_view,
                         &task_view,
                     );
                 } else {
                     tui::draw(
                         f,
-                        log,
+                        draw_log,
                         Some(input.buf.text()),
                         input.cursor_char(),
                         &status_line,
-                        view,
+                        draw_view,
                         None,
                         &task_view,
                     );
@@ -6384,9 +6451,17 @@ fn busy_ui_loop(
                     UiEvent::BtwBegin => btw_active = true,
                     UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
+                    UiEvent::SubStart(label) => {
+                        log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
+                        sub.begin(label);
+                    }
+                    UiEvent::SubEnd => sub.end(),
+                    UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
                     ev => {
                         if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                             worker::apply(btw_log, ev);
+                        } else if sub.adopt_turn {
+                            worker::apply(&mut sub.log, ev);
                         } else {
                             worker::apply(log, ev);
                         }
@@ -6443,6 +6518,13 @@ fn busy_ui_loop(
                 // Backspace/Delete into word-wise operations.
                 let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
+                    // Ctrl-O switches between the main transcript and the
+                    // sub-agent pane; mid-turn is exactly when it matters.
+                    KeyCode::Char('o') if ctrl => {
+                        if !sub.toggle() {
+                            log.push_dim("[no sub-agent has run yet]");
+                        }
+                    }
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
                     }
