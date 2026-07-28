@@ -285,6 +285,75 @@ impl MarkerDetector {
     }
 }
 
+/// Generic tool-call wrappers models fall back to when a tool name is
+/// unfamiliar. Matched regardless of the configured tool list.
+const GENERIC_PSEUDO_OPENERS: [&str; 3] = ["<tool_call>", "<function_call>", "<invoke "];
+
+/// Detects invented, non-DSML tool-call markup: a bare `<name>` opening a line
+/// where `name` is a registered tool, or one of the generic wrappers above.
+///
+/// Anchored at line start (the tail resets on newline) so prose mentioning
+/// `<task>` mid-sentence never matches, and disarmed inside fenced code
+/// blocks, where the model is showing markup rather than emitting it. The
+/// caller gates on `!in_think`, so only the answer region is watched.
+#[derive(Debug, Default)]
+struct PseudoToolDetector {
+    /// Bytes since the last newline, capped.
+    line: Vec<u8>,
+    /// Inside a ``` fenced block, where markup is shown rather than called.
+    in_fence: bool,
+    /// Names of tools that are actually registered this session.
+    tool_names: Vec<String>,
+    /// One report per stream is enough; the turn ends after it.
+    fired: bool,
+}
+
+impl PseudoToolDetector {
+    const CAP: usize = 96;
+
+    fn set_tool_names(&mut self, names: Vec<String>) {
+        self.tool_names = names;
+    }
+
+    /// Feeds one byte; returns the matched opener when this byte completes a
+    /// pseudo-tool-call opening.
+    fn feed(&mut self, c: u8) -> Option<String> {
+        if c == b'\n' {
+            if self.line.starts_with(b"```") {
+                self.in_fence = !self.in_fence;
+            }
+            self.line.clear();
+            return None;
+        }
+        if self.line.len() < Self::CAP {
+            self.line.push(c);
+        }
+        if self.fired || self.in_fence {
+            return None;
+        }
+        // Only a tag opening the line counts; leading whitespace is allowed.
+        let trimmed = self.line.trim_ascii_start();
+        if !trimmed.starts_with(b"<") {
+            return None;
+        }
+        let text = std::str::from_utf8(trimmed).ok()?;
+        for opener in GENERIC_PSEUDO_OPENERS {
+            if text == opener {
+                self.fired = true;
+                return Some(opener.trim_end().to_string());
+            }
+        }
+        for name in &self.tool_names {
+            let tag = format!("<{name}>");
+            if text == tag {
+                self.fired = true;
+                return Some(tag);
+            }
+        }
+        None
+    }
+}
+
 /// Scanner state mirroring the DSML parser for display purposes only.
 #[derive(Debug, Default)]
 enum DsmlScan {
@@ -396,6 +465,8 @@ pub struct StreamRenderer<S> {
     dsml_start_tail: Vec<u8>,
     plain_dsml: MarkerDetector,
     think_dsml: MarkerDetector,
+    /// Detects invented pseudo-tool markup (issue #51) in the answer region.
+    pseudo_tool: PseudoToolDetector,
     dsml_in_think: bool,
     dsml_in_think_reported: bool,
     /// A tool call was discarded *because* it sat inside `<think>`.
@@ -471,6 +542,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             dsml_start_tail: Vec::new(),
             plain_dsml: MarkerDetector::default(),
             think_dsml: MarkerDetector::default(),
+            pseudo_tool: PseudoToolDetector::default(),
             dsml_in_think: false,
             dsml_in_think_reported: false,
             in_think_rejected: false,
@@ -486,6 +558,15 @@ impl<S: RenderSink> StreamRenderer<S> {
             show_thinking: true,
             thinking_tool_calls: false,
         }
+    }
+
+    /// Sets the tool names the pseudo-tool detector recognizes (default none).
+    ///
+    /// Production wires this from the live registry; with an empty list only
+    /// the generic wrappers (`<tool_call>`, `<function_call>`, `<invoke `) are
+    /// matched, which is what unit tests and echo paths get.
+    pub fn set_tool_names(&mut self, names: Vec<String>) {
+        self.pseudo_tool.set_tool_names(names);
     }
 
     /// Sets whether tool-call visualization is shown (default true). Production
@@ -1218,6 +1299,12 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.viz_error_puts(&line);
     }
 
+    fn pseudo_tool_call(&mut self, opener: &str) {
+        self.malformed_dsml(&format!(
+            "{opener} is not a tool call; tools are invoked with the DSML syntax in the system prompt"
+        ));
+    }
+
     fn output_frozen(&self) -> bool {
         self.stream_error.is_some() || self.parser.state() == DsmlState::Error
     }
@@ -1240,6 +1327,19 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
     }
 
+    fn note_pseudo_tool_byte(&mut self, c: u8) {
+        // Deliberately NOT gated on `dsml_in_think`: that flag is sticky for
+        // the whole stream, so a generation in which the model tried DSML
+        // inside <think> and then fell back to `<task>` XML in its answer —
+        // the exact issue #51 scenario — would go unreported.
+        if self.output_frozen() || self.dsml_active || self.in_think {
+            return;
+        }
+        if let Some(opener) = self.pseudo_tool.feed(c) {
+            self.pseudo_tool_call(&opener);
+        }
+    }
+
     fn flush_start_tail(&mut self) {
         if self.dsml_start_tail.is_empty() {
             return;
@@ -1249,6 +1349,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         for b in held {
             self.write_char(b);
             self.note_plain_dsml_byte(b);
+            self.note_pseudo_tool_byte(b);
             if self.output_frozen() {
                 break;
             }
@@ -1297,6 +1398,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 for &b in &held[..held.len() - 1] {
                     self.write_char(b);
                     self.note_plain_dsml_byte(b);
+                    self.note_pseudo_tool_byte(b);
                     if self.output_frozen() {
                         return;
                     }
@@ -1311,6 +1413,7 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.post_think_gap = false;
         self.write_char(c);
         self.note_plain_dsml_byte(c);
+        self.note_pseudo_tool_byte(c);
     }
 
     /// The single streaming display state machine for assistant output.
@@ -1416,6 +1519,73 @@ mod tests {
         sr.push(text);
         sr.finish();
         sr
+    }
+
+    fn pseudo_tool_renderer() -> StreamRenderer<Cap> {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_tool_names(vec!["task".to_string(), "read".to_string()]);
+        sr
+    }
+
+    // Issue #51: the model invents <task> XML for tools it was not trained on.
+    // Nothing recognized it, so the turn ended with no tool call and no error and
+    // the model retried forever.
+    #[test]
+    fn pseudo_tool_block_after_think_is_reported() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<think>planning</think>");
+        sr.push("<task>\ntask_context: \"add headers\"\n</task>");
+        sr.finish();
+        assert!(
+            sr.finished().error.is_some(),
+            "hallucinated call produced no error for the model to correct from"
+        );
+    }
+
+    // While thinking, the model muses about markup; firing there would punish it
+    // for reasoning. Only the answer region counts.
+    #[test]
+    fn pseudo_tool_block_inside_think_is_ignored() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<think>maybe I should write <task> here</think>");
+        sr.push("done");
+        sr.finish();
+        assert!(sr.finished().error.is_none());
+    }
+
+    // Discussing the markup in prose or code is not attempting to call it.
+    #[test]
+    fn pseudo_tool_name_in_prose_or_fence_is_ignored() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("the <task> element is XML, not DSML\n");
+        sr.push("```xml\n<task>\n</task>\n```\n");
+        sr.finish();
+        assert!(sr.finished().error.is_none());
+    }
+
+    // Generic wrappers are matched with no tool list configured at all.
+    #[test]
+    fn generic_tool_call_wrapper_is_reported() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<tool_call>\n{\"name\": \"read\"}\n</tool_call>");
+        sr.finish();
+        assert!(sr.finished().error.is_some());
+    }
+
+    // A real DSML call must never be mistaken for a hallucination.
+    #[test]
+    fn real_dsml_call_is_untouched_by_the_pseudo_detector() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">\
+             <｜DSML｜parameter name=\"path\" string=\"true\">/tmp/x</｜DSML｜parameter｜>\
+             </｜DSML｜invoke｜></｜DSML｜tool_calls｜>",
+        );
+        sr.finish();
+        let fin = sr.finished();
+        assert!(fin.error.is_none(), "error: {:?}", fin.error);
+        assert_eq!(fin.calls.len(), 1);
+        assert_eq!(fin.calls[0].name, "read");
     }
 
     #[test]
