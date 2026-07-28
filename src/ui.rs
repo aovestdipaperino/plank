@@ -463,6 +463,22 @@ impl RenderSink for NullSink {
     fn think_text(&mut self, _text: &str) {}
 }
 
+/// Where a headless sub-agent's rendered output goes. Sub-agents run
+/// synchronously inside a turn, so this is set by whichever front end can
+/// display the result: the TUI routes it over the worker→UI channel, the plain
+/// REPL prints it inline, and the `--non-interactive` protocol path discards it
+/// (its stdout carries a machine protocol that model text would corrupt).
+#[derive(Debug, Default)]
+pub enum SubSinkTarget {
+    /// Discard sub-agent output (the default, and the non-interactive path).
+    #[default]
+    Null,
+    /// Forward over the worker→UI channel as [`crate::worker::UiEvent::Sub`].
+    Events(std::sync::mpsc::Sender<crate::worker::UiEvent>),
+    /// Print inline on stdout (the plain REPL).
+    Stdout,
+}
+
 /// Why a generation pass failed, which decides how it is worded to the model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassError {
@@ -947,6 +963,8 @@ struct Agent<'a> {
     /// When the current session began (process start, or the last `/clear`,
     /// `/resume`, or `/switch`), for the end-of-session duration.
     session_start: std::time::Instant,
+    /// Destination for headless sub-agent output; see [`SubSinkTarget`].
+    sub_sink: SubSinkTarget,
 }
 
 /// Formats a non-negative token count with thousands separators (`12345` →
@@ -1324,6 +1342,13 @@ impl Agent<'_> {
         all
     }
 
+    /// Sends a sub-agent lifecycle event when the front end is listening.
+    fn emit_sub(&self, ev: crate::worker::UiEvent) {
+        if let SubSinkTarget::Events(tx) = &self.sub_sink {
+            let _ = tx.send(ev);
+        }
+    }
+
     /// Runs the model-invocable `agent` tool: delegates `task` to a fresh scoped
     /// sub-agent (a sidechain fork of the live transcript) and returns only its
     /// final report as the tool observation (issue #50). The sidechain shares
@@ -1353,9 +1378,16 @@ impl Agent<'_> {
             }
         };
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+        let label = if name.is_empty() {
+            "sub-agent".to_string()
+        } else {
+            name.to_string()
+        };
+        self.emit_sub(crate::worker::UiEvent::SubStart(label));
         self.tool_ctx.subagent_depth += 1;
         let result = self.run_subagent_loop();
         self.tool_ctx.subagent_depth -= 1;
+        self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
         let report = self.session.transcript[fork_at..]
             .iter()
@@ -1419,7 +1451,21 @@ impl Agent<'_> {
         prompt_text: &str,
         _turn_start: Instant,
     ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
-        let mut stream = StreamRenderer::new(NullSink);
+        let sink: Box<dyn crate::viz::RenderSink> = match &self.sub_sink {
+            SubSinkTarget::Null => Box::new(NullSink),
+            SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
+            SubSinkTarget::Stdout => Box::new(TerminalSink {
+                renderer: TokenRenderer::new(
+                    FlushingStdout,
+                    RenderOptions {
+                        use_color: self.color,
+                        format_thinking: true,
+                        format_markdown: true,
+                    },
+                ),
+            }),
+        };
+        let mut stream = StreamRenderer::new(sink);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         if !matches!(
@@ -1505,6 +1551,9 @@ impl Agent<'_> {
 
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn run_turn(&mut self) -> Result<(), String> {
+        // Plain REPL: a headless sub-agent's output has nowhere else to go, so
+        // print it inline on stdout alongside the parent turn's own stream.
+        self.sub_sink = SubSinkTarget::Stdout;
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
@@ -4897,6 +4946,9 @@ impl Agent<'_> {
     /// Runs on the worker thread and talks to the UI only through `tx`.
     #[allow(clippy::too_many_lines)] // flat generate→tools loop; splitting hurts readability
     fn worker_turn(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) -> Result<(), String> {
+        // TUI: a headless sub-agent's output is forwarded over the same
+        // worker→UI channel as the parent turn's own render events.
+        self.sub_sink = SubSinkTarget::Events(tx.clone());
         crate::title::set(crate::title::State::Busy(self.last_user_prompt()));
         self.last_turn_interrupted = false;
         self.tool_ctx.skill_invocations = 0;
@@ -6678,6 +6730,7 @@ fn new_agent(
         usage: SessionUsage::default(),
         stats: SessionStats::default(),
         session_start: std::time::Instant::now(),
+        sub_sink: SubSinkTarget::default(),
     })
 }
 
@@ -7542,6 +7595,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         }
     }
 
@@ -8939,6 +8993,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -8988,6 +9043,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
 
         // Empty state: no provider turn recorded yet.
@@ -9102,6 +9158,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9270,6 +9327,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9343,6 +9401,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9403,6 +9462,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9486,6 +9546,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -9522,6 +9583,46 @@ mod tests {
         // Stripping again still succeeds, like the C's rewrite.
         assert!(agent.strip_session(&id[..8]).is_ok());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_tool_streams_its_sub_agent_output_to_the_event_sink() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-agenttool-sink-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec!["hi there\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let call = ToolCall {
+            name: "agent".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "task".to_string(),
+                value: "say hi".to_string(),
+                is_string: true,
+            }],
+        };
+        let out = agent.run_agent_tool(&call);
+        assert!(!out.starts_with("Tool error"), "{out}");
+        let got: Vec<crate::worker::UiEvent> = rx.try_iter().collect();
+        assert!(
+            matches!(got.first(), Some(crate::worker::UiEvent::SubStart(_))),
+            "first event should be SubStart: {got:?}"
+        );
+        assert!(
+            matches!(got.last(), Some(crate::worker::UiEvent::SubEnd)),
+            "last event should be SubEnd: {got:?}"
+        );
+        assert!(
+            got.iter()
+                .any(|e| matches!(e, crate::worker::UiEvent::Sub(_))),
+            "no sub-agent render output was forwarded: {got:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9583,6 +9684,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -9660,6 +9762,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -9736,6 +9839,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -9794,6 +9898,7 @@ mod tests {
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
+            sub_sink: SubSinkTarget::default(),
         };
         agent.session.push(Message::user("run echo"));
 

@@ -85,6 +85,21 @@ pub trait RenderSink {
     }
 }
 
+impl RenderSink for Box<dyn RenderSink> {
+    fn visible_text(&mut self, text: &str) {
+        (**self).visible_text(text);
+    }
+    fn think_text(&mut self, text: &str) {
+        (**self).think_text(text);
+    }
+    fn tool_text(&mut self, text: &str) {
+        (**self).tool_text(text);
+    }
+    fn error_text(&mut self, text: &str) {
+        (**self).error_text(text);
+    }
+}
+
 /// Kind of tool parameter, used to select the streaming display style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ParamKind {
