@@ -348,6 +348,11 @@ impl AgentConfig {
         if let Some(ctx) = s.engine.ctx {
             c.generation.ctx_size = ctx;
         }
+        // Forward recovery from an in-think tool call only pays where such a
+        // call is otherwise wasted. With `thinkingToolCalls` on the stanza is
+        // dispatched as-is, so there is nothing to recover from and forcing a
+        // `</think>` would only cut reasoning short.
+        c.generation.think_tool_recovery = !s.engine.thinking_tool_calls;
         c.sandbox_override = s.safety.sandbox;
         if let Some(b) = s.safety.btw_suspend {
             c.btw.suspend = b;

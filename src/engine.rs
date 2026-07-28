@@ -38,6 +38,14 @@ pub struct GenerationOptions {
     pub seed: u64,
     /// Reasoning mode.
     pub think_mode: ThinkMode,
+    /// Recover from a tool call the model starts inside an unclosed `<think>`
+    /// by force-feeding `</think>` and letting it continue (the C server's
+    /// `chat_think_tool_recovery`).
+    ///
+    /// Off by default because it only makes sense where an in-think stanza is
+    /// otherwise wasted: the caller enables it when in-think tool calls are
+    /// prohibited, and leaves it off when they are dispatched as-is.
+    pub think_tool_recovery: bool,
 }
 
 impl Default for GenerationOptions {
@@ -50,6 +58,7 @@ impl Default for GenerationOptions {
             min_p: 0.0,
             seed: 0,
             think_mode: ThinkMode::Auto,
+            think_tool_recovery: false,
         }
     }
 }
@@ -516,6 +525,104 @@ pub trait Engine: Debug + Send {
     }
 }
 
+/// Text force-fed to close an unclosed `<think>` before the model retries a
+/// tool call. Matches the C server's injection byte for byte.
+pub const THINK_RECOVERY_TEXT: &str = "</think>\n\n";
+
+/// Decides when a generation loop should force-close an unclosed `<think>`
+/// because the model started a tool call inside it.
+///
+/// Port of the policy half of `chat_think_tool_recovery`. Waiting for a
+/// `</think>` that never comes stalls the turn: the stanza is never scanned as
+/// executable and gets dropped at parse time. Rather than rewrite sampled
+/// context, recover *forward* — feed `</think>` plus a blank line and let the
+/// model continue. Measured on the real model, that position predicts a fresh
+/// stanza opening so strongly that the call restarts cleanly on the executable
+/// side of the close. Re-emitting the stanza opening as well is
+/// counterproductive: with the dangling opening right before the close and a
+/// forced copy right after it, the model reads the call as already made and
+/// ends the turn. The dangling opening stays harmlessly inside reasoning.
+///
+/// The caller owns the actual injection (tokenizing and evaluating
+/// [`THINK_RECOVERY_TEXT`], and checking it has the budget to do so); this type
+/// only tracks think state and answers [`should_recover`](Self::should_recover).
+#[derive(Debug)]
+pub struct ThinkToolRecovery {
+    inside: bool,
+    /// Offset into the accumulated text where the next scan starts. Held back
+    /// by [`crate::dsml::TOOL_START_SCAN_HOLD`] so an opening split across
+    /// future tokens is still seen from its first byte.
+    scan_from: usize,
+}
+
+impl ThinkToolRecovery {
+    /// Starts a tracker. `inside` is whether the prompt's assistant prefix
+    /// already opened a thinking block.
+    #[must_use]
+    pub fn new(inside: bool) -> Self {
+        Self {
+            inside,
+            scan_from: 0,
+        }
+    }
+
+    /// True when the model is currently inside an unclosed `<think>`.
+    #[must_use]
+    pub fn inside_think(&self) -> bool {
+        self.inside
+    }
+
+    /// Re-examines the accumulated reply and reports whether to inject now.
+    ///
+    /// Call after every decoded token with the whole reply so far; detection
+    /// works on accumulated text, so the marker's tokenization does not matter.
+    /// A lone `<` or a partial marker leaves decoding untouched.
+    pub fn should_recover(&mut self, text: &str) -> bool {
+        // `</think>` anywhere in the reply ends the block, including one the
+        // model closed on its own after we decided to wait.
+        if self.inside && text.contains("</think>") {
+            self.inside = false;
+        } else if !self.inside && text.contains("<think>") {
+            // A block reopened after a close (or opened mid-reply under
+            // ThinkMode::Auto) counts again.
+            self.inside = !text
+                .rsplit("<think>")
+                .next()
+                .unwrap_or("")
+                .contains("</think>");
+        }
+        if !self.inside {
+            return false;
+        }
+        let scan_from = self.scan_from.min(text.len());
+        // Never split a UTF-8 character: the markers are multi-byte.
+        let scan_from = (0..=scan_from)
+            .rev()
+            .find(|i| text.is_char_boundary(*i))
+            .unwrap_or(0);
+        if crate::dsml::find_tool_start(&text[scan_from..]).is_none() {
+            self.scan_from = text.len().saturating_sub(crate::dsml::TOOL_START_SCAN_HOLD);
+            return false;
+        }
+        true
+    }
+
+    /// Records a completed injection: thinking is closed and the scan resumes
+    /// past the marker that triggered it. `text_len` is the length of the
+    /// accumulated reply *including* the appended [`THINK_RECOVERY_TEXT`].
+    pub fn injected(&mut self, text_len: usize) {
+        self.scan_from = text_len;
+        self.inside = false;
+    }
+
+    /// Records that the caller could not recover here (no context or token
+    /// budget). The stream is left as generated for the parse-time fallback;
+    /// skipping past the marker stops the scan retrying it every token.
+    pub fn skipped(&mut self, text_len: usize) {
+        self.scan_from = text_len;
+    }
+}
+
 /// Incremental UTF-8 decoder for byte-level token streams.
 ///
 /// Byte-level BPE tokenizers split multi-byte characters (emoji, CJK) across
@@ -656,8 +763,101 @@ impl Engine for EchoEngine {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        Utf8Stream, reusable_prefix,
+        ThinkToolRecovery, Utf8Stream, reusable_prefix,
     };
+
+    // The trigger: a complete stanza opening while thinking is still open.
+    #[test]
+    fn think_recovery_fires_on_a_stanza_opened_inside_think() {
+        let mut r = ThinkToolRecovery::new(true);
+        assert!(!r.should_recover("let me check the file"));
+        assert!(r.should_recover(
+            "let me check the file<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">"
+        ));
+    }
+
+    // A partial marker must not force a close: the C explicitly keeps decoding
+    // until the opening is complete.
+    #[test]
+    fn think_recovery_ignores_partial_markers() {
+        let mut r = ThinkToolRecovery::new(true);
+        assert!(!r.should_recover("thinking <"));
+        assert!(!r.should_recover("thinking <｜DSML｜tool_call"));
+        assert!(!r.should_recover("thinking <｜DSML｜invoke name=\"read\">"));
+    }
+
+    // Detection is on accumulated text, so an opening split across tokens is
+    // still seen — the scan window is held back past the longest opening.
+    #[test]
+    fn think_recovery_sees_an_opening_split_across_tokens() {
+        let mut r = ThinkToolRecovery::new(true);
+        let mut text = String::new();
+        let full = format!("{}<｜DSML｜tool_calls>", "reasoning ".repeat(40));
+        let mut fired = false;
+        for c in full.chars() {
+            text.push(c);
+            if r.should_recover(&text) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(fired, "the opening must be detected across many pushes");
+        assert_eq!(
+            text, full,
+            "it must fire exactly when the opening completes"
+        );
+    }
+
+    // Outside thinking there is nothing to recover: a normal stanza is already
+    // on the executable side.
+    #[test]
+    fn think_recovery_is_inert_outside_think() {
+        let mut r = ThinkToolRecovery::new(false);
+        assert!(!r.should_recover("<｜DSML｜tool_calls>"));
+
+        let mut closed = ThinkToolRecovery::new(true);
+        assert!(!closed.should_recover("done</think>"));
+        assert!(!closed.inside_think());
+        assert!(!closed.should_recover("done</think><｜DSML｜tool_calls>"));
+    }
+
+    // After an injection thinking is closed, so a stanza that continues past
+    // the forced close does not trigger a second one.
+    #[test]
+    fn think_recovery_does_not_re_fire_after_injecting() {
+        let mut r = ThinkToolRecovery::new(true);
+        let mut text = "hmm<｜DSML｜tool_calls>".to_owned();
+        assert!(r.should_recover(&text));
+        text.push_str(super::THINK_RECOVERY_TEXT);
+        r.injected(text.len());
+        assert!(!r.inside_think());
+        text.push_str("<｜DSML｜tool_calls><｜DSML｜invoke name=\"read\">");
+        assert!(!r.should_recover(&text));
+    }
+
+    // No budget to recover: the marker is skipped rather than retried on every
+    // subsequent token, and thinking stays open for the parse-time fallback.
+    #[test]
+    fn think_recovery_skip_does_not_retry_the_same_marker() {
+        let mut r = ThinkToolRecovery::new(true);
+        let text = "hmm<｜DSML｜tool_calls>".to_owned();
+        assert!(r.should_recover(&text));
+        r.skipped(text.len());
+        assert!(r.inside_think(), "thinking is still open");
+        assert!(!r.should_recover(&text), "the same marker must not re-fire");
+    }
+
+    // The markers are multi-byte, so the held-back scan window must never be
+    // cut mid-character.
+    #[test]
+    fn think_recovery_scan_window_respects_char_boundaries() {
+        let mut r = ThinkToolRecovery::new(true);
+        let mut text = String::new();
+        for _ in 0..200 {
+            text.push('｜');
+            assert!(!r.should_recover(&text));
+        }
+    }
 
     // Cold prefill: nothing cached, so the absolute position is the progress
     // and throughput counts every token.

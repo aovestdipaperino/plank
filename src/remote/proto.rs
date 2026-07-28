@@ -162,6 +162,10 @@ pub struct WireOptions {
     pub min_p: f32,
     pub seed: u64,
     pub think_mode: WireThinkMode,
+    /// Defaulted so an older client that omits the field still parses; it
+    /// simply gets the pre-recovery behavior.
+    #[serde(default)]
+    pub think_tool_recovery: bool,
 }
 
 impl From<&GenerationOptions> for WireOptions {
@@ -174,6 +178,7 @@ impl From<&GenerationOptions> for WireOptions {
             min_p: o.min_p,
             seed: o.seed,
             think_mode: o.think_mode.into(),
+            think_tool_recovery: o.think_tool_recovery,
         }
     }
 }
@@ -188,6 +193,7 @@ impl From<&WireOptions> for GenerationOptions {
             min_p: o.min_p,
             seed: o.seed,
             think_mode: o.think_mode.into(),
+            think_tool_recovery: o.think_tool_recovery,
         }
     }
 }

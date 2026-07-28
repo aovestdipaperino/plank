@@ -37,6 +37,9 @@ pub enum UiEvent {
     Error(String),
     /// A dim log line (tool observations, notices, hook warnings).
     Dim(String),
+    /// An agent system status line (`agent_publish_system_status`): carries the
+    /// bare message, styled by the UI with [`crate::status::system_line`].
+    SystemStatus(String),
     /// A git-style diff card for a file an `edit`/`write` call changed.
     EditCard(crate::tools::diff::EditPreview),
     /// A plain log line.
@@ -310,6 +313,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Tool(t) => log.tool_text(&t),
         UiEvent::Error(t) => log.error_text(&t),
         UiEvent::Dim(t) => log.push_dim(t),
+        UiEvent::SystemStatus(t) => log.push_ansi(&crate::status::system_line(&t, true)),
         UiEvent::EditCard(p) => crate::tui::render_diff_card(log, &p),
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),

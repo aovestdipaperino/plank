@@ -263,6 +263,11 @@ impl ServerMsg {
             UiEvent::Tool(t) => Self::Tool { text: t.clone() },
             UiEvent::Error(t) => Self::Error { text: t.clone() },
             UiEvent::Dim(t) => Self::Dim { text: t.clone() },
+            // Remote clients get the status line pre-styled, like the card
+            // below: the wire has no dedicated frame for it.
+            UiEvent::SystemStatus(t) => Self::Plain {
+                text: crate::status::system_line(t, true),
+            },
             // Remote clients render the card as a pre-styled ANSI text block.
             UiEvent::EditCard(p) => Self::Dim {
                 text: p.to_ansi(true),

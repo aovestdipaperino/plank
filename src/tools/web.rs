@@ -84,6 +84,9 @@ pub fn tool_google_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if query.is_empty() {
         return "Tool error: google_search requires query\n".to_string();
     }
+    // Announced before the fetch, not after: the notice is only useful while
+    // the search is still running (`agent_tool_google_search`).
+    ctx.publish_status(&format!("Searching Google for {query}..."));
     #[cfg(all(ds4_engine, not(feature = "use_obscura")))]
     {
         let _ = call;
@@ -133,6 +136,7 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if !url.starts_with("http://") && !url.starts_with("https://") {
         return format!("Tool error: visit_page failed: unsupported URL scheme: {url}\n");
     }
+    ctx.publish_status(&format!("Opening page {url}..."));
     if let Err(e) = ensure_allowed(ctx) {
         return format!("Tool error: visit_page failed: {e}\n");
     }
@@ -1292,6 +1296,40 @@ let y = 2;</pre>
         // Grant path flips the sticky per-session flag before any fetch.
         assert!(ensure_allowed(&mut ctx).is_ok());
         assert!(ctx.web.allowed);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // The status notice must reach the front end *before* the tool blocks on
+    // approval or a fetch — it only tells the user anything while the search
+    // is still running.
+    #[test]
+    fn web_tools_announce_themselves_before_blocking() {
+        use std::sync::{Arc, Mutex};
+
+        let (mut ctx, dir) = test_ctx();
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        ctx.status_sink = Some({
+            let seen = Arc::clone(&seen);
+            Box::new(move |m: &str| seen.lock().unwrap().push(m.to_owned()))
+        });
+        // Deny approval so nothing is actually fetched: the notice must have
+        // been published before the gate ran.
+        ctx.web_confirm = Some(Box::new(|_| false));
+
+        let _ = dispatch(
+            &test_call("visit_page", &[("url", "https://example.com/a")]),
+            &mut ctx,
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            ["Opening page https://example.com/a...".to_owned()]
+        );
+
+        // A missing required argument is rejected before any notice.
+        seen.lock().unwrap().clear();
+        let _ = dispatch(&test_call("google_search", &[("query", "  ")]), &mut ctx);
+        assert!(seen.lock().unwrap().is_empty(), "no notice for a bad call");
+
         std::fs::remove_dir_all(dir).ok();
     }
 

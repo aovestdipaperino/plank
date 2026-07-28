@@ -711,6 +711,21 @@ pub fn format_user_prompt_echo(text: &str, color: bool) -> String {
     }
 }
 
+/// Formats a system status line, mirroring `agent_publish_system_status`:
+/// a `✦` bullet followed by the message, dim pink on TTYs.
+///
+/// These are the agent talking about itself ("Searching Google for ...",
+/// "Compaction interrupted; ..."), distinct from both model output and the
+/// dim tool-observation log. The returned string has no trailing newline.
+#[must_use]
+pub fn system_line(msg: &str, color: bool) -> String {
+    if color {
+        format!("\x1b[33m✦ \x1b[38;5;218m{msg}\x1b[0m")
+    } else {
+        format!("✦ {msg}")
+    }
+}
+
 /// Formats the welcome banner line, mirroring the C agent's phrasing.
 #[must_use]
 pub fn welcome_banner(ctx_size: i32, color: bool) -> String {

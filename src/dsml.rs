@@ -52,6 +52,32 @@ fn tag_prefix(marker: &str, closing: bool, name: &str) -> String {
     format!("<{slash}｜{marker}｜{name}")
 }
 
+/// Byte offset of the earliest complete tool-call stanza opening in `s`, if any.
+///
+/// Port of the C server's `find_any_tool_start`: the wrapper opener under any
+/// accepted marker, its dropped-leading-bar typo, and the bare `<tool_calls>`
+/// the model sometimes emits. Deliberately *not* the bare `invoke` opener the
+/// streaming detector also accepts — this feeds mid-generation recovery, where
+/// acting on a weaker signal costs a forced injection.
+///
+/// Matching is on accumulated text, so how the marker was tokenized does not
+/// matter; an incomplete opening does not match, and the caller is expected to
+/// re-scan from far enough back that one split across tokens is still seen.
+#[must_use]
+pub fn find_tool_start(s: &str) -> Option<usize> {
+    let mut forms: Vec<String> = vec!["<tool_calls>".to_owned()];
+    for m in MARKER_NAMES {
+        forms.push(format!("<｜{m}｜tool_calls>"));
+        forms.push(format!("<{m}｜tool_calls>"));
+    }
+    forms.iter().filter_map(|f| s.find(f.as_str())).min()
+}
+
+/// Bytes held back when re-scanning a stream for [`find_tool_start`]: longer
+/// than the longest opening, so one split across future tokens is still seen
+/// from its first byte.
+pub const TOOL_START_SCAN_HOLD: usize = 80;
+
 /// One named argument of a parsed tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolArg {
@@ -509,6 +535,34 @@ mod tests {
         assert_eq!(p.state(), DsmlState::Done);
         assert_eq!(p.calls().len(), 1);
         assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
+    }
+
+    // `find_tool_start` reports the *earliest* opening under any accepted
+    // form, so recovery reacts to the first one the model wrote.
+    #[test]
+    fn find_tool_start_matches_every_accepted_wrapper_form() {
+        for form in [
+            "<｜DSML｜tool_calls>",
+            "<DSML｜tool_calls>",
+            "<｜SSML｜tool_calls>",
+            "<tool_calls>",
+        ] {
+            let text = format!("prose {form} rest");
+            assert_eq!(
+                super::find_tool_start(&text),
+                Some("prose ".len()),
+                "{form}"
+            );
+        }
+    }
+
+    // Incomplete openings and the bare invoke opener are deliberately not
+    // matched: acting on a weaker signal costs a forced injection.
+    #[test]
+    fn find_tool_start_ignores_partial_and_bare_invoke() {
+        assert_eq!(super::find_tool_start("<"), None);
+        assert_eq!(super::find_tool_start("<｜DSML｜tool_call"), None);
+        assert_eq!(super::find_tool_start("<｜DSML｜invoke name=\"a\">"), None);
     }
 
     #[test]

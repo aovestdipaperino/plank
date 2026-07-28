@@ -145,9 +145,12 @@ Model text is fed byte-by-byte through a pipeline:
    tool banners. It routes output to a `RenderSink` (visible, thinking, and
    red-styled error banners; raw DSML never reaches the screen, even on parse
    failure). A DSML stanza opened inside `<think>` is discarded with a
-   `[tool call ignored: ...]` notice exactly as the C does; turning on
-   `engine.thinkingToolCalls` (off by default, editable in `/config`) instead
-   dispatches it as an ordinary tool call.
+   `[tool call ignored: ...]` notice exactly as the C does, and the model is
+   told *why* on the next message: the pass reports
+   `sysprompt::IN_THINK_PROHIBITION` — the same placement rule the tools prompt
+   gave it — rather than the parser's verdict on the stanza it threw away.
+   Turning on `engine.thinkingToolCalls` (off by default, editable in
+   `/config`) instead dispatches it as an ordinary tool call.
 2. `render.rs` (stdout path) turns that into ANSI: markdown, syntax
    highlighting, and gray thinking text.
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable

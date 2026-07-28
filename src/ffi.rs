@@ -154,6 +154,10 @@ unsafe extern "C" {
         think_mode: Ds4ThinkMode,
     );
 
+    /// Tokenizes already-rendered chat text, so control strings like
+    /// `</think>` map to their special tokens rather than to literal pieces.
+    pub fn ds4_tokenize_rendered_chat(e: *mut Ds4Engine, text: *const c_char, out: *mut Ds4Tokens);
+
     pub fn ds4_token_text(e: *mut Ds4Engine, token: c_int, len: *mut usize) -> *mut c_char;
     pub fn ds4_token_eos(e: *mut Ds4Engine) -> c_int;
 

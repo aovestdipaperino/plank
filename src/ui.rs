@@ -463,20 +463,78 @@ impl RenderSink for NullSink {
     fn think_text(&mut self, _text: &str) {}
 }
 
+/// Why a generation pass failed, which decides how it is worded to the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassError {
+    /// A tool argument was rejected before the call completed.
+    Preflight,
+    /// The DSML itself was wrong.
+    Dsml,
+    /// The DSML was fine but sat inside `<think></think>`.
+    InThink,
+}
+
 /// Builds the model-visible payload for a failed generation pass, matching
 /// the C worker loop: a preflight failure is fed back verbatim, a DSML parse
 /// failure gets the C's `invalid DSML tool call: ` prefix plus the syntax
 /// reminder so the model can correct its markup.
-fn tool_error_payload(preflight: bool, err: &str) -> String {
-    if preflight {
-        format!("Tool error: {err}\n")
-    } else {
-        format!(
+///
+/// A call made inside `<think></think>` is the exception, and a deliberate
+/// divergence from the C (`ds4_agent.c:7853` routes it through the malformed
+/// path): its markup was *valid*, it was in the wrong place. Prefixing it with
+/// "invalid DSML tool call" and handing over the syntax reminder tells the
+/// model to fix something that was never broken, so it gets the placement rule
+/// verbatim — the same sentence the tools prompt already gave it — and no
+/// syntax reminder at all.
+fn tool_error_payload(kind: PassError, err: &str) -> String {
+    match kind {
+        PassError::Preflight => format!("Tool error: {err}\n"),
+        // Written without a `\`-continued literal on purpose: continuations
+        // strip the next line's indentation, which is a silent way to mangle
+        // model-facing text (see CLAUDE.md).
+        PassError::InThink => format!(
+            concat!(
+                "Tool error: {}\n",
+                "The tool call was not run. Close the thinking block with ",
+                "</think>, then emit the same call again.\n",
+            ),
+            sysprompt::IN_THINK_PROHIBITION
+        ),
+        PassError::Dsml => format!(
             "Tool error: invalid DSML tool call: {err}\n{}",
             sysprompt::dsml_syntax_reminder()
-        )
+        ),
     }
 }
+
+/// Which [`PassError`] a finished pass represents.
+fn pass_error_kind(preflight: bool, in_think_rejected: bool) -> PassError {
+    if preflight {
+        PassError::Preflight
+    } else if in_think_rejected {
+        PassError::InThink
+    } else {
+        PassError::Dsml
+    }
+}
+
+/// What a compaction attempt actually did.
+///
+/// Mirrors the C's `err == "interrupted"` signal out of `agent_worker_compact`:
+/// a Ctrl-C during the summary pass is not a failure, it means the turn stops
+/// with the conversation exactly as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Compacted {
+    /// The transcript was summarized and rebuilt (or needed no compaction).
+    Done,
+    /// The user interrupted the summary pass; nothing was rebuilt.
+    Interrupted,
+}
+
+/// Shown when a compaction pass is interrupted, byte-for-byte with the C's
+/// `agent_worker_compact`.
+const COMPACT_INTERRUPTED: &str =
+    "Compaction interrupted; keeping the previous conversation state.";
 
 /// Closes a `<think>` block the model left open when the turn is about to
 /// continue with a `<tool_result>` user message.
@@ -1389,7 +1447,10 @@ impl Agent<'_> {
         let finished = stream.finished();
         let ended_in_think = finished.ended_in_think;
         if let Some(err) = preflight_error.as_deref().or(finished.error) {
-            let payload = tool_error_payload(preflight_error.is_some(), err);
+            let payload = tool_error_payload(
+                pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
+                err,
+            );
             close_open_think(&mut assistant_text, ended_in_think);
             return Ok((Vec::new(), assistant_text, Some(payload)));
         }
@@ -1422,7 +1483,11 @@ impl Agent<'_> {
             println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
             return Ok(());
         }
-        self.maybe_compact()?;
+        // An interrupted compaction ends the turn here, with the conversation
+        // untouched — the C goes straight back to IDLE (`worker_run_turn`).
+        if self.maybe_compact()? == Compacted::Interrupted {
+            return Ok(());
+        }
         self.maybe_append_system_prompt_reminder();
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
@@ -1487,7 +1552,10 @@ impl Agent<'_> {
                 return Ok(());
             }
             if let Some(err) = preflight_error.as_deref().or(finished.error) {
-                let payload = tool_error_payload(preflight_error.is_some(), err);
+                let payload = tool_error_payload(
+                    pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
+                    err,
+                );
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
@@ -1695,11 +1763,11 @@ impl Agent<'_> {
     }
 
     /// Compacts the transcript when the rendered context is nearly full.
-    fn maybe_compact(&mut self) -> Result<(), String> {
+    fn maybe_compact(&mut self) -> Result<Compacted, String> {
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
         if !compact::should_compact(self.engine.ctx_size(), used) {
-            return Ok(());
+            return Ok(Compacted::Done);
         }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
@@ -1710,7 +1778,7 @@ impl Agent<'_> {
                     "microcompacted: cleared {cleared} old tool result(s)"
                 ))
             );
-            return Ok(());
+            return Ok(Compacted::Done);
         }
         self.compact("low context")
     }
@@ -1773,7 +1841,7 @@ impl Agent<'_> {
 
     /// Performs the compaction exchange and rebuilds the transcript as
     /// summary + recent verbatim tail.
-    fn compact(&mut self, reason: &str) -> Result<(), String> {
+    fn compact(&mut self, reason: &str) -> Result<Compacted, String> {
         print!("{}", compact::banner(reason, self.color));
         // PreCompact: `manual` for a user-driven `/compact`, `auto` otherwise.
         // Injected context is pinned as a user message so it survives the
@@ -1809,11 +1877,12 @@ impl Agent<'_> {
             let _ = write!(prompt_text, "[user]\n{}\n", compact::make_prompt(reason));
         }
         let mut summary = String::new();
-        self.engine
+        let stats = self
+            .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt_text),
                 &self.cfg.generation,
-                &|| false,
+                &|| crate::interrupt::pending(),
                 &|| false,
                 &mut |ev| {
                     if let EngineEvent::Text(t) = ev {
@@ -1824,6 +1893,11 @@ impl Agent<'_> {
             .map_err(|e| e.to_string())?;
         if self.color {
             print!("\x1b[0m");
+        }
+        if stats.interrupted {
+            println!("{}", status::system_line(COMPACT_INTERRUPTED, self.color));
+            crate::interrupt::clear();
+            return Ok(Compacted::Interrupted);
         }
 
         self.rebuild_after_compact(&summary);
@@ -1851,7 +1925,7 @@ impl Agent<'_> {
             }
         }
         println!("{}", self.debug_line("context compacted"));
-        Ok(())
+        Ok(Compacted::Done)
     }
 
     /// Folds a completed pass's provider usage into the session tally. A no-op
@@ -2461,7 +2535,10 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
-            "/compact" => self.compact("user request")?,
+            "/compact" => {
+                // The interrupted case already printed its own notice.
+                self.compact("user request")?;
+            }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
@@ -3374,6 +3451,10 @@ impl Agent<'_> {
         let ask_bridge = crate::tools::ask::AskBridge::new();
         self.tool_ctx.asker = Some(Box::new(crate::tools::ask::BridgeAsker(ask_bridge.clone())));
         self.tool_ctx.ask_bridge = Some(ask_bridge);
+        // stdout is the alternate screen from here on: drop the REPL's
+        // print-to-stdout status sink. `worker_turn` installs a channel-backed
+        // one for the duration of each turn.
+        self.tool_ctx.status_sink = None;
         // `--ui-remote`: bind the loopback listener *before* the alternate
         // screen is entered, so the port line lands on a clean stderr (stdout
         // belongs to the UI). Started here rather than in `main` because this
@@ -4566,13 +4647,29 @@ impl Agent<'_> {
         let mut note = |s: String| {
             let _ = tx.send(UiEvent::Dim(s));
         };
+        // Tools publish system status through the same channel as render
+        // events, so a "Searching Google for ..." notice lands in the log in
+        // the order it happened. Reinstalled per turn: `tx` is per-turn.
+        self.tool_ctx.status_sink = Some({
+            let tx = tx.clone();
+            Box::new(move |msg: &str| {
+                let _ = tx.send(UiEvent::SystemStatus(msg.to_owned()));
+            })
+        });
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
             let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
             return Ok(());
         }
-        self.maybe_compact_notify(&mut note)?;
+        let compact_interrupt =
+            || shared.interrupt.load(Ordering::Relaxed) || crate::interrupt::pending();
+        if self.maybe_compact_notify(&mut note, &compact_interrupt)? == Compacted::Interrupted {
+            // Consume the interrupt so the next turn starts clean, then go
+            // back to idle with the conversation untouched (`worker_run_turn`).
+            shared.interrupt.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         self.maybe_reminder_notify(&mut note);
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
@@ -4969,8 +5066,12 @@ impl Agent<'_> {
         // error to feed back to the model, not a user abort.
         let preflight_error = stream.preflight_error();
         let error = preflight_error
-            .map(|e| tool_error_payload(true, e))
-            .or_else(|| finished.error.map(|e| tool_error_payload(false, e)));
+            .map(|e| tool_error_payload(PassError::Preflight, e))
+            .or_else(|| {
+                finished.error.map(|e| {
+                    tool_error_payload(pass_error_kind(false, finished.in_think_rejected), e)
+                })
+            });
         let user_interrupt = shared.interrupt.load(Ordering::Relaxed);
         // A real interrupt (Esc) takes precedence; only otherwise is a stopped
         // main pass a priority-`/btw` preempt. Preempt is not an error, so a
@@ -5029,11 +5130,15 @@ impl Agent<'_> {
 
     /// Compacts before a TUI turn when context is tight; progress lines go to
     /// `note` (the TUI log, or the worker→UI channel during a turn).
-    fn maybe_compact_notify(&mut self, note: &mut dyn FnMut(String)) -> Result<(), String> {
+    fn maybe_compact_notify(
+        &mut self,
+        note: &mut dyn FnMut(String),
+        interrupt: &dyn Fn() -> bool,
+    ) -> Result<Compacted, String> {
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
         if !compact::should_compact(self.engine.ctx_size(), used) {
-            return Ok(());
+            return Ok(Compacted::Done);
         }
         // Cheapest step first: clear old tool-result bodies (no model
         // round-trip) and only fall back to full summarization if still tight.
@@ -5041,17 +5146,21 @@ impl Agent<'_> {
             note(format!(
                 "microcompacted: cleared {cleared} old tool result(s)"
             ));
-            return Ok(());
+            return Ok(Compacted::Done);
         }
-        self.do_compact_notify("low context", note)
+        self.do_compact_notify("low context", note, interrupt)
     }
 
     /// Performs a compaction pass and rebuilds the transcript.
+    ///
+    /// `interrupt` is polled by the engine between tokens; when it fires the
+    /// summary is discarded and the transcript is left exactly as it was.
     fn do_compact_notify(
         &mut self,
         reason: &str,
         note: &mut dyn FnMut(String),
-    ) -> Result<(), String> {
+        interrupt: &dyn Fn() -> bool,
+    ) -> Result<Compacted, String> {
         note(format!(
             "COMPACTING {reason}: summarizing durable task state..."
         ));
@@ -5061,11 +5170,12 @@ impl Agent<'_> {
             let _ = write!(prompt, "[user]\n{}\n", compact::make_prompt(reason));
         }
         let mut summary = String::new();
-        self.engine
+        let stats = self
+            .engine
             .generate(
                 crate::engine::Prompt::Flat(&prompt),
                 &self.cfg.generation,
-                &|| false,
+                interrupt,
                 &|| false,
                 &mut |ev| {
                     if let EngineEvent::Text(t) = ev {
@@ -5074,9 +5184,14 @@ impl Agent<'_> {
                 },
             )
             .map_err(|e| e.to_string())?;
+        if stats.interrupted {
+            note(COMPACT_INTERRUPTED.to_owned());
+            crate::interrupt::clear();
+            return Ok(Compacted::Interrupted);
+        }
         self.rebuild_after_compact(&summary);
         note("context compacted".to_owned());
-        Ok(())
+        Ok(Compacted::Done)
     }
 
     /// Re-injects the system-prompt reminder in the TUI when due.
@@ -5262,7 +5377,9 @@ impl Agent<'_> {
             "/compact" => {
                 let result = {
                     let mut note = |s: String| log.push_dim(s);
-                    self.do_compact_notify("user request", &mut note)
+                    // No worker is running for a slash command, so the only
+                    // interrupt source is a real SIGINT.
+                    self.do_compact_notify("user request", &mut note, &crate::interrupt::pending)
                 };
                 if let Err(e) = result {
                     log.push_plain(format!("compact failed: {e}"));
@@ -6186,6 +6303,12 @@ fn new_agent(
         tool_ctx.sandbox.enabled = enabled;
     }
     if show_footer {
+        // System status lines go straight to stdout in the REPL; the TUI
+        // replaces this sink with one that forwards to the worker channel.
+        let color = std::io::stdout().is_terminal();
+        tool_ctx.status_sink = Some(Box::new(move |msg: &str| {
+            println!("{}", crate::status::system_line(msg, color));
+        }));
         // Interactive approval for web access, like agent_web_confirm;
         // headless runs keep the auto-deny default.
         tool_ctx.web_confirm = Some(Box::new(|message: &str| {
@@ -8277,6 +8400,78 @@ mod tests {
         assert!(p.is_none());
     }
 
+    // Ctrl-C during the summary pass must leave the conversation exactly as
+    // it was: no summary, no rebuilt transcript, and the turn ends (the C's
+    // "Compaction interrupted; keeping the previous conversation state.").
+    #[test]
+    fn interrupted_compaction_keeps_the_previous_transcript() {
+        let dir = scratch_dir("compact-interrupt");
+        let engine = ScriptedEngine {
+            replies: vec!["a partial summ".to_string()],
+            interrupt_at: Some(0),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("first"));
+        agent.session.push(Message::assistant("reply"));
+        agent.session.push(Message::user("second"));
+        let before: Vec<String> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+
+        let mut notes = Vec::new();
+        let mut note = |s: String| notes.push(s);
+        let outcome = agent
+            .do_compact_notify("low context", &mut note, &|| true)
+            .unwrap();
+
+        assert_eq!(outcome, Compacted::Interrupted);
+        let after: Vec<String> = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect();
+        assert_eq!(after, before, "the transcript must be untouched");
+        assert!(
+            notes.iter().any(|n| n == COMPACT_INTERRUPTED),
+            "got: {notes:?}"
+        );
+        assert!(
+            !notes.iter().any(|n| n == "context compacted"),
+            "compaction must not claim success: {notes:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The uninterrupted path still rebuilds, so the interrupt branch is not
+    // swallowing normal compaction.
+    #[test]
+    fn uninterrupted_compaction_still_rebuilds() {
+        let dir = scratch_dir("compact-ok");
+        let engine = ScriptedEngine {
+            replies: vec!["durable state: the user asked about X".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("first"));
+        agent.session.push(Message::assistant("reply"));
+
+        let mut notes = Vec::new();
+        let mut note = |s: String| notes.push(s);
+        let outcome = agent
+            .do_compact_notify("low context", &mut note, &|| false)
+            .unwrap();
+
+        assert_eq!(outcome, Compacted::Done);
+        assert!(notes.iter().any(|n| n == "context compacted"), "{notes:?}");
+    }
+
     #[test]
     fn btw_interrupt_flushes_remaining_queue() {
         let dir = scratch_dir("btw-flush");
@@ -8620,13 +8815,11 @@ mod tests {
     }
 
     #[test]
-    fn close_open_think_skips_discarded_in_think_stanza() {
+    fn a_discarded_in_think_stanza_tells_the_model_it_was_misplaced() {
         // Parity mode (`StreamRenderer` default: thinking tool calls not
         // allowed): a stanza fired mid-thought is discarded, so the pass
-        // produces no calls and no continuation follows. The gate the three
-        // turn paths apply (`ended_in_think && turn_continues`) must not
-        // append a synthetic `</think>` here, or a parity-mode transcript
-        // gains a byte the C reference never produces.
+        // produces no calls. It must still report *why*, and the reason is
+        // placement, not syntax — the markup here is perfectly well formed.
         const BASH_STANZA: &str = concat!(
             "<｜DSML｜tool_calls>",
             "<｜DSML｜invoke name=\"bash\">",
@@ -8640,16 +8833,67 @@ mod tests {
         let finished = stream.finished();
         assert!(finished.ended_in_think, "block should still be open");
         assert!(finished.calls.is_empty(), "call must be discarded");
+        assert!(finished.in_think_rejected, "rejected for its placement");
+        assert_eq!(
+            finished.error,
+            Some(crate::sysprompt::IN_THINK_PROHIBITION),
+            "the model must be told about placement, not syntax"
+        );
 
+        // The pass continues (an error is fed back), so the open think block
+        // is closed before the tool_result — an unterminated <think> must
+        // never sit in front of a user message.
         let turn_continues = !finished.calls.is_empty() || finished.error.is_some();
+        assert!(turn_continues);
         let mut assistant_text = format!("let me look{BASH_STANZA}");
         close_open_think(
             &mut assistant_text,
             finished.ended_in_think && turn_continues,
         );
         assert!(
-            !assistant_text.ends_with("</think>"),
+            assistant_text.ends_with("</think>"),
             "got: {assistant_text}"
+        );
+    }
+
+    /// Regression: an in-think call used to be reported to the model as
+    /// invalid DSML — sometimes as "incomplete DSML tool call", the parser's
+    /// verdict on a stanza it never got to finish. Both send the model
+    /// rewriting markup that was correct. It gets the placement rule instead,
+    /// with no syntax reminder attached.
+    #[test]
+    fn the_in_think_payload_talks_about_placement_not_syntax() {
+        let payload = tool_error_payload(PassError::InThink, "incomplete DSML tool call");
+        assert!(
+            payload.contains(crate::sysprompt::IN_THINK_PROHIBITION),
+            "{payload:?}"
+        );
+        assert_eq!(
+            payload,
+            concat!(
+                "Tool error: Tool calls are not allowed inside <think></think>;",
+                " finish thinking before emitting DSML.\n",
+                "The tool call was not run. Close the thinking block with ",
+                "</think>, then emit the same call again.\n",
+            ),
+            "exact model-facing wording"
+        );
+        assert!(!payload.contains("invalid DSML"), "{payload:?}");
+        assert!(!payload.contains("incomplete DSML"), "{payload:?}");
+        assert!(
+            !payload.contains("DSML syntax reminder"),
+            "the syntax was fine: {payload:?}"
+        );
+
+        // A genuine syntax failure is untouched: prefix and reminder both.
+        let dsml = tool_error_payload(PassError::Dsml, "unclosed parameter");
+        assert!(dsml.contains("invalid DSML tool call: unclosed parameter"));
+        assert!(dsml.contains("DSML syntax reminder"));
+
+        // A preflight failure is still fed back verbatim.
+        assert_eq!(
+            tool_error_payload(PassError::Preflight, "old not found"),
+            "Tool error: old not found\n"
         );
     }
 

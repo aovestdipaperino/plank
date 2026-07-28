@@ -32,6 +32,38 @@ Beta channel on the 2.7 series.
 
 ### Changed
 
+- **Ctrl-C now interrupts compaction** instead of being ignored until the
+  summary finished. Both compaction paths passed the engine a constant
+  "never interrupt" predicate, so a summary pass over a full context could not
+  be stopped. An interrupted pass now discards the partial summary, leaves the
+  conversation exactly as it was, reports
+  `Compaction interrupted; keeping the previous conversation state.`, and ends
+  the turn. Ported from the C's cooperative-interruption work.
+- **The web tools say what they are doing while they do it**: `google_search`
+  and `visit_page` publish `Searching Google for ...` / `Opening page ...`
+  before they block, as `✦`-prefixed system status lines. Previously a web call
+  looked like a hang until its result landed. The same line style now carries
+  every agent-about-itself notice.
+- **A tool call started inside an unclosed `<think>` is recovered forward**
+  when in-think tool calls are prohibited (`engine.thinkingToolCalls: false`,
+  the default). Rather than waiting for a `</think>` that never comes and
+  dropping the stanza at parse time, the engine force-feeds `</think>` and lets
+  the model restart the call on the executable side of it — the turn does real
+  work instead of being spent on a rejected call. With `thinkingToolCalls: true`
+  the stanza is dispatched as-is, so nothing is injected. Ported from the C
+  server's `chat_think_tool_recovery`; per its findings the stanza opening
+  itself is deliberately *not* re-emitted, since the model then reads the call
+  as already made and ends the turn.
+- **A tool call made inside `<think></think>` is now reported to the model as a
+  placement error**, not a syntax one. It used to be fed back behind
+  `invalid DSML tool call:` with the DSML syntax reminder attached — and if the
+  model had stopped mid-stanza, as `incomplete DSML tool call` — both of which
+  send it rewriting markup that was already correct. It now gets the same
+  sentence the tools prompt gave it ("Tool calls are not allowed inside
+  <think></think>; finish thinking before emitting DSML") plus a note that the
+  call was not run and should be re-emitted after `</think>`. The C reference
+  routes this through its malformed-tool path; this is a deliberate divergence
+  from it.
 - **`/stars` is gone** — the starfield is the screensaver now, not a command.
   The arcade is five games (`/pelota`, `/breakout`, `/invaders`, `/centipede`,
   `/frogger`); the plain REPL's static-sky rendering went with the command.

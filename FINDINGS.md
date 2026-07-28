@@ -278,6 +278,19 @@ test` and review the diff before committing.
   `src/sysprompt.rs` are still verbatim, so `tests/c_parity.rs` keeps passing;
   only the assembled output differs.
 
+  A rejected call is reported to the model as a *placement* error, never a
+  syntax one. The C routes it through the malformed-tool path
+  (`ds4_agent.c:7853`), so it reaches the model behind an `invalid DSML tool
+  call:` prefix plus the DSML syntax reminder — and when the model stopped
+  mid-stanza, behind the parser's own "incomplete DSML tool call". Both tell it
+  to fix markup that was correct; the actual mistake was where the call sat.
+  plank overrides the parse verdict in `StreamRenderer::finished` and words it
+  with the prohibition sentence the tools prompt already carries, no syntax
+  reminder attached. Watch the distinction between `dsml_in_think` (a marker
+  was *seen* in thinking — also true when dispatch is allowed) and
+  `in_think_rejected` (a call was actually thrown away): only the second is
+  worth an error, or the allow path reports failures for calls it just ran.
+
   A call fired mid-thought leaves the reply with an unterminated `<think>`. plank
   appends a synthetic `</think>` before the `<tool_result>` message
   (`close_open_think` in `src/ui.rs`). No engine change is needed to resume
@@ -286,6 +299,41 @@ test` and review the diff before committing.
   This is expected to be cheap in KV-cache terms since the divergence sits at
   the very tail of the reply, but that is unmeasured — worth a manual macOS
   run against a real GGUF model before release.
+
+- **Forward recovery from an in-think tool call must not re-emit the stanza
+  opening.** When the model opens a DSML stanza inside an unclosed `<think>`,
+  the fix is to force-feed `</think>\n\n` and stop there: that position
+  predicts a fresh stanza opening strongly enough that the model restarts the
+  call on the executable side by itself. The C tried also re-emitting the
+  opening after the close and found it counterproductive — with the dangling
+  opening right before the close and a forced copy right after it, the model
+  reads the call as already made and ends the turn. The dangling opening is
+  harmless where it is, inside reasoning.
+
+  Two details are load-bearing. Detection runs on *accumulated* text, so the
+  marker's tokenization does not matter — but the scan cursor must be held back
+  past the longest opening (`TOOL_START_SCAN_HOLD`) or an opening split across
+  tokens is missed, and it must be snapped to a UTF-8 char boundary because the
+  markers are multi-byte. And the trigger is only the `tool_calls` *wrapper*
+  form, not the bare `invoke` opener the streaming detector also accepts: a
+  forced injection is too expensive to spend on a weaker signal.
+
+  This is a policy fork from the agent-side handling, not a replacement for it.
+  plank enables recovery only when `engine.thinkingToolCalls` is false; with
+  in-think calls allowed the stanza is dispatched where it sits and cutting
+  reasoning short would be a regression.
+
+- **An interrupted compaction must keep the old transcript, not the new KV.**
+  Interrupting the summary pass leaves the live KV holding the private
+  compaction prompt while the transcript still holds the real conversation. The
+  C calls `ds4_session_invalidate` there; plank does not need to, because
+  `build_prompt`'s common-prefix reconciliation sees the next turn's prompt as a
+  strict *prefix* of the live checkpoint and rebuilds from zero anyway (the
+  `reusable_prefix` rule). Correctness is the same, cost is the same full
+  rebuild — but do not "optimize" that reconciliation without re-checking this
+  path. Interruption is also not a failure: the turn returns to idle, and the
+  latched interrupt has to be consumed (`shared.interrupt` under the TUI, the
+  SIGINT flag otherwise) or the next turn starts already cancelled.
 
 ## Part 2 — Environment & tooling
 

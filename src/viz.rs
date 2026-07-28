@@ -304,6 +304,11 @@ pub struct Finished<'a> {
     pub error: Option<&'a str>,
     /// True when a DSML marker was seen inside a `<think>` block.
     pub dsml_in_think: bool,
+    /// True when a tool call was rejected for being inside `<think>`, so
+    /// [`Self::error`] is about placement rather than syntax. Callers word the
+    /// model-facing message from this — telling it the DSML was invalid when
+    /// it was merely misplaced is a wild goose chase.
+    pub in_think_rejected: bool,
     /// True when the stream ended with a `<think>` block still open — the model
     /// emitted a tool call mid-thought and stopped for the dispatch. The caller
     /// closes the block in the transcript before appending the tool result.
@@ -354,6 +359,13 @@ pub struct StreamRenderer<S> {
     think_dsml: MarkerDetector,
     dsml_in_think: bool,
     dsml_in_think_reported: bool,
+    /// A tool call was discarded *because* it sat inside `<think>`.
+    ///
+    /// Distinct from [`Self::dsml_in_think`], which only means the marker was
+    /// seen there — that is also true when `engine.thinkingToolCalls` is on
+    /// and the call was dispatched. Only this one means the model asked for a
+    /// tool and got nothing, so only this one is worth telling it about.
+    in_think_rejected: bool,
     post_think_gap: bool,
     /// Error from DSML markup outside a valid stanza; freezes further output.
     stream_error: Option<String>,
@@ -422,6 +434,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             think_dsml: MarkerDetector::default(),
             dsml_in_think: false,
             dsml_in_think_reported: false,
+            in_think_rejected: false,
             post_think_gap: false,
             stream_error: None,
             last_output_newline: true,
@@ -504,9 +517,19 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// interrupted stanza is not a model error.
     #[must_use]
     pub fn finished(&self) -> Finished<'_> {
+        // A call inside `<think>` is *misplaced*, not malformed, and that is
+        // what the model needs to hear: the parser's own verdict on the
+        // discarded stanza ("incomplete DSML tool call", say) would send it
+        // rewriting syntax that was never wrong. `dsml_ignored` covers a
+        // stanza still open when the stream ended; `in_think_rejected` covers
+        // one that completed and was thrown away. Mirrors the C worker loop
+        // (`ds4_agent.c:7853`), which likewise overwrites the parse error.
+        let in_think = self.in_think_rejected || self.dsml_ignored;
         let error = self
             .stream_error
             .as_deref()
+            .filter(|_| !in_think)
+            .or_else(|| in_think.then_some(crate::sysprompt::IN_THINK_PROHIBITION))
             .or_else(|| (self.parser.state() == DsmlState::Error).then(|| self.parser.error()))
             .or_else(|| {
                 matches!(
@@ -519,6 +542,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             calls: &self.calls,
             error,
             dsml_in_think: self.dsml_in_think,
+            in_think_rejected: in_think,
             ended_in_think: self.in_think,
         }
     }
@@ -1125,6 +1149,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     fn finish_ignored_dsml(&mut self, msg: &str) {
         log_tool_error(msg, self.parser.raw());
         self.dsml_in_think = true;
+        self.in_think_rejected = true;
         self.dsml_in_think_reported = true;
         self.viz_newline_if_open();
         let line = format!("[tool call ignored: {msg}]\n");
@@ -1715,6 +1740,50 @@ mod tests {
         }
         sr.finish();
         sr
+    }
+
+    /// The model stopped mid-stanza inside `<think>`: the parser's own verdict
+    /// would be "incomplete DSML tool call", which is true and useless — the
+    /// markup was cut off only because the call had no business being there.
+    /// The reported error is the placement rule.
+    #[test]
+    fn an_unfinished_in_think_stanza_reports_placement_not_syntax() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        // Opens a stanza inside thinking and stops: no closing tags.
+        sr.push("<think>let me look<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">");
+        sr.finish();
+        let fin = sr.finished();
+        assert!(fin.calls.is_empty(), "{:?}", fin.calls);
+        assert!(fin.in_think_rejected, "rejected for placement");
+        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert!(fin.ended_in_think);
+    }
+
+    /// A completed stanza inside `<think>` reports the same placement error,
+    /// rather than falling through to whatever the parser concluded.
+    #[test]
+    fn a_completed_in_think_stanza_reports_placement() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(format!("<think>thinking{BASH_STANZA}"));
+        sr.finish();
+        let fin = sr.finished();
+        assert!(fin.calls.is_empty(), "the call must not be dispatched");
+        assert!(fin.in_think_rejected);
+        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+    }
+
+    /// With `engine.thinkingToolCalls` on, an in-think call is dispatched and
+    /// there is nothing to report: the placement error must not leak into the
+    /// allow path just because the marker was seen inside thinking.
+    #[test]
+    fn allowing_in_think_calls_reports_no_placement_error() {
+        let text = format!("<think>{BASH_STANZA}</think>ok");
+        let sr = run_allowing_in_think(&text);
+        let fin = sr.finished();
+        assert_eq!(fin.calls.len(), 1);
+        assert!(!fin.in_think_rejected, "nothing was rejected");
+        assert!(fin.error.is_none(), "{:?}", fin.error);
+        assert!(fin.dsml_in_think, "the marker was still seen in thinking");
     }
 
     #[test]

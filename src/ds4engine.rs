@@ -363,6 +363,19 @@ impl Ds4Model {
         bytes
     }
 
+    /// Tokenizes already-rendered chat text, so control strings map to their
+    /// special tokens (`</think>` becomes one token, not seven pieces).
+    /// Empty when `text` contains a NUL.
+    fn tokenize_rendered(&self, text: &str) -> Vec<i32> {
+        let Ok(c) = CString::new(text) else {
+            return Vec::new();
+        };
+        let mut tokens = Ds4TokensGuard::new();
+        // SAFETY: engine and tokens are valid; `c` outlives the call.
+        unsafe { ffi::ds4_tokenize_rendered_chat(self.engine, c.as_ptr(), tokens.as_mut_ptr()) };
+        tokens.to_vec()
+    }
+
     /// Approximate token count of `text`, excluding chat-template overhead.
     #[must_use]
     pub fn count_tokens(&self, text: &str) -> i32 {
@@ -725,6 +738,15 @@ impl Engine for Ds4Session {
         let mut reply_tokens: Vec<i32> = Vec::new();
         let mut reply_text = String::new();
         let mut utf8 = crate::engine::Utf8Stream::default();
+        // The local chat template opens `<think>` in the prefill prefix unless
+        // thinking is off, so generation starts inside the block with no tag of
+        // its own — same rule the stream renderer uses.
+        let mut recovery = opts.think_tool_recovery.then(|| {
+            crate::engine::ThinkToolRecovery::new(!matches!(
+                opts.think_mode,
+                crate::engine::ThinkMode::Off
+            ))
+        });
         let start = std::time::Instant::now();
 
         while generated < max_tokens {
@@ -762,6 +784,42 @@ impl Engine for Ds4Session {
                 on_event(EngineEvent::Text(text));
             }
             generated += 1;
+
+            // Live recovery for a tool call opened inside an unclosed
+            // `<think>`: force-feed the close and let the model restart the
+            // call on the executable side of it.
+            if let Some(rec) = recovery.as_mut()
+                && rec.should_recover(&reply_text)
+            {
+                let inject = self
+                    .model
+                    .tokenize_rendered(crate::engine::THINK_RECOVERY_TEXT);
+                // SAFETY: session valid.
+                let room = unsafe { ffi::ds4_session_ctx(session) - ffi::ds4_session_pos(session) };
+                let n = i32::try_from(inject.len()).unwrap_or(i32::MAX);
+                if inject.is_empty() || n >= room || generated + n >= max_tokens {
+                    // No budget to recover; leave the stream as generated and
+                    // let the turn's parse-time fallback deal with it.
+                    rec.skipped(reply_text.len());
+                } else {
+                    for t in &inject {
+                        // SAFETY: session valid; err buffer valid.
+                        let rc = unsafe {
+                            ffi::ds4_session_eval(session, *t, err.as_mut_ptr(), err.len())
+                        };
+                        if rc != 0 {
+                            return Err(EngineError::new(cstr_message(&err, "decode failed")));
+                        }
+                        reply_tokens.push(*t);
+                        generated += 1;
+                    }
+                    reply_text.push_str(crate::engine::THINK_RECOVERY_TEXT);
+                    on_event(EngineEvent::Text(
+                        crate::engine::THINK_RECOVERY_TEXT.to_owned(),
+                    ));
+                    rec.injected(reply_text.len());
+                }
+            }
         }
         let tail = utf8.flush();
         if !tail.is_empty() {

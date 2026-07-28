@@ -64,6 +64,15 @@ pub struct MoreState {
 /// Receives the approval prompt and returns true to allow web access.
 pub type WebConfirmFn = Box<dyn FnMut(&str) -> bool + Send>;
 
+/// Sink for agent system status lines published *while* a tool runs, mirroring
+/// `agent_publish_system_status`.
+///
+/// Distinct from the drained-after-dispatch vectors ([`ToolContext::hook_warnings`],
+/// [`ToolContext::task_completions`]): a "Searching Google for ..." notice is
+/// only useful before the search returns, so it goes straight to the front end.
+/// Receives the bare message; the front end styles it.
+pub type StatusSinkFn = Box<dyn Fn(&str) + Send>;
+
 /// Mutable state shared by all tools of one agent worker.
 pub struct ToolContext {
     /// Working directory relative paths are resolved against.
@@ -76,6 +85,9 @@ pub struct ToolContext {
     pub web: web::WebState,
     /// Web access approval hook; `None` auto-denies like non-interactive C.
     pub web_confirm: Option<WebConfirmFn>,
+    /// Front end for system status lines emitted during a dispatch; `None`
+    /// swallows them (non-interactive runs, tests).
+    pub status_sink: Option<StatusSinkFn>,
     /// Live MCP servers started from the `.mcp.json` config, if any.
     pub mcp: Vec<mcp::McpServer>,
     /// Resolved paths of recent successful `read` calls, oldest first, for
@@ -190,6 +202,7 @@ impl ToolContext {
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
             web_confirm: None,
+            status_sink: None,
             mcp: Vec::new(),
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
@@ -208,6 +221,14 @@ impl ToolContext {
             ask_bridge: None,
             #[cfg(ds4_engine)]
             web_browser: None,
+        }
+    }
+
+    /// Publishes a system status line to the front end, if one is listening.
+    /// Mirrors `agent_publishf_system_status`.
+    pub fn publish_status(&self, msg: &str) {
+        if let Some(sink) = self.status_sink.as_ref() {
+            sink(msg);
         }
     }
 
