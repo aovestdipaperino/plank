@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.4] - 2026-07-29
+
+Beta channel on the 2.7 series.
+
 ### Added
 
 - **Invented tool markup no longer scrolls past silently.** A bare `<task>`
