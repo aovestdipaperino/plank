@@ -174,6 +174,12 @@ struct PendingCall {
     args: Vec<ToolArg>,
 }
 
+/// True when a name is an unsubstituted placeholder copied from the tools
+/// prompt (`$TOOL_NAME`, `$PARAMETER_NAME`, `$PARAMETER_VALUE`).
+fn is_prompt_placeholder(name: &str) -> bool {
+    name.starts_with('$')
+}
+
 impl DsmlParser {
     /// Creates a parser in the `Search` state.
     #[must_use]
@@ -335,6 +341,13 @@ impl DsmlParser {
                             self.set_error("tool invoke without name");
                             return;
                         };
+                        if is_prompt_placeholder(&name) {
+                            self.set_error(format!(
+                                "tool name is the prompt's placeholder {name}, not a real \
+                                 tool; substitute the actual tool name"
+                            ));
+                            return;
+                        }
                         self.current = Some(PendingCall {
                             name,
                             args: Vec::new(),
@@ -345,6 +358,13 @@ impl DsmlParser {
                             self.set_error("tool parameter without name");
                             return;
                         };
+                        if is_prompt_placeholder(&name) {
+                            self.set_error(format!(
+                                "parameter name is the prompt's placeholder {name}, not a \
+                                 real parameter; substitute the actual parameter name"
+                            ));
+                            return;
+                        }
                         self.param_name = Some(name);
                         self.param_is_string =
                             parse_attr(&tag, "string").as_deref() == Some("true");
@@ -497,6 +517,51 @@ mod tests {
         for b in s.as_bytes() {
             p.feed([*b]);
         }
+    }
+
+    // The model copies TOOLS_PROMPT_INTRO verbatim (4 recorded occurrences).
+    // Telling it "not allowed inside <think>" sends it fixing placement when the
+    // real mistake is that it never substituted anything.
+    #[test]
+    fn placeholder_tool_name_is_named_as_such() {
+        let mut p = super::DsmlParser::new();
+        p.feed("<｜DSML｜tool_calls><｜DSML｜invoke name=\"$TOOL_NAME\">".as_bytes());
+        assert_eq!(p.state(), super::DsmlState::Error);
+        assert!(
+            p.error().contains("placeholder $TOOL_NAME"),
+            "unhelpful error: {}",
+            p.error()
+        );
+    }
+
+    #[test]
+    fn placeholder_parameter_name_is_named_as_such() {
+        let mut p = super::DsmlParser::new();
+        p.feed(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">\
+             <｜DSML｜parameter name=\"$PARAMETER_NAME\" string=\"true\">x"
+                .as_bytes(),
+        );
+        assert_eq!(p.state(), super::DsmlState::Error);
+        assert!(
+            p.error().contains("placeholder $PARAMETER_NAME"),
+            "unhelpful error: {}",
+            p.error()
+        );
+    }
+
+    // A real tool whose name merely contains a dollar sign elsewhere is untouched;
+    // only a leading `$` marks a placeholder.
+    #[test]
+    fn dollar_inside_a_name_is_not_a_placeholder() {
+        let mut p = super::DsmlParser::new();
+        p.feed(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"we$rd\">\
+             </｜DSML｜invoke｜></｜DSML｜tool_calls｜>"
+                .as_bytes(),
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
+        assert_eq!(p.calls()[0].name, "we$rd");
     }
 
     /// The SSML alias (see [`MARKER_NAMES`]) must parse identically to the
