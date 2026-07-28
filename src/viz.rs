@@ -1211,17 +1211,6 @@ impl<S: RenderSink> StreamRenderer<S> {
         if self.stream_error.is_some() {
             return;
         }
-        // A stream that already saw a stanza inside <think> is, on any later
-        // stray marker, watching that same stanza's tail arrive after
-        // </think>. Its markup was valid; only its position was wrong. Calling
-        // that a syntax error tells the model to fix something that was never
-        // broken — the same precedence `finished()` applies at stream end.
-        if self.dsml_in_think && !self.thinking_tool_calls {
-            if !self.dsml_in_think_reported {
-                self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
-            }
-            return;
-        }
         self.stream_error = Some(msg.to_string());
         log_tool_error(msg, self.parser.raw());
         self.viz_newline_if_open();
@@ -1816,33 +1805,6 @@ mod tests {
         assert!(fin.in_think_rejected, "rejected for placement");
         assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
         assert!(fin.ended_in_think);
-    }
-
-    // A stanza opened inside <think> whose tail streams out past </think> is a
-    // placement mistake, not a syntax one. Reporting it as malformed markup sends
-    // the model rewriting DSML that was already correct — the recorded U+FF5C
-    // death spiral started exactly here.
-    #[test]
-    fn leaked_in_think_tail_reports_placement_not_syntax() {
-        let mut sr = StreamRenderer::new(Cap::default());
-        sr.push("<think>");
-        sr.push("<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">");
-        sr.push("</think>");
-        sr.push("</｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
-        sr.finish();
-
-        let fin = sr.finished();
-        assert!(fin.in_think_rejected, "should be reported as misplaced");
-        assert_eq!(
-            fin.error,
-            Some(crate::sysprompt::IN_THINK_PROHIBITION),
-            "must not be reported as a syntax error"
-        );
-        let out = &sr.sink().visible;
-        assert!(
-            !out.contains("invalid tool call"),
-            "banner blamed syntax: {out}"
-        );
     }
 
     /// A completed stanza inside `<think>` reports the same placement error,
