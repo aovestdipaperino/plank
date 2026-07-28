@@ -6,6 +6,45 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Invented tool markup no longer scrolls past silently.** A bare `<task>`
+  block, the shape the model falls back to for tools it was never trained on
+  (#51), was invisible to the streaming detectors: the turn ended with no
+  tool call and no error, and the model just tried again on the next turn. A
+  detector now recognizes a registered tool name, or a generic `<tool_call>` /
+  `<function_call>` / `<invoke ` wrapper, opening a line in the answer region,
+  and routes it into the existing correction path so the model is handed the
+  DSML syntax reminder instead. It stays quiet inside `<think>`, inside
+  fenced code blocks, and mid-sentence in prose; a fence opened while
+  thinking and closed just after `</think>` is still recognized as a closer
+  rather than mistaken for a fresh opener that would disarm the detector for
+  the rest of the answer.
+
+### Fixed
+
+- **A stanza opened inside `<think>` was blamed for the wrong mistake.**
+  When its tail streamed out past `</think>`, the model was told its DSML
+  markup was malformed and sent off to rewrite syntax that was already
+  correct; it is now reported as the placement error it actually is. The
+  dropped-leading-bar typo on inner tags (`<DSML｜parameter …>`) is now
+  accepted, matching the tolerance the stanza opener has always had. A tool
+  call whose name is the prompt's own `$TOOL_NAME` template is told so
+  directly instead of being reported as a placement mistake.
+- **In-think rejections are logged with the stanza that was rejected**,
+  rather than an empty payload, which was the single most common entry in
+  `~/.plank/tool-call-errors.log`. Note the hypothesis that this misdiagnosis
+  compounded into further misdiagnoses downstream did not hold up: the one
+  path that could have re-triggered a syntax error after an in-think stanza
+  was already unreachable, so the fix here is the evidence-capture bug on
+  its own, not a chain of failures.
+- **Test runs stopped writing to the real error log.** `cargo test` was
+  appending its fixture failures to the developer's own
+  `~/.plank/tool-call-errors.log`, mixing synthetic test data into a file
+  meant to reflect real sessions. Test builds now log to nothing instead of
+  a shared machine path, and each log record is written in a single call so
+  a concurrent writer can't interleave with it mid-record.
+
 ## [2.7.3] - 2026-07-28
 
 Beta channel on the 2.7 series.

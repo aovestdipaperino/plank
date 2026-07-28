@@ -340,6 +340,14 @@ impl PseudoToolDetector {
     fn feed(&mut self, c: u8, in_think: bool) -> Option<String> {
         if c == b'\n' {
             if self.line.starts_with(b"```") {
+                // Parity is tracked unconditionally, even while `in_think`,
+                // but the trade-off cuts both ways. It's what makes the
+                // thinking-then-answer fence in the doc comment above work.
+                // The flip side: a fence opened in `<think>` and never closed
+                // there leaves `in_fence` true for the rest of the stream,
+                // silently disarming detection for the whole answer region.
+                // Resetting `in_fence` at `</think>` would fix that case but
+                // reopen the one this exists for, so the choice stands.
                 self.in_fence = !self.in_fence;
             }
             self.line.clear();
