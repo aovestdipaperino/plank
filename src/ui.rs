@@ -1080,6 +1080,13 @@ struct SessionStats {
 const HISTORY_DEFAULT_TURNS: usize = 3;
 /// Sessions shown by the /resume picker.
 const RESUME_LIST_LIMIT: usize = 10;
+
+/// Token budget for one `/insights` narrative section, covering the model's
+/// reasoning and the JSON answer that follows it.
+///
+/// Generous enough to think and then answer, bounded so one wandering reply
+/// costs that section rather than the user's afternoon.
+const INSIGHTS_SECTION_TOKENS: i32 = 3000;
 /// Maximum user turns `/history` accepts.
 const HISTORY_MAX_TURNS: usize = 200;
 /// Name of the auto-checkpoint saved before a `/rollback`, so a rollback is
@@ -2374,7 +2381,7 @@ impl Agent<'_> {
                 Ok(msg) => println!("{msg}"),
                 Err(e) => println!("{e}"),
             },
-            "/save" => match self.store.save(&mut self.session) {
+            "/save" => match self.save_session() {
                 Ok(id) => {
                     println!("saved session {}", &id[..8]);
                     if let Some(note) = self.save_session_payload() {
@@ -2562,6 +2569,28 @@ impl Agent<'_> {
                 Ok(path) => println!("exported session to {}", path.display()),
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
             },
+            "/insights" => {
+                let color = self.color;
+                let mut note = |line: String| println!("{}", status::system_line(&line, color));
+                // Reasoning is dimmed prose, not a status line — the same
+                // distinction the streaming renderer draws during a turn.
+                let mut tick = |line: String| {
+                    if color {
+                        println!("\x1b[90m{line}\x1b[0m");
+                    } else {
+                        println!("{line}");
+                    }
+                };
+                match self.run_insights(arg, &mut note, &mut tick) {
+                    Ok((path, summary)) => {
+                        for line in summary {
+                            println!("{line}");
+                        }
+                        println!("report written to {}", path.display());
+                    }
+                    Err(e) => println!("insights failed: {e}\nusage: /insights [fast]"),
+                }
+            }
             "/repro" => match self.write_repro(arg) {
                 Ok(path) => println!(
                     "{}",
@@ -2963,12 +2992,146 @@ the original is frozen and listed in /tree"
             format!("tag set: {tag}")
         };
         if !self.session.id.is_empty() {
-            self.store
-                .save(&mut self.session)
-                .map_err(|e| e.to_string())?;
+            self.save_session().map_err(|e| e.to_string())?;
             msg.push_str(" (saved)");
         }
         Ok(msg)
+    }
+
+    /// Runs `/insights` end to end and returns the report path plus the
+    /// summary lines to show. `note` receives progress as it goes; a first
+    /// run over a long history parses every session, and the model calls that
+    /// follow are not fast either.
+    ///
+    /// `note` receives status lines; `tick` receives the model's reasoning as
+    /// it streams, so a section being written looks like work rather than a
+    /// hang. Each front-end decides how to show them.
+    ///
+    /// `arg` accepts `fast`, which skips the narrative and reports only the
+    /// statistics.
+    ///
+    /// The two halves are deliberately unequal in status: the statistics are
+    /// the report, and every model call is allowed to fail without taking
+    /// anything else down with it.
+    fn run_insights(
+        &mut self,
+        arg: &str,
+        note: &mut dyn FnMut(String),
+        tick: &mut dyn FnMut(String),
+    ) -> Result<(std::path::PathBuf, Vec<String>), String> {
+        use crate::insights;
+
+        let fast = matches!(arg.trim(), "fast" | "--fast" | "quick");
+        let root = insights::usage_dir();
+        let tz = insights::local_utc_offset();
+
+        let mut last_pct = usize::MAX;
+        let metas = insights::collect_metas(&self.store, &root, &mut |done, total| {
+            if total == 0 {
+                return;
+            }
+            let pct = done * 100 / total;
+            // One line per decile, not one per session: a 200-session first
+            // run should report progress, not scroll.
+            if pct / 10 != last_pct / 10 {
+                last_pct = pct;
+                // Transient: the scan is over in seconds and its deciles are
+                // not worth keeping in the log next to the report.
+                tick(format!("reading sessions… {done}/{total}"));
+            }
+        })?;
+        let agg = insights::aggregate(&metas, tz);
+
+        let mut narrative = insights::Narrative::new();
+        if agg.sessions_counted == 0 {
+            note("[no sessions substantial enough to report on]".to_owned());
+        } else if fast {
+            note("[skipping the written sections (fast)]".to_owned());
+        } else if !self.engine.supports_aside() {
+            // An aside answers a question against a scratch copy of the KV
+            // state; without one, the only way to ask is to overwrite the
+            // live conversation's cache, which a slash command must never do.
+            note("[this engine cannot answer asides; statistics only]".to_owned());
+        } else {
+            let context = insights::narrative_context(&agg);
+            for spec in insights::SECTIONS {
+                if crate::interrupt::pending() {
+                    note("[interrupted; writing what is ready]".to_owned());
+                    break;
+                }
+                note(format!("[writing “{}”…]", spec.heading));
+                // Deliberately *not* the agent system prompt. That prompt
+                // exists to make the model reach for tools and reason at
+                // length about a codebase; under it, a request for a bare
+                // JSON object comes back as thinking and tool calls. A
+                // section is a writing task, so it gets a writing task's
+                // framing and nothing else — which also makes the prefill
+                // small, since there is no agent prompt to lay down.
+                let prompt = format!(
+                    "[system]\n{}\n[user]\n{}\n",
+                    insights::ANALYST_SYSTEM,
+                    insights::section_prompt(spec, &context)
+                );
+                let mut reply = String::new();
+                // Stream the reasoning as it arrives, the way an ordinary
+                // turn does, so the wait is legible rather than blank.
+                let mut ticker = insights::ThinkTicker::new();
+                // A section is a paragraph or a short list, and the section
+                // budget is what stops one wandering reply from making the
+                // whole report take minutes. The session's own generation
+                // limit is meant for a coding turn and is far too generous
+                // here.
+                let opts = crate::engine::GenerationOptions {
+                    n_predict: INSIGHTS_SECTION_TOKENS,
+                    // Thinking stays on so there is something to show while
+                    // the section is written: a couple of silent minutes per
+                    // section reads as a hang. The budget below covers the
+                    // reasoning and the answer together, and `extract_json`
+                    // takes the answer from after the think block.
+                    think_mode: crate::engine::ThinkMode::On,
+                    ..self.cfg.generation.clone()
+                };
+                let generated = self.engine.generate_aside(
+                    &prompt,
+                    &opts,
+                    &|| crate::interrupt::pending(),
+                    &mut |ev| {
+                        if let crate::engine::EngineEvent::Text(t) = ev {
+                            reply.push_str(&t);
+                            for line in ticker.feed(&t) {
+                                tick(line);
+                            }
+                        }
+                    },
+                );
+                match generated.map_err(|e| e.to_string()).and_then(|_| {
+                    insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
+                }) {
+                    Ok(value) => {
+                        narrative.insert(spec.key.to_owned(), value);
+                    }
+                    // A section that fails is a section the report goes
+                    // without; it never costs the statistics.
+                    Err(e) => note(format!("[“{}” unavailable: {e}]", spec.heading)),
+                }
+            }
+            crate::interrupt::clear();
+        }
+
+        let html = insights::render_html(&agg, &narrative, tz);
+        let path = insights::write_report(&root, &html)?;
+        Ok((path, insights::render_summary(&agg, &narrative, tz)))
+    }
+
+    /// Saves the live session, recording the project directory it ran in.
+    ///
+    /// The transcript never states which project produced it, so `/insights`
+    /// gets the path from here — stamped at every save rather than at session
+    /// creation, because a session outlives the several places that replace
+    /// it (`/new`, `/resume`, `/clone`).
+    fn save_session(&mut self) -> crate::session::Result<String> {
+        self.session.cwd = self.tool_ctx.cwd.to_string_lossy().into_owned();
+        self.store.save(&mut self.session)
     }
 
     /// Saves the session at exit and returns `(id, path)` so the caller can
@@ -2984,7 +3147,7 @@ the original is frozen and listed in /tree"
         if !self.session.dirty {
             return None;
         }
-        let id = self.store.save(&mut self.session).ok()?;
+        let id = self.save_session().ok()?;
         let path = self
             .store
             .find(&id)
@@ -5385,7 +5548,7 @@ impl Agent<'_> {
                     log.push_plain(format!("compact failed: {e}"));
                 }
             }
-            "/save" => match self.store.save(&mut self.session) {
+            "/save" => match self.save_session() {
                 Ok(id) => {
                     log.push_plain(format!("saved session {}", &id[..8]));
                     if let Some(note) = self.save_session_payload() {
@@ -5551,6 +5714,51 @@ impl Agent<'_> {
                     log.push_dim("usage: /export [md|html] [path]".to_owned());
                 }
             },
+            "/insights" => {
+                // The scan and the model calls both take long enough to look
+                // like a hang, so each progress note is pinned in the prompt's
+                // place and the frame is redrawn — the same "agent is busy"
+                // shape `/clear`'s re-warm uses.
+                let result = {
+                    let log = std::cell::RefCell::new(&mut *log);
+                    let view = std::cell::RefCell::new(&mut *view);
+                    let terminal = std::cell::RefCell::new(&mut *terminal);
+                    let repaint = |line: &str| {
+                        log.borrow_mut()
+                            .set_progress(Some(tui::progress_line(&format!(
+                                "{} {line}",
+                                crate::status::throbber()
+                            ))));
+                        let l = log.borrow();
+                        let mut v = view.borrow_mut();
+                        let _ = terminal.borrow_mut().draw(|f| {
+                            tui::draw(f, *l, None, 0, "", *v, None, &tui::TaskView::default());
+                        });
+                    };
+                    // Status lines are kept in the log; streamed reasoning
+                    // only ever occupies the progress line, so a section's
+                    // thinking ticks past without burying the report.
+                    let mut note = |line: String| {
+                        repaint(&line);
+                        log.borrow_mut().push_dim(line);
+                    };
+                    let mut tick = |line: String| repaint(&line);
+                    self.run_insights(arg, &mut note, &mut tick)
+                };
+                log.set_progress(None);
+                match result {
+                    Ok((path, summary)) => {
+                        for line in summary {
+                            log.push_plain(line);
+                        }
+                        log.push_dim(format!("report written to {}", path.display()));
+                    }
+                    Err(e) => {
+                        log.push_plain(format!("insights failed: {e}"));
+                        log.push_dim("usage: /insights [fast]".to_owned());
+                    }
+                }
+            }
             "/repro" => match self.write_repro(arg) {
                 Ok(path) => log.push_dim(format!("[repro written to {}]", path.display())),
                 Err(e) => log.push_plain(format!("repro failed: {e}")),

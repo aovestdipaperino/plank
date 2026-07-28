@@ -37,6 +37,7 @@ pub mod ffi;
 pub mod hooks;
 pub mod host;
 pub mod imagepaste;
+pub mod insights;
 pub mod interrupt;
 pub mod kvcache;
 /// Volatility-tiered KV cache planning (issues #60, #64). FFI-free and always

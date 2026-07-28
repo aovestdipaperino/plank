@@ -10,6 +10,28 @@ Beta channel on the 2.7 series.
 
 ### Added
 
+- **`/insights`**, a personal usage report over every saved session, written to
+  `~/.plank/usage-data/report.html` (owner-readable only) with a condensed
+  summary in the terminal. Adapted from Claude Code's builtin of the same name,
+  keeping its central discipline: every number is computed deterministically
+  from the transcripts — tool mix, languages, lines added and removed, files
+  touched, commits, failure categories and per-tool failure rates, reply times,
+  activity by hour, and sessions that were live at the same moment — and the
+  model is asked only for the prose it cannot replace. Unlike the reference,
+  plank does not ask the model to judge each session individually: that is one
+  call per session, which does not scale on a local engine, so the model sees
+  only the finished aggregate and costs a fixed handful of calls. `/insights
+  fast` skips the written sections entirely. Per-session statistics are cached
+  under `usage-data/session-meta/`, so a rerun is milliseconds rather than
+  seconds; a section whose model call fails is dropped without touching the
+  statistics.
+
+  The session format grew two optional, backward-compatible records for this:
+  a per-message timestamp on `msg`/`node`, and the project directory the
+  session ran in. Sessions saved before this release still load, still count,
+  and still contribute every statistic that does not need a clock — the report
+  says how many of them there are rather than averaging over a smaller set.
+
 - **A built-in prompt editor behind `Ctrl-G`**, replacing the shell-out to
   `$EDITOR`. It is an in-process, single-buffer fork of
   [Microsoft Edit](https://github.com/microsoft/edit) (MIT, vendored as the

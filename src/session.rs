@@ -29,12 +29,14 @@
 //! used <unix-seconds>
 //! title <byte-len>
 //! <title bytes>
-//! msg <user|assistant> <byte-len>
+//! msg <user|assistant> <byte-len> [<unix-seconds>]
 //! <message bytes>
 //! ...
-//! node <id> <parent-id|-> <user|assistant> <byte-len>
+//! node <id> <parent-id|-> <user|assistant> <byte-len> [<unix-seconds>]
 //! <message bytes>
 //! ...
+//! cwd <byte-len>
+//! <project directory bytes>
 //! meta <tag-byte-len> <last-prompt-byte-len>
 //! <tag bytes>
 //! <last prompt bytes>
@@ -45,6 +47,15 @@
 //! user prompt) at the end of the file so `list()` can read it with a
 //! bounded tail read instead of parsing the whole transcript; files written
 //! before it existed simply lack the record.
+//!
+//! The trailing timestamp on a `msg`/`node` record is the wall-clock second
+//! the message was appended, added for `/insights` (response times, activity
+//! by hour, overlapping-session detection). It is optional in both directions:
+//! records written before it existed parse with a zero timestamp, and a
+//! message with a zero timestamp is written without the field, so a session
+//! that never carried stamps stays byte-identical. The `cwd` record is the
+//! same kind of optional addition, recording the project directory the session
+//! ran in (which the transcript itself does not state).
 //!
 //! The `msg` records are the session tree's *active branch*; the optional
 //! `node` records describe the off-path branches left by `/fork` and `/clone`
@@ -162,23 +173,37 @@ pub struct Message {
     pub role: Role,
     /// Raw message text.
     pub text: String,
+    /// Wall-clock second the message was appended, or 0 when unknown (every
+    /// message loaded from a file written before timestamps existed, and every
+    /// message built outside [`Session::push`]). Consumed by
+    /// [`crate::insights`]; a zero is written to disk as an absent field.
+    pub at: u64,
 }
 
 impl Message {
-    /// Creates a user message.
+    /// Creates a user message with no timestamp.
     pub fn user(text: impl Into<String>) -> Self {
         Self {
             role: Role::User,
             text: text.into(),
+            at: 0,
         }
     }
 
-    /// Creates an assistant message.
+    /// Creates an assistant message with no timestamp.
     pub fn assistant(text: impl Into<String>) -> Self {
         Self {
             role: Role::Assistant,
             text: text.into(),
+            at: 0,
         }
+    }
+
+    /// Stamps the message with a wall-clock second, replacing any existing one.
+    #[must_use]
+    pub fn at(mut self, at: u64) -> Self {
+        self.at = at;
+        self
     }
 
     /// Tool results are stored as user turns; detect them like the C agent.
@@ -213,6 +238,10 @@ pub struct Session {
     pub created_at: u64,
     /// User-assigned tag shown in listings (`/tag`); empty when unset.
     pub tag: String,
+    /// Project directory the session ran in; empty when unknown (sessions
+    /// saved before the field existed). Recorded for `/insights`, which groups
+    /// work by project and cannot recover the path from the transcript.
+    pub cwd: String,
     /// Alternating role-tagged messages: the *active branch* of the session
     /// tree (issue #65). Every existing caller keeps treating this as the
     /// whole conversation.
@@ -238,6 +267,7 @@ impl Session {
             title: String::new(),
             created_at: 0,
             tag: String::new(),
+            cwd: String::new(),
             transcript: Vec::new(),
             branches: Vec::new(),
             tasks: crate::tasks::TaskList::new(),
@@ -246,7 +276,16 @@ impl Session {
     }
 
     /// Appends a message and marks the session dirty.
-    pub fn push(&mut self, message: Message) {
+    ///
+    /// An unstamped message is stamped with the current second here: `push` is
+    /// the one path every live turn takes, so stamping at the door keeps the
+    /// timing data `/insights` needs without every call site knowing about it.
+    /// Messages built by compaction or branch surgery keep whatever stamp they
+    /// carry.
+    pub fn push(&mut self, mut message: Message) {
+        if message.at == 0 {
+            message.at = unix_now();
+        }
         self.transcript.push(message);
         self.dirty = true;
     }
@@ -588,7 +627,7 @@ impl SessionStore {
         body.extend_from_slice(session.title.as_bytes());
         body.push(b'\n');
         for m in &session.transcript {
-            let _ = writeln!(body, "msg {} {}", m.role.tag(), m.text.len());
+            let _ = writeln!(body, "msg {} {}{}", m.role.tag(), m.text.len(), stamp(m.at));
             body.extend_from_slice(m.text.as_bytes());
             body.push(b'\n');
         }
@@ -601,10 +640,11 @@ impl SessionStore {
             let parent = n.parent.map_or_else(|| "-".to_owned(), |p| p.to_string());
             let _ = writeln!(
                 body,
-                "node {} {parent} {} {}",
+                "node {} {parent} {} {}{}",
                 n.id,
                 n.message.role.tag(),
-                n.message.text.len()
+                n.message.text.len(),
+                stamp(n.message.at)
             );
             body.extend_from_slice(n.message.text.as_bytes());
             body.push(b'\n');
@@ -629,6 +669,13 @@ impl SessionStore {
                 body.extend_from_slice(af.as_bytes());
                 body.push(b'\n');
             }
+        }
+        // Project directory (issue: `/insights`): omitted when unset so a
+        // session saved by an older build round-trips byte-identically.
+        if !session.cwd.is_empty() {
+            let _ = writeln!(body, "cwd {}", session.cwd.len());
+            body.extend_from_slice(session.cwd.as_bytes());
+            body.push(b'\n');
         }
         let last_prompt = last_prompt_of(&session.transcript);
         let _ = writeln!(body, "meta {} {}", session.tag.len(), last_prompt.len());
@@ -1313,6 +1360,17 @@ fn read_head_meta(path: &Path) -> Option<(u64, u64, String)> {
     Some((created, used, title))
 }
 
+/// Renders the optional trailing timestamp of a `msg`/`node` header: a
+/// space-prefixed second, or nothing at all for the unstamped messages that
+/// every pre-timestamp session file is made of.
+fn stamp(at: u64) -> String {
+    if at == 0 {
+        String::new()
+    } else {
+        format!(" {at}")
+    }
+}
+
 fn corrupt() -> SessionError {
     SessionError::new("invalid session file")
 }
@@ -1347,11 +1405,13 @@ fn parse_node_record(
         _ => return Err(corrupt()),
     };
     let len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+    // Optional trailing timestamp; absent in every pre-`/insights` file.
+    let at: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
     let text = take_body(data, pos, len)?;
     Ok(crate::branch::OffNode {
         id,
         parent,
-        message: Message { role, text },
+        message: Message { role, text, at },
     })
 }
 
@@ -1387,6 +1447,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
 
     let mut transcript = Vec::new();
     let mut tag = String::new();
+    let mut cwd = String::new();
     let mut tasks: Vec<crate::tasks::Task> = Vec::new();
     let mut tasks_next_id: u32 = 0;
     let mut branches: Vec<crate::branch::OffNode> = Vec::new();
@@ -1426,6 +1487,13 @@ fn read_session_file(path: &Path) -> Result<Session> {
             });
             continue;
         }
+        // Project directory the session ran in; absent in pre-`/insights`
+        // files and whenever the agent had no path to record.
+        if let Some(rest) = header.strip_prefix("cwd ") {
+            let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
+            cwd = take(&data, &mut pos, len)?;
+            continue;
+        }
         // Trailing metadata record: tag + clipped last prompt (derived, so
         // only the tag is carried into the session).
         if let Some(rest) = header.strip_prefix("meta ") {
@@ -1437,15 +1505,17 @@ fn read_session_file(path: &Path) -> Result<Session> {
             continue;
         }
         let rest = header.strip_prefix("msg ").ok_or_else(corrupt)?;
-        let (role, len) = rest.split_once(' ').ok_or_else(corrupt)?;
-        let role = match role {
+        let mut it = rest.split(' ');
+        let role = match it.next().ok_or_else(corrupt)? {
             "user" => Role::User,
             "assistant" => Role::Assistant,
             _ => return Err(corrupt()),
         };
-        let len: usize = len.parse().map_err(|_| corrupt())?;
+        let len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+        // Optional trailing timestamp; absent in every pre-`/insights` file.
+        let at: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
         let text = take(&data, &mut pos, len)?;
-        transcript.push(Message { role, text });
+        transcript.push(Message { role, text, at });
     }
 
     // Off-path nodes are a cache of structure, never trusted blindly: any
@@ -1456,6 +1526,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         title,
         created_at,
         tag,
+        cwd,
         transcript,
         branches,
         tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
@@ -2187,6 +2258,66 @@ hello\n";
         assert_eq!(store.delete(&id).unwrap(), id);
         assert!(store.list().unwrap().is_empty());
         assert!(store.load(&id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_timestamp_files_load_and_resave_byte_identically() {
+        // The `msg` timestamp and the `cwd` record are optional in both
+        // directions: a file written before `/insights` existed must load,
+        // and re-saving it unchanged must not rewrite the format underneath
+        // a user still running an older build.
+        let dir = temp_dir("legacy-format");
+        let store = SessionStore::open(&dir).unwrap();
+        let legacy = concat!(
+            "plank-session 1\n",
+            "created 1000\n",
+            "used 2000\n",
+            "title 5\n",
+            "hello\n",
+            "msg user 2\n",
+            "hi\n",
+            "msg assistant 3\n",
+            "yes\n",
+            "meta 0 2\n",
+            "\n",
+            "hi\n",
+        );
+        let path = dir.join("legacy-one.kv");
+        fs::write(&path, legacy).unwrap();
+
+        let mut loaded = store.load("legacy-one").unwrap();
+        assert_eq!(loaded.transcript.len(), 2);
+        assert_eq!(loaded.title, "hello");
+        // No stamps and no project: absent fields read as absent, not as bad
+        // data.
+        assert!(loaded.transcript.iter().all(|m| m.at == 0));
+        assert!(loaded.cwd.is_empty());
+
+        store.save(&mut loaded).unwrap();
+        let rewritten = fs::read_to_string(&path).unwrap();
+        // `used` is stamped fresh on every save; everything else must match.
+        let strip_used = |s: &str| -> String {
+            s.lines()
+                .filter(|l| !l.starts_with("used "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip_used(&rewritten), strip_used(legacy));
+
+        // A stamped message and a recorded project do get written.
+        loaded.transcript[0].at = 1_500;
+        loaded.cwd = "/work".to_owned();
+        store.save(&mut loaded).unwrap();
+        let stamped = fs::read_to_string(&path).unwrap();
+        assert!(stamped.contains("msg user 2 1500\n"), "{stamped}");
+        assert!(stamped.contains("cwd 5\n/work\n"), "{stamped}");
+        // And come back out again.
+        let again = store.load("legacy-one").unwrap();
+        assert_eq!(again.transcript[0].at, 1_500);
+        assert_eq!(again.transcript[1].at, 0);
+        assert_eq!(again.cwd, "/work");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
