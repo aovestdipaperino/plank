@@ -130,6 +130,18 @@ ask permission to start a browser.\n\n\
     out
 }
 
+/// Names of every tool advertised this session, native and MCP.
+///
+/// Feeds the renderer's pseudo-tool detector, which needs to know which bare
+/// `<name>` tags are the model reaching for a real tool.
+#[must_use]
+pub fn tool_names(mcp: &[crate::tools::mcp::McpServer]) -> Vec<String> {
+    provider_tool_registry(mcp)
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect()
+}
+
 /// Builds the machine-readable tool registry for a provider engine (§4.3).
 ///
 /// The static tool schemas already live as JSON in the DS4 tools prompt

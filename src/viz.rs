@@ -300,7 +300,8 @@ const GENERIC_PSEUDO_OPENERS: [&str; 3] = ["<tool_call>", "<function_call>", "<i
 struct PseudoToolDetector {
     /// Bytes since the last newline, capped.
     line: Vec<u8>,
-    /// Inside a ``` fenced block, where markup is shown rather than called.
+    /// Inside a triple-backtick fenced block, where markup is shown rather
+    /// than called.
     in_fence: bool,
     /// Names of tools that are actually registered this session.
     tool_names: Vec<String>,

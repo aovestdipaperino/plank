@@ -1199,6 +1199,7 @@ impl Agent<'_> {
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
+        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
@@ -1516,6 +1517,7 @@ impl Agent<'_> {
         let mut stream = StreamRenderer::new(sink);
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
+        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         if !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -2849,6 +2851,7 @@ impl Agent<'_> {
         let show_tool_calls = crate::settings::active().ui.show_tool_calls;
         let show_thinking = crate::settings::active().ui.show_thinking;
         let thinking_tool_calls = crate::settings::active().engine.thinking_tool_calls;
+        let tool_names = sysprompt::tool_names(&self.tool_ctx.mcp);
         let pre_open_think = !matches!(
             self.cfg.generation.think_mode,
             crate::engine::ThinkMode::Off
@@ -2880,6 +2883,7 @@ impl Agent<'_> {
                     stream.set_show_tool_calls(show_tool_calls);
                     stream.set_show_thinking(show_thinking);
                     stream.set_thinking_tool_calls(thinking_tool_calls);
+                    stream.set_tool_names(tool_names.clone());
                     if pre_open_think {
                         stream.begin_in_think();
                     }
@@ -5377,6 +5381,7 @@ impl Agent<'_> {
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
+        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
