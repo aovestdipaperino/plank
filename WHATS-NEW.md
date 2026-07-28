@@ -3,6 +3,41 @@
 A short, human-readable highlight reel per release. For the full change list
 see the GitHub releases and commit history.
 
+## 2.7, next beta
+
+📄 **plank reads PDFs.** `read` on a `.pdf` gives you the document as Markdown
+and pages through it like any other file — the same bounded chunks, the same
+line numbers, `more` continuing where the last chunk stopped. Underneath it is
+spatial text extraction over PDFium with OCR for pages that have no text layer,
+so a scanned manual reads as well as a born-digital one, and the converted
+Markdown is cached by content hash: paging through a 400-page document parses it
+once. `visit_page` does the same for a PDF on the web, recognised by its URL or
+by the bytes that come back, instead of handing you mojibake.
+
+It is not a new tool and there is nothing to turn on. `read` simply stopped
+finding documents unreadable — which took two goes to get right. The first
+attempt worked perfectly and never ran, because nothing told the model PDFs were
+readable, so it went looking for `pdftotext` instead; the prompt now says so in
+one sentence. The second went looking, found the file, and refused it: the
+16 MB cap on how much text a read may put in context was being applied to bytes
+that never enter the context, so the 60 MB manual you actually wanted came back
+as *too large to read*. Both fixed. Office formats are still a non-goal — the
+converter reaches them by shelling out to LibreOffice, which plank is not going
+to require behind your back.
+
+🔍 **`/insights` tells you what it is doing, and stops.** The title reads
+`introspecting...` while it runs, Esc and Ctrl-C actually take effect now
+(the command runs inside the dispatch, so no key was ever being read), and a
+stopped run leaves the report you already had whole rather than half-written.
+It has also stopped drawing conclusions from numbers that are not there: a
+history recorded before per-message timestamps sums to a near-zero hour count,
+and the report used to read that back to you as "your total time spent is very
+limited". Timing is now reported only when at least half your sessions carry it.
+
+🟩 **Status lines read better.** `Opening page ...` and friends are the theme
+green instead of dim pink, with any URL lifted to white so the target stands
+out from the prose.
+
 ## 2.6.0
 
 The 2.5 beta line, promoted: five betas' worth of the cache learning to keep

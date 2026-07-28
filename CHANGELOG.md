@@ -4,6 +4,95 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Next beta on the 2.7 series.
+
+### Added
+
+- **PDFs are readable.** `read` on a `.pdf` converts the document to Markdown
+  and serves it exactly like a text file — bounded chunks, line numbers,
+  `continue_offset=`, and `more` continuing where the last chunk stopped. The
+  conversion is [liteparse](https://crates.io/crates/liteparse): spatial text
+  extraction over PDFium, with bundled Tesseract OCR filling in pages that
+  carry no text layer, so a scan reads as well as a born-digital file.
+  Converted Markdown is cached by content hash under `~/.plank/doc-cache`, so
+  re-reading a document — or paging through a long one — parses nothing.
+  Paragraphs are hard-wrapped to 100 columns on the way in, because liteparse
+  reflows each one onto a single line and line-based paging over a 5000-column
+  line is not paging at all; tables, headings and fenced code pass through
+  untouched. Design and rationale in `docs/LIGHT-PARSE.md`.
+
+  `visit_page` routes documents through the same converter, recognised by URL
+  extension or by a `%PDF-` magic in the fetched body, instead of returning
+  lossy-decoded mojibake.
+
+  Deliberately **not** a new tool: the system prompt's tool table is frozen by
+  `tests/c_parity.rs`, and appending to it would churn the Tier 1 KV
+  fingerprint. Extending `read` by extension costs one sentence of prompt —
+  which turned out to be the sentence that matters, see *Fixed* below.
+
+  Office formats stay a non-goal for now. liteparse accepts DOCX/XLSX/PPTX, but
+  it reaches them by shelling out to LibreOffice or ImageMagick to make a PDF
+  first; `DOC_EXTENSIONS` is `["pdf"]` until that dependency is detected and
+  degraded from explicitly. The whole thing sits behind the default-on
+  `docparse` feature (~17 MB of binary, a CMake build of libtesseract);
+  `--no-default-features` gets the old behaviour, where a PDF reads as bytes.
+
+### Changed
+
+- **`/insights` says what it is doing and stops when asked.** The window title
+  reads `introspecting...` for the duration, restored by a drop guard so no
+  error path can leave it describing finished work. Esc and Ctrl-C now take
+  effect: the command runs inside the dispatch, so the event loop was parked
+  and no key was ever read — the repaint drains pending keys and raises the
+  same shared interrupt flag a SIGINT sets. The session scan polls per session
+  and the streaming callback stops the current section rather than waiting for
+  the next section boundary. Cancelling is reported as cancelled, not as a
+  failure. The report is written to `report.html.tmp` and renamed into place,
+  and the render checks between sections rather than mid-string, so a stopped
+  run leaves the report you already had intact rather than a truncated one.
+- **System status lines are the theme green**, not dim pink, and any http(s)
+  URL in the message is lifted to white so the target reads apart from the
+  prose (`Opening page ...`, `Searching Google for ...`).
+
+### Fixed
+
+- **The model would not use PDF support unless the prompt said it existed.**
+  `docs/LIGHT-PARSE.md` argued the prompt cost was zero because "the model does
+  not learn anything new — documents simply stop being unreadable". False in
+  the one way that mattered: a model that believes a `.pdf` is unreadable never
+  calls `read` on one. It searched for the file, found it, and shelled out to
+  `pdftotext` — slower, unpaged, and absent on most machines. One sentence now
+  sits with the other reading rules, outside the C-locked base so the parity
+  fixtures stay authoritative.
+- **A large PDF was rejected before it was ever converted.** The conversion
+  path loaded the file through `read_file_bytes`, which enforces the 16 MB
+  `FILE_MAX_BYTES` cap — and did so only to compute a cache hash. That cap
+  bounds how much text a read may put in context, which is the wrong rule for a
+  PDF: its bytes never enter the context, they are input to a converter whose
+  Markdown is paged. A 60 MB manual, exactly the case the feature exists for,
+  came back as *too large to read*. Hashing now hands the path to `shasum`,
+  which streams it.
+- **Tesseract's C++ diagnostics landed on the TUI prompt line.** liteparse's
+  `quiet` flag gates only the crate's own logging; the bundled Tesseract writes
+  `Detected N diacritics` and friends straight to fd 2 through C stdio, and
+  because plank parses in-process those bytes went wherever the cursor happened
+  to be. A mutex-serialized `StderrSilencer` `dup2`s fd 2 to `/dev/null` around
+  the parse and hands it back afterwards. The regression test converts a noisy
+  scanned fixture in a subprocess — in-process fd capture races across parallel
+  test threads — and asserts nothing but a sentinel reaches stderr.
+- **`/insights` no longer reports timing that does not describe your history.**
+  A history recorded before per-message timestamps sums to a near-zero hour
+  count, and the model was handed it as fact: "your total time spent is very
+  limited, which suggests many quick interactions rather than sustained deep
+  work", drawn entirely from the artifact. Timing now counts only when at least
+  half the counted sessions carry it — the earlier guard asked merely whether
+  the total was non-zero, which `0.3h` sailed past. Unrepresentative timing is
+  omitted from the model's context, shown as an em dash in the stat tile, and
+  dropped from the terminal summary; the `(unrecorded)` project placeholder is
+  never sent as if it were a project name.
+
 ## [2.7.2] - 2026-07-28
 
 Beta channel on the 2.7 series.
