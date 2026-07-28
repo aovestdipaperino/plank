@@ -27,6 +27,25 @@ const DSML_BAR: &[u8] = "｜".as_bytes();
 const THINK_OPEN: &[u8] = b"<think>";
 const THINK_CLOSE: &[u8] = b"</think>";
 
+/// Whether the opt-out env var permits logging. Split out from
+/// [`tool_error_logging_enabled`] so the decision is testable: the
+/// `cfg!(test)` half of that gate is always true inside a test binary.
+fn logging_enabled_for(opt_out: Option<&std::ffi::OsStr>) -> bool {
+    opt_out.is_none_or(|v| v != "1")
+}
+
+/// Whether tool-call errors are appended to `~/.plank/tool-call-errors.log`.
+///
+/// Off under `cargo test`, and off in a spawned binary when
+/// `PLANK_NO_TOOL_ERROR_LOG=1` is set — the e2e harness sets it so fixture
+/// stanzas (`echo plank-e2e`) never enter the developer's real log.
+fn tool_error_logging_enabled() -> bool {
+    if cfg!(test) {
+        return false;
+    }
+    logging_enabled_for(std::env::var_os("PLANK_NO_TOOL_ERROR_LOG").as_deref())
+}
+
 /// Best-effort append of a rejected tool call to `$HOME/.plank/tool-call-errors.log`.
 ///
 /// Records the rejection reason plus the raw DSML stanza the model emitted so a
@@ -35,6 +54,10 @@ const THINK_CLOSE: &[u8] = b"</think>";
 /// never affected.
 fn log_tool_error(reason: &str, raw: &[u8]) {
     use std::io::Write;
+
+    if !tool_error_logging_enabled() {
+        return;
+    }
 
     let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) else {
         return;
@@ -53,7 +76,8 @@ fn log_tool_error(reason: &str, raw: &[u8]) {
         .open(dir.join("tool-call-errors.log"))
     {
         // Ignore write failures; logging must never break parsing.
-        let _ = writeln!(f, "[{secs}] {reason}\n---\n{snippet}\n===");
+        let record = format!("[{secs}] {reason}\n---\n{snippet}\n===\n");
+        let _ = f.write_all(record.as_bytes());
     }
 }
 
@@ -2041,5 +2065,17 @@ mod tests {
         let b = run_charwise(&text);
         assert_eq!(a.sink().visible, b.sink().visible);
         assert_eq!(a.finished().calls, b.finished().calls);
+    }
+
+    #[test]
+    fn tool_error_logging_honors_the_opt_out_env_var() {
+        use std::ffi::OsStr;
+        // The e2e harness sets this when spawning the binary so fixture stanzas
+        // never enter the developer's real ~/.plank log, where they previously
+        // outnumbered genuine model failures four to one.
+        assert!(!super::logging_enabled_for(Some(OsStr::new("1"))));
+        assert!(super::logging_enabled_for(None));
+        // Only an exact "1" disables it; anything else is not an opt-out.
+        assert!(super::logging_enabled_for(Some(OsStr::new("0"))));
     }
 }
