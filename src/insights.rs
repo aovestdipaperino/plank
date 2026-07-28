@@ -81,6 +81,11 @@ const MIN_RESPONSE_SECS: u64 = 2;
 /// Above this a gap is a break, a meeting, or overnight — not a response.
 const MAX_RESPONSE_SECS: u64 = 3600;
 
+/// Stands in for the project of a session saved before the directory was
+/// recorded. Displayed in the chart, but never sent to the model as if it
+/// were a project name.
+const UNRECORDED_PROJECT: &str = "(unrecorded)";
+
 /// Window within which two sessions trading messages count as concurrent use.
 const OVERLAP_WINDOW_SECS: u64 = 30 * 60;
 
@@ -718,6 +723,20 @@ pub struct Aggregated {
     pub highlights: Vec<String>,
 }
 
+impl Aggregated {
+    /// Whether the timing statistics describe the history as a whole rather
+    /// than the fraction of it that happens to carry timestamps.
+    ///
+    /// A near-zero hour count over a history whose sessions mostly predate
+    /// per-message stamps is not a small number, it is an absent one, and
+    /// presenting it as a small number invites exactly the wrong conclusion
+    /// ("you barely use this") from reader and model alike.
+    #[must_use]
+    pub fn timing_is_representative(&self) -> bool {
+        self.sessions_counted > 0 && self.sessions_without_timing * 2 <= self.sessions_counted
+    }
+}
+
 /// Sorts a `name -> count` map into a descending vector.
 fn ranked(map: BTreeMap<String, u32>) -> Vec<(String, u32)> {
     let mut v: Vec<(String, u32)> = map.into_iter().collect();
@@ -796,7 +815,7 @@ pub fn aggregate(metas: &[SessionMeta], tz_offset: i64) -> Aggregated {
             *error_tools.entry(k.clone()).or_insert(0) += v;
         }
         let project = if m.project.is_empty() {
-            "(unrecorded)"
+            UNRECORDED_PROJECT
         } else {
             m.project.as_str()
         };
@@ -1020,6 +1039,14 @@ pub type Narrative = BTreeMap<String, serde_json::Value>;
 /// Deliberately headline-only: the model is asked to interpret, and a full
 /// dump of every session would both blow the context and invite it to
 /// recompute statistics that are already exact.
+///
+/// A field that is not *meaningful* is left out rather than sent as a zero or
+/// a placeholder. This matters more than it sounds: a history recorded before
+/// per-message timestamps reports almost no hours, and one recorded before
+/// project directories reports every session under `(unrecorded)`. Sent as-is,
+/// the model spends its reasoning litigating whether the numbers can be right
+/// — correctly, since they cannot — instead of answering. An absent field asks
+/// nothing of it.
 #[must_use]
 pub fn narrative_context(agg: &Aggregated) -> String {
     let top = |v: &[(String, u32)], n: usize| -> Vec<serde_json::Value> {
@@ -1028,25 +1055,43 @@ pub fn narrative_context(agg: &Aggregated) -> String {
             .map(|(k, c)| serde_json::json!({ "name": k, "count": c }))
             .collect()
     };
-    let ctx = serde_json::json!({
-        "sessions": agg.sessions_counted,
-        "days_active": agg.days_active,
-        "human_messages": agg.human_messages,
-        "hours": (agg.hours * 10.0).round() / 10.0,
-        "lines_added": agg.lines_added,
-        "lines_removed": agg.lines_removed,
-        "files_touched": agg.files_touched,
-        "commits": agg.commits,
-        "top_tools": top(&agg.tools, 12),
-        "languages": top(&agg.languages, 8),
-        "projects": top(&agg.projects, 8),
-        "error_categories": top(&agg.errors, 8),
-        "failing_tools": top(&agg.error_tools, 8),
-        "median_response_secs": agg.response_median,
-        "concurrent_session_pairs": agg.overlaps.len(),
-        "recent_sessions": agg.highlights,
-    });
-    serde_json::to_string_pretty(&ctx).unwrap_or_default()
+    let mut ctx = serde_json::Map::new();
+    let mut put = |k: &str, v: serde_json::Value| {
+        ctx.insert(k.to_owned(), v);
+    };
+    put("sessions", agg.sessions_counted.into());
+    put("days_active", agg.days_active.into());
+    put("human_messages", agg.human_messages.into());
+    put("lines_added", agg.lines_added.into());
+    put("lines_removed", agg.lines_removed.into());
+    put("files_touched", agg.files_touched.into());
+    put("commits", agg.commits.into());
+    put("top_tools", top(&agg.tools, 12).into());
+    put("languages", top(&agg.languages, 8).into());
+    put("error_categories", top(&agg.errors, 8).into());
+    put("failing_tools", top(&agg.error_tools, 8).into());
+    put("recent_sessions", agg.highlights.clone().into());
+
+    // Timing exists only for sessions recorded since per-message stamps, and
+    // is sent only when enough of them carry it to mean anything.
+    if agg.timing_is_representative() {
+        if agg.hours >= 0.05 {
+            put("hours", ((agg.hours * 10.0).round() / 10.0).into());
+        }
+        if agg.response_median > 0 {
+            put("median_response_secs", agg.response_median.into());
+            put("concurrent_session_pairs", agg.overlaps.len().into());
+        }
+    }
+    // Nothing to say about projects when none of them were recorded.
+    if agg
+        .projects
+        .iter()
+        .any(|(name, _)| name != UNRECORDED_PROJECT)
+    {
+        put("projects", top(&agg.projects, 8).into());
+    }
+    serde_json::to_string_pretty(&serde_json::Value::Object(ctx)).unwrap_or_default()
 }
 
 /// Builds the full prompt for one section.
@@ -1076,8 +1121,12 @@ pub struct ThinkTicker {
     done: bool,
 }
 
-/// Longest line the ticker emits; a model that reasons in one long paragraph
-/// would otherwise produce no line breaks and so no visible movement.
+/// Width at which unbroken reasoning is wrapped into a tick.
+///
+/// Not a maximum: a line the model ends itself is emitted whole, however long.
+/// This threshold exists only so that a model reasoning in one long paragraph
+/// — no newlines at all — still produces visible movement rather than one
+/// enormous line at the very end.
 const TICK_WIDTH: usize = 88;
 
 impl ThinkTicker {
@@ -1268,9 +1317,10 @@ pub fn render_summary(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -
         date_str(agg.last_session, tz_offset),
         agg.days_active
     ));
-    // Sessions saved only at exit carry no usable span, so the hours clause
-    // is dropped rather than reported as zero.
-    let hours = if agg.hours >= 0.05 {
+    // Dropped rather than reported small when most of the history predates
+    // per-message stamps: an unrepresentative total misleads more than a
+    // missing one.
+    let hours = if agg.timing_is_representative() && agg.hours >= 0.05 {
         format!("{:.1}h in session, ", agg.hours)
     } else {
         String::new()
@@ -1516,7 +1566,7 @@ pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> S
     let stats: [(String, &str); 6] = [
         (commas(u64::from(agg.human_messages)), "prompts"),
         (
-            if agg.hours >= 0.05 {
+            if agg.timing_is_representative() && agg.hours >= 0.05 {
                 format!("{:.1}h", agg.hours)
             } else {
                 "—".to_owned()
@@ -1606,10 +1656,21 @@ in this chart.</p>",
         let _ = write!(
             body,
             "<p class=\"note\">Median {}, mean {} between the agent finishing and your next \
-message.</p>",
+message.",
             dur(agg.response_median),
             dur(agg.response_mean)
         );
+        // Same exposure as the hour chart: say what the sample is rather than
+        // let a partial history read as the whole one.
+        if agg.sessions_without_timing > 0 {
+            let _ = write!(
+                body,
+                " Measured over {} of {} sessions; the rest predate per-message timestamps.",
+                agg.sessions_counted - agg.sessions_without_timing,
+                agg.sessions_counted
+            );
+        }
+        body.push_str("</p>");
         section(&mut out, "response", "How fast you reply", &body);
     }
 
@@ -1900,6 +1961,71 @@ Tool result 3 (read):\nfine\n</tool_result>",
     }
 
     #[test]
+    fn narrative_context_omits_fields_that_carry_no_information() {
+        // Sending `hours: 0.0` and a project list that is entirely
+        // "(unrecorded)" makes the model argue with the data instead of
+        // reading it — observed doing exactly that on a real history.
+        let legacy = SessionMeta {
+            id: "a".to_owned(),
+            human_messages: 4,
+            tools: [("bash".to_owned(), 3)].into_iter().collect(),
+            ..SessionMeta::default()
+        };
+        let ctx = narrative_context(&aggregate(std::slice::from_ref(&legacy), 0));
+        for absent in [
+            "hours",
+            "projects",
+            "median_response_secs",
+            "concurrent_session_pairs",
+        ] {
+            assert!(!ctx.contains(absent), "{absent} should be omitted:\n{ctx}");
+        }
+        // What is real is still sent.
+        assert!(ctx.contains("top_tools") && ctx.contains("human_messages"));
+
+        // With real timing and a real project, the fields come back.
+        let recorded = SessionMeta {
+            project: "/work/thing".to_owned(),
+            response_secs: vec![30],
+            human_ts: vec![1_000, 8_200],
+            first_ts: 1_000,
+            last_ts: 8_200,
+            ..legacy.clone()
+        };
+        let ctx = narrative_context(&aggregate(std::slice::from_ref(&recorded), 0));
+        assert!(ctx.contains("hours"), "{ctx}");
+        assert!(ctx.contains("/work/thing"), "{ctx}");
+        assert!(ctx.contains("median_response_secs"), "{ctx}");
+
+        // The case that actually bit: a couple of timed sessions among many
+        // untimed ones sum to a small non-zero hour count. That is an absent
+        // number wearing a small number's clothes — the model read it as
+        // "barely uses this" and said so in the report.
+        let mut mostly_untimed = vec![recorded];
+        for i in 0..8 {
+            mostly_untimed.push(SessionMeta {
+                id: format!("u{i}"),
+                ..legacy.clone()
+            });
+        }
+        let agg = aggregate(&mostly_untimed, 0);
+        assert!(agg.hours > 0.05, "the misleading total is really there");
+        assert!(!agg.timing_is_representative());
+        let ctx = narrative_context(&agg);
+        assert!(
+            !ctx.contains("hours"),
+            "an unrepresentative total must not be sent:\n{ctx}"
+        );
+        // And it is not shown to the user as a number either.
+        assert!(render_html(&agg, &Narrative::new(), 0).contains("—"));
+        assert!(
+            !render_summary(&agg, &Narrative::new(), 0)
+                .iter()
+                .any(|l| l.contains("in session"))
+        );
+    }
+
+    #[test]
     fn think_ticker_emits_lines_while_reasoning_and_stops_at_the_answer() {
         let mut t = ThinkTicker::new();
         assert!(
@@ -1930,6 +2056,12 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let lines = t.feed(&words);
         assert!(lines.len() > 1, "expected several ticks, got {lines:?}");
         assert!(lines.iter().all(|l| l.len() <= TICK_WIDTH), "{lines:?}");
+
+        // The width is a wrap threshold, not a maximum: a line the model ends
+        // itself is passed through whole rather than chopped mid-sentence.
+        let mut t = ThinkTicker::new();
+        let long = format!("{}\n", "beta ".repeat(30));
+        assert_eq!(t.feed(&long), vec![long.trim().to_owned()]);
     }
 
     #[test]
