@@ -156,6 +156,14 @@ Model text is fed byte-by-byte through a pipeline:
 3. `dsml.rs` is the strict parser that turns a completed stanza into executable
    `ToolCall`s.
 
+A headless sub-agent's `StreamRenderer` output does not write to the caller's
+screen directly: it is routed by `ui::SubSinkTarget` through a channel to
+`worker::SubAgentSink`, which re-emits it as `UiEvent::Sub`. From there the
+TUI event loop applies it to `tui::SubPane` (the Ctrl+O buffer), the plain
+REPL prints it inline, or — for `SubSinkTarget::Null` under
+`--non-interactive` — it is discarded so the headless stdout protocol stays
+uncorrupted.
+
 ### Tools (`tools/`)
 `dispatch` maps a `ToolCall` to an implementation, mirroring the C tool table:
 `files.rs` (read/more/write/list), `edit.rs` (edit with `[upto]` anchoring,

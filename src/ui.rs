@@ -5996,8 +5996,18 @@ impl Agent<'_> {
                     log.push_plain("usage: /subagent [<name>] <task>");
                 } else {
                     log.push_dim(started);
+                    let label = match &def {
+                        Some(d) => d.name.clone(),
+                        None => "sub-agent".to_string(),
+                    };
                     let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
-                    if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
+                    log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
+                    sub.begin(label);
+                    sub.adopt_turn = true;
+                    let outcome = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+                    sub.adopt_turn = false;
+                    sub.end();
+                    if let Err(e) = outcome {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
                         log.push_plain(format!("/subagent failed: {e}"));
