@@ -286,6 +286,12 @@ impl ServerMsg {
                 let (completed, total) = tv.counter().unwrap_or((0, 0));
                 Self::Tasks { completed, total }
             }
+            // Sub-agent groundwork (not wired up yet): no remote frame exists
+            // for the sub-agent buffer, so these don't cross the wire. A later
+            // task adds dedicated frames once a remote client can view it.
+            UiEvent::SubStart(_) | UiEvent::SubEnd | UiEvent::Sub(_) => Self::Dim {
+                text: String::new(),
+            },
         }
     }
 

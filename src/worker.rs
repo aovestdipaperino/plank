@@ -69,6 +69,16 @@ pub enum UiEvent {
     /// main log back to the last [`UiEvent::MainCheckpoint`] so the re-run
     /// does not duplicate the discarded partial output.
     MainRollback,
+    /// A sub-agent run began; the payload is its display label (the configured
+    /// agent name, or a generic one for an unnamed sub-agent). The UI clears
+    /// the sub-agent buffer and starts filling it.
+    SubStart(String),
+    /// The sub-agent run finished, successfully or not. The buffer is kept so
+    /// the user can still read it.
+    SubEnd,
+    /// One render payload destined for the sub-agent buffer rather than the
+    /// main log. Boxed so the enum does not grow by a whole `UiEvent`.
+    Sub(Box<UiEvent>),
 }
 
 /// [`RenderSink`] forwarding render calls over the worker→UI channel.
@@ -90,6 +100,35 @@ impl RenderSink for ChannelSink {
     }
     fn error_text(&mut self, text: &str) {
         let _ = self.0.send(UiEvent::Error(text.to_owned()));
+    }
+}
+
+/// [`RenderSink`] forwarding a sub-agent's render calls over the worker→UI
+/// channel, wrapped in [`UiEvent::Sub`] so the UI routes them to the sub-agent
+/// buffer instead of the main log. Same hang-up tolerance as [`ChannelSink`].
+#[derive(Debug)]
+pub struct SubAgentSink(pub Sender<UiEvent>);
+
+impl RenderSink for SubAgentSink {
+    fn visible_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Sub(Box::new(UiEvent::Visible(text.to_owned()))));
+    }
+    fn think_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Sub(Box::new(UiEvent::Think(text.to_owned()))));
+    }
+    fn tool_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Sub(Box::new(UiEvent::Tool(text.to_owned()))));
+    }
+    fn error_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Sub(Box::new(UiEvent::Error(text.to_owned()))));
     }
 }
 
@@ -323,7 +362,10 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         | UiEvent::BtwBegin
         | UiEvent::BtwEnd
         | UiEvent::MainCheckpoint
-        | UiEvent::MainRollback => {}
+        | UiEvent::MainRollback
+        | UiEvent::SubStart(_)
+        | UiEvent::SubEnd
+        | UiEvent::Sub(_) => {}
     }
 }
 
@@ -344,6 +386,45 @@ mod tests {
         assert!(matches!(&got[1], UiEvent::Think(t) if t == "b"));
         assert!(matches!(&got[2], UiEvent::Tool(t) if t == "c"));
         assert!(matches!(&got[3], UiEvent::Error(t) if t == "d"));
+    }
+
+    #[test]
+    fn sub_agent_sink_wraps_render_calls_in_sub_events() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut sink = SubAgentSink(tx);
+        sink.visible_text("a");
+        sink.think_text("b");
+        sink.tool_text("c");
+        sink.error_text("d");
+        drop(sink);
+        let got: Vec<UiEvent> = rx.iter().collect();
+        assert!(
+            matches!(got.as_slice(), [
+                UiEvent::Sub(a),
+                UiEvent::Sub(b),
+                UiEvent::Sub(c),
+                UiEvent::Sub(d),
+            ] if matches!(**a, UiEvent::Visible(ref s) if s == "a")
+                && matches!(**b, UiEvent::Think(ref s) if s == "b")
+                && matches!(**c, UiEvent::Tool(ref s) if s == "c")
+                && matches!(**d, UiEvent::Error(ref s) if s == "d")),
+            "unexpected events: {got:?}"
+        );
+    }
+
+    #[test]
+    fn apply_ignores_sub_events_on_the_main_log() {
+        // The main log must never absorb sub-agent output: the UI unwraps `Sub`
+        // and applies the inner event to the sub-agent buffer instead.
+        let mut log = OutputLog::new();
+        let before = log.line_count();
+        apply(&mut log, UiEvent::SubStart("research".to_string()));
+        apply(
+            &mut log,
+            UiEvent::Sub(Box::new(UiEvent::Visible("x".to_string()))),
+        );
+        apply(&mut log, UiEvent::SubEnd);
+        assert_eq!(log.line_count(), before);
     }
 
     #[test]

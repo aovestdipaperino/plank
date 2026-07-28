@@ -284,6 +284,15 @@ impl OutputLog {
         self.push_spans(vec![Span::raw(text.into())]);
     }
 
+    /// Number of committed lines, not counting an in-progress streamed line.
+    /// A read-only peek for callers (like tests) that just need to observe
+    /// whether the log grew, without the side effects [`checkpoint`] has
+    /// (flushing markdown, ending the current line).
+    #[must_use]
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
     /// Appends a line in the thinking gray, for tool and debug output.
     pub fn push_dim(&mut self, text: impl Into<String>) {
         self.push_spans(vec![Span::styled(text.into(), think_style())]);
