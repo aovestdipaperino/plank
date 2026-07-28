@@ -335,6 +335,16 @@ test` and review the diff before committing.
   latched interrupt has to be consumed (`shared.interrupt` under the TUI, the
   SIGINT flag otherwise) or the next turn starts already cancelled.
 
+- **`Color::Black` is not black.** Ratatui's `Color::Black` emits ANSI index 0,
+  which is a *palette slot*, not a value: terminal themes remap it freely and
+  most render it as a dark grey. Painting the screensaver's night sky with it
+  produced a grey background that looked like a missing fill but was the
+  terminal substituting its own colour. Any surface that must be a specific
+  colour rather than "whatever the theme calls this" needs an explicit
+  `Color::Rgb`. The named constants are still right for text that should adapt
+  to the user's theme — the distinction is whether you are asking for a role or
+  a value.
+
 ## Part 2 — Environment & tooling
 
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so

@@ -4,7 +4,7 @@ All notable changes to plank are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.7.1] - unreleased
+## [2.7.2] - 2026-07-28
 
 Beta channel on the 2.7 series.
 
@@ -81,6 +81,22 @@ Beta channel on the 2.7 series.
 - **Rust 1.93 is now the minimum.** The vendored `edit` crates require it.
   CI already builds on stable; a local toolchain older than that will refuse to
   build with a clear `rust-version` error.
+
+### Fixed
+
+- **The starfield screensaver came up on grey instead of black.** Its opaque
+  background was painted with `Color::Black`, which is ANSI index 0 — a slot
+  terminal themes remap freely, and most render as a dark grey. It is now an
+  explicit `Rgb(0, 0, 0)`, which no theme can reinterpret. The same paint path
+  backs an opaquely opened arcade game, so those get a real black too.
+
+### Internal
+
+- The compaction prompt is locked with a fixture (`tests/plank_prompts.rs`, the
+  mirror of `c_parity.rs` for text plank deliberately does *not* share with the
+  C reference). It names the `<summary>`/`<analysis>` tags that
+  `compact::extract_summary` parses, so an accidental edit to either half would
+  have failed silently at runtime rather than in CI.
 
 ## [2.7.0] - 2026-07-27
 

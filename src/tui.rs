@@ -1567,8 +1567,11 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
         veil(frame.buffer_mut(), area);
     } else {
         frame.render_widget(Clear, area);
+        // An explicit RGB triple, not `Color::Black`: that is ANSI index 0,
+        // which themes remap freely and most render as a dark grey — the
+        // starfield came up on grey. Night sky wants a real black.
         frame.render_widget(
-            Block::default().style(Style::default().bg(Color::Black)),
+            Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
             area,
         );
     }
@@ -3015,6 +3018,34 @@ mod tests {
         let mut a = crate::arcade::Arcade::new();
         a.open_screensaver(7, 80, 24);
         a
+    }
+
+    /// The screensaver paints its own background, and it has to be a real
+    /// black. `Color::Black` is ANSI index 0, which terminal themes are free to
+    /// remap — most render it as a dark grey — so the starfield came up on grey
+    /// instead of black. Only an explicit RGB triple is actually black.
+    #[test]
+    fn the_screensaver_background_is_true_black() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let arcade = screensaver();
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_arcade(f, &arcade)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        // Every cell of the play area, star or gap, sits on the same black.
+        for y in 0..23 {
+            for x in 0..80 {
+                let cell = buf.cell(Position::new(x, y)).unwrap();
+                assert_eq!(
+                    cell.bg,
+                    Color::Rgb(0, 0, 0),
+                    "cell ({x},{y}) is not true black: {:?}",
+                    cell.bg
+                );
+            }
+        }
     }
 
     /// Draws one arcade frame and returns it as plain rows of text.
