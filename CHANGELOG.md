@@ -23,21 +23,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **A stanza opened inside `<think>` was blamed for the wrong mistake.**
-  When its tail streamed out past `</think>`, the model was told its DSML
-  markup was malformed and sent off to rewrite syntax that was already
-  correct; it is now reported as the placement error it actually is. The
+- **Two more shapes of tool call that used to die outright now run.** The
   dropped-leading-bar typo on inner tags (`<DSML｜parameter …>`) is now
-  accepted, matching the tolerance the stanza opener has always had. A tool
-  call whose name is the prompt's own `$TOOL_NAME` template is told so
-  directly instead of being reported as a placement mistake.
+  accepted, matching the tolerance the stanza opener has always had; the
+  previous "unexpected DSML tag" error it produced sent the model chasing
+  the wrong cause, in one recorded case concluding the fullwidth bar
+  character itself was wrong. A tool call whose name is the prompt's own
+  `$TOOL_NAME` placeholder now gets its own error instead of being reported
+  as a placement mistake.
 - **In-think rejections are logged with the stanza that was rejected**,
   rather than an empty payload, which was the single most common entry in
-  `~/.plank/tool-call-errors.log`. Note the hypothesis that this misdiagnosis
-  compounded into further misdiagnoses downstream did not hold up: the one
-  path that could have re-triggered a syntax error after an in-think stanza
-  was already unreachable, so the fix here is the evidence-capture bug on
-  its own, not a chain of failures.
+  `~/.plank/tool-call-errors.log`. A hypothesis that this empty-payload bug
+  compounded into a further misdiagnosis downstream — a leaked in-think
+  stanza tail being reported as bad syntax rather than misplacement — did
+  not survive review: the one call site that could report bad syntax
+  already guards on the same in-think state, so that path was unreachable.
+  The fix here is the evidence-capture bug on its own, not a chain of
+  failures.
 - **Test runs stopped writing to the real error log.** `cargo test` was
   appending its fixture failures to the developer's own
   `~/.plank/tool-call-errors.log`, mixing synthetic test data into a file
