@@ -301,7 +301,6 @@ serve/control options deliberately have no key. Six groups:
 | `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
 | `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
 | `ask` | `maxOptions` | the `ask` tool's option cap |
-| `tools` | `task`, `agent`, `planMode` | opt-in switches for non-trained tools |
 
 Editing: `/config` opens an interactive modal (`configform.rs`) in the TUI, or
 `/config <section>.<key> <value>` sets one from the prompt (e.g. `/config

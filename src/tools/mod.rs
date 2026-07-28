@@ -117,10 +117,6 @@ pub struct ToolContext {
     /// True while a read-only plan-mode gate is active (issue #50). Mutating
     /// tools refuse until `ExitPlanMode` clears it.
     pub plan_mode: bool,
-    /// Which opt-in non-trained tools (`task`/`agent`/plan mode) are enabled,
-    /// captured from settings when the context is built. Dispatch refuses a
-    /// disabled tool even if the model calls it.
-    pub tools: crate::settings::ToolSettings,
     /// Set by a tool hook's `{"continue": false}` response envelope; the turn
     /// driver halts the turn after the dispatch that produced it.
     pub hook_stop: Option<String>,
@@ -205,7 +201,6 @@ impl ToolContext {
             skill_invocations: 0,
             subagent_depth: 0,
             plan_mode: false,
-            tools: crate::settings::active().tools,
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),

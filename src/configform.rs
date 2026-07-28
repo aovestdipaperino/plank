@@ -44,9 +44,6 @@ pub enum FieldId {
     SafetyBtwSuspend,
     McpTimeoutSecs,
     AskMaxOptions,
-    ToolsTask,
-    ToolsAgent,
-    ToolsPlanMode,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -249,27 +246,6 @@ pub static FIELDS: &[Field] = &[
         "ask tool max options",
         Kind::Count,
     ),
-    f(
-        FieldId::ToolsTask,
-        "tools",
-        "task",
-        "task todo-list tool",
-        Kind::Bool,
-    ),
-    f(
-        FieldId::ToolsAgent,
-        "tools",
-        "agent",
-        "agent sub-agent tool",
-        Kind::Bool,
-    ),
-    f(
-        FieldId::ToolsPlanMode,
-        "tools",
-        "planMode",
-        "plan mode",
-        Kind::Bool,
-    ),
 ];
 
 const fn f(
@@ -330,9 +306,6 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
         FieldId::AskMaxOptions => s.ask.max_options.to_string(),
-        FieldId::ToolsTask => s.tools.task.to_string(),
-        FieldId::ToolsAgent => s.tools.agent.to_string(),
-        FieldId::ToolsPlanMode => s.tools.plan_mode.to_string(),
     }
 }
 
@@ -369,9 +342,6 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
-        FieldId::ToolsTask => s.tools.task = !s.tools.task,
-        FieldId::ToolsAgent => s.tools.agent = !s.tools.agent,
-        FieldId::ToolsPlanMode => s.tools.plan_mode = !s.tools.plan_mode,
         FieldId::SafetySandbox => s.safety.sandbox = cycle_tri(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = cycle_tri(s.safety.btw_suspend),
         _ => {}
@@ -458,10 +428,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiCrtOff
         | FieldId::UiReducedMotion
         | FieldId::UiEasterEggs
-        | FieldId::UiBuiltinEditor
-        | FieldId::ToolsTask
-        | FieldId::ToolsAgent
-        | FieldId::ToolsPlanMode => {
+        | FieldId::UiBuiltinEditor => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -482,9 +449,6 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiReducedMotion => s.ui.reduced_motion = b,
         FieldId::UiEasterEggs => s.ui.easter_eggs = b,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
-        FieldId::ToolsTask => s.tools.task = b,
-        FieldId::ToolsAgent => s.tools.agent = b,
-        FieldId::ToolsPlanMode => s.tools.plan_mode = b,
         _ => {}
     }
 }
@@ -853,7 +817,7 @@ mod tests {
             .filter(|r| r.header)
             .map(|r| r.label.as_str())
             .collect();
-        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask", "tools"]);
+        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask"]);
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }
 }
