@@ -207,6 +207,7 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> Option<String> {
 /// hold the whole file — fine for a pasted screenshot, wrong for a 60 MB PDF
 /// whose bytes are never wanted in the first place. Handing `shasum` the path
 /// lets it stream.
+#[cfg(any(feature = "docparse", test))]
 pub(crate) fn sha256_file_hex(path: &Path) -> Option<String> {
     let out = Command::new("shasum")
         .args(["-a", "256"])

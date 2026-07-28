@@ -87,7 +87,9 @@ fn convert(path: &Path, display: &str) -> Result<String, String> {
         // none of it, matching how the file tools treat partial reads.
         ocr_failure_fatal: false,
         // liteparse logs timings to stderr unless silenced, which would land
-        // in the middle of the TUI.
+        // in the middle of the TUI. This covers only the crate's own logging;
+        // the bundled Tesseract's C++ prints bypass it and are held back by
+        // StderrSilencer around the parse below.
         quiet: true,
         ..Default::default()
     };
@@ -99,9 +101,11 @@ fn convert(path: &Path, display: &str) -> Result<String, String> {
         .enable_all()
         .build()
         .map_err(|e| format!("convert {display}: {e}"))?;
-    let result = runtime
-        .block_on(parser.parse(&path.to_string_lossy()))
-        .map_err(|e| format!("convert {display}: {e}"))?;
+    let result = {
+        let _silencer = StderrSilencer::engage();
+        runtime.block_on(parser.parse(&path.to_string_lossy()))
+    }
+    .map_err(|e| format!("convert {display}: {e}"))?;
 
     if result.text.trim().is_empty() {
         return Err(format!(
@@ -111,6 +115,94 @@ fn convert(path: &Path, display: &str) -> Result<String, String> {
         ));
     }
     Ok(wrap_markdown(&result.text))
+}
+
+/// Routes fd 2 to `/dev/null` for the lifetime of the guard.
+///
+/// liteparse's `quiet` config only silences the crate's own logging. The
+/// bundled Tesseract writes its C++ diagnostics (`Detected N diacritics` and
+/// friends) straight to stderr through C stdio, which no Rust-side flag
+/// reaches — and because plank parses in-process, those bytes land wherever
+/// the terminal cursor happens to be: the TUI's prompt line. `dup2` is the
+/// one lever that covers both Rust and C writers, since both bottom out at
+/// `write(2, …)`.
+///
+/// Process-wide by nature: while engaged, *any* thread's stderr is
+/// discarded. plank's own diagnostics go to a log file (see `errlog`) and
+/// the TUI draws on stdout, so the only bytes lost are the parser's. A
+/// static mutex serializes engagements: two overlapping guards could restore
+/// the fd in the wrong order and strand fd 2 on `/dev/null` for good.
+#[cfg(all(feature = "docparse", unix))]
+struct StderrSilencer {
+    /// The dup of the real fd 2, or -1 when engagement failed (the guard is
+    /// then a no-op).
+    saved: std::os::fd::RawFd,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(all(feature = "docparse", unix))]
+static STDERR_SILENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(all(feature = "docparse", unix))]
+impl StderrSilencer {
+    fn engage() -> Self {
+        // A poisoned lock still gets a guard: the previous holder panicking
+        // does not make silencing this parse any less correct.
+        let lock = STDERR_SILENCE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: every call uses valid arguments; failures are reported
+        // through the return value / a negative fd, never UB.
+        let saved = unsafe {
+            let saved = libc::dup(libc::STDERR_FILENO);
+            if saved < 0 {
+                return Self { saved, _lock: lock };
+            }
+            let null_fd = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+            if null_fd < 0 || libc::dup2(null_fd, libc::STDERR_FILENO) < 0 {
+                if null_fd >= 0 {
+                    libc::close(null_fd);
+                }
+                libc::close(saved);
+                return Self {
+                    saved: -1,
+                    _lock: lock,
+                };
+            }
+            libc::close(null_fd);
+            saved
+        };
+        Self { saved, _lock: lock }
+    }
+}
+
+#[cfg(all(feature = "docparse", unix))]
+impl Drop for StderrSilencer {
+    fn drop(&mut self) {
+        if self.saved < 0 {
+            return;
+        }
+        // SAFETY: `saved` is a live dup of the original fd 2 held by this
+        // guard, and the lock guarantees no other guard is mid-redirect.
+        unsafe {
+            // Flush C stdio while fd 2 still points at /dev/null, so a
+            // buffered diagnostic cannot slip out after the fd comes back.
+            libc::fflush(std::ptr::null_mut());
+            libc::dup2(self.saved, libc::STDERR_FILENO);
+            libc::close(self.saved);
+        }
+    }
+}
+
+/// No fd redirection without a unix fd table: the guard is a no-op there.
+#[cfg(all(feature = "docparse", not(unix)))]
+struct StderrSilencer;
+
+#[cfg(all(feature = "docparse", not(unix)))]
+impl StderrSilencer {
+    fn engage() -> Self {
+        Self
+    }
 }
 
 /// Column the converted Markdown is wrapped to before caching.
@@ -236,5 +328,61 @@ mod tests {
     fn preserves_short_lines() {
         let text = "# Title\n\nshort line\n\nanother\n";
         assert_eq!(wrap_markdown(text), text);
+    }
+
+    /// Regression for the Tesseract stderr leak. The bundled OCR engine
+    /// writes C++ diagnostics ("Detected N diacritics") straight to fd 2
+    /// through C stdio, which liteparse's `quiet` cannot gate — and because
+    /// plank parses in-process, those bytes land wherever the terminal cursor
+    /// is: the TUI's prompt line. The child process converts a noisy scan
+    /// whose OCR reliably triggers that print, then writes a sentinel to
+    /// fd 2. The child's entire stderr must be exactly that sentinel, proving
+    /// both that the parser was silenced and that fd 2 was handed back
+    /// intact afterwards.
+    ///
+    /// A subprocess, not an in-process capture: fd redirection is
+    /// process-wide, and parallel tests redirecting the same fd 2 would race.
+    #[cfg(all(unix, feature = "docparse"))]
+    #[test]
+    fn parser_diagnostics_never_reach_stderr() {
+        const CHILD_ENV: &str = "PLANK_DOC_STDERR_TEST_CHILD";
+        const SENTINEL: &str = "stderr-alive-after-conversion";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join("fixtures")
+                .join("doc_noisy.pdf");
+            let markdown = convert(&fixture, "doc_noisy.pdf").expect("noisy scan converts");
+            assert!(
+                markdown.contains("Caf"),
+                "OCR lost the page text: {markdown:?}"
+            );
+            // Written via libc so no Rust-side buffering or test-output
+            // capture interferes: this must reach fd 2 verbatim.
+            unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    SENTINEL.as_ptr().cast(),
+                    SENTINEL.len(),
+                );
+            }
+            // A distinctive success code: a filter typo running zero tests
+            // exits 0, a panic exits 101 — neither passes for success here.
+            std::process::exit(42);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "doc::tests::parser_diagnostics_never_reach_stderr",
+                "--exact",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(42), "child failed: {out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            SENTINEL,
+            "parser wrote to stderr during conversion"
+        );
     }
 }

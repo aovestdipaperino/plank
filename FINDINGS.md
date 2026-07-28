@@ -614,3 +614,18 @@ test` and review the diff before committing.
   `ds4_tokenize_rendered_chat` (public at `refs/ds4/ds4.h:203`) for the tools
   prompt and the reminder. Note the alias is deliberately narrow — only the one
   observed misspelling, not any four letters — so prose cannot open a stanza.
+
+- **liteparse's `quiet` does not silence the bundled Tesseract.** The flag
+  only gates the crate's own Rust-side logging; Tesseract 5.3.4's
+  `tprintf("Detected %d diacritics", …)` (`textord/strokewidth.cpp:381`,
+  unconditional on the `PFR_NOISE` path) writes to fd 2 through C stdio,
+  which no Rust-side flag reaches. Because plank parses in-process, those
+  bytes land wherever the terminal cursor happens to be — the TUI's prompt
+  line. Any C library can do this; the one lever that covers both Rust and C
+  writers is `dup2` on the fd itself. `StderrSilencer` in `src/doc/mod.rs`
+  routes fd 2 to `/dev/null` around the parse, mutex-serialized so
+  overlapping guards cannot restore in the wrong order and strand the fd.
+  The regression test (`doc::tests::parser_diagnostics_never_reach_stderr`)
+  converts a noisy scanned fixture (`tests/fixtures/doc_noisy.pdf`) in a
+  subprocess — in-process fd capture races across parallel test threads —
+  and asserts nothing but a post-conversion sentinel reaches stderr.
