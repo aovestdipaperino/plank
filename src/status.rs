@@ -712,18 +712,32 @@ pub fn format_user_prompt_echo(text: &str, color: bool) -> String {
 }
 
 /// Formats a system status line, mirroring `agent_publish_system_status`:
-/// a `✦` bullet followed by the message, dim pink on TTYs.
+/// a `✦` bullet followed by the message in the theme green on TTYs, with any
+/// URL in the message lifted to white so the target stands out from the prose.
 ///
 /// These are the agent talking about itself ("Searching Google for ...",
 /// "Compaction interrupted; ..."), distinct from both model output and the
 /// dim tool-observation log. The returned string has no trailing newline.
 #[must_use]
 pub fn system_line(msg: &str, color: bool) -> String {
-    if color {
-        format!("\x1b[33m✦ \x1b[38;5;218m{msg}\x1b[0m")
-    } else {
-        format!("✦ {msg}")
+    if !color {
+        return format!("✦ {msg}");
     }
+    let green = format!("\x1b[38;5;{THEME_COLOR}m");
+    let mut body = String::with_capacity(msg.len());
+    for (i, word) in msg.split(' ').enumerate() {
+        if i > 0 {
+            body.push(' ');
+        }
+        if word.starts_with("http://") || word.starts_with("https://") {
+            body.push_str("\x1b[38;5;231m");
+            body.push_str(word);
+            body.push_str(&green);
+        } else {
+            body.push_str(word);
+        }
+    }
+    format!("\x1b[33m✦ {green}{body}\x1b[0m")
 }
 
 /// Formats the welcome banner line, mirroring the C agent's phrasing.
@@ -763,6 +777,19 @@ pub fn no_model_lines() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_line_is_theme_green_with_white_urls() {
+        assert_eq!(
+            system_line("Opening page x...", false),
+            "✦ Opening page x..."
+        );
+        let s = system_line("Opening page https://example.com/a...", true);
+        assert!(s.contains(&format!("\x1b[38;5;{THEME_COLOR}m")));
+        assert!(s.contains("\x1b[38;5;231mhttps://example.com/a..."));
+        // Prose after the URL returns to green.
+        assert!(system_line("see https://x.dev now", true).ends_with(" now\x1b[0m"));
+    }
 
     #[test]
     fn ctx_size_formatting() {

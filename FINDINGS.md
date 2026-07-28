@@ -377,6 +377,15 @@ test` and review the diff before committing.
   to the user's theme — the distinction is whether you are asking for a role or
   a value.
 
+- **The TUI's ANSI parser only understands `38;2` / `38;5` colours.**
+  `apply_sgr` in `src/tui.rs` handles reset, `39`/`49`, and the truecolor and
+  256-colour forms; the basic and bright SGR codes (`30`–`37`, `90`–`97`) fall
+  through the `_ => i += 1` arm and are silently ignored, so text styled with
+  them keeps whatever colour was active. Escape sequences that must survive the
+  stdout *and* TUI paths — anything routed through `OutputLog::push_ansi`, e.g.
+  `status::system_line` — have to use the indexed form (white is `38;5;231`,
+  not `97`).
+
 ## Part 2 — Environment & tooling
 
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so
