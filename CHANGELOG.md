@@ -6,9 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Next beta on the 2.7 series.
+## [2.7.3] - 2026-07-28
+
+Beta channel on the 2.7 series.
 
 ### Added
+
+- **A sub-agent output pane on Ctrl-O.** Sub-agent model text no longer
+  interleaves with the parent transcript: it streams into a second `OutputLog`
+  you toggle to with Ctrl-O, titled `[sub-agent: <label>]` with a
+  `ctrl+o: back to main` hint drawn over it without changing the output
+  geometry. Scroll, End, jump hints, mouse drag-selection and the code-copy hit
+  test all follow the visible pane, and the selection is cleared on a switch so
+  a highlight is never painted over the other pane's rows. `/subagent` runs
+  follow into the pane too, and a nested `agent` call can no longer clear the
+  buffer or end the outer run mid-stream. The pane resets on `/clear`, `/new`,
+  `/resume` and `/switch`. Headless and remote paths are unaffected: the
+  pane-only events have no wire frame and are never broadcast, and the plain
+  REPL keeps printing sub-agent output on stdout while the machine protocols
+  keep the null sink.
+- **The task, agent and plan-mode tools are always on.** The `tools` opt-in
+  block in settings is gone along with its three README rows; there is nothing
+  left to enable.
 
 - **PDFs are readable.** `read` on a `.pdf` converts the document to Markdown
   and serves it exactly like a text file — bounded chunks, line numbers,
@@ -58,6 +77,11 @@ Next beta on the 2.7 series.
 
 ### Fixed
 
+- **The screensaver came up the instant a long generation ended.** The idle
+  clock was stamped when an event arrived, so the Enter that submitted the
+  prompt started the countdown and it had long elapsed by the time the turn
+  finished. `tui_loop` now also stamps after the key match, and remote-driven
+  and `--prompt` startup turns stamp at their own call sites.
 - **The model would not use PDF support unless the prompt said it existed.**
   `docs/LIGHT-PARSE.md` argued the prompt cost was zero because "the model does
   not learn anything new — documents simply stop being unreadable". False in
