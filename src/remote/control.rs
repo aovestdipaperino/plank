@@ -254,10 +254,11 @@ pub enum ServerMsg {
 }
 
 impl ServerMsg {
-    /// Maps a worker [`UiEvent`] to its wire message. Total and lossless.
+    /// Maps a worker [`UiEvent`] to its wire message, or `None` if the event
+    /// has no wire representation and must not be sent.
     #[must_use]
-    pub fn from_event(ev: &UiEvent) -> Self {
-        match ev {
+    pub fn from_event(ev: &UiEvent) -> Option<Self> {
+        Some(match ev {
             UiEvent::Visible(t) => Self::Visible { text: t.clone() },
             UiEvent::Think(t) => Self::Think { text: t.clone() },
             UiEvent::Tool(t) => Self::Tool { text: t.clone() },
@@ -289,10 +290,8 @@ impl ServerMsg {
             // Sub-agent groundwork (not wired up yet): no remote frame exists
             // for the sub-agent buffer, so these don't cross the wire. A later
             // task adds dedicated frames once a remote client can view it.
-            UiEvent::SubStart(_) | UiEvent::SubEnd | UiEvent::Sub(_) => Self::Dim {
-                text: String::new(),
-            },
-        }
+            UiEvent::SubStart(_) | UiEvent::SubEnd | UiEvent::Sub(_) => return None,
+        })
     }
 
     /// True for a `status` frame (used by the connection loop's coalescing).
@@ -1064,9 +1063,8 @@ fn do_handshake<S: std::io::Read + std::io::Write>(
     let (tail, highest_id) = state.bus.scrollback_since(resume_from);
     let scrollback = tail
         .into_iter()
-        .map(|s| ScrollbackEntry {
-            id: s.id,
-            msg: ServerMsg::from_event(&s.event),
+        .filter_map(|s| {
+            ServerMsg::from_event(&s.event).map(|msg| ScrollbackEntry { id: s.id, msg })
         })
         .collect();
     send(
@@ -1170,7 +1168,9 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
 ) -> Result<(), String> {
     let mut pending_status: Option<SeqEvent> = None;
     while let Ok(seq) = rx.try_recv() {
-        let msg = ServerMsg::from_event(&seq.event);
+        let Some(msg) = ServerMsg::from_event(&seq.event) else {
+            continue;
+        };
         if msg.is_status() {
             pending_status = Some(seq); // keep only the newest
             continue;
@@ -1181,10 +1181,9 @@ fn pump_bus<S: std::io::Read + std::io::Write>(
         let now = std::time::Instant::now();
         let due = last_status_at.is_none_or(|prev| now.duration_since(prev) >= STATUS_MIN_INTERVAL);
         if due {
-            send(
-                ws,
-                &ServerFrame::seq(seq.id, ServerMsg::from_event(&seq.event)),
-            )?;
+            if let Some(msg) = ServerMsg::from_event(&seq.event) {
+                send(ws, &ServerFrame::seq(seq.id, msg))?;
+            }
             *last_status_at = Some(now);
         }
     }
@@ -1335,6 +1334,16 @@ mod tests {
     // --- protocol round-trip ---
 
     #[test]
+    fn from_event_none_for_sub_agent_variants() {
+        assert!(ServerMsg::from_event(&UiEvent::SubStart("agent".into())).is_none());
+        assert!(ServerMsg::from_event(&UiEvent::SubEnd).is_none());
+        assert!(
+            ServerMsg::from_event(&UiEvent::Sub(Box::new(UiEvent::Visible("x".into())))).is_none()
+        );
+        assert!(ServerMsg::from_event(&UiEvent::Visible("v".into())).is_some());
+    }
+
+    #[test]
     fn frame_roundtrip_all_events() {
         let events = [
             UiEvent::Visible("v".into()),
@@ -1358,7 +1367,7 @@ mod tests {
             }),
         ];
         for (i, ev) in events.iter().enumerate() {
-            let frame = ServerFrame::seq(i as u64, ServerMsg::from_event(ev));
+            let frame = ServerFrame::seq(i as u64, ServerMsg::from_event(ev).unwrap());
             let json = frame.to_json().unwrap();
             let back: ServerFrame = serde_json::from_str(&json).unwrap();
             assert_eq!(frame, back, "roundtrip for {ev:?}");
