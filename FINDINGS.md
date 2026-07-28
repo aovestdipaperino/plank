@@ -233,6 +233,21 @@ test` and review the diff before committing.
   that a spy/echo engine which models no token buffer cannot catch this class of
   bug — it is invisible to `kvtier`'s unit tests by construction, and only the
   `PLANK_KV_DEBUG` trace or a real-model timing shows it.
+  *Instance 3 — the subagent fork.* The fork truncated the sidechain out of the
+  text transcript but left the live KV holding parent+sidechain, so the very
+  next turn's prompt (parent prefix + the small framed report) diverged behind
+  the live end and the **whole parent context re-prefilled from zero** — the
+  slowest possible turn, every time a sub-agent finished. The fix follows the
+  `/btw` aside precedent instead of fighting the rule: `begin_subagent_fork`
+  captures a real frontier snapshot (`engine.get_kv()`), and every fork-end
+  path (`finish_subagent_fork`, plus the `agent` tool's inline truncation)
+  restores it (`engine.set_kv()`), turning the post-fork sync back into an
+  extend that prefills only the report. The guard is a *stack*
+  (`Agent::fork_kv`) because `/subagent` turns are interactive and can nest;
+  engines without snapshot support (Echo, scripted test doubles) return `None`
+  from `get_kv` and keep the old re-prefill behavior. Unit tests can only
+  assert the capture/restore *calls* — per the note above, the actual token
+  savings need a real model or the `PLANK_KV_DEBUG` trace to observe.
 - **`count_tokens` must subtract chat-template overhead** so it reports
   text-only counts; the template wrapper is measured once at engine startup
   (`src/ds4engine.rs`).
@@ -638,3 +653,39 @@ test` and review the diff before committing.
   converts a noisy scanned fixture (`tests/fixtures/doc_noisy.pdf`) in a
   subprocess — in-process fd capture races across parallel test threads —
   and asserts nothing but a post-conversion sentinel reaches stderr.
+
+- **The agent's own tool harness has no write-lock around file mutations —
+  concurrent tool invocations can interleave their outputs into shared state.**
+  Discovered while drafting a Medium post via the `medium_create_draft` MCP tool:
+  the `write` tool and `bash` fired in the same frame, and the bash output
+  (`wc -w` results) landed as literal bytes inside the file content being
+  written, including the DSML tool-call syntax that invoked the bash command.
+  The corrupted file then caused `edit` to fail (old text anchor no longer
+  matched) and `read` to return a file that contained raw DSML markers as
+  content rather than Markdown. Three distinct failure modes from one root cause:
+
+  1. **No mutual exclusion between write and bash.** The harness dispatches all
+     tools in a single frame without ordering guarantees. A `write` that creates
+     or overwrites a file and a `bash` that reports on it race: the bash output
+     stream lands inside the write's byte stream, producing a file whose content
+     is the intended text plus an embedded tool-call stanza and its output.
+  2. **Bash heredoc captures DSML syntax as literal stdin.** Using
+     `cat << 'POSTEOF'` heredocs to append to a file, the bash process receives
+     DSML markers (`<｜DSML｜tool_calls>`, `</think>`) as literal stdin bytes.
+     The system then tries to parse those stdin bytes as tool calls instead of
+     file content, producing parse errors and further corrupting the file.
+  3. **Write-tool content truncated by concurrent bash.** The `write` tool's
+     content parameter is a single string; when a bash job in the same frame
+     produces output before the write completes, the write's byte stream is
+     interleaved with the bash output at the OS level, truncating the written
+     content at the point of interleaving.
+
+  The fix for the draft was to use Python for file writes (single-threaded, no
+  concurrent output to corrupt) instead of the `write` tool or bash heredocs.
+  The root cause — no write-lock around file mutations in the tool harness —
+  is unresolved in the agent itself. Any tool that writes a file and any tool
+  that reads or reports on that file must not be dispatched in the same frame,
+  or the harness must serialize them. The same class of bug can affect any pair
+  of tools where one produces output that another consumes as input: `edit` +
+  `bash`, `write` + `read`, `write` + `edit`, and any MCP tool that writes a
+  file followed by a built-in tool that reads it.

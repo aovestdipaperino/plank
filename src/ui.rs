@@ -965,6 +965,15 @@ struct Agent<'a> {
     session_start: std::time::Instant,
     /// Destination for headless sub-agent output; see [`SubSinkTarget`].
     sub_sink: SubSinkTarget,
+    /// Parent-KV snapshots captured by
+    /// [`begin_subagent_fork`](Self::begin_subagent_fork), one per open fork
+    /// (a stack: nested forks restore LIFO). The C engine's sync can only
+    /// *extend* a checkpoint, so without the restore at fork end the next
+    /// turn — parent prefix plus the small report — diverges behind the
+    /// sidechain's live end and the whole parent context re-prefills from
+    /// token zero. `None` entries are engines without KV support (Echo),
+    /// where the restore no-ops.
+    fork_kv: Vec<Option<crate::kvcache::KVCache>>,
 }
 
 /// Formats a non-negative token count with thousands separators (`12345` →
@@ -1407,6 +1416,7 @@ impl Agent<'_> {
             })
             .map(|m| m.text.trim().to_owned());
         self.session.transcript.truncate(fork_at);
+        self.restore_fork_kv();
         match result {
             Err(e) => format!("Tool error: sub-agent failed: {e}\n"),
             Ok(()) => match report {
@@ -3429,11 +3439,29 @@ the original is frozen and listed in /tree"
     /// sync reuses the parent KV cache.
     fn begin_subagent_fork(&mut self, instructions: Option<&str>, task: &str) -> usize {
         let fork_at = self.session.transcript.len();
+        // Capture the live KV before the sidechain diverges it; the matching
+        // restore is `restore_fork_kv`, called by every fork-end path. `None`
+        // on engines without snapshot support — the restore then no-ops and
+        // the next turn re-prefills as before this guard existed.
+        self.fork_kv.push(self.engine.get_kv());
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
         )));
         fork_at
+    }
+
+    /// Rolls the engine's KV back to the parent prefix captured by
+    /// [`begin_subagent_fork`](Self::begin_subagent_fork). Without it, the
+    /// post-fork prompt (parent prefix + the small report) diverges behind
+    /// the sidechain's live end, and the extend-only C sync re-prefills the
+    /// whole parent context from token zero instead of just the report. A
+    /// restore failure keeps exactly that status quo, so it is swallowed.
+    fn restore_fork_kv(&mut self) {
+        let Some(Some(kv)) = self.fork_kv.pop() else {
+            return;
+        };
+        let _ = self.engine.set_kv(&kv);
     }
 
     /// Ends a `/subagent` fork: truncates the sidechain back out of the
@@ -3449,6 +3477,7 @@ the original is frozen and listed in /tree"
             })
             .map(|m| m.text.clone());
         self.session.transcript.truncate(fork_at);
+        self.restore_fork_kv();
         match report {
             Some(report) => {
                 self.session
@@ -6915,6 +6944,7 @@ fn new_agent(
         stats: SessionStats::default(),
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
+        fork_kv: Vec::new(),
     })
 }
 
@@ -7727,6 +7757,13 @@ mod tests {
         /// snapshot/restore support) so the in-pass `/btw` suspend path runs
         /// instead of falling back to the boundary queue.
         aside_support: bool,
+        /// When set, the engine pretends to have KV snapshot support:
+        /// `get_kv` logs `capture` and returns a dummy payload tagged with an
+        /// incrementing counter (so nested captures are distinguishable),
+        /// `set_kv` logs `restore:<tag>`, and each generate logs `generate` —
+        /// letting fork tests assert the capture → sidechain → restore order.
+        kv_events: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        kv_captures: u8,
     }
 
     impl ScriptedEngine {
@@ -7737,6 +7774,9 @@ mod tests {
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> GenerationStats {
             self.prompts.lock().unwrap().push(transcript.to_owned());
+            if let Some(events) = &self.kv_events {
+                events.lock().unwrap().push("generate".to_string());
+            }
             let interrupted = self.interrupt_at == Some(self.next);
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
@@ -7783,6 +7823,22 @@ mod tests {
         fn supports_aside(&self) -> bool {
             self.aside_support
         }
+        fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
+            let events = self.kv_events.as_ref()?;
+            self.kv_captures += 1;
+            events.lock().unwrap().push("capture".to_string());
+            Some(crate::kvcache::KVCache::new(
+                vec![self.kv_captures],
+                crate::ds4tokens::TokenTranscript::new(),
+            ))
+        }
+        fn set_kv(&mut self, cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
+            if let Some(events) = &self.kv_events {
+                let tag = cache.kv().first().copied().unwrap_or(0);
+                events.lock().unwrap().push(format!("restore:{tag}"));
+            }
+            Ok(())
+        }
         fn ctx_size(&self) -> i32 {
             100_000
         }
@@ -7820,6 +7876,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         }
     }
 
@@ -9218,6 +9275,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -9268,6 +9326,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
 
         // Empty state: no provider turn recorded yet.
@@ -9383,6 +9442,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9552,6 +9612,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9626,6 +9687,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9687,6 +9749,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -9771,6 +9834,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -9920,6 +9984,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -9998,6 +10063,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -10020,6 +10086,66 @@ mod tests {
         let fork_at = agent.begin_subagent_fork(None, "noop");
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The C engine's sync can only *extend* a KV checkpoint — a prompt that
+    /// diverges behind the live end (exactly what the fork's truncation
+    /// produces) re-prefills the whole context from token zero. The fork must
+    /// therefore capture the parent KV at begin and restore it at finish, so
+    /// the post-fork turn prefills only the report.
+    #[test]
+    fn subagent_fork_restores_parent_kv_after_the_sidechain() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-kv-fork-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["There are 42 tests.\n".to_string()],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant("hello"));
+
+        let fork_at = agent.begin_subagent_fork(None, "count the tests");
+        agent.run_turn().unwrap();
+        assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "generate", "restore:1"]
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Nested forks restore LIFO: each finish rolls the KV back to the state
+    /// its own begin captured. Also covers the no-report path — the restore
+    /// must fire even when the sidechain produced nothing.
+    #[test]
+    fn nested_subagent_forks_restore_kv_lifo() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-kv-nest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Off;
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let outer = agent.begin_subagent_fork(None, "outer");
+        let inner = agent.begin_subagent_fork(None, "inner");
+        assert!(!agent.finish_subagent_fork(inner, "inner"));
+        assert!(!agent.finish_subagent_fork(outer, "outer"));
+
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            ["capture", "capture", "restore:2", "restore:1"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -10075,6 +10201,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -10134,6 +10261,7 @@ mod tests {
             stats: SessionStats::default(),
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
+            fork_kv: Vec::new(),
         };
         agent.session.push(Message::user("run echo"));
 
