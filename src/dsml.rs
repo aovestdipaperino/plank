@@ -5,15 +5,22 @@
 //!
 //! The model streams raw text tokens. This parser recognizes completed DSML
 //! tool stanzas (`<｜DSML｜tool_calls>` ... `</｜DSML｜tool_calls｜>`) and keeps
-//! a copy of the raw stanza for diagnostics. It is deliberately strict after
-//! the opening marker: typo recovery belongs to the streaming detector so the
-//! actual tool parser stays small and predictable.
+//! a copy of the raw stanza for diagnostics. Inner tags tolerate the one
+//! observed typo (a dropped leading `｜`, e.g. `<DSML｜invoke ...>`), matching
+//! the tolerance the stanza opener already had; beyond that the parser stays
+//! strict, so the actual tool parser stays small and predictable.
 //!
 //! Port of the `agent_dsml_*` family from `ds4_agent.c`.
 
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
-const CLOSE_MARKER_HEAD: &[u8] = "</".as_bytes();
+/// Cheap scan filter used to locate candidate closing tags: any `</` byte
+/// pair, not just a validated close marker. Real validation happens in
+/// [`close_tag_at`], which requires a full [`tag_prefix_len`] match against
+/// the accepted marker/name spellings — so a bare `</` inside a parameter
+/// value (e.g. HTML written through a `write` or `edit` call) never
+/// terminates the parameter on its own.
+const CLOSE_SCAN_HEAD: &[u8] = "</".as_bytes();
 const DSML_BAR: &[u8] = "｜".as_bytes();
 
 /// Marker names accepted inside a tag: `<｜NAME｜invoke ...>`.
@@ -411,7 +418,7 @@ fn close_tag_at(s: &[u8], name: &str) -> Option<usize> {
 /// Finds a DSML closing tag for `name` in `s`; returns (offset, tag length).
 fn find_close_tag(s: &[u8], name: &str) -> Option<(usize, usize)> {
     let mut from = 0;
-    while let Some(pos) = find_bytes(&s[from..], CLOSE_MARKER_HEAD) {
+    while let Some(pos) = find_bytes(&s[from..], CLOSE_SCAN_HEAD) {
         let at = from + pos;
         if let Some(tag_len) = close_tag_at(&s[at..], name) {
             return Some((at, tag_len));
@@ -612,6 +619,34 @@ mod tests {
         feed_all(&mut p, s);
         assert_eq!(p.state(), DsmlState::Done);
         assert_eq!(p.calls()[0].arg_value("a"), Some("v"));
+    }
+
+    /// A literal `</` in a parameter value (e.g. HTML written through a
+    /// `write` call's `content` param) must not terminate the parameter: the
+    /// cheap `</` scan in `find_close_tag` is only a candidate filter, and
+    /// `close_tag_at` requires the full `</｜DSML｜parameter` prefix (or its
+    /// dropped-bar variant) before accepting a close. This pins the safety
+    /// that let `CLOSE_SCAN_HEAD` widen from `"</｜"` to `"</"`.
+    #[test]
+    fn literal_close_bytes_in_param_value_do_not_terminate_it() {
+        // Includes a bare `</parameter>` (no DSML marker) so a validator
+        // that dropped the marker check would truncate the value here.
+        let html = "<div>hi</div></p> see </parameter> too";
+        let s = format!(
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"content\" string=\"true\">{html}</｜DSML｜parameter｜>",
+                "</｜DSML｜invoke｜>",
+                "</｜DSML｜tool_calls｜>",
+            ),
+            html = html
+        );
+        let mut p = DsmlParser::new();
+        feed_all(&mut p, &s);
+        assert_eq!(p.state(), DsmlState::Done);
+        assert_eq!(p.calls().len(), 1);
+        assert_eq!(p.calls()[0].arg_value("content"), Some(html));
     }
 
     #[test]
