@@ -45,10 +45,9 @@ pub(crate) const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
 /// length is taken from the form that actually matched.
 pub(crate) fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
     MARKER_NAMES.iter().find_map(|marker| {
-        tag_prefixes(marker, closing, name)
+        tag_prefix_forms(marker, closing, name)
             .into_iter()
-            .find(|prefix| s.starts_with(prefix.as_bytes()))
-            .map(|prefix| prefix.len())
+            .find_map(|form| segments_prefix_of(&form, s))
     })
 }
 
@@ -56,20 +55,56 @@ pub(crate) fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usiz
 /// under any accepted marker, in either the canonical or dropped-bar form.
 pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
     MARKER_NAMES.iter().any(|marker| {
-        tag_prefixes(marker, closing, name)
+        tag_prefix_forms(marker, closing, name)
             .iter()
-            .any(|prefix| prefix.as_bytes().starts_with(s))
+            .any(|form| is_prefix_of_segments(s, form))
     })
 }
 
-/// The accepted spellings of a tag prefix: canonical first, then the
-/// dropped-leading-bar typo the model actually emits.
-fn tag_prefixes(marker: &str, closing: bool, name: &str) -> [String; 2] {
-    let slash = if closing { "/" } else { "" };
+/// The accepted spellings of a tag prefix, as segment lists: canonical first,
+/// then the dropped-leading-bar typo the model actually emits.
+///
+/// Segments rather than assembled `String`s because this sits on the hot path:
+/// [`find_close_tag`] re-scans the accumulated parameter value on every
+/// `feed`, and `CLOSE_SCAN_HEAD` is a bare `</`, which occurs on nearly every
+/// line of HTML written through a `write` or `edit` parameter. Building the
+/// spellings with `format!` cost four transient allocations per candidate,
+/// which is order 10^6 for a few hundred lines of markup.
+fn tag_prefix_forms<'a>(marker: &'a str, closing: bool, name: &'a str) -> [[&'a [u8]; 6]; 2] {
+    let slash: &[u8] = if closing { b"/" } else { b"" };
+    let (marker, name) = (marker.as_bytes(), name.as_bytes());
     [
-        format!("<{slash}｜{marker}｜{name}"),
-        format!("<{slash}{marker}｜{name}"),
+        [b"<", slash, DSML_BAR, marker, DSML_BAR, name],
+        [b"<", slash, marker, DSML_BAR, name, b""],
     ]
+}
+
+/// Length of the concatenated `segments` when they are a prefix of `s`.
+fn segments_prefix_of(segments: &[&[u8]], s: &[u8]) -> Option<usize> {
+    let mut at = 0;
+    for seg in segments {
+        if !s[at..].starts_with(seg) {
+            return None;
+        }
+        at += seg.len();
+    }
+    Some(at)
+}
+
+/// True when `s` is a prefix of the concatenated `segments`, `s` possibly
+/// stopping part-way through one of them.
+fn is_prefix_of_segments(s: &[u8], segments: &[&[u8]]) -> bool {
+    let mut rest = s;
+    for seg in segments {
+        if rest.len() < seg.len() {
+            return seg.starts_with(rest);
+        }
+        if !rest.starts_with(seg) {
+            return false;
+        }
+        rest = &rest[seg.len()..];
+    }
+    rest.is_empty()
 }
 
 /// Byte offset of the earliest complete tool-call stanza opening in `s`, if any.
@@ -176,8 +211,11 @@ struct PendingCall {
 
 /// True when a name is an unsubstituted placeholder copied from the tools
 /// prompt (`$TOOL_NAME`, `$PARAMETER_NAME`, `$PARAMETER_VALUE`).
+///
+/// Exactly those three: a tool or parameter genuinely named `$path` is a
+/// different mistake and must not be told it copied the prompt.
 fn is_prompt_placeholder(name: &str) -> bool {
-    name.starts_with('$')
+    matches!(name, "$TOOL_NAME" | "$PARAMETER_NAME" | "$PARAMETER_VALUE")
 }
 
 impl DsmlParser {
@@ -343,8 +381,7 @@ impl DsmlParser {
                         };
                         if is_prompt_placeholder(&name) {
                             self.set_error(format!(
-                                "tool name is the prompt's placeholder {name}, not a real \
-                                 tool; substitute the actual tool name"
+                                "tool name is the prompt's placeholder {name}, not a real tool; substitute the actual tool name"
                             ));
                             return;
                         }
@@ -360,8 +397,7 @@ impl DsmlParser {
                         };
                         if is_prompt_placeholder(&name) {
                             self.set_error(format!(
-                                "parameter name is the prompt's placeholder {name}, not a \
-                                 real parameter; substitute the actual parameter name"
+                                "parameter name is the prompt's placeholder {name}, not a real parameter; substitute the actual parameter name"
                             ));
                             return;
                         }
@@ -527,10 +563,9 @@ mod tests {
         let mut p = super::DsmlParser::new();
         p.feed("<｜DSML｜tool_calls><｜DSML｜invoke name=\"$TOOL_NAME\">".as_bytes());
         assert_eq!(p.state(), super::DsmlState::Error);
-        assert!(
-            p.error().contains("placeholder $TOOL_NAME"),
-            "unhelpful error: {}",
-            p.error()
+        assert_eq!(
+            p.error(),
+            "tool name is the prompt's placeholder $TOOL_NAME, not a real tool; substitute the actual tool name"
         );
     }
 
@@ -543,25 +578,29 @@ mod tests {
                 .as_bytes(),
         );
         assert_eq!(p.state(), super::DsmlState::Error);
-        assert!(
-            p.error().contains("placeholder $PARAMETER_NAME"),
-            "unhelpful error: {}",
-            p.error()
+        assert_eq!(
+            p.error(),
+            "parameter name is the prompt's placeholder $PARAMETER_NAME, not a real parameter; substitute the actual parameter name"
         );
     }
 
-    // A real tool whose name merely contains a dollar sign elsewhere is untouched;
-    // only a leading `$` marks a placeholder.
+    // A name with a dollar sign in it is untouched: only the three literal
+    // placeholders from the tools prompt count, so a tool named `$path` is not
+    // told it copied the prompt.
     #[test]
     fn dollar_inside_a_name_is_not_a_placeholder() {
-        let mut p = super::DsmlParser::new();
-        p.feed(
-            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"we$rd\">\
-             </｜DSML｜invoke｜></｜DSML｜tool_calls｜>"
+        for name in ["we$rd", "$path"] {
+            let mut p = super::DsmlParser::new();
+            p.feed(
+                format!(
+                    "<｜DSML｜tool_calls><｜DSML｜invoke name=\"{name}\">\
+                     </｜DSML｜invoke｜></｜DSML｜tool_calls｜>"
+                )
                 .as_bytes(),
-        );
-        assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
-        assert_eq!(p.calls()[0].name, "we$rd");
+            );
+            assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
+            assert_eq!(p.calls()[0].name, name);
+        }
     }
 
     /// The SSML alias (see [`MARKER_NAMES`]) must parse identically to the
