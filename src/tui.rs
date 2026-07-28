@@ -174,6 +174,21 @@ impl SubPane {
         self.running = false;
     }
 
+    /// The log the user is currently looking at: this pane's while it is on
+    /// screen, otherwise `main`. Single decision point for input routing, so a
+    /// selection or hit test never reads the pane that is not displayed.
+    #[must_use]
+    pub fn active_log<'a>(&'a self, main: &'a OutputLog) -> &'a OutputLog {
+        if self.active { &self.log } else { main }
+    }
+
+    /// The scroll state the visible pane owns — the mutable counterpart of
+    /// [`Self::active_log`]. Every scroll/follow gesture goes through this so
+    /// the hidden pane's position is never disturbed.
+    pub fn active_view<'a>(&'a mut self, main: &'a mut OutputView) -> &'a mut OutputView {
+        if self.active { &mut self.view } else { main }
+    }
+
     /// Flips which pane is on screen. Returns `false` (changing nothing) when
     /// no sub-agent has ever run, so there is nothing to switch to.
     pub fn toggle(&mut self) -> bool {
@@ -2185,6 +2200,52 @@ mod tests {
         pane.begin("other".to_string());
         assert_eq!(pane.log.line_count(), 0);
         assert_eq!(pane.label.as_deref(), Some("other"));
+    }
+
+    #[test]
+    fn sub_pane_begin_resets_the_scroll_view_not_just_the_log() {
+        let mut pane = SubPane::default();
+        pane.begin("first".to_string());
+        pane.log.push_plain("a long first run");
+        // The user scrolled up in the sub pane during the first run.
+        pane.view.follow = false;
+        pane.view.top = 42;
+
+        // A new run must start at the top in follow mode: a stale `top` from
+        // the previous (now discarded) buffer would point past the new content.
+        pane.begin("second".to_string());
+        assert_eq!(pane.view.top, 0);
+        assert!(pane.view.follow);
+        assert_eq!(pane.log.line_count(), 0);
+    }
+
+    #[test]
+    fn sub_pane_active_log_and_view_follow_which_pane_is_on_screen() {
+        let mut main_log = super::OutputLog::new();
+        main_log.push_plain("main transcript");
+        let mut main_view = super::OutputView {
+            top: 7,
+            ..Default::default()
+        };
+
+        let mut pane = SubPane::default();
+        pane.begin("research".to_string());
+        pane.log.push_plain("sub output");
+        pane.log.push_plain("sub output two");
+        pane.view.top = 3;
+
+        // Inactive: everything routes to the main pane, unchanged.
+        assert_eq!(pane.active_log(&main_log).line_count(), 1);
+        assert_eq!(pane.active_view(&mut main_view).top, 7);
+
+        assert!(pane.toggle());
+        assert_eq!(pane.active_log(&main_log).line_count(), 2);
+        let v = pane.active_view(&mut main_view);
+        assert_eq!(v.top, 3);
+        // Scrolling the active pane leaves the hidden one alone.
+        v.top = 9;
+        assert_eq!(pane.view.top, 9);
+        assert_eq!(main_view.top, 7);
     }
 
     /// Issue #72: `/clear` and `/new` must wipe the TUI scrollback, including

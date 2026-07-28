@@ -4134,38 +4134,48 @@ impl Agent<'_> {
                     MouseEventKind::ScrollUp => {
                         // Selection endpoints are content-anchored, so scrolling
                         // leaves them alone — the highlight tracks the text.
-                        view.follow = false;
-                        view.top = view.top.saturating_sub(3);
+                        let v = sub_pane.active_view(&mut view);
+                        v.follow = false;
+                        v.top = v.top.saturating_sub(3);
                     }
                     MouseEventKind::ScrollDown => {
                         // Clamped by draw, which re-enters follow mode at the bottom.
-                        view.top = view.top.saturating_add(3);
+                        let v = sub_pane.active_view(&mut view);
+                        v.top = v.top.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         // A click on the jump-to-bottom hint resumes follow mode
                         // (same as End) instead of starting a text selection.
-                        if view.jump_hint_rect.is_some_and(|r| {
+                        let v = sub_pane.active_view(&mut view);
+                        if v.jump_hint_rect.is_some_and(|r| {
                             r.contains(ratatui::layout::Position::new(m.column, m.row))
                         }) {
-                            view.follow = true;
+                            v.follow = true;
                             selection = None;
                         } else {
-                            let row = view.top.saturating_add(usize::from(m.row));
+                            let row = v.top.saturating_add(usize::from(m.row));
                             selection = Some(((m.column, row), (m.column, row)));
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
+                        let top = sub_pane.active_view(&mut view).top;
                         if let Some((_, end)) = &mut selection {
-                            *end = (m.column, view.top.saturating_add(usize::from(m.row)));
+                            *end = (m.column, top.saturating_add(usize::from(m.row)));
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
+                        let top = sub_pane.active_view(&mut view).top;
                         if let Some(sel) = selection.filter(|(a, b)| a != b) {
                             // A drag: extract from the content model (not the
                             // screen buffer) so a selection larger than the
-                            // viewport still copies in full.
-                            let text = tui::selection_text_content(&log, size.width, sel);
+                            // viewport still copies in full — from whichever
+                            // pane is on screen, so the copy matches the pixels.
+                            let text = tui::selection_text_content(
+                                sub_pane.active_log(&log),
+                                size.width,
+                                sel,
+                            );
                             if !text.trim().is_empty() {
                                 tui::copy_to_clipboard(&text);
                                 let chars = text.chars().count();
@@ -4178,10 +4188,11 @@ impl Agent<'_> {
                             // row for the click test.
                             let out_h = size.height.saturating_sub(2);
                             let screen_row =
-                                u16::try_from(row.saturating_sub(view.top)).unwrap_or(u16::MAX);
+                                u16::try_from(row.saturating_sub(top)).unwrap_or(u16::MAX);
                             if screen_row < out_h
-                                && let Some(code) =
-                                    log.code_copy_at(size.width, view.top, col, screen_row)
+                                && let Some(code) = sub_pane
+                                    .active_log(&log)
+                                    .code_copy_at(size.width, top, col, screen_row)
                             {
                                 tui::copy_to_clipboard(&code);
                                 let chars = code.chars().count();
@@ -4293,6 +4304,12 @@ impl Agent<'_> {
                     if !sub_pane.toggle() {
                         log.push_dim("[no sub-agent has run yet]");
                     }
+                    // A selection belongs to the pane it was dragged over, so it
+                    // does not survive a pane switch — otherwise its highlight
+                    // would be painted over the other pane's text. (Every key
+                    // already clears it above; kept here so the invariant is
+                    // stated where the switch happens.)
+                    selection = None;
                 }
                 KeyCode::Char('c') if ctrl => {
                     if !input.buf.text().is_empty() {
@@ -6366,15 +6383,15 @@ fn busy_ui_loop(
                     log.truncate_to(main_checkpoint);
                     view.follow = true;
                 }
-                // Route to the panel only while an answer is streaming; once
-                // it finishes the main task's output goes to the main log even
-                // though the (frozen) panel is still visible.
                 UiEvent::SubStart(label) => {
                     log.push_dim(format!("[sub-agent: {label} — ctrl+o to follow]"));
                     sub.begin(label);
                 }
                 UiEvent::SubEnd => sub.end(),
                 UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                // Route to the panel only while an answer is streaming; once
+                // it finishes the main task's output goes to the main log even
+                // though the (frozen) panel is still visible.
                 ev => {
                     if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                         worker::apply(btw_log, ev);
@@ -6579,7 +6596,7 @@ fn busy_ui_loop(
                                 shared.preempt.store(true, Ordering::Relaxed);
                                 log.push_dim("[/btw — pausing the task to answer now]");
                             }
-                            view.follow = true;
+                            sub.active_view(view).follow = true;
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
@@ -6591,7 +6608,7 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_ansi(&out);
-                            view.follow = true;
+                            sub.active_view(view).follow = true;
                         } else if let Some(cmd) = arcade_command(&line) {
                             // The whole point of these is the waiting, so they
                             // are the commands that *do* run mid-turn.
@@ -6618,7 +6635,7 @@ fn busy_ui_loop(
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_dim("[queued — joins the conversation at the next step]");
                             shared.push_queued(line);
-                            view.follow = true;
+                            sub.active_view(view).follow = true;
                         }
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
@@ -6664,7 +6681,7 @@ fn busy_ui_loop(
                     // it is the usual end-of-line motion.
                     KeyCode::End => {
                         if input.buf.text().is_empty() {
-                            view.follow = true;
+                            sub.active_view(view).follow = true;
                         } else {
                             input.buf.move_end();
                         }
@@ -6687,20 +6704,22 @@ fn busy_ui_loop(
             }
             Event::Mouse(m) => match m.kind {
                 MouseEventKind::ScrollUp => {
-                    view.follow = false;
-                    view.top = view.top.saturating_sub(3);
+                    let v = sub.active_view(view);
+                    v.follow = false;
+                    v.top = v.top.saturating_sub(3);
                 }
                 MouseEventKind::ScrollDown => {
                     // Clamped by draw, which re-enters follow mode at the bottom.
-                    view.top = view.top.saturating_add(3);
+                    let v = sub.active_view(view);
+                    v.top = v.top.saturating_add(3);
                 }
                 // Clicking the jump-to-bottom hint resumes follow mode.
                 MouseEventKind::Down(MouseButton::Left)
-                    if view.jump_hint_rect.is_some_and(|r| {
+                    if sub.active_view(view).jump_hint_rect.is_some_and(|r| {
                         r.contains(ratatui::layout::Position::new(m.column, m.row))
                     }) =>
                 {
-                    view.follow = true;
+                    sub.active_view(view).follow = true;
                 }
                 _ => {}
             },
