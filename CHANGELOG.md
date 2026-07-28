@@ -92,6 +92,12 @@ Beta channel on the 2.7 series.
 
 ### Internal
 
+- **Restored the `refs/openclaw` stanza in `.gitmodules`.** It was dropped while
+  `refs/edit` was added, but its gitlink stayed in the tree, so every CI and
+  release checkout died at `git submodule update --recursive` before building
+  anything. Its old entry carried `update = none`, which is why it had been
+  skipped harmlessly until then.
+
 - The compaction prompt is locked with a fixture (`tests/plank_prompts.rs`, the
   mirror of `c_parity.rs` for text plank deliberately does *not* share with the
   C reference). It names the `<summary>`/`<analysis>` tags that

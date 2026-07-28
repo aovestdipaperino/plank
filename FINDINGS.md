@@ -335,6 +335,21 @@ test` and review the diff before committing.
   latched interrupt has to be consumed (`shared.interrupt` under the TUI, the
   SIGINT flag otherwise) or the next turn starts already cancelled.
 
+- **A gitlink without a `.gitmodules` entry breaks every CI checkout.** The
+  tree can hold a submodule commit (mode `160000`) that `.gitmodules` does not
+  describe; `git submodule update --recursive`, which `actions/checkout` runs,
+  then dies with `fatal: No url found for submodule path '<path>'` before a
+  single line is built. `refs/openclaw` sat in that state after its stanza was
+  dropped while adding `refs/edit`, and it broke both CI *and* the release
+  bottle build. It had survived earlier releases only because its entry carried
+  `update = none`, which made recursive checkout skip it — remove the stanza and
+  the exemption goes with it.
+
+  Local builds notice none of this: the submodule is already checked out, so
+  nothing re-resolves it. Check with
+  `diff <(git ls-files -s | grep 160000 | awk '{print $4}' | sort) <(grep 'path = ' .gitmodules | awk '{print $3}' | sort)`
+  before touching `.gitmodules`.
+
 - **`Color::Black` is not black.** Ratatui's `Color::Black` emits ANSI index 0,
   which is a *palette slot*, not a value: terminal themes remap it freely and
   most render it as a dark grey. Painting the screensaver's night sky with it
