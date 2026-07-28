@@ -327,8 +327,14 @@ impl PseudoToolDetector {
         self.line.clear();
     }
 
-    /// Feeds one byte; returns the matched opener when this byte completes a
-    /// pseudo-tool-call opening.
+    /// Feeds one byte; returns the matched line when the byte *completes* a
+    /// line that is nothing but a pseudo-tool-call opening.
+    ///
+    /// Matching deliberately waits for the end of the line. Firing at the `>`
+    /// would misjudge `<read> is how you spell it`, and since a stream error
+    /// freezes output that fabricated diagnosis would also discard the rest of
+    /// a legitimate answer. A stream that ends mid-line is matched by
+    /// [`Self::finish_line`].
     ///
     /// `in_think` still runs the byte through the fence tracker — a fence
     /// opened inside `<think>` must flip `in_fence` there so that its
@@ -339,6 +345,7 @@ impl PseudoToolDetector {
     /// block). Only the tag-matching/report path is skipped while thinking.
     fn feed(&mut self, c: u8, in_think: bool) -> Option<String> {
         if c == b'\n' {
+            let hit = self.match_line(in_think);
             if self.line.starts_with(b"```") {
                 // Parity is tracked unconditionally, even while `in_think`,
                 // but the trade-off cuts both ways. It's what makes the
@@ -351,35 +358,58 @@ impl PseudoToolDetector {
                 self.in_fence = !self.in_fence;
             }
             self.line.clear();
-            return None;
+            return hit;
         }
         if self.line.len() < Self::CAP {
             self.line.push(c);
         }
+        None
+    }
+
+    /// Matches the line held at end of stream, where no `\n` will arrive.
+    fn finish_line(&mut self, in_think: bool) -> Option<String> {
+        let hit = self.match_line(in_think);
+        self.line.clear();
+        hit
+    }
+
+    /// Tests the completed line, returning it when it is nothing but an
+    /// invented tool-call opening.
+    fn match_line(&mut self, in_think: bool) -> Option<String> {
         if in_think || self.fired || self.in_fence {
             return None;
         }
-        // Only a tag opening the line counts; leading whitespace is allowed.
-        let trimmed = self.line.trim_ascii_start();
+        // Only a tag *alone* on the line counts; surrounding whitespace is
+        // allowed, prose after the tag is not.
+        let trimmed = self.line.trim_ascii();
         if !trimmed.starts_with(b"<") {
             return None;
         }
         let text = std::str::from_utf8(trimmed).ok()?;
-        for opener in GENERIC_PSEUDO_OPENERS {
-            if text == opener {
-                self.fired = true;
-                return Some(opener.trim_end().to_string());
+        let matched = GENERIC_PSEUDO_OPENERS.iter().any(|opener| {
+            // `<invoke ` carries attributes, so it matches any single tag
+            // opening with it; the others must be the whole line.
+            if opener.ends_with(' ') {
+                text.starts_with(*opener) && is_lone_tag(text)
+            } else {
+                text == *opener
             }
+        }) || self.tool_names.iter().any(|name| {
+            text.strip_prefix('<')
+                .and_then(|t| t.strip_suffix('>'))
+                .is_some_and(|inner| inner == name)
+        });
+        if !matched {
+            return None;
         }
-        for name in &self.tool_names {
-            let tag = format!("<{name}>");
-            if text == tag {
-                self.fired = true;
-                return Some(tag);
-            }
-        }
-        None
+        self.fired = true;
+        Some(text.to_string())
     }
+}
+
+/// True when `text` is a single `<...>` tag and nothing else.
+fn is_lone_tag(text: &str) -> bool {
+    text.ends_with('>') && !text[..text.len() - 1].contains('>')
 }
 
 /// Scanner state mirroring the DSML parser for display purposes only.
@@ -504,6 +534,11 @@ pub struct StreamRenderer<S> {
     /// and the call was dispatched. Only this one means the model asked for a
     /// tool and got nothing, so only this one is worth telling it about.
     in_think_rejected: bool,
+    /// The stream error came from the pseudo-tool detector, which by
+    /// construction only fires in the answer region. It must outrank the
+    /// in-think prohibition in [`Self::finished`]: the model's mistake was
+    /// inventing markup after `</think>`, not calling a tool inside it.
+    pseudo_tool_fired: bool,
     post_think_gap: bool,
     /// Error from DSML markup outside a valid stanza; freezes further output.
     stream_error: Option<String>,
@@ -581,6 +616,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             dsml_in_think: false,
             dsml_in_think_reported: false,
             in_think_rejected: false,
+            pseudo_tool_fired: false,
             post_think_gap: false,
             stream_error: None,
             last_output_newline: true,
@@ -673,6 +709,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     pub fn finish(&mut self) {
         self.stream_text(b"", true);
         self.flush_carry();
+        self.flush_pseudo_tool();
     }
 
     /// Results after the stream ends: completed calls and error state.
@@ -690,7 +727,14 @@ impl<S: RenderSink> StreamRenderer<S> {
         // stanza still open when the stream ended; `in_think_rejected` covers
         // one that completed and was thrown away. Mirrors the C worker loop
         // (`ds4_agent.c:7853`), which likewise overwrites the parse error.
-        let in_think = self.in_think_rejected || self.dsml_ignored;
+        //
+        // The one exception is a pseudo-tool hit: it can only be raised in the
+        // answer region, after `</think>`, so overwriting it with the
+        // prohibition would tell the model to move a call it never made there.
+        // A stanza leaked from thinking *and* invented markup in the answer is
+        // exactly the reported case, and the answer-region mistake is the one
+        // the model must fix.
+        let in_think = (self.in_think_rejected || self.dsml_ignored) && !self.pseudo_tool_fired;
         let error = self
             .stream_error
             .as_deref()
@@ -1346,6 +1390,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn pseudo_tool_call(&mut self, opener: &str) {
+        self.pseudo_tool_fired = true;
         self.malformed_dsml(&format!(
             "{opener} is not a tool call; tools are invoked with the DSML syntax in the system prompt"
         ));
@@ -1389,6 +1434,17 @@ impl<S: RenderSink> StreamRenderer<S> {
             return;
         }
         if let Some(opener) = self.pseudo_tool.feed(c, self.in_think) {
+            self.pseudo_tool_call(&opener);
+        }
+    }
+
+    /// Matches the last line at end of stream: a hallucinated tag as the final
+    /// line, with no trailing newline, is still a hallucinated call.
+    fn flush_pseudo_tool(&mut self) {
+        if self.output_frozen() || self.dsml_active || self.replay {
+            return;
+        }
+        if let Some(opener) = self.pseudo_tool.finish_line(self.in_think) {
             self.pseudo_tool_call(&opener);
         }
     }
@@ -1607,10 +1663,11 @@ mod tests {
         assert!(sr.finished().error.is_none());
     }
 
-    // A fence opened inside <think> is never observed by the detector (it is
-    // gated on `!in_think`), so its matching close in the answer region must
-    // not be mistaken for an opener — otherwise the detector is silenced for
-    // the rest of the stream. Issue #51 case: the model tries DSML-like
+    // A fence opened inside <think> IS observed by the detector: every byte
+    // reaches the fence tracker, and only tag matching is gated on `!in_think`.
+    // That is what makes its matching close in the answer region read as a
+    // close rather than a fresh opener that would silence the detector for the
+    // rest of the stream. Issue #51 case: the model tries DSML-like
     // markup inside thinking, then falls back to `<task>` XML in its answer.
     #[test]
     fn stray_fence_close_leaking_from_think_does_not_disarm_the_detector() {
@@ -1631,6 +1688,102 @@ mod tests {
         sr.push("```xml\n<task>\n</task>\n```\n");
         sr.finish();
         assert!(sr.finished().error.is_none());
+    }
+
+    // A pseudo-tool hit happens by construction in the ANSWER region, after
+    // `</think>`. Reporting the in-think prohibition instead tells the model to
+    // move a call it never made, which is the misdiagnosis this detector exists
+    // to end.
+    #[test]
+    fn pseudo_tool_error_wins_over_the_in_think_prohibition() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push(concat!(
+            "<think><｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">",
+            "</｜DSML｜invoke｜></｜DSML｜tool_calls｜></think>\n",
+            "<task>\nx\n</task>",
+        ));
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(
+            fin.error,
+            Some(
+                "<task> is not a tool call; tools are invoked with the DSML syntax in the system prompt"
+            ),
+            "pseudo-tool hit must not be masked by the in-think prohibition"
+        );
+        assert!(
+            !fin.in_think_rejected,
+            "in-think framing would wrap the answer-region error in the wrong advice"
+        );
+    }
+
+    // The other direction: a genuinely leaked in-think stanza with no
+    // pseudo-tool hit still reports the prohibition.
+    #[test]
+    fn leaked_in_think_stanza_alone_still_reports_the_prohibition() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push(concat!(
+            "<think><｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">",
+            "</｜DSML｜invoke｜></｜DSML｜tool_calls｜></think>\n",
+            "all done\n",
+        ));
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert!(fin.in_think_rejected);
+    }
+
+    // A line that opens with a tool tag and then continues in prose is prose:
+    // firing there both fabricates a tool error and truncates a legitimate
+    // answer, because a stream error freezes output.
+    #[test]
+    fn prose_continuing_after_a_tool_tag_does_not_fire() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<read> is how you spell it, unlike the others.\nand more text\n");
+        sr.finish();
+        assert!(sr.finished().error.is_none(), "{:?}", sr.finished().error);
+        assert!(
+            sr.sink().visible.contains("and more text"),
+            "answer truncated: {:?}",
+            sr.sink().visible
+        );
+    }
+
+    // A line that is nothing but the tag is still a hallucinated call.
+    #[test]
+    fn bare_tool_tag_on_its_own_line_fires() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("here goes\n<read>\npath: /tmp/x\n</read>\n");
+        sr.finish();
+        assert!(sr.finished().error.is_some());
+    }
+
+    // ... including when the stream ends without a trailing newline.
+    #[test]
+    fn bare_tool_tag_as_final_line_without_newline_fires() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("here goes\n<task>");
+        sr.finish();
+        assert_eq!(
+            sr.finished().error,
+            Some(
+                "<task> is not a tool call; tools are invoked with the DSML syntax in the system prompt"
+            )
+        );
+    }
+
+    // The model-facing text names the line it actually saw.
+    #[test]
+    fn pseudo_tool_message_quotes_the_matched_line() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<invoke name=\"bash\">\n");
+        sr.finish();
+        assert_eq!(
+            sr.finished().error,
+            Some(
+                "<invoke name=\"bash\"> is not a tool call; tools are invoked with the DSML syntax in the system prompt"
+            )
+        );
     }
 
     // Generic wrappers are matched with no tool list configured at all.
