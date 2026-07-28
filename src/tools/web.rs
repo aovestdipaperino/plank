@@ -57,6 +57,10 @@ const CURL_TIMEOUT_SEC: u32 = 20;
 /// Cap on fetched HTML, mirroring the C's 4 MiB websocket message cap.
 #[cfg_attr(all(ds4_engine, not(feature = "use_obscura")), allow(dead_code))]
 const MAX_HTML_BYTES: usize = 4 * 1024 * 1024;
+/// Cap on a fetched document, enforced by `curl --max-filesize`. Unlike HTML a
+/// document cannot be truncated on arrival — half a PDF is not a PDF — so an
+/// oversized one is refused rather than clipped.
+const MAX_DOC_BYTES: u64 = 32 * 1024 * 1024;
 /// Page Markdown length at which extraction stops (`web_extract_page_js`).
 const PAGE_CONTENT_CAP: usize = 900_000;
 /// Approval prompt shown before the first network access (`web_ensure_browser`).
@@ -140,6 +144,19 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if let Err(e) = ensure_allowed(ctx) {
         return format!("Tool error: visit_page failed: {e}\n");
     }
+    // A URL that names a document is downloaded and converted rather than
+    // rendered: an HTML renderer handed a PDF produces the lossy-decoded
+    // mojibake the model then reports as "binary and not readable". See
+    // `crate::doc`, which `read` routes local documents through the same way.
+    if url_is_document(&url) {
+        return match document_markdown(ctx, &url) {
+            Ok(out) => out,
+            Err(e) => {
+                crate::errlog::log_error("visit_page", &format!("{url}: {e}"));
+                format!("Tool error: visit_page failed: {e}\n")
+            }
+        };
+    }
     // On ds4_engine builds (without obscura) render the page in the C
     // engine's real browser; elsewhere fetch the HTML (obscura or curl) and
     // extract Markdown in Rust.
@@ -163,6 +180,19 @@ pub fn tool_visit_page(ctx: &mut ToolContext, call: &ToolCall) -> String {
                 return format!("Tool error: visit_page failed: {e}\n");
             }
         };
+        // Content-type, not extension: plenty of PDFs are served from URLs that
+        // do not end in `.pdf`. The lossy decode leaves the ASCII signature
+        // intact, so this costs one re-fetch in exactly the case that would
+        // otherwise return garbage.
+        if html.starts_with("%PDF-") {
+            return match document_markdown(ctx, &url) {
+                Ok(out) => out,
+                Err(e) => {
+                    crate::errlog::log_error("visit_page", &format!("{url}: {e}"));
+                    format!("Tool error: visit_page failed: {e}\n")
+                }
+            };
+        }
         extract_page_markdown(&url, &html)
     };
     let path = match write_temp_text("ds4_agent_web", &md) {
@@ -278,6 +308,98 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
     }
     ctx.web.allowed = true;
     Ok(())
+}
+
+/// True when a URL's path names a document `read` would convert.
+///
+/// The query and fragment are stripped first, so `paper.pdf?download=1` still
+/// counts and `index.html#a.pdf` does not.
+fn url_is_document(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    crate::doc::is_document(std::path::Path::new(path))
+}
+
+/// Downloads a document URL and renders it as Markdown, framed exactly like any
+/// other `visit_page` result.
+///
+/// The bytes go to a temp file so [`crate::doc::to_markdown`] can hash and cache
+/// them by content — visiting the same paper twice reparses nothing. The
+/// Markdown is then written to the usual `visit_page` temp file rather than
+/// handing back the `~/.plank/doc-cache` path, which the framing would invite
+/// the model to `read` and `edit`.
+///
+/// # Errors
+///
+/// Returns a bare message (the caller adds the `Tool error:` prefix) when the
+/// download fails, the body is not a PDF, or conversion fails.
+fn document_markdown(ctx: &mut ToolContext, url: &str) -> Result<String, String> {
+    ctx.publish_status(&format!("Converting document {url}..."));
+    let bytes = curl_fetch_bytes(url)?;
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(format!(
+            "{url} has a document extension but the response is not a PDF"
+        ));
+    }
+    // The extension matters: liteparse dispatches on it, and rejects a
+    // suffixless path outright.
+    let tmp = write_temp_bytes("plank_web_doc", "pdf", &bytes)?;
+    let converted = crate::doc::to_markdown(std::path::Path::new(&tmp), url);
+    std::fs::remove_file(&tmp).ok();
+    let md = std::fs::read_to_string(converted?)
+        .map_err(|e| format!("failed to read the converted document: {e}"))?;
+    let path = write_temp_text("ds4_agent_web", &md)?;
+    Ok(frame_visit_output(url, &path, &md))
+}
+
+/// Fetches a URL with curl as raw bytes, refusing bodies over [`MAX_DOC_BYTES`].
+///
+/// Separate from [`curl_fetch`] because a document must survive byte-for-byte:
+/// the lossy UTF-8 decode and mid-body truncation that are harmless for HTML
+/// both destroy a PDF. Used on every build, including `use_obscura` ones, since
+/// a headless renderer has nothing useful to do with a document either.
+fn curl_fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            "60",
+            "--max-filesize",
+            &MAX_DOC_BYTES.to_string(),
+            "-A",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+             Chrome/124.0 Safari/537.36",
+            "--",
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+    if !out.status.success() {
+        // 63 is curl's "maximum file size exceeded".
+        if out.status.code() == Some(63) {
+            return Err(format!(
+                "the document is larger than {} MiB",
+                MAX_DOC_BYTES / (1024 * 1024)
+            ));
+        }
+        return Err(format!(
+            "curl exited with status {}",
+            out.status.code().unwrap_or(-1)
+        ));
+    }
+    Ok(out.stdout)
+}
+
+/// Writes bytes to a fresh temp file, the binary twin of [`write_temp_text`].
+fn write_temp_bytes(prefix: &str, ext: &str, bytes: &[u8]) -> Result<String, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "{prefix}_{}_{}.{ext}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, bytes).map_err(|e| format!("failed to create temporary file: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// Fetches page HTML through the configured transport: the embedded obscura
@@ -631,7 +753,14 @@ pub fn decode_entities(s: impl AsRef<str>) -> String {
     while let Some(pos) = rest.find('&') {
         out.push_str(&rest[..pos]);
         rest = &rest[pos..];
-        let Some(semi) = rest[..rest.len().min(12)].find(';') else {
+        // Longest entity worth considering, as a byte count — but that byte
+        // may sit inside a multi-byte character (binary responses decoded
+        // lossily are largely U+FFFD), so walk back to a boundary first.
+        let mut window = rest.len().min(12);
+        while !rest.is_char_boundary(window) {
+            window -= 1;
+        }
+        let Some(semi) = rest[..window].find(';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -1143,6 +1272,43 @@ mod tests {
     use super::*;
     use crate::tools::{dispatch, test_call, test_ctx};
 
+    /// A document URL is downloaded, converted, and framed like any other
+    /// `visit_page` result — text the model can read, not lossy binary. The
+    /// fixture is fetched over `file://` so the test needs no network; every
+    /// step after the transport is the one the http path takes.
+    #[cfg(feature = "docparse")]
+    #[test]
+    fn visit_page_converts_a_pdf() {
+        let (mut ctx, dir) = test_ctx();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("doc_sample.pdf");
+        let url = format!("file://{}", fixture.display());
+        assert!(url_is_document(&url));
+
+        let out = document_markdown(&mut ctx, &url).expect("conversion");
+        assert!(out.starts_with(&format!("visit_page url={url}\n")), "{out}");
+        assert!(out.contains("DOC FIXTURE TITLE"), "{out}");
+        // Never the document cache: the framing tells the model to `read` the
+        // path it names.
+        assert!(!out.contains("doc-cache"), "{out}");
+
+        // A body that is not a PDF is an error, not mojibake handed to the model.
+        let text = dir.join("not.pdf");
+        std::fs::write(&text, "hello\n").unwrap();
+        let err = document_markdown(&mut ctx, &format!("file://{}", text.display()))
+            .expect_err("non-PDF body");
+        assert!(err.contains("is not a PDF"), "{err}");
+
+        // liteparse dispatches on the extension and rejects a suffixless path,
+        // so the download's temp name must keep one.
+        let tmp = write_temp_bytes("plank_web_doc", "pdf", b"%PDF-1.4\n").unwrap();
+        assert!(crate::doc::is_document(std::path::Path::new(&tmp)), "{tmp}");
+        std::fs::remove_file(&tmp).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn text_helpers() {
         assert_eq!(clean("  a \n\t b  "), "a b");
@@ -1151,6 +1317,20 @@ mod tests {
             "a & b <x> AB &bogus;"
         );
         assert_eq!(esc_link_text("a [b] \\c"), "a \\[b\\] \\\\c");
+        // The entity-length window is a byte count, but the byte it lands on
+        // may be inside a multi-byte character — as it is for the U+FFFD runs
+        // that lossy-decoded binary responses are full of. Slicing there used
+        // to panic the whole tool worker.
+        assert_eq!(
+            decode_entities("&aaaaaaaaaa\u{FFFD}rest"),
+            "&aaaaaaaaaa\u{FFFD}rest"
+        );
+        // A document URL is routed to conversion, query strings and all; a
+        // fragment that merely mentions one is not.
+        assert!(url_is_document("https://x.org/papers/a-v2.pdf"));
+        assert!(url_is_document("https://x.org/a.PDF?download=1&t=2"));
+        assert!(!url_is_document("https://x.org/index.html#a.pdf"));
+        assert!(!url_is_document("https://x.org/"));
         assert_eq!(slice_chars("héllo", 2), "hé");
         assert_eq!(url_encode("a b/~c"), "a%20b%2F~c");
     }

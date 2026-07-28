@@ -1,6 +1,8 @@
 /target
 *.gguf
 .claude/
+# per-project /config settings (src/config.rs saves them here)
+.plank/
 /local/
 /vault/
 # local launch scripts may embed API keys (e.g. scripts/plank-z.sh)

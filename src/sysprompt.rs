@@ -331,6 +331,7 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: bool) -> String {
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
+    insert_document_read_note(&mut out);
     append_native_extra_schemas(&mut out);
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -386,6 +387,38 @@ fn insert_marker_spelling_note(out: &mut String) {
         out.insert_str(at + ANCHOR.len(), MARKER_SPELLING_NOTE);
     }
 }
+
+/// The line telling the model that `read` already handles PDFs.
+///
+/// `docs/LIGHT-PARSE.md` argued the prompt cost of document ingestion was zero
+/// because "the model does not learn anything new — documents simply stop being
+/// unreadable". That turned out to be false in the one way that matters: a
+/// model that believes a `.pdf` is unreadable never calls `read` on one. It
+/// shells out to `pdftotext` instead, which is slower, unpaged, and absent on
+/// most machines. One sentence next to the reading rules is what makes the
+/// feature reachable.
+#[cfg(feature = "docparse")]
+const DOCUMENT_READ_NOTE: &str = "PDFs are readable: read on a .pdf serves the document as Markdown and pages through it \
+     exactly like a text file. Never shell out to pdftotext or a PDF library.\n\n";
+
+/// Inserts [`DOCUMENT_READ_NOTE`] after the paragraph on bounded reads.
+///
+/// Anchored on the last sentence of that paragraph so the note sits with the
+/// other `read` guidance rather than behind the tool schemas. A missing anchor
+/// leaves the prompt untouched — routing still works, the model just may not
+/// think to use it. Gated on `docparse`: in a build without the parser, `read`
+/// on a PDF fails, and promising otherwise would be worse than saying nothing.
+#[cfg(feature = "docparse")]
+fn insert_document_read_note(out: &mut String) {
+    const ANCHOR: &str = "then explain that and use chunks.\n\n";
+    if let Some(at) = out.find(ANCHOR) {
+        out.insert_str(at + ANCHOR.len(), DOCUMENT_READ_NOTE);
+    }
+}
+
+/// Without a document parser linked in, the prompt says nothing about PDFs.
+#[cfg(not(feature = "docparse"))]
+fn insert_document_read_note(_out: &mut String) {}
 
 /// Appends the schemas of native tools plank adds beyond the C-trained table.
 ///
@@ -783,6 +816,25 @@ mod tests {
             // The reminder re-sends the tools prompt, so it inherits the note.
             assert!(build_system_prompt_reminder(&[], parity).contains(MARKER_SPELLING_NOTE));
             assert!(build_system_prompt("", &[], parity).contains(MARKER_SPELLING_NOTE));
+        }
+    }
+
+    /// The PDF note sits with the other `read` guidance, reaches the reminder,
+    /// and stays out of the C-locked base.
+    #[cfg(feature = "docparse")]
+    #[test]
+    fn document_read_note_lands_after_the_reading_rules_but_not_in_the_base() {
+        for parity in [true, false] {
+            assert!(
+                !build_tools_prompt_base(parity).contains("PDFs are readable"),
+                "base must stay verbatim C"
+            );
+            let prompt = build_tools_prompt(&[], parity);
+            assert_eq!(prompt.matches(DOCUMENT_READ_NOTE).count(), 1);
+            let anchor = "then explain that and use chunks.\n\n";
+            let at = prompt.find(anchor).unwrap() + anchor.len();
+            assert!(prompt[at..].starts_with(DOCUMENT_READ_NOTE));
+            assert!(build_system_prompt_reminder(&[], parity).contains(DOCUMENT_READ_NOTE));
         }
     }
 

@@ -51,8 +51,12 @@ impl ToolResult {
 /// State for the `more` continuation tool: where the next read resumes.
 #[derive(Debug, Clone)]
 pub struct MoreState {
-    /// Path of the file the previous truncated read came from.
+    /// Path of the file the previous truncated read came from, as the model
+    /// spelled it. Shown in the continuation's output.
     pub path: String,
+    /// Path the bytes are actually read from. Equal to `path` except for
+    /// converted documents, where it points into `~/.plank/doc-cache`.
+    pub read_path: String,
     /// 1-based line the next chunk starts at.
     pub next_line: usize,
     /// True when the previous read was in raw (bare) mode.

@@ -145,7 +145,18 @@ routing and wrapping stay CI-tested; only the conversion itself is gated, and
 with the feature off `to_markdown` returns a message naming the flag that would
 fix it. `cargo build --no-default-features` and its clippy run are both clean.
 
-## Prompt-side cost: still zero
+## Prompt-side cost: one sentence, not zero
+
+**Corrected.** The claim below ("the model does not learn anything new") was
+wrong in the one way that matters: a model that believes a `.pdf` is unreadable
+never calls `read` on one — it shells out to `pdftotext`. Extension routing is
+invisible unless the prompt says it exists. `sysprompt.rs` therefore appends one
+sentence (`DOCUMENT_READ_NOTE`) after the bounded-read paragraph, gated on
+`docparse` and outside the C-locked base, alongside the marker-spelling note.
+That does churn the Tier 1 fingerprint once, costing a single re-prefill on
+upgrade. Still no new tool.
+
+The original argument, which holds for everything except discoverability:
 
 Unchanged from `PDF-INGESTION.md`, and still the load-bearing constraint. The
 system prompt's tool table is frozen by `tests/c_parity.rs`; a new tool would

@@ -18,6 +18,9 @@ pub mod config;
 pub mod configform;
 pub mod consent;
 pub mod context;
+/// Document ingestion for the `read` tool (PDF → Markdown). Always compiled so
+/// the extension routing is CI-tested; the conversion itself needs `docparse`.
+pub mod doc;
 pub mod download;
 #[cfg(ds4_engine)]
 pub mod ds4engine;

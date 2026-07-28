@@ -185,7 +185,7 @@ fn cache_dir() -> Option<PathBuf> {
 }
 
 /// Content hash via the system `shasum` (macOS ships it; avoids a crypto dep).
-fn sha256_hex(bytes: &[u8]) -> Option<String> {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> Option<String> {
     let mut child = Command::new("shasum")
         .args(["-a", "256"])
         .stdin(Stdio::piped())
@@ -196,6 +196,28 @@ fn sha256_hex(bytes: &[u8]) -> Option<String> {
     child.stdin.as_mut()?.write_all(bytes).ok()?;
     drop(child.stdin.take());
     let out = child.wait_with_output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let hash = text.split_whitespace().next()?.to_owned();
+    (hash.len() == 64).then_some(hash)
+}
+
+/// Content hash of a file on disk, without loading it into memory.
+///
+/// [`sha256_hex`] pipes bytes through stdin, which means the caller must first
+/// hold the whole file — fine for a pasted screenshot, wrong for a 60 MB PDF
+/// whose bytes are never wanted in the first place. Handing `shasum` the path
+/// lets it stream.
+pub(crate) fn sha256_file_hex(path: &Path) -> Option<String> {
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let hash = text.split_whitespace().next()?.to_owned();
     (hash.len() == 64).then_some(hash)
@@ -226,6 +248,20 @@ fn prune_cache(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Hashing a path and hashing its bytes must agree, and a missing file
+    /// must be `None` rather than a bogus hash.
+    #[test]
+    fn file_hash_matches_byte_hash() {
+        let dir = std::env::temp_dir().join(format!("plank-hash-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("payload.bin");
+        let bytes = b"the quick brown fox\n";
+        std::fs::write(&file, bytes).unwrap();
+        assert_eq!(sha256_file_hex(&file), sha256_hex(bytes));
+        assert!(sha256_file_hex(&dir.join("absent.bin")).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn media_type_detection() {

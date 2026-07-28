@@ -12,7 +12,7 @@ rust-version = "1.93"
 exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf"]
 
 [features]
-default = ["use_obscura", "builtin_editor"]
+default = ["use_obscura", "builtin_editor", "docparse"]
 # Image pasting (Cmd-V clipboard images, image file paths) is disabled until
 # the model's handling of image-file references is understood; build with
 # `--features images` to re-enable.
@@ -32,6 +32,12 @@ use_obscura = ["dep:obscura", "dep:tokio"]
 # (refs/edit submodule, MIT). With this off, Ctrl-G shells out to $EDITOR as
 # before. Disable with `--no-default-features` when the submodule is absent.
 builtin_editor = ["dep:edit", "dep:stdext"]
+# Document ingestion: `read` on a .pdf converts it to Markdown via liteparse
+# (spatial extraction over PDFium, plus bundled Tesseract OCR for scanned
+# pages) and pages through it with `more`. Costs ~17 MB of binary and a CMake
+# build of libtesseract; disable with `--no-default-features` to get the old
+# behaviour (a PDF reads as bytes).
+docparse = ["dep:liteparse", "dep:tokio"]
 
 [dependencies]
 libc = "0.2"
@@ -58,8 +64,13 @@ crt-off = "0.1.2"
 # path points into the refs/obscura git submodule so the browser is compiled
 # into the plank binary rather than shipped separately.
 obscura = { path = "refs/obscura/crates/obscura", optional = true }
-# Minimal runtime to drive obscura's async API from plank's sync tool code.
+# Minimal runtime to drive obscura's and liteparse's async APIs from plank's
+# sync tool code.
 tokio = { version = "1", features = ["rt"], optional = true }
+# Document → Markdown conversion for the `read` tool (feature `docparse`).
+# Pinned exactly: the crate shipped 27 releases in three months and the
+# fixture assertions in `src/doc/mod.rs` are coupled to its markdown emitter.
+liteparse = { version = "=2.10", optional = true }
 # Text buffer, immediate-mode TUI framework, and VT input parser behind the
 # built-in Ctrl-G editor (feature `builtin_editor`); the paths point into the
 # refs/edit git submodule. MIT (c) Microsoft Corporation. `stdext` carries the

@@ -18,6 +18,8 @@ String parameters use raw text and string="true". Numbers and booleans use JSON 
 
 Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. If read says more lines are available, call more with count=<lines> to read the next chunk; more defaults to the next 500 lines. The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. If the user explicitly asks you to read a complete file into context, call read with whole=true. A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.
 
+PDFs are readable: read on a .pdf serves the document as Markdown and pages through it exactly like a text file. Never shell out to pdftotext or a PDF library.
+
 ## Editing files
 
 Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. For edit, always put the edited file path as the first parameter. The old text must match exactly once in the current file; otherwise edit fails for safety.

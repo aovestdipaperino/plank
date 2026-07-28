@@ -98,8 +98,17 @@ fn push_lossy(out: &mut String, bytes: &[u8]) {
 /// Normal mode decorates lines with plain line numbers; `bare` mode returns
 /// raw content for payloads that decoration would corrupt. Truncated reads
 /// record continuation state for the `more` tool when `set_more` is true.
+///
+/// `read_path` and `path` diverge for converted documents: the bytes come from
+/// the Markdown in `~/.plank/doc-cache`, but every path the model sees — the
+/// header, the truncation notice, error text, and the `more` continuation —
+/// must be the path the user asked for. Leaking a cache path into an
+/// observation would invite the model to `read` or `edit` it. For every other
+/// file the two are the same string.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn read_range(
     ctx: &mut ToolContext,
+    read_path: &str,
     path: &str,
     start_line: usize,
     max_lines: usize,
@@ -110,7 +119,7 @@ pub(crate) fn read_range(
     if path.is_empty() {
         return "Tool error: read requires path\n".to_string();
     }
-    let data = match read_file_bytes(&ctx.resolve(path), path) {
+    let data = match read_file_bytes(&ctx.resolve(read_path), path) {
         Ok(d) => d,
         Err(err) => return format!("Tool error: {err}\n"),
     };
@@ -178,6 +187,7 @@ pub(crate) fn read_range(
         ctx.more = if end_idx < spans.len() {
             Some(MoreState {
                 path: path.to_string(),
+                read_path: read_path.to_string(),
                 next_line: end_idx + 1,
                 bare,
             })
@@ -200,8 +210,19 @@ pub fn tool_read(ctx: &mut ToolContext, call: &ToolCall) -> String {
         i64::MAX,
     );
     let raw = parse_bool_default(call.arg_value("raw"), false);
+    // A document is converted to Markdown first and then read like any other
+    // text file; see `crate::doc`.
+    let read_path = if crate::doc::is_document(Path::new(&path)) {
+        match crate::doc::to_markdown(&ctx.resolve(&path), &path) {
+            Ok(md) => md.to_string_lossy().into_owned(),
+            Err(err) => return format!("Tool error: {err}\n"),
+        }
+    } else {
+        path.clone()
+    };
     let out = read_range(
         ctx,
+        &read_path,
         &path,
         usize::try_from(start).unwrap_or(usize::MAX),
         usize::try_from(count).unwrap_or(usize::MAX),
@@ -229,6 +250,7 @@ pub fn tool_more(ctx: &mut ToolContext, call: &ToolCall) -> String {
     };
     read_range(
         ctx,
+        &more.read_path,
         &more.path,
         more.next_line,
         usize::try_from(count).unwrap_or(usize::MAX),
@@ -661,6 +683,55 @@ mod tests {
             "a\nb\n[Read truncated at line 2 of 3. continue_offset=3. \
              Call more with count=2 to read the next chunk.]\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `read` on a PDF serves Markdown, and `more` continues it — both naming
+    /// the user's path, never the `~/.plank/doc-cache` file the bytes came
+    /// from.
+    #[cfg(feature = "docparse")]
+    #[test]
+    fn read_pdf_as_markdown_and_continue() {
+        let (mut ctx, dir) = test_ctx();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("doc_sample.pdf");
+        std::fs::copy(&fixture, dir.join("doc.pdf")).unwrap();
+
+        let out = tool_read(
+            &mut ctx,
+            &test_call("read", &[("path", "doc.pdf"), ("max_lines", "10")]),
+        );
+        assert!(out.starts_with("doc.pdf: lines 1-10 of "), "{out}");
+        assert!(out.contains("DOC FIXTURE TITLE"), "{out}");
+        assert!(!out.contains("doc-cache"), "{out}");
+        assert!(out.contains("continue_offset=11"), "{out}");
+
+        let out = tool_more(&mut ctx, &test_call("more", &[("count", "10")]));
+        assert!(out.starts_with("doc.pdf: lines 11-20 of "), "{out}");
+        assert!(!out.contains("doc-cache"), "{out}");
+
+        // Wrapping made the document paginate: a reflowed conversion would be
+        // a handful of enormous lines instead.
+        let out = tool_read(
+            &mut ctx,
+            &test_call("read", &[("path", "doc.pdf"), ("whole", "true")]),
+        );
+        assert!(out.lines().count() > 40, "{out}");
+        assert!(out.contains("Line 100:"), "{out}");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A file that is not a PDF is untouched by the document path, and a
+    /// corrupt PDF is a tool error rather than a panic.
+    #[cfg(feature = "docparse")]
+    #[test]
+    fn unparseable_pdf_is_a_tool_error() {
+        let (mut ctx, dir) = test_ctx();
+        write_file(&dir, "broken.pdf", "not a pdf at all\n");
+        let out = tool_read(&mut ctx, &test_call("read", &[("path", "broken.pdf")]));
+        assert!(out.starts_with("Tool error: convert broken.pdf: "), "{out}");
         std::fs::remove_dir_all(dir).ok();
     }
 
