@@ -690,27 +690,22 @@ test` and review the diff before committing.
   `bash`, `write` + `read`, `write` + `edit`, and any MCP tool that writes a
   file followed by a built-in tool that reads it.
 
-- **A stray in-think stanza tail after `</think>` used to get misdiagnosed as
-  malformed markup.** When a model opens a DSML tool-call stanza inside
-  `<think>` and streams its closing tail out after `</think>`, the placement
-  mistake (calling a tool from inside thinking, which plank correctly
-  declines to run) is a different failure from a syntax mistake — but
-  `note_plain_dsml_byte`/`malformed_dsml` (`src/viz.rs`) could report the
-  latter (`[invalid tool call: DSML markup outside a valid tool_calls
-  block]`), handing the model a syntax reminder for markup that was never
-  malformed. In a recorded session this misdirection sent the model into a
-  rewrite spiral over perfectly valid syntax. `finished()` already gave the
-  in-think verdict precedence over a parse error at stream end; `malformed_dsml`
-  now applies the same precedence mid-stream: if `dsml_in_think` is set and
-  `thinking_tool_calls` is off, it defers to `finish_ignored_dsml` instead of
-  setting `stream_error`. On investigation this branch turned out to be
-  unreachable through the only current call site — `note_plain_dsml_byte`
-  already guards on `dsml_in_think` (sticky for the rest of the stream once
-  set) — so the fix is defensive infrastructure for a second call path
-  expected in later work, not an observed-failing-test fix. Separately,
-  `finish_ignored_dsml` logged `self.parser.raw()` for the rejection reason,
-  which is almost always already drained by the time the rejection fires —
-  the single most common entry in the tool-error log (in-think rejections,
-  969 recorded) carried an empty payload. It now falls back to the held
-  `dsml_start_tail` bytes so the log keeps some evidence of what was
-  rejected.
+- **The empty-payload defect in `finish_ignored_dsml` is real and fixed** — in-think
+  rejections are the most common entry in `~/.plank/tool-call-errors.log` (969
+  recorded) and were logging `self.parser.raw()` at a point where it has
+  usually been drained, so the most frequent failure carried no evidence. It
+  now falls back to the held `dsml_start_tail` bytes.
+
+  The misdiagnosis was **hypothesized and not reproduced**. `note_plain_dsml_byte`
+  already guards on `dsml_in_think`, which is sticky for the rest of the
+  stream, so `malformed_dsml` cannot be reached again once an in-think stanza
+  is seen. A guard added there was removed as dead code.
+
+  The methodological lesson, which is the part worth cataloguing: the
+  hypothesis came from reading `~/.plank/tool-call-errors.log` and seeing
+  "DSML markup outside a valid tool_calls block" adjacent to in-think
+  rejections 402 times, but those clusters were `echo plank-e2e` test-fixture
+  runs, not real sessions. The log was filtered for fixtures when counting,
+  and not when reasoning about adjacency. Note also that the log cannot see
+  hallucinated non-DSML markup at all, since `log_tool_error` is only reached
+  from paths that already classified something as tool markup.
