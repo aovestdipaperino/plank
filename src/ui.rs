@@ -2880,6 +2880,7 @@ impl Agent<'_> {
                     // turn uses, so markdown, thinking gray, and tool-call
                     // banners come back exactly as they were shown.
                     let mut stream = StreamRenderer::new(std::mem::take(log));
+                    stream.set_replay(true);
                     stream.set_show_tool_calls(show_tool_calls);
                     stream.set_show_thinking(show_thinking);
                     stream.set_thinking_tool_calls(thinking_tool_calls);

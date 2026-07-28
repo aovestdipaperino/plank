@@ -294,8 +294,10 @@ const GENERIC_PSEUDO_OPENERS: [&str; 3] = ["<tool_call>", "<function_call>", "<i
 ///
 /// Anchored at line start (the tail resets on newline) so prose mentioning
 /// `<task>` mid-sentence never matches, and disarmed inside fenced code
-/// blocks, where the model is showing markup rather than emitting it. The
-/// caller gates on `!in_think`, so only the answer region is watched.
+/// blocks, where the model is showing markup rather than emitting it. Every
+/// byte of the stream is fed to the fence tracker, including thinking, so a
+/// fence's open/close parity survives a `<think>`/`</think>` boundary; only
+/// tag matching (and thus reporting) is skipped while thinking.
 #[derive(Debug, Default)]
 struct PseudoToolDetector {
     /// Bytes since the last newline, capped.
@@ -316,9 +318,26 @@ impl PseudoToolDetector {
         self.tool_names = names;
     }
 
+    /// Clears the line-start anchor. `</think>` is a hard boundary for the
+    /// answer region even though no `\n` byte crosses it, so without this the
+    /// tail of a thinking line (never cleared, since tag matching — not line
+    /// tracking — is what's skipped while thinking) would still be glued
+    /// onto the first line of the answer and defeat the line-start anchor.
+    fn reset_line(&mut self) {
+        self.line.clear();
+    }
+
     /// Feeds one byte; returns the matched opener when this byte completes a
     /// pseudo-tool-call opening.
-    fn feed(&mut self, c: u8) -> Option<String> {
+    ///
+    /// `in_think` still runs the byte through the fence tracker — a fence
+    /// opened inside `<think>` must flip `in_fence` there so that its
+    /// matching closer in the answer region is recognized as a *closer*,
+    /// not mistaken for a fresh opener that would silence the detector for
+    /// the rest of the stream (issue #51's reproduction: a fence opened in
+    /// thinking and closed just after `</think>`, right before a pseudo-tool
+    /// block). Only the tag-matching/report path is skipped while thinking.
+    fn feed(&mut self, c: u8, in_think: bool) -> Option<String> {
         if c == b'\n' {
             if self.line.starts_with(b"```") {
                 self.in_fence = !self.in_fence;
@@ -329,7 +348,7 @@ impl PseudoToolDetector {
         if self.line.len() < Self::CAP {
             self.line.push(c);
         }
-        if self.fired || self.in_fence {
+        if in_think || self.fired || self.in_fence {
             return None;
         }
         // Only a tag opening the line counts; leading whitespace is allowed.
@@ -508,6 +527,13 @@ pub struct StreamRenderer<S> {
     /// Production wires this from `engine.thinkingToolCalls`, which defaults
     /// off too, so callers and tests keep the C behavior unless they opt in.
     thinking_tool_calls: bool,
+    /// When true, this renderer is replaying text that was already streamed
+    /// (and diagnosed) once before, from a stored transcript. The pseudo-tool
+    /// detector is a new addition on top of an existing replay path that
+    /// discards `finished()`, so any error it raises can never reach the
+    /// model; it would only double-log to disk and truncate the replayed
+    /// text. Defaults false. See [`StreamRenderer::set_replay`].
+    replay: bool,
 }
 
 /// Hook validating a partially-parsed tool call mid-stream.
@@ -558,7 +584,18 @@ impl<S: RenderSink> StreamRenderer<S> {
             show_tool_calls: true,
             show_thinking: true,
             thinking_tool_calls: false,
+            replay: false,
         }
+    }
+
+    /// Sets whether this renderer is replaying already-diagnosed text from a
+    /// stored transcript (default false). Replayed text was already streamed
+    /// and diagnosed the first time it was produced, so re-reporting it here
+    /// would both double-log to `~/.plank/tool-call-errors.log` and truncate
+    /// the rest of the replayed message via `stream_error`. Wire this at the
+    /// replay construction site only; live generation must leave it false.
+    pub fn set_replay(&mut self, replay: bool) {
+        self.replay = replay;
     }
 
     /// Sets the tool names the pseudo-tool detector recognizes (default none).
@@ -1333,10 +1370,17 @@ impl<S: RenderSink> StreamRenderer<S> {
         // the whole stream, so a generation in which the model tried DSML
         // inside <think> and then fell back to `<task>` XML in its answer —
         // the exact issue #51 scenario — would go unreported.
-        if self.output_frozen() || self.dsml_active || self.in_think {
+        //
+        // NOT gated on `in_think` either: the byte still has to reach the
+        // detector's fence tracker so a fence opened inside thinking keeps
+        // correct open/close parity across the `</think>` boundary (see
+        // `PseudoToolDetector::feed`). `in_think` is passed through instead
+        // so tag matching, and thus reporting, is still skipped while
+        // thinking.
+        if self.output_frozen() || self.dsml_active || self.replay {
             return;
         }
-        if let Some(opener) = self.pseudo_tool.feed(c) {
+        if let Some(opener) = self.pseudo_tool.feed(c, self.in_think) {
             self.pseudo_tool_call(&opener);
         }
     }
@@ -1435,6 +1479,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             if !self.dsml_active && rem.starts_with(THINK_CLOSE) {
                 self.flush_start_tail();
                 self.in_think = false;
+                self.pseudo_tool.reset_line();
                 self.viz_newline_if_open();
                 self.emit_visible_bytes(b"\n");
                 self.post_think_gap = true;
@@ -1548,10 +1593,26 @@ mod tests {
     #[test]
     fn pseudo_tool_block_inside_think_is_ignored() {
         let mut sr = pseudo_tool_renderer();
-        sr.push("<think>maybe I should write <task> here</think>");
+        sr.push("<think>\n<task>\n</task>\n</think>");
         sr.push("done");
         sr.finish();
         assert!(sr.finished().error.is_none());
+    }
+
+    // A fence opened inside <think> is never observed by the detector (it is
+    // gated on `!in_think`), so its matching close in the answer region must
+    // not be mistaken for an opener — otherwise the detector is silenced for
+    // the rest of the stream. Issue #51 case: the model tries DSML-like
+    // markup inside thinking, then falls back to `<task>` XML in its answer.
+    #[test]
+    fn stray_fence_close_leaking_from_think_does_not_disarm_the_detector() {
+        let mut sr = pseudo_tool_renderer();
+        sr.push("<think>```rust\nfoo\n</think>```\n<task>\nx\n</task>");
+        sr.finish();
+        assert!(
+            sr.finished().error.is_some(),
+            "a fence opened inside <think> disarmed the detector for the rest of the stream"
+        );
     }
 
     // Discussing the markup in prose or code is not attempting to call it.
@@ -1571,6 +1632,17 @@ mod tests {
         sr.push("<tool_call>\n{\"name\": \"read\"}\n</tool_call>");
         sr.finish();
         assert!(sr.finished().error.is_some());
+    }
+
+    // Replaying stored transcript text must not produce new diagnostics: the
+    // text was already diagnosed when it was first produced.
+    #[test]
+    fn pseudo_tool_block_is_not_reported_during_replay() {
+        let mut sr = pseudo_tool_renderer();
+        sr.set_replay(true);
+        sr.push("<task>\ntask_context: \"add headers\"\n</task>");
+        sr.finish();
+        assert!(sr.finished().error.is_none());
     }
 
     // A real DSML call must never be mistaken for a hallucination.
