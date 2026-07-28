@@ -19,7 +19,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fenced code blocks, and mid-sentence in prose; a fence opened while
   thinking and closed just after `</think>` is still recognized as a closer
   rather than mistaken for a fresh opener that would disarm the detector for
-  the rest of the answer.
+  the rest of the answer. Matching waits for the end of the line, so a line
+  that opens with a tool tag and then continues in prose is left alone; only
+  a line that is nothing but the tag counts, and the error quotes the line
+  that was actually seen. Because such a line can only appear after
+  `</think>`, this error now takes precedence over the in-think prohibition
+  when a generation manages both mistakes at once.
 
 ### Fixed
 
@@ -31,15 +36,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   character itself was wrong. A tool call whose name is the prompt's own
   `$TOOL_NAME` placeholder now gets its own error instead of being reported
   as a placement mistake.
-- **In-think rejections are logged with the stanza that was rejected**,
-  rather than an empty payload, which was the single most common entry in
-  `~/.plank/tool-call-errors.log`. A hypothesis that this empty-payload bug
-  compounded into a further misdiagnosis downstream — a leaked in-think
-  stanza tail being reported as bad syntax rather than misplacement — did
-  not survive review: the one call site that could report bad syntax
-  already guards on the same in-think state, so that path was unreachable.
-  The fix here is the evidence-capture bug on its own, not a chain of
-  failures.
+- **In-think rejections are usually logged with the stanza that was
+  rejected**, rather than an empty payload, which was the single most common
+  entry in `~/.plank/tool-call-errors.log`. The record now falls back to the
+  held `<`-anchored tail when the parser buffer has already been drained; when
+  no such tail was held the payload is still empty, so this narrows the blind
+  spot rather than closing it. A hypothesis that the empty-payload bug
+  compounded into a further misdiagnosis downstream, a leaked in-think stanza
+  tail being reported as bad syntax rather than misplacement, did not survive
+  review: the call site that reports bad syntax outside a stanza guards on the
+  same in-think state. The pseudo-tool detector added later in this release
+  does report from the answer region without that guard, but only for markup
+  the model invented there, and its error deliberately outranks the in-think
+  one.
 - **Test runs stopped writing to the real error log.** `cargo test` was
   appending its fixture failures to the developer's own
   `~/.plank/tool-call-errors.log`, mixing synthetic test data into a file

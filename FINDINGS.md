@@ -696,10 +696,19 @@ test` and review the diff before committing.
   usually been drained, so the most frequent failure carried no evidence. It
   now falls back to the held `dsml_start_tail` bytes.
 
+  The fallback is not total: when no `<`-anchored tail was being held, the
+  logged payload is still empty.
+
   The misdiagnosis was **hypothesized and not reproduced**. `note_plain_dsml_byte`
-  already guards on `dsml_in_think`, which is sticky for the rest of the
-  stream, so `malformed_dsml` cannot be reached again once an in-think stanza
-  is seen. A guard added there was removed as dead code.
+  guards on `dsml_in_think`, which is sticky for the rest of the stream, so
+  *that* call site cannot report `malformed_dsml` again once an in-think stanza
+  is seen. A guard added there was removed as dead code. The pseudo-tool
+  detector (issue #51) later added a second `malformed_dsml` call site which is
+  deliberately *not* guarded on `dsml_in_think`: the whole point is to catch
+  the model falling back to invented `<task>` markup in its answer after its
+  in-think DSML attempt was discarded. That path reports the invented markup,
+  not a parse verdict on the discarded stanza, and `finished()` lets it outrank
+  the in-think prohibition, so it is not a route back into the misdiagnosis.
 
   The methodological lesson, which is the part worth cataloguing: the
   hypothesis came from reading `~/.plank/tool-call-errors.log` and seeing
