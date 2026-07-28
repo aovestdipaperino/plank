@@ -3864,6 +3864,9 @@ impl Agent<'_> {
                 &mut btw_panel,
                 &mut arcade,
             )?;
+            // `--prompt` runs before the loop is ever idle: restart the clock
+            // so the screensaver waits out a full idle stretch afterwards.
+            last_activity = Instant::now();
         }
 
         // Endpoints of a mouse drag selection over the output area, in content
@@ -4022,6 +4025,11 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut arcade,
                         )?;
+                        // A remote-driven turn is time the user was not idle
+                        // at the prompt: start the screensaver clock from the
+                        // moment the UI comes back to idle, not from before
+                        // the turn.
+                        last_activity = Instant::now();
                     }
                 }
                 continue;
@@ -4382,6 +4390,15 @@ impl Agent<'_> {
                     }
                 }
                 _ => {}
+            }
+            // Re-stamp the idle clock now that the event has been fully
+            // handled. The stamp above covers the short paths that `continue`;
+            // this one covers the long ones — a key that starts a turn may not
+            // return here for minutes, and timing the screensaver from the
+            // keystroke would put the stars up the instant the turn finishes.
+            // Going back to idle is what starts the countdown.
+            if from_user {
+                last_activity = Instant::now();
             }
             // Retarget (or close) the popup after every edit and cursor move.
             input.sync_popup();

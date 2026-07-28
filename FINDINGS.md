@@ -501,6 +501,15 @@ test` and review the diff before committing.
   driving the terminal. Only keys, mouse and pastes count. Symptom: the idle
   timer visibly resets every few seconds with nobody touching the keyboard.
 
+- **…and it must be stamped when the event finishes being handled, not when it
+  arrives.** The Enter that submits a prompt is a user event, but the loop does
+  not come back to it until the whole turn is done — minutes later. Stamping on
+  arrival means the delay has already elapsed by then and the stars come up the
+  instant the turn ends. `tui_loop` stamps twice: once on arrival (covering the
+  short paths that `continue` out of the match) and once after the match, so a
+  long turn restarts the countdown from idle. Remote-driven turns and the
+  `--prompt` startup turn stamp at their own call sites for the same reason.
+
 - **`ratatui-markdown` code-block headers can't be customized via the block's
   `header_override`.** When a `RenderHooks` impl (plank uses `HighlightHooks`)
   returns `Some` from `render_code_block`, the crate renders the whole block —
