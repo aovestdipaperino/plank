@@ -1,0 +1,16 @@
+Internal plank-agent context compaction request. This is not a user request.
+Summarize the conversation so far into durable task state for continuing the work. Use exactly these numbered sections, omitting none (write "none" when a section is empty):
+1. Primary request and intent
+2. Key technical concepts
+3. Files and code sections (exact paths, ranges, and why each matters)
+4. Errors and fixes (including rejected approaches and known bugs)
+5. All user messages (condensed, in order)
+6. Pending tasks
+7. Current work (what was in progress at this very moment)
+8. Next step (only if one was explicitly requested by the user)
+
+You may reason first inside a single <analysis>...</analysis> block; it will be discarded. Then wrap the final summary in <summary>...</summary> tags.
+Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion; prefer exact paths/ranges/commands that can reload the data.
+After the summary, stop. Do not continue the user task, do not call tools, and do not output thinking tags or DSML markup.
+
+Compaction reason: low context

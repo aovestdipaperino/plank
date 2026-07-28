@@ -230,6 +230,45 @@ mod tests {
         assert!(p.contains("<analysis>"));
     }
 
+    // The prompt and `extract_summary` are two halves of one contract: the
+    // prompt names the tags, the parser looks for them. Renaming either alone
+    // fails silently at runtime — an empty summary, or one still carrying the
+    // model's reasoning — so assert a reply shaped exactly as the prompt
+    // instructs round-trips through the parser.
+    #[test]
+    fn a_reply_following_the_prompt_round_trips_through_extract_summary() {
+        let prompt = make_prompt("low context");
+
+        // Build the reply from the tag names the prompt itself asks for, so a
+        // rename in the prompt moves this test's input with it and only a
+        // *mismatch* between prompt and parser can fail.
+        let analysis = prompt
+            .split_once("inside a single ")
+            .and_then(|(_, rest)| rest.split_once("..."))
+            .map(|(open, _)| open.to_owned())
+            .expect("the prompt names an analysis open tag");
+        let summary = prompt
+            .split_once("wrap the final summary in ")
+            .and_then(|(_, rest)| rest.split_once("..."))
+            .map(|(open, _)| open.to_owned())
+            .expect("the prompt names a summary open tag");
+        let close = |open: &str| format!("</{}", open.trim_start_matches('<'));
+
+        let reply = format!(
+            "{analysis}deciding what matters{}\n{summary}\n1. Primary request and intent\nPort the thing.\n{}\n",
+            close(&analysis),
+            close(&summary)
+        );
+
+        let got = extract_summary(&reply);
+        assert_eq!(got, "1. Primary request and intent\nPort the thing.");
+        assert!(
+            !got.contains("deciding what matters"),
+            "reasoning must be discarded, got: {got:?}"
+        );
+        assert!(!got.contains('<'), "tags must be unwrapped, got: {got:?}");
+    }
+
     fn big_tool_result(tag: &str) -> Message {
         Message::user(format!(
             "<tool_result>{tag} {}</tool_result>",
