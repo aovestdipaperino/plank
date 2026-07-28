@@ -24,6 +24,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `liteparse-pdfium-sys`'s build script downloads pdfium into
+      # ~/.cache/pdfium-rs, bakes that path into the binary, and copies the
+      # dylib into target/<profile>/deps. rust-cache restores target/ but not
+      # that cache dir, so on a cache hit the script never re-runs: nothing
+      # re-downloads, and the baked path points at a directory the runner does
+      # not have. Every `doc::` test then dies in dlopen with "could not find
+      # pdfium shared library". Keyed on Cargo.lock so a dependency bump (and
+      # with it a new pdfium release tag) misses the cache and re-downloads.
+      - name: Cache pdfium binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdfium-rs
+          key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          # Deliberately no restore-keys: the build script takes whatever is in
+          # the cache dir if it exists, so a partial-key restore would hand a
+          # bumped liteparse-pdfium the previous release's binaries instead of
+          # downloading its own.
+
       # Not `--all`: plank is a single package whose path dependencies point
       # into the vendored submodules (`obscura`, `edit`), and `--all` reaches
       # into them. Their code is upstream's and is not formatted to plank's
