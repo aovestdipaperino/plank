@@ -92,6 +92,12 @@ Beta channel on the 2.7 series.
 
 ### Internal
 
+- **CI's format check no longer fails on vendored submodule code.** It ran
+  `cargo fmt --all`, which follows the `path =` dependencies into `refs/obscura`
+  and `refs/edit` and checks upstream's source against plank's `rustfmt.toml`;
+  the result was a red build on every push that said nothing about plank. It is
+  `cargo fmt --check` now, which stops at the package boundary.
+
 - **Restored the `refs/openclaw` stanza in `.gitmodules`.** It was dropped while
   `refs/edit` was added, but its gitlink stayed in the tree, so every CI and
   release checkout died at `git submodule update --recursive` before building

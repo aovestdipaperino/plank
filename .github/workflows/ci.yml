@@ -24,8 +24,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Not `--all`: plank is a single package whose path dependencies point
+      # into the vendored submodules (`obscura`, `edit`), and `--all` reaches
+      # into them. Their code is upstream's and is not formatted to plank's
+      # rustfmt.toml, so `--all` failed here on every push while saying nothing
+      # about plank's own source.
       - name: Format check
-        run: cargo fmt --all -- --check
+        run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings

@@ -335,6 +335,23 @@ test` and review the diff before committing.
   latched interrupt has to be consumed (`shared.interrupt` under the TUI, the
   SIGINT flag otherwise) or the next turn starts already cancelled.
 
+- **`cargo fmt --all` reaches into vendored path dependencies.** plank is a
+  single package, but `obscura` and `edit` are `path =` dependencies pointing
+  into submodules, and `--all` formats those crates too. Upstream code is not
+  written to plank's `rustfmt.toml`, so CI's `cargo fmt --all -- --check`
+  reported 667 diffs — none of them plank's — and failed every push while
+  saying nothing about plank's own source. `cargo fmt --check` (no `--all`)
+  covers this package and stops at the submodule boundary; verified by probing
+  a misformatted function into `src/` and confirming it is still caught.
+
+  The pre-commit hook hid it: it ran `cargo fmt --all` *without* `--check`, so
+  locally it silently rewrote ~59 submodule files instead of failing. Nothing
+  was ever committed (only already-staged files get re-staged), but it left
+  `refs/obscura` permanently dirty and meant the hook could never agree with
+  CI. The hook now runs `rustfmt --edition <crate edition>` on the staged files
+  only. Clippy needs no equivalent change: path dependencies are built, not
+  linted.
+
 - **A gitlink without a `.gitmodules` entry breaks every CI checkout.** The
   tree can hold a submodule commit (mode `160000`) that `.gitmodules` does not
   describe; `git submodule update --recursive`, which `actions/checkout` runs,
