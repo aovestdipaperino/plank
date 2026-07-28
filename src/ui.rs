@@ -4411,6 +4411,7 @@ impl Agent<'_> {
                     input.popup = None;
                     input.hist_idx = None;
                     view.follow = true;
+                    sub_pane.view.follow = true;
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
@@ -6596,7 +6597,8 @@ fn busy_ui_loop(
                                 shared.preempt.store(true, Ordering::Relaxed);
                                 log.push_dim("[/btw — pausing the task to answer now]");
                             }
-                            sub.active_view(view).follow = true;
+                            view.follow = true;
+                            sub.view.follow = true;
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
@@ -6608,7 +6610,8 @@ fn busy_ui_loop(
                             input.history.add(&line);
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_ansi(&out);
-                            sub.active_view(view).follow = true;
+                            view.follow = true;
+                            sub.view.follow = true;
                         } else if let Some(cmd) = arcade_command(&line) {
                             // The whole point of these is the waiting, so they
                             // are the commands that *do* run mid-turn.
@@ -6635,7 +6638,8 @@ fn busy_ui_loop(
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_dim("[queued — joins the conversation at the next step]");
                             shared.push_queued(line);
-                            sub.active_view(view).follow = true;
+                            view.follow = true;
+                            sub.view.follow = true;
                         }
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
