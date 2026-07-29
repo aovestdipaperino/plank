@@ -112,7 +112,7 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/btw-panel.png" alt="The plank TUI split screen: a counting task on the left, a /btw side answer on the right" width="700">
 </p>
 
-Long turns end with a native macOS notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon and plank's logo. `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`, and `/renotify` re-shows the last one — useful on Ventura and later, where a banner no longer sticks around waiting to be read:
+Long turns end with a native macOS notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon and plank's logo. `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`:
 
 <p align="center">
   <img src="assets/notification.png" alt="macOS desktop notification: a finished plank task with the prompt as headline and the answer tail as body" width="500">
