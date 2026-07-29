@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.5] - 2026-07-29
+
+Beta channel on the 2.7 series.
+
+### Changed
+
+- **The CRT power-off animation ends on a thinner trace.** Its last two
+  phases used half- and full-block glyphs, which read as a solid bar rather
+  than a collapsing scanline. The line is now `▁` (a lower one-eighth block,
+  which tiles without gaps where a plain `_` would not) and the final
+  phosphor point is `.`, via crt-off 0.1.3.
+
 ## [2.7.4] - 2026-07-29
 
 Beta channel on the 2.7 series.
