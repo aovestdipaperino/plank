@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.6] - 2026-07-29
+
+Beta channel on the 2.7 series.
+
+### Added
+
+- **`/btw` answers beside the running task instead of freezing it.** An in-pass
+  side question used to pause the main generation for the whole answer. It now
+  runs on a fork of the session, interleaved with the main task at token
+  granularity, so the main reply keeps advancing while the answer streams into
+  the side panel. The aside gets the larger share of the thread (4:1) — it is a
+  short question with someone waiting on it, and at an even split the answer
+  took twice as long as it would have alone.
+
+  This is time-slicing, not parallelism: one Metal command queue means nothing
+  finishes sooner overall. What changes is that the main task no longer stops.
+
+  One aside runs at a time and questions are no longer queued behind one — with
+  the answer already on screen, holding the next question back bought nothing.
+  Engines that cannot fork (the stub, remote engines) keep the old
+  freeze/answer/resume behaviour.
+
+### Fixed
+
+- **The second `/btw` of a turn no longer re-prefills the whole conversation.**
+  It rebuilt every token — 14602 of them on a moderate transcript, around a
+  minute of dead air that read as a hang. A suspended pass generates twice into
+  one assistant message, but the transcript recorded a span per generation
+  while the rendered conversation holds one merged section; reconciliation
+  diverged there and the prompt stopped extending the live cache. One assistant
+  turn is now one span, and the second aside reuses 99.9% of its prefix.
+  Diagnosis in `docs/DOUBLE-BTW.md`.
+- **A `/btw` answer no longer loses its last line.** The panel was never told to
+  close the final line, so the tail of every answer was dropped.
+
 ## [2.7.5] - 2026-07-29
 
 Beta channel on the 2.7 series.
