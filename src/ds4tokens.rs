@@ -141,13 +141,52 @@ impl TokenTranscript {
     /// the incoming `sections`: the count of leading spans whose (role, text)
     /// key matches the corresponding section. This is the reconciliation point —
     /// spans before it are reused verbatim, everything from it on is stale.
+    ///
+    /// A span's text is compared **trailing-trimmed**, because the renderer the
+    /// sections come from trims every section's end (`parse_sections`). Storing
+    /// text raw and trimming here is what keeps the two comparable while a span
+    /// stays extendable: [`extend_last_span`](Self::extend_last_span) has to
+    /// concatenate exactly what the UI concatenates, so it cannot afford to have
+    /// had the first half's trailing whitespace trimmed away at record time.
     #[must_use]
     pub fn common_prefix(&self, sections: &[SectionKey]) -> usize {
         self.spans
             .iter()
             .zip(sections)
-            .take_while(|(span, sec)| span.role == sec.role && span.text == sec.text)
+            .take_while(|(span, sec)| span.role == sec.role && span.text.trim_end() == sec.text)
             .count()
+    }
+
+    /// Whether the last span is an assistant reply.
+    ///
+    /// This is the signal that a newly sampled reply *continues* the last span
+    /// rather than opening a fresh turn: ordinary turns alternate user and
+    /// assistant, so two adjacent assistant spans can only come from a pass
+    /// that was suspended and resumed (`docs/DOUBLE-BTW.md`).
+    #[must_use]
+    pub fn last_is_assistant(&self) -> bool {
+        self.spans
+            .last()
+            .is_some_and(|s| s.role == SpanRole::Assistant)
+    }
+
+    /// Extends the last span with more text and tokens, instead of starting a
+    /// new one.
+    ///
+    /// The token buffer is appended to exactly as [`push_span`](Self::push_span)
+    /// would, so the ids and their order are identical either way — only the
+    /// span boundary differs. That is the whole point: one assistant turn must
+    /// be one span, because the rendered transcript it reconciles against holds
+    /// it as one section (`docs/DOUBLE-BTW.md` §4).
+    ///
+    /// A no-op when the buffer is empty.
+    pub fn extend_last_span(&mut self, text: &str, tokens: &[i32]) {
+        let Some(last) = self.spans.last_mut() else {
+            return;
+        };
+        self.tokens.extend_from_slice(tokens);
+        last.text.push_str(text);
+        last.ntokens += tokens.len();
     }
 
     /// Drops all spans (and their tokens) from index `keep` onward, so the
@@ -282,6 +321,73 @@ mod tests {
             role,
             text: text.to_string(),
         }
+    }
+
+    /// The merge is a span-index change and nothing more: the ids and their
+    /// order are identical to having pushed a second span, so the KV the
+    /// transcript describes is byte-for-byte the same.
+    #[test]
+    fn merging_the_last_assistant_span_keeps_the_token_buffer() {
+        let mut appended = TokenTranscript::new();
+        appended.push_span(SpanRole::User, 0, "q".into(), &[1, 2]);
+        appended.push_span(SpanRole::Assistant, 0, "half".into(), &[3, 4]);
+        appended.push_span(SpanRole::Assistant, 0, " rest".into(), &[5, 6]);
+
+        let mut merged = TokenTranscript::new();
+        merged.push_span(SpanRole::User, 0, "q".into(), &[1, 2]);
+        merged.push_span(SpanRole::Assistant, 0, "half".into(), &[3, 4]);
+        merged.extend_last_span(" rest", &[5, 6]);
+
+        assert_eq!(
+            merged.tokens(),
+            appended.tokens(),
+            "merging must not change the ids or their order"
+        );
+        assert_eq!(merged.spans().len(), 2, "the two halves are now one span");
+        assert_eq!(merged.spans()[1].text, "half rest");
+        assert_eq!(
+            merged.spans()[1].ntokens,
+            4,
+            "the merged span covers both halves' tokens"
+        );
+    }
+
+    /// `last_is_assistant` is the merge signal, so it must be false for the
+    /// shapes an ordinary turn produces.
+    #[test]
+    fn last_is_assistant_only_after_a_reply() {
+        let mut t = TokenTranscript::new();
+        assert!(!t.last_is_assistant(), "an empty buffer has no last span");
+        t.push_span(SpanRole::User, 0, "q".into(), &[1]);
+        assert!(!t.last_is_assistant(), "a user turn is not a reply");
+        t.push_span(SpanRole::Assistant, 0, "a".into(), &[2]);
+        assert!(t.last_is_assistant());
+    }
+
+    /// Spans hold raw text so a suspended reply can be extended by its
+    /// continuation; the renderer trims every section's end, so the comparison
+    /// trims too. Without this the first half's trailing whitespace would make
+    /// a completed, correctly-merged reply look divergent.
+    #[test]
+    fn common_prefix_ignores_trailing_whitespace() {
+        let mut t = TokenTranscript::new();
+        t.push_span(SpanRole::User, 0, "q".into(), &[1]);
+        t.push_span(SpanRole::Assistant, 0, "answer\n\n".into(), &[2]);
+
+        let sections = [key(SpanRole::User, "q"), key(SpanRole::Assistant, "answer")];
+        assert_eq!(
+            t.common_prefix(&sections),
+            2,
+            "a raw-stored span still matches its trimmed section"
+        );
+
+        // Interior whitespace is still significant: it is what the UI renders
+        // between the two halves of a resumed reply.
+        let differing = [
+            key(SpanRole::User, "q"),
+            key(SpanRole::Assistant, "ans wer"),
+        ];
+        assert_eq!(t.common_prefix(&differing), 1);
     }
 
     fn built() -> TokenTranscript {

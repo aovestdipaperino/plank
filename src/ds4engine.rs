@@ -576,6 +576,13 @@ impl Ds4Session {
         self.transcript.tokens()
     }
 
+    /// The transcript's span index, whose shape must mirror the rendered
+    /// transcript's sections (`docs/DOUBLE-BTW.md`).
+    #[must_use]
+    pub fn transcript_spans(&self) -> &[crate::ds4tokens::Span] {
+        self.transcript.spans()
+    }
+
     /// The shared model behind this session, for creating siblings over the
     /// same weights without reloading them.
     #[must_use]
@@ -730,8 +737,19 @@ impl Ds4Session {
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
         span.push(eos);
-        self.transcript
-            .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+        // A reply that follows another assistant span *continues* it: the pass
+        // was suspended for an in-pass `/btw` and resumed, and the UI splices
+        // both halves into one assistant message. Extend rather than append, so
+        // the span index matches the single section the next turn reconciles
+        // against — appending instead diverges there and re-prefills the whole
+        // conversation (`docs/DOUBLE-BTW.md`). The ids appended are the same
+        // either way, so the KV is untouched by the choice.
+        if self.transcript.last_is_assistant() {
+            self.transcript.extend_last_span(&text, &span);
+        } else {
+            self.transcript
+                .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+        }
     }
 }
 
@@ -942,9 +960,12 @@ impl Engine for Ds4Session {
         }
 
         // Append the sampled reply to the token transcript so the next turn's
-        // reconciliation keeps these exact tokens verbatim (its span key is the
-        // trimmed reply text) and the live KV prefix reaches this turn's end.
-        reply_text.truncate(reply_text.trim_end().len());
+        // reconciliation keeps these exact tokens verbatim and the live KV
+        // prefix reaches this turn's end. The text is recorded *raw*: a
+        // suspended pass's partial may later be extended by its continuation,
+        // and the two halves have to concatenate into exactly what the UI
+        // renders (`docs/DOUBLE-BTW.md` §4.1). `common_prefix` trims when it
+        // compares, so a completed reply still matches its rendered section.
         self.record_reply(reply_text, &reply_tokens, opts.think_mode);
 
         let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
@@ -1363,7 +1384,6 @@ impl Ds4HostSession {
         // An incomplete trailing sequence at end of stream decodes lossily;
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
-        reply_text.truncate(reply_text.trim_end().len());
         self.inner
             .record_reply(reply_text, &st.reply_tokens, st.opts.think_mode);
         let secs = st.start.elapsed().as_secs_f64();
@@ -1729,6 +1749,44 @@ mod tests {
         assert_eq!(strip_legacy(&legacy), kv);
         // A payload with no legacy magic is already raw KV: pass-through.
         assert_eq!(strip_legacy(kv), kv);
+    }
+
+    /// A resumed pass generates twice into one assistant message, and the
+    /// rendered transcript holds it as one section — so the transcript must
+    /// hold one span, or reconciliation diverges there and the next prompt
+    /// stops extending the live KV (`docs/DOUBLE-BTW.md` §3).
+    ///
+    /// Exercises the span bookkeeping directly, without a model: what matters
+    /// is that a second reply extends rather than appends, and that the merged
+    /// key is what `parse_sections` will produce from the merged message.
+    #[test]
+    fn a_resumed_reply_extends_one_assistant_span() {
+        use crate::ds4tokens::{SectionKey, SpanRole, TokenTranscript};
+
+        // The suspended pass records its partial, raw (trailing newline and
+        // all), then the resumed pass records the continuation.
+        let mut t = TokenTranscript::new();
+        t.push_span(SpanRole::User, 0, "count to three".into(), &[1, 2]);
+        t.push_span(SpanRole::Assistant, 0, "one\ntwo\n".into(), &[3, 4]);
+        assert!(t.last_is_assistant(), "the partial is the last span");
+        t.extend_last_span("three\n", &[5, 6]);
+
+        assert_eq!(t.spans().len(), 2, "one reply is one span");
+
+        // What the UI renders next turn: the two halves spliced into one
+        // message, whose section key `parse_sections` trims at the end.
+        let rendered = "[user]\ncount to three\n[assistant]\none\ntwo\nthree\n";
+        let sections: Vec<SectionKey> = parse_sections(rendered)
+            .into_iter()
+            .filter_map(|(role, text)| {
+                SpanRole::from_tag(role).map(|role| SectionKey { role, text })
+            })
+            .collect();
+        assert_eq!(
+            t.common_prefix(&sections),
+            2,
+            "the merged span matches the merged section, so nothing is stale"
+        );
     }
 
     #[test]
@@ -2799,6 +2857,106 @@ mod tests {
         assert!(
             paris <= 1,
             "the forks contaminated each other: {paris} mention Paris"
+        );
+    }
+
+    /// The headline for `docs/DOUBLE-BTW.md`: a *second* in-pass aside must
+    /// still reuse the prefix. The first one worked all along; the second one
+    /// re-prefilled the whole conversation, because the resumed pass appended a
+    /// second assistant span while the UI renders one merged section.
+    ///
+    /// Drives the real shape twice over: freeze, aside, resume, freeze again,
+    /// aside again.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_second_aside_still_reuses_the_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+        use std::fmt::Write as _;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 91,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nCount slowly from one to forty.\n";
+        // Text the main task has produced so far, spliced into every prompt the
+        // way `run_turn` splices it.
+        let mut produced = String::new();
+        let mut asides = Vec::new();
+
+        for round in 0..2 {
+            // Freeze a pass partway, as a preempting `/btw` does.
+            let seen = Cell::new(0);
+            let mut prompt = base.to_owned();
+            if !produced.is_empty() {
+                let _ = write!(prompt, "[assistant]\n{produced}");
+            }
+            engine
+                .generate(
+                    crate::engine::Prompt::Flat(&prompt),
+                    &opts,
+                    &|| seen.get() > 6,
+                    &|| false,
+                    &mut |e| {
+                        if let EngineEvent::Text(t) = e {
+                            seen.set(seen.get() + 1);
+                            produced.push_str(&t);
+                        }
+                    },
+                )
+                .unwrap();
+            assert!(!produced.is_empty(), "round {round} produced a partial");
+
+            // The aside, framed over the paused reply.
+            let aside_prompt =
+                format!("{base}[assistant]\n{produced}\n[user]\nWhat is the capital of France?\n");
+            let mut remaining = 0;
+            engine
+                .generate_aside_forked(&aside_prompt, &opts, &|| false, &mut |e| {
+                    if let EngineEvent::Prefill(p) = e {
+                        remaining = remaining.max(p.total);
+                    }
+                })
+                .unwrap();
+            asides.push(remaining);
+        }
+
+        eprintln!("aside prefill by round: {asides:?}");
+
+        // The structural invariant, and the one that actually discriminates:
+        // two generations into one assistant message are one span, because the
+        // rendered transcript holds them as one section. Appending instead is
+        // what makes the next reconciliation diverge.
+        let assistant_spans = engine
+            .transcript_spans()
+            .iter()
+            .filter(|s| s.role == crate::ds4tokens::SpanRole::Assistant)
+            .count();
+        assert_eq!(
+            assistant_spans, 1,
+            "two resumed generations must be one assistant span, not {assistant_spans}"
+        );
+
+        // And the cost follows from it: the second aside prefills its question,
+        // not the conversation. Held tight deliberately — with the fix both
+        // rounds cost the same, and without it the second grew threefold even
+        // on this short transcript.
+        assert!(
+            asides[1] <= asides[0] + 4,
+            "the second aside re-prefilled the conversation instead of reusing \
+             it (first={}, second={})",
+            asides[0],
+            asides[1]
         );
     }
 
