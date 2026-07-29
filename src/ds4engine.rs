@@ -1073,6 +1073,7 @@ impl Engine for Ds4Session {
         opts: &GenerationOptions,
         interrupt: &dyn Fn() -> bool,
         on_event: &mut dyn FnMut(crate::engine::AsideStream, EngineEvent),
+        on_stream_end: &mut dyn FnMut(crate::engine::AsideStream),
     ) -> Result<(GenerationStats, GenerationStats), EngineError> {
         use crate::engine::AsideStream;
         use crate::slice::{JobId, SliceRunner};
@@ -1108,17 +1109,22 @@ impl Engine for Ds4Session {
                 Arc::clone(&stop),
                 crate::slice::ASIDE_SLICE_WEIGHT,
             );
-            runner.run(&mut |id, ev| {
-                if interrupt() {
-                    stop.store(true, Ordering::Relaxed);
-                }
-                let which = if id == JobId(0) {
+            let stream_of = |id: JobId| {
+                if id == JobId(0) {
                     AsideStream::Main
                 } else {
                     AsideStream::Aside
-                };
-                on_event(which, ev);
-            })
+                }
+            };
+            runner.run_with(
+                &mut |id, ev| {
+                    if interrupt() {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                    on_event(stream_of(id), ev);
+                },
+                &mut |id| on_stream_end(stream_of(id)),
+            )
         };
 
         // Take the live session back before surfacing any error, so a failed
@@ -2723,6 +2729,7 @@ mod tests {
                         }
                     }
                 },
+                &mut |_| {},
             )
             .unwrap();
 

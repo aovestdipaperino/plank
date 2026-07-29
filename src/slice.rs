@@ -172,6 +172,23 @@ impl<'a> SliceRunner<'a> {
     /// the rest keep running. Interrupting a job likewise ends only that job —
     /// its stats carry `interrupted`.
     pub fn run(&mut self, on_event: &mut dyn FnMut(JobId, EngineEvent)) -> Vec<JobOutcome> {
+        self.run_with(on_event, &mut |_| {})
+    }
+
+    /// As [`run`](Self::run), plus `on_done`, called the moment a job leaves the
+    /// rotation — not when the whole run ends.
+    ///
+    /// The difference is the point. Jobs finish at wildly different times: a
+    /// one-line aside is done in a single slice while the main task still has
+    /// hundreds of tokens to go. A caller that only learns of completion from
+    /// the returned outcomes cannot close out that stream until every sibling
+    /// has finished too, which for an aside means its answer sits unterminated
+    /// on screen long after it was written.
+    pub fn run_with(
+        &mut self,
+        on_event: &mut dyn FnMut(JobId, EngineEvent),
+        on_done: &mut dyn FnMut(JobId),
+    ) -> Vec<JobOutcome> {
         while let Some(idx) = self.rotation.pop_front() {
             let job = &mut self.jobs[idx];
             let id = JobId(idx);
@@ -180,8 +197,14 @@ impl<'a> SliceRunner<'a> {
                 // More to do: back of the queue, so every sibling gets a slice
                 // before this one runs again.
                 Ok(None) => self.rotation.push_back(idx),
-                Ok(Some(stats)) => job.result = Some(Ok(stats)),
-                Err(e) => job.result = Some(Err(e)),
+                Ok(Some(stats)) => {
+                    job.result = Some(Ok(stats));
+                    on_done(id);
+                }
+                Err(e) => {
+                    job.result = Some(Err(e));
+                    on_done(id);
+                }
             }
         }
         self.take_outcomes()
@@ -367,6 +390,39 @@ mod tests {
             "the weighted job should finish first (aside ended at {last_aside}, \
              main at {last_main})"
         );
+    }
+
+    /// A job's completion is reported the moment it happens, not when the run
+    /// ends — so a short stream can be closed out while its long sibling is
+    /// still going.
+    #[test]
+    fn completion_is_reported_as_it_happens() {
+        let (mut quick, mut slow) = (StepSession::steps("q", 2), StepSession::steps("s", 8));
+        let mut runner = SliceRunner::new(1);
+        runner.add(&mut quick, "x".into(), opts(), flag());
+        runner.add(&mut slow, "y".into(), opts(), flag());
+
+        // Record completions inline with the token stream, so their position
+        // in the sequence is visible.
+        let timeline = std::cell::RefCell::new(Vec::<String>::new());
+        let outcomes = runner.run_with(
+            &mut |id, ev| {
+                if let EngineEvent::Text(t) = ev {
+                    timeline.borrow_mut().push(format!("{}:{t}", id.0));
+                }
+            },
+            &mut |id| timeline.borrow_mut().push(format!("done{}", id.0)),
+        );
+        let timeline = timeline.into_inner();
+
+        let done_quick = timeline.iter().position(|e| e == "done0").unwrap();
+        let last_slow = timeline.iter().rposition(|e| e.starts_with("1:")).unwrap();
+        assert!(
+            done_quick < last_slow,
+            "the short job's completion must land before its sibling's last \
+             token, not after the whole run: {timeline:?}"
+        );
+        assert_eq!(outcomes.len(), 2);
     }
 
     /// Weighting decides who waits, not how much work happens: the same tokens

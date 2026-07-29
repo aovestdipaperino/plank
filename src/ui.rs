@@ -5620,16 +5620,18 @@ impl Agent<'_> {
             // The aside gets a renderer of its own, so its thinking is split
             // from its answer the way any other generation's is. Tool calls are
             // denied for an aside, so it needs none of the dispatch machinery.
-            let mut aside_stream = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
-            aside_stream.set_show_thinking(crate::settings::active().ui.show_thinking);
+            let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
+            aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
             if !matches!(
                 self.cfg.generation.think_mode,
                 crate::engine::ThinkMode::Off
             ) {
-                aside_stream.begin_in_think();
+                aside_renderer.begin_in_think();
             }
-            let result = self
-                .engine
+            // Shared between the token sink and the completion hook; the borrow
+            // checker will not let both closures hold it mutably.
+            let aside_stream = std::cell::RefCell::new(aside_renderer);
+            self.engine
                 .generate_multiplexed(
                     prompt,
                     &aside_prompt,
@@ -5639,18 +5641,22 @@ impl Agent<'_> {
                         crate::engine::AsideStream::Main => on_event(ev),
                         crate::engine::AsideStream::Aside => {
                             if let EngineEvent::Text(t) = ev {
-                                aside_stream.push(&t);
+                                aside_stream.borrow_mut().push(&t);
                             }
                         }
                     },
+                    // Close the answer out the moment the aside itself is done,
+                    // not when the main task catches up. A one-line aside
+                    // finishes in a slice or two; waiting would leave its last
+                    // line uncommitted for the rest of the turn.
+                    &mut |which| {
+                        if which == crate::engine::AsideStream::Aside {
+                            aside_stream.borrow_mut().finish();
+                            let _ = tx.send(UiEvent::Btw(Box::new(UiEvent::EndLine)));
+                        }
+                    },
                 )
-                .map(|(main, _aside)| main);
-            // Flush the renderer, then close the panel's line: without the
-            // `EndLine` its last, unterminated line is never committed to the
-            // log, so the tail of the answer is silently lost.
-            aside_stream.finish();
-            let _ = tx.send(UiEvent::Btw(Box::new(UiEvent::EndLine)));
-            result
+                .map(|(main, _aside)| main)
         } else {
             self.engine.generate(
                 engine_prompt,

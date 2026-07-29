@@ -511,6 +511,10 @@ pub trait Engine: Debug + Send {
     /// The default implementation returns [`EngineError::unsupported`] so
     /// callers fall back to the freeze/answer/resume path. Real engines return
     /// [`EngineError`] on a backend failure, including a refused fork.
+    /// `on_stream_end` fires as soon as one of the two finishes, rather than
+    /// when the call returns. An aside is usually done in a slice or two while
+    /// the main task still has hundreds of tokens to run; without this its
+    /// answer would sit unterminated on screen for the rest of the turn.
     fn generate_multiplexed(
         &mut self,
         _main_prompt: &str,
@@ -518,6 +522,7 @@ pub trait Engine: Debug + Send {
         _opts: &GenerationOptions,
         _interrupt: &dyn Fn() -> bool,
         _on_event: &mut dyn FnMut(AsideStream, EngineEvent),
+        _on_stream_end: &mut dyn FnMut(AsideStream),
     ) -> Result<(GenerationStats, GenerationStats), EngineError> {
         Err(EngineError::unsupported())
     }
