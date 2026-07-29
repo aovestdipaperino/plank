@@ -125,6 +125,31 @@ pub struct HostStatus {
     pub kv_budget_bytes: Option<u64>,
     /// Per-session accounting, sorted by id.
     pub sessions: Vec<SessionAccount>,
+    /// Cost of the most recent KV capture the scheduler performed, if any.
+    pub last_capture: Option<KvTiming>,
+    /// Cost of the most recent KV restore the scheduler performed, if any.
+    pub last_restore: Option<KvTiming>,
+}
+
+/// Wall-clock cost of one KV snapshot capture or restore.
+///
+/// Recorded because session cloning (`docs/SESSION-CLONE-DESIGN.md` §8) is only
+/// viable for interactive use if capture is cheap: a clone that is semantically
+/// perfect but costs seconds is not a clone anyone can use. Correctness tests
+/// cannot see that, so the host measures it from the first snapshot it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvTiming {
+    /// Size of the serialized snapshot, in bytes.
+    pub bytes: usize,
+    /// Wall-clock duration of the operation.
+    pub elapsed: Duration,
+}
+
+/// The scheduler's running record of the latest capture and restore costs.
+#[derive(Debug, Clone, Copy, Default)]
+struct KvTimings {
+    capture: Option<KvTiming>,
+    restore: Option<KvTiming>,
 }
 
 /// The shared, immutable model: weights, tokenizer, and the Metal command
@@ -233,6 +258,11 @@ enum Command {
         ctx_size: Option<i32>,
         reply: Sender<Result<u64, EngineError>>,
     },
+    Clone {
+        /// The session whose KV and transcript the new session starts from.
+        src: u64,
+        reply: Sender<Result<u64, EngineError>>,
+    },
     Generate {
         id: u64,
         transcript: String,
@@ -334,6 +364,37 @@ impl EngineHost {
         let (reply, reply_rx) = channel();
         self.cmd_tx
             .send(Command::Attach { ctx_size, reply })
+            .map_err(|_| EngineError::new("engine host stopped"))?;
+        let id = reply_rx
+            .recv()
+            .map_err(|_| EngineError::new("engine host stopped"))??;
+        Ok(SessionHandle {
+            id,
+            cmd_tx: self.cmd_tx.clone(),
+        })
+    }
+
+    /// Attaches a new session pre-loaded with `from`'s current KV and token
+    /// transcript, so it continues where `from` left off without re-prefilling
+    /// (`docs/SESSION-CLONE-DESIGN.md` §5.1). The source is left untouched and
+    /// the two sessions diverge independently from that point.
+    ///
+    /// The clone is an ordinary session in every other respect: it counts
+    /// against `max_sessions` and the KV-bytes budget at the source's
+    /// `ctx_size`, so memory roughly doubles for its lifetime.
+    ///
+    /// # Errors
+    /// Returns an `unsupported` [`EngineError`] when the backend cannot
+    /// snapshot, so the caller can fall back to a non-cloning path. Returns a
+    /// real error when the source is unknown, is currently generating, has been
+    /// idle-reclaimed, or when admission refuses the second context.
+    pub fn attach_clone(&self, from: &SessionHandle) -> Result<SessionHandle, EngineError> {
+        let (reply, reply_rx) = channel();
+        self.cmd_tx
+            .send(Command::Clone {
+                src: from.id,
+                reply,
+            })
             .map_err(|_| EngineError::new("engine host stopped"))?;
         let id = reply_rx
             .recv()
@@ -473,6 +534,7 @@ fn scheduler_loop(
 ) {
     let mut sessions: HashMap<u64, SessionSlot> = HashMap::new();
     let mut rotation: VecDeque<ActiveJob> = VecDeque::new();
+    let mut timings = KvTimings::default();
     let ctx_size = model.ctx_size();
 
     loop {
@@ -482,28 +544,28 @@ fn scheduler_loop(
         if rotation.is_empty() {
             match recv_or_reclaim(cmd_rx, cfg.idle_reclaim) {
                 RecvOutcome::Command(cmd) => {
-                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
+                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg, &mut timings) {
                         return;
                     }
                 }
                 RecvOutcome::ReclaimTick => {
                     if let Some(threshold) = cfg.idle_reclaim {
-                        reclaim_idle_sessions(&mut sessions, &rotation, threshold);
+                        reclaim_idle_sessions(&mut sessions, &rotation, threshold, &mut timings);
                     }
                 }
                 RecvOutcome::Disconnected => return,
             }
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
         let mut dirty = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
+            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg, &mut timings) {
                 return;
             }
             dirty = true;
         }
         if dirty {
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
 
         // One round-robin pass: give each active job a single K-token slice,
@@ -544,7 +606,7 @@ fn scheduler_loop(
             }
         }
         if completed {
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
     }
 }
@@ -588,6 +650,7 @@ fn reclaim_idle_sessions(
     sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &VecDeque<ActiveJob>,
     threshold: Duration,
+    timings: &mut KvTimings,
 ) {
     let now = Instant::now();
     for (id, slot) in sessions.iter_mut() {
@@ -601,8 +664,13 @@ fn reclaim_idle_sessions(
             continue;
         }
         let mut session = slot.session.take().expect("checked is_some above");
+        let started = Instant::now();
         match session.snapshot_bytes() {
             Some(bytes) => {
+                timings.capture = Some(KvTiming {
+                    bytes: bytes.len(),
+                    elapsed: started.elapsed(),
+                });
                 let path = idle_snapshot_path(*id);
                 if std::fs::write(&path, &bytes).is_ok() {
                     // Dropping `session` here frees its live KV (design §7).
@@ -629,6 +697,7 @@ fn publish_status(
     sessions: &HashMap<u64, SessionSlot>,
     cfg: HostConfig,
     ctx_size: i32,
+    timings: KvTimings,
 ) {
     let mut accounts: Vec<SessionAccount> = sessions
         .iter()
@@ -654,6 +723,8 @@ fn publish_status(
     g.kv_bytes = kv_bytes;
     g.kv_budget_bytes = cfg.kv_budget_bytes;
     g.sessions = accounts;
+    g.last_capture = timings.capture;
+    g.last_restore = timings.restore;
 }
 
 /// Applies one command on the GPU thread. Returns `false` to stop the worker.
@@ -663,6 +734,7 @@ fn apply_command(
     sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &mut VecDeque<ActiveJob>,
     cfg: HostConfig,
+    timings: &mut KvTimings,
 ) -> bool {
     match cmd {
         Command::Attach { ctx_size, reply } => {
@@ -672,28 +744,17 @@ fn apply_command(
             let requested = ctx_size.or(cfg.session_ctx_size).unwrap_or(model_ctx);
             let ctx = clamp_ctx_size(requested, model_ctx);
             let new_bytes = est_kv_bytes(ctx, model.kv_bytes_per_token());
-            let current_bytes: u64 = sessions.values().map(|s| s.kv_bytes).sum();
-            let result = if sessions.len() >= cfg.max_sessions {
-                Err(EngineError::new(format!(
-                    "engine host at capacity: {} sessions already attached",
-                    cfg.max_sessions
-                )))
-            } else if let Some(budget) = cfg.kv_budget_bytes
-                && current_bytes.saturating_add(new_bytes) > budget
-            {
-                Err(EngineError::new(format!(
-                    "engine host KV budget exceeded: {current_bytes} + {new_bytes} bytes \
-                     would exceed the {budget}-byte budget ({} sessions attached)",
-                    sessions.len()
-                )))
-            } else {
+            let result = admit(sessions, cfg, new_bytes).and_then(|()| {
                 Arc::clone(model).spawn(ctx).map(|session| {
                     let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
                     sessions.insert(id, SessionSlot::new(session, ctx, new_bytes));
                     id
                 })
-            };
+            });
             let _ = reply.send(result);
+        }
+        Command::Clone { src, reply } => {
+            let _ = reply.send(clone_session(src, model, sessions, rotation, cfg, timings));
         }
         Command::Generate {
             id,
@@ -710,7 +771,7 @@ fn apply_command(
             // (design §7). The bytes came from disk, so `restore_bytes` uses the
             // non-owning FFI path (FINDINGS double-free gotcha).
             if slot.session.is_none() {
-                match restore_reclaimed(model, slot) {
+                match restore_reclaimed(model, slot, timings) {
                     Ok(()) => {}
                     Err(e) => {
                         let _ = out.send(Yield::Done(Err(e)));
@@ -736,16 +797,110 @@ fn apply_command(
     true
 }
 
+/// The admission checks every new session passes: the attached-session cap and
+/// the aggregate KV-bytes budget (design §7). Shared by `Attach` and `Clone` so
+/// a clone can never sneak past a budget an attach would have refused.
+fn admit(
+    sessions: &HashMap<u64, SessionSlot>,
+    cfg: HostConfig,
+    new_bytes: u64,
+) -> Result<(), EngineError> {
+    if sessions.len() >= cfg.max_sessions {
+        return Err(EngineError::new(format!(
+            "engine host at capacity: {} sessions already attached",
+            cfg.max_sessions
+        )));
+    }
+    let current_bytes: u64 = sessions.values().map(|s| s.kv_bytes).sum();
+    if let Some(budget) = cfg.kv_budget_bytes
+        && current_bytes.saturating_add(new_bytes) > budget
+    {
+        return Err(EngineError::new(format!(
+            "engine host KV budget exceeded: {current_bytes} + {new_bytes} bytes \
+             would exceed the {budget}-byte budget ({} sessions attached)",
+            sessions.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Captures `src`'s KV and loads it into a freshly spawned sibling
+/// (`docs/SESSION-CLONE-DESIGN.md` §5.1). Runs on the GPU thread, because
+/// snapshot and restore have GPU-thread affinity.
+///
+/// Order matters. The source is validated and captured *before* admission, so a
+/// backend that cannot snapshot reports `unsupported` rather than a spurious
+/// budget error; admission then runs exactly as it would for an attach, and the
+/// spawn happens only once both have passed.
+fn clone_session(
+    src: u64,
+    model: &Arc<dyn ModelHandle>,
+    sessions: &mut HashMap<u64, SessionSlot>,
+    rotation: &VecDeque<ActiveJob>,
+    cfg: HostConfig,
+    timings: &mut KvTimings,
+) -> Result<u64, EngineError> {
+    let slot = sessions
+        .get_mut(&src)
+        .ok_or_else(|| EngineError::new("no such session"))?;
+    // Phase 1 restriction (design §4): a session mid-generation has a moving
+    // cursor, and reclamation already refuses to touch one. Cloning at a
+    // token-slice boundary is phase 3 work.
+    if rotation.iter().any(|j| j.id == src) {
+        return Err(EngineError::new(
+            "cannot clone a session while it is generating",
+        ));
+    }
+    let ctx_size = slot.ctx_size;
+    let kv_bytes = slot.kv_bytes;
+    let session = slot
+        .session
+        .as_mut()
+        .ok_or_else(|| EngineError::new("cannot clone an idle-reclaimed session"))?;
+
+    let started = Instant::now();
+    let bytes = session
+        .snapshot_bytes()
+        .ok_or_else(EngineError::unsupported)?;
+    timings.capture = Some(KvTiming {
+        bytes: bytes.len(),
+        elapsed: started.elapsed(),
+    });
+
+    admit(sessions, cfg, kv_bytes)?;
+
+    let mut clone = Arc::clone(model).spawn(ctx_size)?;
+    // The bytes made a round trip through Rust-owned memory, so this must be
+    // the non-owning restore path (FINDINGS double-free). They also stay in
+    // memory: unlike reclamation, a clone has no reason to touch the disk.
+    let started = Instant::now();
+    clone.restore_bytes(&bytes)?;
+    timings.restore = Some(KvTiming {
+        bytes: bytes.len(),
+        elapsed: started.elapsed(),
+    });
+
+    let id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+    sessions.insert(id, SessionSlot::new(clone, ctx_size, kv_bytes));
+    Ok(id)
+}
+
 /// Spawns a fresh session and restores a reclaimed slot's persisted KV into it.
 fn restore_reclaimed(
     model: &Arc<dyn ModelHandle>,
     slot: &mut SessionSlot,
+    timings: &mut KvTimings,
 ) -> Result<(), EngineError> {
     let mut session = Arc::clone(model).spawn(slot.ctx_size)?;
     if let Some(path) = slot.snapshot_path.take() {
         let bytes =
             std::fs::read(&path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
+        let started = Instant::now();
         session.restore_bytes(&bytes)?;
+        timings.restore = Some(KvTiming {
+            bytes: bytes.len(),
+            elapsed: started.elapsed(),
+        });
         let _ = std::fs::remove_file(&path);
     }
     slot.ctx_tokens = session.ctx_tokens();
@@ -1309,6 +1464,129 @@ mod tests {
         assert!(
             st.resident_ctx_tokens >= tokens,
             "restored session's KV accounting is preserved"
+        );
+    }
+
+    /// The clone carries the source's context forward rather than starting
+    /// empty, and leaves the source usable. The stub's "KV" is just its token
+    /// count, so this proves the plumbing, not the Metal semantics — those need
+    /// a real model and live in `ds4engine.rs`.
+    #[test]
+    fn clone_carries_source_context_and_spares_the_source() {
+        let host = shared_host(HostConfig {
+            max_sessions: 3,
+            slice_tokens: 8,
+            idle_reclaim: None,
+            ..HostConfig::default()
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        let before = poll_status(&host, |s| s.resident_ctx_tokens > 0);
+        let tokens = before.sessions[0].ctx_tokens;
+
+        let b = host.attach_clone(&a).unwrap();
+        let st = poll_status(&host, |s| s.live_sessions == 2);
+        let cloned = st
+            .sessions
+            .iter()
+            .find(|s| s.id != before.sessions[0].id)
+            .expect("the clone is attached alongside the source");
+        assert_eq!(
+            cloned.ctx_tokens, tokens,
+            "the clone starts from the source's context, not an empty one"
+        );
+        assert_eq!(
+            cloned.ctx_size, before.sessions[0].ctx_size,
+            "the clone inherits the source's context window"
+        );
+
+        // Both sessions keep generating afterwards: capture was non-destructive.
+        run_gen(&a);
+        run_gen(&b);
+    }
+
+    /// A clone is a full second context, so it faces the same admission checks
+    /// an attach would. Refusal must be a clean error with the source intact.
+    #[test]
+    fn clone_refused_over_kv_budget_leaves_source_usable() {
+        // Budget for exactly one full-context session: the source fits, its
+        // clone does not.
+        let per_session = est_kv_bytes(4096, DEFAULT_KV_BYTES_PER_TOKEN);
+        let host = shared_host(HostConfig {
+            max_sessions: 4,
+            slice_tokens: 8,
+            idle_reclaim: None,
+            kv_budget_bytes: Some(per_session),
+            ..HostConfig::default()
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+
+        let err = host
+            .attach_clone(&a)
+            .expect_err("admission refuses a clone");
+        assert!(
+            !err.is_unsupported(),
+            "a budget refusal is a real error, not a fallback signal: {err}"
+        );
+        assert!(err.to_string().contains("KV budget"), "{err}");
+        run_gen(&a); // the source survives a refused clone
+    }
+
+    /// An idle-reclaimed session has no live KV to capture. Erroring cleanly
+    /// matters more than being clever: the caller can retry after a generation
+    /// brings the session back.
+    #[test]
+    fn clone_of_reclaimed_session_errors() {
+        let host = shared_host(HostConfig {
+            max_sessions: 3,
+            slice_tokens: 8,
+            idle_reclaim: Some(Duration::from_millis(120)),
+            ..HostConfig::default()
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        poll_status(&host, |s| s.sessions.iter().any(|x| x.reclaimed));
+
+        let err = host
+            .attach_clone(&a)
+            .expect_err("a reclaimed session cannot be cloned");
+        assert!(
+            err.to_string().contains("reclaimed"),
+            "the error names the reason: {err}"
+        );
+    }
+
+    /// Stage 0 of `docs/SESSION-CLONE-DESIGN.md`: the host must be able to say
+    /// what a KV capture and restore actually cost, because that number decides
+    /// whether cloning is viable for interactive use. The stub's snapshot is
+    /// trivially cheap, so this asserts the accounting is wired up and carries
+    /// a plausible byte count — the latency itself only means something on Metal.
+    #[test]
+    fn kv_timings_recorded_for_capture_and_restore() {
+        let host = shared_host(HostConfig {
+            max_sessions: 2,
+            slice_tokens: 8,
+            idle_reclaim: Some(Duration::from_millis(120)),
+            ..HostConfig::default()
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        assert!(
+            host.status().last_capture.is_none(),
+            "nothing captured before the first reclaim"
+        );
+
+        let st = poll_status(&host, |s| s.last_capture.is_some());
+        let capture = st.last_capture.expect("polled until Some");
+        assert!(capture.bytes > 0, "a capture carries its payload size");
+
+        run_gen(&a);
+        let st = poll_status(&host, |s| s.last_restore.is_some());
+        let restore = st.last_restore.expect("polled until Some");
+        assert_eq!(
+            restore.bytes, capture.bytes,
+            "the restore reads back exactly what the capture wrote"
         );
     }
 

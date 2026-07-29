@@ -508,6 +508,100 @@ impl Ds4Session {
         }
     }
 
+    /// Forks this session: a sibling over the *same* weights, pre-loaded with
+    /// this session's KV and token transcript, which then diverges
+    /// independently (`docs/SESSION-CLONE-DESIGN.md` §5).
+    ///
+    /// This is the local form of the clone primitive. It needs no
+    /// [`EngineHost`](crate::host::EngineHost): a `Ds4Session` already holds an
+    /// `Arc<Ds4Model>`, so the sibling shares the loaded weights and Metal
+    /// queue and costs only its own KV. The interactive agent can therefore
+    /// fork its live session directly, without being host-backed.
+    ///
+    /// Capture is non-destructive — `self` is left exactly as it was, cursor
+    /// included — so the caller keeps generating on it. The two sessions share
+    /// nothing mutable afterwards.
+    ///
+    /// Cost is one full KV allocation for the fork's lifetime, plus the
+    /// serialize/restore round trip. Callers that fork per aside should drop
+    /// the sibling as soon as it has answered.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if this session has no live KV to capture, or if
+    /// the sibling cannot be created or loaded.
+    pub fn fork(&mut self) -> Result<Self, EngineError> {
+        let bytes = self
+            .capture_bytes()
+            .ok_or_else(|| EngineError::new("cannot fork a session with no live KV"))?;
+        let mut sibling = Self::from_model(Arc::clone(&self.model));
+        sibling.load_bytes(&bytes)?;
+        Ok(sibling)
+    }
+
+    /// Current absolute cursor position in the live KV, in tokens; 0 when no
+    /// FFI session exists yet.
+    #[must_use]
+    pub fn ctx_tokens(&self) -> i32 {
+        if self.session.is_null() {
+            return 0;
+        }
+        // SAFETY: session is non-null here and freed only on drop.
+        unsafe { ffi::ds4_session_pos(self.session) }
+    }
+
+    /// This session's token transcript — the source of truth for its prompt
+    /// prefix. Exposed so callers can assert an operation left it untouched.
+    #[must_use]
+    pub fn transcript_tokens(&self) -> &[i32] {
+        self.transcript.tokens()
+    }
+
+    /// The shared model behind this session, for creating siblings over the
+    /// same weights without reloading them.
+    #[must_use]
+    pub fn model_arc(&self) -> Arc<Ds4Model> {
+        Arc::clone(&self.model)
+    }
+
+    /// Serializes this session's live KV and token transcript to owned bytes,
+    /// or `None` when it has no live session to capture. Non-destructive.
+    ///
+    /// The transcript rides in front of the KV bytes (the same wrap as
+    /// [`get_kv`](Engine::get_kv)) so a session loaded from these bytes keeps
+    /// its exact token buffer and prefills only genuinely new tokens.
+    fn capture_bytes(&mut self) -> Option<Vec<u8>> {
+        if self.session.is_null() {
+            return None;
+        }
+        // Copy out an owned buffer so the engine-owned snapshot is freed here.
+        // The returned Vec is Rust's, which is why `load_bytes` must restore it
+        // through the non-owning FFI path (FINDINGS double-free).
+        let snap = SessionSnapshot::capture(self.session).ok()?;
+        let mut out = ds4tokens::encode(&self.transcript);
+        out.extend_from_slice(snap.as_bytes());
+        Some(out)
+    }
+
+    /// Loads bytes produced by [`capture_bytes`](Self::capture_bytes) into this
+    /// session, creating its FFI session if needed. The restored KV/cursor and
+    /// its captured token transcript supersede whatever this session held.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the session cannot be created or the backend
+    /// rejects the payload.
+    fn load_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let session = self.ensure_session()?;
+        let (transcript, kv) = match ds4tokens::decode(bytes) {
+            Some((transcript, off)) => (transcript, &bytes[off..]),
+            None => (TokenTranscript::new(), strip_legacy(bytes)),
+        };
+        // Rust owns `bytes`, so this is the non-owning restore path: the engine
+        // must never free our buffer (FINDINGS double-free).
+        SessionSnapshot::restore_bytes(session, kv)?;
+        self.transcript = transcript;
+        Ok(())
+    }
+
     /// Model name reported by the engine.
     #[must_use]
     pub fn model_name(&self) -> String {
@@ -903,6 +997,34 @@ impl Engine for Ds4Session {
         true
     }
 
+    fn generate_aside_forked(
+        &mut self,
+        prompt: &str,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        // The whole aside runs on a sibling session. Compare `generate_aside`
+        // above: no snapshot, no `RestoreOnDrop`, no transcript save/restore —
+        // all three exist there only because it answers destructively on the
+        // live session. Here nothing of `self` is written, so there is nothing
+        // to undo, on any exit path.
+        //
+        // The fork's KV is freed when it drops at the end of this call.
+        let mut aside = self.fork()?;
+        aside.generate(
+            crate::engine::Prompt::Flat(prompt),
+            opts,
+            interrupt,
+            &|| false,
+            on_event,
+        )
+    }
+
+    fn supports_forked_aside(&self) -> bool {
+        true
+    }
+
     fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
         self.warm_tokens = self.model.build_system_tokens(system);
         Ok(())
@@ -1240,34 +1362,12 @@ impl HostSession for Ds4HostSession {
     }
 
     fn snapshot_bytes(&mut self) -> Option<Vec<u8>> {
-        if self.inner.session.is_null() {
-            return None;
-        }
-        // Reuse the single snapshot primitive; copy out an owned buffer so the
-        // engine-owned snapshot is freed here (the returned Vec is Rust's, and
-        // the disk-read restore path must never free it — FINDINGS double-free).
-        // The token transcript rides in front of the KV bytes (same wrap as
-        // `get_kv`) so an idle-reclaimed session resumes with its exact
-        // token buffer intact and only prefills genuinely new tokens.
-        let snap = SessionSnapshot::capture(self.inner.session).ok()?;
-        let mut out = ds4tokens::encode(&self.inner.transcript);
-        out.extend_from_slice(snap.as_bytes());
-        Some(out)
+        self.inner.capture_bytes()
     }
 
     fn restore_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        // Restore into the freshly spawned session (already warmed with the
-        // shared system-prompt prefix). Disk-read bytes use the non-owning FFI
-        // path so the engine never frees Rust's buffer (FINDINGS double-free).
-        let session = self.inner.ensure_session()?;
-        let (transcript, kv) = match ds4tokens::decode(bytes) {
-            Some((transcript, off)) => (transcript, &bytes[off..]),
-            None => (TokenTranscript::new(), strip_legacy(bytes)),
-        };
-        SessionSnapshot::restore_bytes(session, kv)?;
-        // The restored KV/cursor and its captured token transcript supersede any
-        // prior Rust-side transcript.
-        self.inner.transcript = transcript;
+        self.inner.load_bytes(bytes)?;
+        // The restored KV supersedes any generation this slot had queued.
         self.pending = None;
         self.active = None;
         Ok(())
@@ -1873,20 +1973,22 @@ mod tests {
     }
 
     // Test-support: run one generation over a solely-owned `Ds4Session` and
-    // return `(new_prefill, cached)` derived from the *first* `Prefill` event.
-    // `generate` always primes one such event up front with `done == cached`
-    // (tokens reused from the live KV prefix) and `total == prompt_len`, so
-    // `new_prefill = total - done` is the count of tokens actually evaluated
-    // this turn (§KV-cache discipline). This is the reuse signal the
-    // zero-re-prefill assertions below key off of; no production change needed.
+    // return how many prompt tokens this turn still had to evaluate — the
+    // priming `Prefill` event's `total`, which `PrefillProgress::primed`
+    // defines as `prompt_len - cached`.
+    //
+    // Reuse is therefore visible as a *small* return value, and a full rebuild
+    // as one proportional to the prompt. There is no "reused" count to read
+    // directly: `primed` reports `done == 0` by construction (a bar must not
+    // read 100% before any work has happened — #64 follow-up), so the reuse
+    // assertions below are written as comparisons against a control run.
     #[cfg(ds4_engine)]
     fn gen_capture_prefill(
         engine: &mut super::Ds4Session,
         transcript: &str,
         opts: &crate::engine::GenerationOptions,
-    ) -> (i32, i32) {
-        let (np, cached, _) = gen_capture_reply(engine, transcript, opts);
-        (np, cached)
+    ) -> i32 {
+        gen_capture_reply(engine, transcript, opts).0
     }
 
     /// As [`gen_capture_prefill`], plus the generated reply text — needed to
@@ -1897,9 +1999,9 @@ mod tests {
         engine: &mut super::Ds4Session,
         transcript: &str,
         opts: &crate::engine::GenerationOptions,
-    ) -> (i32, i32, String) {
+    ) -> (i32, String) {
         use crate::engine::{Engine, EngineEvent, Prompt};
-        let mut first: Option<(i32, i32)> = None;
+        let mut remaining: Option<i32> = None;
         let mut reply = String::new();
         engine
             .generate(
@@ -1908,16 +2010,16 @@ mod tests {
                 &|| false,
                 &|| false,
                 &mut |e| match e {
-                    EngineEvent::Prefill(p) if first.is_none() => {
-                        first = Some((p.done, p.total));
-                    }
+                    EngineEvent::Prefill(p) if remaining.is_none() => remaining = Some(p.total),
                     EngineEvent::Text(t) => reply.push_str(&t),
                     EngineEvent::Prefill(_) | EngineEvent::Notice(_) => {}
                 },
             )
             .unwrap();
-        let (done, total) = first.expect("generate always primes a Prefill event");
-        (total - done, done, reply)
+        (
+            remaining.expect("generate always primes a Prefill event"),
+            reply,
+        )
     }
 
     // #29 — /checkpoint + /rollback reuses the checkpoint KV. Establish a
@@ -1961,7 +2063,7 @@ mod tests {
         let transcript2 = "[user]\nName a planet.\n";
 
         // Establish the checkpoint conversation, then capture its KV.
-        let (_, _, reply1) = gen_capture_reply(&mut engine, transcript1, &opts);
+        let (_, reply1) = gen_capture_reply(&mut engine, transcript1, &opts);
         let checkpoint = engine.get_kv().expect("get_kv yields a checkpoint payload");
         let restored_len =
             i32::try_from(checkpoint.transcript().tokens().len()).expect("token count fits i32");
@@ -1972,10 +2074,10 @@ mod tests {
 
         // Diverge onto a different single-user turn: only the system prompt is
         // reusable, so this turn does real re-prefill (the control).
-        let (np_divergent, cached_divergent) = gen_capture_prefill(&mut engine, transcript2, &opts);
+        let divergent = gen_capture_prefill(&mut engine, transcript2, &opts);
         assert!(
-            np_divergent > 0,
-            "a divergent turn must actually prefill its new suffix (np={np_divergent})"
+            divergent > 0,
+            "a divergent turn must actually prefill its new suffix (remaining={divergent})"
         );
 
         // Roll back, then continue as `rollback_to` does: the restored
@@ -1986,40 +2088,27 @@ mod tests {
             "{transcript1}[assistant]\n{}\n[user]\nName a planet.\n",
             reply1.trim()
         );
-        let (np_resumed, cached_resumed) = gen_capture_prefill(&mut engine, &resumed, &opts);
-        // The KV is exactly one token shorter than the token transcript: the
-        // reply's EOS is sampled and recorded but never evaluated
-        // (`record_reply`), so it is the one token the resumed turn must pay for.
+        let resumed_remaining = gen_capture_prefill(&mut engine, &resumed, &opts);
+        // The resumed prompt is *longer* than the checkpoint — it appends the
+        // assistant turn and a new question — yet it evaluates only a handful of
+        // tokens. That gap is the reuse: the restored prefix was kept, not
+        // rebuilt. (The KV is one token shorter than the token transcript: the
+        // reply's EOS is sampled and recorded but never evaluated in
+        // `record_reply`, so it is among the tokens this turn pays for.)
         assert!(
-            cached_resumed >= restored_len - 1,
-            "rollback must reuse the whole restored prefix \
-             (reused {cached_resumed}, restored {restored_len} incl. the unevaluated EOS)"
-        );
-        // Reuse, not absolute prefill count, is the discriminating signal: both
-        // turns here happen to prefill the same handful of tokens, but the
-        // divergent one had to rebuild from nothing while the rollback kept the
-        // entire conversation.
-        assert_eq!(
-            cached_divergent, 0,
-            "the divergent control reuses nothing, so it is a real rebuild"
-        );
-        assert!(
-            cached_resumed > cached_divergent,
-            "rollback reuses the checkpoint KV ({cached_resumed}) where a \
-             divergent turn reuses none ({cached_divergent})"
-        );
-        assert!(
-            np_resumed < restored_len,
-            "only the sampled EOS, the new question, and one assistant prefix \
-             are new (np={np_resumed}, restored prefix {restored_len})"
+            resumed_remaining < restored_len,
+            "rollback must reuse the restored prefix: the resumed turn evaluates \
+             its new suffix ({resumed_remaining}), not the whole {restored_len}-token \
+             checkpoint"
         );
 
         // The sharp edge, asserted so it cannot regress into a silent rebuild:
-        // a prompt that sits *behind* the live KV's end reuses nothing at all.
+        // a prompt that sits *behind* the live KV's end reuses nothing at all,
+        // so it pays for every one of its own tokens.
         engine.set_kv(&checkpoint).unwrap();
-        let (_, cached_behind) = gen_capture_prefill(&mut engine, transcript1, &opts);
-        assert_eq!(
-            cached_behind, 0,
+        let behind = gen_capture_prefill(&mut engine, transcript1, &opts);
+        assert!(
+            behind > 0,
             "a prompt behind the live KV's end is rebuilt from zero, not reused"
         );
     }
@@ -2056,7 +2145,7 @@ mod tests {
         let (payload, reply) = {
             let mut a =
                 super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
-            let (_, _, reply) = gen_capture_reply(&mut a, transcript, &opts);
+            let (_, reply) = gen_capture_reply(&mut a, transcript, &opts);
             (a.get_kv().expect("get_kv yields a payload"), reply)
         };
         let restored_len =
@@ -2069,7 +2158,7 @@ mod tests {
 
         // Cold-baseline control: a fresh engine with an empty KV must prefill
         // the whole prompt (nothing reused). This calibrates "full re-prefill".
-        let (np_cold, cached_cold) = {
+        let cold = {
             let mut c =
                 super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
             gen_capture_prefill(&mut c, &resumed, &opts)
@@ -2080,25 +2169,718 @@ mod tests {
         let mut b =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
         b.set_kv(&payload).unwrap();
-        let (np, cached) = gen_capture_prefill(&mut b, &resumed, &opts);
-        // Minus one: the reply's EOS is sampled but never evaluated, so the KV
-        // is one token shorter than the token transcript it was captured with.
+        let resumed_remaining = gen_capture_prefill(&mut b, &resumed, &opts);
+        // Same prompt, two starting states: the resumed session evaluates only
+        // the suffix past the payload, the cold one evaluates the whole thing.
         assert!(
-            cached >= restored_len - 1,
-            "resume must reuse the whole payload prefix \
-             (reused {cached}, restored {restored_len} incl. the unevaluated EOS)"
-        );
-        // Against the cold baseline: the resumed run re-prefills far less and
-        // reuses far more KV, proving the payload's prefix was NOT recomputed.
-        assert!(
-            np < np_cold,
-            "resume ({np}) must re-prefill far less than a cold start ({np_cold})"
+            resumed_remaining < cold,
+            "resume ({resumed_remaining}) must re-prefill far less than a cold \
+             start ({cold}) over the identical prompt"
         );
         assert!(
-            cached > cached_cold,
-            "resume reuses the payload KV; cold start reuses none \
-             (cached={cached} > cold={cached_cold})"
+            resumed_remaining < restored_len,
+            "resume reused the payload prefix rather than rebuilding its \
+             {restored_len} tokens (remaining={resumed_remaining})"
         );
+    }
+
+    // Session cloning on real Metal (docs/SESSION-CLONE-DESIGN.md §5.2). These
+    // are the tests that actually decide whether cloning is sound: everything
+    // below `EngineHost::attach_clone` is a no-op on `EchoEngine`, so the
+    // host-level tests in `host.rs` prove only the plumbing.
+    //
+    // None of this runs in CI. It compiles there behind `cfg(ds4_engine)` and
+    // skips without `PLANK_TEST_MODEL`, so a green CI run is not evidence.
+    // Run locally on macOS with a GGUF before trusting the primitive.
+
+    /// P1 + P2 — capture is non-destructive and the clone is faithful. The
+    /// source keeps generating normally after being cloned, and the clone
+    /// starts from the source's cursor rather than an empty one.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_carries_source_transcript_and_spares_source() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(2) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 3,
+            n_predict: 12,
+            ..GenerationOptions::default()
+        };
+        let mut reply = String::new();
+        a.generate(
+            "[user]\nName a fruit.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!reply.is_empty(), "the source generates before the clone");
+
+        let b = host.attach_clone(&a).unwrap();
+
+        // Read both cursors from the *same* status snapshot: the scheduler
+        // publishes after replying, so comparing across two reads races it.
+        let st = poll_host(&host, |s| (s.live_sessions == 2).then(|| s.clone()))
+            .expect("the clone attaches alongside A");
+        let (source, cloned) = (
+            st.sessions.first().expect("A has the older id"),
+            st.sessions.last().expect("the clone has the newer id"),
+        );
+        assert!(source.ctx_tokens > 0, "A holds a real cursor to clone from");
+        assert_eq!(
+            cloned.ctx_tokens, source.ctx_tokens,
+            "the clone holds A's cursor, not a fresh one"
+        );
+        assert_eq!(
+            cloned.ctx_size, source.ctx_size,
+            "the clone inherits A's context window"
+        );
+
+        // P1: A is undamaged by the capture and keeps generating.
+        let mut after = String::new();
+        a.generate(
+            &format!("[user]\nName a fruit.\n[assistant]\n{reply}\n[user]\nName a planet.\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    after.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!after.is_empty(), "A survives being cloned");
+        drop(b);
+    }
+
+    /// P3 — the headline. A clone must continue from the source's KV, not
+    /// re-prefill it.
+    ///
+    /// The measurement is `PrefillProgress::total`: the tokens *this pass* has
+    /// to evaluate, cached prefix excluded. Reuse therefore shows up as a small
+    /// total, and the proof is a direct comparison — the clone and a cold
+    /// sibling are given the identical continuation, and the clone must
+    /// evaluate far fewer tokens. (`done` cannot serve here: it is rebased to
+    /// the cached prefix and starts at 0 by construction.)
+    ///
+    /// This test also records what the capture cost. Correctness is not enough:
+    /// §8 flags capture latency as the risk that decides whether cloning is
+    /// usable interactively, and `HostStatus::last_capture` is where that lands.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_avoids_cold_reprefill() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(3) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 5,
+            n_predict: 12,
+            ..GenerationOptions::default()
+        };
+
+        let mut reply = String::new();
+        a.generate(
+            "[user]\nName a fruit.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!reply.is_empty(), "the source generates before the clone");
+        let continuation =
+            format!("[user]\nName a fruit.\n[assistant]\n{reply}\n[user]\nName a planet.\n");
+
+        let b = host.attach_clone(&a).unwrap();
+        // `attach_clone` replies from the GPU thread before that thread
+        // republishes status, so poll rather than racing it.
+        let capture =
+            poll_host(&host, |s| s.last_capture).expect("cloning records what the capture cost");
+        eprintln!(
+            "clone capture: {} bytes in {:?}",
+            capture.bytes, capture.elapsed
+        );
+
+        let (stats, cloned_total) = prefill_total(&b, &continuation, &opts);
+        assert!(stats.generated > 0, "the clone generates normally");
+
+        // Control: a fresh session over the same warm system prompt, given the
+        // identical transcript. It has to evaluate the whole conversation.
+        let cold = host.attach().unwrap();
+        let (_, cold_total) = prefill_total(&cold, &continuation, &opts);
+
+        eprintln!("prefill totals: clone={cloned_total} cold={cold_total}");
+        assert!(
+            cold_total > 0,
+            "the control must prefill something for the comparison to mean anything"
+        );
+        assert!(
+            cloned_total < cold_total,
+            "the clone continued A's context instead of re-prefilling it \
+             (clone={cloned_total} < cold={cold_total})"
+        );
+    }
+
+    /// Runs one generation and reports its terminal stats plus the largest
+    /// prefill `total` seen — the tokens that pass had to evaluate.
+    #[cfg(ds4_engine)]
+    fn prefill_total(
+        session: &crate::host::SessionHandle,
+        transcript: &str,
+        opts: &crate::engine::GenerationOptions,
+    ) -> (crate::engine::GenerationStats, i32) {
+        use crate::engine::EngineEvent;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let mut total = 0;
+        let stats = session
+            .generate(
+                transcript,
+                opts,
+                Arc::new(AtomicBool::new(false)),
+                &mut |e| {
+                    if let EngineEvent::Prefill(p) = e {
+                        total = total.max(p.total);
+                    }
+                },
+            )
+            .unwrap();
+        (stats, total)
+    }
+
+    /// The local fork path, which is the one the interactive agent can actually
+    /// use: no `EngineHost`, no scheduler thread, just a `Ds4Session` forking
+    /// itself over its own `Arc<Ds4Model>`.
+    ///
+    /// Proves the same properties as the host-backed clone: the source is
+    /// undisturbed (P1), the fork carries its transcript (P2), the fork
+    /// continues rather than re-prefilling (P3), and the two diverge without
+    /// contaminating each other (P4).
+    #[cfg(ds4_engine)]
+    #[test]
+    fn fork_is_a_local_clone_without_a_host() {
+        use crate::engine::GenerationOptions;
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut a =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 21,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        let transcript = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut a, transcript, &opts);
+        assert!(!reply.is_empty(), "the source generates before forking");
+        let source_pos = a.ctx_tokens();
+        assert!(
+            source_pos > 0,
+            "the source holds a real cursor to fork from"
+        );
+
+        let mut b = a.fork().expect("a live session forks");
+
+        // P1: capture left A's cursor exactly where it was.
+        assert_eq!(
+            a.ctx_tokens(),
+            source_pos,
+            "forking must not disturb the source's cursor"
+        );
+        // P2: B came across at the same position, over the same weights.
+        assert_eq!(
+            b.ctx_tokens(),
+            source_pos,
+            "the fork holds A's cursor, not a fresh one"
+        );
+
+        let continued = format!("{transcript}[assistant]\n{}\n[user]\n", reply.trim());
+
+        // P3: B continues A's conversation instead of rebuilding it. The cold
+        // control is a fresh session over the same model, given the same prompt.
+        let b_prompt = format!("{continued}What is the capital of France?\n");
+        let b_remaining = gen_capture_prefill(&mut b, &b_prompt, &opts);
+        let cold_remaining = {
+            let mut c = super::Ds4Session::from_model(a.model_arc());
+            gen_capture_prefill(&mut c, &b_prompt, &opts)
+        };
+        eprintln!("fork prefill: fork={b_remaining} cold={cold_remaining}");
+        assert!(
+            cold_remaining > 0,
+            "the control must prefill something for the comparison to mean anything"
+        );
+        assert!(
+            b_remaining < cold_remaining,
+            "the fork continued A's context instead of re-prefilling it \
+             (fork={b_remaining} < cold={cold_remaining})"
+        );
+
+        // P4: A is unaffected by what B was asked.
+        let (_, out_a) = gen_capture_reply(&mut a, &format!("{continued}Name a planet.\n"), &opts);
+        assert!(!out_a.is_empty(), "A keeps generating after being forked");
+        assert!(
+            !out_a.to_lowercase().contains("paris"),
+            "B's question must not leak into A: {out_a}"
+        );
+    }
+
+    /// The aside must *reuse* the main task's KV, not just avoid damaging it.
+    /// `drain_btw_inner` frames the question onto the whole rendered
+    /// transcript, so the fork's prompt shares everything but the last few
+    /// tokens with the KV it was forked from: the aside should prefill the
+    /// question and nothing else.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_reuses_the_main_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::fmt::Write as _;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 41,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        // Build a conversation of a few turns, so "reuse the prefix" and
+        // "re-prefill everything" are far apart.
+        let mut convo = String::new();
+        for q in ["Name a fruit.", "Name a color.", "Name a country."] {
+            let _ = write!(convo, "[user]\n{q}\n");
+            let (_, reply) = gen_capture_reply(&mut engine, &convo, &opts);
+            let _ = write!(convo, "[assistant]\n{}\n", reply.trim());
+        }
+
+        // Exactly what `drain_btw_inner` builds: the rendered transcript plus
+        // the framed question.
+        let aside_prompt = format!("{convo}[user]\nWhat is the capital of France?\n");
+
+        let mut aside_remaining = 0;
+        engine
+            .generate_aside_forked(&aside_prompt, &opts, &|| false, &mut |e| {
+                if let EngineEvent::Prefill(p) = e {
+                    aside_remaining = aside_remaining.max(p.total);
+                }
+            })
+            .unwrap();
+
+        // Control: the same prompt with no KV to reuse.
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &aside_prompt, &opts)
+        };
+        eprintln!("aside prefill: fork={aside_remaining} cold={cold}");
+        assert!(cold > 0, "the control must actually prefill the prompt");
+        assert!(
+            aside_remaining < cold,
+            "the aside must continue the forked KV, not re-prefill the whole \
+             conversation (aside={aside_remaining} cold={cold})"
+        );
+    }
+
+    /// An aside answered while a pass is frozen must not rebuild the whole
+    /// prompt. The frozen partial reply is live in the KV *and* recorded in the
+    /// token transcript, but the aside's prompt does not contain it, so the
+    /// aside's prompt is a strict *prefix* of the live KV — and
+    /// `ds4_session_sync` cannot rewrite behind the live end, so a naive run
+    /// rebuilds from zero (see `rollback_checkpoint_zero_reprefill`).
+    ///
+    /// Both tiers are measured here, because the fix has to hold for both.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn aside_during_a_frozen_pass_reuses_the_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let opts = GenerationOptions {
+            seed: 61,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+        let base = "[user]\nCount slowly from one to thirty.\n";
+
+        // One model, two fresh sessions over it — opening a second Ds4Model in
+        // the same process is not supported.
+        let shared = std::sync::Arc::new(
+            super::Ds4Model::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap(),
+        );
+
+        // `forked` selects the tier. `freeze` decides whether the preceding
+        // pass is interrupted (leaving a partial reply live in the KV) or runs
+        // to completion — the only difference between the two, so any gap in
+        // prefill cost is attributable to the freeze.
+        let run = |forked: bool, freeze: bool| -> i32 {
+            let mut engine = super::Ds4Session::from_model(std::sync::Arc::clone(&shared));
+            let seen = Cell::new(0);
+            let mut partial = String::new();
+            engine
+                .generate(
+                    crate::engine::Prompt::Flat(base),
+                    &opts,
+                    &|| freeze && seen.get() > 6,
+                    &|| false,
+                    &mut |e| {
+                        if let EngineEvent::Text(t) = e {
+                            seen.set(seen.get() + 1);
+                            partial.push_str(&t);
+                        }
+                    },
+                )
+                .unwrap();
+            assert!(!partial.is_empty(), "the pass produced a reply");
+
+            // `drain_btw_inner` frames the question onto the rendered
+            // transcript *plus* the paused pass's partial reply, so the prompt
+            // extends the live KV in both cases. Dropping that splice is the
+            // bug this test guards: the partial is live in the KV, and a prompt
+            // that omits it lands behind the live end and rebuilds from zero.
+            let aside_prompt = format!(
+                "{base}[assistant]\n{}\n[user]\nWhat is the capital of France?\n",
+                partial.trim()
+            );
+
+            let mut remaining = 0;
+            let sink = &mut |e: EngineEvent| {
+                if let EngineEvent::Prefill(p) = e {
+                    remaining = remaining.max(p.total);
+                }
+            };
+            if forked {
+                engine
+                    .generate_aside_forked(&aside_prompt, &opts, &|| false, sink)
+                    .unwrap();
+            } else {
+                engine
+                    .generate_aside(&aside_prompt, &opts, &|| false, sink)
+                    .unwrap();
+            }
+            remaining
+        };
+
+        for forked in [false, true] {
+            let tier = if forked { "forked" } else { "destructive" };
+            let clean = run(forked, false);
+            let frozen = run(forked, true);
+            eprintln!("{tier} aside: after-clean-pass={clean} after-frozen-pass={frozen}");
+            assert!(
+                frozen <= clean,
+                "{tier}: freezing the pass cost the aside its cache — it \
+                 prefilled {frozen} tokens where an unfrozen pass costs \
+                 {clean}. The partial reply is live in the KV but absent from \
+                 the aside's prompt, so the prompt no longer extends the live \
+                 end and ds4_session_sync rebuilds from zero."
+            );
+        }
+    }
+
+    /// The suspend/resume shape `run_turn` actually drives: a pass is frozen
+    /// mid-generation (partial reply in the KV, *not* in the token transcript),
+    /// an aside is answered, then the pass resumes with the partial spliced
+    /// back onto the prompt. The resume must cost nothing — that is the whole
+    /// point of freezing rather than re-running.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_does_not_cost_the_resume_its_cache() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 51,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nCount slowly from one to twenty.\n";
+
+        // Freeze a pass partway: interrupt after a few text events, exactly as
+        // a preempting `/btw` does. The partial stays in the KV; nothing is
+        // recorded to the transcript.
+        let seen = Cell::new(0);
+        let mut partial = String::new();
+        engine
+            .generate(
+                crate::engine::Prompt::Flat(base),
+                &opts,
+                &|| seen.get() > 6,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        seen.set(seen.get() + 1);
+                        partial.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!partial.is_empty(), "the frozen pass produced a partial");
+
+        // The aside runs while the pass is frozen.
+        let mut aside_text = String::new();
+        engine
+            .generate_aside_forked(
+                &format!("{base}[user]\nWhat is the capital of France?\n"),
+                &opts,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        aside_text.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!aside_text.is_empty(), "the aside answers");
+
+        // Resume: `run_turn` re-opens the assistant turn with the partial so
+        // the engine splices its exact tokens and continues.
+        let resume_prompt = format!("{base}[assistant]\n{partial}");
+        let remaining = gen_capture_prefill(&mut engine, &resume_prompt, &opts);
+        eprintln!(
+            "resume after aside: remaining={remaining} partial_chars={}",
+            partial.len()
+        );
+
+        // A cold session over the identical resume prompt is the calibration:
+        // it has to evaluate the whole thing.
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &resume_prompt, &opts)
+        };
+        eprintln!("resume cold control: {cold}");
+        assert!(
+            remaining < cold,
+            "the aside cost the main pass its cache: resuming re-prefilled \
+             {remaining} tokens where a cold start pays {cold}"
+        );
+    }
+
+    /// §6.4's strongest regression: a forked aside must leave the main session
+    /// exactly as it found it — the direct analogue of the invariant
+    /// `generate_aside` protects with `RestoreOnDrop`, but held structurally
+    /// here because the aside never touches the live session at all.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_leaves_the_main_session_clean() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 31,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        let transcript = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, transcript, &opts);
+        let pos_before = engine.ctx_tokens();
+        let tokens_before = engine.transcript_tokens().to_vec();
+
+        let mut aside_text = String::new();
+        engine
+            .generate_aside_forked(
+                "[user]\nWhat is the capital of France?\n",
+                &opts,
+                &|| false,
+                &mut |e| {
+                    if let crate::engine::EngineEvent::Text(t) = e {
+                        aside_text.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!aside_text.is_empty(), "the aside produces an answer");
+
+        assert_eq!(
+            engine.ctx_tokens(),
+            pos_before,
+            "the aside must not move the main cursor"
+        );
+        assert_eq!(
+            engine.transcript_tokens(),
+            tokens_before,
+            "the aside must not touch the main token transcript"
+        );
+
+        // And the main task continues as if nothing happened: its next turn
+        // still reuses its own prefix rather than rebuilding.
+        let continuation = format!(
+            "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+            reply.trim()
+        );
+        let remaining = gen_capture_prefill(&mut engine, &continuation, &opts);
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &continuation, &opts)
+        };
+        assert!(
+            remaining < cold,
+            "the main session's KV survived the aside intact \
+             (remaining={remaining} < cold={cold})"
+        );
+    }
+
+    /// P4 — the two sessions diverge without contaminating each other. B is
+    /// asked something A never saw; A's own continuation must not mention it,
+    /// and both must keep producing output.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_diverges_independently() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(2) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 11,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+        let shared = "[user]\nName a fruit.\n";
+        let mut reply = String::new();
+        a.generate(shared, &opts, Arc::new(AtomicBool::new(false)), &mut |e| {
+            if let EngineEvent::Text(t) = e {
+                reply.push_str(&t);
+            }
+        })
+        .unwrap();
+
+        let b = host.attach_clone(&a).unwrap();
+        let prefix = format!("{shared}[assistant]\n{reply}\n");
+
+        let mut out_b = String::new();
+        b.generate(
+            &format!("{prefix}[user]\nWhat is the capital of France?\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    out_b.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+
+        let mut out_a = String::new();
+        a.generate(
+            &format!("{prefix}[user]\nName a planet.\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    out_a.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(!out_a.is_empty() && !out_b.is_empty());
+        assert!(
+            !out_a.to_lowercase().contains("paris"),
+            "B's aside must not leak into A's continuation: {out_a}"
+        );
+    }
+
+    /// Polls host status until `pick` yields a value, or the budget runs out.
+    /// Host commands reply from the GPU thread *before* it republishes status,
+    /// so a status read right after `attach_clone` races the publish.
+    #[cfg(ds4_engine)]
+    fn poll_host<T>(
+        host: &crate::host::EngineHost,
+        pick: impl Fn(&crate::host::HostStatus) -> Option<T>,
+    ) -> Option<T> {
+        for _ in 0..500 {
+            if let Some(v) = pick(&host.status()) {
+                return Some(v);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        None
+    }
+
+    /// Opens a shared model and host for the clone tests, or `None` when no
+    /// test model is configured. Metal-only; see the module note above.
+    #[cfg(ds4_engine)]
+    fn clone_test_host(max_sessions: usize) -> Option<crate::host::EngineHost> {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+
+        let model_path = std::env::var_os("PLANK_TEST_MODEL").or_else(|| {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            None
+        })?;
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+        )
+        .unwrap();
+        Some(EngineHost::new(
+            model,
+            HostConfig {
+                max_sessions,
+                slice_tokens: crate::host::DEFAULT_SLICE_TOKENS,
+                idle_reclaim: None,
+                ..HostConfig::default()
+            },
+        ))
     }
 
     // #28 — idle-reclaim restore keeps context without a cold re-prefill. Via
@@ -2149,25 +2931,20 @@ mod tests {
             ..GenerationOptions::default()
         };
 
-        // First turn: record the system-prompt reuse baseline + the reply.
+        // First turn: just the reply. The reuse measurement comes later, from
+        // `total` — see the cold control below.
         let mut reply1 = String::new();
-        let mut first1: Option<(i32, i32)> = None;
         s.generate(
             "[user]\nName a fruit.\n",
             &opts,
             Arc::new(AtomicBool::new(false)),
-            &mut |e| match e {
-                EngineEvent::Prefill(p) => {
-                    if first1.is_none() {
-                        first1 = Some((p.done, p.total));
-                    }
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply1.push_str(&t);
                 }
-                EngineEvent::Text(t) => reply1.push_str(&t),
-                EngineEvent::Notice(_) => {}
             },
         )
         .unwrap();
-        let (sys_cached, _t1) = first1.expect("first turn primes a Prefill event");
         assert!(!reply1.is_empty(), "first turn must produce a reply");
 
         // Force reclamation to disk (short idle window; wait for the scheduler).
@@ -2184,28 +2961,23 @@ mod tests {
         // must reach past the system prompt into the prior turn + reply.
         let transcript2 =
             format!("[user]\nName a fruit.\n[assistant]\n{reply1}\n[user]\nName a planet.\n");
-        let mut first2: Option<(i32, i32)> = None;
-        let stats = s
-            .generate(
-                &transcript2,
-                &opts,
-                Arc::new(AtomicBool::new(false)),
-                &mut |e| {
-                    if let EngineEvent::Prefill(p) = e
-                        && first2.is_none()
-                    {
-                        first2 = Some((p.done, p.total));
-                    }
-                },
-            )
-            .unwrap();
-        let (cached2, _t2) = first2.expect("restored turn primes a Prefill event");
+        let (stats, restored_total) = prefill_total(&s, &transcript2, &opts);
         assert!(stats.generated > 0, "restored session generates normally");
+
+        // Control: a fresh session over the same warm system prompt, given the
+        // identical transcript, has to evaluate the whole conversation.
+        let cold = host.attach().unwrap();
+        let (_, cold_total) = prefill_total(&cold, &transcript2, &opts);
         assert!(
-            cached2 > sys_cached,
-            "restore kept context beyond the system prompt: no cold re-prefill \
-             (cached2={cached2} > sys_baseline={sys_cached})"
+            cold_total > 0,
+            "the control must prefill something for the comparison to mean anything"
         );
+        assert!(
+            restored_total < cold_total,
+            "restore kept context beyond the system prompt: no cold re-prefill \
+             (restored={restored_total} < cold={cold_total})"
+        );
+        drop(cold);
         assert!(
             host.status().sessions.iter().all(|x| !x.reclaimed),
             "session is resident again after restore"

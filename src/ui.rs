@@ -2058,6 +2058,36 @@ impl Agent<'_> {
         Ok(Compacted::Done)
     }
 
+    /// Runs a tool-free aside, picking the best tier the engine offers.
+    ///
+    /// Tier 1, preferred whenever the engine offers it, answers on a forked
+    /// session, so the live KV is never written to. Tier 2 is the historical
+    /// path: answer destructively on the live session and restore it
+    /// unconditionally afterwards. Callers that cannot run either fall back to
+    /// the boundary queue, which is the third tier and lives at the call site.
+    ///
+    /// An `unsupported` error from the fork tier is a fall-through, not a
+    /// failure — a real backend error is not, and surfaces to the caller.
+    fn generate_aside_best(
+        &mut self,
+        prompt: &str,
+        opts: &crate::engine::GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(crate::engine::EngineEvent),
+    ) -> Result<crate::engine::GenerationStats, crate::engine::EngineError> {
+        if self.engine.supports_forked_aside() {
+            match self
+                .engine
+                .generate_aside_forked(prompt, opts, interrupt, on_event)
+            {
+                Err(e) if e.is_unsupported() => {}
+                result => return result,
+            }
+        }
+        self.engine
+            .generate_aside(prompt, opts, interrupt, on_event)
+    }
+
     /// Folds a completed pass's provider usage into the session tally. A no-op
     /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
     /// unless an online provider is driving the turns.
@@ -3238,7 +3268,7 @@ the original is frozen and listed in /tree"
                     ..self.cfg.generation.clone()
                 };
                 let stop = AtomicBool::new(false);
-                let generated = self.engine.generate_aside(
+                let generated = self.generate_aside_best(
                     &prompt,
                     &opts,
                     &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
@@ -5146,7 +5176,9 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::EndLine);
                     resumed_prefix.push_str(&out.assistant_text);
                     let _ = tx.send(UiEvent::Dim(worker::BTW_SUSPEND_MARKER.to_owned()));
-                    self.drain_aside(tx, shared);
+                    // The aside is asked *over* the paused reply, which is what
+                    // keeps its prompt an extension of the live KV.
+                    self.drain_aside(tx, shared, &resumed_prefix);
                     let _ = tx.send(UiEvent::Dim(worker::BTW_RESUME_MARKER.to_owned()));
                     continue;
                 }
@@ -5258,19 +5290,33 @@ impl Agent<'_> {
     /// the answer is done. `BtwEnd` only stops routing to the panel; the UI
     /// keeps it on screen (frozen, readable) until the user presses Esc.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
-        self.drain_btw_inner(tx, shared, false);
+        self.drain_btw_inner(tx, shared, false, "");
     }
 
-    /// Suspend-mode drain: answers the queued `/btw` question(s) with
-    /// [`Engine::generate_aside`] so the frozen main-task KV is snapshotted and
-    /// restored around each answer (BTW-SUSPEND-DESIGN §4.3). Used only from
-    /// the in-pass suspend path, where the main pass is paused mid-reply and
-    /// the partial reply must survive the aside.
-    fn drain_aside(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
-        self.drain_btw_inner(tx, shared, true);
+    /// Suspend-mode drain: answers the queued `/btw` question(s) on a session
+    /// that still holds the frozen main-task KV (BTW-SUSPEND-DESIGN §4.3).
+    /// Used only from the in-pass suspend path, where the main pass is paused
+    /// mid-reply and the partial reply must survive the aside.
+    ///
+    /// `frozen_partial` is the text the paused pass had already produced. It
+    /// must be spliced into the aside's prompt, exactly as the resume splices
+    /// it: those tokens are live in the KV, and `ds4_session_sync` reuses the
+    /// KV *only* for a prompt that extends its end (see
+    /// [`crate::engine::reusable_prefix`]). Leaving it out makes the prompt
+    /// diverge behind the live end, which silently re-prefills the entire
+    /// conversation — BTW-SUSPEND-DESIGN §4.3 step 2 assumed a cursor rollback
+    /// the engine cannot perform.
+    fn drain_aside(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared, frozen_partial: &str) {
+        self.drain_btw_inner(tx, shared, true, frozen_partial);
     }
 
-    fn drain_btw_inner(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared, aside: bool) {
+    fn drain_btw_inner(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+        aside: bool,
+        frozen_partial: &str,
+    ) {
         let Some(mut question) = shared.pop_btw() else {
             return;
         };
@@ -5285,6 +5331,11 @@ impl Agent<'_> {
             let mut prompt = render_transcript(&self.session, &self.system);
             {
                 use std::fmt::Write as _;
+                // Close the paused assistant turn with what it had produced, so
+                // the prompt extends the live KV instead of diverging behind it.
+                if !frozen_partial.trim().is_empty() {
+                    let _ = write!(prompt, "[assistant]\n{}\n", frozen_partial.trim_end());
+                }
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
             match self.worker_generate_kind(tx, shared, &prompt, Instant::now(), false, aside) {
@@ -5488,10 +5539,10 @@ impl Agent<'_> {
             None => crate::engine::Prompt::Flat(prompt),
         };
         let result = if aside {
-            // The aside snapshots/restores the main KV itself and forces greedy
-            // off internally, so no greedy sampler is passed.
-            self.engine
-                .generate_aside(prompt, &self.cfg.generation, &interrupt, &mut on_event)
+            // The aside keeps the main KV intact itself — by forking it, or by
+            // snapshot/restore — and forces greedy off internally, so no
+            // greedy sampler is passed.
+            self.generate_aside_best(prompt, &self.cfg.generation, &interrupt, &mut on_event)
         } else {
             self.engine.generate(
                 engine_prompt,
@@ -7765,6 +7816,13 @@ mod tests {
         /// snapshot/restore support) so the in-pass `/btw` suspend path runs
         /// instead of falling back to the boundary queue.
         aside_support: bool,
+        /// When true, `generate_aside_forked` is implemented too, so the
+        /// `--btw-fork` tier is available above the destructive one.
+        fork_aside_support: bool,
+        /// Records which aside tier each call took ("forked" / "destructive"),
+        /// so tier-selection tests can assert on the choice rather than on the
+        /// reply text, which is identical either way.
+        aside_tiers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         /// When set, the engine pretends to have KV snapshot support:
         /// `get_kv` logs `capture` and returns a dummy payload tagged with an
         /// incrementing counter (so nested captures are distinguishable),
@@ -7775,6 +7833,13 @@ mod tests {
     }
 
     impl ScriptedEngine {
+        /// Notes which aside tier a call took, when the test is watching.
+        fn record_tier(&self, tier: &str) {
+            if let Some(tiers) = &self.aside_tiers {
+                tiers.lock().unwrap().push(tier.to_owned());
+            }
+        }
+
         /// Records the prompt and streams the next scripted reply in chunks.
         fn play_next(
             &mut self,
@@ -7826,10 +7891,27 @@ mod tests {
             if !self.aside_support {
                 return Err(EngineError::unsupported());
             }
+            self.record_tier("destructive");
             Ok(self.play_next(prompt, on_event))
         }
         fn supports_aside(&self) -> bool {
             self.aside_support
+        }
+        fn generate_aside_forked(
+            &mut self,
+            prompt: &str,
+            _opts: &crate::engine::GenerationOptions,
+            _interrupt: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            if !self.fork_aside_support {
+                return Err(EngineError::unsupported());
+            }
+            self.record_tier("forked");
+            Ok(self.play_next(prompt, on_event))
+        }
+        fn supports_forked_aside(&self) -> bool {
+            self.fork_aside_support
         }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
@@ -8463,6 +8545,81 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The three aside tiers degrade cleanly into one another
+    /// (`docs/SESSION-CLONE-DESIGN.md` §6.4). Runs without Metal, which is the
+    /// point: it is the only tier check CI can execute.
+    #[test]
+    fn aside_tier_selection_degrades_cleanly() {
+        // An engine that can fork does; one that cannot (EchoEngine, remote
+        // engines) falls through to the destructive path rather than failing.
+        let cases = [(true, "forked"), (false, "destructive")];
+        for (engine_forks, expected) in cases {
+            let dir = scratch_dir("btw-aside-tier");
+            let tiers: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+            let engine = ScriptedEngine {
+                replies: vec!["answered\n".to_string()],
+                aside_support: true,
+                fork_aside_support: engine_forks,
+                aside_tiers: Some(tiers.clone()),
+                ..ScriptedEngine::default()
+            };
+            let cfg = test_cfg();
+            let mut agent = test_agent(&dir, engine, &cfg);
+
+            let mut reply = String::new();
+            agent
+                .generate_aside_best(
+                    "[user]\nwhat language?\n",
+                    &cfg.generation.clone(),
+                    &|| false,
+                    &mut |ev| {
+                        if let EngineEvent::Text(t) = ev {
+                            reply.push_str(&t);
+                        }
+                    },
+                )
+                .unwrap();
+
+            assert_eq!(
+                tiers.lock().unwrap().as_slice(),
+                [expected.to_string()],
+                "engine_forks={engine_forks}"
+            );
+            assert!(
+                reply.contains("answered"),
+                "every tier still answers the question"
+            );
+        }
+    }
+
+    /// An engine with no aside support at all cannot serve either tier, so the
+    /// caller is told to fall back to the boundary queue — the third tier.
+    #[test]
+    fn aside_without_engine_support_is_unsupported() {
+        let dir = scratch_dir("btw-aside-none");
+        let engine = ScriptedEngine {
+            replies: vec!["unused\n".to_string()],
+            aside_support: false,
+            fork_aside_support: false,
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let err = agent
+            .generate_aside_best(
+                "[user]\nwhat language?\n",
+                &cfg.generation.clone(),
+                &|| false,
+                &mut |_| {},
+            )
+            .expect_err("no tier can serve this engine");
+        assert!(
+            err.is_unsupported(),
+            "the caller must see a fall-through signal, not a hard failure: {err}"
+        );
+    }
+
     // BTW-SUSPEND-DESIGN §6 `aside_fifo_cap`: more than the cap of in-pass /btw
     // questions drop the oldest with a notice, and the suspend drain answers
     // the survivors FIFO via `generate_aside`.
@@ -8493,7 +8650,7 @@ mod tests {
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("main"));
         let (tx, _rx) = std::sync::mpsc::channel();
-        agent.drain_aside(&tx, &shared);
+        agent.drain_aside(&tx, &shared, "");
         drop(tx);
 
         let recorded = prompts.lock().unwrap();
