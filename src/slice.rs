@@ -42,10 +42,14 @@ use crate::host::HostSession;
 /// An aside is a short question with someone waiting on the answer; the main
 /// task is long-running work whose next few seconds nobody is watching. At an
 /// even split the answer takes twice as long as it would alone — long enough,
-/// on a slow local model, to look like it is not coming. Four to one puts the
-/// answer up promptly and costs the main task only the seconds it was going to
-/// lose to the aside regardless.
-pub const ASIDE_SLICE_WEIGHT: usize = 4;
+/// on a slow local model, to look like it is not coming. Favouring the aside
+/// puts the answer up promptly and costs the main task only the seconds it was
+/// going to lose to the aside regardless.
+///
+/// Raising this mostly helps a *long* aside: a one-line answer finishes inside
+/// a single slice either way, and what follows is the main task running alone
+/// because there is nothing left to share with.
+pub const ASIDE_SLICE_WEIGHT: usize = 2;
 
 /// Identifies one job within a [`SliceRunner`], and tags the events it emits.
 /// Assigned in insertion order, so it doubles as the dispatch index callers

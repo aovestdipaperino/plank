@@ -80,7 +80,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 
 - **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and an animated status bar that shows the working directory, git branch, and the name of the tool currently running; the C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
-- **`/btw` side questions** — ask something mid-task; the running generation genuinely suspends, answers in a split panel, and resumes byte-for-byte with no re-prefill.
+- **`/btw` side questions** — ask something mid-task; the answer runs on a fork of the session, interleaved with the main generation, so it streams into a split panel while the main task keeps going. Nothing is written to the conversation, and neither side re-prefills.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.
 - **Git-style diff cards** — an `edit` (or an overwriting `write`) renders as a change card with an `Update(path)` header, an added/removed summary, and red/green `@@` hunks; a brand-new file streams its content dimmed as it is written.
 - **`agent` sub-agent tool** — the model delegates a bounded task to a fresh scoped sub-agent and gets back only its conclusion, keeping the main transcript clean; bounded so a sub-agent can't itself delegate.
@@ -106,11 +106,13 @@ The `/context` command visualizes context-window usage by category:
   <img src="assets/context-usage.png" alt="/context report showing token usage by category" width="700">
 </p>
 
-`/btw` answers a side question in a split panel while the main task keeps its place — here the model counts to 20 on the left while a `/btw what is 2 plus 2?` is answered on the right, with nothing written to the conversation:
+`/btw` answers a side question *beside* the running task rather than pausing it. The aside runs on a fork of the session, interleaved with the main generation, so both advance at once — here the model keeps counting on the left while `/btw what is the capital of Italy` is answered on the right, with nothing written to the conversation:
 
 <p align="center">
-  <img src="assets/btw-panel.png" alt="The plank TUI split screen: a counting task on the left, a /btw side answer on the right" width="700">
+  <img src="assets/btw-multiplex.gif" alt="The plank TUI split screen: the main task keeps counting on the left while a /btw side question is answered on the right" width="700">
 </p>
+
+One Metal command queue means this is time-slicing, not parallelism — nothing finishes sooner overall. What changes is that the main task no longer stops. The aside takes the larger share of the thread while it runs, since it is the one you are waiting on.
 
 Long turns end with a native macOS notification — your prompt as the headline and the tail of the answer as the body, wearing your terminal's icon and plank's logo. `ui.notifications` picks when they fire: `always`, `unfocused` (only while the terminal isn't focused), or `never`:
 
