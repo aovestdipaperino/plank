@@ -1309,7 +1309,9 @@ impl Agent<'_> {
     /// actually delegates.
     fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
         use std::fmt::Write as _;
-        if !calls.is_empty() {
+        // Holds the tool label in the status bar for the whole dispatch, then
+        // clears it on drop whichever way we return.
+        let _running = (!calls.is_empty()).then(|| {
             let names = calls
                 .iter()
                 .map(|c| {
@@ -1321,8 +1323,8 @@ impl Agent<'_> {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            crate::status::set_flash_tip_for(format!("🔧 {names}"), crate::status::TOOL_FLASH_MS);
-        }
+            crate::status::ToolActivity::begin(format!("🔧 {names}"))
+        });
         if !calls.iter().any(|c| c.name == "agent") {
             return dispatch_all(calls, &mut self.tool_ctx);
         }

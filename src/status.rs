@@ -482,9 +482,100 @@ pub fn rotating_tip(tick_ms: u64) -> &'static str {
 /// status bar before it reverts to the rotating tip. Fixed, not configurable.
 pub const FLASH_TIP_MS: u64 = 10_000;
 
-/// How long the "tool usage" flash (posted when the model dispatches tools)
-/// stays in the status bar.
-pub const TOOL_FLASH_MS: u64 = 5_000;
+/// The floor on how long a tool label stays in the status bar. A tool that
+/// finishes in milliseconds would otherwise flicker past unread, so the label
+/// lingers this long after the run ends — unless the next tool starts first,
+/// which replaces it immediately.
+pub const TOOL_LINGER_MS: u64 = 4_000;
+
+/// Full period of the tool label's blink, half on and half off.
+pub const TOOL_BLINK_MS: u64 = 800;
+
+/// The tools currently executing, as a display label (e.g. `read_file, bash`),
+/// paired with the moment the run ended (`None` while still running).
+///
+/// Unlike a flash tip a running label has no expiry: it is posted when a DSML
+/// block's tool calls start and stays up for exactly as long as they run, then
+/// for [`TOOL_LINGER_MS`] more. While it is set it owns the status bar's tail
+/// notification slot — no flash, no rotating tip — because that is the one
+/// thing the user needs to see while waiting on a tool.
+static TOOL_ACTIVITY: std::sync::Mutex<Option<(String, Option<std::time::Instant>)>> =
+    std::sync::Mutex::new(None);
+
+/// Posts the running-tools label, replacing any previous one (including one
+/// still serving out its linger window — a fresh tool always wins the slot).
+pub fn set_tool_activity(label: String) {
+    let mut guard = TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some((label, None));
+}
+
+/// Marks the tools as finished, starting the [`TOOL_LINGER_MS`] window after
+/// which the label drops out of the bar.
+pub fn end_tool_activity() {
+    let mut guard = TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, ended @ None)) = guard.as_mut() {
+        *ended = Some(std::time::Instant::now());
+    }
+}
+
+/// Drops the tool label immediately, linger window and all.
+pub fn clear_tool_activity() {
+    let mut guard = TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+/// The tool label to show: present while tools run and for [`TOOL_LINGER_MS`]
+/// after they finish. Expired labels are dropped on read.
+#[must_use]
+pub fn tool_activity() -> Option<String> {
+    let mut guard = TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.as_ref() {
+        Some((label, None)) => Some(label.clone()),
+        Some((label, Some(at))) if flash_active(at.elapsed(), TOOL_LINGER_MS) => {
+            Some(label.clone())
+        }
+        Some(_) => {
+            *guard = None;
+            None
+        }
+        None => None,
+    }
+}
+
+/// Whether the tool label is in the lit half of its blink cycle.
+#[must_use]
+pub fn tool_blink_on(tick_ms: u64) -> bool {
+    tick_ms % TOOL_BLINK_MS < TOOL_BLINK_MS / 2
+}
+
+/// Sets the running-tools label for as long as the guard lives, then hands it
+/// over to its linger window on drop, so no early return (or panic) can leave
+/// the bar claiming a tool is still running.
+#[derive(Debug)]
+pub struct ToolActivity;
+
+impl ToolActivity {
+    /// Posts `label` and returns the guard that ends it.
+    #[must_use]
+    pub fn begin(label: String) -> Self {
+        set_tool_activity(label);
+        Self
+    }
+}
+
+impl Drop for ToolActivity {
+    fn drop(&mut self) {
+        end_tool_activity();
+    }
+}
 
 /// A transient status-bar message (with its display window in ms) shown in
 /// place of the rotating tip until it expires, then cleared automatically on
@@ -956,12 +1047,31 @@ mod tests {
             Duration::from_millis(FLASH_TIP_MS + 5_000),
             FLASH_TIP_MS
         ));
-        // The tool-usage window is shorter.
-        assert!(flash_active(Duration::from_millis(4_999), TOOL_FLASH_MS));
-        assert!(!flash_active(
-            Duration::from_millis(TOOL_FLASH_MS),
-            TOOL_FLASH_MS
-        ));
+    }
+
+    #[test]
+    fn tool_activity_lasts_the_run_then_lingers_until_the_next_tool() {
+        clear_tool_activity();
+        {
+            let _running = ToolActivity::begin("read_file, bash".to_string());
+            assert_eq!(tool_activity().as_deref(), Some("read_file, bash"));
+        }
+        // The guard is gone but the label lingers so a fast tool stays read.
+        assert_eq!(tool_activity().as_deref(), Some("read_file, bash"));
+        // The next tool takes the slot immediately, without waiting it out.
+        let _next = ToolActivity::begin("web_search".to_string());
+        assert_eq!(tool_activity().as_deref(), Some("web_search"));
+        clear_tool_activity();
+        assert_eq!(tool_activity(), None);
+    }
+
+    #[test]
+    fn tool_blink_is_half_on_half_off() {
+        assert!(tool_blink_on(0));
+        assert!(tool_blink_on(TOOL_BLINK_MS / 2 - 1));
+        assert!(!tool_blink_on(TOOL_BLINK_MS / 2));
+        assert!(!tool_blink_on(TOOL_BLINK_MS - 1));
+        assert!(tool_blink_on(TOOL_BLINK_MS));
     }
 
     #[test]

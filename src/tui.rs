@@ -2226,11 +2226,22 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(format!("✓ {done}/{total}"), counter_style));
     }
-    // Tail tip. A transient "flash" (e.g. a copy confirmation) takes over for
-    // its window; otherwise the rotating yellow tip shows, changing every few
-    // seconds off the animation clock. On a narrow terminal the line truncates
-    // and drops whichever tip is last.
-    if let Some(flash) = crate::status::flash_tip() {
+    // Tail notification slot. A running tool owns it for the whole run (no
+    // timed window), shimmering off the animation clock, so nothing else shows
+    // there until the tool finishes. Otherwise a transient "flash" (e.g. a copy
+    // confirmation) takes over for its window; otherwise the rotating yellow
+    // tip shows, changing every few seconds off the animation clock. On a
+    // narrow terminal the line truncates and drops whichever tip is last.
+    if let Some(running) = crate::status::tool_activity() {
+        spans.push(Span::styled(" | ".to_string(), base));
+        if crate::status::tool_blink_on(tick_ms) {
+            push_shimmered(&mut spans, &running, tick_ms, theme);
+        } else {
+            // Off half of the blink: same glyphs at the same width, dimmed, so
+            // the label pulses without the line jittering around it.
+            spans.push(Span::styled(running, base.fg(Color::Indexed(240))));
+        }
+    } else if let Some(flash) = crate::status::flash_tip() {
         spans.push(Span::styled(" | ".to_string(), base));
         spans.push(Span::styled(
             flash,
