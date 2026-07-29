@@ -125,6 +125,31 @@ pub struct HostStatus {
     pub kv_budget_bytes: Option<u64>,
     /// Per-session accounting, sorted by id.
     pub sessions: Vec<SessionAccount>,
+    /// Cost of the most recent KV capture the scheduler performed, if any.
+    pub last_capture: Option<KvTiming>,
+    /// Cost of the most recent KV restore the scheduler performed, if any.
+    pub last_restore: Option<KvTiming>,
+}
+
+/// Wall-clock cost of one KV snapshot capture or restore.
+///
+/// Recorded because session cloning (`docs/SESSION-CLONE-DESIGN.md` §8) is only
+/// viable for interactive use if capture is cheap: a clone that is semantically
+/// perfect but costs seconds is not a clone anyone can use. Correctness tests
+/// cannot see that, so the host measures it from the first snapshot it takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvTiming {
+    /// Size of the serialized snapshot, in bytes.
+    pub bytes: usize,
+    /// Wall-clock duration of the operation.
+    pub elapsed: Duration,
+}
+
+/// The scheduler's running record of the latest capture and restore costs.
+#[derive(Debug, Clone, Copy, Default)]
+struct KvTimings {
+    capture: Option<KvTiming>,
+    restore: Option<KvTiming>,
 }
 
 /// The shared, immutable model: weights, tokenizer, and the Metal command
@@ -473,6 +498,7 @@ fn scheduler_loop(
 ) {
     let mut sessions: HashMap<u64, SessionSlot> = HashMap::new();
     let mut rotation: VecDeque<ActiveJob> = VecDeque::new();
+    let mut timings = KvTimings::default();
     let ctx_size = model.ctx_size();
 
     loop {
@@ -482,28 +508,28 @@ fn scheduler_loop(
         if rotation.is_empty() {
             match recv_or_reclaim(cmd_rx, cfg.idle_reclaim) {
                 RecvOutcome::Command(cmd) => {
-                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
+                    if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg, &mut timings) {
                         return;
                     }
                 }
                 RecvOutcome::ReclaimTick => {
                     if let Some(threshold) = cfg.idle_reclaim {
-                        reclaim_idle_sessions(&mut sessions, &rotation, threshold);
+                        reclaim_idle_sessions(&mut sessions, &rotation, threshold, &mut timings);
                     }
                 }
                 RecvOutcome::Disconnected => return,
             }
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
         let mut dirty = false;
         while let Ok(cmd) = cmd_rx.try_recv() {
-            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg) {
+            if !apply_command(cmd, model, &mut sessions, &mut rotation, cfg, &mut timings) {
                 return;
             }
             dirty = true;
         }
         if dirty {
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
 
         // One round-robin pass: give each active job a single K-token slice,
@@ -544,7 +570,7 @@ fn scheduler_loop(
             }
         }
         if completed {
-            publish_status(status, &sessions, cfg, ctx_size);
+            publish_status(status, &sessions, cfg, ctx_size, timings);
         }
     }
 }
@@ -588,6 +614,7 @@ fn reclaim_idle_sessions(
     sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &VecDeque<ActiveJob>,
     threshold: Duration,
+    timings: &mut KvTimings,
 ) {
     let now = Instant::now();
     for (id, slot) in sessions.iter_mut() {
@@ -601,8 +628,13 @@ fn reclaim_idle_sessions(
             continue;
         }
         let mut session = slot.session.take().expect("checked is_some above");
+        let started = Instant::now();
         match session.snapshot_bytes() {
             Some(bytes) => {
+                timings.capture = Some(KvTiming {
+                    bytes: bytes.len(),
+                    elapsed: started.elapsed(),
+                });
                 let path = idle_snapshot_path(*id);
                 if std::fs::write(&path, &bytes).is_ok() {
                     // Dropping `session` here frees its live KV (design §7).
@@ -629,6 +661,7 @@ fn publish_status(
     sessions: &HashMap<u64, SessionSlot>,
     cfg: HostConfig,
     ctx_size: i32,
+    timings: KvTimings,
 ) {
     let mut accounts: Vec<SessionAccount> = sessions
         .iter()
@@ -654,6 +687,8 @@ fn publish_status(
     g.kv_bytes = kv_bytes;
     g.kv_budget_bytes = cfg.kv_budget_bytes;
     g.sessions = accounts;
+    g.last_capture = timings.capture;
+    g.last_restore = timings.restore;
 }
 
 /// Applies one command on the GPU thread. Returns `false` to stop the worker.
@@ -663,6 +698,7 @@ fn apply_command(
     sessions: &mut HashMap<u64, SessionSlot>,
     rotation: &mut VecDeque<ActiveJob>,
     cfg: HostConfig,
+    timings: &mut KvTimings,
 ) -> bool {
     match cmd {
         Command::Attach { ctx_size, reply } => {
@@ -710,7 +746,7 @@ fn apply_command(
             // (design §7). The bytes came from disk, so `restore_bytes` uses the
             // non-owning FFI path (FINDINGS double-free gotcha).
             if slot.session.is_none() {
-                match restore_reclaimed(model, slot) {
+                match restore_reclaimed(model, slot, timings) {
                     Ok(()) => {}
                     Err(e) => {
                         let _ = out.send(Yield::Done(Err(e)));
@@ -740,12 +776,18 @@ fn apply_command(
 fn restore_reclaimed(
     model: &Arc<dyn ModelHandle>,
     slot: &mut SessionSlot,
+    timings: &mut KvTimings,
 ) -> Result<(), EngineError> {
     let mut session = Arc::clone(model).spawn(slot.ctx_size)?;
     if let Some(path) = slot.snapshot_path.take() {
         let bytes =
             std::fs::read(&path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
+        let started = Instant::now();
         session.restore_bytes(&bytes)?;
+        timings.restore = Some(KvTiming {
+            bytes: bytes.len(),
+            elapsed: started.elapsed(),
+        });
         let _ = std::fs::remove_file(&path);
     }
     slot.ctx_tokens = session.ctx_tokens();
@@ -1309,6 +1351,39 @@ mod tests {
         assert!(
             st.resident_ctx_tokens >= tokens,
             "restored session's KV accounting is preserved"
+        );
+    }
+
+    /// Stage 0 of `docs/SESSION-CLONE-DESIGN.md`: the host must be able to say
+    /// what a KV capture and restore actually cost, because that number decides
+    /// whether cloning is viable for interactive use. The stub's snapshot is
+    /// trivially cheap, so this asserts the accounting is wired up and carries
+    /// a plausible byte count — the latency itself only means something on Metal.
+    #[test]
+    fn kv_timings_recorded_for_capture_and_restore() {
+        let host = shared_host(HostConfig {
+            max_sessions: 2,
+            slice_tokens: 8,
+            idle_reclaim: Some(Duration::from_millis(120)),
+            ..HostConfig::default()
+        });
+        let a = host.attach().unwrap();
+        run_gen(&a);
+        assert!(
+            host.status().last_capture.is_none(),
+            "nothing captured before the first reclaim"
+        );
+
+        let st = poll_status(&host, |s| s.last_capture.is_some());
+        let capture = st.last_capture.expect("polled until Some");
+        assert!(capture.bytes > 0, "a capture carries its payload size");
+
+        run_gen(&a);
+        let st = poll_status(&host, |s| s.last_restore.is_some());
+        let restore = st.last_restore.expect("polled until Some");
+        assert_eq!(
+            restore.bytes, capture.bytes,
+            "the restore reads back exactly what the capture wrote"
         );
     }
 
