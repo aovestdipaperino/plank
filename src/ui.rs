@@ -5645,7 +5645,11 @@ impl Agent<'_> {
                     },
                 )
                 .map(|(main, _aside)| main);
+            // Flush the renderer, then close the panel's line: without the
+            // `EndLine` its last, unterminated line is never committed to the
+            // log, so the tail of the answer is silently lost.
             aside_stream.finish();
+            let _ = tx.send(UiEvent::Btw(Box::new(UiEvent::EndLine)));
             result
         } else {
             self.engine.generate(
