@@ -508,6 +508,93 @@ impl Ds4Session {
         }
     }
 
+    /// Forks this session: a sibling over the *same* weights, pre-loaded with
+    /// this session's KV and token transcript, which then diverges
+    /// independently (`docs/SESSION-CLONE-DESIGN.md` §5).
+    ///
+    /// This is the local form of the clone primitive. It needs no
+    /// [`EngineHost`](crate::host::EngineHost): a `Ds4Session` already holds an
+    /// `Arc<Ds4Model>`, so the sibling shares the loaded weights and Metal
+    /// queue and costs only its own KV. The interactive agent can therefore
+    /// fork its live session directly, without being host-backed.
+    ///
+    /// Capture is non-destructive — `self` is left exactly as it was, cursor
+    /// included — so the caller keeps generating on it. The two sessions share
+    /// nothing mutable afterwards.
+    ///
+    /// Cost is one full KV allocation for the fork's lifetime, plus the
+    /// serialize/restore round trip. Callers that fork per aside should drop
+    /// the sibling as soon as it has answered.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if this session has no live KV to capture, or if
+    /// the sibling cannot be created or loaded.
+    pub fn fork(&mut self) -> Result<Self, EngineError> {
+        let bytes = self
+            .capture_bytes()
+            .ok_or_else(|| EngineError::new("cannot fork a session with no live KV"))?;
+        let mut sibling = Self::from_model(Arc::clone(&self.model));
+        sibling.load_bytes(&bytes)?;
+        Ok(sibling)
+    }
+
+    /// Current absolute cursor position in the live KV, in tokens; 0 when no
+    /// FFI session exists yet.
+    #[must_use]
+    pub fn ctx_tokens(&self) -> i32 {
+        if self.session.is_null() {
+            return 0;
+        }
+        // SAFETY: session is non-null here and freed only on drop.
+        unsafe { ffi::ds4_session_pos(self.session) }
+    }
+
+    /// The shared model behind this session, for creating siblings over the
+    /// same weights without reloading them.
+    #[must_use]
+    pub fn model_arc(&self) -> Arc<Ds4Model> {
+        Arc::clone(&self.model)
+    }
+
+    /// Serializes this session's live KV and token transcript to owned bytes,
+    /// or `None` when it has no live session to capture. Non-destructive.
+    ///
+    /// The transcript rides in front of the KV bytes (the same wrap as
+    /// [`get_kv`](Engine::get_kv)) so a session loaded from these bytes keeps
+    /// its exact token buffer and prefills only genuinely new tokens.
+    fn capture_bytes(&mut self) -> Option<Vec<u8>> {
+        if self.session.is_null() {
+            return None;
+        }
+        // Copy out an owned buffer so the engine-owned snapshot is freed here.
+        // The returned Vec is Rust's, which is why `load_bytes` must restore it
+        // through the non-owning FFI path (FINDINGS double-free).
+        let snap = SessionSnapshot::capture(self.session).ok()?;
+        let mut out = ds4tokens::encode(&self.transcript);
+        out.extend_from_slice(snap.as_bytes());
+        Some(out)
+    }
+
+    /// Loads bytes produced by [`capture_bytes`](Self::capture_bytes) into this
+    /// session, creating its FFI session if needed. The restored KV/cursor and
+    /// its captured token transcript supersede whatever this session held.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if the session cannot be created or the backend
+    /// rejects the payload.
+    fn load_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
+        let session = self.ensure_session()?;
+        let (transcript, kv) = match ds4tokens::decode(bytes) {
+            Some((transcript, off)) => (transcript, &bytes[off..]),
+            None => (TokenTranscript::new(), strip_legacy(bytes)),
+        };
+        // Rust owns `bytes`, so this is the non-owning restore path: the engine
+        // must never free our buffer (FINDINGS double-free).
+        SessionSnapshot::restore_bytes(session, kv)?;
+        self.transcript = transcript;
+        Ok(())
+    }
+
     /// Model name reported by the engine.
     #[must_use]
     pub fn model_name(&self) -> String {
@@ -1240,34 +1327,12 @@ impl HostSession for Ds4HostSession {
     }
 
     fn snapshot_bytes(&mut self) -> Option<Vec<u8>> {
-        if self.inner.session.is_null() {
-            return None;
-        }
-        // Reuse the single snapshot primitive; copy out an owned buffer so the
-        // engine-owned snapshot is freed here (the returned Vec is Rust's, and
-        // the disk-read restore path must never free it — FINDINGS double-free).
-        // The token transcript rides in front of the KV bytes (same wrap as
-        // `get_kv`) so an idle-reclaimed session resumes with its exact
-        // token buffer intact and only prefills genuinely new tokens.
-        let snap = SessionSnapshot::capture(self.inner.session).ok()?;
-        let mut out = ds4tokens::encode(&self.inner.transcript);
-        out.extend_from_slice(snap.as_bytes());
-        Some(out)
+        self.inner.capture_bytes()
     }
 
     fn restore_bytes(&mut self, bytes: &[u8]) -> Result<(), EngineError> {
-        // Restore into the freshly spawned session (already warmed with the
-        // shared system-prompt prefix). Disk-read bytes use the non-owning FFI
-        // path so the engine never frees Rust's buffer (FINDINGS double-free).
-        let session = self.inner.ensure_session()?;
-        let (transcript, kv) = match ds4tokens::decode(bytes) {
-            Some((transcript, off)) => (transcript, &bytes[off..]),
-            None => (TokenTranscript::new(), strip_legacy(bytes)),
-        };
-        SessionSnapshot::restore_bytes(session, kv)?;
-        // The restored KV/cursor and its captured token transcript supersede any
-        // prior Rust-side transcript.
-        self.inner.transcript = transcript;
+        self.inner.load_bytes(bytes)?;
+        // The restored KV supersedes any generation this slot had queued.
         self.pending = None;
         self.active = None;
         Ok(())
@@ -2265,6 +2330,87 @@ mod tests {
             )
             .unwrap();
         (stats, total)
+    }
+
+    /// The local fork path, which is the one the interactive agent can actually
+    /// use: no `EngineHost`, no scheduler thread, just a `Ds4Session` forking
+    /// itself over its own `Arc<Ds4Model>`.
+    ///
+    /// Proves the same properties as the host-backed clone: the source is
+    /// undisturbed (P1), the fork carries its transcript (P2), the fork
+    /// continues rather than re-prefilling (P3), and the two diverge without
+    /// contaminating each other (P4).
+    #[cfg(ds4_engine)]
+    #[test]
+    fn fork_is_a_local_clone_without_a_host() {
+        use crate::engine::GenerationOptions;
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut a =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 21,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        let transcript = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut a, transcript, &opts);
+        assert!(!reply.is_empty(), "the source generates before forking");
+        let source_pos = a.ctx_tokens();
+        assert!(
+            source_pos > 0,
+            "the source holds a real cursor to fork from"
+        );
+
+        let mut b = a.fork().expect("a live session forks");
+
+        // P1: capture left A's cursor exactly where it was.
+        assert_eq!(
+            a.ctx_tokens(),
+            source_pos,
+            "forking must not disturb the source's cursor"
+        );
+        // P2: B came across at the same position, over the same weights.
+        assert_eq!(
+            b.ctx_tokens(),
+            source_pos,
+            "the fork holds A's cursor, not a fresh one"
+        );
+
+        let continued = format!("{transcript}[assistant]\n{}\n[user]\n", reply.trim());
+
+        // P3: B continues A's conversation instead of rebuilding it. The cold
+        // control is a fresh session over the same model, given the same prompt.
+        let b_prompt = format!("{continued}What is the capital of France?\n");
+        let b_remaining = gen_capture_prefill(&mut b, &b_prompt, &opts);
+        let cold_remaining = {
+            let mut c = super::Ds4Session::from_model(a.model_arc());
+            gen_capture_prefill(&mut c, &b_prompt, &opts)
+        };
+        eprintln!("fork prefill: fork={b_remaining} cold={cold_remaining}");
+        assert!(
+            cold_remaining > 0,
+            "the control must prefill something for the comparison to mean anything"
+        );
+        assert!(
+            b_remaining < cold_remaining,
+            "the fork continued A's context instead of re-prefilling it \
+             (fork={b_remaining} < cold={cold_remaining})"
+        );
+
+        // P4: A is unaffected by what B was asked.
+        let (_, out_a) = gen_capture_reply(&mut a, &format!("{continued}Name a planet.\n"), &opts);
+        assert!(!out_a.is_empty(), "A keeps generating after being forked");
+        assert!(
+            !out_a.to_lowercase().contains("paris"),
+            "B's question must not leak into A: {out_a}"
+        );
     }
 
     /// P4 — the two sessions diverge without contaminating each other. B is
