@@ -483,7 +483,8 @@ series shipped in 2.6.2, where it is now documented.
 ## [2.6.0] - 2026-07-25
 
 Stable release: the 2.5 beta line promoted. Two visible fixes to how a turn's
-progress is shown while the engine works.
+progress is shown while the engine works, and one to how the spinner looks
+while it works.
 
 ### Changed
 
@@ -498,6 +499,13 @@ progress is shown while the engine works.
   backend, so it is brief but visible. Hiding the prompt also prevents typing
   into a session whose KV is still loading. The plain REPL, which has no
   persistent prompt, prints one transient line and erases it.
+- **The shimmer sweeping across the spinner verb is shaded in the theme's own
+  hue** rather than flat white. All three of its columns were painted pure
+  white over the military green, which reads as a blown-out glitch and pulls
+  the eye harder than the text it decorates. Each column now takes its
+  lightness by distance from the center of the window — brightest in the
+  middle, easing back into the theme color at the edges — and the window
+  widened to match, so adding a shade softens the sweep in one edit.
 
 ## [2.5.5] - 2026-07-25
 
@@ -621,6 +629,10 @@ Beta patch bump on the 2.5 series, landing the first wave of the 2.6.0 work.
 - **Startup context warming** (#63): the session-start context is prefilled into
   the KV so the first turn prefills only the question. The TUI input prompt now
   appears only once warming completes, behind an animated "warming cache" screen.
+- **`/version`**, on both the REPL and TUI paths.
+- **Rejected DSML tool calls are logged** to `~/.plank/tool-call-errors.log`,
+  which is the record later releases mine to find the shapes of tool call the
+  model actually gets wrong.
 
 ### Changed
 
@@ -632,7 +644,25 @@ Beta patch bump on the 2.5 series, landing the first wave of the 2.6.0 work.
   tier-fingerprint chaining and project-scoped checkpoint paths. (Native
   restore-loop wiring tracked in #64.)
 
+### Fixed
+
+- **The CRT power-off animation ran over an all-black image.** Ratatui swaps
+  its buffers before `draw()` returns, so the effect rasterized the blank
+  post-swap buffer instead of the frame that had just been on screen. The TUI
+  loop now snapshots each tick's completed frame and hands the last one back
+  to the caller, gated on the effect actually being enabled so there is no
+  per-tick cost when it is off.
+
 ## [2.5.2] - 2026-07-25
+
+### Added
+
+- **`/renotify`** re-shows the last delivered desktop notification. The
+  banner is remembered after delivery, which matters on Ventura and later
+  where `_showsButtons` no longer makes a banner stick around to be read.
+- **A missing API key falls back to `DUMMY`** instead of erroring, so
+  key-less OpenAI-compatible endpoints — a local `ollama serve`, for
+  instance — work without inventing a credential for them.
 
 ### Fixed
 
