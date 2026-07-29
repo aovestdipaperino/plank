@@ -1873,20 +1873,22 @@ mod tests {
     }
 
     // Test-support: run one generation over a solely-owned `Ds4Session` and
-    // return `(new_prefill, cached)` derived from the *first* `Prefill` event.
-    // `generate` always primes one such event up front with `done == cached`
-    // (tokens reused from the live KV prefix) and `total == prompt_len`, so
-    // `new_prefill = total - done` is the count of tokens actually evaluated
-    // this turn (§KV-cache discipline). This is the reuse signal the
-    // zero-re-prefill assertions below key off of; no production change needed.
+    // return how many prompt tokens this turn still had to evaluate — the
+    // priming `Prefill` event's `total`, which `PrefillProgress::primed`
+    // defines as `prompt_len - cached`.
+    //
+    // Reuse is therefore visible as a *small* return value, and a full rebuild
+    // as one proportional to the prompt. There is no "reused" count to read
+    // directly: `primed` reports `done == 0` by construction (a bar must not
+    // read 100% before any work has happened — #64 follow-up), so the reuse
+    // assertions below are written as comparisons against a control run.
     #[cfg(ds4_engine)]
     fn gen_capture_prefill(
         engine: &mut super::Ds4Session,
         transcript: &str,
         opts: &crate::engine::GenerationOptions,
-    ) -> (i32, i32) {
-        let (np, cached, _) = gen_capture_reply(engine, transcript, opts);
-        (np, cached)
+    ) -> i32 {
+        gen_capture_reply(engine, transcript, opts).0
     }
 
     /// As [`gen_capture_prefill`], plus the generated reply text — needed to
@@ -1897,9 +1899,9 @@ mod tests {
         engine: &mut super::Ds4Session,
         transcript: &str,
         opts: &crate::engine::GenerationOptions,
-    ) -> (i32, i32, String) {
+    ) -> (i32, String) {
         use crate::engine::{Engine, EngineEvent, Prompt};
-        let mut first: Option<(i32, i32)> = None;
+        let mut remaining: Option<i32> = None;
         let mut reply = String::new();
         engine
             .generate(
@@ -1908,16 +1910,16 @@ mod tests {
                 &|| false,
                 &|| false,
                 &mut |e| match e {
-                    EngineEvent::Prefill(p) if first.is_none() => {
-                        first = Some((p.done, p.total));
-                    }
+                    EngineEvent::Prefill(p) if remaining.is_none() => remaining = Some(p.total),
                     EngineEvent::Text(t) => reply.push_str(&t),
                     EngineEvent::Prefill(_) | EngineEvent::Notice(_) => {}
                 },
             )
             .unwrap();
-        let (done, total) = first.expect("generate always primes a Prefill event");
-        (total - done, done, reply)
+        (
+            remaining.expect("generate always primes a Prefill event"),
+            reply,
+        )
     }
 
     // #29 — /checkpoint + /rollback reuses the checkpoint KV. Establish a
@@ -1961,7 +1963,7 @@ mod tests {
         let transcript2 = "[user]\nName a planet.\n";
 
         // Establish the checkpoint conversation, then capture its KV.
-        let (_, _, reply1) = gen_capture_reply(&mut engine, transcript1, &opts);
+        let (_, reply1) = gen_capture_reply(&mut engine, transcript1, &opts);
         let checkpoint = engine.get_kv().expect("get_kv yields a checkpoint payload");
         let restored_len =
             i32::try_from(checkpoint.transcript().tokens().len()).expect("token count fits i32");
@@ -1972,10 +1974,10 @@ mod tests {
 
         // Diverge onto a different single-user turn: only the system prompt is
         // reusable, so this turn does real re-prefill (the control).
-        let (np_divergent, cached_divergent) = gen_capture_prefill(&mut engine, transcript2, &opts);
+        let divergent = gen_capture_prefill(&mut engine, transcript2, &opts);
         assert!(
-            np_divergent > 0,
-            "a divergent turn must actually prefill its new suffix (np={np_divergent})"
+            divergent > 0,
+            "a divergent turn must actually prefill its new suffix (remaining={divergent})"
         );
 
         // Roll back, then continue as `rollback_to` does: the restored
@@ -1986,40 +1988,27 @@ mod tests {
             "{transcript1}[assistant]\n{}\n[user]\nName a planet.\n",
             reply1.trim()
         );
-        let (np_resumed, cached_resumed) = gen_capture_prefill(&mut engine, &resumed, &opts);
-        // The KV is exactly one token shorter than the token transcript: the
-        // reply's EOS is sampled and recorded but never evaluated
-        // (`record_reply`), so it is the one token the resumed turn must pay for.
+        let resumed_remaining = gen_capture_prefill(&mut engine, &resumed, &opts);
+        // The resumed prompt is *longer* than the checkpoint — it appends the
+        // assistant turn and a new question — yet it evaluates only a handful of
+        // tokens. That gap is the reuse: the restored prefix was kept, not
+        // rebuilt. (The KV is one token shorter than the token transcript: the
+        // reply's EOS is sampled and recorded but never evaluated in
+        // `record_reply`, so it is among the tokens this turn pays for.)
         assert!(
-            cached_resumed >= restored_len - 1,
-            "rollback must reuse the whole restored prefix \
-             (reused {cached_resumed}, restored {restored_len} incl. the unevaluated EOS)"
-        );
-        // Reuse, not absolute prefill count, is the discriminating signal: both
-        // turns here happen to prefill the same handful of tokens, but the
-        // divergent one had to rebuild from nothing while the rollback kept the
-        // entire conversation.
-        assert_eq!(
-            cached_divergent, 0,
-            "the divergent control reuses nothing, so it is a real rebuild"
-        );
-        assert!(
-            cached_resumed > cached_divergent,
-            "rollback reuses the checkpoint KV ({cached_resumed}) where a \
-             divergent turn reuses none ({cached_divergent})"
-        );
-        assert!(
-            np_resumed < restored_len,
-            "only the sampled EOS, the new question, and one assistant prefix \
-             are new (np={np_resumed}, restored prefix {restored_len})"
+            resumed_remaining < restored_len,
+            "rollback must reuse the restored prefix: the resumed turn evaluates \
+             its new suffix ({resumed_remaining}), not the whole {restored_len}-token \
+             checkpoint"
         );
 
         // The sharp edge, asserted so it cannot regress into a silent rebuild:
-        // a prompt that sits *behind* the live KV's end reuses nothing at all.
+        // a prompt that sits *behind* the live KV's end reuses nothing at all,
+        // so it pays for every one of its own tokens.
         engine.set_kv(&checkpoint).unwrap();
-        let (_, cached_behind) = gen_capture_prefill(&mut engine, transcript1, &opts);
-        assert_eq!(
-            cached_behind, 0,
+        let behind = gen_capture_prefill(&mut engine, transcript1, &opts);
+        assert!(
+            behind > 0,
             "a prompt behind the live KV's end is rebuilt from zero, not reused"
         );
     }
@@ -2056,7 +2045,7 @@ mod tests {
         let (payload, reply) = {
             let mut a =
                 super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
-            let (_, _, reply) = gen_capture_reply(&mut a, transcript, &opts);
+            let (_, reply) = gen_capture_reply(&mut a, transcript, &opts);
             (a.get_kv().expect("get_kv yields a payload"), reply)
         };
         let restored_len =
@@ -2069,7 +2058,7 @@ mod tests {
 
         // Cold-baseline control: a fresh engine with an empty KV must prefill
         // the whole prompt (nothing reused). This calibrates "full re-prefill".
-        let (np_cold, cached_cold) = {
+        let cold = {
             let mut c =
                 super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
             gen_capture_prefill(&mut c, &resumed, &opts)
@@ -2080,24 +2069,18 @@ mod tests {
         let mut b =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
         b.set_kv(&payload).unwrap();
-        let (np, cached) = gen_capture_prefill(&mut b, &resumed, &opts);
-        // Minus one: the reply's EOS is sampled but never evaluated, so the KV
-        // is one token shorter than the token transcript it was captured with.
+        let resumed_remaining = gen_capture_prefill(&mut b, &resumed, &opts);
+        // Same prompt, two starting states: the resumed session evaluates only
+        // the suffix past the payload, the cold one evaluates the whole thing.
         assert!(
-            cached >= restored_len - 1,
-            "resume must reuse the whole payload prefix \
-             (reused {cached}, restored {restored_len} incl. the unevaluated EOS)"
-        );
-        // Against the cold baseline: the resumed run re-prefills far less and
-        // reuses far more KV, proving the payload's prefix was NOT recomputed.
-        assert!(
-            np < np_cold,
-            "resume ({np}) must re-prefill far less than a cold start ({np_cold})"
+            resumed_remaining < cold,
+            "resume ({resumed_remaining}) must re-prefill far less than a cold \
+             start ({cold}) over the identical prompt"
         );
         assert!(
-            cached > cached_cold,
-            "resume reuses the payload KV; cold start reuses none \
-             (cached={cached} > cold={cached_cold})"
+            resumed_remaining < restored_len,
+            "resume reused the payload prefix rather than rebuilding its \
+             {restored_len} tokens (remaining={resumed_remaining})"
         );
     }
 
