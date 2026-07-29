@@ -6,6 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.7] - 2026-07-29
+
+Beta channel on the 2.7 series.
+
+### Fixed
+
+- **A `/btw` answer is closed out when the aside finishes, not when the main
+  task does.** A one-line aside is done in a single slice — around two seconds —
+  while the main task may have hundreds of tokens left. Its panel line was only
+  terminated when the whole multiplexed pass returned, so the answer sat
+  unfinished on screen for the rest of the turn.
+
+### Changed
+
+- The aside's share of the thread is now 2:1 over the main task rather than 4:1.
+  Measured, the weight mostly matters for a long aside: a one-line answer
+  finishes inside a single slice at any weight, and what follows is the main task
+  running alone because there is nothing left to share with.
+- `README.md` and the site show `/btw` multiplexing as a recording, and no longer
+  describe the old freeze-and-resume behaviour. `WHATS-NEW.md` is grouped by
+  channel — what is in the betas, then the stable releases — instead of one
+  section per version.
+
 ## [2.7.6] - 2026-07-29
 
 Beta channel on the 2.7 series.

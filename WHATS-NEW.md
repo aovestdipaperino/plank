@@ -1,9 +1,37 @@
 # What's new in plank
 
-A short, human-readable highlight reel per release. For the full change list
-see the GitHub releases and commit history.
+A short, human-readable highlight reel. For the full change list see the GitHub
+releases and commit history.
 
-## 2.7, next beta
+plank ships on two channels, and the patch number is the channel: `X.Y.0` is
+stable, anything above it is a beta on the way to the next stable. This page is
+grouped the same way — what is in the beta now, then the stable releases behind
+it.
+
+## In the betas
+
+Riding the beta channel today, on top of the newest stable release. Install with
+`brew install aovestdipaperino/tap/plank-agent-beta`.
+
+💬 **`/btw` answers beside the task instead of freezing it.** Asking a side
+question mid-generation used to stop the main task dead until the answer was
+done. The aside now runs on a fork of the session, interleaved with the main
+generation, so the reply keeps streaming on the left while the answer fills the
+panel on the right. The aside takes the larger share of the thread while it
+runs, since it is the one you are waiting on.
+
+One Metal command queue means this is time-slicing, not parallelism — nothing
+finishes sooner overall. What changes is that the main task no longer stops.
+Only one aside runs at a time, and questions are no longer queued behind one:
+with the answer already on screen, holding the next one back bought nothing.
+
+🧠 **The second `/btw` of a turn stopped rebuilding the whole conversation.** It
+re-prefilled every token — around 14,600 of them on a moderate transcript, a
+minute of dead air that read as a hang. A suspended turn generates twice into
+one reply, but the cache index recorded the two halves separately while the
+conversation holds them as one, so the next question no longer lined up with
+what was cached and the engine started over. One reply is now one entry, and
+the second aside reuses 99.9% of what it already had.
 
 📄 **plank reads PDFs.** `read` on a `.pdf` gives you the document as Markdown
 and pages through it like any other file — the same bounded chunks, the same
@@ -38,7 +66,9 @@ limited". Timing is now reported only when at least half your sessions carry it.
 green instead of dim pink, with any URL lifted to white so the target stands
 out from the prose.
 
-## 2.6.0
+## Stable releases
+
+### 2.6.0
 
 The 2.5 beta line, promoted: five betas' worth of the cache learning to keep
 what it already knows, plus session branching, a handful of commands, and a lot
@@ -142,7 +172,7 @@ prefill.
 
 The Homebrew formulas are `plank-agent` and `plank-agent-beta`.
 
-## 2.0.2
+### 2.0.2
 
 The v2 line, promoted to stable. plank stays a local agent by default, but it
 can now be driven remotely, serve one model to many sessions at once, and talk
@@ -249,7 +279,7 @@ or run a hook asynchronously, and matchers can key on a command's arguments
 
 All still local first, macOS, open source.
 
-## 1.6.0
+### 1.6.0
 
 The whole 1.x line, promoted to stable. plank is a terminal coding agent
 written in Rust that runs DeepSeek V4 Flash locally on Apple Silicon through
@@ -286,7 +316,7 @@ keep their footing.
 crash into a clear message, and a green rule now separates the scrollback from
 the resting prompt.
 
-## 0.x — the foundation
+### 0.x — the foundation
 
 The pre-1.0 line, where plank became a working local agent. It was ported from
 the `ds4_agent` C reference functionality by functionality, each C section
