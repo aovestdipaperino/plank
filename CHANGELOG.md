@@ -16,7 +16,7 @@ Beta channel on the 2.7 series.
   phases used half- and full-block glyphs, which read as a solid bar rather
   than a collapsing scanline. The line is now `▁` (a lower one-eighth block,
   which tiles without gaps where a plain `_` would not) and the final
-  phosphor point is `.`, via crt-off 0.1.3.
+  phosphor point is a bold `.`, via crt-off 0.1.4.
 
 ## [2.7.4] - 2026-07-29
 
