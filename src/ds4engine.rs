@@ -549,6 +549,13 @@ impl Ds4Session {
         unsafe { ffi::ds4_session_pos(self.session) }
     }
 
+    /// This session's token transcript — the source of truth for its prompt
+    /// prefix. Exposed so callers can assert an operation left it untouched.
+    #[must_use]
+    pub fn transcript_tokens(&self) -> &[i32] {
+        self.transcript.tokens()
+    }
+
     /// The shared model behind this session, for creating siblings over the
     /// same weights without reloading them.
     #[must_use]
@@ -987,6 +994,34 @@ impl Engine for Ds4Session {
     }
 
     fn supports_aside(&self) -> bool {
+        true
+    }
+
+    fn generate_aside_forked(
+        &mut self,
+        prompt: &str,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        // The whole aside runs on a sibling session. Compare `generate_aside`
+        // above: no snapshot, no `RestoreOnDrop`, no transcript save/restore —
+        // all three exist there only because it answers destructively on the
+        // live session. Here nothing of `self` is written, so there is nothing
+        // to undo, on any exit path.
+        //
+        // The fork's KV is freed when it drops at the end of this call.
+        let mut aside = self.fork()?;
+        aside.generate(
+            crate::engine::Prompt::Flat(prompt),
+            opts,
+            interrupt,
+            &|| false,
+            on_event,
+        )
+    }
+
+    fn supports_forked_aside(&self) -> bool {
         true
     }
 
@@ -2410,6 +2445,78 @@ mod tests {
         assert!(
             !out_a.to_lowercase().contains("paris"),
             "B's question must not leak into A: {out_a}"
+        );
+    }
+
+    /// §6.4's strongest regression: a forked aside must leave the main session
+    /// exactly as it found it — the direct analogue of the invariant
+    /// `generate_aside` protects with `RestoreOnDrop`, but held structurally
+    /// here because the aside never touches the live session at all.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_leaves_the_main_session_clean() {
+        use crate::engine::{Engine, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 31,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        let transcript = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, transcript, &opts);
+        let pos_before = engine.ctx_tokens();
+        let tokens_before = engine.transcript_tokens().to_vec();
+
+        let mut aside_text = String::new();
+        engine
+            .generate_aside_forked(
+                "[user]\nWhat is the capital of France?\n",
+                &opts,
+                &|| false,
+                &mut |e| {
+                    if let crate::engine::EngineEvent::Text(t) = e {
+                        aside_text.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!aside_text.is_empty(), "the aside produces an answer");
+
+        assert_eq!(
+            engine.ctx_tokens(),
+            pos_before,
+            "the aside must not move the main cursor"
+        );
+        assert_eq!(
+            engine.transcript_tokens(),
+            tokens_before,
+            "the aside must not touch the main token transcript"
+        );
+
+        // And the main task continues as if nothing happened: its next turn
+        // still reuses its own prefix rather than rebuilding.
+        let continuation = format!(
+            "{transcript}[assistant]\n{}\n[user]\nName a planet.\n",
+            reply.trim()
+        );
+        let remaining = gen_capture_prefill(&mut engine, &continuation, &opts);
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &continuation, &opts)
+        };
+        assert!(
+            remaining < cold,
+            "the main session's KV survived the aside intact \
+             (remaining={remaining} < cold={cold})"
         );
     }
 

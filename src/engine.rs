@@ -448,6 +448,41 @@ pub trait Engine: Debug + Send {
         false
     }
 
+    /// Answers a one-shot, tool-free prompt on a *forked* session, leaving this
+    /// one completely untouched (`docs/SESSION-CLONE-DESIGN.md` §6.1).
+    ///
+    /// This is the non-destructive tier above [`generate_aside`]. Where that
+    /// one answers on the live session and relies on an unconditional restore
+    /// to undo the damage, this forks the session first, so the main task's KV,
+    /// cursor and transcript are never written to at all — an interrupted or
+    /// failed aside cannot corrupt them, because it never touched them.
+    ///
+    /// The cost is a second full KV for the aside's lifetime. Callers gate it
+    /// accordingly; the three tiers (fork, destructive-with-restore, boundary
+    /// queue) each degrade cleanly into the next.
+    ///
+    /// # Errors
+    /// The default implementation returns [`EngineError::unsupported`] so
+    /// [`EchoEngine`] and remote engines fall through to [`generate_aside`].
+    /// Real engines return [`EngineError`] on a backend failure, including a
+    /// refusal to allocate the fork.
+    fn generate_aside_forked(
+        &mut self,
+        _prompt: &str,
+        _opts: &GenerationOptions,
+        _interrupt: &dyn Fn() -> bool,
+        _on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        Err(EngineError::unsupported())
+    }
+
+    /// Whether [`generate_aside_forked`](Self::generate_aside_forked) is really
+    /// implemented. Checked before an aside so the caller can pick the tier
+    /// without a throwaway call. Default `false`.
+    fn supports_forked_aside(&self) -> bool {
+        false
+    }
+
     /// Approximate token count of `text` for context accounting.
     fn count_tokens(&self, text: &str) -> i32 {
         // ~4 bytes per token is the usual rough estimate.
