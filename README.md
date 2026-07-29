@@ -78,7 +78,7 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 plank tracks `ds4_agent` for the core agent loop but moves faster on the user-facing side. A few of the things that exist only in plank:
 
-- **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and an animated status bar that shows the working directory and git branch; the C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
+- **Full-screen Ratatui TUI** — markdown rendering with syntax-highlighted code, mouse-wheel scrollback, and an animated status bar that shows the working directory, git branch, and the name of the tool currently running; the C reference is a plain line REPL. Resumed sessions replay through the same renderer, so history comes back as markdown with thinking dimmed, not flat text.
 - **Type while it thinks** — each turn runs on a worker thread, so the prompt stays live during generation and you can queue the next message.
 - **`/btw` side questions** — ask something mid-task; the running generation genuinely suspends, answers in a split panel, and resumes byte-for-byte with no re-prefill.
 - **Checkpoints, resume, and instant KV restore** — `/checkpoint`/`/rollback` and `/resume` snapshot the live engine KV alongside the transcript, so returning to a conversation skips re-prefilling it.

@@ -12,11 +12,33 @@ Beta channel on the 2.7 series.
 
 ### Changed
 
+- **The status bar holds the name of the running tool for as long as it
+  runs.** The label used to be a 5s flash tip, so it could expire while the
+  tool was still working, and it competed with the rotating tips for the tail
+  slot. It is now posted for the life of the dispatch by an RAII guard,
+  lingers 4s past the end so a fast tool stays readable, and is replaced
+  immediately when the next tool starts. While it is up it owns the tail
+  notification slot — tips are suppressed; the task counter and the rest of
+  the bar are untouched — and blinks on an 800ms cycle, alternating the
+  shimmer sweep with a dimmed pass at the same width so the line doesn't
+  jitter.
 - **The CRT power-off animation ends on a thinner trace.** Its last two
   phases used half- and full-block glyphs, which read as a solid bar rather
   than a collapsing scanline. The line is now `▁` (a lower one-eighth block,
   which tiles without gaps where a plain `_` would not) and the final
   phosphor point is a bold `.`, via crt-off 0.1.4.
+
+### Fixed
+
+- **CI is green again on the PDF tests.** `liteparse-pdfium-sys` downloads
+  PDFium into `~/.cache/pdfium-rs` and bakes that path into the binary, but
+  `rust-cache` restores `target/` and not that directory — so on a cache hit
+  the build script never re-ran, nothing re-downloaded, and the baked path
+  pointed at a directory the runner didn't have. Every `doc::` test died in
+  `dlopen`, which is why 2.7.3 and 2.7.4 both shipped with CI red. The cache
+  directory is now cached in its own right, keyed on `Cargo.lock` so a
+  dependency bump re-downloads, and the build is forced to re-run when that
+  cache is evicted while `target/` stays warm (#78).
 
 ## [2.7.4] - 2026-07-29
 
