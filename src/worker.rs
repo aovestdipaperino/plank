@@ -79,6 +79,15 @@ pub enum UiEvent {
     /// One render payload destined for the sub-agent buffer rather than the
     /// main log. Boxed so the enum does not grow by a whole `UiEvent`.
     Sub(Box<UiEvent>),
+    /// One render payload destined for the `/btw` panel, addressed per event
+    /// rather than by the [`BtwBegin`](Self::BtwBegin)/[`BtwEnd`](Self::BtwEnd)
+    /// mode.
+    ///
+    /// The mode cannot serve a *multiplexed* aside: the main task and the aside
+    /// interleave, so their events arrive mixed and a mode flag would misroute
+    /// whichever stream it is not currently set to. Boxed for the same reason
+    /// as [`Sub`](Self::Sub).
+    Btw(Box<UiEvent>),
 }
 
 impl UiEvent {
@@ -91,7 +100,10 @@ impl UiEvent {
     /// broadcasting is safe.
     #[must_use]
     pub fn is_local_pane_only(&self) -> bool {
-        matches!(self, Self::SubStart(_) | Self::SubEnd | Self::Sub(_))
+        matches!(
+            self,
+            Self::SubStart(_) | Self::SubEnd | Self::Sub(_) | Self::Btw(_)
+        )
     }
 }
 
@@ -143,6 +155,40 @@ impl RenderSink for SubAgentSink {
         let _ = self
             .0
             .send(UiEvent::Sub(Box::new(UiEvent::Error(text.to_owned()))));
+    }
+}
+
+/// [`RenderSink`] forwarding a `/btw` aside's render calls, wrapped in
+/// [`UiEvent::Btw`] so they reach the side panel even while the main task is
+/// streaming into the main log beside them. Same hang-up tolerance as
+/// [`ChannelSink`].
+///
+/// A multiplexed aside needs its own renderer, not just its own sink: without
+/// one its raw model output reaches the panel with the `<think>` tags still in
+/// it.
+#[derive(Debug)]
+pub struct BtwSink(pub Sender<UiEvent>);
+
+impl RenderSink for BtwSink {
+    fn visible_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Btw(Box::new(UiEvent::Visible(text.to_owned()))));
+    }
+    fn think_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Btw(Box::new(UiEvent::Think(text.to_owned()))));
+    }
+    fn tool_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Btw(Box::new(UiEvent::Tool(text.to_owned()))));
+    }
+    fn error_text(&mut self, text: &str) {
+        let _ = self
+            .0
+            .send(UiEvent::Btw(Box::new(UiEvent::Error(text.to_owned()))));
     }
 }
 
@@ -379,7 +425,8 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         | UiEvent::MainRollback
         | UiEvent::SubStart(_)
         | UiEvent::SubEnd
-        | UiEvent::Sub(_) => {}
+        | UiEvent::Sub(_)
+        | UiEvent::Btw(_) => {}
     }
 }
 

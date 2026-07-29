@@ -538,6 +538,26 @@ impl Ds4Session {
         Ok(sibling)
     }
 
+    /// Forks this session into a *sliceable* one: a [`HostSession`] carrying
+    /// this session's KV and transcript, ready to hand to
+    /// [`SliceRunner`](crate::slice::SliceRunner).
+    ///
+    /// This is the bridge that lets a plain interactive `Ds4Session` fan out.
+    /// [`fork`](Self::fork) gives a sibling that generates all-or-nothing;
+    /// wrapping it in [`Ds4HostSession`] gives one that generates in resumable
+    /// K-token slices, which is what interleaving several of them requires.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if this session has no live KV to capture, or if
+    /// the sibling cannot be created or loaded.
+    pub fn fork_sliceable(&mut self) -> Result<Box<dyn HostSession>, EngineError> {
+        Ok(Box::new(Ds4HostSession {
+            inner: self.fork()?,
+            pending: None,
+            active: None,
+        }))
+    }
+
     /// Current absolute cursor position in the live KV, in tokens; 0 when no
     /// FFI session exists yet.
     #[must_use]
@@ -554,6 +574,13 @@ impl Ds4Session {
     #[must_use]
     pub fn transcript_tokens(&self) -> &[i32] {
         self.transcript.tokens()
+    }
+
+    /// The transcript's span index, whose shape must mirror the rendered
+    /// transcript's sections (`docs/DOUBLE-BTW.md`).
+    #[must_use]
+    pub fn transcript_spans(&self) -> &[crate::ds4tokens::Span] {
+        self.transcript.spans()
     }
 
     /// The shared model behind this session, for creating siblings over the
@@ -710,8 +737,19 @@ impl Ds4Session {
         // SAFETY: engine valid.
         let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
         span.push(eos);
-        self.transcript
-            .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+        // A reply that follows another assistant span *continues* it: the pass
+        // was suspended for an in-pass `/btw` and resumed, and the UI splices
+        // both halves into one assistant message. Extend rather than append, so
+        // the span index matches the single section the next turn reconciles
+        // against — appending instead diverges there and re-prefills the whole
+        // conversation (`docs/DOUBLE-BTW.md`). The ids appended are the same
+        // either way, so the KV is untouched by the choice.
+        if self.transcript.last_is_assistant() {
+            self.transcript.extend_last_span(&text, &span);
+        } else {
+            self.transcript
+                .push_span(SpanRole::Assistant, ds4_think(think) as u8, text, &span);
+        }
     }
 }
 
@@ -922,9 +960,12 @@ impl Engine for Ds4Session {
         }
 
         // Append the sampled reply to the token transcript so the next turn's
-        // reconciliation keeps these exact tokens verbatim (its span key is the
-        // trimmed reply text) and the live KV prefix reaches this turn's end.
-        reply_text.truncate(reply_text.trim_end().len());
+        // reconciliation keeps these exact tokens verbatim and the live KV
+        // prefix reaches this turn's end. The text is recorded *raw*: a
+        // suspended pass's partial may later be extended by its continuation,
+        // and the two halves have to concatenate into exactly what the UI
+        // renders (`docs/DOUBLE-BTW.md` §4.1). `common_prefix` trims when it
+        // compares, so a completed reply still matches its rendered section.
         self.record_reply(reply_text, &reply_tokens, opts.think_mode);
 
         let interrupted = interrupt() || INTERRUPT.with(|f| f.load(Ordering::SeqCst));
@@ -1022,6 +1063,75 @@ impl Engine for Ds4Session {
     }
 
     fn supports_forked_aside(&self) -> bool {
+        true
+    }
+
+    fn generate_multiplexed(
+        &mut self,
+        main_prompt: &str,
+        aside_prompt: &str,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(crate::engine::AsideStream, EngineEvent),
+    ) -> Result<(GenerationStats, GenerationStats), EngineError> {
+        use crate::engine::AsideStream;
+        use crate::slice::{JobId, SliceRunner};
+
+        // Fork first: if the fork is refused there is nothing to undo, and the
+        // caller can still fall back to the freeze/answer/resume path.
+        let mut aside = Ds4HostSession::from_session(self.fork()?);
+
+        // Lend our own live session to the rotation. It has to be owned by a
+        // `Ds4HostSession` to be sliceable, so it moves out and back; the
+        // placeholder is never generated on.
+        let placeholder = Self::from_model(Arc::clone(&self.model));
+        let mut main = Ds4HostSession::from_session(std::mem::replace(self, placeholder));
+
+        // The runner polls an `AtomicBool` per job; bridge the caller's
+        // closure onto one shared flag, since an interrupt means "stop the
+        // whole thing" here.
+        let stop = Arc::new(AtomicBool::new(false));
+        let outcomes = {
+            let mut runner = SliceRunner::new(crate::host::DEFAULT_SLICE_TOKENS);
+            runner.add(
+                &mut main,
+                main_prompt.to_owned(),
+                opts.clone(),
+                Arc::clone(&stop),
+            );
+            // The aside gets the larger share: it is a short question with the
+            // user waiting on it, while the main task is background progress.
+            runner.add_weighted(
+                &mut aside,
+                aside_prompt.to_owned(),
+                opts.clone(),
+                Arc::clone(&stop),
+                crate::slice::ASIDE_SLICE_WEIGHT,
+            );
+            runner.run(&mut |id, ev| {
+                if interrupt() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                let which = if id == JobId(0) {
+                    AsideStream::Main
+                } else {
+                    AsideStream::Aside
+                };
+                on_event(which, ev);
+            })
+        };
+
+        // Take the live session back before surfacing any error, so a failed
+        // aside never strands the main task in the placeholder.
+        *self = main.into_session();
+
+        let mut it = outcomes.into_iter();
+        let main_stats = it.next().expect("job 0 was added").result?;
+        let aside_stats = it.next().expect("job 1 was added").result?;
+        Ok((main_stats, aside_stats))
+    }
+
+    fn supports_multiplexing(&self) -> bool {
         true
     }
 
@@ -1160,6 +1270,24 @@ pub struct Ds4HostSession {
 }
 
 impl Ds4HostSession {
+    /// Wraps an owned session so it can be driven in resumable K-token slices.
+    #[must_use]
+    pub fn from_session(inner: Ds4Session) -> Self {
+        Self {
+            inner,
+            pending: None,
+            active: None,
+        }
+    }
+
+    /// Unwraps the session, discarding any slicing state. Used to hand a live
+    /// session back to its owner after it has been lent to a
+    /// [`SliceRunner`](crate::slice::SliceRunner).
+    #[must_use]
+    pub fn into_session(self) -> Ds4Session {
+        self.inner
+    }
+
     /// Non-preemptible suffix prefill (design §5, §11.8). Builds the prompt,
     /// syncs the session, and returns the initial [`GenState`], or `Err(stats)`
     /// if interrupted during prefill.
@@ -1259,7 +1387,6 @@ impl Ds4HostSession {
         // An incomplete trailing sequence at end of stream decodes lossily;
         // mid-stream characters were already reassembled by the carry.
         reply_text.push_str(&st.utf8.flush());
-        reply_text.truncate(reply_text.trim_end().len());
         self.inner
             .record_reply(reply_text, &st.reply_tokens, st.opts.think_mode);
         let secs = st.start.elapsed().as_secs_f64();
@@ -1625,6 +1752,44 @@ mod tests {
         assert_eq!(strip_legacy(&legacy), kv);
         // A payload with no legacy magic is already raw KV: pass-through.
         assert_eq!(strip_legacy(kv), kv);
+    }
+
+    /// A resumed pass generates twice into one assistant message, and the
+    /// rendered transcript holds it as one section — so the transcript must
+    /// hold one span, or reconciliation diverges there and the next prompt
+    /// stops extending the live KV (`docs/DOUBLE-BTW.md` §3).
+    ///
+    /// Exercises the span bookkeeping directly, without a model: what matters
+    /// is that a second reply extends rather than appends, and that the merged
+    /// key is what `parse_sections` will produce from the merged message.
+    #[test]
+    fn a_resumed_reply_extends_one_assistant_span() {
+        use crate::ds4tokens::{SectionKey, SpanRole, TokenTranscript};
+
+        // The suspended pass records its partial, raw (trailing newline and
+        // all), then the resumed pass records the continuation.
+        let mut t = TokenTranscript::new();
+        t.push_span(SpanRole::User, 0, "count to three".into(), &[1, 2]);
+        t.push_span(SpanRole::Assistant, 0, "one\ntwo\n".into(), &[3, 4]);
+        assert!(t.last_is_assistant(), "the partial is the last span");
+        t.extend_last_span("three\n", &[5, 6]);
+
+        assert_eq!(t.spans().len(), 2, "one reply is one span");
+
+        // What the UI renders next turn: the two halves spliced into one
+        // message, whose section key `parse_sections` trims at the end.
+        let rendered = "[user]\ncount to three\n[assistant]\none\ntwo\nthree\n";
+        let sections: Vec<SectionKey> = parse_sections(rendered)
+            .into_iter()
+            .filter_map(|(role, text)| {
+                SpanRole::from_tag(role).map(|role| SectionKey { role, text })
+            })
+            .collect();
+        assert_eq!(
+            t.common_prefix(&sections),
+            2,
+            "the merged span matches the merged section, so nothing is stale"
+        );
     }
 
     #[test]
@@ -2506,6 +2671,295 @@ mod tests {
             aside_remaining < cold,
             "the aside must continue the forked KV, not re-prefill the whole \
              conversation (aside={aside_remaining} cold={cold})"
+        );
+    }
+
+    /// `/btw` without freezing: the main task keeps producing tokens *while*
+    /// the aside is answered on a fork, and neither leaks into the other.
+    ///
+    /// The freeze/answer/resume path emits the main task's tokens strictly
+    /// before or after the aside's; this one must interleave them.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn multiplexed_aside_keeps_the_main_task_moving() {
+        use crate::engine::{AsideStream, Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 81,
+            n_predict: 40,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, base, &opts);
+        let shared = format!("{base}[assistant]\n{}\n", reply.trim());
+        let pos_before = engine.ctx_tokens();
+
+        let mut main_text = String::new();
+        let mut aside_text = String::new();
+        let mut order: Vec<AsideStream> = Vec::new();
+        let (main_stats, aside_stats) = engine
+            .generate_multiplexed(
+                &format!("{shared}[user]\nCount slowly from one to twenty.\n"),
+                &format!("{shared}[user]\nWhat is the capital of France?\n"),
+                &opts,
+                &|| false,
+                &mut |which, ev| {
+                    if let EngineEvent::Text(t) = ev {
+                        if order.last() != Some(&which) {
+                            order.push(which);
+                        }
+                        match which {
+                            AsideStream::Main => main_text.push_str(&t),
+                            AsideStream::Aside => aside_text.push_str(&t),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        assert!(main_stats.generated > 0, "the main task generated");
+        assert!(aside_stats.generated > 0, "the aside generated");
+        assert!(!main_text.trim().is_empty() && !aside_text.trim().is_empty());
+
+        // The whole point: the streams hand off to each other repeatedly. A
+        // freeze/resume would produce at most two runs.
+        eprintln!("stream hand-offs: {}", order.len());
+        assert!(
+            order.len() > 2,
+            "the aside froze the main task instead of interleaving with it \
+             (only {} hand-offs)",
+            order.len()
+        );
+
+        // The aside ran on a fork, so it never entered the main transcript.
+        assert!(
+            !main_text.to_lowercase().contains("paris"),
+            "the aside leaked into the main stream: {main_text}"
+        );
+        // And the live session advanced past where it started, i.e. the main
+        // continuation really ran on it rather than on a copy.
+        assert!(
+            engine.ctx_tokens() > pos_before,
+            "the main task's own KV advanced"
+        );
+    }
+
+    /// The fan-out this whole line of work is for: one live session forked
+    /// several ways, all generating *together* on one thread via
+    /// [`SliceRunner`](crate::slice::SliceRunner), each continuing the shared
+    /// conversation without re-prefilling it.
+    ///
+    /// One Metal queue means this is time-slicing, so it does not finish sooner
+    /// than running them in series — what it proves is that the streams
+    /// genuinely interleave and stay separate.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forks_interleave_through_the_slice_runner() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use crate::slice::{JobId, SliceRunner};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 71,
+            n_predict: 24,
+            ..GenerationOptions::default()
+        };
+
+        // A shared conversation for every fork to continue from.
+        let base = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, base, &opts);
+        let shared = format!("{base}[assistant]\n{}\n", reply.trim());
+
+        let questions = [
+            "What is the capital of France?",
+            "What is the capital of Japan?",
+            "What is the capital of Peru?",
+        ];
+        // The runner borrows, so the forks are owned here for its lifetime.
+        let mut forks: Vec<Box<dyn crate::host::HostSession>> = questions
+            .iter()
+            .map(|_| engine.fork_sliceable().expect("a live session forks"))
+            .collect();
+        let mut runner = SliceRunner::new(4);
+        for (fork, q) in forks.iter_mut().zip(questions) {
+            runner.add(
+                fork.as_mut(),
+                format!("{shared}[user]\n{q}\n"),
+                opts.clone(),
+                Arc::new(AtomicBool::new(false)),
+            );
+        }
+
+        let mut text: HashMap<JobId, String> = HashMap::new();
+        let mut order: Vec<JobId> = Vec::new();
+        let mut prefill: HashMap<JobId, i32> = HashMap::new();
+        let outcomes = runner.run(&mut |id, ev| match ev {
+            EngineEvent::Text(t) => {
+                if order.last() != Some(&id) {
+                    order.push(id);
+                }
+                text.entry(id).or_default().push_str(&t);
+            }
+            EngineEvent::Prefill(p) => {
+                let e = prefill.entry(id).or_default();
+                *e = (*e).max(p.total);
+            }
+            EngineEvent::Notice(_) => {}
+        });
+
+        assert_eq!(outcomes.len(), 3);
+        for o in &outcomes {
+            assert!(
+                o.result.as_ref().unwrap().generated > 0,
+                "job {:?} generated nothing",
+                o.id
+            );
+            assert!(
+                !text[&o.id].trim().is_empty(),
+                "job {:?} produced no text",
+                o.id
+            );
+            // Each fork continues the shared conversation, so it pays for its
+            // own question and not for the transcript.
+            eprintln!("job {:?}: prefill={} ", o.id, prefill[&o.id]);
+        }
+
+        // Interleaving: the streams hand off to one another repeatedly rather
+        // than each running to completion in turn (which would be 3 runs).
+        eprintln!("hand-offs: {}", order.len());
+        assert!(
+            order.len() > questions.len(),
+            "the forks ran serially, not interleaved (only {} hand-offs)",
+            order.len()
+        );
+
+        // And they stayed separate: no fork answered another's question.
+        let paris = text
+            .values()
+            .filter(|t| t.to_lowercase().contains("paris"))
+            .count();
+        assert!(
+            paris <= 1,
+            "the forks contaminated each other: {paris} mention Paris"
+        );
+    }
+
+    /// The headline for `docs/DOUBLE-BTW.md`: a *second* in-pass aside must
+    /// still reuse the prefix. The first one worked all along; the second one
+    /// re-prefilled the whole conversation, because the resumed pass appended a
+    /// second assistant span while the UI renders one merged section.
+    ///
+    /// Drives the real shape twice over: freeze, aside, resume, freeze again,
+    /// aside again.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn a_second_aside_still_reuses_the_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+        use std::fmt::Write as _;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 91,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nCount slowly from one to forty.\n";
+        // Text the main task has produced so far, spliced into every prompt the
+        // way `run_turn` splices it.
+        let mut produced = String::new();
+        let mut asides = Vec::new();
+
+        for round in 0..2 {
+            // Freeze a pass partway, as a preempting `/btw` does.
+            let seen = Cell::new(0);
+            let mut prompt = base.to_owned();
+            if !produced.is_empty() {
+                let _ = write!(prompt, "[assistant]\n{produced}");
+            }
+            engine
+                .generate(
+                    crate::engine::Prompt::Flat(&prompt),
+                    &opts,
+                    &|| seen.get() > 6,
+                    &|| false,
+                    &mut |e| {
+                        if let EngineEvent::Text(t) = e {
+                            seen.set(seen.get() + 1);
+                            produced.push_str(&t);
+                        }
+                    },
+                )
+                .unwrap();
+            assert!(!produced.is_empty(), "round {round} produced a partial");
+
+            // The aside, framed over the paused reply.
+            let aside_prompt =
+                format!("{base}[assistant]\n{produced}\n[user]\nWhat is the capital of France?\n");
+            let mut remaining = 0;
+            engine
+                .generate_aside_forked(&aside_prompt, &opts, &|| false, &mut |e| {
+                    if let EngineEvent::Prefill(p) = e {
+                        remaining = remaining.max(p.total);
+                    }
+                })
+                .unwrap();
+            asides.push(remaining);
+        }
+
+        eprintln!("aside prefill by round: {asides:?}");
+
+        // The structural invariant, and the one that actually discriminates:
+        // two generations into one assistant message are one span, because the
+        // rendered transcript holds them as one section. Appending instead is
+        // what makes the next reconciliation diverge.
+        let assistant_spans = engine
+            .transcript_spans()
+            .iter()
+            .filter(|s| s.role == crate::ds4tokens::SpanRole::Assistant)
+            .count();
+        assert_eq!(
+            assistant_spans, 1,
+            "two resumed generations must be one assistant span, not {assistant_spans}"
+        );
+
+        // And the cost follows from it: the second aside prefills its question,
+        // not the conversation. Held tight deliberately — with the fix both
+        // rounds cost the same, and without it the second grew threefold even
+        // on this short transcript.
+        assert!(
+            asides[1] <= asides[0] + 4,
+            "the second aside re-prefilled the conversation instead of reusing \
+             it (first={}, second={})",
+            asides[0],
+            asides[1]
         );
     }
 

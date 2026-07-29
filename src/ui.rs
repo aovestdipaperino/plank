@@ -934,6 +934,14 @@ struct Agent<'a> {
     /// Whether the most recent turn ended by user interrupt, so the turn-end
     /// notification says "interrupted" instead of "finished".
     last_turn_interrupted: bool,
+    /// A framed `/btw` prompt waiting to be answered *alongside* the next main
+    /// pass rather than in place of it (`docs/SESSION-CLONE-DESIGN.md` §6.2).
+    ///
+    /// Set when a `/btw` preempts a pass and the engine can multiplex; the next
+    /// `run_pass` takes it and runs both streams interleaved. `None` on every
+    /// other path, which is what keeps the ordinary single-stream turn — and
+    /// every engine that cannot fork — completely unchanged.
+    pending_aside: Option<String>,
     /// Context content collected at session start (git, AGENTS.md, date).
     context_content: ContextContent,
     /// Skills loaded from ~/.plank/skills overlaid by ./.plank/skills.
@@ -2056,6 +2064,50 @@ impl Agent<'_> {
         }
         println!("{}", self.debug_line("context compacted"));
         Ok(Compacted::Done)
+    }
+
+    /// Takes the pending `/btw` question and frames it for a *multiplexed*
+    /// answer, or `None` when the aside should freeze the main task instead.
+    ///
+    /// **One aside at a time, and no queue.** A multiplexed aside occupies the
+    /// one side panel and costs one fork's worth of KV for as long as it runs,
+    /// so a second concurrent one has nowhere to render and no reason to exist.
+    /// Extra questions are therefore *dropped with a notice* rather than
+    /// queued: with the aside answering beside the main task instead of
+    /// freezing it, a queue would only hold questions back behind an answer the
+    /// user can already read.
+    ///
+    /// `None` also covers the engine being unable to fork or multiplex
+    /// (`EchoEngine`, remote engines), which falls back to the freeze path.
+    ///
+    /// The frozen partial is spliced in for the same reason the freeze path
+    /// splices it: it is live in the KV, and a prompt that omits it re-prefills
+    /// the whole conversation.
+    fn multiplexable_aside(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+        frozen_partial: &str,
+    ) -> Option<String> {
+        if !self.engine.supports_multiplexing() || self.pending_aside.is_some() {
+            return None;
+        }
+        let question = shared.pop_btw()?;
+        let dropped = shared.clear_btw();
+        if dropped > 0 {
+            let _ = tx.send(UiEvent::Dim(format!(
+                "[btw — answering one at a time; dropped {dropped} more]"
+            )));
+        }
+        let mut prompt = render_transcript(&self.session, &self.system);
+        {
+            use std::fmt::Write as _;
+            if !frozen_partial.trim().is_empty() {
+                let _ = write!(prompt, "[assistant]\n{}\n", frozen_partial.trim_end());
+            }
+            let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
+        }
+        Some(prompt)
     }
 
     /// Runs a tool-free aside, picking the best tier the engine offers.
@@ -5170,16 +5222,31 @@ impl Agent<'_> {
                 };
                 let out = self.worker_generate(tx, shared, &prompt, turn_start, true)?;
                 if out.preempted && suspend_enabled {
-                    // Freeze: keep the partial on screen, answer the queued
-                    // aside(s) via `generate_aside` (which snapshots/restores
-                    // the main KV), then resume the same pass.
                     let _ = tx.send(UiEvent::EndLine);
                     resumed_prefix.push_str(&out.assistant_text);
-                    let _ = tx.send(UiEvent::Dim(worker::BTW_SUSPEND_MARKER.to_owned()));
                     // The aside is asked *over* the paused reply, which is what
                     // keeps its prompt an extension of the live KV.
-                    self.drain_aside(tx, shared, &resumed_prefix);
-                    let _ = tx.send(UiEvent::Dim(worker::BTW_RESUME_MARKER.to_owned()));
+                    if let Some(framed) = self.multiplexable_aside(tx, shared, &resumed_prefix) {
+                        // Nothing pauses: the next pass carries this aside
+                        // alongside the main continuation, so the suspend and
+                        // resume markers would be lying about a freeze that
+                        // never happens.
+                        //
+                        // Open the panel and immediately leave its routing
+                        // mode. The mode would swallow the main task's events
+                        // too — the two streams interleave, so the aside's
+                        // events address the panel individually instead
+                        // (`UiEvent::Btw`).
+                        let _ = tx.send(UiEvent::BtwBegin);
+                        let _ = tx.send(UiEvent::BtwEnd);
+                        self.pending_aside = Some(framed);
+                    } else {
+                        // Freeze: keep the partial on screen, answer the queued
+                        // aside(s) on the paused session, then resume the pass.
+                        let _ = tx.send(UiEvent::Dim(worker::BTW_SUSPEND_MARKER.to_owned()));
+                        self.drain_aside(tx, shared, &resumed_prefix);
+                        let _ = tx.send(UiEvent::Dim(worker::BTW_RESUME_MARKER.to_owned()));
+                    }
                     continue;
                 }
                 break out;
@@ -5543,6 +5610,47 @@ impl Agent<'_> {
             // snapshot/restore — and forces greedy off internally, so no
             // greedy sampler is passed.
             self.generate_aside_best(prompt, &self.cfg.generation, &interrupt, &mut on_event)
+        } else if let Some(aside_prompt) = self.pending_aside.take() {
+            // A `/btw` arrived during the previous pass. Rather than freezing
+            // the main task for the whole answer, run both: this continuation
+            // on the live session and the aside on a fork, interleaved. The
+            // main stream keeps its ordinary renderer — only the aside's events
+            // are routed away, to the side panel.
+            //
+            // The aside gets a renderer of its own, so its thinking is split
+            // from its answer the way any other generation's is. Tool calls are
+            // denied for an aside, so it needs none of the dispatch machinery.
+            let mut aside_stream = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
+            aside_stream.set_show_thinking(crate::settings::active().ui.show_thinking);
+            if !matches!(
+                self.cfg.generation.think_mode,
+                crate::engine::ThinkMode::Off
+            ) {
+                aside_stream.begin_in_think();
+            }
+            let result = self
+                .engine
+                .generate_multiplexed(
+                    prompt,
+                    &aside_prompt,
+                    &self.cfg.generation,
+                    &interrupt,
+                    &mut |which, ev| match which {
+                        crate::engine::AsideStream::Main => on_event(ev),
+                        crate::engine::AsideStream::Aside => {
+                            if let EngineEvent::Text(t) = ev {
+                                aside_stream.push(&t);
+                            }
+                        }
+                    },
+                )
+                .map(|(main, _aside)| main);
+            // Flush the renderer, then close the panel's line: without the
+            // `EndLine` its last, unterminated line is never committed to the
+            // log, so the tail of the answer is silently lost.
+            aside_stream.finish();
+            let _ = tx.send(UiEvent::Btw(Box::new(UiEvent::EndLine)));
+            result
         } else {
             self.engine.generate(
                 engine_prompt,
@@ -6560,6 +6668,13 @@ fn busy_ui_loop(
                 UiEvent::SubStart(label) => sub.on_sub_start(label),
                 UiEvent::SubEnd => sub.on_sub_end(),
                 UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                // Addressed to the panel per event, so it lands there even
+                // while the main task streams into the main log beside it.
+                UiEvent::Btw(inner) => {
+                    if let Some((btw_log, _)) = btw.as_mut() {
+                        worker::apply(btw_log, *inner);
+                    }
+                }
                 // Route to the panel only while an answer is streaming; once
                 // it finishes the main task's output goes to the main log even
                 // though the (frozen) panel is still visible.
@@ -6645,6 +6760,13 @@ fn busy_ui_loop(
                     UiEvent::SubStart(label) => sub.on_sub_start(label),
                     UiEvent::SubEnd => sub.on_sub_end(),
                     UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                    // Addressed to the panel per event, so a multiplexed aside
+                    // lands there while the main task streams into the log.
+                    UiEvent::Btw(inner) => {
+                        if let Some((btw_log, _)) = btw.as_mut() {
+                            worker::apply(btw_log, *inner);
+                        }
+                    }
                     ev => {
                         if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                             worker::apply(btw_log, ev);
@@ -6765,7 +6887,11 @@ fn busy_ui_loop(
                                 log.push_dim("[/btw — answers next in the panel]");
                             } else {
                                 shared.preempt.store(true, Ordering::Relaxed);
-                                log.push_dim("[/btw — pausing the task to answer now]");
+                                // Whether the main task actually pauses is the
+                                // worker's call — it multiplexes when the engine
+                                // can fork, and emits BTW_SUSPEND_MARKER only
+                                // when it really does freeze. Stay neutral here.
+                                log.push_dim("[/btw — answering now]");
                             }
                             view.follow = true;
                             sub.view.follow = true;
@@ -6982,6 +7108,7 @@ fn new_agent(
         cfg,
         session,
         store,
+        pending_aside: None,
         tool_ctx,
         system,
         reminder: SystemPromptReminder::new(),
@@ -7817,8 +7944,11 @@ mod tests {
         /// instead of falling back to the boundary queue.
         aside_support: bool,
         /// When true, `generate_aside_forked` is implemented too, so the
-        /// `--btw-fork` tier is available above the destructive one.
+        /// fork tier is available above the destructive one.
         fork_aside_support: bool,
+        /// When true, the engine reports it can run a main pass and an aside
+        /// interleaved, so the `/btw` path multiplexes instead of freezing.
+        multiplex_support: bool,
         /// Records which aside tier each call took ("forked" / "destructive"),
         /// so tier-selection tests can assert on the choice rather than on the
         /// reply text, which is identical either way.
@@ -7913,6 +8043,9 @@ mod tests {
         fn supports_forked_aside(&self) -> bool {
             self.fork_aside_support
         }
+        fn supports_multiplexing(&self) -> bool {
+            self.multiplex_support
+        }
         fn get_kv(&mut self) -> Option<crate::kvcache::KVCache> {
             let events = self.kv_events.as_ref()?;
             self.kv_captures += 1;
@@ -7945,6 +8078,7 @@ mod tests {
             cfg,
             session: Session::new(),
             store: SessionStore::open(dir).unwrap(),
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -8543,6 +8677,67 @@ mod tests {
         );
         assert!(!shared.preempt.load(Ordering::Relaxed));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A multiplexed aside is one-at-a-time and unqueued: it takes the next
+    /// question, drops any others with a notice, and refuses to start a second
+    /// while one is still in flight.
+    #[test]
+    fn multiplexed_aside_is_one_at_a_time_and_unqueued() {
+        let dir = scratch_dir("btw-mux-one");
+        let engine = ScriptedEngine {
+            replies: vec!["answered\n".to_string()],
+            aside_support: true,
+            fork_aside_support: true,
+            multiplex_support: true,
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let shared = TurnShared::default();
+        shared.push_btw("first".to_owned());
+        shared.push_btw("second".to_owned());
+        shared.push_btw("third".to_owned());
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        let framed = agent
+            .multiplexable_aside(&tx, &shared, "partial reply")
+            .expect("a fork-capable engine multiplexes");
+        assert!(framed.contains("first"), "it takes the next question");
+        assert!(
+            !framed.contains("second") && !framed.contains("third"),
+            "the others are not merged into one prompt"
+        );
+        assert!(
+            framed.contains("partial reply"),
+            "the frozen partial is spliced in so the prompt extends the live KV"
+        );
+
+        // No queue: the extras are gone, and the user is told.
+        assert_eq!(shared.pop_btw(), None, "nothing is left queued");
+        drop(tx);
+        let notices: Vec<String> = rx
+            .iter()
+            .filter_map(|ev| match ev {
+                UiEvent::Dim(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|t| t.contains("dropped 2")),
+            "the dropped questions are reported: {notices:?}"
+        );
+
+        // One at a time: with an aside already pending, a new question does not
+        // start a second one — it falls back to the freeze path.
+        agent.pending_aside = Some("in flight".to_owned());
+        let (tx2, _rx2) = std::sync::mpsc::channel();
+        shared.push_btw("fourth".to_owned());
+        assert!(
+            agent.multiplexable_aside(&tx2, &shared, "").is_none(),
+            "a second concurrent aside is refused while one is in flight"
+        );
     }
 
     /// The three aside tiers degrade cleanly into one another
@@ -9419,6 +9614,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: "system prompt".to_string(),
             reminder: SystemPromptReminder::new(),
@@ -9470,6 +9666,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: String::new(),
             reminder: SystemPromptReminder::new(),
@@ -9586,6 +9783,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -9756,6 +9954,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -9831,6 +10030,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -9893,6 +10093,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -9978,6 +10179,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -10128,6 +10330,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -10207,6 +10410,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -10345,6 +10549,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
@@ -10405,6 +10610,7 @@ mod tests {
             cfg: &cfg,
             session: Session::new(),
             store,
+            pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
