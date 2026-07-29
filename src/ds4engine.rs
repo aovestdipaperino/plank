@@ -2101,6 +2101,303 @@ mod tests {
         );
     }
 
+    // Session cloning on real Metal (docs/SESSION-CLONE-DESIGN.md §5.2). These
+    // are the tests that actually decide whether cloning is sound: everything
+    // below `EngineHost::attach_clone` is a no-op on `EchoEngine`, so the
+    // host-level tests in `host.rs` prove only the plumbing.
+    //
+    // None of this runs in CI. It compiles there behind `cfg(ds4_engine)` and
+    // skips without `PLANK_TEST_MODEL`, so a green CI run is not evidence.
+    // Run locally on macOS with a GGUF before trusting the primitive.
+
+    /// P1 + P2 — capture is non-destructive and the clone is faithful. The
+    /// source keeps generating normally after being cloned, and the clone
+    /// starts from the source's cursor rather than an empty one.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_carries_source_transcript_and_spares_source() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(2) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 3,
+            n_predict: 12,
+            ..GenerationOptions::default()
+        };
+        let mut reply = String::new();
+        a.generate(
+            "[user]\nName a fruit.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!reply.is_empty(), "the source generates before the clone");
+
+        let b = host.attach_clone(&a).unwrap();
+
+        // Read both cursors from the *same* status snapshot: the scheduler
+        // publishes after replying, so comparing across two reads races it.
+        let st = poll_host(&host, |s| (s.live_sessions == 2).then(|| s.clone()))
+            .expect("the clone attaches alongside A");
+        let (source, cloned) = (
+            st.sessions.first().expect("A has the older id"),
+            st.sessions.last().expect("the clone has the newer id"),
+        );
+        assert!(source.ctx_tokens > 0, "A holds a real cursor to clone from");
+        assert_eq!(
+            cloned.ctx_tokens, source.ctx_tokens,
+            "the clone holds A's cursor, not a fresh one"
+        );
+        assert_eq!(
+            cloned.ctx_size, source.ctx_size,
+            "the clone inherits A's context window"
+        );
+
+        // P1: A is undamaged by the capture and keeps generating.
+        let mut after = String::new();
+        a.generate(
+            &format!("[user]\nName a fruit.\n[assistant]\n{reply}\n[user]\nName a planet.\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    after.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!after.is_empty(), "A survives being cloned");
+        drop(b);
+    }
+
+    /// P3 — the headline. A clone must continue from the source's KV, not
+    /// re-prefill it.
+    ///
+    /// The measurement is `PrefillProgress::total`: the tokens *this pass* has
+    /// to evaluate, cached prefix excluded. Reuse therefore shows up as a small
+    /// total, and the proof is a direct comparison — the clone and a cold
+    /// sibling are given the identical continuation, and the clone must
+    /// evaluate far fewer tokens. (`done` cannot serve here: it is rebased to
+    /// the cached prefix and starts at 0 by construction.)
+    ///
+    /// This test also records what the capture cost. Correctness is not enough:
+    /// §8 flags capture latency as the risk that decides whether cloning is
+    /// usable interactively, and `HostStatus::last_capture` is where that lands.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_avoids_cold_reprefill() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(3) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 5,
+            n_predict: 12,
+            ..GenerationOptions::default()
+        };
+
+        let mut reply = String::new();
+        a.generate(
+            "[user]\nName a fruit.\n",
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+        assert!(!reply.is_empty(), "the source generates before the clone");
+        let continuation =
+            format!("[user]\nName a fruit.\n[assistant]\n{reply}\n[user]\nName a planet.\n");
+
+        let b = host.attach_clone(&a).unwrap();
+        // `attach_clone` replies from the GPU thread before that thread
+        // republishes status, so poll rather than racing it.
+        let capture =
+            poll_host(&host, |s| s.last_capture).expect("cloning records what the capture cost");
+        eprintln!(
+            "clone capture: {} bytes in {:?}",
+            capture.bytes, capture.elapsed
+        );
+
+        let (stats, cloned_total) = prefill_total(&b, &continuation, &opts);
+        assert!(stats.generated > 0, "the clone generates normally");
+
+        // Control: a fresh session over the same warm system prompt, given the
+        // identical transcript. It has to evaluate the whole conversation.
+        let cold = host.attach().unwrap();
+        let (_, cold_total) = prefill_total(&cold, &continuation, &opts);
+
+        eprintln!("prefill totals: clone={cloned_total} cold={cold_total}");
+        assert!(
+            cold_total > 0,
+            "the control must prefill something for the comparison to mean anything"
+        );
+        assert!(
+            cloned_total < cold_total,
+            "the clone continued A's context instead of re-prefilling it \
+             (clone={cloned_total} < cold={cold_total})"
+        );
+    }
+
+    /// Runs one generation and reports its terminal stats plus the largest
+    /// prefill `total` seen — the tokens that pass had to evaluate.
+    #[cfg(ds4_engine)]
+    fn prefill_total(
+        session: &crate::host::SessionHandle,
+        transcript: &str,
+        opts: &crate::engine::GenerationOptions,
+    ) -> (crate::engine::GenerationStats, i32) {
+        use crate::engine::EngineEvent;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let mut total = 0;
+        let stats = session
+            .generate(
+                transcript,
+                opts,
+                Arc::new(AtomicBool::new(false)),
+                &mut |e| {
+                    if let EngineEvent::Prefill(p) = e {
+                        total = total.max(p.total);
+                    }
+                },
+            )
+            .unwrap();
+        (stats, total)
+    }
+
+    /// P4 — the two sessions diverge without contaminating each other. B is
+    /// asked something A never saw; A's own continuation must not mention it,
+    /// and both must keep producing output.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn clone_diverges_independently() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(host) = clone_test_host(2) else {
+            return;
+        };
+        let a = host.attach().unwrap();
+        let opts = GenerationOptions {
+            seed: 11,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+        let shared = "[user]\nName a fruit.\n";
+        let mut reply = String::new();
+        a.generate(shared, &opts, Arc::new(AtomicBool::new(false)), &mut |e| {
+            if let EngineEvent::Text(t) = e {
+                reply.push_str(&t);
+            }
+        })
+        .unwrap();
+
+        let b = host.attach_clone(&a).unwrap();
+        let prefix = format!("{shared}[assistant]\n{reply}\n");
+
+        let mut out_b = String::new();
+        b.generate(
+            &format!("{prefix}[user]\nWhat is the capital of France?\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    out_b.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+
+        let mut out_a = String::new();
+        a.generate(
+            &format!("{prefix}[user]\nName a planet.\n"),
+            &opts,
+            Arc::new(AtomicBool::new(false)),
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    out_a.push_str(&t);
+                }
+            },
+        )
+        .unwrap();
+
+        assert!(!out_a.is_empty() && !out_b.is_empty());
+        assert!(
+            !out_a.to_lowercase().contains("paris"),
+            "B's aside must not leak into A's continuation: {out_a}"
+        );
+    }
+
+    /// Polls host status until `pick` yields a value, or the budget runs out.
+    /// Host commands reply from the GPU thread *before* it republishes status,
+    /// so a status read right after `attach_clone` races the publish.
+    #[cfg(ds4_engine)]
+    fn poll_host<T>(
+        host: &crate::host::EngineHost,
+        pick: impl Fn(&crate::host::HostStatus) -> Option<T>,
+    ) -> Option<T> {
+        for _ in 0..500 {
+            if let Some(v) = pick(&host.status()) {
+                return Some(v);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        None
+    }
+
+    /// Opens a shared model and host for the clone tests, or `None` when no
+    /// test model is configured. Metal-only; see the module note above.
+    #[cfg(ds4_engine)]
+    fn clone_test_host(max_sessions: usize) -> Option<crate::host::EngineHost> {
+        use crate::ffi::Ds4Backend;
+        use crate::host::{EngineHost, HostConfig};
+
+        let model_path = std::env::var_os("PLANK_TEST_MODEL").or_else(|| {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            None
+        })?;
+        let tuning = crate::config::EngineTuning::default();
+        let model = super::Ds4Model::open_shared(
+            &model_path,
+            Ds4Backend::Metal,
+            4096,
+            0,
+            100,
+            &tuning,
+            "you are a helpful assistant",
+        )
+        .unwrap();
+        Some(EngineHost::new(
+            model,
+            HostConfig {
+                max_sessions,
+                slice_tokens: crate::host::DEFAULT_SLICE_TOKENS,
+                idle_reclaim: None,
+                ..HostConfig::default()
+            },
+        ))
+    }
+
     // #28 — idle-reclaim restore keeps context without a cold re-prefill. Via
     // the shared EngineHost: attach, generate (recording the system-prompt
     // reuse baseline), force idle reclamation (KV snapshotted to disk + dropped)
@@ -2149,25 +2446,20 @@ mod tests {
             ..GenerationOptions::default()
         };
 
-        // First turn: record the system-prompt reuse baseline + the reply.
+        // First turn: just the reply. The reuse measurement comes later, from
+        // `total` — see the cold control below.
         let mut reply1 = String::new();
-        let mut first1: Option<(i32, i32)> = None;
         s.generate(
             "[user]\nName a fruit.\n",
             &opts,
             Arc::new(AtomicBool::new(false)),
-            &mut |e| match e {
-                EngineEvent::Prefill(p) => {
-                    if first1.is_none() {
-                        first1 = Some((p.done, p.total));
-                    }
+            &mut |e| {
+                if let EngineEvent::Text(t) = e {
+                    reply1.push_str(&t);
                 }
-                EngineEvent::Text(t) => reply1.push_str(&t),
-                EngineEvent::Notice(_) => {}
             },
         )
         .unwrap();
-        let (sys_cached, _t1) = first1.expect("first turn primes a Prefill event");
         assert!(!reply1.is_empty(), "first turn must produce a reply");
 
         // Force reclamation to disk (short idle window; wait for the scheduler).
@@ -2184,28 +2476,23 @@ mod tests {
         // must reach past the system prompt into the prior turn + reply.
         let transcript2 =
             format!("[user]\nName a fruit.\n[assistant]\n{reply1}\n[user]\nName a planet.\n");
-        let mut first2: Option<(i32, i32)> = None;
-        let stats = s
-            .generate(
-                &transcript2,
-                &opts,
-                Arc::new(AtomicBool::new(false)),
-                &mut |e| {
-                    if let EngineEvent::Prefill(p) = e
-                        && first2.is_none()
-                    {
-                        first2 = Some((p.done, p.total));
-                    }
-                },
-            )
-            .unwrap();
-        let (cached2, _t2) = first2.expect("restored turn primes a Prefill event");
+        let (stats, restored_total) = prefill_total(&s, &transcript2, &opts);
         assert!(stats.generated > 0, "restored session generates normally");
+
+        // Control: a fresh session over the same warm system prompt, given the
+        // identical transcript, has to evaluate the whole conversation.
+        let cold = host.attach().unwrap();
+        let (_, cold_total) = prefill_total(&cold, &transcript2, &opts);
         assert!(
-            cached2 > sys_cached,
-            "restore kept context beyond the system prompt: no cold re-prefill \
-             (cached2={cached2} > sys_baseline={sys_cached})"
+            cold_total > 0,
+            "the control must prefill something for the comparison to mean anything"
         );
+        assert!(
+            restored_total < cold_total,
+            "restore kept context beyond the system prompt: no cold re-prefill \
+             (restored={restored_total} < cold={cold_total})"
+        );
+        drop(cold);
         assert!(
             host.status().sessions.iter().all(|x| !x.reclaimed),
             "session is resident again after restore"
