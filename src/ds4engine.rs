@@ -2448,6 +2448,67 @@ mod tests {
         );
     }
 
+    /// The aside must *reuse* the main task's KV, not just avoid damaging it.
+    /// `drain_btw_inner` frames the question onto the whole rendered
+    /// transcript, so the fork's prompt shares everything but the last few
+    /// tokens with the KV it was forked from: the aside should prefill the
+    /// question and nothing else.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_reuses_the_main_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::fmt::Write as _;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 41,
+            n_predict: 16,
+            ..GenerationOptions::default()
+        };
+
+        // Build a conversation of a few turns, so "reuse the prefix" and
+        // "re-prefill everything" are far apart.
+        let mut convo = String::new();
+        for q in ["Name a fruit.", "Name a color.", "Name a country."] {
+            let _ = write!(convo, "[user]\n{q}\n");
+            let (_, reply) = gen_capture_reply(&mut engine, &convo, &opts);
+            let _ = write!(convo, "[assistant]\n{}\n", reply.trim());
+        }
+
+        // Exactly what `drain_btw_inner` builds: the rendered transcript plus
+        // the framed question.
+        let aside_prompt = format!("{convo}[user]\nWhat is the capital of France?\n");
+
+        let mut aside_remaining = 0;
+        engine
+            .generate_aside_forked(&aside_prompt, &opts, &|| false, &mut |e| {
+                if let EngineEvent::Prefill(p) = e {
+                    aside_remaining = aside_remaining.max(p.total);
+                }
+            })
+            .unwrap();
+
+        // Control: the same prompt with no KV to reuse.
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &aside_prompt, &opts)
+        };
+        eprintln!("aside prefill: fork={aside_remaining} cold={cold}");
+        assert!(cold > 0, "the control must actually prefill the prompt");
+        assert!(
+            aside_remaining < cold,
+            "the aside must continue the forked KV, not re-prefill the whole \
+             conversation (aside={aside_remaining} cold={cold})"
+        );
+    }
+
     /// §6.4's strongest regression: a forked aside must leave the main session
     /// exactly as it found it — the direct analogue of the invariant
     /// `generate_aside` protects with `RestoreOnDrop`, but held structurally
