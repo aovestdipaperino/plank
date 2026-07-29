@@ -3,7 +3,7 @@
 
 //! Document ingestion: PDFs read as Markdown.
 //!
-//! Implements `docs/LIGHT-PARSE.md`. `read` on a `.pdf` converts the file to
+//! Implements `docs/LITEPARSE.md`. `read` on a `.pdf` converts the file to
 //! Markdown through [`liteparse`] (spatial text extraction over PDFium, with
 //! bundled Tesseract OCR filling in pages that have no text layer), caches the
 //! result under `~/.plank/doc-cache`, and then hands the *cache path* to the

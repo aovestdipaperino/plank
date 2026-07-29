@@ -395,7 +395,7 @@ fn insert_marker_spelling_note(out: &mut String) {
 
 /// The line telling the model that `read` already handles PDFs.
 ///
-/// `docs/LIGHT-PARSE.md` argued the prompt cost of document ingestion was zero
+/// `docs/LITEPARSE.md` argued the prompt cost of document ingestion was zero
 /// because "the model does not learn anything new — documents simply stop being
 /// unreadable". That turned out to be false in the one way that matters: a
 /// model that believes a `.pdf` is unreadable never calls `read` on one. It

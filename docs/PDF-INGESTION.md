@@ -7,7 +7,7 @@ Read this document for the *shape* of the feature — extend `read` rather than
 adding a tool, content-address the result, page through `more` — which is what
 was built and why. Do not read it for the extractor: the hand-written
 `lopdf`-plus-heuristics module it specifies was never written.
-`LIGHT-PARSE.md` replaced it with [liteparse](https://github.com/run-llama/liteparse)
+`LITEPARSE.md` replaced it with [liteparse](https://github.com/run-llama/liteparse)
 (spatial extraction over PDFium, bundled Tesseract OCR) before any of it
 landed, and that document is the authority on the conversion half.
 
@@ -62,7 +62,7 @@ PDF is an output format for pandoc, not an input one. It has no PDF reader.
 ## Architecture
 
 > The flow below is the planned one; the vision branch was never built.
-> `LIGHT-PARSE.md` carries the diagram of what actually runs.
+> `LITEPARSE.md` carries the diagram of what actually runs.
 
 ```mermaid
 flowchart TD
@@ -144,7 +144,7 @@ revisiting once there is real usage to look at.
 ## Vision fallback — not implemented
 
 > **There is no vision tier.** Bundled Tesseract handles ordinary scans inside
-> liteparse, which was the whole reason `LIGHT-PARSE.md` demoted this from
+> liteparse, which was the whole reason `LITEPARSE.md` demoted this from
 > second line to third. `VISION-MODEL.md` is still design, so a photographed
 > page, a handwritten annotation, or a figure that needs *describing* rather
 > than transcribing remains unreadable — reported as the no-readable-text

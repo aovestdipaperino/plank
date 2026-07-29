@@ -128,7 +128,7 @@ Beta channel on the 2.7 series.
   Paragraphs are hard-wrapped to 100 columns on the way in, because liteparse
   reflows each one onto a single line and line-based paging over a 5000-column
   line is not paging at all; tables, headings and fenced code pass through
-  untouched. Design and rationale in `docs/LIGHT-PARSE.md`.
+  untouched. Design and rationale in `docs/LITEPARSE.md`.
 
   `visit_page` routes documents through the same converter, recognised by URL
   extension or by a `%PDF-` magic in the fetched body, instead of returning
@@ -171,7 +171,7 @@ Beta channel on the 2.7 series.
   finished. `tui_loop` now also stamps after the key match, and remote-driven
   and `--prompt` startup turns stamp at their own call sites.
 - **The model would not use PDF support unless the prompt said it existed.**
-  `docs/LIGHT-PARSE.md` argued the prompt cost was zero because "the model does
+  `docs/LITEPARSE.md` argued the prompt cost was zero because "the model does
   not learn anything new — documents simply stop being unreadable". False in
   the one way that mattered: a model that believes a `.pdf` is unreadable never
   calls `read` on one. It searched for the file, found it, and shelled out to
