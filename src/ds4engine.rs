@@ -2509,6 +2509,93 @@ mod tests {
         );
     }
 
+    /// The suspend/resume shape `run_turn` actually drives: a pass is frozen
+    /// mid-generation (partial reply in the KV, *not* in the token transcript),
+    /// an aside is answered, then the pass resumes with the partial spliced
+    /// back onto the prompt. The resume must cost nothing — that is the whole
+    /// point of freezing rather than re-running.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forked_aside_does_not_cost_the_resume_its_cache() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 51,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nCount slowly from one to twenty.\n";
+
+        // Freeze a pass partway: interrupt after a few text events, exactly as
+        // a preempting `/btw` does. The partial stays in the KV; nothing is
+        // recorded to the transcript.
+        let seen = Cell::new(0);
+        let mut partial = String::new();
+        engine
+            .generate(
+                crate::engine::Prompt::Flat(base),
+                &opts,
+                &|| seen.get() > 6,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        seen.set(seen.get() + 1);
+                        partial.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!partial.is_empty(), "the frozen pass produced a partial");
+
+        // The aside runs while the pass is frozen.
+        let mut aside_text = String::new();
+        engine
+            .generate_aside_forked(
+                &format!("{base}[user]\nWhat is the capital of France?\n"),
+                &opts,
+                &|| false,
+                &mut |e| {
+                    if let EngineEvent::Text(t) = e {
+                        aside_text.push_str(&t);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!aside_text.is_empty(), "the aside answers");
+
+        // Resume: `run_turn` re-opens the assistant turn with the partial so
+        // the engine splices its exact tokens and continues.
+        let resume_prompt = format!("{base}[assistant]\n{partial}");
+        let remaining = gen_capture_prefill(&mut engine, &resume_prompt, &opts);
+        eprintln!(
+            "resume after aside: remaining={remaining} partial_chars={}",
+            partial.len()
+        );
+
+        // A cold session over the identical resume prompt is the calibration:
+        // it has to evaluate the whole thing.
+        let cold = {
+            let mut c = super::Ds4Session::from_model(engine.model_arc());
+            gen_capture_prefill(&mut c, &resume_prompt, &opts)
+        };
+        eprintln!("resume cold control: {cold}");
+        assert!(
+            remaining < cold,
+            "the aside cost the main pass its cache: resuming re-prefilled \
+             {remaining} tokens where a cold start pays {cold}"
+        );
+    }
+
     /// §6.4's strongest regression: a forked aside must leave the main session
     /// exactly as it found it — the direct analogue of the invariant
     /// `generate_aside` protects with `RestoreOnDrop`, but held structurally
