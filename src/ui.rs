@@ -5176,7 +5176,9 @@ impl Agent<'_> {
                     let _ = tx.send(UiEvent::EndLine);
                     resumed_prefix.push_str(&out.assistant_text);
                     let _ = tx.send(UiEvent::Dim(worker::BTW_SUSPEND_MARKER.to_owned()));
-                    self.drain_aside(tx, shared);
+                    // The aside is asked *over* the paused reply, which is what
+                    // keeps its prompt an extension of the live KV.
+                    self.drain_aside(tx, shared, &resumed_prefix);
                     let _ = tx.send(UiEvent::Dim(worker::BTW_RESUME_MARKER.to_owned()));
                     continue;
                 }
@@ -5288,19 +5290,33 @@ impl Agent<'_> {
     /// the answer is done. `BtwEnd` only stops routing to the panel; the UI
     /// keeps it on screen (frozen, readable) until the user presses Esc.
     fn drain_btw(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
-        self.drain_btw_inner(tx, shared, false);
+        self.drain_btw_inner(tx, shared, false, "");
     }
 
-    /// Suspend-mode drain: answers the queued `/btw` question(s) with
-    /// [`Engine::generate_aside`] so the frozen main-task KV is snapshotted and
-    /// restored around each answer (BTW-SUSPEND-DESIGN §4.3). Used only from
-    /// the in-pass suspend path, where the main pass is paused mid-reply and
-    /// the partial reply must survive the aside.
-    fn drain_aside(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared) {
-        self.drain_btw_inner(tx, shared, true);
+    /// Suspend-mode drain: answers the queued `/btw` question(s) on a session
+    /// that still holds the frozen main-task KV (BTW-SUSPEND-DESIGN §4.3).
+    /// Used only from the in-pass suspend path, where the main pass is paused
+    /// mid-reply and the partial reply must survive the aside.
+    ///
+    /// `frozen_partial` is the text the paused pass had already produced. It
+    /// must be spliced into the aside's prompt, exactly as the resume splices
+    /// it: those tokens are live in the KV, and `ds4_session_sync` reuses the
+    /// KV *only* for a prompt that extends its end (see
+    /// [`crate::engine::reusable_prefix`]). Leaving it out makes the prompt
+    /// diverge behind the live end, which silently re-prefills the entire
+    /// conversation — BTW-SUSPEND-DESIGN §4.3 step 2 assumed a cursor rollback
+    /// the engine cannot perform.
+    fn drain_aside(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared, frozen_partial: &str) {
+        self.drain_btw_inner(tx, shared, true, frozen_partial);
     }
 
-    fn drain_btw_inner(&mut self, tx: &Sender<UiEvent>, shared: &TurnShared, aside: bool) {
+    fn drain_btw_inner(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+        aside: bool,
+        frozen_partial: &str,
+    ) {
         let Some(mut question) = shared.pop_btw() else {
             return;
         };
@@ -5315,6 +5331,11 @@ impl Agent<'_> {
             let mut prompt = render_transcript(&self.session, &self.system);
             {
                 use std::fmt::Write as _;
+                // Close the paused assistant turn with what it had produced, so
+                // the prompt extends the live KV instead of diverging behind it.
+                if !frozen_partial.trim().is_empty() {
+                    let _ = write!(prompt, "[assistant]\n{}\n", frozen_partial.trim_end());
+                }
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
             match self.worker_generate_kind(tx, shared, &prompt, Instant::now(), false, aside) {
@@ -8629,7 +8650,7 @@ mod tests {
         let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("main"));
         let (tx, _rx) = std::sync::mpsc::channel();
-        agent.drain_aside(&tx, &shared);
+        agent.drain_aside(&tx, &shared, "");
         drop(tx);
 
         let recorded = prompts.lock().unwrap();

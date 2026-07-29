@@ -2509,6 +2509,107 @@ mod tests {
         );
     }
 
+    /// An aside answered while a pass is frozen must not rebuild the whole
+    /// prompt. The frozen partial reply is live in the KV *and* recorded in the
+    /// token transcript, but the aside's prompt does not contain it, so the
+    /// aside's prompt is a strict *prefix* of the live KV — and
+    /// `ds4_session_sync` cannot rewrite behind the live end, so a naive run
+    /// rebuilds from zero (see `rollback_checkpoint_zero_reprefill`).
+    ///
+    /// Both tiers are measured here, because the fix has to hold for both.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn aside_during_a_frozen_pass_reuses_the_prefix() {
+        use crate::engine::{Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use std::cell::Cell;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let opts = GenerationOptions {
+            seed: 61,
+            n_predict: 64,
+            ..GenerationOptions::default()
+        };
+        let base = "[user]\nCount slowly from one to thirty.\n";
+
+        // One model, two fresh sessions over it — opening a second Ds4Model in
+        // the same process is not supported.
+        let shared = std::sync::Arc::new(
+            super::Ds4Model::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap(),
+        );
+
+        // `forked` selects the tier. `freeze` decides whether the preceding
+        // pass is interrupted (leaving a partial reply live in the KV) or runs
+        // to completion — the only difference between the two, so any gap in
+        // prefill cost is attributable to the freeze.
+        let run = |forked: bool, freeze: bool| -> i32 {
+            let mut engine = super::Ds4Session::from_model(std::sync::Arc::clone(&shared));
+            let seen = Cell::new(0);
+            let mut partial = String::new();
+            engine
+                .generate(
+                    crate::engine::Prompt::Flat(base),
+                    &opts,
+                    &|| freeze && seen.get() > 6,
+                    &|| false,
+                    &mut |e| {
+                        if let EngineEvent::Text(t) = e {
+                            seen.set(seen.get() + 1);
+                            partial.push_str(&t);
+                        }
+                    },
+                )
+                .unwrap();
+            assert!(!partial.is_empty(), "the pass produced a reply");
+
+            // `drain_btw_inner` frames the question onto the rendered
+            // transcript *plus* the paused pass's partial reply, so the prompt
+            // extends the live KV in both cases. Dropping that splice is the
+            // bug this test guards: the partial is live in the KV, and a prompt
+            // that omits it lands behind the live end and rebuilds from zero.
+            let aside_prompt = format!(
+                "{base}[assistant]\n{}\n[user]\nWhat is the capital of France?\n",
+                partial.trim()
+            );
+
+            let mut remaining = 0;
+            let sink = &mut |e: EngineEvent| {
+                if let EngineEvent::Prefill(p) = e {
+                    remaining = remaining.max(p.total);
+                }
+            };
+            if forked {
+                engine
+                    .generate_aside_forked(&aside_prompt, &opts, &|| false, sink)
+                    .unwrap();
+            } else {
+                engine
+                    .generate_aside(&aside_prompt, &opts, &|| false, sink)
+                    .unwrap();
+            }
+            remaining
+        };
+
+        for forked in [false, true] {
+            let tier = if forked { "forked" } else { "destructive" };
+            let clean = run(forked, false);
+            let frozen = run(forked, true);
+            eprintln!("{tier} aside: after-clean-pass={clean} after-frozen-pass={frozen}");
+            assert!(
+                frozen <= clean,
+                "{tier}: freezing the pass cost the aside its cache — it \
+                 prefilled {frozen} tokens where an unfrozen pass costs \
+                 {clean}. The partial reply is live in the KV but absent from \
+                 the aside's prompt, so the prompt no longer extends the live \
+                 end and ds4_session_sync rebuilds from zero."
+            );
+        }
+    }
+
     /// The suspend/resume shape `run_turn` actually drives: a pass is frozen
     /// mid-generation (partial reply in the KV, *not* in the token transcript),
     /// an aside is answered, then the pass resumes with the partial spliced

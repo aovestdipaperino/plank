@@ -109,14 +109,26 @@ fn generate_aside(
 
 1. **Snapshot.** `save_snapshot(session)` → owned `Ds4SessionSnapshot`. This
    captures the frozen main-task KV (transcript + partial reply + cursor).
-2. **Answer destructively on the same session.** Run the standard btw execution
-   model (BTW-DESIGN §4.2): `render_transcript + btw_user_message(question)` as
-   the prompt. `ds4_session_sync` rolls the session's cursor back to the common
-   prefix with the frozen state — which is the transcript (the partial reply
-   diverges), so only the framed question is prefilled — then the normal token
-   loop generates the answer with **tools denied** (drop `finished().calls`) and
-   greedy off. Stream its `EngineEvent::Text` to `on_event` so the aside renders
-   live.
+2. **Answer on a session holding the frozen KV.** Run the standard btw
+   execution model (BTW-DESIGN §4.2), but with the paused pass's partial reply
+   spliced in: `render_transcript + [assistant]\n<partial> + btw_user_message(question)`.
+   Then only the framed question is prefilled.
+
+   > **The splice is load-bearing.** An earlier version of this step claimed
+   > `ds4_session_sync` would "roll the cursor back to the common prefix with
+   > the frozen state" when the prompt omitted the partial. It does not:
+   > `engine::reusable_prefix` reuses the live KV **only** when the prompt
+   > *extends* its end (`prompt_len >= pos && starts_with(prompt, checkpoint)`),
+   > because rewriting behind the live end is not an in-place operation for the
+   > backend's SWA/compressed/indexer rows. A prompt that omits the live partial
+   > diverges behind the end and takes the reset branch, silently re-prefilling
+   > the *entire* conversation — measured at 13981 tokens rebuilt where 238
+   > would do. Splicing the partial keeps the prompt an extension, which is also
+   > exactly what the resume prompt in §4.3 does.
+
+   Then the normal token loop generates the answer with **tools denied** (drop
+   `finished().calls`) and greedy off. Stream its `EngineEvent::Text` to
+   `on_event` so the aside renders live.
 3. **Restore.** `load_snapshot(session, &snap)` returns the session to the exact
    frozen KV and cursor; `snapshot_free`. The main task's next
    `sample`/`eval` continues as if nothing happened — **zero re-prefill**,
