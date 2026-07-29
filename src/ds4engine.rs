@@ -538,6 +538,26 @@ impl Ds4Session {
         Ok(sibling)
     }
 
+    /// Forks this session into a *sliceable* one: a [`HostSession`] carrying
+    /// this session's KV and transcript, ready to hand to
+    /// [`SliceRunner`](crate::slice::SliceRunner).
+    ///
+    /// This is the bridge that lets a plain interactive `Ds4Session` fan out.
+    /// [`fork`](Self::fork) gives a sibling that generates all-or-nothing;
+    /// wrapping it in [`Ds4HostSession`] gives one that generates in resumable
+    /// K-token slices, which is what interleaving several of them requires.
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] if this session has no live KV to capture, or if
+    /// the sibling cannot be created or loaded.
+    pub fn fork_sliceable(&mut self) -> Result<Box<dyn HostSession>, EngineError> {
+        Ok(Box::new(Ds4HostSession {
+            inner: self.fork()?,
+            pending: None,
+            active: None,
+        }))
+    }
+
     /// Current absolute cursor position in the live KV, in tokens; 0 when no
     /// FFI session exists yet.
     #[must_use]
@@ -2506,6 +2526,112 @@ mod tests {
             aside_remaining < cold,
             "the aside must continue the forked KV, not re-prefill the whole \
              conversation (aside={aside_remaining} cold={cold})"
+        );
+    }
+
+    /// The fan-out this whole line of work is for: one live session forked
+    /// several ways, all generating *together* on one thread via
+    /// [`SliceRunner`](crate::slice::SliceRunner), each continuing the shared
+    /// conversation without re-prefilling it.
+    ///
+    /// One Metal queue means this is time-slicing, so it does not finish sooner
+    /// than running them in series — what it proves is that the streams
+    /// genuinely interleave and stay separate.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn forks_interleave_through_the_slice_runner() {
+        use crate::engine::{EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+        use crate::slice::{JobId, SliceRunner};
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 71,
+            n_predict: 24,
+            ..GenerationOptions::default()
+        };
+
+        // A shared conversation for every fork to continue from.
+        let base = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, base, &opts);
+        let shared = format!("{base}[assistant]\n{}\n", reply.trim());
+
+        let questions = [
+            "What is the capital of France?",
+            "What is the capital of Japan?",
+            "What is the capital of Peru?",
+        ];
+        let mut runner = SliceRunner::new(4);
+        for q in questions {
+            let fork = engine.fork_sliceable().expect("a live session forks");
+            runner.add(
+                fork,
+                format!("{shared}[user]\n{q}\n"),
+                opts.clone(),
+                Arc::new(AtomicBool::new(false)),
+            );
+        }
+
+        let mut text: HashMap<JobId, String> = HashMap::new();
+        let mut order: Vec<JobId> = Vec::new();
+        let mut prefill: HashMap<JobId, i32> = HashMap::new();
+        let outcomes = runner.run(&mut |id, ev| match ev {
+            EngineEvent::Text(t) => {
+                if order.last() != Some(&id) {
+                    order.push(id);
+                }
+                text.entry(id).or_default().push_str(&t);
+            }
+            EngineEvent::Prefill(p) => {
+                let e = prefill.entry(id).or_default();
+                *e = (*e).max(p.total);
+            }
+            EngineEvent::Notice(_) => {}
+        });
+
+        assert_eq!(outcomes.len(), 3);
+        for o in &outcomes {
+            assert!(
+                o.result.as_ref().unwrap().generated > 0,
+                "job {:?} generated nothing",
+                o.id
+            );
+            assert!(
+                !text[&o.id].trim().is_empty(),
+                "job {:?} produced no text",
+                o.id
+            );
+            // Each fork continues the shared conversation, so it pays for its
+            // own question and not for the transcript.
+            eprintln!("job {:?}: prefill={} ", o.id, prefill[&o.id]);
+        }
+
+        // Interleaving: the streams hand off to one another repeatedly rather
+        // than each running to completion in turn (which would be 3 runs).
+        eprintln!("hand-offs: {}", order.len());
+        assert!(
+            order.len() > questions.len(),
+            "the forks ran serially, not interleaved (only {} hand-offs)",
+            order.len()
+        );
+
+        // And they stayed separate: no fork answered another's question.
+        let paris = text
+            .values()
+            .filter(|t| t.to_lowercase().contains("paris"))
+            .count();
+        assert!(
+            paris <= 1,
+            "the forks contaminated each other: {paris} mention Paris"
         );
     }
 

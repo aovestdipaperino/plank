@@ -63,6 +63,9 @@ pub mod session;
 pub mod settings;
 pub mod singleton;
 pub mod skills;
+/// Cooperative round-robin over several sessions on the caller's thread — the
+/// hostless counterpart to `EngineHost`'s scheduler, for fanning out forks.
+pub mod slice;
 pub mod snapshot;
 pub mod status;
 pub mod statusbar;
