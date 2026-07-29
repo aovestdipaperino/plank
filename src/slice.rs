@@ -36,6 +36,17 @@ use std::sync::atomic::AtomicBool;
 use crate::engine::{EngineError, EngineEvent, GenerationOptions, GenerationStats};
 use crate::host::HostSession;
 
+/// Share of the thread a `/btw` aside gets relative to the main task it runs
+/// beside ([`SliceRunner::add_weighted`]).
+///
+/// An aside is a short question with someone waiting on the answer; the main
+/// task is long-running work whose next few seconds nobody is watching. At an
+/// even split the answer takes twice as long as it would alone — long enough,
+/// on a slow local model, to look like it is not coming. Four to one puts the
+/// answer up promptly and costs the main task only the seconds it was going to
+/// lose to the aside regardless.
+pub const ASIDE_SLICE_WEIGHT: usize = 4;
+
 /// Identifies one job within a [`SliceRunner`], and tags the events it emits.
 /// Assigned in insertion order, so it doubles as the dispatch index callers
 /// need when rejoining results deterministically (completion order is not
@@ -56,6 +67,9 @@ pub struct JobOutcome {
 struct Job<'a> {
     session: &'a mut dyn HostSession,
     interrupt: Arc<AtomicBool>,
+    /// Tokens this job generates per turn in the rotation — the base slice
+    /// scaled by its weight.
+    slice: usize,
     result: Option<Result<GenerationStats, EngineError>>,
 }
 
@@ -99,11 +113,36 @@ impl<'a> SliceRunner<'a> {
         opts: GenerationOptions,
         interrupt: Arc<AtomicBool>,
     ) -> JobId {
+        self.add_weighted(session, transcript, opts, interrupt, 1)
+    }
+
+    /// As [`add`](Self::add), but with a share of the thread proportional to
+    /// `weight`: a job at weight 3 generates three times as many tokens per
+    /// rotation as one at weight 1.
+    ///
+    /// Weighting matters because the jobs are rarely equally urgent. A `/btw`
+    /// aside is a short question someone is waiting on, next to a main task
+    /// that is long-running background progress; splitting the thread evenly
+    /// makes the answer take twice as long as it would alone, for no benefit
+    /// the user can see. Favouring the aside costs the main task only the
+    /// seconds the answer takes, which it was going to lose anyway.
+    ///
+    /// Nothing here creates throughput: one queue means the total is fixed, and
+    /// a weight only decides who waits. Weight 0 is treated as 1.
+    pub fn add_weighted(
+        &mut self,
+        session: &'a mut dyn HostSession,
+        transcript: String,
+        opts: GenerationOptions,
+        interrupt: Arc<AtomicBool>,
+        weight: usize,
+    ) -> JobId {
         session.begin(transcript, opts);
         let id = JobId(self.jobs.len());
         self.jobs.push(Job {
             session,
             interrupt,
+            slice: self.slice_tokens * weight.max(1),
             result: None,
         });
         self.rotation.push_back(id.0);
@@ -137,10 +176,7 @@ impl<'a> SliceRunner<'a> {
             let job = &mut self.jobs[idx];
             let id = JobId(idx);
             let mut sink = |ev: EngineEvent| on_event(id, ev);
-            match job
-                .session
-                .advance(self.slice_tokens, &job.interrupt, &mut sink)
-            {
+            match job.session.advance(job.slice, &job.interrupt, &mut sink) {
                 // More to do: back of the queue, so every sibling gets a slice
                 // before this one runs again.
                 Ok(None) => self.rotation.push_back(idx),
@@ -225,7 +261,7 @@ mod tests {
 
         fn advance(
             &mut self,
-            _k: usize,
+            k: usize,
             interrupt: &AtomicBool,
             sink: &mut dyn FnMut(EngineEvent),
         ) -> Result<Option<GenerationStats>, EngineError> {
@@ -236,16 +272,22 @@ mod tests {
                     ..GenerationStats::default()
                 }));
             }
-            if self.fail_at == Some(self.emitted) {
-                return Err(EngineError::new(format!("{} failed", self.tag)));
-            }
-            self.emitted += 1;
-            sink(EngineEvent::Text(format!("{}{}", self.tag, self.emitted)));
-            if self.emitted >= self.total {
-                return Ok(Some(GenerationStats {
-                    generated: i32::try_from(self.emitted).unwrap_or(i32::MAX),
-                    ..GenerationStats::default()
-                }));
+            // Honour `k` the way a real session does — up to k tokens per
+            // slice, not one. Ignoring it would make every weight look
+            // identical, and a weighting test pass against a runner that
+            // does not weight.
+            for _ in 0..k.max(1) {
+                if self.fail_at == Some(self.emitted) {
+                    return Err(EngineError::new(format!("{} failed", self.tag)));
+                }
+                self.emitted += 1;
+                sink(EngineEvent::Text(format!("{}{}", self.tag, self.emitted)));
+                if self.emitted >= self.total {
+                    return Ok(Some(GenerationStats {
+                        generated: i32::try_from(self.emitted).unwrap_or(i32::MAX),
+                        ..GenerationStats::default()
+                    }));
+                }
             }
             Ok(None)
         }
@@ -295,6 +337,56 @@ mod tests {
         for o in &outcomes {
             assert_eq!(o.result.as_ref().unwrap().generated, 3);
         }
+    }
+
+    /// A weighted job takes proportionally more of the thread, so the stream
+    /// someone is waiting on finishes first even though it started second.
+    #[test]
+    fn a_weighted_job_gets_a_larger_share() {
+        // Both jobs want the same number of tokens; only the weight differs.
+        let (mut main, mut aside) = (StepSession::steps("m", 8), StepSession::steps("a", 8));
+        let mut runner = SliceRunner::new(1);
+        runner.add(&mut main, "x".into(), opts(), flag());
+        runner.add_weighted(&mut aside, "y".into(), opts(), flag(), 4);
+
+        let (_, log) = drive(&mut runner);
+        let text: Vec<&str> = log.iter().map(|(_, t)| t.as_str()).collect();
+
+        // The weighted job runs four tokens for every one of the other's.
+        assert_eq!(
+            &text[..5],
+            ["m1", "a1", "a2", "a3", "a4"],
+            "the weighted job takes four slices to the main task's one"
+        );
+
+        // And it finishes first, despite being dispatched second.
+        let last_aside = log.iter().rposition(|(id, _)| *id == JobId(1)).unwrap();
+        let last_main = log.iter().rposition(|(id, _)| *id == JobId(0)).unwrap();
+        assert!(
+            last_aside < last_main,
+            "the weighted job should finish first (aside ended at {last_aside}, \
+             main at {last_main})"
+        );
+    }
+
+    /// Weighting decides who waits, not how much work happens: the same tokens
+    /// come out either way.
+    #[test]
+    fn weighting_does_not_change_total_output() {
+        let mut totals = Vec::new();
+        for weight in [1, 4] {
+            let (mut a, mut b) = (StepSession::steps("a", 5), StepSession::steps("b", 5));
+            let mut runner = SliceRunner::new(1);
+            runner.add(&mut a, "x".into(), opts(), flag());
+            runner.add_weighted(&mut b, "y".into(), opts(), flag(), weight);
+            let (outcomes, log) = drive(&mut runner);
+            assert!(outcomes.iter().all(|o| o.result.is_ok()));
+            totals.push(log.len());
+        }
+        assert_eq!(
+            totals[0], totals[1],
+            "one queue: a weight reorders the tokens, it does not add any"
+        );
     }
 
     /// Outcomes come back in dispatch order even though the jobs finish in a

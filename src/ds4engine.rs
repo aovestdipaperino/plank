@@ -1099,11 +1099,14 @@ impl Engine for Ds4Session {
                 opts.clone(),
                 Arc::clone(&stop),
             );
-            runner.add(
+            // The aside gets the larger share: it is a short question with the
+            // user waiting on it, while the main task is background progress.
+            runner.add_weighted(
                 &mut aside,
                 aside_prompt.to_owned(),
                 opts.clone(),
                 Arc::clone(&stop),
+                crate::slice::ASIDE_SLICE_WEIGHT,
             );
             runner.run(&mut |id, ev| {
                 if interrupt() {
