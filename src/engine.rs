@@ -174,6 +174,16 @@ pub fn reusable_prefix(pos: i32, common: i32) -> i32 {
     if pos > 0 && common == pos { pos } else { 0 }
 }
 
+/// Which of two interleaved streams an event belongs to, so a front-end can
+/// route the main task and a concurrent aside to different places.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsideStream {
+    /// The main task's continuation.
+    Main,
+    /// The `/btw` aside running beside it on a fork.
+    Aside,
+}
+
 /// Role of a structured chat message handed to a provider engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
@@ -480,6 +490,41 @@ pub trait Engine: Debug + Send {
     /// implemented. Checked before an aside so the caller can pick the tier
     /// without a throwaway call. Default `false`.
     fn supports_forked_aside(&self) -> bool {
+        false
+    }
+
+    /// Continues the main task **and** answers an aside at the same time,
+    /// interleaving both at token granularity on this thread
+    /// (`docs/SESSION-CLONE-DESIGN.md` §6.2).
+    ///
+    /// The main generation runs on the live session; the aside runs on a fork,
+    /// so neither can disturb the other. Events are tagged
+    /// [`AsideStream`](crate::engine::AsideStream) so a caller can route the
+    /// aside to a side panel while the main task keeps flowing to the main log.
+    /// Returns `(main, aside)` stats.
+    ///
+    /// One Metal queue means this is time-slicing: the main task does not
+    /// finish sooner than it would have. What changes is that it does not
+    /// *stop* — the alternative is freezing it for the whole aside.
+    ///
+    /// # Errors
+    /// The default implementation returns [`EngineError::unsupported`] so
+    /// callers fall back to the freeze/answer/resume path. Real engines return
+    /// [`EngineError`] on a backend failure, including a refused fork.
+    fn generate_multiplexed(
+        &mut self,
+        _main_prompt: &str,
+        _aside_prompt: &str,
+        _opts: &GenerationOptions,
+        _interrupt: &dyn Fn() -> bool,
+        _on_event: &mut dyn FnMut(AsideStream, EngineEvent),
+    ) -> Result<(GenerationStats, GenerationStats), EngineError> {
+        Err(EngineError::unsupported())
+    }
+
+    /// Whether [`generate_multiplexed`](Self::generate_multiplexed) is really
+    /// implemented. Default `false`.
+    fn supports_multiplexing(&self) -> bool {
         false
     }
 

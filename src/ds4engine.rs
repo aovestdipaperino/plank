@@ -1045,6 +1045,72 @@ impl Engine for Ds4Session {
         true
     }
 
+    fn generate_multiplexed(
+        &mut self,
+        main_prompt: &str,
+        aside_prompt: &str,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(crate::engine::AsideStream, EngineEvent),
+    ) -> Result<(GenerationStats, GenerationStats), EngineError> {
+        use crate::engine::AsideStream;
+        use crate::slice::{JobId, SliceRunner};
+
+        // Fork first: if the fork is refused there is nothing to undo, and the
+        // caller can still fall back to the freeze/answer/resume path.
+        let mut aside = Ds4HostSession::from_session(self.fork()?);
+
+        // Lend our own live session to the rotation. It has to be owned by a
+        // `Ds4HostSession` to be sliceable, so it moves out and back; the
+        // placeholder is never generated on.
+        let placeholder = Self::from_model(Arc::clone(&self.model));
+        let mut main = Ds4HostSession::from_session(std::mem::replace(self, placeholder));
+
+        // The runner polls an `AtomicBool` per job; bridge the caller's
+        // closure onto one shared flag, since an interrupt means "stop the
+        // whole thing" here.
+        let stop = Arc::new(AtomicBool::new(false));
+        let outcomes = {
+            let mut runner = SliceRunner::new(crate::host::DEFAULT_SLICE_TOKENS);
+            runner.add(
+                &mut main,
+                main_prompt.to_owned(),
+                opts.clone(),
+                Arc::clone(&stop),
+            );
+            runner.add(
+                &mut aside,
+                aside_prompt.to_owned(),
+                opts.clone(),
+                Arc::clone(&stop),
+            );
+            runner.run(&mut |id, ev| {
+                if interrupt() {
+                    stop.store(true, Ordering::Relaxed);
+                }
+                let which = if id == JobId(0) {
+                    AsideStream::Main
+                } else {
+                    AsideStream::Aside
+                };
+                on_event(which, ev);
+            })
+        };
+
+        // Take the live session back before surfacing any error, so a failed
+        // aside never strands the main task in the placeholder.
+        *self = main.into_session();
+
+        let mut it = outcomes.into_iter();
+        let main_stats = it.next().expect("job 0 was added").result?;
+        let aside_stats = it.next().expect("job 1 was added").result?;
+        Ok((main_stats, aside_stats))
+    }
+
+    fn supports_multiplexing(&self) -> bool {
+        true
+    }
+
     fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
         self.warm_tokens = self.model.build_system_tokens(system);
         Ok(())
@@ -1180,6 +1246,24 @@ pub struct Ds4HostSession {
 }
 
 impl Ds4HostSession {
+    /// Wraps an owned session so it can be driven in resumable K-token slices.
+    #[must_use]
+    pub fn from_session(inner: Ds4Session) -> Self {
+        Self {
+            inner,
+            pending: None,
+            active: None,
+        }
+    }
+
+    /// Unwraps the session, discarding any slicing state. Used to hand a live
+    /// session back to its owner after it has been lent to a
+    /// [`SliceRunner`](crate::slice::SliceRunner).
+    #[must_use]
+    pub fn into_session(self) -> Ds4Session {
+        self.inner
+    }
+
     /// Non-preemptible suffix prefill (design §5, §11.8). Builds the prompt,
     /// syncs the session, and returns the initial [`GenState`], or `Err(stats)`
     /// if interrupted during prefill.
@@ -2529,6 +2613,85 @@ mod tests {
         );
     }
 
+    /// `/btw` without freezing: the main task keeps producing tokens *while*
+    /// the aside is answered on a fork, and neither leaks into the other.
+    ///
+    /// The freeze/answer/resume path emits the main task's tokens strictly
+    /// before or after the aside's; this one must interleave them.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn multiplexed_aside_keeps_the_main_task_moving() {
+        use crate::engine::{AsideStream, Engine, EngineEvent, GenerationOptions};
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let mut engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let opts = GenerationOptions {
+            seed: 81,
+            n_predict: 40,
+            ..GenerationOptions::default()
+        };
+
+        let base = "[user]\nName a fruit.\n";
+        let (_, reply) = gen_capture_reply(&mut engine, base, &opts);
+        let shared = format!("{base}[assistant]\n{}\n", reply.trim());
+        let pos_before = engine.ctx_tokens();
+
+        let mut main_text = String::new();
+        let mut aside_text = String::new();
+        let mut order: Vec<AsideStream> = Vec::new();
+        let (main_stats, aside_stats) = engine
+            .generate_multiplexed(
+                &format!("{shared}[user]\nCount slowly from one to twenty.\n"),
+                &format!("{shared}[user]\nWhat is the capital of France?\n"),
+                &opts,
+                &|| false,
+                &mut |which, ev| {
+                    if let EngineEvent::Text(t) = ev {
+                        if order.last() != Some(&which) {
+                            order.push(which);
+                        }
+                        match which {
+                            AsideStream::Main => main_text.push_str(&t),
+                            AsideStream::Aside => aside_text.push_str(&t),
+                        }
+                    }
+                },
+            )
+            .unwrap();
+
+        assert!(main_stats.generated > 0, "the main task generated");
+        assert!(aside_stats.generated > 0, "the aside generated");
+        assert!(!main_text.trim().is_empty() && !aside_text.trim().is_empty());
+
+        // The whole point: the streams hand off to each other repeatedly. A
+        // freeze/resume would produce at most two runs.
+        eprintln!("stream hand-offs: {}", order.len());
+        assert!(
+            order.len() > 2,
+            "the aside froze the main task instead of interleaving with it \
+             (only {} hand-offs)",
+            order.len()
+        );
+
+        // The aside ran on a fork, so it never entered the main transcript.
+        assert!(
+            !main_text.to_lowercase().contains("paris"),
+            "the aside leaked into the main stream: {main_text}"
+        );
+        // And the live session advanced past where it started, i.e. the main
+        // continuation really ran on it rather than on a copy.
+        assert!(
+            engine.ctx_tokens() > pos_before,
+            "the main task's own KV advanced"
+        );
+    }
+
     /// The fan-out this whole line of work is for: one live session forked
     /// several ways, all generating *together* on one thread via
     /// [`SliceRunner`](crate::slice::SliceRunner), each continuing the shared
@@ -2570,11 +2733,15 @@ mod tests {
             "What is the capital of Japan?",
             "What is the capital of Peru?",
         ];
+        // The runner borrows, so the forks are owned here for its lifetime.
+        let mut forks: Vec<Box<dyn crate::host::HostSession>> = questions
+            .iter()
+            .map(|_| engine.fork_sliceable().expect("a live session forks"))
+            .collect();
         let mut runner = SliceRunner::new(4);
-        for q in questions {
-            let fork = engine.fork_sliceable().expect("a live session forks");
+        for (fork, q) in forks.iter_mut().zip(questions) {
             runner.add(
-                fork,
+                fork.as_mut(),
                 format!("{shared}[user]\n{q}\n"),
                 opts.clone(),
                 Arc::new(AtomicBool::new(false)),

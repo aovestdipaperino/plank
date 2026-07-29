@@ -18,11 +18,12 @@
 //!
 //! **This is time-slicing, not parallelism.** One Metal command queue means
 //! total wall time is roughly the sum of the jobs, not the max. What it buys is
-//! that every stream *advances*: N subagents make visible progress together
-//! instead of the first finishing before the second starts. For a single aside
-//! beside one main task that is close to worthless — the main task does not
-//! finish sooner — which is why `/btw` does not use it. For a fan-out of
-//! subagents it is the difference between a live dashboard and a queue.
+//! that every stream *advances*: an aside answers while the main task keeps
+//! inching forward, and N subagents make visible progress together instead of
+//! the first finishing before the second starts. Nothing finishes sooner. For
+//! a fan-out it is the difference between a live dashboard and a queue; for a
+//! single `/btw` it is the difference between a frozen main task and a moving
+//! one.
 //!
 //! Prefill is non-preemptible, matching the host (design §5, §11.8): a job's
 //! first slice runs its whole prefill before yielding. Jobs therefore begin
@@ -52,23 +53,27 @@ pub struct JobOutcome {
     pub result: Result<GenerationStats, EngineError>,
 }
 
-struct Job {
-    session: Box<dyn HostSession>,
+struct Job<'a> {
+    session: &'a mut dyn HostSession,
     interrupt: Arc<AtomicBool>,
     result: Option<Result<GenerationStats, EngineError>>,
 }
 
 /// Round-robin driver for several concurrent generations on one thread.
 ///
+/// Jobs are *borrowed*, not owned: a caller can lend its live session for the
+/// duration of a run and keep it afterwards, which is what letting a main task
+/// and an aside share the thread requires.
+///
 /// See the [module docs](self) for what this does and does not buy.
-pub struct SliceRunner {
+pub struct SliceRunner<'a> {
     slice_tokens: usize,
-    jobs: Vec<Job>,
+    jobs: Vec<Job<'a>>,
     /// Indices still runnable, in service order.
     rotation: VecDeque<usize>,
 }
 
-impl SliceRunner {
+impl<'a> SliceRunner<'a> {
     /// Creates an empty runner that yields between jobs every `slice_tokens`
     /// generated tokens. Smaller slices interleave more smoothly and cost more
     /// switching; the host's [`DEFAULT_SLICE_TOKENS`](crate::host::DEFAULT_SLICE_TOKENS)
@@ -89,7 +94,7 @@ impl SliceRunner {
     /// and leaves its siblings running.
     pub fn add(
         &mut self,
-        mut session: Box<dyn HostSession>,
+        session: &'a mut dyn HostSession,
         transcript: String,
         opts: GenerationOptions,
         interrupt: Arc<AtomicBool>,
@@ -163,16 +168,9 @@ impl SliceRunner {
             })
             .collect()
     }
-
-    /// Reclaims the sessions in dispatch order, so a caller can keep a live one
-    /// and drop the forks.
-    #[must_use]
-    pub fn into_sessions(self) -> Vec<Box<dyn HostSession>> {
-        self.jobs.into_iter().map(|j| j.session).collect()
-    }
 }
 
-impl std::fmt::Debug for SliceRunner {
+impl std::fmt::Debug for SliceRunner<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SliceRunner")
             .field("slice_tokens", &self.slice_tokens)
@@ -201,22 +199,22 @@ mod tests {
     }
 
     impl StepSession {
-        fn boxed(tag: &'static str, total: usize) -> Box<dyn HostSession> {
-            Box::new(Self {
+        fn steps(tag: &'static str, total: usize) -> Self {
+            Self {
                 tag,
                 total,
                 emitted: 0,
                 fail_at: None,
-            })
+            }
         }
 
-        fn failing(tag: &'static str, total: usize, fail_at: usize) -> Box<dyn HostSession> {
-            Box::new(Self {
+        fn failing(tag: &'static str, total: usize, fail_at: usize) -> Self {
+            Self {
                 tag,
                 total,
                 emitted: 0,
                 fail_at: Some(fail_at),
-            })
+            }
         }
     }
 
@@ -279,9 +277,10 @@ mod tests {
     /// finishing before the other starts.
     #[test]
     fn jobs_interleave_rather_than_serialize() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 3), StepSession::steps("b", 3));
         let mut runner = SliceRunner::new(1);
-        let a = runner.add(StepSession::boxed("a", 3), "x".into(), opts(), flag());
-        let b = runner.add(StepSession::boxed("b", 3), "y".into(), opts(), flag());
+        let a = runner.add(&mut sa, "x".into(), opts(), flag());
+        let b = runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (outcomes, log) = drive(&mut runner);
         let text: Vec<&str> = log.iter().map(|(_, t)| t.as_str()).collect();
@@ -302,10 +301,11 @@ mod tests {
     /// different one — what a fan-out needs to rejoin reports deterministically.
     #[test]
     fn outcomes_are_ordered_by_dispatch_not_completion() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 4), StepSession::steps("b", 1));
         let mut runner = SliceRunner::new(1);
         // The longer job is dispatched first, so completion order is b then a.
-        runner.add(StepSession::boxed("a", 4), "x".into(), opts(), flag());
-        runner.add(StepSession::boxed("b", 1), "y".into(), opts(), flag());
+        runner.add(&mut sa, "x".into(), opts(), flag());
+        runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (outcomes, log) = drive(&mut runner);
         let last = log.last().expect("both jobs emitted");
@@ -320,9 +320,10 @@ mod tests {
     /// A short job retiring must not stall or starve the survivors.
     #[test]
     fn a_finished_job_leaves_the_rotation() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 1), StepSession::steps("b", 3));
         let mut runner = SliceRunner::new(1);
-        runner.add(StepSession::boxed("a", 1), "x".into(), opts(), flag());
-        runner.add(StepSession::boxed("b", 3), "y".into(), opts(), flag());
+        runner.add(&mut sa, "x".into(), opts(), flag());
+        runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (_, log) = drive(&mut runner);
         let text: Vec<&str> = log.iter().map(|(_, t)| t.as_str()).collect();
@@ -336,11 +337,12 @@ mod tests {
     /// One job's interrupt is its own: siblings run to completion.
     #[test]
     fn interrupt_stops_only_its_own_job() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 3), StepSession::steps("b", 2));
         let mut runner = SliceRunner::new(1);
         let stop = flag();
         stop.store(true, Ordering::Relaxed);
-        runner.add(StepSession::boxed("a", 3), "x".into(), opts(), stop);
-        runner.add(StepSession::boxed("b", 2), "y".into(), opts(), flag());
+        runner.add(&mut sa, "x".into(), opts(), stop);
+        runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (outcomes, log) = drive(&mut runner);
         let text: Vec<&str> = log.iter().map(|(_, t)| t.as_str()).collect();
@@ -359,9 +361,10 @@ mod tests {
     /// the others still finish.
     #[test]
     fn a_failing_job_does_not_take_down_its_siblings() {
+        let (mut sa, mut sb) = (StepSession::failing("a", 5, 2), StepSession::steps("b", 3));
         let mut runner = SliceRunner::new(1);
-        runner.add(StepSession::failing("a", 5, 2), "x".into(), opts(), flag());
-        runner.add(StepSession::boxed("b", 3), "y".into(), opts(), flag());
+        runner.add(&mut sa, "x".into(), opts(), flag());
+        runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (outcomes, log) = drive(&mut runner);
         assert!(
@@ -380,9 +383,10 @@ mod tests {
     /// Every event is tagged, so a caller can route jobs to different sinks.
     #[test]
     fn events_carry_their_job_id() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 2), StepSession::steps("b", 2));
         let mut runner = SliceRunner::new(1);
-        runner.add(StepSession::boxed("a", 2), "x".into(), opts(), flag());
-        runner.add(StepSession::boxed("b", 2), "y".into(), opts(), flag());
+        runner.add(&mut sa, "x".into(), opts(), flag());
+        runner.add(&mut sb, "y".into(), opts(), flag());
 
         let (_, log) = drive(&mut runner);
         for (id, text) in &log {
@@ -394,19 +398,20 @@ mod tests {
         }
     }
 
-    /// Sessions come back in dispatch order, so a caller can keep the live one
-    /// and drop the forks.
+    /// The caller keeps its sessions: the runner only borrows them, so a live
+    /// session lent for one run is usable again afterwards. This is what lets
+    /// the main task join a rotation and then carry on.
     #[test]
-    fn sessions_are_reclaimable_in_dispatch_order() {
-        let mut runner = SliceRunner::new(1);
-        runner.add(StepSession::boxed("a", 2), "x".into(), opts(), flag());
-        runner.add(StepSession::boxed("b", 4), "y".into(), opts(), flag());
-        drive(&mut runner);
-
-        let sessions = runner.into_sessions();
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions[0].ctx_tokens(), 2);
-        assert_eq!(sessions[1].ctx_tokens(), 4);
+    fn borrowed_sessions_return_to_the_caller() {
+        let (mut sa, mut sb) = (StepSession::steps("a", 2), StepSession::steps("b", 4));
+        {
+            let mut runner = SliceRunner::new(1);
+            runner.add(&mut sa, "x".into(), opts(), flag());
+            runner.add(&mut sb, "y".into(), opts(), flag());
+            drive(&mut runner);
+        }
+        assert_eq!(sa.ctx_tokens(), 2, "the caller still owns its session");
+        assert_eq!(sb.ctx_tokens(), 4);
     }
 
     /// Running with nothing queued is a no-op, not a hang.
