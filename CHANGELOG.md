@@ -6,6 +6,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.8] - 2026-08-02
+
+Beta channel on the 2.7 series.
+
+### Fixed
+
+- **Tool calls the updated model weights emit are parsed again.** Two syntax
+  shapes appeared after the weights were updated, and each one cost the whole
+  turn. The stanza opener now arrives as `<｜DSML｜tool_calls｜>` — the same
+  optional trailing bar the closing tags have always tolerated, now on the
+  opener. No opener form matched it, so the stanza never opened: the call
+  streamed out as prose and the model was told only "DSML markup outside a
+  valid tool_calls block", with nothing to identify which part of its syntax
+  was wrong.
+
+- **A parameter written as its own element is accepted.** The weights emit
+  `<｜DSML｜command string="true">` in place of
+  `<｜DSML｜parameter name="command" string="true">`, closed with
+  `</｜DSML｜invoke>`. The recorded repro shows the model unable to work
+  backwards from the resulting error: it blamed the marker spelling twice and
+  then emitted a tool call inside `<think>`. The shorthand is now accepted, but
+  narrowly — only inside an already-open invoke, only for a tag whose element
+  name is a plain identifier, and only when it carries no `name` attribute. A
+  canonical parameter keeps its strict terminator, so a `write` payload that
+  itself contains `</｜DSML｜invoke>` is still never truncated.
+
+### Changed
+
+- **The model download fetches the official `-0731` Flash build** (~87 GB), the
+  non-preview DeepSeek V4 Flash of 2026-07-31. The architecture is unchanged
+  from the April preview — the gains are all post-training — so the engine
+  loads it exactly as before. The build a model came from is now recorded
+  beside it: previously a bumped default was invisible to anyone who already
+  had a file, since only the path's existence was ever checked. The stamp is
+  advisory, and unknown never means re-download.
+
+- **Breakout is playable while the model downloads.** Hours is a long time to
+  watch a bar fill, so a round sits above the gauge. It never delays the
+  transfer; Esc puts it away, and `q` or Ctrl-C abort the download from
+  anywhere, so a rally can't trap you. The wall now hangs from the very top,
+  and the paddle takes a shorter glide per key press — terminals give discrete
+  presses rather than key-down/key-up, so the glide is effectively the step
+  size, and a tap that slid the paddle past its own length made fine
+  positioning impossible.
+
+- **The TUI banner reads as one masthead**, with the version line set to the
+  right of the logo's middle row instead of stacked underneath it.
+
 ## [2.7.7] - 2026-07-29
 
 Beta channel on the 2.7 series.

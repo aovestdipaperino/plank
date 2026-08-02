@@ -33,7 +33,7 @@ Three ways to get one were considered:
 - **Spawn `llama-server` as a child process** and talk to it over localhost
   HTTP. Chosen.
 
-The deciding factor is memory. ds4 Flash occupies roughly 81 GB. A vision model
+The deciding factor is memory. ds4 Flash occupies roughly 87 GB. A vision model
 in a separate process can be spawned on first use and killed when idle, and the
 OS reclaims every byte. In-process, it is resident for the life of the session.
 Process isolation also keeps plank's build exactly as it is today: no new

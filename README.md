@@ -59,7 +59,7 @@ Run with a prompt argument for one-shot headless mode.
 
 ### Model download
 
-Real inference needs the DeepSeek V4 Flash GGUF. You can point plank at any copy with `-m <path>`, but with no flag it looks in the default location (`~/.plank/ds4flash.gguf`) and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
+Real inference needs the DeepSeek V4 Flash GGUF — the official (non-preview) `-0731` build of 2026-07-31. You can point plank at any copy with `-m <path>`, but with no flag it looks in the default location (`~/.plank/ds4flash.gguf`) and, when nothing is there, offers to fetch the quantized model (~87 GB) from Hugging Face — one keypress and it downloads in place with live progress:
 
 <p align="center">
   <img src="assets/model-download.gif" alt="Model download progress UI" width="700">
@@ -70,6 +70,8 @@ Details worth knowing:
 - **Resumable.** The download streams to a `.part` file next to the destination; if it's interrupted (Ctrl-C, network drop), the next launch detects the partial file and resumes from where it stopped instead of starting over.
 - **Guarded.** The default quant needs ~82 GB resident, so plank refuses to download or load on machines with less than 96 GB of RAM — you find out before spending hours on the transfer, not after.
 - **Honest about the wait.** An 87 GB download takes a while; the progress bar keeps you company with size/rate counters and a rotation of two hundred status messages ("Almost sentient. Please hold." among them).
+- **Playable.** A round of [breakout](#the-arcade) sits above the gauge, because hours is a long time to watch a bar fill. It is decoration and never delays the transfer: Esc puts it away, and `q` or Ctrl-C abort the download from anywhere, so a rally can't trap you.
+- **Kept current.** The build a model was downloaded from is recorded beside it, so a newer default is noticed instead of being masked forever by an existing file. Inferred from the filename when there's no stamp, which covers symlinking `ds4flash.gguf` at a GGUF you keep elsewhere; unknown never means re-download.
 - **Headless-safe.** With stdin not attached to a terminal there is no prompt to answer, so plank exits with instructions instead of hanging a script.
 
 Without a model (or on non-macOS platforms) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
