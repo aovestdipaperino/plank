@@ -3961,18 +3961,38 @@ impl Agent<'_> {
         result.map(|_| ())
     }
 
+    /// Lays the version line out to the *right* of the logo, on the logo's
+    /// middle row, so the two read as one masthead instead of stacking.
+    ///
+    /// Art with no rows has no middle to hang the text off, so the version
+    /// falls back to a line of its own and nothing is lost.
+    fn masthead(
+        mut art: Vec<ratatui::text::Line<'static>>,
+        version: String,
+    ) -> Vec<ratatui::text::Line<'static>> {
+        if art.is_empty() {
+            return vec![ratatui::text::Line::from(version)];
+        }
+        let middle = (art.len() - 1) / 2;
+        art[middle]
+            .spans
+            .push(ratatui::text::Span::raw(format!("  {version}")));
+        art
+    }
+
     /// Writes the startup banner (logo art, version/context line, hints) into
     /// `log`. Used both at launch and after `/clear` and `/new`, so a cleared
     /// screen looks exactly like a fresh start.
     fn tui_write_banner(&self, log: &mut OutputLog) {
-        for line in tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 144 / 100)) {
-            log.push_spans(line.spans);
-        }
-        log.push_plain(format!(
+        let version = format!(
             "plank {} 🪵 Agent, context {} tokens",
             crate::logo::version_label(),
             status::format_ctx_size(self.engine.ctx_size())
-        ));
+        );
+        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 3 / 4));
+        for line in Self::masthead(art, version) {
+            log.push_spans(line.spans);
+        }
         log.push_plain("Type a message, or /help for commands. Ctrl-D to quit.");
         // Non-intrusive one-time update hint (issue #56), shown in yellow just
         // below the welcome line; absent when up to date or the check is off.
@@ -7533,6 +7553,55 @@ mod tests {
     use crate::engine::{EngineError, EngineEvent, GenerationStats};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// Flattened text of a line, for asserting on layout.
+    fn text_of(line: &ratatui::text::Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn the_version_sits_beside_the_logo_not_below_it() {
+        let art: Vec<ratatui::text::Line<'static>> = (0..7)
+            .map(|i| ratatui::text::Line::from(format!("art{i}")))
+            .collect();
+        let out = Agent::masthead(art, "plank v9 🪵 Agent".to_string());
+
+        // No extra row: the version rides an existing art line.
+        assert_eq!(out.len(), 7, "the banner must not grow a row");
+        let joined: Vec<String> = out.iter().map(text_of).collect();
+        let carrying: Vec<usize> = joined
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.contains("plank v9"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(carrying, vec![3], "on the middle row, exactly once");
+        // The art on that row survives, and the version follows it.
+        assert_eq!(joined[3], "art3  plank v9 🪵 Agent");
+    }
+
+    #[test]
+    fn masthead_without_art_still_shows_the_version() {
+        let out = Agent::masthead(Vec::new(), "plank v9".to_string());
+        assert_eq!(out.len(), 1);
+        assert_eq!(text_of(&out[0]), "plank v9");
+    }
+
+    #[test]
+    fn masthead_middle_row_is_stable_for_even_and_odd_art() {
+        for rows in 1..12usize {
+            let art: Vec<ratatui::text::Line<'static>> = (0..rows)
+                .map(|i| ratatui::text::Line::from(format!("a{i}")))
+                .collect();
+            let out = Agent::masthead(art, "V".to_string());
+            assert_eq!(out.len(), rows, "{rows} rows in, {rows} rows out");
+            let hits = out.iter().filter(|l| text_of(l).contains('V')).count();
+            assert_eq!(
+                hits, 1,
+                "exactly one row carries the version at {rows} rows"
+            );
+        }
+    }
 
     #[test]
     fn render_transcript_never_injects_the_task_list_mid_transcript() {

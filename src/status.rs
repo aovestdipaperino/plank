@@ -853,7 +853,7 @@ pub fn no_model_lines() -> Vec<String> {
             .to_owned(),
         "  local  : git submodule update --init refs/ds4 && cargo build   (macOS + Metal, 96 GB RAM)"
             .to_owned(),
-        "           then plank -m <model.gguf>, or plank with no -m to fetch ~/.plank/ds4flash.gguf (~81 GB)"
+        "           then plank -m <model.gguf>, or plank with no -m to fetch ~/.plank/ds4flash.gguf (~87 GB)"
             .to_owned(),
         "  hosted : plank --provider anthropic --model <name>   (key from $ANTHROPIC_API_KEY)".to_owned(),
         "  remote : plank --remote <url>   (another box running plank serve)".to_owned(),

@@ -9,20 +9,34 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
 
-use super::{CONTACT, GLIDE_MS, Glyph, H_GAIN, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};
+use super::{CONTACT, Glyph, H_GAIN, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};
 use crate::anim::Rgb;
 
 /// Bricks per row. Fixed, so the wall reads the same at every size.
 pub const COLS: usize = 14;
 /// Where the wall starts and how tall one brick row is, as fractions of the
 /// field height.
-const WALL_TOP: f32 = 0.06;
+///
+/// The wall hangs from the very top: any gap above it is dead space the ball
+/// only passes through, and on the download screen it read as a blank row
+/// under the rule. The ceiling bounce still works — with the top row cleared
+/// the ball simply reaches `y = 0` and reflects.
+const WALL_TOP: f32 = 0.0;
 const BRICK_H: f32 = 0.05;
 /// The paddle's row.
 const PADDLE_Y: f32 = 0.94;
 /// How fast the paddle travels, in field-widths per second. Comfortably above
 /// every ball speed: the ball should beat you on placement, not on pace.
-const PADDLE_SPEED: f32 = 1.6;
+const PADDLE_SPEED: f32 = 1.2;
+/// How long one key press keeps the paddle moving.
+///
+/// Breakout keeps its own, well under the arcade-wide [`super::GLIDE_MS`]:
+/// terminals give us discrete presses rather than key-down/key-up, so the
+/// glide *is* the step size, and a tap that slides the paddle past its own
+/// length makes fine positioning impossible. At [`PADDLE_SPEED`] this moves it
+/// roughly half a paddle, while still outlasting the gap between auto-repeats
+/// so holding the key reads as continuous travel.
+const PADDLE_GLIDE_MS: u64 = 80;
 /// Steepest angle off the paddle, in radians (~65°).
 const MAX_BOUNCE: f32 = 1.13;
 /// Lives at the start of a game.
@@ -180,12 +194,12 @@ impl Breakout {
         match key.code {
             KeyCode::Left | KeyCode::Char('h' | 'H' | 'a' | 'A') => {
                 self.dir = -1.0;
-                self.glide_ms = GLIDE_MS;
+                self.glide_ms = PADDLE_GLIDE_MS;
                 self.unpause();
             }
             KeyCode::Right | KeyCode::Char('l' | 'L' | 'd' | 'D') => {
                 self.dir = 1.0;
-                self.glide_ms = GLIDE_MS;
+                self.glide_ms = PADDLE_GLIDE_MS;
                 self.unpause();
             }
             KeyCode::Char('p') => {
@@ -212,12 +226,12 @@ impl Breakout {
         match ev.kind {
             MouseEventKind::ScrollUp => {
                 self.dir = -1.0;
-                self.glide_ms = GLIDE_MS;
+                self.glide_ms = PADDLE_GLIDE_MS;
                 self.unpause();
             }
             MouseEventKind::ScrollDown => {
                 self.dir = 1.0;
-                self.glide_ms = GLIDE_MS;
+                self.glide_ms = PADDLE_GLIDE_MS;
                 self.unpause();
             }
             MouseEventKind::Down(_) | MouseEventKind::Drag(_) | MouseEventKind::Moved => {
@@ -395,7 +409,10 @@ impl Breakout {
         let mut out = Vec::with_capacity(self.rows * COLS + usize::from(w));
         // The wall: each surviving brick fills its slice of the row.
         for r in 0..self.rows {
-            let y = row(BRICK_H.mul_add(r as f32 + 0.5, WALL_TOP));
+            // Drawn at the top edge of the brick's band, not its center: the
+            // centering offset is half a brick, which on a tall field rounds
+            // the first row down to row 1 and reopens the gap under the rule.
+            let y = row(BRICK_H.mul_add(r as f32, WALL_TOP));
             let color = ROW_COLORS[r % ROW_COLORS.len()];
             for c in 0..COLS {
                 if !self.bricks[r * COLS + c] {
@@ -415,16 +432,42 @@ impl Breakout {
             }
         }
 
-        // Paddle.
+        // Paddle. Drawn at half-cell resolution: `paddle_x` is a float that
+        // moves continuously, so snapping both ends to whole columns made it
+        // jump a full character at a time. Half blocks at the ends let it
+        // land between columns, which is what reads as smooth motion.
         let half = self.spec().paddle_half;
         let py = row(PADDLE_Y);
-        for x in col(self.paddle_x - half)..=col(self.paddle_x + half) {
+        // `col` rounds, so column `i` covers `[i - 0.5, i + 0.5)`. Shifting by
+        // a half puts the ends in a space where column `i` is `[i, i + 1)`,
+        // which floor and ceil below can work in — and keeps the paddle
+        // aligned with the ball and bricks, which are placed with `col`.
+        let paddle = (
+            (self.paddle_x - half).clamp(0.0, 1.0).mul_add(cols_f, 0.5),
+            (self.paddle_x + half).clamp(0.0, 1.0).mul_add(cols_f, 0.5),
+        );
+        let mut cap = |x: f32, ch: char| {
             out.push(Glyph {
-                x,
+                x: x as u16,
                 y: py,
-                ch: '█',
+                ch,
                 color: (120, 220, 255),
             });
+        };
+        // Whole columns the paddle covers end to end.
+        let (first_full, last_full) = (paddle.0.ceil(), paddle.1.floor());
+        let mut x = first_full;
+        while x < last_full {
+            cap(x, '█');
+            x += 1.0;
+        }
+        // A left edge landing in the back half of its column fills just that
+        // half; likewise the right edge, from the other side.
+        if paddle.0.fract() > 0.0 && paddle.0.fract() <= 0.5 {
+            cap(paddle.0.floor(), '▐');
+        }
+        if paddle.1 - last_full >= 0.5 {
+            cap(last_full, '▌');
         }
 
         // Ball — hidden while a banner is up.
@@ -480,6 +523,141 @@ mod tests {
     fn run(b: &mut Breakout, ms: u64) {
         for _ in 0..(ms / 50) {
             b.step(50);
+        }
+    }
+
+    /// The paddle row of a rendered frame: `(leftmost x, glyph chars)`.
+    fn paddle_row(b: &Breakout, w: u16, h: u16) -> (u16, Vec<char>) {
+        let g = b.glyphs(w, h);
+        let py = g.iter().map(|g| g.y).max().unwrap_or(0);
+        let mut cells: Vec<_> = g
+            .iter()
+            .filter(|g| g.y == py && matches!(g.ch, '█' | '▌' | '▐'))
+            .map(|g| (g.x, g.ch))
+            .collect();
+        cells.sort_unstable();
+        (
+            cells.first().map_or(0, |c| c.0),
+            cells.iter().map(|c| c.1).collect(),
+        )
+    }
+
+    #[test]
+    fn the_wall_starts_on_the_very_first_row() {
+        // No dead row above the wall: on the download screen that row sits
+        // directly under the rule and reads as a gap.
+        for h in [12u16, 20, 30, 48] {
+            let b = Breakout::new(5);
+            let top = b.glyphs(80, h).iter().map(|g| g.y).min().unwrap();
+            assert_eq!(top, 0, "wall starts at row {top} on a {h}-row field");
+        }
+    }
+
+    #[test]
+    fn the_ball_still_bounces_off_the_ceiling_with_the_wall_flush_to_it() {
+        // The ceiling reflection keys off y < 0, not off WALL_TOP, so clearing
+        // the top row must not let the ball escape upward.
+        let mut b = Breakout::new(9);
+        b.phase = Phase::Playing;
+        for brick in &mut b.bricks {
+            *brick = false;
+        }
+        b.ball = (0.5, 0.02);
+        b.vel = (0.0, -0.6);
+        run(&mut b, 300);
+        assert!(b.ball.1 >= 0.0, "the ball left through the ceiling");
+        assert!(b.vel.1 > 0.0, "the ball should be heading back down");
+    }
+
+    #[test]
+    fn one_key_press_nudges_the_paddle_well_under_its_own_length() {
+        // A tap that slides the paddle past its own length makes it impossible
+        // to line up on the ball: you overshoot every time.
+        let mut b = Breakout::new(1);
+        b.phase = Phase::Playing;
+        let start = b.paddle_x;
+        b.handle_key(key(KeyCode::Right));
+        // Long enough for the whole glide to play out.
+        run(&mut b, 400);
+        let moved = b.paddle_x - start;
+        let length = LEVELS[0].paddle_half * 2.0;
+        assert!(moved > 0.0, "the paddle must actually move");
+        assert!(
+            moved < length * 0.75,
+            "one press moved {moved:.3}, {:.1} paddle lengths",
+            moved / length
+        );
+    }
+
+    #[test]
+    fn holding_the_key_still_travels_continuously() {
+        // The glide has to outlast the gap between terminal auto-repeats, or
+        // holding the key stutters instead of sliding.
+        let repeat_gap = 60;
+        assert!(
+            PADDLE_GLIDE_MS >= repeat_gap,
+            "glide {PADDLE_GLIDE_MS}ms is shorter than a {repeat_gap}ms repeat gap"
+        );
+        let mut b = Breakout::new(1);
+        b.phase = Phase::Playing;
+        let mut last = b.paddle_x;
+        for _ in 0..6 {
+            b.handle_key(key(KeyCode::Left));
+            b.step(repeat_gap);
+            assert!(b.paddle_x < last, "the paddle stalled between repeats");
+            last = b.paddle_x;
+        }
+    }
+
+    #[test]
+    fn the_paddle_moves_in_half_cells_not_whole_ones() {
+        // Sample the paddle across a slow sweep. If the ends only ever landed
+        // on whole columns the paddle would jump a full character at a time;
+        // the half-block caps are what make the in-between positions visible.
+        let mut b = Breakout::new(7);
+        b.handle_key(key(KeyCode::Left));
+        let mut seen_caps = 0;
+        let mut frames = Vec::new();
+        for _ in 0..24 {
+            b.handle_key(key(KeyCode::Left));
+            b.step(4);
+            let row = paddle_row(&b, 80, 24);
+            if row.1.iter().any(|c| matches!(c, '▌' | '▐')) {
+                seen_caps += 1;
+            }
+            frames.push(row);
+        }
+        assert!(
+            seen_caps > 0,
+            "no half-block caps in a full sweep: {frames:?}"
+        );
+        // Consecutive frames must not be identical for long — that is the
+        // stutter the caps exist to remove.
+        let distinct = frames.windows(2).filter(|w| w[0] != w[1]).count();
+        assert!(
+            distinct >= frames.len() / 2,
+            "paddle rendering barely changes across the sweep: {distinct} of {}",
+            frames.len() - 1
+        );
+    }
+
+    #[test]
+    fn the_paddle_stays_centered_on_its_own_position() {
+        // The caps must not drift the paddle off the center the physics uses:
+        // the ball is placed with the same rounding, and a half-cell offset
+        // would make it look like it misses.
+        let mut b = Breakout::new(3);
+        for _ in 0..40 {
+            b.step(16);
+            let (left, chars) = paddle_row(&b, 81, 24);
+            assert!(!chars.is_empty(), "the paddle must always render");
+            let right = left + u16::try_from(chars.len()).unwrap() - 1;
+            let center = f32::from(left + right) / 2.0;
+            let want = (b.paddle_x.clamp(0.0, 1.0) * 80.0).round();
+            assert!(
+                (center - want).abs() <= 1.0,
+                "paddle drawn at {center}, physics says {want}"
+            );
         }
     }
 

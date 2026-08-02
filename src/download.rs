@@ -7,6 +7,11 @@
 //! missing, it offers to fetch the `DeepSeek` V4 Flash GGUF from Hugging Face
 //! (`huggingface.co`),
 //! streaming a magenta progress bar with a rotating series of messages.
+//!
+//! The download runs for hours, so the screen hosts a playable round of
+//! [`crate::arcade::breakout`] above the gauge. The game is decoration: it
+//! never delays the transfer, Esc puts it away, and `q` or Ctrl-C abort the
+//! download from anywhere, so a rally can never trap the user.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
@@ -17,18 +22,205 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Gauge, Paragraph};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Clear, Gauge, Paragraph};
 
-use crate::{logo, tui};
+use crate::arcade;
+use crate::arcade::breakout::Breakout;
 
 /// Hugging Face repository hosting the GGUF files.
 const REPO: &str = "antirez/deepseek-v4-gguf";
-/// The recommended Flash quant (~81 GB) for 96–128 GB machines.
-const FILE: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+/// The recommended Flash quant (~87 GB) for 96–128 GB machines.
+///
+/// `-0731` is the official (non-preview) `DeepSeek` V4 Flash of 2026-07-31. The
+/// architecture is unchanged from the April preview — the gains are all
+/// post-training — so the tensor layout the engine expects is the same.
+const FILE: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
+
+/// Records which `FILE` produced the local model, alongside it.
+///
+/// Without this a bumped [`FILE`] would be invisible to anyone who already has
+/// a model: [`ensure_model`] only ever checked that the path exists, so an old
+/// download would be used forever. The stamp is advisory — a missing or
+/// unreadable one means "unknown", never "re-download".
+fn stamp_path(model: &Path) -> PathBuf {
+    model.with_extension("source")
+}
+
+/// The `FILE` the model at `path` was downloaded from, if recorded.
+fn stamped_source(path: &Path) -> Option<String> {
+    let s = std::fs::read_to_string(stamp_path(path)).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+/// Which repo file the model at `path` is, as best we can tell.
+///
+/// The stamp is authoritative. Failing that the name is inferred from what the
+/// path actually resolves to, which covers the common setup of symlinking
+/// `ds4flash.gguf` at a GGUF kept elsewhere (a shared `~/.ds4/models`, say):
+/// the link target still carries the build in its name.
+fn local_build(path: &Path) -> Option<String> {
+    stamped_source(path).or_else(|| {
+        let resolved = std::fs::canonicalize(path).ok()?;
+        let name = resolved.file_name()?.to_str()?;
+        (name.starts_with("DeepSeek-V4-") && is_gguf(name)).then(|| name.to_string())
+    })
+}
+
+/// Whether `name` is a GGUF, by extension.
+fn is_gguf(name: &str) -> bool {
+    std::path::Path::new(name)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+}
+
+/// The build-independent part of a repo filename: the quant recipe, without
+/// any trailing `-MMDD` release tag.
+///
+/// `…-chat-v2-imatrix-0731.gguf` and `…-chat-v2-imatrix.gguf` share the family
+/// `…-chat-v2-imatrix`, which is what makes one recognizable as a newer cut of
+/// the other. Only a four-digit tag is stripped, so a recipe that genuinely
+/// ends in digits is left alone.
+fn family_of(file: &str) -> &str {
+    let stem = file.strip_suffix(".gguf").unwrap_or(file);
+    match stem.rsplit_once('-') {
+        Some((head, tag)) if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()) => head,
+        _ => stem,
+    }
+}
+
+/// Picks the most recently committed member of `family` out of a Hugging Face
+/// tree listing.
+///
+/// The API is the authority on ordering: every entry carries its commit date,
+/// so nothing here has to parse `-MMDD` tags or reason about year boundaries.
+/// Two builds of the same recipe are also byte-identical in size, so the date
+/// is the only signal that works.
+fn newest_in_family(json: &str, family: &str) -> Option<String> {
+    let entries: serde_json::Value = serde_json::from_str(json).ok()?;
+    let mut best: Option<(String, String)> = None;
+    for entry in entries.as_array()? {
+        let path = entry.get("path")?.as_str()?;
+        if entry.get("type").and_then(serde_json::Value::as_str) != Some("file")
+            || family_of(path) != family
+            || !is_gguf(path)
+        {
+            continue;
+        }
+        let date = entry
+            .get("lastCommit")
+            .and_then(|c| c.get("date"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        // ISO-8601 dates from the API sort correctly as plain strings.
+        if best.as_ref().is_none_or(|(_, b)| date > b.as_str()) {
+            best = Some((path.to_string(), date.to_string()));
+        }
+    }
+    best.map(|(path, _)| path)
+}
+
+/// Hugging Face tree listing for [`REPO`]. `expand=true` is what attaches each
+/// file's `lastCommit`, which is the whole basis for "newer".
+#[cfg(not(test))]
+const TREE_URL: &str =
+    "https://huggingface.co/api/models/antirez/deepseek-v4-gguf/tree/main?expand=true";
+/// How often to ask Hugging Face what the newest build is.
+const MODEL_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Bounded timeout for that request. Startup must never hang on the network.
+#[cfg(not(test))]
+const MODEL_CHECK_TIMEOUT_SECS: u64 = 3;
+/// Cache of `(last_check_epoch, newest_known_file)`, beside the model.
+const MODEL_CHECK_FILE: &str = "model-check";
+
+/// Fetches the repo tree, bounded by [`MODEL_CHECK_TIMEOUT_SECS`]. `None` on
+/// any failure — offline, timeout, HTTP error — so the caller stays quiet.
+#[cfg(not(test))]
+fn fetch_tree() -> Option<String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(MODEL_CHECK_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(TREE_URL)
+        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.body_mut().read_to_string().ok()
+}
+
+/// Test builds never touch the network; [`decide_upgrade`] is driven directly.
+#[cfg(test)]
+fn fetch_tree() -> Option<String> {
+    None
+}
+
+/// Current Unix time in whole seconds, or 0 if the clock predates the epoch.
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Reads the model-check cache: `(last_check_epoch, newest_known_file)`.
+fn read_check_cache(path: &Path) -> (Option<u64>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return (None, None);
+    };
+    let mut lines = text.lines();
+    let when = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
+    let newest = lines
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    (when, newest)
+}
+
+/// Pure decision: given what is on disk, the cache, and the clock, work out
+/// whether to offer an upgrade.
+///
+/// Returns `(refreshed_cache, offer)`. `fetch` is injected so tests can drive
+/// the whole thing without a network.
+///
+/// Asking is throttled to [`MODEL_CHECK_INTERVAL_SECS`], and the timestamp is
+/// written whether or not the offer is accepted. That is deliberate: a startup
+/// prompt you have already declined must not reappear on the next launch.
+fn decide_upgrade(
+    have: Option<&str>,
+    last: Option<u64>,
+    cached: Option<String>,
+    now: u64,
+    fetch: impl FnOnce() -> Option<String>,
+) -> (Option<(u64, String)>, Option<String>) {
+    // Nothing identifiable on disk means no family to track, so stay silent
+    // rather than guess a user's quant recipe wrong.
+    let Some(have) = have else {
+        return (None, None);
+    };
+    let family = family_of(have);
+
+    let due = last.is_none_or(|t| now.saturating_sub(t) >= MODEL_CHECK_INTERVAL_SECS);
+    let (newest, refreshed) = if due {
+        match fetch().as_deref().and_then(|j| newest_in_family(j, family)) {
+            Some(found) => (Some(found.clone()), Some((now, found))),
+            // A failed check is not worth burning the interval on.
+            None => (cached, None),
+        }
+    } else {
+        (cached, None)
+    };
+
+    let offer = newest.filter(|n| n != have);
+    (refreshed, offer)
+}
 
 /// Rotating status lines shown while the model downloads.
 const MESSAGES: [&str; 200] = [
@@ -241,10 +433,15 @@ pub fn default_model_path() -> PathBuf {
     home.join(".plank").join("ds4flash.gguf")
 }
 
+/// Hugging Face download URL for `file` in [`REPO`].
+fn file_url(file: &str) -> String {
+    format!("https://huggingface.co/{REPO}/resolve/main/{file}")
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
-    format!("https://huggingface.co/{REPO}/resolve/main/{FILE}")
+    file_url(FILE)
 }
 
 /// Ensures a model file exists at `path`, offering to download it if missing.
@@ -254,6 +451,9 @@ pub fn model_url() -> String {
 /// terminal (so no prompt is possible), or when the download fails.
 pub fn ensure_model(path: &Path) -> Result<(), String> {
     if path.exists() {
+        if std::io::stdin().is_terminal() {
+            return offer_upgrade(path);
+        }
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -271,7 +471,7 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
             gb(partial_bytes(path))
         );
     } else {
-        eprintln!("plank can download DeepSeek V4 Flash (~81 GB) from Hugging Face:");
+        eprintln!("plank can download DeepSeek V4 Flash (~87 GB) from Hugging Face:");
     }
     eprintln!("  {}", model_url());
     eprint!(
@@ -288,6 +488,43 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
         return Err("no model available; re-run with -m <path> or download it".to_string());
     }
     download(&model_url(), path)
+}
+
+/// Asks Hugging Face whether a newer build of the local model's quant family
+/// exists and, if so, offers to fetch it.
+///
+/// Never fatal: a model that is one release behind still works, so every
+/// failure path here — offline, unreadable cache, declined prompt — leaves the
+/// existing model in place and returns `Ok`.
+fn offer_upgrade(path: &Path) -> Result<(), String> {
+    let have = local_build(path);
+    let cache = path.with_file_name(MODEL_CHECK_FILE);
+    let (last, cached) = read_check_cache(&cache);
+    let (refreshed, offer) = decide_upgrade(have.as_deref(), last, cached, now_epoch(), fetch_tree);
+
+    if let Some((when, ref newest)) = refreshed {
+        let _ = std::fs::write(&cache, format!("{when}\n{newest}\n"));
+    }
+    let Some(newest) = offer else {
+        return Ok(());
+    };
+
+    eprintln!("A newer DeepSeek V4 Flash build is available:");
+    eprintln!("  have: {}", have.unwrap_or_default());
+    eprintln!("  new:  {newest}");
+    eprint!("Download it now? [y/N] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    if matches!(answer.trim(), "y" | "Y" | "yes") {
+        // Fetch the build we actually found, not the compiled-in default.
+        download(&file_url(&newest), path)?;
+        let _ = std::fs::write(stamp_path(path), format!("{newest}\n"));
+        return Ok(());
+    }
+    Ok(())
 }
 
 /// Size of the partial download alongside `dest`, or 0 if none.
@@ -307,6 +544,7 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     // (e.g. a previous run died between finishing the body and renaming).
     if total.is_some_and(|t| t > 0 && partial_bytes(dest) == t) {
         std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+        finish(dest);
         eprintln!("Model ready at {}.", dest.display());
         return Ok(());
     }
@@ -341,8 +579,70 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
         }
     }
     std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+    finish(dest);
     eprintln!("Model ready at {}.", dest.display());
     Ok(())
+}
+
+/// Records the [`FILE`] that produced `dest`, so a later [`FILE`] bump can be
+/// noticed. Best-effort: a model that downloaded fine is not worth failing
+/// over an unwritable sidecar.
+fn write_stamp(dest: &Path) {
+    let _ = std::fs::write(stamp_path(dest), format!("{FILE}\n"));
+}
+
+/// Celebratory sounds, best first.
+///
+/// `Tada` is the one to play, but Apple dropped it from `/System/Library/Sounds`
+/// in recent macOS, so the list falls through to the nearest survivors rather
+/// than going silent on a machine that never had it.
+const TADA_SOUNDS: [&str; 3] = ["Tada", "Hero", "Glass"];
+
+/// Where macOS keeps sounds: the user's own first, then the system's.
+fn sound_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home).join("Library/Sounds"));
+    }
+    dirs.push(PathBuf::from("/System/Library/Sounds"));
+    dirs
+}
+
+/// First of `names` that exists under any of `dirs`, in preference order.
+///
+/// Names are tried outermost so a user's own `Tada.aiff` beats a system
+/// fallback, rather than whichever directory happens to come first.
+fn find_sound(names: &[&str], dirs: &[PathBuf]) -> Option<PathBuf> {
+    names.iter().find_map(|name| {
+        dirs.iter()
+            .map(|dir| dir.join(format!("{name}.aiff")))
+            .find(|path| path.is_file())
+    })
+}
+
+/// Plays the completion sound. Best-effort and detached — a download that
+/// finished is not worth failing over a missing audio player.
+#[cfg(target_os = "macos")]
+fn play_tada() {
+    let Some(path) = find_sound(&TADA_SOUNDS, &sound_dirs()) else {
+        return;
+    };
+    let _ = std::process::Command::new("/usr/bin/afplay")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// No system sound library to draw on off macOS.
+#[cfg(not(target_os = "macos"))]
+fn play_tada() {}
+
+/// Marks a finished download: stamps the build and sounds the fanfare.
+fn finish(dest: &Path) {
+    write_stamp(dest);
+    play_tada();
 }
 
 /// Spawns the worker thread that streams `url` into `part`, resuming if possible.
@@ -389,89 +689,58 @@ fn fetch(url: &str, part: &Path, cancel: &AtomicBool) -> Result<(), String> {
     }
 }
 
-/// Runs the full-screen download UI until the worker finishes or the user cancels.
-fn run_ui(
-    terminal: &mut ratatui::DefaultTerminal,
-    worker: &JoinHandle<Result<(), String>>,
-    cancel: &AtomicBool,
-    part: &Path,
-    total: Option<u64>,
-) -> Result<(), String> {
-    let start = Instant::now();
-    let mut msg = 0usize;
-    let mut last_rotate = Instant::now();
-    // Render the logo once (it never changes), sized to fill most of the
-    // splash. The image is portrait (~0.87:1), so one output row spans ~0.57
-    // columns; a width of ~1.74x the target row count fills that many rows.
-    // Pick a width that fills ~75% of the height and still fits the width.
-    let (rows, cols) = terminal
-        .size()
-        .map_or((24u16, 80u16), |s| (s.height, s.width));
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    let logo_width = {
-        let by_height = (f32::from(rows) * 0.75 * 1.74) as u32;
-        // Never let the logo crowd out the message/gauge/stats block (6 rows).
-        let fit = (f32::from(rows.saturating_sub(7)) * 1.74) as u32;
-        by_height
-            .min(fit)
-            .min(u32::from(cols).saturating_sub(2))
-            .max(24)
-    };
-    let logo = tui::ansi_to_lines(&logo::art(logo_width));
-    loop {
-        if worker.is_finished() {
-            let _ = terminal.draw(|f| draw(f, &logo, part, total, msg, start));
-            // The caller joins the worker and surfaces its error, if any.
-            return Ok(());
-        }
-        // Ctrl-C / Esc / q cancels; the poll timeout also paces the frames.
-        if event::poll(Duration::from_millis(250)).map_err(|e| e.to_string())?
-            && let Ok(Event::Key(k)) = event::read()
-            && k.kind == KeyEventKind::Press
-            && (matches!(k.code, KeyCode::Esc | KeyCode::Char('q'))
-                || (matches!(k.code, KeyCode::Char('c'))
-                    && k.modifiers.contains(KeyModifiers::CONTROL)))
-        {
-            cancel.store(true, Ordering::Relaxed);
-            return Err("download cancelled".to_string());
-        }
-        if last_rotate.elapsed() >= Duration::from_secs(3) {
-            msg += 1;
-            last_rotate = Instant::now();
-        }
-        let _ = terminal.draw(|f| draw(f, &logo, part, total, msg, start));
-    }
+/// Rows the message/gauge/stats block always keeps: message, gauge, stats and
+/// the two spacers between them.
+const PROGRESS_ROWS: u16 = 5;
+/// Rows taken by one of the rules bracketing the playfield.
+const RULE_ROWS: u16 = 1;
+/// Both rules together: one above the field, one below it.
+const RULES_ROWS: u16 = RULE_ROWS * 2;
+/// Frame budget while the game is up; the ball needs far more than the 250 ms
+/// a gauge is happy with.
+const GAME_FRAME_MS: u64 = 16;
+/// Frame budget with no game on screen — a gauge and a slowly rotating message
+/// do not justify spinning.
+const IDLE_FRAME_MS: u64 = 250;
+/// How long each rotating message stays up. Long enough to actually read it:
+/// the list runs to 200 lines and the download to hours, so there is no need
+/// to hurry through them.
+const MESSAGE_DWELL: Duration = Duration::from_secs(9);
+
+/// Where each piece of the download screen goes.
+///
+/// The progress block always gets its rows; the playfield takes everything
+/// left over, so the field grows with the terminal. Below [`arcade::MIN_W`] x
+/// [`arcade::MIN_H`], or once the game has been closed, the screen is just the
+/// message, gauge and stats.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Screen {
+    /// The rules bracketing the playfield, above and below.
+    rule_top: Option<Rect>,
+    rule_bottom: Option<Rect>,
+    game: Option<Rect>,
+    message: Rect,
+    gauge: Rect,
+    stats: Rect,
 }
 
-/// Draws one download frame: centered logo, red rotating message, gauge, stats.
-fn draw(
-    frame: &mut Frame,
-    logo: &[Line<'static>],
-    part: &Path,
-    total: Option<u64>,
-    msg: usize,
-    start: Instant,
-) {
-    let current = std::fs::metadata(part).map_or(0, |m| m.len());
-    let elapsed = start.elapsed().as_secs_f64();
-    #[allow(clippy::cast_precision_loss)]
-    let speed = if elapsed > 0.0 {
-        current as f64 / elapsed / 1_000_000.0
+/// Splits `area`, giving the playfield whatever the progress block does not
+/// need. `show_game` is false once the user has closed the game.
+fn layout(area: Rect, show_game: bool) -> Screen {
+    let avail = area.height.saturating_sub(PROGRESS_ROWS);
+    let game_h = if show_game && playable(area.height, area.width) {
+        // Two rows go to the rules bracketing the playfield.
+        avail - RULES_ROWS
     } else {
-        0.0
+        0
     };
+    let rule_h = if game_h > 0 { RULE_ROWS } else { 0 };
 
-    let area = frame.area();
-    let logo_h = u16::try_from(logo.len()).unwrap_or(0);
-    // Center the logo + progress block vertically.
     let rows = Layout::vertical([
         Constraint::Fill(1),
-        Constraint::Length(logo_h), // logo
-        Constraint::Length(1),      // spacer
+        Constraint::Length(rule_h), // rule above the playfield
+        Constraint::Length(game_h),
+        Constraint::Length(rule_h), // rule below it
         Constraint::Length(1),      // message
         Constraint::Length(1),      // spacer
         Constraint::Length(1),      // gauge
@@ -481,21 +750,231 @@ fn draw(
     ])
     .split(area);
 
-    // Logo, horizontally centered at its rendered width.
-    let logo_w = u16::try_from(logo.iter().map(Line::width).max().unwrap_or(0)).unwrap_or(0);
-    let logo_area = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(logo_w),
-        Constraint::Fill(1),
-    ])
-    .split(rows[1])[1];
-    frame.render_widget(Paragraph::new(logo.to_vec()), logo_area);
+    Screen {
+        rule_top: (rule_h > 0).then(|| rows[1]),
+        game: (game_h > 0).then(|| rows[2]),
+        rule_bottom: (rule_h > 0).then(|| rows[3]),
+        message: rows[4],
+        gauge: rows[6],
+        stats: rows[8],
+    }
+}
+
+/// Whether a terminal of `rows` x `cols` has room for the playfield once the
+/// progress block has taken its share.
+fn playable(rows: u16, cols: u16) -> bool {
+    cols >= arcade::MIN_W && rows.saturating_sub(PROGRESS_ROWS + RULES_ROWS) >= arcade::MIN_H
+}
+
+/// What a key press asks the download screen to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Action {
+    /// Abort the transfer.
+    Cancel,
+    /// Put the game away, leaving the bare progress screen.
+    CloseGame,
+    /// Not ours — hand it to the game.
+    Play,
+}
+
+/// Classifies a key press.
+///
+/// Esc is staged: it closes the game first and only cancels once the game is
+/// already gone, so reaching for it mid-rally cannot lose you an 87 GB
+/// download by accident. `q` and Ctrl-C stay immediate — someone typing those
+/// means it.
+fn classify(key: KeyEvent, game_open: bool) -> Action {
+    if matches!(key.code, KeyCode::Char('q'))
+        || (matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL))
+    {
+        return Action::Cancel;
+    }
+    if key.code == KeyCode::Esc {
+        return if game_open {
+            Action::CloseGame
+        } else {
+            Action::Cancel
+        };
+    }
+    Action::Play
+}
+
+/// Runs the full-screen download UI until the worker finishes or the user cancels.
+fn run_ui(
+    terminal: &mut ratatui::DefaultTerminal,
+    worker: &JoinHandle<Result<(), String>>,
+    cancel: &AtomicBool,
+    part: &Path,
+    total: Option<u64>,
+) -> Result<(), String> {
+    let start = Instant::now();
+    // Bytes already on disk: the baseline a resumed download measures from.
+    let done = std::fs::metadata(part).map_or(0, |m| m.len());
+    let mut msg = 0usize;
+    let mut last_rotate = Instant::now();
+
+    // The wait is long enough to deserve a game. It advances only through the
+    // measured delta below, never its own clock — see `crate::arcade`. `None`
+    // once the user has closed it with Esc.
+    let mut game = Some(Breakout::new(seed()));
+    let mut last_frame = Instant::now();
+    loop {
+        if worker.is_finished() {
+            let _ = terminal.draw(|f| draw(f, game.as_ref(), part, total, msg, start, done));
+            // The caller joins the worker and surfaces its error, if any.
+            return Ok(());
+        }
+        // The poll timeout paces the frames: fast enough for a moving ball
+        // while one is on screen, unhurried once the game is closed or the
+        // terminal is too small for it and there is only a gauge to repaint.
+        let size = terminal
+            .size()
+            .map_or((24u16, 80u16), |s| (s.height, s.width));
+        let tick = if game.is_some() && playable(size.0, size.1) {
+            GAME_FRAME_MS
+        } else {
+            IDLE_FRAME_MS
+        };
+        if event::poll(Duration::from_millis(tick)).map_err(|e| e.to_string())?
+            && let Ok(Event::Key(k)) = event::read()
+            && k.kind == KeyEventKind::Press
+        {
+            match classify(k, game.is_some()) {
+                Action::Cancel => {
+                    cancel.store(true, Ordering::Relaxed);
+                    return Err("download cancelled".to_string());
+                }
+                Action::CloseGame => game = None,
+                Action::Play => {
+                    if let Some(g) = game.as_mut() {
+                        g.handle_key(k);
+                    }
+                }
+            }
+        }
+        if last_rotate.elapsed() >= MESSAGE_DWELL {
+            msg += 1;
+            last_rotate = Instant::now();
+        }
+        let dt = last_frame.elapsed();
+        last_frame = Instant::now();
+        if let Some(g) = game.as_mut() {
+            g.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+        }
+        let _ = terminal.draw(|f| draw(f, game.as_ref(), part, total, msg, start, done));
+    }
+}
+
+/// A seed for the download screen's game, from the wall clock.
+fn seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(1, |d| d.as_secs() ^ u64::from(d.subsec_nanos()) << 20)
+}
+
+/// Paints the playfield into `area`: the game's glyphs, its scoreboard on the
+/// bottom row, and any centered banner stamped over the middle.
+///
+/// Mirrors [`crate::tui::draw_arcade`], but into a sub-area rather than the
+/// whole frame, and clamped so a stray coordinate cannot reach the gauge.
+fn draw_game(frame: &mut Frame, game: &Breakout, area: Rect) {
+    if area.height < 2 {
+        return;
+    }
+    let play = Rect {
+        height: area.height - 1,
+        ..area
+    };
+
+    let buf = frame.buffer_mut();
+    for g in game.glyphs(play.width, play.height) {
+        if g.x >= play.width || g.y >= play.height {
+            continue;
+        }
+        if let Some(cell) = buf.cell_mut(Position::new(play.x + g.x, play.y + g.y)) {
+            let (r, gr, b) = g.color;
+            cell.set_char(g.ch).set_fg(Color::Rgb(r, gr, b));
+        }
+    }
+
+    if let Some(text) = game.banner() {
+        let width = u16::try_from(text.chars().count()).unwrap_or(u16::MAX);
+        let rect = Rect {
+            x: play.x + play.width.saturating_sub(width + 2) / 2,
+            y: play.y + play.height / 2,
+            width: (width + 2).min(play.width),
+            height: 1,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!(" {text} "),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Rgb(255, 214, 120))
+                    .add_modifier(Modifier::BOLD),
+            ))),
+            rect,
+        );
+    }
+
+    let hud = Rect {
+        y: area.y + area.height - 1,
+        height: 1,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(game.hud())
+            .style(Style::default().fg(Color::Indexed(245)))
+            .alignment(Alignment::Center),
+        hud,
+    );
+}
+
+/// Draws one download frame: centered logo, red rotating message, gauge, stats.
+fn draw(
+    frame: &mut Frame,
+    game: Option<&Breakout>,
+    part: &Path,
+    total: Option<u64>,
+    msg: usize,
+    start: Instant,
+    done: u64,
+) {
+    let current = std::fs::metadata(part).map_or(0, |m| m.len());
+    let elapsed = start.elapsed().as_secs_f64();
+    // Only bytes fetched *this run* count toward the rate: on a resume the
+    // file already holds `done` bytes, and charging those to zero elapsed time
+    // reports a wild speed and a meaningless ETA.
+    #[allow(clippy::cast_precision_loss)]
+    let speed = if elapsed > 0.0 {
+        current.saturating_sub(done) as f64 / elapsed / 1_000_000.0
+    } else {
+        0.0
+    };
+
+    let area = frame.area();
+    let screen = layout(area, game.is_some());
+
+    // Rules bracketing the playfield: the wall hangs from the top one, and
+    // the bottom one closes the field off from the progress block.
+    for row in [screen.rule_top, screen.rule_bottom].into_iter().flatten() {
+        frame.render_widget(
+            Paragraph::new("─".repeat(row.width as usize))
+                .style(Style::default().fg(Color::Indexed(240))),
+            row,
+        );
+    }
+
+    if let (Some(row), Some(game)) = (screen.game, game) {
+        draw_game(frame, game, row);
+    }
 
     let red = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
     let message = Paragraph::new(MESSAGES[msg % MESSAGES.len()])
         .style(red)
         .alignment(Alignment::Center);
-    frame.render_widget(message, rows[3]);
+    frame.render_widget(message, screen.message);
 
     // A centered, fixed-width gauge.
     let gauge_area = Layout::horizontal([
@@ -503,7 +982,7 @@ fn draw(
         Constraint::Length(48),
         Constraint::Fill(1),
     ])
-    .split(rows[5])[1];
+    .split(screen.gauge)[1];
     #[allow(clippy::cast_precision_loss)]
     let ratio = match total.filter(|t| *t > 0) {
         Some(t) => (current as f64 / t as f64).clamp(0.0, 1.0),
@@ -513,11 +992,26 @@ fn draw(
         || "downloading...".to_string(),
         |_| format!("{:.1}%", ratio * 100.0),
     );
+    let eta = total.and_then(|t| eta_secs(current, t, done, elapsed).map(format_eta));
+    let eta_slot = eta
+        .as_deref()
+        .and_then(|text| eta_slot(gauge_area, ratio, &label, text));
     let gauge = Gauge::default()
         .gauge_style(Style::default().fg(Color::Red).bg(Color::Indexed(238)))
         .ratio(ratio)
         .label(label);
     frame.render_widget(gauge, gauge_area);
+
+    // The ETA rides in the unfilled part of the bar. It is painted over the
+    // gauge, so it keeps the gauge's own unfilled background.
+    if let (Some(slot), Some(text)) = (eta_slot, eta) {
+        frame.render_widget(
+            Paragraph::new(text)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(Color::Gray).bg(Color::Indexed(238))),
+            slot,
+        );
+    }
 
     let stats = match total {
         Some(t) => format!("{:.1} / {:.1} GB   {speed:.0} MB/s", gb(current), gb(t)),
@@ -526,7 +1020,70 @@ fn draw(
     let stats_line = Paragraph::new(stats)
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
-    frame.render_widget(stats_line, rows[7]);
+    frame.render_widget(stats_line, screen.stats);
+}
+
+/// Seconds left, from the rate achieved so far.
+///
+/// `done` is what was already on disk when this run started — a resumed
+/// download must not count those bytes as progress, or the first frames report
+/// an enormous rate and an ETA of nothing. `None` until there is enough of a
+/// sample to divide by.
+fn eta_secs(current: u64, total: u64, done: u64, elapsed: f64) -> Option<f64> {
+    let fetched = current.checked_sub(done)?;
+    let left = total.checked_sub(current)?;
+    if elapsed <= 0.5 || fetched == 0 || left == 0 {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let rate = fetched as f64 / elapsed;
+    #[allow(clippy::cast_precision_loss)]
+    let secs = left as f64 / rate;
+    secs.is_finite().then_some(secs)
+}
+
+/// Renders seconds as a compact "time left", coarsening as it grows.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn format_eta(secs: f64) -> String {
+    let secs = secs.clamp(0.0, f64::from(u32::MAX)) as u64;
+    match (secs / 3600, (secs % 3600) / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s left"),
+        (0, m, s) => format!("{m}m {s}s left"),
+        (h, m, _) => format!("{h}h {m}m left"),
+    }
+}
+
+/// Where the ETA goes inside the bar, or `None` when it will not fit.
+///
+/// It is centered in the unfilled span, but never over the percent label the
+/// gauge centers on the whole bar — so the usable room is what is left to the
+/// right of that label. As the bar fills, that room shrinks; once it is too
+/// narrow the ETA is dropped rather than clipped.
+fn eta_slot(bar: Rect, ratio: f64, label: &str, text: &str) -> Option<Rect> {
+    let text_w = u16::try_from(text.chars().count()).ok()?;
+    let label_w = u16::try_from(label.chars().count()).ok()?;
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let filled = (ratio.clamp(0.0, 1.0) * f64::from(bar.width)).round() as u16;
+    let label_end = bar.x + (bar.width.saturating_sub(label_w)) / 2 + label_w;
+    // One blank column of breathing room after each of them.
+    let start = (bar.x + filled).max(label_end + 1);
+    let end = bar.x + bar.width;
+
+    let room = end.checked_sub(start)?;
+    if room < text_w + 2 {
+        return None;
+    }
+    Some(Rect {
+        x: start + (room - text_w) / 2,
+        y: bar.y,
+        width: text_w,
+        height: 1,
+    })
 }
 
 /// Probes the total download size via a HEAD request.
@@ -556,6 +1113,380 @@ mod tests {
         assert!(MESSAGES.iter().all(|m| !m.is_empty()));
         let unique: std::collections::HashSet<_> = MESSAGES.iter().collect();
         assert_eq!(unique.len(), MESSAGES.len(), "messages must be unique");
+    }
+
+    /// A terminal of `cols` x `rows`.
+    fn term(cols: u16, rows: u16) -> Rect {
+        Rect::new(0, 0, cols, rows)
+    }
+
+    #[test]
+    fn progress_block_is_never_covered_by_the_playfield() {
+        for rows in 5..60u16 {
+            for cols in [20u16, 30, 80, 200] {
+                let s = layout(term(cols, rows), true);
+                // The three progress rows are distinct and in order.
+                assert!(s.message.y < s.gauge.y, "{cols}x{rows}");
+                assert!(s.gauge.y < s.stats.y, "{cols}x{rows}");
+                if let Some(game) = s.game {
+                    assert!(
+                        game.y + game.height <= s.message.y,
+                        "playfield overlaps the message at {cols}x{rows}"
+                    );
+                    let top = s.rule_top.expect("a playfield always gets its rules");
+                    let bottom = s.rule_bottom.expect("both of them");
+                    assert!(top.bottom() <= game.y, "top rule overlaps the field");
+                    assert!(game.bottom() <= bottom.y, "bottom rule overlaps the field");
+                    assert!(
+                        bottom.bottom() <= s.message.y,
+                        "bottom rule hits the message"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn game_is_suppressed_when_the_terminal_is_too_small() {
+        // Too narrow, however tall.
+        let narrow = layout(term(arcade::MIN_W - 1, 60), true);
+        assert!(narrow.game.is_none());
+        assert!(
+            narrow.rule_top.is_none() && narrow.rule_bottom.is_none(),
+            "no stray rules without a field"
+        );
+        // Too short, however wide: the progress block, the rule and MIN_H do
+        // not fit.
+        let short = layout(
+            term(200, PROGRESS_ROWS + RULE_ROWS + arcade::MIN_H - 1),
+            true,
+        );
+        assert!(short.game.is_none());
+    }
+
+    #[test]
+    fn the_field_takes_every_row_the_progress_block_does_not() {
+        // No logo competes for space any more: the field grows with the
+        // terminal, which is what keeps the wall clear of the paddle.
+        let tall = layout(term(80, 60), true);
+        assert_eq!(tall.game.unwrap().height, 60 - PROGRESS_ROWS - RULES_ROWS);
+        assert_eq!(tall.rule_top.unwrap().height, RULE_ROWS);
+        assert_eq!(tall.rule_bottom.unwrap().height, RULE_ROWS);
+        assert!(
+            layout(term(80, 80), true).game.unwrap().height > tall.game.unwrap().height,
+            "a taller terminal means a taller field"
+        );
+    }
+
+    #[test]
+    fn closing_the_game_hands_its_rows_back() {
+        let closed = layout(term(80, 60), false);
+        assert!(closed.game.is_none(), "the field is gone");
+        assert!(
+            closed.rule_top.is_none() && closed.rule_bottom.is_none(),
+            "and so are its rules"
+        );
+        // The progress block is untouched and still in order.
+        let open = layout(term(80, 60), true);
+        assert!(closed.message.y < closed.gauge.y);
+        assert!(closed.gauge.y < closed.stats.y);
+        assert_eq!(closed.message.height, open.message.height);
+    }
+
+    #[test]
+    fn the_completion_sound_falls_back_when_tada_is_missing() {
+        let root = std::env::temp_dir().join(format!("plank-sound-{}", std::process::id()));
+        let (user, system) = (root.join("user"), root.join("system"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let dirs = vec![user.clone(), system.clone()];
+
+        // Nothing installed at all: silence, not a panic.
+        assert!(find_sound(&TADA_SOUNDS, &dirs).is_none());
+
+        // Recent macOS ships no Tada, so the next choice wins.
+        std::fs::write(system.join("Glass.aiff"), b"").unwrap();
+        assert_eq!(
+            find_sound(&TADA_SOUNDS, &dirs),
+            Some(system.join("Glass.aiff"))
+        );
+        std::fs::write(system.join("Hero.aiff"), b"").unwrap();
+        assert_eq!(
+            find_sound(&TADA_SOUNDS, &dirs),
+            Some(system.join("Hero.aiff")),
+            "Hero is preferred over Glass"
+        );
+
+        // A real Tada anywhere beats every fallback...
+        std::fs::write(system.join("Tada.aiff"), b"").unwrap();
+        assert_eq!(
+            find_sound(&TADA_SOUNDS, &dirs),
+            Some(system.join("Tada.aiff"))
+        );
+        // ...and the user's own copy beats the system one.
+        std::fs::write(user.join("Tada.aiff"), b"").unwrap();
+        assert_eq!(
+            find_sound(&TADA_SOUNDS, &dirs),
+            Some(user.join("Tada.aiff"))
+        );
+
+        // Preference is by name first, not by directory: a user-installed
+        // Hero must not outrank a system Tada.
+        std::fs::remove_file(user.join("Tada.aiff")).unwrap();
+        std::fs::write(user.join("Hero.aiff"), b"").unwrap();
+        assert_eq!(
+            find_sound(&TADA_SOUNDS, &dirs),
+            Some(system.join("Tada.aiff"))
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn the_eta_hides_once_the_unfilled_span_runs_out() {
+        let bar = Rect::new(10, 4, 48, 1);
+        let text = "12m 30s left";
+        // Early on there is plenty of room to the right of the percent label.
+        let slot = eta_slot(bar, 0.10, "10.0%", text).expect("room at 10%");
+        assert_eq!(slot.width, 12);
+        assert!(slot.y == bar.y && slot.height == 1);
+        // It never sits over the centered percent label.
+        let label_end = bar.x + (bar.width - 5) / 2 + 5;
+        assert!(slot.x > label_end, "ETA overlaps the percent label");
+        // Nor over the filled part of the bar.
+        assert!(slot.x >= bar.x + 5, "ETA sits on filled bar");
+
+        // As the bar fills the room shrinks and the ETA is dropped rather
+        // than clipped.
+        assert!(
+            eta_slot(bar, 0.95, "95.0%", text).is_none(),
+            "no room at 95%"
+        );
+        assert!(
+            eta_slot(bar, 1.0, "100.0%", text).is_none(),
+            "none when done"
+        );
+        // A narrow bar never has room at all.
+        assert!(eta_slot(Rect::new(0, 0, 20, 1), 0.0, "0.0%", text).is_none());
+    }
+
+    #[test]
+    fn the_eta_slot_stays_inside_the_bar_at_every_ratio() {
+        let bar = Rect::new(3, 0, 48, 1);
+        for pct in 0..=100 {
+            let ratio = f64::from(pct) / 100.0;
+            let label = format!("{:.1}%", ratio * 100.0);
+            if let Some(slot) = eta_slot(bar, ratio, &label, "1h 2m left") {
+                assert!(slot.x >= bar.x, "{pct}% ran off the left");
+                assert!(
+                    slot.x + slot.width <= bar.x + bar.width,
+                    "{pct}% ran off the right"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_eta_measures_only_what_this_run_fetched() {
+        // A resumed download starts with bytes already on disk. Counting them
+        // as progress would report a huge rate and an ETA of almost nothing.
+        let resumed = eta_secs(60_000_000_000, 80_000_000_000, 50_000_000_000, 10.0);
+        // 10 GB in 10 s = 1 GB/s, 20 GB left => 20 s.
+        assert_eq!(resumed.map(f64::round), Some(20.0));
+        // Counting the pre-existing bytes would have said 3 s instead.
+        let naive = eta_secs(60_000_000_000, 80_000_000_000, 0, 10.0);
+        assert_eq!(naive.map(f64::round), Some(3.0));
+
+        // Too early, nothing fetched yet, or already complete: no estimate.
+        assert!(eta_secs(1_000, 80_000, 0, 0.1).is_none(), "too early");
+        assert!(
+            eta_secs(500, 80_000, 500, 30.0).is_none(),
+            "nothing fetched"
+        );
+        assert!(eta_secs(80_000, 80_000, 0, 30.0).is_none(), "already done");
+    }
+
+    #[test]
+    fn the_eta_coarsens_as_it_grows() {
+        assert_eq!(format_eta(9.0), "9s left");
+        assert_eq!(format_eta(90.0), "1m 30s left");
+        assert_eq!(format_eta(3_600.0), "1h 0m left");
+        assert_eq!(format_eta(7_830.0), "2h 10m left");
+        // Absurd inputs must not panic or wrap.
+        assert_eq!(format_eta(-5.0), "0s left");
+        assert!(format_eta(f64::INFINITY).ends_with("left"));
+    }
+
+    #[test]
+    fn esc_closes_the_game_first_and_cancels_only_after() {
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        // Two presses to abort: the first only puts the game away, so reaching
+        // for Esc mid-rally cannot lose an 87 GB download.
+        assert_eq!(classify(esc, true), Action::CloseGame);
+        assert_eq!(classify(esc, false), Action::Cancel);
+    }
+
+    #[test]
+    fn q_and_ctrl_c_cancel_outright_even_mid_rally() {
+        let q = KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        for open in [true, false] {
+            assert_eq!(classify(q, open), Action::Cancel, "q, game open: {open}");
+            assert_eq!(classify(ctrl_c, open), Action::Cancel);
+        }
+        // Plain 'c' is a game key, not a cancel.
+        assert_eq!(
+            classify(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), true),
+            Action::Play
+        );
+    }
+
+    #[test]
+    fn paddle_keys_reach_the_game() {
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Char(' ')] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(classify(key, true), Action::Play, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn paddle_keys_are_accepted_by_the_game() {
+        let mut game = Breakout::new(1);
+        for code in [KeyCode::Left, KeyCode::Right] {
+            let key = KeyEvent::new(code, KeyModifiers::NONE);
+            assert_eq!(classify(key, true), Action::Play);
+            assert!(game.handle_key(key), "{code:?} should move the paddle");
+        }
+    }
+
+    const APRIL: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
+    const JULY: &str =
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
+
+    /// A tree listing shaped like the real one, newest entry deliberately not
+    /// last so the pick cannot pass by accident.
+    fn tree() -> String {
+        format!(
+            r#"[
+              {{"type":"file","path":"{JULY}","lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
+              {{"type":"file","path":"{APRIL}","lastCommit":{{"date":"2026-05-11T10:00:00.000Z"}}}},
+              {{"type":"file","path":"DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf",
+                "lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
+              {{"type":"directory","path":"imatrix"}}
+            ]"#
+        )
+    }
+
+    #[test]
+    fn family_strips_only_a_four_digit_release_tag() {
+        let family = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix";
+        assert_eq!(family_of(JULY), family);
+        assert_eq!(
+            family_of(APRIL),
+            family,
+            "the untagged build is the same family"
+        );
+        assert_eq!(family_of(FILE), family, "the pinned default too");
+        // A recipe ending in digits is not a release tag.
+        assert_eq!(family_of("Model-MXFP4.gguf"), "Model-MXFP4");
+        assert_eq!(family_of("Model-Q4K-12345.gguf"), "Model-Q4K-12345");
+    }
+
+    #[test]
+    fn newest_is_picked_by_commit_date_within_the_family() {
+        let family = family_of(APRIL);
+        assert_eq!(newest_in_family(&tree(), family).as_deref(), Some(JULY));
+        // The Q4 build is a different family and must never be offered to a
+        // machine running the Q2 quant.
+        assert_ne!(
+            newest_in_family(&tree(), family).as_deref(),
+            Some("DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf")
+        );
+        // An unknown family matches nothing; malformed JSON is not fatal.
+        assert!(newest_in_family(&tree(), "Nope").is_none());
+        assert!(newest_in_family("not json", family).is_none());
+    }
+
+    #[test]
+    fn upgrade_is_offered_only_for_a_genuinely_newer_build() {
+        let now = 1_800_000_000;
+        let fetch = || Some(tree());
+
+        // Running April: July is offered and the cache is refreshed.
+        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, fetch);
+        assert_eq!(offer.as_deref(), Some(JULY));
+        assert_eq!(cache, Some((now, JULY.to_string())));
+
+        // Already on July: nothing to offer.
+        let (_, offer) = decide_upgrade(Some(JULY), None, None, now, fetch);
+        assert!(offer.is_none());
+
+        // Nothing identifiable on disk: stay silent rather than guess.
+        let (cache, offer) = decide_upgrade(None, None, None, now, fetch);
+        assert!(offer.is_none() && cache.is_none());
+    }
+
+    #[test]
+    fn the_check_is_throttled_and_a_decline_is_not_re_asked() {
+        let now = 1_800_000_000;
+        let boom = || panic!("must not hit the network inside the interval");
+
+        // Within the interval the cached answer is reused, no fetch.
+        let recent = now - MODEL_CHECK_INTERVAL_SECS + 1;
+        let (cache, offer) =
+            decide_upgrade(Some(APRIL), Some(recent), Some(JULY.to_string()), now, boom);
+        assert_eq!(
+            offer.as_deref(),
+            Some(JULY),
+            "the cached answer still stands"
+        );
+        assert!(cache.is_none(), "no refresh without a fetch");
+
+        // Past the interval it checks again.
+        let stale = now - MODEL_CHECK_INTERVAL_SECS;
+        let (cache, _) = decide_upgrade(Some(APRIL), Some(stale), None, now, || Some(tree()));
+        assert_eq!(cache, Some((now, JULY.to_string())));
+    }
+
+    #[test]
+    fn a_failed_check_does_not_burn_the_interval() {
+        let now = 1_800_000_000;
+        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, || None);
+        assert!(cache.is_none(), "offline must not count as a check");
+        assert!(offer.is_none());
+        // A previously cached answer survives an offline check.
+        let (_, offer) = decide_upgrade(Some(APRIL), None, Some(JULY.to_string()), now, || None);
+        assert_eq!(offer.as_deref(), Some(JULY));
+    }
+
+    #[test]
+    fn the_local_build_is_read_from_the_stamp_or_the_link_target() {
+        let dir = std::env::temp_dir().join(format!("plank-build-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let model = dir.join("ds4flash.gguf");
+
+        // A stamp is authoritative.
+        std::fs::write(&model, b"weights").unwrap();
+        write_stamp(&model);
+        assert_eq!(local_build(&model).as_deref(), Some(FILE));
+
+        // Without one, a symlink reveals the build through its target — the
+        // shared ~/.ds4/models setup.
+        std::fs::remove_file(stamp_path(&model)).unwrap();
+        std::fs::remove_file(&model).unwrap();
+        let real = dir.join(APRIL);
+        std::fs::write(&real, b"weights").unwrap();
+        std::os::unix::fs::symlink(&real, &model).unwrap();
+        assert_eq!(local_build(&model).as_deref(), Some(APRIL));
+
+        // An opaque name stays unknown.
+        let opaque = dir.join("mystery.gguf");
+        std::fs::write(&opaque, b"weights").unwrap();
+        assert!(local_build(&opaque).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
