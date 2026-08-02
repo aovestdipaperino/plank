@@ -401,6 +401,37 @@ test` and review the diff before committing.
   `status::system_line` — have to use the indexed form (white is `38;5;231`,
   not `97`).
 
+- **The stanza opener can carry a trailing `｜` too.** Post-update weights emit
+  `<｜DSML｜tool_calls｜>` where the prompt teaches `<｜DSML｜tool_calls>` — the
+  same optional bar the *closing* tags have always tolerated, now on the opener.
+  Because no opener form matched, the stanza never opened: the whole tool call
+  streamed out as prose and the inner `<｜DSML｜invoke` tripped the loose-marker
+  detector, so every turn ended with "DSML markup outside a valid tool_calls
+  block" and the model had no idea which part of its syntax was rejected. It is
+  a wrapper-only quirk; `invoke` and `parameter` openers were unaffected. The
+  accepted forms live in two places that must stay in sync — `dsml_start_match`
+  in `src/viz.rs` (the streaming detector, which seeds the parser with canonical
+  bytes) and `DSML_START*` / `find_tool_start` in `src/dsml.rs`.
+
+- **Post-update weights also write the parameter name as the element name.**
+  `<｜DSML｜command string="true">ls</｜DSML｜invoke>` in place of
+  `<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>`. The C
+  reference errors on this (`unexpected DSML tag`, `ds4_agent.c`, the `else`
+  arm of `agent_dsml_parse`) and has no fix upstream — checked at `80ebbc3`,
+  which is `origin/main`. Rejecting is not neutral: the recorded repro shows the
+  model unable to work backwards from an error that only echoes the tag, so it
+  blamed the marker spelling twice and then emitted DSML inside `<think>`,
+  losing the turn. plank accepts the shorthand, but narrowly — only inside an
+  already-open invoke, only for a DSML-marked tag whose element name is a plain
+  identifier, and only when it carries no `name` attribute (a tag with one is a
+  different malformation and still errors).
+  The close tag is the trap: the model ends the shorthand with
+  `</｜DSML｜invoke>`, not `</｜DSML｜command>`. Widening the value terminator to
+  match is why the widening is confined to shorthand parameters via
+  `param_elem` — a canonical parameter keeps the strict `parameter`-only
+  terminator, so a `write` payload containing `</｜DSML｜invoke>` (this repo's own
+  sources and docs do) is still never truncated. Do not lift that restriction.
+
 ## Part 2 — Environment & tooling
 
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so

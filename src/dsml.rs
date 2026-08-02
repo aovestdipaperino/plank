@@ -14,6 +14,12 @@
 
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
+/// The same openers with a trailing `｜` before `>`. Closing tags have always
+/// tolerated that bar; post-update weights emit it on the opener too, and
+/// without these forms the stanza never opens and the model only sees the
+/// downstream "DSML markup outside a valid `tool_calls` block" error.
+const DSML_START_BAR: &[u8] = "<｜DSML｜tool_calls｜>".as_bytes();
+const SSML_START_BAR: &[u8] = "<｜SSML｜tool_calls｜>".as_bytes();
 /// Cheap scan filter used to locate candidate closing tags: any `</` byte
 /// pair, not just a validated close marker. Real validation happens in
 /// [`close_tag_at`], which requires a full [`tag_prefix_len`] match against
@@ -65,7 +71,7 @@ pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
 /// then the dropped-leading-bar typo the model actually emits.
 ///
 /// Segments rather than assembled `String`s because this sits on the hot path:
-/// [`find_close_tag`] re-scans the accumulated parameter value on every
+/// [`find_close_tag_any`] re-scans the accumulated parameter value on every
 /// `feed`, and `CLOSE_SCAN_HEAD` is a bare `</`, which occurs on nearly every
 /// line of HTML written through a `write` or `edit` parameter. Building the
 /// spellings with `format!` cost four transient allocations per candidate,
@@ -123,7 +129,9 @@ pub fn find_tool_start(s: &str) -> Option<usize> {
     let mut forms: Vec<String> = vec!["<tool_calls>".to_owned()];
     for m in MARKER_NAMES {
         forms.push(format!("<｜{m}｜tool_calls>"));
+        forms.push(format!("<｜{m}｜tool_calls｜>"));
         forms.push(format!("<{m}｜tool_calls>"));
+        forms.push(format!("<{m}｜tool_calls｜>"));
     }
     forms.iter().filter_map(|f| s.find(f.as_str())).min()
 }
@@ -196,6 +204,13 @@ pub struct DsmlParser {
     param_name: Option<String>,
     param_is_string: bool,
     param_value_start: usize,
+    /// Element name when the open parameter used the shorthand form
+    /// (`<｜DSML｜command …>` instead of `<｜DSML｜parameter name="command" …>`),
+    /// which widens the accepted terminators for *this value only*. `None` for
+    /// canonical parameters, so their strict `parameter`-only terminator — the
+    /// thing that keeps a `</` inside a `write` payload from ending the value —
+    /// is never relaxed.
+    param_elem: Option<String>,
     /// True while the raw tail looks like a partial parameter close tag, so
     /// online rendering can hide it before the full tag arrives.
     param_close_prefix: bool,
@@ -282,7 +297,9 @@ impl DsmlParser {
                     self.search_tail.remove(0);
                 }
                 self.search_tail.push(c);
-                if self.search_tail.ends_with(DSML_START) || self.search_tail.ends_with(SSML_START)
+                if [DSML_START, SSML_START, DSML_START_BAR, SSML_START_BAR]
+                    .iter()
+                    .any(|f| self.search_tail.ends_with(f))
                 {
                     self.start();
                 }
@@ -325,8 +342,17 @@ impl DsmlParser {
         loop {
             match self.state {
                 DsmlState::ParamValue => {
+                    // A shorthand parameter is closed inconsistently: the
+                    // recorded repro ends `<｜DSML｜command …>` with
+                    // `</｜DSML｜invoke>`, not `</｜DSML｜command>`. Accept either,
+                    // plus `parameter`, and take whichever lands first.
+                    let mut names: Vec<&str> = vec!["parameter"];
+                    if let Some(elem) = self.param_elem.as_deref() {
+                        names.push(elem);
+                        names.push("invoke");
+                    }
                     let Some((end, tag_len)) =
-                        find_close_tag(&self.raw[self.param_value_start..], "parameter")
+                        find_close_tag_any(&self.raw[self.param_value_start..], &names)
                     else {
                         return;
                     };
@@ -342,6 +368,7 @@ impl DsmlParser {
                         .args
                         .push(arg);
                     self.param_close_prefix = false;
+                    self.param_elem = None;
                     self.parse_pos = self.param_value_start + end + tag_len;
                     self.state = DsmlState::Structural;
                 }
@@ -401,13 +428,11 @@ impl DsmlParser {
                             ));
                             return;
                         }
-                        self.param_name = Some(name);
-                        self.param_is_string =
-                            parse_attr(&tag, "string").as_deref() == Some("true");
-                        self.parse_pos += tag_len;
-                        self.param_value_start = self.parse_pos;
-                        self.param_close_prefix = false;
-                        self.state = DsmlState::ParamValue;
+                        self.param_elem = None;
+                        self.open_param(name, &tag, tag_len);
+                    } else if let Some(elem) = self.shorthand_param_name(&tag) {
+                        self.param_elem = Some(elem.clone());
+                        self.open_param(elem, &tag, tag_len);
                     } else {
                         let shown: String = tag.chars().take(80).collect();
                         self.set_error(format!("unexpected DSML tag: {shown}"));
@@ -417,6 +442,37 @@ impl DsmlParser {
                 _ => return,
             }
         }
+    }
+
+    /// Enters `ParamValue` for a parameter named `name` opened by `tag`.
+    fn open_param(&mut self, name: String, tag: &str, tag_len: usize) {
+        self.param_name = Some(name);
+        self.param_is_string = parse_attr(tag, "string").as_deref() == Some("true");
+        self.parse_pos += tag_len;
+        self.param_value_start = self.parse_pos;
+        self.param_close_prefix = false;
+        self.state = DsmlState::ParamValue;
+    }
+
+    /// The parameter name for the shorthand form the post-update weights emit:
+    /// the parameter name written as the element name,
+    /// `<｜DSML｜command string="true">ls</｜DSML｜invoke>` in place of
+    /// `<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>`.
+    ///
+    /// Deliberately narrow, because accepting it means *running* a tool call
+    /// that was not written the way the prompt teaches. All of these must hold:
+    /// an invoke is already open, the tag carries the DSML marker, its element
+    /// name is a plain identifier, and it has no `name` attribute — a tag with
+    /// one is some other malformation and still errors. Rejecting instead is
+    /// not free: the recorded repro shows the model unable to find its way back
+    /// from the error, re-emitting the same shape and then breaking the think
+    /// gate, so the turn is lost either way.
+    fn shorthand_param_name(&self, tag: &str) -> Option<String> {
+        if self.current.is_none() || parse_attr(tag, "name").is_some() {
+            return None;
+        }
+        let elem = element_name(tag)?;
+        (!is_prompt_placeholder(&elem)).then_some(elem)
     }
 
     /// Tracks whether the raw tail is a partial parameter close tag, so the
@@ -437,6 +493,23 @@ impl DsmlParser {
         let mut complete = false;
         self.param_close_prefix = parameter_close_tail(tail, &mut complete) && !complete;
     }
+}
+
+/// The element name of a DSML-marked opening tag, e.g. `command` for
+/// `<｜DSML｜command string="true">`.
+///
+/// Used only to sharpen the "unexpected DSML tag" error. Post-update weights
+/// write the *parameter name* as the element name; echoing the tag back taught
+/// the model nothing, and the recorded repro shows it guessing at the marker
+/// spelling for three turns and then emitting DSML inside `<think>`. Naming the
+/// rewrite gives it something to act on.
+fn element_name(tag: &str) -> Option<String> {
+    let len = tag_prefix_len(tag.as_bytes(), false, "")?;
+    let name: String = tag[len..]
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Checks whether `tag` is an opening DSML tag with the given element name.
@@ -471,12 +544,17 @@ fn close_tag_at(s: &[u8], name: &str) -> Option<usize> {
     Some(i + 1)
 }
 
-/// Finds a DSML closing tag for `name` in `s`; returns (offset, tag length).
-fn find_close_tag(s: &[u8], name: &str) -> Option<(usize, usize)> {
+/// Finds the earliest DSML closing tag for any of `names`; returns
+/// (offset, tag length).
+///
+/// Scanning position-first rather than name-first matters: the winner must be
+/// the tag that appears earliest in the value, not the one whose name happens
+/// to come first in the list.
+fn find_close_tag_any(s: &[u8], names: &[&str]) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some(pos) = find_bytes(&s[from..], CLOSE_SCAN_HEAD) {
         let at = from + pos;
-        if let Some(tag_len) = close_tag_at(&s[at..], name) {
+        if let Some(tag_len) = names.iter().find_map(|n| close_tag_at(&s[at..], n)) {
             return Some((at, tag_len));
         }
         from = at + 1;
@@ -553,6 +631,113 @@ mod tests {
         for b in s.as_bytes() {
             p.feed([*b]);
         }
+    }
+
+    /// Post-update weights close the stanza opener with `｜>` rather than `>`.
+    /// Before this was accepted the stanza never opened at all, and the model
+    /// saw only "DSML markup outside a valid `tool_calls` block" — with no way to
+    /// tell which part of its syntax was rejected — turn after turn.
+    #[test]
+    fn opener_tolerates_trailing_bar() {
+        let stanza = STANZA.replacen("<｜DSML｜tool_calls>", "<｜DSML｜tool_calls｜>", 1);
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, &stanza);
+            assert_eq!(p.state(), super::DsmlState::Done);
+            assert_eq!(p.calls().len(), 1);
+            assert_eq!(p.calls()[0].name, "read_file");
+            assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
+        }
+        assert_eq!(super::find_tool_start(&stanza), Some(0));
+    }
+
+    /// Post-update weights write the parameter name as the element name, and
+    /// close it with `</｜DSML｜invoke>`. Verbatim from the recorded repro, in
+    /// which rejecting it cost the whole turn.
+    #[test]
+    fn shorthand_parameter_element_is_executed() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls｜>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜command string=\"true\">cd /tmp && ls</｜DSML｜invoke>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, stanza);
+            assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+            assert_eq!(p.calls().len(), 1);
+            assert_eq!(p.calls()[0].name, "bash");
+            assert_eq!(p.calls()[0].arg_value("command"), Some("cd /tmp && ls"));
+            assert!(p.calls()[0].args[0].is_string);
+        }
+    }
+
+    /// The self-consistent spelling of the shorthand closes with its own
+    /// element name and a single `</｜DSML｜invoke>`.
+    #[test]
+    fn shorthand_parameter_closed_by_its_own_element() {
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls>\
+             <｜DSML｜invoke name=\"read\">\
+             <｜DSML｜path string=\"true\">src/main.rs</｜DSML｜path>\
+             </｜DSML｜invoke>\
+             </｜DSML｜tool_calls>",
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
+    }
+
+    /// The tolerance must not reach canonical parameters: a `write` payload
+    /// that itself contains `</｜DSML｜invoke>` (this repo's own sources and
+    /// docs do) still runs to its real `</｜DSML｜parameter>` terminator.
+    #[test]
+    fn canonical_parameter_value_is_not_truncated_by_a_foreign_close_tag() {
+        let content = "docs mentioning </｜DSML｜invoke> and </｜DSML｜command> inline";
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            &format!(
+                "<｜DSML｜tool_calls>\
+                 <｜DSML｜invoke name=\"write\">\
+                 <｜DSML｜parameter name=\"content\" string=\"true\">{content}</｜DSML｜parameter｜>\
+                 </｜DSML｜invoke｜>\
+                 </｜DSML｜tool_calls｜>"
+            ),
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls()[0].arg_value("content"), Some(content));
+    }
+
+    /// A tag carrying `name=` is a different malformation, not the shorthand,
+    /// so it must not be silently turned into a parameter and run.
+    #[test]
+    fn unknown_element_with_a_name_attribute_still_errors() {
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">\
+             <｜DSML｜argument name=\"command\">ls</｜DSML｜argument>",
+        );
+        assert_eq!(p.state(), super::DsmlState::Error);
+        assert!(
+            p.error().starts_with("unexpected DSML tag:"),
+            "{}",
+            p.error()
+        );
+    }
+
+    /// The hint is only meaningful inside an open invoke; stray markup before
+    /// one keeps the plain echo rather than inventing a parameter name.
+    #[test]
+    fn unexpected_tag_outside_an_invoke_keeps_the_plain_error() {
+        let mut p = super::DsmlParser::new();
+        feed_all(&mut p, "<｜DSML｜tool_calls><b>");
+        assert_eq!(p.state(), super::DsmlState::Error);
+        assert_eq!(p.error(), "unexpected DSML tag: <b>");
     }
 
     // The model copies TOOLS_PROMPT_INTRO verbatim (4 recorded occurrences).
@@ -727,7 +912,7 @@ mod tests {
 
     /// A literal `</` in a parameter value (e.g. HTML written through a
     /// `write` call's `content` param) must not terminate the parameter: the
-    /// cheap `</` scan in `find_close_tag` is only a candidate filter, and
+    /// cheap `</` scan in `find_close_tag_any` is only a candidate filter, and
     /// `close_tag_at` requires the full `</｜DSML｜parameter` prefix (or its
     /// dropped-bar variant) before accepting a close. This pins the safety
     /// that let `CLOSE_SCAN_HEAD` widen from `"</｜"` to `"</"`.

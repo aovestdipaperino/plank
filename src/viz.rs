@@ -235,11 +235,15 @@ fn dsml_start_match(tail: &[u8], complete: &mut bool, implicit_invoke: &mut bool
     *complete = false;
     *implicit_invoke = false;
     // Each marker contributes the canonical form and the dropped-leading-bar
-    // typo, for both the wrapper and the bare invoke opener.
+    // typo, for both the wrapper and the bare invoke opener. The wrapper also
+    // accepts a trailing `｜` before `>` — the closing tags always tolerated it,
+    // and post-update weights emit it on the opener too.
     let forms = MARKER_NAMES.iter().flat_map(|m| {
         [
             (format!("<｜{m}｜tool_calls>"), false),
+            (format!("<｜{m}｜tool_calls｜>"), false),
             (format!("<{m}｜tool_calls>"), false),
+            (format!("<{m}｜tool_calls｜>"), false),
             (format!("<｜{m}｜invoke"), true),
             (format!("<{m}｜invoke"), true),
         ]
@@ -2432,6 +2436,49 @@ mod tests {
             let fin = sr.finished();
             assert_eq!(fin.calls.len(), 1);
             assert_eq!(fin.calls[0].arg_value("command"), Some("pwd"));
+        }
+    }
+
+    /// Regression for the repro captured after a weights update: every turn
+    /// opened with `<｜DSML｜tool_calls｜>`, which matched no opener form, so the
+    /// stanza streamed as prose and the inner `<｜DSML｜invoke` tripped the
+    /// loose-marker detector instead of dispatching the tool.
+    #[test]
+    fn opener_with_trailing_bar_is_accepted() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls｜>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">pwd</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        for sr in [run_chunked(stanza), run_charwise(stanza)] {
+            let fin = sr.finished();
+            assert_eq!(fin.error, None);
+            assert_eq!(fin.calls.len(), 1);
+            assert_eq!(fin.calls[0].name, "bash");
+            assert_eq!(fin.calls[0].arg_value("command"), Some("pwd"));
+        }
+    }
+
+    /// Second recorded repro: the parameter written as its own element, closed
+    /// with `</｜DSML｜invoke>`. Rejecting it cost three turns and ended with the
+    /// model breaking the think gate, so the shorthand dispatches instead.
+    #[test]
+    fn shorthand_parameter_element_dispatches() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls｜>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜command string=\"true\">ls</｜DSML｜invoke>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        for sr in [run_chunked(stanza), run_charwise(stanza)] {
+            let fin = sr.finished();
+            assert_eq!(fin.error, None);
+            assert_eq!(fin.calls.len(), 1);
+            assert_eq!(fin.calls[0].name, "bash");
+            assert_eq!(fin.calls[0].arg_value("command"), Some("ls"));
         }
     }
 
