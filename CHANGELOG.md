@@ -6,6 +6,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.7.9] - 2026-08-03
+
+Beta channel on the 2.7 series.
+
+### Fixed
+
+- **A tool call is judged when it closes, not when it opens.** Rejecting a
+  stanza the moment its opening marker appeared inside `<think>` was too eager:
+  a model reasoning about DSML syntax writes an opening marker mid-thought and
+  often closes the thinking block before emitting the real call. The recorded
+  repro shows exactly that — a correct, post-`</think>` `edit` call thrown away,
+  and the model told to stop calling tools inside thinking, which it had not
+  done. It rewrote correct markup and looped. An opening marker is now only a
+  candidate; the verdict lands at the stop token, against the thinking state at
+  that instant. `</think>` is recognized inside an open stanza too, except
+  within a parameter value, where it is payload a `write` or `edit` may
+  legitimately contain.
+
+- **Mentioning the markup while thinking no longer costs the turn.** Any
+  DSML-shaped bytes inside `<think>` used to raise the placement prohibition at
+  stream end, even with no stanza and no stop token — so a model recalling its
+  own tool-call format got a tool error back for it.
+
+- **The tool name written as its own element is accepted.** The weights emit
+  `<｜DSML｜edit>` in place of `<｜DSML｜invoke name="edit">`, closing with
+  `</｜DSML｜invoke>` — their own tell that an invoke was meant. plank already
+  tolerated the identical rewrite one level down, for parameters; the invoke
+  form was rejected five times in one recorded session, with no recovery. Which
+  shorthand a bare element is depends only on whether an invoke is open: before
+  one it names the tool, inside one a parameter. Both stay narrow — DSML marker
+  present, element name a plain identifier, no `name` attribute — and a name
+  that is not a real tool fails at dispatch, by name, which the model can act
+  on. The renderer learned both forms, so a shorthand call draws its banner
+  instead of running invisibly.
+
+- **The system prompt's tool instructions reach the model as the token they were
+  trained as.** `｜DSML｜` is an entry in the model's own vocabulary, but a
+  `system` message is tokenized as plain text, so every marker in the tools
+  prompt arrived as spelled-out BPE pieces — and a spelled-out marker is what
+  the model then reproduces letter by letter and occasionally corrupts
+  (`<｜DSinvoke name="bash">`, and the `SSML` misspelling). The built-in prompt
+  is now tokenized as rendered chat, as the C reference has always done, which
+  turns those 16 markers into single tokens. MCP tool schemas and `-sys` text
+  are deliberately left as plain content: both are third-party text, and as
+  control tokens either could forge a turn boundary.
+
+### Added
+
+- **`/think off|medium|max` selects the reasoning level**, and `--think-max`
+  now means what it says. The engine has always had three levels — the third
+  adds a reasoning-effort preamble ahead of the system prompt — but plank
+  collapsed the top two and never reached it. The preamble is the reference
+  engine's own text, byte-for-byte. It wants at least a 384K context, and below
+  that the level is refused rather than silently downgraded, so a request that
+  cannot take effect says so.
+
 ## [2.7.8] - 2026-08-02
 
 Beta channel on the 2.7 series.
