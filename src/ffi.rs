@@ -154,6 +154,18 @@ unsafe extern "C" {
         think_mode: Ds4ThinkMode,
     );
 
+    /// Appends the reasoning-effort preamble `DS4_THINK_MAX` prepends ahead of
+    /// the system prompt. Tokenized as plain text, so it must sit immediately
+    /// after `ds4_chat_begin` and before the first message — the position the
+    /// C's `repl_chat_apply_max_prefix` inserts it at.
+    ///
+    /// The C also exposes the text and its context floor as
+    /// `ds4_think_max_prefix` / `ds4_think_max_min_context`; plank mirrors those
+    /// as `engine::THINK_MAX_PREFIX` / `engine::THINK_MAX_MIN_CONTEXT` rather
+    /// than calling them, so both are available without a model loaded.
+    /// `tests/c_parity.rs` holds the Rust copies equal to the C source.
+    pub fn ds4_chat_append_max_effort_prefix(e: *mut Ds4Engine, tokens: *mut Ds4Tokens);
+
     /// Tokenizes already-rendered chat text, so control strings like
     /// `</think>` map to their special tokens rather than to literal pieces.
     pub fn ds4_tokenize_rendered_chat(e: *mut Ds4Engine, text: *const c_char, out: *mut Ds4Tokens);
@@ -167,6 +179,10 @@ unsafe extern "C" {
         ctx_size: c_int,
     ) -> c_int;
     pub fn ds4_session_free(s: *mut Ds4Session);
+    /// Drops the session's cached KV so the next sync prefills from zero. Used
+    /// when the prompt *prefix* changes under it (the reasoning-effort preamble
+    /// moving in or out), which a common-prefix probe alone cannot recover from.
+    pub fn ds4_session_invalidate(s: *mut Ds4Session);
     pub fn ds4_session_set_display_progress(
         s: *mut Ds4Session,
         f: Option<

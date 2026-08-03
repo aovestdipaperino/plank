@@ -334,14 +334,31 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 /// followed by the schemas of any MCP tools loaded at startup.
 #[must_use]
 pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: bool) -> String {
+    build_tools_prompt_parts(mcp_servers, parity).0
+}
+
+/// [`build_tools_prompt`] plus the byte length of its leading **trusted** span.
+///
+/// Everything up to that offset is plank's own control text — the C-derived
+/// base, the two inserted notes, and the native tool schemas. Everything after
+/// it comes from MCP servers, which are third-party processes whose tool names,
+/// descriptions, and JSON schemas are arbitrary text.
+///
+/// The distinction exists because the trusted span is tokenized differently:
+/// see [`SplitSystemPrompt::trusted_len`].
+fn build_tools_prompt_parts(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    parity: bool,
+) -> (String, usize) {
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
     append_native_extra_schemas(&mut out);
+    let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
-    out
+    (out, trusted_len)
 }
 
 /// The C-derived tools prompt with nothing appended.
@@ -586,10 +603,11 @@ pub fn build_system_prompt_reminder(
 /// Composes the initial system prompt: tools prompt plus optional user text.
 ///
 /// Mirrors `agent_append_system_prompt`: the built-in tools prompt comes
-/// first, and non-empty user `-sys` text is appended after a blank line. In
-/// the C agent the two parts are tokenized differently (the built-in prompt
-/// as rendered chat so DSML markers become control tokens, user text as plain
-/// content); here both are returned as one composed string.
+/// first, and non-empty user `-sys` text is appended after a blank line. The
+/// two halves are tokenized differently, as in the C — see
+/// [`SplitSystemPrompt::trusted_len`], which [`build_system_prompt_parts`] reports.
+/// This function returns only the composed text, for callers that render or
+/// fingerprint it rather than tokenize it.
 #[must_use]
 /// **Cache-boundary rule** (docs/SYSTEM-PROMPT.md): everything composed here
 /// enters the fingerprinted `sysprompt.kv` KV prefix, so only inputs that are
@@ -602,12 +620,54 @@ pub fn build_system_prompt(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> String {
-    let mut out = build_tools_prompt(mcp_servers, parity);
+    build_system_prompt_parts(user_system, mcp_servers, parity).text
+}
+
+/// A composed system prompt together with the boundary that decides how each
+/// half is tokenized.
+#[derive(Debug, Clone)]
+pub struct SplitSystemPrompt {
+    /// The composed prompt, identical to [`build_system_prompt`]'s output.
+    pub text: String,
+    /// Byte length of the leading span that is **trusted control text**.
+    ///
+    /// This span is tokenized as *rendered chat*, so the literal `｜DSML｜` in
+    /// its examples becomes the model's dedicated DSML vocabulary token rather
+    /// than a spelled-out BPE sequence — the form the model was trained on.
+    /// The C does the same in `agent_append_system_prompt`, with the comment:
+    ///
+    /// > The built-in tool prompt is trusted DS4 control text. Tokenize it like
+    /// > a rendered chat prompt so the literal ｜DSML｜ markers in the examples
+    /// > become the model's dedicated DSML token. Do not apply that tokenizer
+    /// > to user supplied -sys text: arbitrary user text containing
+    /// > `<｜User｜>`, `<think>`, or `｜DSML｜` must remain plain content, not
+    /// > control tokens.
+    ///
+    /// That prohibition is a prompt-injection boundary, and plank's is **wider
+    /// than the C's**: the C's tools prompt is entirely built in, while plank
+    /// appends MCP tool schemas and server instructions to it. Those come from
+    /// third-party processes, so they sit *outside* the trusted span alongside
+    /// `-sys` text. Every `｜DSML｜` the prompt teaches is in the built-in part,
+    /// so nothing is lost by drawing the line there.
+    ///
+    /// Widening this span to cover MCP or user text would let either forge a
+    /// turn boundary. Do not.
+    pub trusted_len: usize,
+}
+
+/// [`build_system_prompt`] with the trusted/untrusted boundary reported.
+#[must_use]
+pub fn build_system_prompt_parts(
+    user_system: &str,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    parity: bool,
+) -> SplitSystemPrompt {
+    let (mut text, trusted_len) = build_tools_prompt_parts(mcp_servers, parity);
     if !user_system.is_empty() {
-        out.push_str("\n\n");
-        out.push_str(user_system);
+        text.push_str("\n\n");
+        text.push_str(user_system);
     }
-    out
+    SplitSystemPrompt { text, trusted_len }
 }
 
 /// Formats the session-start datetime context line for the given instant.
@@ -824,6 +884,59 @@ mod tests {
     /// The marker-spelling warning must reach every prompt surface the model
     /// sees, sit next to the shape it is about, and stay out of the C-locked
     /// base so the parity suite keeps checking that base byte-for-byte.
+    /// The trusted span must cover every `｜DSML｜` the prompt teaches — that is
+    /// the whole point of tokenizing it as rendered chat — and must stop before
+    /// anything a third party controls.
+    #[test]
+    fn trusted_span_covers_the_dsml_examples_and_nothing_untrusted() {
+        for parity in [true, false] {
+            let p = build_system_prompt_parts("USER SYS TEXT", &[], parity);
+            let trusted = &p.text[..p.trusted_len];
+            let rest = &p.text[p.trusted_len..];
+
+            // Every marker the prompt teaches is inside the trusted span.
+            assert!(trusted.contains("<｜DSML｜tool_calls>"), "parity={parity}");
+            assert!(trusted.contains("<｜DSML｜invoke"), "parity={parity}");
+            assert!(trusted.contains("<｜DSML｜parameter"), "parity={parity}");
+            assert!(
+                !rest.contains("｜DSML｜"),
+                "a DSML marker outside the trusted span would be spelled out: {rest:?}"
+            );
+
+            // User `-sys` text never is: as control tokens it could forge a turn.
+            assert!(!trusted.contains("USER SYS TEXT"), "parity={parity}");
+            assert!(rest.contains("USER SYS TEXT"), "parity={parity}");
+        }
+    }
+
+    /// The boundary is a property of the built-in prompt alone, so everything
+    /// added after it — MCP schemas in a live session, `-sys` text here — lands
+    /// outside, and the trusted prefix itself never moves.
+    #[test]
+    fn trusted_span_ends_before_anything_appended() {
+        let bare = build_system_prompt_parts("", &[], true);
+        assert_eq!(bare.trusted_len, bare.text.len(), "nothing untrusted yet");
+
+        let with_user = build_system_prompt_parts("Be terse.", &[], true);
+        assert_eq!(with_user.trusted_len, bare.trusted_len);
+        assert!(with_user.text.len() > with_user.trusted_len);
+        assert!(with_user.text.starts_with(&bare.text[..bare.trusted_len]));
+    }
+
+    /// The composed text is unchanged by the split: the KV fingerprint and the
+    /// rendered transcript must see exactly what they always did.
+    #[test]
+    fn parts_text_matches_the_plain_composition() {
+        for parity in [true, false] {
+            for user in ["", "Be terse."] {
+                assert_eq!(
+                    build_system_prompt_parts(user, &[], parity).text,
+                    build_system_prompt(user, &[], parity),
+                );
+            }
+        }
+    }
+
     #[test]
     fn marker_spelling_note_lands_after_the_shape_but_not_in_the_base() {
         for parity in [true, false] {

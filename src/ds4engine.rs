@@ -278,11 +278,52 @@ impl Ds4Model {
 
     /// Builds chat-template tokens for the system prompt alone (no assistant
     /// prefix), used to warm and checkpoint the KV cache.
-    fn build_system_tokens(&self, system: &str) -> Ds4TokensGuard {
+    fn build_system_tokens(
+        &self,
+        system: &str,
+        trusted_len: usize,
+        think: ThinkMode,
+    ) -> Ds4TokensGuard {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the whole build.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
-        if let (Ok(role), Ok(content)) = (CString::new("system"), CString::new(system)) {
+        self.append_max_effort_prefix(&mut tokens, think);
+        self.append_system_text(&mut tokens, system, trusted_len);
+        tokens
+    }
+
+    /// Appends a system prompt, split at `trusted_len` into a control-text
+    /// prefix and plain content — the C's `agent_append_system_prompt`.
+    ///
+    /// The prefix goes through `ds4_tokenize_rendered_chat`, which maps the
+    /// literal `｜DSML｜` in the prompt's examples (and `<think>`, and the turn
+    /// markers) onto their real vocabulary tokens. The model was trained with
+    /// `｜DSML｜` as one atomic token; spelling it out as BPE pieces is what the
+    /// model then reproduces, letter by letter, and occasionally corrupts —
+    /// `<｜DSinvoke name="bash">` in `repro-1785754509.md`.
+    ///
+    /// The remainder is deliberately *not* given that treatment. It holds MCP
+    /// schemas and `-sys` text, and a `<｜User｜>` in either must stay inert
+    /// prose rather than become a real turn boundary. `trusted_len` is clamped
+    /// and snapped to a character boundary, so a stale or wrong value can only
+    /// ever shrink the trusted span, never leak untrusted bytes into it.
+    fn append_system_text(&self, tokens: &mut Ds4TokensGuard, system: &str, trusted_len: usize) {
+        let split = (0..=trusted_len.min(system.len()))
+            .rev()
+            .find(|&i| system.is_char_boundary(i))
+            .unwrap_or(0);
+        let (trusted, plain) = system.split_at(split);
+        if !trusted.is_empty()
+            && let Ok(text) = CString::new(trusted)
+        {
+            // SAFETY: engine and tokens valid; text outlives the call.
+            unsafe {
+                ffi::ds4_tokenize_rendered_chat(self.engine, text.as_ptr(), tokens.as_mut_ptr());
+            }
+        }
+        if !plain.is_empty()
+            && let (Ok(role), Ok(content)) = (CString::new("system"), CString::new(plain))
+        {
             // SAFETY: role/content strings outlive the call.
             unsafe {
                 ffi::ds4_chat_append_message(
@@ -293,17 +334,35 @@ impl Ds4Model {
                 );
             }
         }
-        tokens
     }
 
     /// Chat-template preamble tokens emitted by `ds4_chat_begin` (BOS / opening
     /// template), prepended once ahead of the first message. Folded into the
     /// first span of the token transcript so the buffer is self-contained.
-    fn begin_tokens(&self) -> Vec<i32> {
+    fn begin_tokens(&self, think: ThinkMode) -> Vec<i32> {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the call.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
+        self.append_max_effort_prefix(&mut tokens, think);
         tokens.to_vec()
+    }
+
+    /// Appends the reasoning-effort preamble when the level is
+    /// [`ThinkMode::Max`], and nothing otherwise.
+    ///
+    /// The preamble is plain text with no role wrapper, so its position is
+    /// load-bearing: immediately after the `ds4_chat_begin` preamble and ahead
+    /// of the system message, which is where the C puts it — both in
+    /// `encode_chat_prompt` (tokenized straight before the system text) and in
+    /// the REPL's `repl_chat_apply_max_prefix` (inserted at transcript index 1,
+    /// past the BOS). Folding it into the system *string* instead would place
+    /// it after the system role marker and diverge.
+    fn append_max_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
+        if think != ThinkMode::Max {
+            return;
+        }
+        // SAFETY: engine and tokens are valid for the call.
+        unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
     }
 
     /// The chat-template tokens for one message (role wrapper + content),
@@ -328,6 +387,18 @@ impl Ds4Model {
             );
             tokens.slice_from(base).to_vec()
         }
+    }
+
+    /// The tokens for a system message, split at `trusted_len` — the delta
+    /// [`Self::append_system_text`] contributes, isolated from any preamble the
+    /// same way [`Self::message_tokens`] isolates a message's.
+    ///
+    /// A system message carries no role wrapper (`ds4_chat_append_message`
+    /// tokenizes its content directly), so this is exactly the content tokens.
+    fn system_message_tokens(&self, system: &str, trusted_len: usize) -> Vec<i32> {
+        let mut tokens = Ds4TokensGuard::new();
+        self.append_system_text(&mut tokens, system, trusted_len);
+        tokens.to_vec()
     }
 
     /// The assistant-prefix tokens for the given think mode (the `<assistant>`
@@ -419,6 +490,8 @@ impl ModelHandle for Ds4Model {
             session,
             transcript: TokenTranscript::new(),
             warm_tokens: Ds4TokensGuard::new(),
+            think: ThinkMode::default(),
+            trusted_system_len: 0,
         };
         Ok(Box::new(Ds4HostSession {
             inner,
@@ -460,6 +533,15 @@ pub struct Ds4Session {
     /// Cumulative token buffer for an in-progress warm walk (`warm_reset` /
     /// `warm_sync`). Empty outside a walk.
     warm_tokens: Ds4TokensGuard,
+    /// Reasoning level for prompts built from here on. Only [`ThinkMode::Max`]
+    /// changes the prompt *prefix* (it prepends the reasoning-effort preamble
+    /// ahead of the system prompt), so `set_think_mode` drops the token
+    /// transcript when the level moves in or out of `Max`.
+    think: ThinkMode,
+    /// Byte length of the system prompt's trusted, control-text prefix; see
+    /// [`Engine::set_trusted_system_prefix`]. Zero means "tokenize all of it as
+    /// plain content", the safe default.
+    trusted_system_len: usize,
 }
 
 /// Back-compatible alias: the single-owner engine callers used before the split
@@ -505,6 +587,8 @@ impl Ds4Session {
             session: std::ptr::null_mut(),
             transcript: TokenTranscript::new(),
             warm_tokens: Ds4TokensGuard::new(),
+            think: ThinkMode::default(),
+            trusted_system_len: 0,
         }
     }
 
@@ -700,10 +784,19 @@ impl Ds4Session {
             let Some(span_role) = SpanRole::from_tag(role) else {
                 continue;
             };
-            let mut toks = self.model.message_tokens(role, text);
+            // The system section is tokenized with the trusted/plain split, the
+            // same way the warm walk builds it. Both paths must produce byte-
+            // identical tokens or the KV common-prefix probe stops right after
+            // the system prompt and every turn re-prefills the conversation.
+            let mut toks = if span_role == SpanRole::System {
+                self.model
+                    .system_message_tokens(text, self.trusted_system_len)
+            } else {
+                self.model.message_tokens(role, text)
+            };
             if self.transcript.is_empty() {
                 // First message carries the chat-template preamble (BOS/open).
-                let mut begin = self.model.begin_tokens();
+                let mut begin = self.model.begin_tokens(self.think);
                 begin.extend_from_slice(&toks);
                 toks = begin;
             }
@@ -1142,8 +1235,50 @@ impl Engine for Ds4Session {
     }
 
     fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
-        self.warm_tokens = self.model.build_system_tokens(system);
+        self.warm_tokens =
+            self.model
+                .build_system_tokens(system, self.trusted_system_len, self.think);
         Ok(())
+    }
+
+    fn set_trusted_system_prefix(&mut self, len: usize) {
+        if self.trusted_system_len == len {
+            return;
+        }
+        // The system prompt's tokens change, so everything cached below them
+        // does too. Same reset as a `max` toggle: drop the token transcript and
+        // the live KV rather than letting a common-prefix probe walk into
+        // tokens that no longer match.
+        self.trusted_system_len = len;
+        self.transcript = TokenTranscript::new();
+        self.warm_tokens = Ds4TokensGuard::new();
+        if !self.session.is_null() {
+            // SAFETY: session is non-null and owned by us.
+            unsafe { ffi::ds4_session_invalidate(self.session) };
+        }
+    }
+
+    fn set_think_mode(&mut self, mode: ThinkMode) {
+        if self.think == mode {
+            return;
+        }
+        // Only moving in or out of `Max` changes the prompt prefix; `Off` vs
+        // `Medium` lives entirely in the per-turn assistant prefix, which is
+        // re-derived every turn and never cached. So a level change that keeps
+        // the preamble where it is costs nothing.
+        let prefix_changed = (self.think == ThinkMode::Max) != (mode == ThinkMode::Max);
+        self.think = mode;
+        if prefix_changed {
+            // The whole token buffer now starts with the wrong prefix. Drop it
+            // so the next turn retokenizes from text, and invalidate the live
+            // KV — the C's `ds4_session_invalidate` in `repl_chat_apply_max_prefix`.
+            self.transcript = TokenTranscript::new();
+            self.warm_tokens = Ds4TokensGuard::new();
+            if !self.session.is_null() {
+                // SAFETY: session is non-null and owned by us.
+                unsafe { ffi::ds4_session_invalidate(self.session) };
+            }
+        }
     }
 
     fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
@@ -1637,7 +1772,8 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
 fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
     match think {
         ThinkMode::Off => ffi::Ds4ThinkMode::None,
-        ThinkMode::Auto | ThinkMode::On => ffi::Ds4ThinkMode::High,
+        ThinkMode::Medium => ffi::Ds4ThinkMode::High,
+        ThinkMode::Max => ffi::Ds4ThinkMode::Max,
     }
 }
 
@@ -1842,6 +1978,99 @@ mod tests {
     // Requires a loaded model, so it is gated on `ds4_engine` and skips unless
     // PLANK_TEST_MODEL points at a GGUF. It will only run on a Metal box with
     // the `refs/ds4` submodule built.
+    // The trusted span of the system prompt must tokenize as *rendered chat*,
+    // so the literal `｜DSML｜` in its examples becomes the model's dedicated
+    // vocabulary token rather than a spelled-out BPE sequence. Asserted by
+    // detokenizing: exactly one token whose text is the whole marker.
+    //
+    // Requires a loaded model, so it is gated on `ds4_engine` and skips unless
+    // PLANK_TEST_MODEL points at a GGUF.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn trusted_system_prefix_emits_the_native_dsml_token() {
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true);
+
+        let marker = "｜DSML｜".as_bytes();
+        let count_marker_tokens = |toks: &[i32]| {
+            toks.iter()
+                .filter(|&&t| engine.model.token_bytes(t) == marker)
+                .count()
+        };
+
+        let split = engine
+            .model
+            .system_message_tokens(&parts.text, parts.trusted_len);
+        let plain = engine.model.system_message_tokens(&parts.text, 0);
+
+        assert!(
+            count_marker_tokens(&split) > 0,
+            "the trusted span must yield native ｜DSML｜ tokens"
+        );
+        assert_eq!(
+            count_marker_tokens(&plain),
+            0,
+            "plain BPE spells the marker out; that is the bug this fixes"
+        );
+        eprintln!(
+            "system prompt: {} tokens split vs {} plain ({} native ｜DSML｜ tokens)",
+            split.len(),
+            plain.len(),
+            count_marker_tokens(&split)
+        );
+        // Collapsing each spelled-out marker into one token can only shorten it.
+        assert!(
+            split.len() < plain.len(),
+            "split={} plain={}",
+            split.len(),
+            plain.len()
+        );
+    }
+
+    // The warm walk and the per-turn reconcile both tokenize the system prompt.
+    // If they ever disagree the KV common-prefix probe stops right after it and
+    // every turn re-prefills the whole conversation, silently.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn warm_and_reconcile_tokenize_the_system_prompt_identically() {
+        use crate::ffi::Ds4Backend;
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let engine =
+            super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
+        let parts = crate::sysprompt::build_system_prompt_parts("Be terse.", &[], true);
+
+        for think in [
+            crate::engine::ThinkMode::Off,
+            crate::engine::ThinkMode::Medium,
+        ] {
+            let warm = engine
+                .model
+                .build_system_tokens(&parts.text, parts.trusted_len, think)
+                .to_vec();
+            // What `reconcile` builds for the first (system) section.
+            let mut turn = engine.model.begin_tokens(think);
+            turn.extend_from_slice(
+                &engine
+                    .model
+                    .system_message_tokens(&parts.text, parts.trusted_len),
+            );
+            assert_eq!(warm, turn, "{think:?}");
+        }
+    }
+
     #[cfg(ds4_engine)]
     #[test]
     fn aside_snapshot_roundtrip_lossless() {

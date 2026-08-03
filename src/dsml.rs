@@ -401,47 +401,69 @@ impl DsmlParser {
                     let tag_len = gt + 1;
                     let tag = String::from_utf8_lossy(&rest[..tag_len]).into_owned();
 
-                    if open_tag_is(&tag, "invoke") {
-                        let Some(name) = parse_attr(&tag, "name") else {
-                            self.set_error("tool invoke without name");
-                            return;
-                        };
-                        if is_prompt_placeholder(&name) {
-                            self.set_error(format!(
-                                "tool name is the prompt's placeholder {name}, not a real tool; substitute the actual tool name"
-                            ));
-                            return;
-                        }
-                        self.current = Some(PendingCall {
-                            name,
-                            args: Vec::new(),
-                        });
-                        self.parse_pos += tag_len;
-                    } else if open_tag_is(&tag, "parameter") {
-                        let Some(name) = parse_attr(&tag, "name") else {
-                            self.set_error("tool parameter without name");
-                            return;
-                        };
-                        if is_prompt_placeholder(&name) {
-                            self.set_error(format!(
-                                "parameter name is the prompt's placeholder {name}, not a real parameter; substitute the actual parameter name"
-                            ));
-                            return;
-                        }
-                        self.param_elem = None;
-                        self.open_param(name, &tag, tag_len);
-                    } else if let Some(elem) = self.shorthand_param_name(&tag) {
-                        self.param_elem = Some(elem.clone());
-                        self.open_param(elem, &tag, tag_len);
-                    } else {
-                        let shown: String = tag.chars().take(80).collect();
-                        self.set_error(format!("unexpected DSML tag: {shown}"));
+                    if !self.open_tag(&tag, tag_len) {
                         return;
                     }
                 }
                 _ => return,
             }
         }
+    }
+
+    /// Handles one opening tag inside a stanza. Returns false when parsing must
+    /// stop, having set the error.
+    ///
+    /// The four accepted spellings, in precedence order: a canonical `invoke`,
+    /// a canonical `parameter`, and the two bare-element shorthands — parameter
+    /// first, since it is the one that applies while an invoke is open (see
+    /// [`Self::shorthand_invoke_name`] for why the open invoke is the whole
+    /// distinction).
+    fn open_tag(&mut self, tag: &str, tag_len: usize) -> bool {
+        if open_tag_is(tag, "invoke") {
+            let Some(name) = parse_attr(tag, "name") else {
+                self.set_error("tool invoke without name");
+                return false;
+            };
+            if is_prompt_placeholder(&name) {
+                self.set_error(format!(
+                    "tool name is the prompt's placeholder {name}, not a real tool; substitute the actual tool name"
+                ));
+                return false;
+            }
+            self.open_invoke(name, tag_len);
+        } else if open_tag_is(tag, "parameter") {
+            let Some(name) = parse_attr(tag, "name") else {
+                self.set_error("tool parameter without name");
+                return false;
+            };
+            if is_prompt_placeholder(&name) {
+                self.set_error(format!(
+                    "parameter name is the prompt's placeholder {name}, not a real parameter; substitute the actual parameter name"
+                ));
+                return false;
+            }
+            self.param_elem = None;
+            self.open_param(name, tag, tag_len);
+        } else if let Some(elem) = self.shorthand_param_name(tag) {
+            self.param_elem = Some(elem.clone());
+            self.open_param(elem, tag, tag_len);
+        } else if let Some(elem) = self.shorthand_invoke_name(tag) {
+            self.open_invoke(elem, tag_len);
+        } else {
+            let shown: String = tag.chars().take(80).collect();
+            self.set_error(format!("unexpected DSML tag: {shown}"));
+            return false;
+        }
+        true
+    }
+
+    /// Opens a tool call, however its name was spelled.
+    fn open_invoke(&mut self, name: String, tag_len: usize) {
+        self.current = Some(PendingCall {
+            name,
+            args: Vec::new(),
+        });
+        self.parse_pos += tag_len;
     }
 
     /// Enters `ParamValue` for a parameter named `name` opened by `tag`.
@@ -469,6 +491,34 @@ impl DsmlParser {
     /// gate, so the turn is lost either way.
     fn shorthand_param_name(&self, tag: &str) -> Option<String> {
         if self.current.is_none() || parse_attr(tag, "name").is_some() {
+            return None;
+        }
+        let elem = element_name(tag)?;
+        (!is_prompt_placeholder(&elem)).then_some(elem)
+    }
+
+    /// The same shorthand one level up: the *tool* name written as the element
+    /// name, `<｜DSML｜edit>…</｜DSML｜invoke>` in place of
+    /// `<｜DSML｜invoke name="edit">…</｜DSML｜invoke>`.
+    ///
+    /// Which of the two shorthands a bare element is depends on one thing:
+    /// whether an invoke is open. Before one, the model is naming the tool it
+    /// wants; inside one, a parameter. That is why this is checked *after*
+    /// [`Self::shorthand_param_name`] — the parameter reading wins whenever
+    /// both could apply, which is exactly when an invoke is already open.
+    ///
+    /// Same narrowness as the parameter form, and for the same reason:
+    /// accepting it means *running* a call written the way the prompt does not
+    /// teach. The tag must carry the DSML marker, its element name must be a
+    /// plain identifier, and it must have no `name` attribute — a tag with one
+    /// is some other malformation and still errors. An element name that is not
+    /// a real tool reaches dispatch and fails there by name, which is a clear
+    /// error the model can act on; rejecting the stanza outright is not free.
+    /// `repro-1785754509.md` is the recorded cost: five rejections of this
+    /// shape, no recovery, and the model finally breaking the think gate while
+    /// trying to restate the syntax back to itself.
+    fn shorthand_invoke_name(&self, tag: &str) -> Option<String> {
+        if self.current.is_some() || parse_attr(tag, "name").is_some() {
             return None;
         }
         let elem = element_name(tag)?;
@@ -503,7 +553,7 @@ impl DsmlParser {
 /// the model nothing, and the recorded repro shows it guessing at the marker
 /// spelling for three turns and then emitting DSML inside `<think>`. Naming the
 /// rewrite gives it something to act on.
-fn element_name(tag: &str) -> Option<String> {
+pub(crate) fn element_name(tag: &str) -> Option<String> {
     let len = tag_prefix_len(tag.as_bytes(), false, "")?;
     let name: String = tag[len..]
         .chars()
@@ -672,6 +722,54 @@ mod tests {
             assert_eq!(p.calls()[0].arg_value("command"), Some("cd /tmp && ls"));
             assert!(p.calls()[0].args[0].is_string);
         }
+    }
+
+    /// The same shorthand one level up: the *tool* name written as the element
+    /// name, with no `invoke` wrapper. Verbatim from `repro-1785754509.md`,
+    /// where the model emitted this shape five times for `write` and `edit`,
+    /// never recovered from the rejection, and finally broke the think gate
+    /// trying to restate the syntax.
+    #[test]
+    fn shorthand_invoke_element_is_executed() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜edit>",
+            "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/a.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"old\" string=\"true\">one</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"new\" string=\"true\">two</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, stanza);
+            assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+            assert_eq!(p.calls().len(), 1);
+            assert_eq!(p.calls()[0].name, "edit");
+            assert_eq!(p.calls()[0].arg_value("path"), Some("/tmp/a.rs"));
+            assert_eq!(p.calls()[0].arg_value("old"), Some("one"));
+            assert_eq!(p.calls()[0].arg_value("new"), Some("two"));
+        }
+    }
+
+    /// Which shorthand a bare element is depends only on whether an invoke is
+    /// open: before one it names the tool, inside one it names a parameter.
+    /// Both spellings in a single stanza must land in the right slots.
+    #[test]
+    fn bare_elements_are_tool_then_parameter_names() {
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls>\
+             <｜DSML｜bash>\
+             <｜DSML｜command string=\"true\">ls -la</｜DSML｜command>\
+             </｜DSML｜invoke>\
+             </｜DSML｜tool_calls>",
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls().len(), 1);
+        assert_eq!(p.calls()[0].name, "bash");
+        assert_eq!(p.calls()[0].arg_value("command"), Some("ls -la"));
     }
 
     /// The self-consistent spelling of the shorthand closes with its own

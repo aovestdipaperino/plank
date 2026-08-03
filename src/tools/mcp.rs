@@ -1750,8 +1750,18 @@ mod tests {
         let flapped_prompt = crate::sysprompt::build_tools_prompt(&flapped, false);
         assert_eq!(flapped_prompt, live_prompt);
         assert_eq!(
-            crate::kvtier::system_fingerprint("m", &flapped_prompt),
-            crate::kvtier::system_fingerprint("m", &live_prompt),
+            crate::kvtier::system_fingerprint(
+                "m",
+                &flapped_prompt,
+                crate::engine::ThinkMode::default(),
+                0
+            ),
+            crate::kvtier::system_fingerprint(
+                "m",
+                &live_prompt,
+                crate::engine::ThinkMode::default(),
+                0
+            ),
             "fp1 must not move across a flap"
         );
         assert_eq!(
@@ -2626,8 +2636,18 @@ done
 
         assert_eq!(shadow_prompt, live_prompt);
         assert_eq!(
-            crate::kvtier::system_fingerprint("m", &shadow_prompt),
-            crate::kvtier::system_fingerprint("m", &live_prompt),
+            crate::kvtier::system_fingerprint(
+                "m",
+                &shadow_prompt,
+                crate::engine::ThinkMode::default(),
+                0
+            ),
+            crate::kvtier::system_fingerprint(
+                "m",
+                &live_prompt,
+                crate::engine::ThinkMode::default(),
+                0
+            ),
             "fp1 must not move across a flap"
         );
         assert!(shadow.is_offline());

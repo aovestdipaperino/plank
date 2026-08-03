@@ -183,9 +183,19 @@ fn tool_result_framing_matches_reference() {
 // ---------------------------------------------------------------------------
 
 fn c_source() -> Option<String> {
+    c_file("ds4_agent.c")
+}
+
+/// The engine core, which owns the chat encoding and the reasoning-effort
+/// preamble (the agent lives one layer above it).
+fn c_core_source() -> Option<String> {
+    c_file("ds4.c")
+}
+
+fn c_file(name: &str) -> Option<String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("refs/ds4")
-        .join("ds4_agent.c");
+        .join(name);
     std::fs::read_to_string(path).ok()
 }
 
@@ -302,5 +312,47 @@ fn tool_result_header_format_matches_c_source() {
     assert!(
         src.contains(r#""Tool error: empty tool call block\n""#),
         "C empty-block text changed"
+    );
+}
+
+/// The `/think max` preamble is model-facing text prepended ahead of the system
+/// prompt, so it is under the same byte-for-byte rule as the system prompt
+/// itself: the model was trained against exactly these words.
+#[test]
+fn think_max_prefix_matches_c_source() {
+    let Some(src) = c_core_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let expected = extract_c_string_constant(&src, "DS4_REASONING_EFFORT_MAX_PREFIX");
+    assert_identical(
+        &expected,
+        plank::engine::THINK_MAX_PREFIX,
+        "think-max preamble vs C",
+    );
+}
+
+/// The context floor `/think max` enforces is the C's, so the two cannot drift
+/// into disagreeing about when the level is usable.
+#[test]
+fn think_max_min_context_matches_c_source() {
+    let Some(src) = c_core_source() else {
+        eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
+        return;
+    };
+    let decl = "#define DS4_THINK_MAX_MIN_CONTEXT ";
+    let start = src
+        .find(decl)
+        .expect("DS4_THINK_MAX_MIN_CONTEXT not found in ds4.c")
+        + decl.len();
+    let digits: String = src[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let expected: i32 = digits.parse().expect("min-context define is not a number");
+    assert_eq!(
+        expected,
+        plank::engine::THINK_MAX_MIN_CONTEXT,
+        "think-max minimum context vs C"
     );
 }

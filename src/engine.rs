@@ -9,17 +9,78 @@
 
 use std::fmt::Debug;
 
-/// Reasoning mode requested for a generation, mirroring `ds4_think_mode`.
+/// Reasoning level requested for a generation, mirroring `ds4_think_mode`.
+///
+/// The three levels are the C's `DS4_THINK_NONE` / `_HIGH` / `_MAX`. plank long
+/// exposed only the first two (an `Auto` and an `On` that both mapped to
+/// `HIGH`); the levels are now one-to-one with the engine's, so `Max` — the
+/// reasoning-effort preamble in [`THINK_MAX_PREFIX`] — is reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkMode {
-    /// Model decides whether to emit a thinking block.
-    #[default]
-    Auto,
-    /// Force a thinking block.
-    On,
-    /// Suppress thinking.
+    /// Suppress thinking: the assistant prefix opens with `</think>`.
     Off,
+    /// Ordinary thinking (the C's `DS4_THINK_HIGH`). The default.
+    #[default]
+    Medium,
+    /// Ordinary thinking plus the reasoning-effort preamble, prepended ahead of
+    /// the system prompt. Needs a context of at least [`THINK_MAX_MIN_CONTEXT`].
+    Max,
 }
+
+impl ThinkMode {
+    /// The level's name, matching the C's `ds4_think_mode_name` for the two
+    /// shared levels and naming `Medium` as the user types it to [`parse`].
+    ///
+    /// [`parse`]: ThinkMode::parse
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Medium => "medium",
+            Self::Max => "max",
+        }
+    }
+
+    /// Parses a level typed by the user, case-insensitively. `high` and `none`
+    /// are accepted as the C's names for `Medium` and `Off`.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "no" => Some(Self::Off),
+            "medium" | "high" | "on" => Some(Self::Medium),
+            "max" | "maximum" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    /// Whether the assistant prefix opens a thinking block at this level
+    /// (the C's `ds4_think_mode_enabled`).
+    #[must_use]
+    pub fn thinks(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+/// The reasoning-effort preamble `Max` prepends ahead of the system prompt,
+/// byte-for-byte the C's `DS4_REASONING_EFFORT_MAX_PREFIX` (`refs/ds4/ds4.c`).
+/// Checked against the C source by `tests/c_parity.rs`.
+pub const THINK_MAX_PREFIX: &str = concat!(
+    "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n",
+    "You MUST be very thorough in your thinking and comprehensively decompose the problem to \
+     resolve the root cause, rigorously stress-testing your logic against all potential paths, \
+     edge cases, and adversarial scenarios.\n",
+    "Explicitly write out your entire deliberation process, documenting every intermediate step, \
+     considered alternative, and rejected hypothesis to ensure absolutely no assumption is left \
+     unchecked.\n\n",
+);
+
+/// Smallest context [`ThinkMode::Max`] is allowed at, the C's
+/// `DS4_THINK_MAX_MIN_CONTEXT`. The model guidance recommends think-max only with at
+/// least a 384K-token window; below it the preamble asks for a reasoning budget
+/// the context is not meant to hold, so `/think max` is refused rather than
+/// silently downgraded (the C downgrades instead — see
+/// `ds4_think_mode_for_context`).
+pub const THINK_MAX_MIN_CONTEXT: i32 = 393_216;
 
 /// Sampling and length options for one generation pass.
 #[derive(Debug, Clone)]
@@ -57,7 +118,7 @@ impl Default for GenerationOptions {
             top_p: 0.95,
             min_p: 0.0,
             seed: 0,
-            think_mode: ThinkMode::Auto,
+            think_mode: ThinkMode::Medium,
             think_tool_recovery: false,
         }
     }
@@ -423,6 +484,33 @@ pub trait Engine: Debug + Send {
     fn wants_structured(&self) -> bool {
         false
     }
+
+    /// Sets the reasoning level for every prompt built from now on.
+    ///
+    /// [`ThinkMode::Max`] prepends [`THINK_MAX_PREFIX`] ahead of the system
+    /// prompt, so changing the level changes the token prefix and every cached
+    /// KV prefix below it. An engine that caches tokens must drop them here —
+    /// the C does the same via `ds4_session_invalidate` when `/think max`
+    /// toggles the prefix in and out of the transcript.
+    ///
+    /// The level still travels per-generation in
+    /// [`GenerationOptions::think_mode`], which drives the assistant prefix;
+    /// this call is only about the prefix that sits *above* the transcript.
+    /// Engines that build no prompt of their own ignore it.
+    fn set_think_mode(&mut self, _mode: ThinkMode) {}
+
+    /// Byte length of the leading span of the system prompt that is trusted
+    /// control text (`sysprompt::SplitSystemPrompt::trusted_len`).
+    ///
+    /// A local engine tokenizes that span as *rendered chat*, so the literal
+    /// `｜DSML｜` in the prompt's examples becomes the model's dedicated DSML
+    /// vocabulary token instead of a spelled-out BPE sequence — what the model
+    /// was trained to read, and to emit. The remainder (MCP schemas, `-sys`
+    /// text) stays plain content so it cannot forge control tokens.
+    ///
+    /// Set once before the first prompt is built, and again whenever the system
+    /// prompt is rebuilt. Engines that do not tokenize locally ignore it.
+    fn set_trusted_system_prefix(&mut self, _len: usize) {}
 
     /// Answers a one-shot, tool-free prompt without disturbing the live
     /// generation state, then restores it exactly. Returns the aside's stats;
@@ -848,8 +936,43 @@ impl Engine for EchoEngine {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        ThinkToolRecovery, Utf8Stream, reusable_prefix,
+        ThinkMode, ThinkToolRecovery, Utf8Stream, reusable_prefix,
     };
+
+    // The default is ordinary thinking, the level plank has always run at.
+    #[test]
+    fn think_mode_defaults_to_medium() {
+        assert_eq!(ThinkMode::default(), ThinkMode::Medium);
+        assert_eq!(GenerationOptions::default().think_mode, ThinkMode::Medium);
+    }
+
+    #[test]
+    fn think_mode_round_trips_through_its_name() {
+        for level in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+            assert_eq!(ThinkMode::parse(level.name()), Some(level), "{level:?}");
+        }
+    }
+
+    // The C's own names for the two levels it shares with us, plus the casing
+    // and spacing a user actually types.
+    #[test]
+    fn think_mode_parses_the_c_names_and_sloppy_input() {
+        assert_eq!(ThinkMode::parse("none"), Some(ThinkMode::Off));
+        assert_eq!(ThinkMode::parse("high"), Some(ThinkMode::Medium));
+        assert_eq!(ThinkMode::parse("  MAX "), Some(ThinkMode::Max));
+        assert_eq!(ThinkMode::parse("Medium"), Some(ThinkMode::Medium));
+        assert_eq!(ThinkMode::parse("more"), None);
+        assert_eq!(ThinkMode::parse(""), None);
+    }
+
+    // Only `off` suppresses the thinking block; `max` thinks like `medium` and
+    // adds the effort preamble on top.
+    #[test]
+    fn only_off_suppresses_thinking() {
+        assert!(!ThinkMode::Off.thinks());
+        assert!(ThinkMode::Medium.thinks());
+        assert!(ThinkMode::Max.thinks());
+    }
 
     // The trigger: a complete stanza opening while thinking is still open.
     #[test]

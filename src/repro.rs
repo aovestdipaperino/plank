@@ -34,6 +34,9 @@ pub struct Meta<'a> {
     pub last_ctx_used: i32,
     /// GPU power cap percent in effect.
     pub power_percent: i32,
+    /// Reasoning level in effect. Carried on the meta rather than read from
+    /// the config because `/think` can change it after launch.
+    pub think: crate::engine::ThinkMode,
     /// Session identity SHA (empty when never saved).
     pub session_id: &'a str,
     /// Session tag (empty when unset).
@@ -85,7 +88,7 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
 
     let _ = writeln!(out, "## Generation");
     let _ = writeln!(out);
-    let _ = writeln!(out, "- think mode: {:?}", g.think_mode);
+    let _ = writeln!(out, "- think mode: {}", meta.think.name());
     let _ = writeln!(out, "- n_predict: {}", g.n_predict);
     let _ = writeln!(out, "- temperature: {}", g.temperature);
     let _ = writeln!(out, "- top_p: {}", g.top_p);
@@ -157,6 +160,7 @@ mod tests {
             transcript_tokens: 42,
             last_ctx_used: 40,
             power_percent: 100,
+            think: crate::engine::ThinkMode::Medium,
             session_id: "abc123",
             session_tag: "",
             note: "model looped on edit",
@@ -171,7 +175,7 @@ mod tests {
         assert!(report.starts_with("# plank repro 9.9.9\n"));
         assert!(report.contains("note: model looped on edit"));
         assert!(report.contains("session: abc123"));
-        assert!(report.contains("think mode: On"));
+        assert!(report.contains("think mode: medium"));
         // The transcript is embedded verbatim between the fences.
         let body = report
             .split_once("----- BEGIN TRANSCRIPT -----\n")

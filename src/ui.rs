@@ -922,6 +922,16 @@ struct Agent<'a> {
     reminder: SystemPromptReminder,
     trace: Trace,
     power_percent: i32,
+    /// Byte length of `system`'s trusted control-text prefix, handed to the
+    /// engine so it tokenizes that span as rendered chat, and folded into the
+    /// Tier 1 KV key so a checkpoint written under a different split is never
+    /// restored (the prompt *text* is identical either way, so the text alone
+    /// cannot tell them apart).
+    trusted_system_len: usize,
+    /// Live reasoning level, seeded from `cfg.generation.think_mode` and
+    /// changed by `/think`. Owned here rather than read from `cfg` on each
+    /// turn because `cfg` is shared immutably for the agent's lifetime.
+    think: crate::engine::ThinkMode,
     color: bool,
     show_footer: bool,
     /// True when the line editor renders its own resting footer, so the turn
@@ -1215,11 +1225,7 @@ impl Agent<'_> {
         // renders gray until `</think>`. Provider engines are excluded: their
         // translator emits explicit `<think>`/`</think>` tags, so pre-opening
         // here would mis-color any output not preceded by a reasoning delta.
-        if !matches!(
-            self.cfg.generation.think_mode,
-            crate::engine::ThinkMode::Off
-        ) && !self.engine.wants_structured()
-        {
+        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
             stream.begin_in_think();
         }
         let mut assistant_text = String::new();
@@ -1528,11 +1534,7 @@ impl Agent<'_> {
         stream.set_preflight(edit_preflight(&self.tool_ctx));
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
-        if !matches!(
-            self.cfg.generation.think_mode,
-            crate::engine::ThinkMode::Off
-        ) && !self.engine.wants_structured()
-        {
+        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
             stream.begin_in_think();
         }
         let mut assistant_text = String::new();
@@ -2687,6 +2689,7 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
+            "/think" => println!("{}", self.think_command(arg)),
             "/notify" => println!("{}", Self::notify_command(arg)),
             // Non-advertised: re-shows the last desktop notification so it can be
             // screenshotted. Not in `/help` or `slash_command_known`.
@@ -2936,10 +2939,8 @@ impl Agent<'_> {
         let show_thinking = crate::settings::active().ui.show_thinking;
         let thinking_tool_calls = crate::settings::active().engine.thinking_tool_calls;
         let tool_names = sysprompt::tool_names(&self.tool_ctx.mcp);
-        let pre_open_think = !matches!(
-            self.cfg.generation.think_mode,
-            crate::engine::ThinkMode::Off
-        ) && !self.engine.wants_structured();
+        let pre_open_think =
+            !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured();
 
         for m in &transcript[start..] {
             match m.role {
@@ -3190,6 +3191,52 @@ the original is frozen and listed in /tree"
         format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
+    /// Parses a `/think [off|medium|max]` argument and applies it; returns the
+    /// status line to report to the user. Shared by both front-ends so the two
+    /// dispatchers cannot drift.
+    ///
+    /// With no argument it reports the current level. `max` is refused below
+    /// [`THINK_MAX_MIN_CONTEXT`]: the preamble asks for a reasoning budget a
+    /// smaller context is not meant to hold, and a refusal the user can act on
+    /// (raise `--ctx-size`) beats the C's silent downgrade to `medium`.
+    ///
+    /// [`THINK_MAX_MIN_CONTEXT`]: crate::engine::THINK_MAX_MIN_CONTEXT
+    fn think_command(&mut self, arg: &str) -> String {
+        use crate::engine::{THINK_MAX_MIN_CONTEXT, ThinkMode};
+
+        let current = self.think;
+        let arg = arg.trim();
+        if arg.is_empty() {
+            return format!("thinking: {} (off|medium|max)", current.name());
+        }
+        let Some(level) = ThinkMode::parse(arg) else {
+            return format!("/think: expected off|medium|max, got `{arg}`");
+        };
+        let ctx = self.engine.ctx_size();
+        if level == ThinkMode::Max && ctx < THINK_MAX_MIN_CONTEXT {
+            return format!(
+                "/think max needs a context of at least {THINK_MAX_MIN_CONTEXT} tokens \
+                 (this session has {ctx}; restart with --ctx {THINK_MAX_MIN_CONTEXT}); \
+                 still {}",
+                current.name()
+            );
+        }
+        if level == current {
+            return format!("thinking already {}", level.name());
+        }
+        self.think = level;
+        // Moving in or out of `max` changes the prompt prefix, so the engine
+        // drops its cached tokens and KV here. Re-warm from the tier
+        // checkpoints under the new fingerprint rather than making the next
+        // turn re-prefill the system prompt inline.
+        let prefix_changed = (current == ThinkMode::Max) != (level == ThinkMode::Max);
+        self.engine.set_think_mode(level);
+        if prefix_changed {
+            self.rewarm_after_reset(&mut || {});
+        }
+        format!("thinking {}", level.name())
+    }
+
     /// Sets (or with `-` clears) the session tag, re-saving immediately when
     /// the session was already saved so listings pick it up.
     fn set_tag(&mut self, arg: &str) -> Result<String, String> {
@@ -3316,7 +3363,7 @@ the original is frozen and listed in /tree"
                     // section reads as a hang. The budget below covers the
                     // reasoning and the answer together, and `extract_json`
                     // takes the answer from after the think block.
-                    think_mode: crate::engine::ThinkMode::On,
+                    think_mode: crate::engine::ThinkMode::Medium,
                     ..self.cfg.generation.clone()
                 };
                 let stop = AtomicBool::new(false);
@@ -3473,6 +3520,7 @@ the original is frozen and listed in /tree"
             transcript_tokens: self.engine.count_tokens(&rendered),
             last_ctx_used: self.last_ctx_used,
             power_percent: self.power_percent,
+            think: self.think,
             session_id: &self.session.id,
             session_tag: &self.session.tag,
             note: note.trim(),
@@ -4793,7 +4841,12 @@ impl Agent<'_> {
     /// Tier 1, and moving them down would needlessly fork Tier 2 while moving
     /// local ones up would fork the model-global Tier 1 per project.
     fn kv_tiers(&self) -> Vec<crate::kvtier::TierSpec> {
-        let fp1 = crate::kvtier::system_fingerprint(&self.engine.model_name(), &self.system);
+        let fp1 = crate::kvtier::system_fingerprint(
+            &self.engine.model_name(),
+            &self.system,
+            self.think,
+            self.trusted_system_len,
+        );
         let local_names = crate::tools::mcp::local_server_names(None);
         let local_defs = crate::tools::mcp::local_tool_defs(&self.tool_ctx.mcp, &local_names);
         let local_material = crate::kvtier::tool_defs_material(&local_defs);
@@ -5527,11 +5580,7 @@ impl Agent<'_> {
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
-        if !matches!(
-            self.cfg.generation.think_mode,
-            crate::engine::ThinkMode::Off
-        ) && !self.engine.wants_structured()
-        {
+        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
             stream.begin_in_think();
         }
         // Set when a mid-stream preflight fails: stops the engine early, but
@@ -5642,10 +5691,7 @@ impl Agent<'_> {
             // denied for an aside, so it needs none of the dispatch machinery.
             let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
             aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
-            if !matches!(
-                self.cfg.generation.think_mode,
-                crate::engine::ThinkMode::Off
-            ) {
+            if !matches!(self.think, crate::engine::ThinkMode::Off) {
                 aside_renderer.begin_in_think();
             }
             // Shared between the token sink and the completion hook; the borrow
@@ -6123,6 +6169,10 @@ impl Agent<'_> {
                 }
                 None => log.push_plain("usage: /power <1..100>"),
             },
+            "/think" => {
+                let msg = self.think_command(arg);
+                log.push_plain(msg);
+            }
             "/notify" => log.push_plain(Self::notify_command(arg)),
             // Non-advertised: re-shows the last desktop notification so it can be
             // screenshotted. Not in `/help` or `slash_command_known`.
@@ -7068,7 +7118,7 @@ fn print_footer(st: &Status, color: bool) {
 }
 
 fn new_agent(
-    engine: Box<dyn Engine>,
+    mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
     remote: Option<Arc<RemoteState>>,
@@ -7118,11 +7168,17 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
-    let system = sysprompt::build_system_prompt(
+    let system = sysprompt::build_system_prompt_parts(
         &cfg.system,
         &tool_ctx.mcp,
         !crate::settings::active().engine.thinking_tool_calls,
     );
+    // Tell the engine where the trusted control text ends before it tokenizes
+    // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
+    // own token rather than as spelled-out BPE pieces.
+    engine.set_trusted_system_prefix(system.trusted_len);
+    let trusted_system_len = system.trusted_len;
+    let system = system.text;
     let skills = crate::skills::load_default(&tool_ctx.cwd);
     let templates = crate::templates::load_default(&tool_ctx.cwd);
     // The `skill` tool resolves names against the same set the slash command
@@ -7139,6 +7195,8 @@ fn new_agent(
         system,
         reminder: SystemPromptReminder::new(),
         power_percent: 0,
+        trusted_system_len,
+        think: cfg.generation.think_mode,
         trace,
         color: std::io::stdout().is_terminal(),
         show_footer,
@@ -7550,7 +7608,7 @@ fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{EngineError, EngineEvent, GenerationStats};
+    use crate::engine::{EngineError, EngineEvent, GenerationStats, ThinkMode};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -8035,6 +8093,12 @@ mod tests {
         /// letting fork tests assert the capture → sidechain → restore order.
         kv_events: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         kv_captures: u8,
+        /// Overrides the reported context size, so tests can stand on either
+        /// side of `THINK_MAX_MIN_CONTEXT`. `None` reports the usual `100_000`.
+        ctx_override: Option<i32>,
+        /// Records every `set_think_mode` call, so a test can assert the level
+        /// change reached the engine (where it drops cached tokens and KV).
+        think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
     }
 
     impl ScriptedEngine {
@@ -8138,7 +8202,13 @@ mod tests {
             Ok(())
         }
         fn ctx_size(&self) -> i32 {
-            100_000
+            self.ctx_override.unwrap_or(100_000)
+        }
+
+        fn set_think_mode(&mut self, mode: ThinkMode) {
+            if let Some(seen) = &self.think_modes {
+                seen.lock().unwrap().push(mode);
+            }
         }
     }
 
@@ -8158,6 +8228,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -8994,6 +9066,99 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `/think` with no argument reports rather than changes, and names the
+    // levels so the user learns the vocabulary from the answer.
+    #[test]
+    fn think_command_reports_the_current_level() {
+        let dir = scratch_dir("think-report");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let out = agent.think_command("");
+        assert!(out.contains("off"), "got: {out}");
+        assert!(out.contains("medium") && out.contains("max"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Setting a level changes what the next turn generates with *and* tells the
+    // engine, which is where the cached prefix decision is made.
+    #[test]
+    fn think_command_sets_the_level_and_tells_the_engine() {
+        let dir = scratch_dir("think-set");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("medium");
+        assert!(out.contains("medium"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Medium);
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Medium]);
+
+        // A no-op change says so and does not disturb the engine.
+        let out = agent.think_command("medium");
+        assert!(out.contains("already"), "got: {out}");
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The context guard: `max` is refused below the minimum rather than
+    // silently downgraded, and the refusal leaves the level alone.
+    #[test]
+    fn think_max_is_refused_on_a_small_context() {
+        let dir = scratch_dir("think-max-small");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("max");
+        assert!(
+            out.contains(&crate::engine::THINK_MAX_MIN_CONTEXT.to_string()),
+            "the refusal must name the context it needs; got: {out}"
+        );
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        assert!(seen.lock().unwrap().is_empty(), "engine untouched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // With enough context it goes through.
+    #[test]
+    fn think_max_is_accepted_on_a_large_context() {
+        let dir = scratch_dir("think-max-large");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("max");
+        assert!(out.contains("max"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Max);
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn think_command_rejects_an_unknown_level() {
+        let dir = scratch_dir("think-bad");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let out = agent.think_command("turbo");
+        assert!(out.contains("turbo"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn notify_command_toggles_and_reports() {
         let _g = crate::notify::TEST_LOCK
@@ -9694,6 +9859,8 @@ mod tests {
             system: "system prompt".to_string(),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -9746,6 +9913,8 @@ mod tests {
             system: String::new(),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -9863,6 +10032,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10034,6 +10205,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10110,6 +10283,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10173,6 +10348,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10259,6 +10436,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10410,6 +10589,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10490,6 +10671,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10629,6 +10812,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,
@@ -10690,6 +10875,8 @@ mod tests {
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
+            trusted_system_len: 0,
+            think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
             color: false,
             show_footer: false,

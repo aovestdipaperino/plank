@@ -124,20 +124,28 @@ impl InfoResponse {
 }
 
 /// Serde mirror of [`ThinkMode`] (the engine enum is not itself serializable).
+///
+/// The tags are deliberately not the level names: `Medium` still goes out as
+/// `"on"`, the tag plank has always sent for ordinary thinking, so a peer from
+/// before the levels split still understands it. `"auto"` and `"high"` are
+/// accepted inbound for the same reason — the old `Auto` was `On` in all but
+/// name. Only `"max"` is new, and a peer that rejects it could not have honored
+/// it anyway.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WireThinkMode {
-    Auto,
-    On,
     Off,
+    #[serde(alias = "auto", alias = "medium", alias = "high")]
+    On,
+    Max,
 }
 
 impl From<ThinkMode> for WireThinkMode {
     fn from(m: ThinkMode) -> Self {
         match m {
-            ThinkMode::Auto => Self::Auto,
-            ThinkMode::On => Self::On,
             ThinkMode::Off => Self::Off,
+            ThinkMode::Medium => Self::On,
+            ThinkMode::Max => Self::Max,
         }
     }
 }
@@ -145,9 +153,9 @@ impl From<ThinkMode> for WireThinkMode {
 impl From<WireThinkMode> for ThinkMode {
     fn from(m: WireThinkMode) -> Self {
         match m {
-            WireThinkMode::Auto => Self::Auto,
-            WireThinkMode::On => Self::On,
             WireThinkMode::Off => Self::Off,
+            WireThinkMode::On => Self::Medium,
+            WireThinkMode::Max => Self::Max,
         }
     }
 }

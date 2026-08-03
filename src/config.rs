@@ -288,7 +288,7 @@ impl Default for AgentConfig {
             generation: GenerationOptions {
                 n_predict: DEFAULT_N_PREDICT,
                 ctx_size: DEFAULT_CTX_SIZE,
-                think_mode: ThinkMode::On,
+                think_mode: ThinkMode::Medium,
                 ..GenerationOptions::default()
             },
             prompt: None,
@@ -448,8 +448,8 @@ Options:
       --top-p F            nucleus sampling threshold (0..1)
       --min-p F            minimum-probability threshold (0..1)
       --seed N             RNG seed (positive integer)
-      --think              enable thinking (default)
-      --think-max          enable maximum thinking effort
+      --think              ordinary thinking (default); same as /think medium
+      --think-max          maximum reasoning effort; needs --ctx 393216 or more
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
@@ -637,6 +637,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/power")
+        || slash_command_with_args(cmd, "/think")
         || slash_command_with_args(cmd, "/switch")
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
@@ -879,7 +880,10 @@ pub fn parse_options_with(
             "--top-p" => c.generation.top_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
             "--min-p" => c.generation.min_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
             "--seed" => c.generation.seed = parse_u64(need_arg(&mut i)?, arg)?,
-            "--think" | "--think-max" => c.generation.think_mode = ThinkMode::On,
+            // `--think-max` used to be an alias for ordinary thinking; it now
+            // selects the level it names, which the engine has always had.
+            "--think" => c.generation.think_mode = ThinkMode::Medium,
+            "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -921,6 +925,17 @@ pub fn parse_options_with(
 fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
+    }
+    // The same context floor `/think max` enforces, applied to `--think-max`.
+    // Checked here rather than at the flag because `--ctx` may follow it.
+    if c.generation.think_mode == ThinkMode::Max
+        && c.generation.ctx_size < crate::engine::THINK_MAX_MIN_CONTEXT
+    {
+        return Err(format!(
+            "--think-max needs --ctx {} or more (got {})",
+            crate::engine::THINK_MAX_MIN_CONTEXT,
+            c.generation.ctx_size
+        ));
     }
     // --provider (flavor b) selects a third-party API engine. Mutually
     // exclusive with the local selectors and with --remote (§4.7).
@@ -1066,7 +1081,7 @@ mod tests {
         assert_eq!(c.generation.n_predict, DEFAULT_N_PREDICT);
         assert_eq!(c.generation.ctx_size, DEFAULT_CTX_SIZE);
         assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT);
-        assert_eq!(c.generation.think_mode, ThinkMode::On);
+        assert_eq!(c.generation.think_mode, ThinkMode::Medium);
         assert!(c.prompt.is_none());
         // In-pass /btw suspend is on by default; --disable-btw-suspend opts out.
         assert!(c.btw.suspend);
@@ -1255,14 +1270,50 @@ mod tests {
                 .unwrap()
                 .generation
                 .think_mode,
-            ThinkMode::On
+            ThinkMode::Medium
         );
+        // `--think-max` selects the max level now, not the ordinary one.
         assert_eq!(
             parse_options(&args(&["--think-max"]))
                 .unwrap()
                 .generation
                 .think_mode,
-            ThinkMode::On
+            ThinkMode::Max
+        );
+        assert_eq!(
+            parse_options(&args(&["--nothink"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Off
+        );
+    }
+
+    // The max level's context floor is enforced at launch too, not only by
+    // `/think max` — and the flag order must not matter.
+    #[test]
+    fn think_max_requires_enough_context() {
+        // The default context is well above the floor, so the flag alone works.
+        assert!(parse_options(&args(&["--think-max"])).is_ok());
+        for flags in [
+            vec!["--think-max", "--ctx", "8192"],
+            vec!["--ctx", "8192", "--think-max"],
+        ] {
+            let err = parse_options(&args(&flags)).unwrap_err();
+            assert!(err.contains("--think-max"), "got: {err}");
+            assert!(
+                err.contains(&crate::engine::THINK_MAX_MIN_CONTEXT.to_string()),
+                "the error must name the context it needs; got: {err}"
+            );
+        }
+        // The floor exactly is enough.
+        assert!(
+            parse_options(&args(&[
+                "--think-max",
+                "--ctx",
+                &crate::engine::THINK_MAX_MIN_CONTEXT.to_string(),
+            ]))
+            .is_ok()
         );
     }
 

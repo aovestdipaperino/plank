@@ -432,6 +432,151 @@ test` and review the diff before committing.
   terminator, so a `write` payload containing `</｜DSML｜invoke>` (this repo's own
   sources and docs do) is still never truncated. Do not lift that restriction.
 
+- **`DS4_THINK_MAX` was in the C all along; plank collapsed it away.** The C's
+  `ds4_think_mode` has three levels (`NONE`/`HIGH`/`MAX`), but plank's
+  `ThinkMode` had `Auto`/`On`/`Off` where `Auto` and `On` both mapped to `HIGH`
+  and `MAX` was unreachable. Exposing the third level (`/think off|medium|max`)
+  therefore needed **no parity break**: the preamble text is the C's own
+  `DS4_REASONING_EFFORT_MAX_PREFIX`, checked byte-for-byte by `c_parity.rs`.
+  Two things about it are load-bearing:
+
+  *Position.* The preamble is tokenized as **plain text with no role wrapper**,
+  immediately after `ds4_chat_begin` and **before** the system message — see
+  `encode_chat_prompt` and the REPL's `repl_chat_apply_max_prefix`, which
+  inserts it at transcript index 1 (past the BOS). Folding it into the system
+  prompt *string* instead looks equivalent and is not: it would land after the
+  system role marker and diverge from the trained prefix.
+
+  *Cache identity.* Because it sits above the system prompt, the reasoning
+  level is key material for Tier 1 — `system_fingerprint` hashes
+  `model ‖ NUL ‖ think ‖ NUL ‖ system`. Without it a `max` checkpoint would be
+  restored under `medium`. (Adding the field changed the layout, so existing
+  `sysprompt-*.kv` files miss once and are rebuilt.) Changing the level in or
+  out of `max` invalidates the live KV and the token transcript; changing
+  between `off` and `medium` costs nothing, because that difference lives
+  entirely in the per-turn assistant prefix.
+
+  The C *downgrades* `max` to `high` below a 384K context
+  (`ds4_think_mode_for_context`); plank refuses instead, at both `--think-max`
+  and `/think max`, so the user learns the level did not take effect.
+
+- **The in-think tool-call verdict belongs at the stop token, not the opening
+  marker.** The original rule rejected a stanza the moment its opening marker
+  appeared inside `<think>`, and separately raised the prohibition at stream end
+  whenever `note_thinking_dsml_byte` had seen *any* DSML-shaped bytes while
+  thinking. Both are too eager, because a model reasoning about its own tool
+  syntax writes that syntax as part of the thought. `repro-1785754509.md` is the
+  case: the model quoted an opening `<｜DSML｜tool_calls>`, closed the thinking
+  block, emitted a correct call after it — and got back "tool calls are not
+  allowed inside `<think>`", which is advice about something it had not done, so
+  it rewrote correct markup and looped.
+
+  An opening marker is only a *candidate*. The model has not called a tool until
+  the stanza reaches its stop token, so that is where `rejects_in_think` is
+  evaluated, against the think state at that instant.
+
+  Two things had to move with it:
+
+  *`</think>` must be recognized while a stanza is open* — it was gated on
+  `!dsml_active`, so a stanza opened in thinking could never observe the close
+  and stayed "in think" for the rest of the stream. But only where it cannot be
+  data: inside a parameter value `</think>` is payload (a `write` of any document
+  discussing thinking blocks contains it), so the gate is
+  `parser.state() != ParamValue`, not `!dsml_active`. Getting this backwards
+  silently corrupts written files.
+
+  *Rendering is deferred, not just the verdict.* A stanza opening in thinking is
+  tracked but not drawn; the banner starts if `</think>` arrives with it still
+  open. Drawing optimistically would flash a tool banner every time the model
+  quoted a marker mid-thought.
+
+  Still unfixed, and separate: a *shorthand* opener (`<｜DSML｜invoke …>`) quoted
+  inside thinking opens an implicit stanza that never closes, so the rest of the
+  turn is swallowed as stanza content. That predates this change and is not
+  distinguishable from a real call at the point it matters.
+
+- **The shorthand has two levels, and only one of them was accepted.** The
+  parameter form (`<｜DSML｜command …>` for `<｜DSML｜parameter name="command" …>`)
+  was tolerated; the identical rewrite one level up was not. In
+  `repro-1785754509.md` the model wrote the *tool* name as the element name —
+
+  ```
+  <｜DSML｜tool_calls>
+  <｜DSML｜edit>
+    <｜DSML｜parameter name="path" string="true">…</｜DSML｜parameter>
+  </｜DSML｜invoke>
+  </｜DSML｜tool_calls>
+  ```
+
+  — five times, for `write` and `edit`, and got `unexpected DSML tag` every
+  time. The stanza is otherwise flawless: right wrapper, canonical parameters,
+  and it closes with `</｜DSML｜invoke>`, which is the model's own tell that it
+  meant an invoke. It never recovered, and eventually broke the think gate
+  restating the syntax to itself.
+
+  Telling the two shorthands apart needs exactly one bit: **is an invoke open?**
+  Before one, a bare element names the tool; inside one, a parameter. So
+  `shorthand_param_name` is checked first and `shorthand_invoke_name` second,
+  and each guards on the opposite state of `self.current`. Both stay narrow the
+  same way — DSML marker present, element name a plain identifier, no `name`
+  attribute — because accepting either means *running* a call the prompt never
+  taught. A bogus element name is safe: it reaches dispatch and fails there by
+  tool name, which the model can act on.
+
+  `viz.rs::scan_dsml_tag` mirrors the parser for rendering and had to learn both
+  forms too, keyed on `viz.tool_announced` (that side's copy of "an invoke is
+  open"). Without it a shorthand call ran with no banner, or rendered its tool
+  name as a parameter — worse than the rejection it replaced.
+
+  Still unaccepted, seen once in the same log: `<｜DSinvoke name="bash">`, the
+  marker itself corrupted (`DSML｜` → `DS`). That is token damage rather than a
+  syntax variant, and widening `MARKER_NAMES` to catch it would start matching
+  prose.
+
+- **The system prompt must be tokenized in two halves, and plank was doing it in
+  one.** `｜DSML｜` is not a markup convention — it is a token in the model's own
+  GGUF vocabulary, looked up at load time next to BOS/EOS/`<｜User｜>` and fatal
+  if missing (`ds4.c:22272`). But `ds4_chat_append_message` tokenizes a `system`
+  message with plain `bpe_tokenize_text`, *no* special-token splitting. So every
+  marker in the tools prompt reached the model as ordinary BPE pieces, and the
+  model read a spelled-out marker and wrote a spelled-out marker back — which is
+  where `<｜DSinvoke name="bash">` and the `SSML` misspelling come from.
+
+  The C already solves this. `agent_append_system_prompt` splits the prompt and
+  routes the halves differently, with the rule in a comment:
+
+  > The built-in tool prompt is trusted DS4 control text. Tokenize it like a
+  > rendered chat prompt so the literal ｜DSML｜ markers in the examples become
+  > the model's dedicated DSML token. Do not apply that tokenizer to user
+  > supplied -sys text: arbitrary user text containing `<｜User｜>`, `<think>`,
+  > or `｜DSML｜` must remain plain content, not control tokens.
+
+  That second sentence is a **prompt-injection boundary**, and plank's is wider
+  than the C's: the C's tools prompt is entirely built in, while plank appends
+  MCP tool schemas and server instructions to it. Those come from third-party
+  processes, so they sit outside the trusted span alongside `-sys` text. Every
+  `｜DSML｜` the prompt teaches is in the built-in part, so nothing is lost by
+  drawing the line there — see `SplitSystemPrompt::trusted_len`. Widening that
+  span would let an MCP server forge a turn boundary.
+
+  Two traps in implementing it:
+
+  *Two paths tokenize the system prompt, not one.* The warm walk builds it via
+  `build_system_tokens`, and `reconcile` rebuilds it every turn as section 0 of
+  the rendered transcript. If they disagree by a single token the KV
+  common-prefix probe stops right after the system prompt and each turn
+  re-prefills the whole conversation — silently, since nothing errors. Both now
+  go through `append_system_text`, and a model-gated test asserts they agree.
+
+  *The split changes the tokens without changing the text.* `system_fingerprint`
+  keys the Tier 1 checkpoint on the prompt's bytes, which are identical before
+  and after, so a checkpoint written under the old scheme would have been
+  restored under the new one and prefilled against a KV that no longer matches.
+  `trusted_len` is therefore key material too.
+
+  Measured on the real model (`PLANK_TEST_MODEL`): 3263 → 3213 tokens, with 16
+  native `｜DSML｜` tokens where there were previously none.
+
 ## Part 2 — Environment & tooling
 
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so

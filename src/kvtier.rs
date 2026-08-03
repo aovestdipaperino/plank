@@ -36,7 +36,7 @@
 
 use std::path::Path;
 
-use crate::engine::{Engine, EngineError, EngineEvent};
+use crate::engine::{Engine, EngineError, EngineEvent, ThinkMode};
 use crate::session::KvKey;
 use crate::session::SessionStore;
 use crate::session::tier_fingerprint;
@@ -96,15 +96,36 @@ impl TierSpec {
     }
 }
 
-/// Tier 1's fingerprint: `sha1(model ‖ NUL ‖ system)`.
+/// Tier 1's fingerprint: `sha1(model ‖ NUL ‖ think ‖ NUL ‖ trusted_len ‖ NUL ‖ system)`.
 ///
 /// The single definition of the system-prompt checkpoint key, shared by the
 /// engine (which writes `sysprompt-*.kv` with it) and by the tier planner
 /// (which chains `fp2` off it). Keeping one implementation is what guarantees
 /// the two never disagree and silently invalidate the whole chain.
+///
+/// The reasoning level is key material because [`ThinkMode::Max`] prepends the
+/// reasoning-effort preamble *ahead of* the system prompt: two levels give the
+/// same system text a different token prefix, and a checkpoint keyed on the
+/// text alone would be restored under the wrong one.
+///
+/// `trusted_len` is key material for the same reason, one step subtler: it does
+/// not change the prompt's *text* at all, only where the tokenizer stops
+/// treating it as control text (`sysprompt::SplitSystemPrompt::trusted_len`).
+/// Two builds that split differently render byte-identical prompts to
+/// byte-*different* token streams, so without this a checkpoint from one would
+/// be restored under the other and prefill from a KV that does not match.
 #[must_use]
-pub fn system_fingerprint(model: &str, system: &str) -> String {
+pub fn system_fingerprint(
+    model: &str,
+    system: &str,
+    think: ThinkMode,
+    trusted_len: usize,
+) -> String {
     let mut data = model.as_bytes().to_vec();
+    data.push(0);
+    data.extend_from_slice(think.name().as_bytes());
+    data.push(0);
+    data.extend_from_slice(trusted_len.to_string().as_bytes());
     data.push(0);
     data.extend_from_slice(system.as_bytes());
     crate::session::sha1_hex(&data)
@@ -350,7 +371,7 @@ mod tests {
 
     #[test]
     fn plan_emits_the_system_tier_first_and_keys_each_tier() {
-        let fp1 = system_fingerprint("model-a", "SYSTEM");
+        let fp1 = system_fingerprint("model-a", "SYSTEM", crate::engine::ThinkMode::default(), 0);
         let tiers = plan(
             &fp1,
             "SYSTEM",
@@ -383,7 +404,7 @@ mod tests {
 
     #[test]
     fn plan_without_a_project_dir_still_caches_the_system_tier() {
-        let fp1 = system_fingerprint("m", "SYSTEM");
+        let fp1 = system_fingerprint("m", "SYSTEM", crate::engine::ThinkMode::default(), 0);
         let tiers = plan(&fp1, "SYSTEM", "agents\n", "", "", None);
         assert_eq!(tiers[0].key, Some(KvKey::System { fp: fp1 }));
         assert_eq!(tiers[1].key, None, "no store, no project checkpoint");
@@ -580,16 +601,34 @@ mod tests {
     }
 
     #[test]
-    fn system_fingerprint_is_model_and_prompt_keyed() {
-        let a = system_fingerprint("model-a", "sys");
-        assert_eq!(a, system_fingerprint("model-a", "sys"));
-        assert_ne!(a, system_fingerprint("model-b", "sys"));
-        assert_ne!(a, system_fingerprint("model-a", "sys2"));
-        // The NUL separator keeps the two fields from bleeding together.
-        assert_ne!(system_fingerprint("ab", "c"), system_fingerprint("a", "bc"));
-        // Matches the historical `sha1(model ‖ NUL ‖ system)` layout the
-        // existing sysprompt checkpoints were written with.
+    fn system_fingerprint_is_model_prompt_level_and_split_keyed() {
+        use ThinkMode::{Max, Medium, Off};
+        let a = system_fingerprint("model-a", "sys", Medium, 0);
+        assert_eq!(a, system_fingerprint("model-a", "sys", Medium, 0));
+        assert_ne!(a, system_fingerprint("model-b", "sys", Medium, 0));
+        assert_ne!(a, system_fingerprint("model-a", "sys2", Medium, 0));
+        // The reasoning level keys the tier: `max` prepends the effort preamble
+        // ahead of the same system text, so its checkpoint must not be reused
+        // for another level.
+        assert_ne!(a, system_fingerprint("model-a", "sys", Max, 0));
+        assert_ne!(a, system_fingerprint("model-a", "sys", Off, 0));
+        assert_ne!(
+            system_fingerprint("model-a", "sys", Max, 0),
+            system_fingerprint("model-a", "sys", Off, 0)
+        );
+        // The NUL separators keep the three fields from bleeding together.
+        assert_ne!(
+            system_fingerprint("ab", "c", Medium, 0),
+            system_fingerprint("a", "bc", Medium, 0)
+        );
+        // The tokenization split keys it too: identical text, different tokens.
+        assert_ne!(a, system_fingerprint("model-a", "sys", Medium, 3));
+
         let mut expect = b"model-a".to_vec();
+        expect.push(0);
+        expect.extend_from_slice(b"medium");
+        expect.push(0);
+        expect.extend_from_slice(b"0");
         expect.push(0);
         expect.extend_from_slice(b"sys");
         assert_eq!(a, crate::session::sha1_hex(&expect));
@@ -685,7 +724,7 @@ mod warm_tests {
     }
 
     fn tiers_for(system: &str, stable: &str, volatile: &str) -> Vec<TierSpec> {
-        let fp1 = system_fingerprint("m", system);
+        let fp1 = system_fingerprint("m", system, crate::engine::ThinkMode::default(), 0);
         plan(&fp1, system, stable, volatile, "", Some(Path::new("/p")))
     }
 

@@ -1270,6 +1270,21 @@ impl<S: RenderSink> StreamRenderer<S> {
         {
             self.viz_param_begin(&name);
             self.scan = DsmlScan::Value;
+        } else if parse_attr(&tag, "name").is_none()
+            && let Some(elem) = crate::dsml::element_name(&tag)
+        {
+            // The two shorthand forms the parser accepts, told apart the same
+            // way it tells them apart: before an invoke is open a bare element
+            // names the tool, inside one it names a parameter. `tool_announced`
+            // is this side's copy of the parser's "an invoke is open".
+            // Without mirroring it here a shorthand call runs with no banner,
+            // or with its tool name rendered as a parameter.
+            if self.viz.tool_announced {
+                self.viz_param_begin(&elem);
+                self.scan = DsmlScan::Value;
+            } else {
+                self.viz_tool(&elem);
+            }
         }
         // Anything else is malformed; the strict parser reports it.
     }
@@ -1285,14 +1300,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         match self.parser.state() {
             DsmlState::Done => {
-                if self.dsml_ignored {
+                if self.rejects_in_think() {
                     // A discarded in-think stanza must never surface as an
                     // executable call: this parser instance is shared across
                     // the whole stream, so leaving `self.calls` unset here
                     // (rather than syncing it from the parser, which parsed
                     // the ignored stanza too) keeps a prior real call intact
                     // and never lets the ignored one leak into dispatch.
-                    self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
+                    self.reject_in_think_stanza(
+                        "tool calling is not allowed inside <think></think>",
+                    );
                 } else {
                     self.calls = self.parser.calls().to_vec();
                     self.viz_finish(None);
@@ -1300,8 +1317,8 @@ impl<S: RenderSink> StreamRenderer<S> {
                 }
             }
             DsmlState::Error => {
-                if self.dsml_ignored {
-                    self.finish_ignored_dsml("malformed tool call inside <think></think>");
+                if self.rejects_in_think() {
+                    self.reject_in_think_stanza("malformed tool call inside <think></think>");
                 } else {
                     let err = if self.parser.error().is_empty() {
                         "parse error"
@@ -1345,19 +1362,62 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Starts a DSML block; the parser is seeded with canonical bytes so all
     /// later parsing stays strict even when a typo form was accepted.
-    fn start_dsml(&mut self, ignored: bool) {
+    ///
+    /// A stanza opening inside `<think>` is always *tracked* — whether it is
+    /// allowed is decided at its stop token by [`Self::rejects_in_think`], not
+    /// here. It is not *rendered* yet, though: until it leaves the thinking
+    /// block it may still turn out to be the model quoting syntax, and a
+    /// banner for a call that never happens is worse than a late one. Rendering
+    /// starts if and when `</think>` arrives with the stanza still open.
+    fn start_dsml(&mut self) {
         self.dsml_active = true;
-        self.dsml_ignored = ignored;
-        if ignored {
+        self.dsml_ignored = self.rejects_in_think();
+        if self.in_think {
             self.dsml_in_think = true;
         }
         self.dsml_start_tail.clear();
         self.post_think_gap = false;
         self.parser.feed(DSML_START);
         self.scan = DsmlScan::Between;
-        if !ignored {
+        if !self.dsml_ignored {
             self.viz_start();
         }
+    }
+
+    /// Whether the stanza reaching its stop token right now must be discarded
+    /// for sitting inside `<think>`.
+    ///
+    /// Judged at the **stop token**, against the think state at that moment —
+    /// never at the opening marker. A model reasoning about DSML syntax writes
+    /// an opening marker mid-thought all the time, and often goes on to close
+    /// the thinking block and emit the real call (`repro-1785754509.md`).
+    /// Deciding at the opening threw that correct call away and told the model
+    /// to stop doing something it had not done, which reliably sent it into a
+    /// rewrite loop. An opening marker is only ever a *candidate*; the model has
+    /// not called a tool until the stanza closes.
+    fn rejects_in_think(&self) -> bool {
+        self.in_think && !self.thinking_tool_calls
+    }
+
+    /// Rejects the stanza that just closed (or was cut off) inside thinking.
+    /// The banner it already streamed is closed off first, the way an invalid
+    /// stanza's is: rendering is optimistic because acceptance is not known
+    /// until the stop token.
+    fn reject_in_think_stanza(&mut self, msg: &str) {
+        self.dsml_ignored = true;
+        self.viz_drop_invalid_dsml();
+        self.finish_ignored_dsml(msg);
+    }
+
+    /// Whether a `</think>` at the current position is a control token rather
+    /// than stanza content.
+    ///
+    /// Outside a stanza it always is. Inside one it is, *except* within a
+    /// parameter value: a `write` or `edit` payload may legitimately contain
+    /// the literal text `</think>` (this repo's own sources and docs do), and
+    /// swallowing it there would silently corrupt what gets written.
+    fn think_close_is_control(&self) -> bool {
+        !self.dsml_active || self.parser.state() != DsmlState::ParamValue
     }
 
     fn finish_ignored_dsml(&mut self, msg: &str) {
@@ -1494,7 +1554,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 if complete {
                     // Parity mode discards an in-think stanza; otherwise it is
                     // an ordinary tool call that happens to sit inside a thought.
-                    self.start_dsml(self.in_think && !self.thinking_tool_calls);
+                    self.start_dsml();
                     if implicit_invoke {
                         for &b in CANONICAL_INVOKE {
                             self.feed_dsml_byte(b);
@@ -1544,19 +1604,33 @@ impl<S: RenderSink> StreamRenderer<S> {
                 i += THINK_OPEN.len();
                 continue;
             }
-            if !self.dsml_active && rem.starts_with(THINK_CLOSE) {
-                self.flush_start_tail();
-                self.in_think = false;
-                self.pseudo_tool.reset_line();
-                self.viz_newline_if_open();
-                self.emit_visible_bytes(b"\n");
-                self.post_think_gap = true;
+            if rem.starts_with(THINK_CLOSE) && self.think_close_is_control() {
+                if self.dsml_active {
+                    // The model closed its thought part-way through a stanza.
+                    // `</think>` is a control token, never stanza content, so
+                    // it is consumed without reaching the parser and the call
+                    // carries on — now outside thinking, so its stop token
+                    // will accept it. The call is real after all, so start
+                    // rendering it if the opener was held back.
+                    self.in_think = false;
+                    if self.dsml_ignored {
+                        self.dsml_ignored = false;
+                        self.viz_start();
+                    }
+                } else {
+                    self.flush_start_tail();
+                    self.in_think = false;
+                    self.pseudo_tool.reset_line();
+                    self.viz_newline_if_open();
+                    self.emit_visible_bytes(b"\n");
+                    self.post_think_gap = true;
+                }
                 i += THINK_CLOSE.len();
                 continue;
             }
             if !finish
-                && !self.dsml_active
                 && rem[0] == b'<'
+                && self.think_close_is_control()
                 && (is_partial_prefix(rem, THINK_OPEN) || is_partial_prefix(rem, THINK_CLOSE))
             {
                 self.pending = rem.to_vec();
@@ -1578,8 +1652,12 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.flush_start_tail();
             self.post_think_gap = false;
             if self.dsml_active {
-                if self.dsml_ignored {
-                    self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
+                if self.rejects_in_think() {
+                    // Cut off mid-stanza and still inside thinking: the model
+                    // never left the block, so the placement rule applies.
+                    self.reject_in_think_stanza(
+                        "tool calling is not allowed inside <think></think>",
+                    );
                 } else {
                     self.viz_finish(Some(if self.preflight_error.is_some() {
                         "[tool call stopped: edit old selector failed]\n"
@@ -1589,13 +1667,14 @@ impl<S: RenderSink> StreamRenderer<S> {
                     self.dsml_active = false;
                 }
             }
-            // In allow mode, `dsml_in_think` is set by `note_thinking_dsml_byte`
-            // as soon as a real in-think stanza is detected, even though it
-            // dispatches normally instead of being ignored; guard against
-            // re-reporting a stanza that already completed via `Done`.
-            if self.dsml_in_think && !self.dsml_in_think_reported && !self.thinking_tool_calls {
-                self.finish_ignored_dsml("tool calling is not allowed inside <think></think>");
-            }
+            // Deliberately nothing here for `dsml_in_think` alone. That flag is
+            // set by `note_thinking_dsml_byte` the moment DSML-shaped bytes
+            // appear inside `<think>`, which happens whenever the model reasons
+            // *about* the syntax — quoting a marker is not calling a tool. It
+            // used to raise the prohibition at finish, so a model explaining its
+            // own tool-call format got a tool error back and rewrote correct
+            // syntax. Only a stanza that reaches its stop token (or is cut off
+            // mid-flight) is a call, and both are handled above.
         }
     }
 }
@@ -2213,6 +2292,143 @@ mod tests {
         assert!(fin.in_think_rejected, "rejected for placement");
         assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
         assert!(fin.ended_in_think);
+    }
+
+    /// The verdict belongs at the stanza's *stop* token, not its opening.
+    ///
+    /// From `repro-1785754509.md`: the model was reasoning about the correct
+    /// syntax, wrote an opening `<｜DSML｜tool_calls>` as part of that thought,
+    /// then closed the thinking block and emitted the real call. Judging at the
+    /// opening threw the whole (correct, post-`</think>`) call away and told
+    /// the model to stop calling tools inside thinking — which it had not done.
+    #[test]
+    fn a_stanza_opened_in_think_but_closed_after_it_is_dispatched() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<think>the correct format is:\n\n<｜DSML｜tool_calls>\n</think>\n\n");
+        sr.push("<｜DSML｜invoke name=\"bash\">");
+        sr.push("<｜DSML｜parameter name=\"command\">ls -la</｜DSML｜parameter｜>");
+        sr.push("</｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
+        assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
+        assert!(!fin.in_think_rejected, "the call closed outside thinking");
+        assert!(fin.error.is_none(), "{:?}", fin.error);
+        assert!(
+            !sr.sink().visible.contains("[tool call ignored:"),
+            "{:?}",
+            sr.sink().visible
+        );
+    }
+
+    /// Merely *mentioning* the markup while reasoning is not a tool call and
+    /// must not poison the turn: with no stanza and no stop token there is
+    /// nothing to block. The marker detector alone used to raise the
+    /// prohibition at finish, so a model recalling its own syntax mid-thought
+    /// got a tool error back and went off rewriting correct markup.
+    #[test]
+    fn dsml_mentioned_while_thinking_without_a_stop_token_is_not_rejected() {
+        for text in [
+            // A parameter line quoted mid-thought: DSML-shaped, but not an
+            // opener, so no stanza is ever tracked.
+            "<think>each arg is <｜DSML｜parameter name=\"x\" string=\"true\">v</｜DSML｜parameter｜>              inside the invoke</think>the answer",
+            // A bare closing tag, the other half of the same recollection.
+            "<think>and it ends with </｜DSML｜tool_calls｜> of course</think>the answer",
+        ] {
+            let sr = run_chunked(text);
+            let fin = sr.finished();
+            assert!(fin.calls.is_empty(), "{:?}", fin.calls);
+            assert!(!fin.in_think_rejected, "nothing completed; {text}");
+            assert_eq!(fin.error, None, "{text}");
+            // The marker was still *seen* in thinking, which is reported as
+            // information; it just is not an error any more.
+            assert!(fin.dsml_in_think, "{text}");
+            assert!(sr.sink().visible.contains("the answer"), "{text}");
+        }
+    }
+
+    /// `</think>` is only a control token where it cannot be data. Inside a
+    /// parameter value it is payload — this repo's own sources and docs contain
+    /// the literal text — so it must reach the parser untouched. Swallowing it
+    /// there would silently corrupt every file written about thinking blocks.
+    #[test]
+    fn think_close_inside_a_parameter_value_is_payload_not_a_control_token() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<think>writing it up</think>");
+        sr.push("<｜DSML｜tool_calls><｜DSML｜invoke name=\"write\">");
+        sr.push("<｜DSML｜parameter name=\"content\">close it with </think> when done");
+        sr.push("</｜DSML｜parameter｜></｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
+        assert_eq!(
+            fin.calls[0].arg_value("content"),
+            Some("close it with </think> when done")
+        );
+        assert!(fin.error.is_none(), "{:?}", fin.error);
+    }
+
+    /// A stanza that both opens and closes inside thinking is still rejected —
+    /// that is the trained rule — and it renders no banner on the way, since it
+    /// never became a real call.
+    #[test]
+    fn a_stanza_wholly_inside_think_is_rejected_without_a_banner() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(format!("<think>thinking{BASH_STANZA}</think>done"));
+        sr.finish();
+        let fin = sr.finished();
+        assert!(fin.calls.is_empty(), "{:?}", fin.calls);
+        assert!(fin.in_think_rejected);
+        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert!(
+            !sr.sink().visible.contains("🛠️"),
+            "no banner for a call that never happened: {:?}",
+            sr.sink().visible
+        );
+    }
+
+    /// A shorthand invoke (`<｜DSML｜edit>`) dispatches, so it must also draw a
+    /// banner naming the tool — a call that runs invisibly is worse than one
+    /// that is refused.
+    #[test]
+    fn shorthand_invoke_renders_a_banner() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<｜DSML｜tool_calls><｜DSML｜bash>");
+        sr.push("<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter｜>");
+        sr.push("</｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
+        assert_eq!(fin.calls[0].name, "bash");
+        assert!(
+            sr.sink().visible.contains("🛠️ $ ls -la"),
+            "{:?}",
+            sr.sink().visible
+        );
+        assert!(
+            !sr.sink().visible.contains("DSML"),
+            "{:?}",
+            sr.sink().visible
+        );
+    }
+
+    /// The parameter shorthand renders under its own name too — the same
+    /// mirroring, one level down.
+    #[test]
+    fn shorthand_parameter_renders_under_its_element_name() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">");
+        sr.push("<｜DSML｜command string=\"true\">ls -la</｜DSML｜invoke>");
+        sr.push("</｜DSML｜invoke｜></｜DSML｜tool_calls｜>");
+        sr.finish();
+        let fin = sr.finished();
+        assert_eq!(fin.calls.len(), 1, "{:?}", fin.calls);
+        assert_eq!(fin.calls[0].arg_value("command"), Some("ls -la"));
+        assert!(
+            sr.sink().visible.contains("🛠️ $ ls -la"),
+            "{:?}",
+            sr.sink().visible
+        );
     }
 
     /// A completed stanza inside `<think>` reports the same placement error,
