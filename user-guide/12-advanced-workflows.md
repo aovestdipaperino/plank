@@ -98,6 +98,12 @@ Do not wait for the automatic pass to fire in the middle of something delicate. 
 /compact      # rebuild: summary + recent tail + recently read files
 ```
 
+When you already know what the next stretch of work needs, say so and the summary will keep it:
+
+```
+/compact keep the failing test cases verbatim
+```
+
 A `/checkpoint` taken beforehand makes even that reversible — a checkpoint stores the whole transcript, so `/rollback` reconstructs the pre-compaction conversation exactly.
 
 ### Give it a plan that survives
@@ -151,10 +157,10 @@ The bash sandbox already limits writes to the working directory and temp. If a p
 The model's `bash` tool cannot drive a login prompt, a pager, or an editor. Use `!`:
 
 ```
-!gh auth login
+!!gh auth login
 ```
 
-Your command, your shell, never sandboxed, output lands in the conversation where the model can see the result.
+Your command, your shell, never sandboxed. Use `!!` when the output is only for you — a login flow is noise the model does not need — and plain `!` when you want the result recorded so the model can act on it in your next message.
 
 ## Making it repeatable
 

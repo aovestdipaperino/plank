@@ -101,7 +101,7 @@ Hooks run your shell commands (or inject static prompts) at lifecycle points. Co
 | `UserPromptSubmit` | every submitted prompt | may inject turn context |
 | `SessionStart` | session begins (`startup`/`resume`/`clear`/`compact`) | may inject context |
 | `SessionEnd` | session ends (with a reason) | — |
-| `PreCompact` / `PostCompact` | around a compaction pass | may inject context; `PostCompact` carries the summary |
+| `PreCompact` / `PostCompact` | around a compaction pass | may inject context; both carry `trigger` (`manual` for `/compact`, `auto` for a threshold pass) and `PostCompact` carries the summary. `PostCompact` does not fire for a pass that was interrupted or produced no summary, since no compaction happened |
 
 ### The protocol
 

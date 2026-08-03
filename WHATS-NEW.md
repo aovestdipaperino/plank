@@ -13,6 +13,44 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
+The 2.8.1 beta channel has just opened and is identical to the 2.8.0 stable
+release below. Nothing to report here yet.
+
+## Stable releases
+
+### 2.8.0
+
+The 2.7 beta line, promoted: `/btw` learning to answer without stopping the
+task, PDF reading, and an `/insights` report that stops overreaching — plus
+shell escapes and compaction both learning a distinction they were missing.
+
+🐚 **`!` and `!!` now differ by who sees the output.** A `!` command used to be
+yours alone: it ran, you read the output, and the model never knew. That is now
+`!!`. Plain `!` runs the command exactly the same way and then records it and its
+result in the conversation, so `!cargo test` followed by "fix the failure" works
+without you pasting anything. Neither form starts a turn, so `!` is not a way to
+ask for something — it is a way to have already shown it.
+
+🗜️ **`/compact` takes instructions.** `/compact keep the failing test cases
+verbatim` steers that one summary. What you say is added to what plank already
+asks for rather than replacing it, so the summary keeps its structure and gains
+your emphasis. Automatic compaction asks exactly what it always did.
+
+⏳ **Compaction says how far along it is.** It used to print one line and then go
+quiet for as long as it took, which on a large conversation reads as a hang. The
+throbber line now carries a flashing `compacting` with a bar and a percentage,
+and the window title reads `🗑️ compacting...` until the pass ends.
+
+🪝 **Compaction hooks fired for almost nobody.** `PreCompact` and `PostCompact`
+ran only in the plain REPL, so if you use plank in a terminal — which is to say,
+in the TUI — a compaction hook you had configured never ran at all. Both now
+fire on both front-ends.
+
+🛟 **A failed compaction no longer costs you the conversation.** If the model
+came back with no usable summary, plank rebuilt the transcript anyway and put
+that emptiness where the summary should have been. A pass with nothing to show
+for it is now a failure: your conversation is left exactly as it was.
+
 💬 **`/btw` answers beside the task instead of freezing it.** Asking a side
 question mid-generation used to stop the main task dead until the answer was
 done. The aside now runs on a fork of the session, interleaved with the main
@@ -65,8 +103,6 @@ limited". Timing is now reported only when at least half your sessions carry it.
 🟩 **Status lines read better.** `Opening page ...` and friends are the theme
 green instead of dim pink, with any URL lifted to white so the target stands
 out from the prose.
-
-## Stable releases
 
 ### 2.6.0
 

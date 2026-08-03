@@ -38,7 +38,7 @@ See [Sessions](06-sessions.md).
 | Command | What it does |
 |---|---|
 | `/context` | report context-window usage by category |
-| `/compact` | compact the conversation now, rather than waiting for the automatic pass |
+| `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |

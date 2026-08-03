@@ -76,6 +76,19 @@ When the conversation approaches the window, plank reclaims space in escalating 
 
 runs it on demand — useful just before handing the model a big new job, so it starts with room.
 
+**Steering the summary.** Anything after `/compact` is extra instruction for that one pass:
+
+```
+/compact keep the failing test cases verbatim
+/compact focus on the parser work and drop the deployment detour
+```
+
+Your instruction is *added* to what plank already asks for, not substituted for it, so the summary keeps its structure and gains your emphasis. Use it when you know which thread matters next and the default summary would flatten it. Automatic compaction has no instructions, and asks exactly what it always did.
+
+While a pass runs the status bar shows its progress and the window title reads `🗑️ compacting...`. `Esc` interrupts it, which leaves the conversation exactly as it was.
+
+**If it fails, nothing is lost.** An interrupted pass, or one where the model returns no usable summary, leaves the transcript untouched and abandons the turn rather than rebuilding on a bad summary. You will see `Compaction produced no summary; keeping the previous conversation state.` — retry it, or `/compact` with an instruction to nudge the model.
+
 Two things deliberately survive compaction: the **task list** (that is what the `task` tool is for) and **memory**.
 
 And one thing makes compaction reversible: a `/checkpoint` taken before it stores the whole transcript, so `/rollback` reconstructs the pre-compaction conversation exactly. See [Sessions](06-sessions.md).

@@ -80,7 +80,7 @@ The model searches, opens the pages worth opening, and reports. If it answers fr
 
 On macOS, model-initiated shell commands run under `/usr/bin/sandbox-exec` with a generated Seatbelt profile: **read everywhere, write only under the working directory, temp directories, and any roots you allow**. It is on by default, because a model-chosen command should not be able to write outside the project it was pointed at.
 
-Commands *you* type with `!` are never sandboxed — you typing the command is the authorization.
+Commands *you* type with `!` or `!!` are never sandboxed — you typing the command is the authorization.
 
 Configure it in `~/.plank/sandbox.json`, overlaid by `./.plank/sandbox.json`:
 

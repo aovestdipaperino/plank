@@ -14,6 +14,14 @@ A `settings.json` that moved you off Metal or shrank the context is invisible on
 
 Then check `/context`. A window that is nearly full compacts often, and a conversation that has been compacted several times has lost detail by design. `/compact` deliberately, or start a fresh session for a new task.
 
+## "Compaction produced no summary"
+
+The pass ran but the model returned nothing usable, so plank kept your conversation instead of rebuilding it on a bad summary — nothing was lost, but nothing was reclaimed either, and the turn was abandoned rather than continuing on a full window.
+
+Run `/compact` again; it usually succeeds on a second attempt. If it keeps failing, give it something to aim at (`/compact summarize the parser work so far`), or start a fresh session and carry over what matters by hand.
+
+Interrupting a pass with `Esc` is the same outcome by a different route, and says so separately: `Compaction interrupted; keeping the previous conversation state.`
+
 ## "the model isn't using my instructions"
 
 - Is `AGENTS.md` where plank will find it? It is discovered from the **working directory**, and `--chdir` does not carry project settings with it.
@@ -43,11 +51,11 @@ Name the path rather than switching the sandbox off:
 { "writablePaths": ["/Users/me/.cache/my-build"] }
 ```
 
-in `./.plank/sandbox.json`. Commands you type with `!` are never sandboxed.
+in `./.plank/sandbox.json`. Commands you type with `!` or `!!` are never sandboxed.
 
 ## An interactive command hangs
 
-The model's `bash` tool cannot answer a prompt, page through output, or drive an editor. Run those yourself with `!`.
+The model's `bash` tool cannot answer a prompt, page through output, or drive an editor. Run those yourself with `!` (or `!!` to keep the output out of the conversation).
 
 ## The two log files
 

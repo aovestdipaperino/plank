@@ -10,6 +10,14 @@ Assistant replies render as markdown — headings, lists, tables, and fenced cod
 
 The status bar shows, left to right: the working directory and git branch, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and a power/remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
 
+While plank is compacting, the throbber-and-verb line is replaced by a flashing `compacting` with a progress bar and percentage:
+
+```
+compacting ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 21%
+```
+
+Most of the bar tracks re-reading the conversation, which is the slow part; the tail tracks the summary being written. It goes away as soon as the pass ends. See [Compaction](07-context.md#compaction).
+
 ## Keys
 
 ### Editing the prompt
@@ -60,15 +68,28 @@ Type `@` in the prompt and a fuzzy-completion popup offers file paths from the w
 - `ui.respectGitignore` decides whether untracked files that `.gitignore` excludes are offered (default `true`).
 - `ui.indexRefreshSecs` is how long the file index is trusted before it is rebuilt (default 5).
 
-## `!` — run a shell command yourself
+## `!` and `!!` — run a shell command yourself
 
-Prefix a line with `!` and it runs in your shell, in plank's working directory, with the output landing in the conversation:
+Prefix a line with `!` and it runs in your shell, in plank's working directory, with the output streaming into the screen as it is produced:
 
 ```
 !cargo test --lib parser
 ```
 
-This is *your* command, not the model's, so it is **never sandboxed** — you typing it is the authorization. It is also the right way to do anything interactive (a login flow, an editor, a pager) that the model's `bash` tool cannot drive.
+The number of `!`s decides whether the model ever sees it:
+
+| | What the model gets |
+|---|---|
+| `!command` | the command and its output are recorded in the conversation, so the model has them as history on your next message |
+| `!!command` | nothing — the output is yours alone |
+
+Neither form starts a turn. A `!` command does not make the model respond; it just means that when you *do* send your next message, the model can already see what happened. So `!cargo test` followed by "fix the failure" works without pasting anything, while `!!git log` keeps a bit of poking around out of a context you are paying for.
+
+Recorded output is capped (200 lines, 16 KB) with a truncation marker, so one runaway command cannot flood the conversation. If you want the model to act on something *right now* rather than on your next message, ask it in a normal turn and let it run `bash` itself.
+
+Either form is **your** command, not the model's, so it is **never sandboxed** — you typing it is the authorization. Both are also the right way to do anything interactive (a login flow, an editor, a pager) that the model's `bash` tool cannot drive.
+
+`Esc` or `Ctrl-C` kills a running command, and `Up`/`Down` on a line that starts with `!` walks only your previous shell commands.
 
 ## Pasting images
 
@@ -90,7 +111,7 @@ See [Tools](05-tools.md).
 
 ## Notifications and the window title
 
-Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task, e.g. `🪵 plank - fix the bug…`.
+Long turns end with a native macOS notification: your prompt as the headline, the tail of the answer as the body (`interrupted` for an aborted turn). The terminal title tracks the current task, e.g. `🪵 plank - fix the bug…`, and names the phase when plank is busy with something that is not your turn: `🗑️ compacting...` while it reclaims context, `👀 introspecting...` during `/insights`. The title it displaced comes back afterwards, so a compaction mid-turn returns the title to your prompt.
 
 - `ui.notifications` — `always`, `unfocused` (only when the terminal is not focused), or `never`.
 - `ui.notifyAfterSecs` — minimum turn length before a completion notification fires (default 10). Awaiting-input notifications ignore it.
