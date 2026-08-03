@@ -1103,10 +1103,30 @@ pub fn session_identity_sha(title: &str, created_at: u64) -> String {
 /// difference in model, system prompt, or transcript text (including a
 /// resave after more turns) makes it stale, and a stale payload is rebuilt
 /// by prefill, never trusted. NUL separators keep the fields unambiguous.
+///
+/// `think` and `trusted_len` are here for the reason the text fields cannot
+/// cover: both change the *tokens* the prompt prefills to while leaving every
+/// byte of `system` and `transcript_render` identical. `ThinkMode::Max`
+/// prepends the reasoning-effort preamble, and `trusted_len` decides how much
+/// of the prompt is tokenized as rendered chat (native `｜DSML｜` versus
+/// spelled-out BPE pieces). Without them a payload written before either
+/// changed — including one written by a build with a different tokenization
+/// split — passes the staleness gate and is restored over a KV it does not
+/// match. That is the one failure mode this fingerprint exists to prevent.
 #[must_use]
-pub fn payload_fingerprint(model: &str, system: &str, transcript_render: &str) -> String {
-    let mut data = Vec::with_capacity(model.len() + system.len() + transcript_render.len() + 2);
+pub fn payload_fingerprint(
+    model: &str,
+    system: &str,
+    transcript_render: &str,
+    think: crate::engine::ThinkMode,
+    trusted_len: usize,
+) -> String {
+    let mut data = Vec::with_capacity(model.len() + system.len() + transcript_render.len() + 4);
     data.extend_from_slice(model.as_bytes());
+    data.push(0);
+    data.extend_from_slice(think.name().as_bytes());
+    data.push(0);
+    data.extend_from_slice(trusted_len.to_string().as_bytes());
     data.push(0);
     data.extend_from_slice(system.as_bytes());
     data.push(0);
@@ -2328,7 +2348,8 @@ hello\n";
 
         let dir = temp_dir("payload");
         let store = SessionStore::open(&dir).unwrap();
-        let fp = payload_fingerprint("model-a", "sys", "[user]\nhi\n");
+        let med = crate::engine::ThinkMode::Medium;
+        let fp = payload_fingerprint("model-a", "sys", "[user]\nhi\n", med, 0);
         let key = |fp: &str| KvKey::Session {
             id: "x".to_owned(),
             fp: fp.to_owned(),
@@ -2339,11 +2360,21 @@ hello\n";
             store.kv_load(&key(&fp)).map(|c| c.kv().to_vec()),
             Some(b"\x00\x01snapshot\nbytes".to_vec())
         );
-        // Any drift in model, system prompt, or transcript is stale.
+        // Any drift in model, system prompt, or transcript is stale — and so is
+        // drift in the reasoning level or the tokenization split, neither of
+        // which shows up in any of the text fields.
         for stale in [
-            payload_fingerprint("model-b", "sys", "[user]\nhi\n"),
-            payload_fingerprint("model-a", "sys2", "[user]\nhi\n"),
-            payload_fingerprint("model-a", "sys", "[user]\nhi\n[assistant]\nyo\n"),
+            payload_fingerprint("model-b", "sys", "[user]\nhi\n", med, 0),
+            payload_fingerprint("model-a", "sys2", "[user]\nhi\n", med, 0),
+            payload_fingerprint("model-a", "sys", "[user]\nhi\n[assistant]\nyo\n", med, 0),
+            payload_fingerprint(
+                "model-a",
+                "sys",
+                "[user]\nhi\n",
+                crate::engine::ThinkMode::Max,
+                0,
+            ),
+            payload_fingerprint("model-a", "sys", "[user]\nhi\n", med, 3),
         ] {
             assert_ne!(stale, fp);
             assert!(store.kv_load(&key(&stale)).is_none());

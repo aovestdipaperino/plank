@@ -2035,6 +2035,90 @@ mod tests {
         );
     }
 
+    // A session interrupted *mid-thinking* and resumed must reuse its whole KV.
+    //
+    // The interrupted assistant span is left with an unclosed `<think>` (the
+    // turn did not continue, so no `</think>` is appended), and on resume that
+    // span is retokenized from text rather than replayed from sampled ids. If
+    // the retokenization diverges by one token, the common-prefix probe stops
+    // there and the conversation silently re-prefills — the exact symptom
+    // reported against 2.7.9, where the exit path saved no payload at all.
+    //
+    // Requires a loaded model; skips unless PLANK_TEST_MODEL points at a GGUF.
+    #[cfg(ds4_engine)]
+    #[test]
+    fn resume_mid_thinking_reuses_the_whole_kv() {
+        use crate::engine::{Engine, ThinkMode};
+        use crate::ffi::{self, Ds4Backend};
+
+        let Some(model) = std::env::var_os("PLANK_TEST_MODEL") else {
+            eprintln!("skipping: set PLANK_TEST_MODEL to a GGUF to run");
+            return;
+        };
+        let tuning = crate::config::EngineTuning::default();
+        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true);
+        // The shape an interrupt mid-thinking leaves behind: the last assistant
+        // span opens `<think>` and never closes it.
+        let transcript = format!(
+            "[system]\n{}\n[user]\nrewrite the list\n[assistant]\n<think>Let me look at the \
+             current implementation before I change anything",
+            parts.text
+        );
+
+        // One model, two sessions: the second launch is modelled by a sibling
+        // session over the same weights, which is also what keeps this test from
+        // mmapping ~87 GB twice.
+        let weights = std::sync::Arc::new(
+            super::Ds4Model::open(&model, Ds4Backend::Metal, 8192, 0, 100, &tuning).unwrap(),
+        );
+        let mut a = super::Ds4Session::from_model(std::sync::Arc::clone(&weights));
+        a.set_trusted_system_prefix(parts.trusted_len);
+
+        // Prefill the transcript, then snapshot as the exit path does.
+        let toks = a.build_prompt(&transcript, ThinkMode::Medium);
+        let prompt_len = toks.len();
+        let session = a.ensure_session().unwrap();
+        let mut err = [0_i8; 512];
+        let rc =
+            unsafe { ffi::ds4_session_sync(session, toks.as_ptr(), err.as_mut_ptr(), err.len()) };
+        assert_eq!(
+            rc,
+            0,
+            "prefill failed: {}",
+            super::cstr_message(&err, "sync")
+        );
+        let cache = a.get_kv().expect("KV snapshot");
+
+        // A fresh launch restores it and rebuilds the same prompt.
+        let mut b = super::Ds4Session::from_model(std::sync::Arc::clone(&weights));
+        b.set_trusted_system_prefix(parts.trusted_len);
+        b.set_kv(&cache).expect("KV restore");
+
+        let toks2 = b.build_prompt(&transcript, ThinkMode::Medium);
+        assert_eq!(
+            toks2.as_slice(),
+            toks.as_slice(),
+            "the resumed prompt must retokenize to the same ids"
+        );
+        let session_b = b.ensure_session().unwrap();
+        let common = unsafe { ffi::ds4_session_common_prefix(session_b, toks2.as_ptr()) };
+        eprintln!("restored: {common}/{prompt_len} tokens reused");
+        assert_eq!(
+            common, prompt_len,
+            "resume must reuse the whole KV: {common}/{prompt_len} tokens matched"
+        );
+
+        // Control: without the restore the same prompt reuses nothing, so the
+        // assertion above is measuring the payload and not something incidental.
+        let mut c = super::Ds4Session::from_model(std::sync::Arc::clone(&weights));
+        c.set_trusted_system_prefix(parts.trusted_len);
+        let toks3 = c.build_prompt(&transcript, ThinkMode::Medium);
+        let session_c = c.ensure_session().unwrap();
+        let cold = unsafe { ffi::ds4_session_common_prefix(session_c, toks3.as_ptr()) };
+        eprintln!("cold:     {cold}/{prompt_len} tokens reused");
+        assert_eq!(cold, 0, "a session with no payload starts cold");
+    }
+
     // The warm walk and the per-turn reconcile both tokenize the system prompt.
     // If they ever disagree the KV common-prefix probe stops right after it and
     // every turn re-prefills the whole conversation, silently.

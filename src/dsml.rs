@@ -419,6 +419,15 @@ impl DsmlParser {
     /// [`Self::shorthand_invoke_name`] for why the open invoke is the whole
     /// distinction).
     fn open_tag(&mut self, tag: &str, tag_len: usize) -> bool {
+        // A repeated wrapper opener is the model restating itself, not a second
+        // stanza — `repro-1785770781.md` does it 37 times. The stanza is already
+        // open, so consuming the tag and moving on is idempotent, and strictly
+        // better than the alternatives: erroring costs the turn, and treating it
+        // as a name invents a `tool_calls` call that swallows the parameters.
+        if open_tag_is(tag, "tool_calls") {
+            self.parse_pos += tag_len;
+            return true;
+        }
         if open_tag_is(tag, "invoke") {
             let Some(name) = parse_attr(tag, "name") else {
                 self.set_error("tool invoke without name");
@@ -494,8 +503,18 @@ impl DsmlParser {
             return None;
         }
         let elem = element_name(tag)?;
-        (!is_prompt_placeholder(&elem)).then_some(elem)
+        (!is_prompt_placeholder(&elem) && !Self::STRUCTURAL_ELEMS.contains(&elem.as_str()))
+            .then_some(elem)
     }
+
+    /// Structural element names, which can never be a tool or a parameter name.
+    ///
+    /// Without this the shorthands read the model restating a wrapper tag as a
+    /// name: `repro-1785770781.md` opens 37 stanzas with `<｜DSML｜tool_calls>`
+    /// twice in a row, and the second one parsed as a *successful* call named
+    /// `tool_calls` that swallowed the real parameters. Erroring would be better
+    /// than that; skipping it, as [`Self::open_tag`] now does, is better still.
+    const STRUCTURAL_ELEMS: [&'static str; 3] = ["tool_calls", "invoke", "parameter"];
 
     /// The same shorthand one level up: the *tool* name written as the element
     /// name, `<｜DSML｜edit>…</｜DSML｜invoke>` in place of
@@ -522,7 +541,8 @@ impl DsmlParser {
             return None;
         }
         let elem = element_name(tag)?;
-        (!is_prompt_placeholder(&elem)).then_some(elem)
+        (!is_prompt_placeholder(&elem) && !Self::STRUCTURAL_ELEMS.contains(&elem.as_str()))
+            .then_some(elem)
     }
 
     /// Tracks whether the raw tail is a partial parameter close tag, so the
@@ -749,6 +769,154 @@ mod tests {
             assert_eq!(p.calls()[0].arg_value("path"), Some("/tmp/a.rs"));
             assert_eq!(p.calls()[0].arg_value("old"), Some("one"));
             assert_eq!(p.calls()[0].arg_value("new"), Some("two"));
+        }
+    }
+
+    /// A repeated `<｜DSML｜tool_calls>` opener is the model restating itself and
+    /// must not become a call. Verbatim from `repro-1785770781.md`, which opens
+    /// 37 stanzas that way; the invoke shorthand read the second one as a tool
+    /// named `tool_calls` and reported Done, so a nonsense call reached dispatch
+    /// carrying the real parameters.
+    #[test]
+    fn a_repeated_wrapper_opener_is_skipped_not_named() {
+        // The benign case: the repeat is absorbed and the real call is intact.
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls -la</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, stanza);
+            assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+            assert_eq!(p.calls().len(), 1, "{:?}", p.calls());
+            assert_eq!(p.calls()[0].name, "bash");
+            assert_eq!(p.calls()[0].arg_value("command"), Some("ls -la"));
+        }
+
+        // The dangerous case, and the one that regressed: with no real invoke
+        // after the repeat, the shorthand read `tool_calls` as the tool name and
+        // reported Done, so a call literally named `tool_calls` — carrying the
+        // parameters meant for the real tool — reached dispatch. Whatever else
+        // this shape yields, that name must never appear.
+        let no_invoke = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, no_invoke);
+            assert!(
+                p.calls().iter().all(|c| c.name != "tool_calls"),
+                "the wrapper name must never become a tool: {:?}",
+                p.calls()
+            );
+        }
+    }
+
+    /// The full malformed stanza from `repro-1785770781.md`, verbatim: a repeated
+    /// wrapper opener followed by `<｜DSML｜tool ATTR="...">`, where the model
+    /// folded the element name and the attribute name together.
+    ///
+    /// The repeated opener is tolerated, but the rest is *not* guessed at. The
+    /// shape is self-inconsistent — `path="/tmp/lib.rs"` puts the value in the
+    /// attribute while `old="true"` uses it as the `string=` flag with the value
+    /// as element text — so any reading would be wrong half the time, and this is
+    /// an `edit`. Erroring is the correct outcome; fabricating a call is not.
+    #[test]
+    fn the_folded_attribute_shape_errors_without_fabricating_a_call() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜tool_calls>\n",
+            "<｜DSML｜tool name=\"edit\">\n",
+            "<｜DSML｜tool path=\"/tmp/lib.rs\">\n",
+            "<｜DSML｜tool old=\"true\">OLD TEXT</｜DSML｜tool>\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, stanza);
+            assert_eq!(p.state(), super::DsmlState::Error, "{:?}", p.calls());
+            assert!(
+                p.error().starts_with("unexpected DSML tag:"),
+                "{}",
+                p.error()
+            );
+            // Nothing executable may survive under the wrapper's name, and no
+            // half-built `edit` carrying a bogus `old`.
+            assert!(
+                p.calls().iter().all(|c| c.name != "tool_calls"),
+                "{:?}",
+                p.calls()
+            );
+            assert!(
+                p.calls().iter().all(|c| c.arg_value("old") != Some("true")),
+                "`old=\"true\"` is a string flag, never the old text: {:?}",
+                p.calls()
+            );
+        }
+    }
+
+    /// The shorthands must never read a structural element as a name, whichever
+    /// level they are at. `tool_calls` is the wrapper; a bare `invoke` or
+    /// `parameter` is a missing-name error, which is its own clearer message.
+    #[test]
+    fn structural_elements_are_never_names() {
+        // At invoke level: no `tool_calls` call is fabricated.
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls><｜DSML｜tool_calls>\
+             <｜DSML｜parameter name=\"command\">ls</｜DSML｜parameter>",
+        );
+        assert!(
+            p.calls().iter().all(|c| c.name != "tool_calls"),
+            "{:?}",
+            p.calls()
+        );
+
+        // At parameter level: an invoke is open, and a repeated wrapper tag
+        // still must not become a parameter called `tool_calls`.
+        let mut p = super::DsmlParser::new();
+        feed_all(
+            &mut p,
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\"><｜DSML｜tool_calls>\
+             <｜DSML｜parameter name=\"command\" string=\"true\">ls</｜DSML｜parameter>\
+             </｜DSML｜invoke></｜DSML｜tool_calls>",
+        );
+        assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+        assert_eq!(p.calls().len(), 1);
+        assert_eq!(p.calls()[0].name, "bash");
+        assert!(
+            p.calls()[0].args.iter().all(|a| a.name != "tool_calls"),
+            "{:?}",
+            p.calls()[0].args
+        );
+        assert_eq!(p.calls()[0].arg_value("command"), Some("ls"));
+
+        // A bare `invoke` / `parameter` keeps its own missing-name error rather
+        // than being silently accepted as a shorthand name.
+        for (text, want) in [
+            (
+                "<｜DSML｜tool_calls><｜DSML｜invoke>",
+                "tool invoke without name",
+            ),
+            (
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\"><｜DSML｜parameter>",
+                "tool parameter without name",
+            ),
+        ] {
+            let mut p = super::DsmlParser::new();
+            feed_all(&mut p, text);
+            assert_eq!(p.state(), super::DsmlState::Error, "{text}");
+            assert_eq!(p.error(), want, "{text}");
         }
     }
 
