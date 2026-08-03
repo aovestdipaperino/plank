@@ -53,10 +53,31 @@ fn assert_fixture_eq(name: &str, actual: &str) {
 /// free-form bulleted summary, plank asks for eight numbered sections wrapped
 /// in `<summary>` tags because that is what `extract_summary` parses. Locked
 /// with a reason so the trailing `Compaction reason:` line is covered too.
+/// Locked *without* custom instructions: that is the automatic-compaction form,
+/// the one every turn can hit, and pinning it keeps `/compact <instructions>`
+/// from silently changing the default prompt.
 #[test]
 fn compaction_prompt_matches_fixture() {
     assert_fixture_eq(
         "compaction_prompt.txt",
-        &plank::compact::make_prompt("low context"),
+        &plank::compact::make_prompt("low context", ""),
     );
+}
+
+/// `/compact <instructions>` adds to the pinned prompt rather than reshaping it:
+/// the fixture text must still be present in full, with the instructions spliced
+/// in ahead of the closing no-tools trailer.
+#[test]
+fn compaction_prompt_with_instructions_extends_the_fixture() {
+    let base = plank::compact::make_prompt("low context", "");
+    let with = plank::compact::make_prompt("low context", "focus on the parser bug");
+    let (body, tail) = base
+        .split_once("After the summary, stop.")
+        .expect("the pinned prompt ends with the no-tools trailer");
+    assert!(with.starts_with(body), "the pinned body must be unchanged");
+    assert!(
+        with.ends_with(&format!("After the summary, stop.{tail}")),
+        "the pinned trailer must stay last"
+    );
+    assert!(with.contains("focus on the parser bug"));
 }

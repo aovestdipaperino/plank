@@ -422,6 +422,7 @@ pub const TIPS: &[&str] = &[
     "try /context to see context usage",
     "try /config to change settings interactively",
     "try /compact to summarize and free up context",
+    "try /compact <instructions> to steer what the summary keeps",
     "try /usage to see token usage and cost this session",
     "try /checkpoint <name> to bookmark this point",
     "try /rollback <name> to jump back to a checkpoint",
@@ -648,6 +649,124 @@ fn power_suffix(st: &Status) -> String {
     } else {
         String::new()
     }
+}
+
+/// Cells in the compaction bar shown in the status bar's tail slot. Much
+/// narrower than [`PROGRESS_BAR_WIDTH`]: that bar owns a full centered line on
+/// the warm-up screen, this one shares a single row with the whole status bar.
+pub const COMPACT_BAR_WIDTH: usize = 18;
+
+/// Filled cell of the compaction bar.
+pub const COMPACT_BAR_FILLED: char = '▰';
+/// Empty cell of the compaction bar.
+pub const COMPACT_BAR_EMPTY: char = '▱';
+
+/// How much of the compaction bar the prefill phase spans. Compaction is one
+/// prefill of the entire transcript followed by one summary generation, and the
+/// prefill is far the longer of the two, so it owns most of the bar.
+pub const COMPACT_PREFILL_SHARE: f64 = 0.8;
+
+/// Nominal length of a compaction summary, in tokens, used to advance the bar
+/// through the summarizing phase. It is an *estimate*: `n_predict` is unlimited
+/// by default, so there is no real total to divide by, and the phase is clamped
+/// just short of full so the bar never claims to be done before it is.
+pub const COMPACT_SUMMARY_TOKENS: f64 = 1200.0;
+
+/// Compaction progress as a 0.0..=1.0 fraction while a compaction pass is
+/// running, or `None` when none is. Process-global for the same reason as
+/// [`FLASH_TIP`]: compaction runs on the worker thread and the status bar is
+/// drawn on the UI thread, with no shared state between them to thread it
+/// through.
+static COMPACT_PROGRESS: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Publishes compaction progress, clamped to 0.0..=1.0.
+pub fn set_compact_progress(frac: f64) {
+    let mut guard = COMPACT_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(frac.clamp(0.0, 1.0));
+}
+
+/// Drops the compaction bar from the status bar.
+pub fn clear_compact_progress() {
+    let mut guard = COMPACT_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+/// The running compaction's progress fraction, or `None` when not compacting.
+#[must_use]
+pub fn compact_progress() -> Option<f64> {
+    *COMPACT_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Shows the compaction bar for as long as the guard lives, then clears it on
+/// drop, so an interrupt, an engine error, or a panic cannot leave the status
+/// bar insisting a compaction is still in flight.
+#[derive(Debug)]
+pub struct CompactProgress;
+
+impl CompactProgress {
+    /// Posts an empty bar and returns the guard that clears it.
+    #[must_use]
+    pub fn begin() -> Self {
+        set_compact_progress(0.0);
+        Self
+    }
+
+    /// Reports prefill progress; maps onto the first
+    /// [`COMPACT_PREFILL_SHARE`] of the bar.
+    #[allow(clippy::unused_self)]
+    pub fn prefill(&self, done: i32, total: i32) {
+        let total = total.max(1);
+        let frac = f64::from(done.clamp(0, total)) / f64::from(total);
+        set_compact_progress(frac * COMPACT_PREFILL_SHARE);
+    }
+
+    /// Reports summary bytes generated so far; maps onto the remainder of the
+    /// bar, approaching but never reaching full.
+    #[allow(clippy::unused_self)]
+    pub fn summarizing(&self, bytes: usize) {
+        // ~4 bytes per token is the usual rule of thumb for English prose; the
+        // phase total is an estimate either way (see COMPACT_SUMMARY_TOKENS).
+        #[allow(clippy::cast_precision_loss)]
+        let tokens = bytes as f64 / 4.0;
+        let frac = (tokens / COMPACT_SUMMARY_TOKENS).clamp(0.0, 0.95);
+        set_compact_progress(COMPACT_PREFILL_SHARE + frac * (1.0 - COMPACT_PREFILL_SHARE));
+    }
+}
+
+impl Drop for CompactProgress {
+    fn drop(&mut self) {
+        clear_compact_progress();
+    }
+}
+
+/// Splits the compaction bar into its filled and empty runs for a 0.0..=1.0
+/// fraction, plus the percentage to print after it. Returned as pieces rather
+/// than one string so the TUI can style the two runs differently; the total
+/// width is always [`COMPACT_BAR_WIDTH`], so the status line never reflows as
+/// the bar advances.
+#[must_use]
+pub fn compact_bar(frac: f64) -> (String, String, u16) {
+    let frac = frac.clamp(0.0, 1.0);
+    // `frac` is clamped to 0..=1 and both widths are small constants, so every
+    // rounded product below fits its target type; the `min`/`clamp` are belts to
+    // the braces against float rounding at the endpoints.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let filled = ((frac * f64::from(u16::try_from(COMPACT_BAR_WIDTH).unwrap_or(u16::MAX))).round()
+        as usize)
+        .min(COMPACT_BAR_WIDTH);
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let pct = (frac * 100.0).round() as u16;
+    (
+        std::iter::repeat_n(COMPACT_BAR_FILLED, filled).collect(),
+        std::iter::repeat_n(COMPACT_BAR_EMPTY, COMPACT_BAR_WIDTH - filled).collect(),
+        pct,
+    )
 }
 
 /// Milliseconds per throbber frame (one Braille glyph of the ping-pong cycle).
@@ -1031,6 +1150,48 @@ mod tests {
         assert!(bar.starts_with('[') && bar.ends_with(']'));
         assert_eq!(bar.matches('▶').count(), 16);
         assert_eq!(bar.matches('·').count(), 16);
+    }
+
+    #[test]
+    fn compact_bar_splits_at_the_fraction_and_keeps_a_fixed_width() {
+        for (frac, filled) in [(0.0, 0), (0.5, 9), (1.0, COMPACT_BAR_WIDTH)] {
+            let (on, off, _) = compact_bar(frac);
+            assert_eq!(on.chars().count(), filled, "at {frac}");
+            assert_eq!(
+                on.chars().count() + off.chars().count(),
+                COMPACT_BAR_WIDTH,
+                "width must not vary at {frac}"
+            );
+        }
+        // Out-of-range input is clamped rather than panicking or overflowing.
+        assert_eq!(compact_bar(-1.0).2, 0);
+        assert_eq!(compact_bar(2.0).2, 100);
+        assert_eq!(compact_bar(0.21).2, 21);
+    }
+
+    #[test]
+    fn compact_progress_phases_advance_monotonically_and_the_guard_clears() {
+        let p = CompactProgress::begin();
+        assert_eq!(compact_progress(), Some(0.0));
+        // Prefill spans the first share of the bar.
+        p.prefill(50, 100);
+        assert!((compact_progress().unwrap() - COMPACT_PREFILL_SHARE / 2.0).abs() < 1e-9);
+        p.prefill(100, 100);
+        let after_prefill = compact_progress().unwrap();
+        assert!((after_prefill - COMPACT_PREFILL_SHARE).abs() < 1e-9);
+        // Summarizing picks up where prefill left off and never reaches full.
+        p.summarizing(400);
+        let mid = compact_progress().unwrap();
+        assert!(mid > after_prefill, "{mid} must exceed {after_prefill}");
+        p.summarizing(1_000_000);
+        let end = compact_progress().unwrap();
+        assert!(
+            end > mid && end < 1.0,
+            "{end} must approach but not reach 1"
+        );
+        // Dropping the guard takes the bar down, however the pass ended.
+        drop(p);
+        assert!(compact_progress().is_none());
     }
 
     #[test]

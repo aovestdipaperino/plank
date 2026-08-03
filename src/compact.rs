@@ -124,29 +124,49 @@ pub fn tail_budget(ctx_size: i32) -> i32 {
     (ctx_size / COMPACT_TAIL_DIVISOR).clamp(1, COMPACT_TAIL_CAP_TOKENS)
 }
 
+/// Everything the compaction prompt says before any caller-supplied
+/// instructions: what is being asked for, the fixed sections, and the
+/// `<analysis>`/`<summary>` tag contract.
+const PROMPT_BODY: &str = "Internal plank-agent context compaction request. This is not a user request.\n\
+     Summarize the conversation so far into durable task state for continuing the work. Use exactly these numbered sections, omitting none (write \"none\" when a section is empty):\n\
+     1. Primary request and intent\n\
+     2. Key technical concepts\n\
+     3. Files and code sections (exact paths, ranges, and why each matters)\n\
+     4. Errors and fixes (including rejected approaches and known bugs)\n\
+     5. All user messages (condensed, in order)\n\
+     6. Pending tasks\n\
+     7. Current work (what was in progress at this very moment)\n\
+     8. Next step (only if one was explicitly requested by the user)\n\n\
+     You may reason first inside a single <analysis>...</analysis> block; it will be discarded. Then wrap the final summary in <summary>...</summary> tags.\n\
+     Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion; prefer exact paths/ranges/commands that can reload the data.\n";
+
+/// The closing instruction, kept **last** in the prompt so it is the final thing
+/// the model reads before it starts writing: any caller-supplied instructions go
+/// above it and cannot displace the no-tools rule.
+const PROMPT_TRAILER: &str = "After the summary, stop. Do not continue the user task, do not call tools, and do not output thinking tags or DSML markup.\n";
+
 /// Builds the private prompt used to ask the model for durable state.
 ///
 /// Asks for a fixed-section summary wrapped in `<summary>` tags, with an
 /// optional `<analysis>` scratch block that [`extract_summary`] strips. The
 /// prompt explicitly forbids tool calls because the result is consumed
 /// internally, not delivered as an assistant turn.
+///
+/// `instructions` carries the argument to `/compact <instructions>` (empty for
+/// automatic compaction). It is inserted between the section list and the
+/// closing no-tools trailer, and framed as *additional* to keep it from being
+/// read as a replacement for the section contract that
+/// [`extract_summary`] and the rebuild depend on.
 #[must_use]
-pub fn make_prompt(reason: &str) -> String {
-    let mut b = String::from(
-        "Internal plank-agent context compaction request. This is not a user request.\n\
-         Summarize the conversation so far into durable task state for continuing the work. Use exactly these numbered sections, omitting none (write \"none\" when a section is empty):\n\
-         1. Primary request and intent\n\
-         2. Key technical concepts\n\
-         3. Files and code sections (exact paths, ranges, and why each matters)\n\
-         4. Errors and fixes (including rejected approaches and known bugs)\n\
-         5. All user messages (condensed, in order)\n\
-         6. Pending tasks\n\
-         7. Current work (what was in progress at this very moment)\n\
-         8. Next step (only if one was explicitly requested by the user)\n\n\
-         You may reason first inside a single <analysis>...</analysis> block; it will be discarded. Then wrap the final summary in <summary>...</summary> tags.\n\
-         Do not invent facts. Do not include generic narration. Do not include raw file contents unless they were essential to a conclusion; prefer exact paths/ranges/commands that can reload the data.\n\
-         After the summary, stop. Do not continue the user task, do not call tools, and do not output thinking tags or DSML markup.\n",
-    );
+pub fn make_prompt(reason: &str, instructions: &str) -> String {
+    let mut b = String::from(PROMPT_BODY);
+    let instructions = instructions.trim();
+    if !instructions.is_empty() {
+        b.push_str("\nAdditional instructions from the user for this summary (follow them in addition to, not instead of, the sections above):\n");
+        b.push_str(instructions);
+        b.push('\n');
+    }
+    b.push_str(PROMPT_TRAILER);
     if !reason.is_empty() {
         b.push_str("\nCompaction reason: ");
         b.push_str(reason);
@@ -217,13 +237,32 @@ mod tests {
 
     #[test]
     fn prompt_includes_reason() {
-        assert!(make_prompt("low context").contains("Compaction reason: low context"));
-        assert!(!make_prompt("").contains("Compaction reason"));
+        assert!(make_prompt("low context", "").contains("Compaction reason: low context"));
+        assert!(!make_prompt("", "").contains("Compaction reason"));
+    }
+
+    #[test]
+    fn prompt_carries_custom_instructions_above_the_no_tools_trailer() {
+        let p = make_prompt("user request", "focus on the parser bug");
+        assert!(p.contains("focus on the parser bug"), "{p}");
+        // The section contract must still be asked for: extra instructions are
+        // additional, never a replacement.
+        assert!(p.contains("1. Primary request and intent"));
+        // The no-tools trailer stays last, so instructions cannot displace it.
+        let at = p.find("focus on the parser bug").unwrap();
+        let trailer = p.find("do not call tools").unwrap();
+        assert!(at < trailer, "instructions must precede the trailer");
+        // Blank or whitespace-only arguments add nothing at all.
+        assert_eq!(
+            make_prompt("user request", ""),
+            make_prompt("user request", "   ")
+        );
+        assert!(!make_prompt("user request", "  ").contains("Additional instructions"));
     }
 
     #[test]
     fn prompt_asks_for_fixed_sections() {
-        let p = make_prompt("");
+        let p = make_prompt("", "");
         assert!(p.contains("1. Primary request and intent"));
         assert!(p.contains("8. Next step"));
         assert!(p.contains("<summary>"));
@@ -237,7 +276,7 @@ mod tests {
     // instructs round-trips through the parser.
     #[test]
     fn a_reply_following_the_prompt_round_trips_through_extract_summary() {
-        let prompt = make_prompt("low context");
+        let prompt = make_prompt("low context", "");
 
         // Build the reply from the tag names the prompt itself asks for, so a
         // rename in the prompt moves this test's input with it and only a

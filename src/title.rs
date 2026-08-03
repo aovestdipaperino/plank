@@ -29,6 +29,11 @@ pub enum State<'a> {
     /// being answered — and it runs long enough that the window should say
     /// what it is doing.
     Introspecting,
+    /// Summarizing the transcript to reclaim context. Like
+    /// [`State::Introspecting`], its own state: it interrupts whatever the user
+    /// asked for, takes long enough to be worth naming, and is the one phase
+    /// where a background window should say "not your turn yet".
+    Compacting,
 }
 
 /// Longest prompt (in characters) kept in a [`State::Busy`] title before it is
@@ -42,6 +47,9 @@ const LOADING: &str = "🚀 Plank loading...";
 /// Title shown while `/insights` is reading back the user's own history.
 const INTROSPECTING: &str = "👀 introspecting...";
 
+/// Title shown while a compaction pass is summarizing the transcript.
+const COMPACTING: &str = "🗑️ compacting...";
+
 /// Formats the window title for `state`. A [`State::Busy`] prompt is collapsed
 /// to one line and truncated past [`TITLE_PROMPT_MAX`] characters; a
 /// whitespace-only prompt degrades to the plain loading form.
@@ -51,6 +59,7 @@ pub fn window_title(state: State<'_>) -> String {
         State::Loading => return LOADING.to_string(),
         State::Idle => return "🪵 Plank - READY.".to_string(),
         State::Introspecting => return INTROSPECTING.to_string(),
+        State::Compacting => return COMPACTING.to_string(),
         State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
     };
     if prompt.is_empty() {
@@ -62,18 +71,62 @@ pub fn window_title(state: State<'_>) -> String {
     }
 }
 
+/// The title last written, so a transient state ([`Scoped`]) can put back what
+/// it displaced instead of every caller having to know what came before.
+static LAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
 /// Sets the terminal window title to [`window_title`]`(state)`. Best-effort:
 /// errors are ignored, and nothing is written when stderr is not a tty.
 pub fn set(state: State<'_>) {
+    set_text(&window_title(state));
+}
+
+/// Writes an already-formatted title, recording it as the current one.
+fn set_text(title: &str) {
+    *LAST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(title.to_owned());
     let mut err = std::io::stderr();
     if !err.is_terminal() {
         return;
     }
     // OSC 0 (icon + window title), BEL-terminated — the most widely supported
     // form. One write so it cannot interleave with other stderr output.
-    let seq = format!("\x1b]0;{}\x07", window_title(state));
+    let seq = format!("\x1b]0;{title}\x07");
     let _ = err.write_all(seq.as_bytes());
     let _ = err.flush();
+}
+
+/// Shows a title for as long as the guard lives, then restores the one it
+/// displaced.
+///
+/// For phases that interrupt something else and must hand the window back
+/// afterwards. Compaction is the case in point: it runs both mid-turn (title
+/// was [`State::Busy`]) and from `/compact` at the prompt (title was
+/// [`State::Idle`]), so the phase itself cannot know what to restore — and
+/// restoring on drop covers the interrupted and failed passes too.
+#[derive(Debug)]
+pub struct Scoped(Option<String>);
+
+impl Scoped {
+    /// Displaces the current title with `state`'s.
+    #[must_use]
+    pub fn set(state: State<'_>) -> Self {
+        let previous = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        crate::title::set(state);
+        Self(previous)
+    }
+}
+
+impl Drop for Scoped {
+    fn drop(&mut self) {
+        if let Some(previous) = self.0.take() {
+            set_text(&previous);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -85,7 +138,36 @@ mod tests {
         assert_eq!(window_title(State::Loading), "🚀 Plank loading...");
         assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
         assert_eq!(window_title(State::Introspecting), "👀 introspecting...");
+        assert_eq!(window_title(State::Compacting), "🗑️ compacting...");
     }
+
+    /// Serialized against itself, and the only test that reads `LAST`'s exact
+    /// contents: the compaction tests in [`crate::ui`] also write the global (via
+    /// [`Scoped`]), so this takes `TITLE_TEST_LOCK` and keeps its critical
+    /// section to two adjacent calls.
+    #[test]
+    fn scoped_captures_and_restores_the_title_it_displaced() {
+        let _serial = TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        set_text("sentinel-title");
+        let guard = Scoped::set(State::Compacting);
+        assert_eq!(
+            guard.0.as_deref(),
+            Some("sentinel-title"),
+            "the guard must capture the title it displaced"
+        );
+        drop(guard);
+        let restored = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(restored.as_deref(), Some("sentinel-title"));
+    }
+
+    /// Serializes the tests in this module that assert on the process-global
+    /// `LAST`.
+    static TITLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn blank_busy_prompt_falls_back_to_loading() {

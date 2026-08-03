@@ -8,13 +8,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [2.8.0] - 2026-08-03
 
-Stable release: the 2.7 beta series promoted. Everything listed under 2.7.1
-through 2.7.9 is now on the stable channel (`brew install
-aovestdipaperino/tap/plank-agent`), most notably the tool-call parsing and
-system-prompt tokenization fixes in 2.7.8 and 2.7.9.
+Stable release: the 2.7 beta series promoted, plus the compaction and shell-escape
+work below. Everything listed under 2.7.1 through 2.7.9 is now on the stable
+channel (`brew install aovestdipaperino/tap/plank-agent`), most notably the
+tool-call parsing and system-prompt tokenization fixes in 2.7.8 and 2.7.9.
 
 ### Added
 
+- **`!` now feeds its result to the model; `!!` keeps it private.** The old `!`
+  behavior (run a shell command, show the output, record nothing) moved to `!!`.
+  A single `!` runs the command the same way and then records the command and its
+  output in the transcript as one caveated user message, so the model has it as
+  history on your next prompt without a turn being spent on it. Output is capped
+  at 200 lines / 16 KB, and `<`/`&` are escaped so command output cannot forge
+  the framing.
+- **`/compact [instructions]`** steers a single compaction pass
+  (`/compact keep the failing test cases verbatim`). The argument is added to the
+  standing eight-section summary contract rather than replacing it, and sits above
+  the closing no-tools instruction so it cannot displace it. Automatic compaction
+  sends a byte-identical prompt to before.
+- **Compaction progress in the status bar.** While a pass runs, the
+  throbber/spinner-verb line below the output is replaced by a flashing
+  `compacting` plus an `▰▱` bar and percentage, driven by real prefill progress
+  for the bulk of the bar and the summary's length for the tail. The window title
+  reads `🗑️ compacting...` for the duration and is restored afterwards, including
+  on an interrupted or failed pass.
 - **The status footer shows the reasoning level**, as a `🧠 med` segment just
   before the ctx gauge. The level changes how every turn is generated, so it
   keeps a permanent slot rather than appearing only when off the default. The
@@ -22,6 +40,28 @@ system-prompt tokenization fixes in 2.7.8 and 2.7.9.
   switching level never shifts the rest of the footer sideways; `/think med`
   parses too, since that is the spelling on screen.
 
+### Fixed
+
+- **A resumed session re-prefilled its whole conversation.** The KV payload
+  fingerprint covered the model, system prompt, and rendered transcript, but not
+  the reasoning level or the trusted-prefix length — both of which change the
+  *tokens* a prompt prefills to while leaving every byte of that text identical.
+  A payload written before either changed passed the staleness gate and was
+  restored over a KV it did not match. Both are now part of the fingerprint.
+- **A repeated `tool_calls` wrapper opener became a phantom tool.** A stanza that
+  opens the wrapper twice had the second opener read as an element name, so
+  `tool_calls` itself was dispatched as a tool. The wrapper openers are now
+  skipped, and the three structural element names can never be named as tools.
+- **Compaction hooks fired on only one front-end.** `PreCompact` and
+  `PostCompact` ran on the plain-REPL path but not the TUI path, so a hook
+  configured by a TUI user — the default front-end on a TTY — silently never ran.
+  Both orchestrators now dispatch both events through one shared implementation.
+- **A compaction that produced no usable summary destroyed the transcript**,
+  replacing it with an empty summary plus the verbatim tail. A pass that comes
+  back empty (including a reply that is only a discarded `<analysis>` block) is
+  now treated as a failure: the conversation is left as it was, `PostCompact`
+  does not fire, and the turn is abandoned rather than continuing on a context
+  that was never reclaimed.
 ### Changed
 
 - **Releases are arm64 only.** Intel Macs cannot run the Metal backend and none

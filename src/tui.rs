@@ -2179,6 +2179,38 @@ fn with_remote_marker(status: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The compaction progress line, shown in place of the throbber/spinner-verb
+/// segment pinned below the output while a compaction pass runs. Same slot, same
+/// role: it is what the turn is doing right now.
+#[must_use]
+pub fn compact_progress_line(frac: f64) -> Line<'static> {
+    Line::from(compact_slot_spans(frac, anim_tick_ms(), Style::default()))
+}
+
+/// Builds the compaction indicator: a flashing `compacting` label, then the
+/// bar, then the percentage.
+///
+/// Only the *label* flashes. The bar and the percentage hold steady, because a
+/// blinking progress bar reads as a glitch rather than as progress — and both
+/// keep a fixed width, so the line does not reflow as the bar fills.
+fn compact_slot_spans(frac: f64, tick_ms: u64, base: Style) -> Vec<Span<'static>> {
+    let (filled, empty, pct) = crate::status::compact_bar(frac);
+    let dim = base.fg(Color::Indexed(240));
+    vec![
+        Span::styled(
+            "compacting ".to_string(),
+            if crate::status::tool_blink_on(tick_ms) {
+                base.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            } else {
+                dim
+            },
+        ),
+        Span::styled(filled, base.add_modifier(Modifier::BOLD)),
+        Span::styled(empty, dim),
+        Span::styled(format!(" {pct}%"), base.add_modifier(Modifier::BOLD)),
+    ]
+}
+
 /// Builds the status line, coloring the progress bar's filled arrows and the
 /// accent word (operation name or spinner verb) in the theme color.
 ///
@@ -2519,6 +2551,32 @@ mod tests {
             .into_iter()
             .map(|s| (s.content.into_owned(), s.style.fg))
             .collect()
+    }
+
+    #[test]
+    fn compact_progress_line_flashes_the_label_but_holds_the_bar_steady() {
+        let base = Style::default();
+        let lit = crate::status::TOOL_BLINK_MS / 4; // lit half of the blink
+        let dark = crate::status::TOOL_BLINK_MS * 3 / 4; // dark half
+        let spans = compact_slot_spans(0.21, lit, base);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.starts_with("compacting "), "{text}");
+        assert!(text.ends_with(" 21%"), "{text}");
+        assert_eq!(spans[0].style.fg, Some(Color::Yellow), "label lit");
+        // Bar cells: filled + empty always add up to the full width.
+        assert_eq!(
+            spans[1].content.chars().count() + spans[2].content.chars().count(),
+            crate::status::COMPACT_BAR_WIDTH
+        );
+        assert!(spans[1].content.chars().all(|c| c == '▰'));
+        assert!(spans[2].content.chars().all(|c| c == '▱'));
+
+        // Off half of the blink: the label dims, everything else is unchanged
+        // (same glyphs, same width), so the line does not jitter.
+        let off = compact_slot_spans(0.21, dark, base);
+        assert_eq!(off[0].style.fg, Some(Color::Indexed(240)), "label dimmed");
+        let off_text: String = off.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(off_text, text);
     }
 
     #[test]

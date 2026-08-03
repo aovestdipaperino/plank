@@ -9,8 +9,8 @@
 //!
 //! When enabled, `bash` tool commands run under `/usr/bin/sandbox-exec` with
 //! a generated profile: read everywhere, write only under the working
-//! directory, temp dirs, and any configured extra roots. User-typed `!`
-//! commands are never sandboxed — the user typing the command is the
+//! directory, temp dirs, and any configured extra roots. User-typed `!` and
+//! `!!` commands are never sandboxed — the user typing the command is the
 //! authorization.
 //!
 //! Configured via `~/.plank/sandbox.json` overlaid by `./.plank/sandbox.json`:

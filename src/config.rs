@@ -594,7 +594,6 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         cmd,
         "/help"
             | "/save"
-            | "/compact"
             | "/list"
             | "/quit"
             | "/exit"
@@ -626,6 +625,10 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             && crate::arcade::Arcade::COMMANDS
                 .iter()
                 .any(|egg| slash_command_with_args(cmd, egg)))
+        // `/compact` takes optional extra summarization instructions, so it goes
+        // through the with-args form: bare `/compact` and
+        // `/compact focus on the parser bug` are both valid invocations.
+        || slash_command_with_args(cmd, "/compact")
         || slash_command_with_args(cmd, "/config")
         || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")
@@ -1531,6 +1534,10 @@ mod tests {
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
         assert!(!slash_command_known("/helpme"));
+        // `/compact` takes optional summarization instructions.
+        assert!(slash_command_known("/compact"));
+        assert!(slash_command_known("/compact focus on the parser bug"));
+        assert!(!slash_command_known("/compacting"));
     }
 
     #[test]

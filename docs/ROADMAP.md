@@ -18,7 +18,7 @@ Current release line: **v2.0.0** (beta channel).
 ## Next minor releases (unslotted)
 
 - **! command refinements** (split from #16, follow-up to #4):
-  - feed `!` output into the transcript ([#20](https://github.com/aovestdipaperino/plank/issues/20)) — blocked on the model-format investigation;
+  - ~~feed `!` output into the transcript~~ ([#20](https://github.com/aovestdipaperino/plank/issues/20)) — landed: `!` records a caveated transcript entry, `!!` stays private;
   - mode-aware history navigation ([#21](https://github.com/aovestdipaperino/plank/issues/21));
   - live output streaming ([#22](https://github.com/aovestdipaperino/plank/issues/22)) — natural follow-on to the worker thread.
 - ~~Persistent memory across sessions~~ (#23) and ~~named session save/restore~~ (#24) — first cuts landed in `a203a3b` (`/remember` + layered `MEMORY.md`; session `meta` trailer, `/tag`, `/resume` picker).
