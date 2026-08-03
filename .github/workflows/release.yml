@@ -57,16 +57,16 @@ jobs:
           # macos-15 runners: the ds4 Metal backend needs the macOS 15 SDK
           # (MTLResidencySet). cpu_flag overrides the ds4 Makefile's
           # `-mcpu=native` default with a portable baseline for bottles.
+          #
+          # arm64 only. Real inference wants Metal and enough unified memory to
+          # hold an ~87 GB model, which no Intel Mac has, so an x86_64 build
+          # could only ever ship the engine-less stub — not worth building,
+          # bottling, or having Homebrew prefer over a source build.
           - name: aarch64-macos
             runner: macos-15
             target: aarch64-apple-darwin
             bottle_tag: arm64_sequoia
             cpu_flag: "-mcpu=apple-m1"
-          - name: x86_64-macos
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            bottle_tag: sequoia
-            cpu_flag: "-march=x86-64-v3"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -149,7 +149,7 @@ jobs:
           FORMULA_NAME=$([ "$CHANNEL" = "beta" ] && echo plank-agent-beta || echo plank-agent)
           echo "formula_name=$FORMULA_NAME" >> "$GITHUB_OUTPUT"
           echo "source_sha=$(sha256sum source.tar.gz | awk '{print $1}')" >> "$GITHUB_OUTPUT"
-          for tag in arm64_sequoia sequoia; do
+          for tag in arm64_sequoia; do
             sha=$(sha256sum "bottles/$FORMULA_NAME-$VERSION.$tag.bottle.tar.gz" | awk '{print $1}')
             echo "${tag}_sha=$sha" >> "$GITHUB_OUTPUT"
           done
@@ -163,7 +163,6 @@ jobs:
           FORMULA_NAME="${{ steps.hashes.outputs.formula_name }}"
           SOURCE_SHA="${{ steps.hashes.outputs.source_sha }}"
           ARM64_SEQUOIA_SHA="${{ steps.hashes.outputs.arm64_sequoia_sha }}"
-          SEQUOIA_SHA="${{ steps.hashes.outputs.sequoia_sha }}"
 
           if [ "$CHANNEL" = "beta" ]; then
             CLASS_NAME=PlankAgentBeta
@@ -186,12 +185,15 @@ jobs:
             license "MIT"
 
             depends_on :macos
+            # arm64 only: the ds4 Metal backend cannot run on Intel, so a source
+            # build there would spend twenty minutes producing a binary with no
+            # inference engine. Refuse up front instead of shipping that.
+            depends_on arch: :arm64
             depends_on "rust" => :build
 
             bottle do
               root_url "https://github.com/aovestdipaperino/plank/releases/download/v${VERSION}"
               sha256 cellar: :any_skip_relocation, arm64_sequoia: "${ARM64_SEQUOIA_SHA}"
-              sha256 cellar: :any_skip_relocation, sequoia: "${SEQUOIA_SHA}"
             end
           ${EXTRA}
             def install
