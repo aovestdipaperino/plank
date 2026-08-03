@@ -40,6 +40,14 @@ pub const QUEUE_STYLE: &str = "\x1b[38;5;87;1m";
 /// a Powerline-patched or Nerd Font to render.
 pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 
+/// Leading glyph of the **think segment** (`🧠 medium`), the reasoning level
+/// shown just before the ctx gauge.
+///
+/// Also the anchor the TUI splits the footer on: it sits between the dir prefix
+/// and the body, so [`crate::tui`] peels it as its own span rather than letting
+/// `push_dir_prefix` mistake it for part of the branch name.
+pub const THINK_MARK: &str = "🧠";
+
 const PROGRESS_BAR_WIDTH: usize = 32;
 
 /// Worker lifecycle state mirrored from `agent_worker_state`.
@@ -89,6 +97,8 @@ pub struct Status {
     pub ctx_size: i32,
     /// Power limit percent; 0 or 100 hides the suffix.
     pub power_percent: i32,
+    /// Reasoning level, shown as the think segment ahead of the ctx gauge.
+    pub think: crate::engine::ThinkMode,
     /// Error text for the `Error` state.
     pub error: String,
 }
@@ -744,6 +754,12 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
     } else {
         "ctx 0%".to_owned()
     };
+    // The think segment: the reasoning level `/think` selects, ahead of the ctx
+    // gauge. Always shown — it changes how every turn is generated, so it is
+    // worth a permanent slot rather than appearing only when off the default.
+    // Abbreviated to a fixed three columns so changing level does not shift the
+    // rest of the footer sideways.
+    let think = format!("{THINK_MARK} {} | ", st.think.short_name());
     let power = power_suffix(st);
     // Theme-colored accent text; returns to the footer style (not a full
     // reset) so the status bar's background survives on color terminals.
@@ -762,6 +778,7 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
     } else {
         format!("{} | ", theme(&cwd))
     };
+    let ctx = format!("{think}{ctx}");
     let body = match st.state {
         WorkerState::Prefill | WorkerState::Generating => {
             match progress_segment(st, color).filter(|_| progress_in_bar) {
@@ -1084,6 +1101,57 @@ mod tests {
         // Leave the process-global clean for other tests in this binary.
         clear_flash_tip();
         assert_eq!(flash_tip(), None);
+    }
+
+    /// The think segment sits immediately before the ctx gauge, in every state,
+    /// and names the level `/think` selected.
+    #[test]
+    fn think_segment_precedes_the_ctx_gauge() {
+        use crate::engine::ThinkMode;
+
+        for (level, name) in [
+            (ThinkMode::Off, "off"),
+            (ThinkMode::Medium, "med"),
+            (ThinkMode::Max, "max"),
+        ] {
+            for state in [
+                WorkerState::Idle,
+                WorkerState::Saving,
+                WorkerState::Stopped,
+                WorkerState::Compacting,
+            ] {
+                let st = Status {
+                    state,
+                    ctx_used: 30,
+                    ctx_size: 1000,
+                    think: level,
+                    ..Status::default()
+                };
+                let line = build_status_text(&st, false, true);
+                assert!(
+                    line.contains(&format!("{THINK_MARK} {name} | ctx 3%")),
+                    "{level:?}/{state:?}: {line}"
+                );
+            }
+        }
+    }
+
+    /// It is a body segment, not part of the dir prefix: the separator before it
+    /// belongs to the directory hand-off, so the branch name must not absorb it.
+    /// (The TUI splits on `THINK_MARK` for exactly this reason.)
+    #[test]
+    fn think_segment_follows_the_dir_prefix() {
+        let st = Status {
+            ctx_used: 1,
+            ctx_size: 100,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        let mark = line.find(THINK_MARK).expect("think segment present");
+        let ctx = line.find("ctx ").expect("ctx gauge present");
+        assert!(mark < ctx, "{line}");
+        // Nothing between the two but the separator.
+        assert_eq!(&line[mark..ctx], format!("{THINK_MARK} med | "), "{line}");
     }
 
     #[test]

@@ -41,13 +41,32 @@ impl ThinkMode {
         }
     }
 
+    /// The level's name abbreviated to a fixed three columns: `off`, `med`,
+    /// `max`.
+    ///
+    /// For the status footer, where every level must occupy the same width — a
+    /// segment that grows and shrinks as the level changes shifts everything to
+    /// its right. Prose contexts (`/think`, `/repro`) use [`name`] instead, and
+    /// the KV fingerprint keys on [`name`] so this stays a display concern.
+    ///
+    /// [`name`]: ThinkMode::name
+    #[must_use]
+    pub fn short_name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Medium => "med",
+            Self::Max => "max",
+        }
+    }
+
     /// Parses a level typed by the user, case-insensitively. `high` and `none`
-    /// are accepted as the C's names for `Medium` and `Off`.
+    /// are accepted as the C's names for `Medium` and `Off`, and `med` because
+    /// that is the spelling the status footer shows.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "no" => Some(Self::Off),
-            "medium" | "high" | "on" => Some(Self::Medium),
+            "medium" | "med" | "high" | "on" => Some(Self::Medium),
             "max" | "maximum" => Some(Self::Max),
             _ => None,
         }
@@ -944,6 +963,23 @@ mod tests {
     fn think_mode_defaults_to_medium() {
         assert_eq!(ThinkMode::default(), ThinkMode::Medium);
         assert_eq!(GenerationOptions::default().think_mode, ThinkMode::Medium);
+    }
+
+    // The footer's segment must not change width with the level.
+    #[test]
+    fn think_mode_short_names_are_a_fixed_width() {
+        let names: Vec<&str> = [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max]
+            .iter()
+            .map(|l| l.short_name())
+            .collect();
+        assert!(
+            names.iter().all(|n| n.chars().count() == 3),
+            "{names:?} must all be three columns wide"
+        );
+        // And each still parses back, since it is what the user sees and copies.
+        for level in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+            assert_eq!(ThinkMode::parse(level.short_name()), Some(level));
+        }
     }
 
     #[test]

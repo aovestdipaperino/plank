@@ -1231,6 +1231,7 @@ impl Agent<'_> {
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
+        let think = self.think;
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -1298,6 +1299,7 @@ impl Agent<'_> {
                             ctx_used: prompt_tokens,
                             ctx_size,
                             power_percent: power,
+                            think,
                             ..Status::default()
                         });
                     }
@@ -1670,6 +1672,7 @@ impl Agent<'_> {
                 generated: stats.generated,
                 gen_tps: stats.tps,
                 power_percent: self.power_percent,
+                think: self.think,
                 ..Status::default()
             };
             if real_interrupt {
@@ -5018,6 +5021,7 @@ impl Agent<'_> {
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
+            think: self.think,
             ..Status::default()
         };
         status::build_status_text(&st, false, true)
@@ -5591,6 +5595,7 @@ impl Agent<'_> {
         let greedy = AtomicBool::new(false);
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
+        let think = self.think;
         // Prompt tokens already in context; generated tokens add onto this so
         // the ctx gauge moves while the model streams.
         let prompt_tokens = self.engine.count_tokens(prompt);
@@ -5630,6 +5635,7 @@ impl Agent<'_> {
                         ctx_used: prompt_tokens + gen_count,
                         ctx_size,
                         power_percent: power,
+                        think,
                         greedy_sampling: greedy.load(Ordering::Relaxed),
                         ..Status::default()
                     }
@@ -5650,6 +5656,7 @@ impl Agent<'_> {
                     ctx_used: prompt_tokens,
                     ctx_size,
                     power_percent: power,
+                    think,
                     ..Status::default()
                 },
                 // Warm-up-only signal; never emitted mid-turn.

@@ -2191,12 +2191,32 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
     let mut spans = Vec::new();
     // Peel the leading "<path> ⎇ <branch> | " directory segment and theme the
     // path and branch green; the powerline glyph and separators stay plain.
-    let text = if let Some(idx) = text.find("ctx ").filter(|&i| i > 0) {
+    //
+    // The boundary is the think segment when present, else the ctx gauge. It
+    // cannot be the ctx gauge unconditionally: `push_dir_prefix` splits on the
+    // *last* " | " it finds, so leaving "🧠 medium | " inside the prefix slice
+    // would make the branch read "main | 🧠 medium".
+    let think_mark = crate::status::THINK_MARK;
+    let boundary = text
+        .find(think_mark)
+        .or_else(|| text.find("ctx "))
+        .filter(|&i| i > 0);
+    let mut text = if let Some(idx) = boundary {
         push_dir_prefix(&mut spans, &text[..idx], base, theme);
         &text[idx..]
     } else {
         text
     };
+    // The think segment is its own span: plain, like the ctx gauge and power
+    // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
+    if text.starts_with(think_mark)
+        && let Some(i) = text.find(" | ")
+    {
+        spans.push(Span::styled(text[..i].to_string(), base));
+        spans.push(Span::styled(" | ".to_string(), base));
+        text = &text[i + " | ".len()..];
+    }
+    let text = text;
     let bar = text
         .find('[')
         .and_then(|open| text[open..].find(']').map(|i| (open, open + i)));
@@ -2955,6 +2975,43 @@ mod tests {
             .find(|s| s.content.contains("1/1"))
             .unwrap();
         assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
+    }
+
+    /// With the think segment present, the branch must still end at the branch:
+    /// `push_dir_prefix` splits on the *last* " | ", so if the segment were left
+    /// inside the prefix slice the branch would read "main | 🧠 medium".
+    #[test]
+    fn status_bar_keeps_the_think_segment_out_of_the_branch() {
+        let base = Style::default();
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let mark = crate::status::THINK_MARK;
+        let text = format!("~/Code/plank {glyph} main | {mark} max | ctx 12% | idle");
+        let line = status_bar_line(&text, 0, base, &TaskView::default());
+
+        let branch = line
+            .spans
+            .iter()
+            .find(|s| s.content == "main")
+            .expect("branch span ends at the branch");
+        assert_eq!(branch.style.fg, Some(theme));
+
+        // The segment renders as its own plain span, and only once.
+        let think: Vec<_> = line
+            .spans
+            .iter()
+            .filter(|s| s.content.contains(mark))
+            .collect();
+        assert_eq!(think.len(), 1, "{:?}", line.spans);
+        assert_eq!(think[0].content, format!("{mark} max"));
+        assert_eq!(think[0].style.fg, None, "plain, like the ctx gauge");
+
+        // Nothing is dropped: the rendered spans still spell the input.
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            joined.contains(&format!("{mark} max | ctx 12%")),
+            "{joined}"
+        );
     }
 
     #[test]

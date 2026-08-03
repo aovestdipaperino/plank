@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-08-03
+
+Stable release: the 2.7 beta series promoted. Everything listed under 2.7.1
+through 2.7.9 is now on the stable channel (`brew install
+aovestdipaperino/tap/plank-agent`), most notably the tool-call parsing and
+system-prompt tokenization fixes in 2.7.8 and 2.7.9.
+
+### Added
+
+- **The status footer shows the reasoning level**, as a `🧠 med` segment just
+  before the ctx gauge. The level changes how every turn is generated, so it
+  keeps a permanent slot rather than appearing only when off the default. The
+  three names are abbreviated to a fixed three columns (`off`, `med`, `max`) so
+  switching level never shifts the rest of the footer sideways; `/think med`
+  parses too, since that is the spelling on screen.
+
+### Changed
+
+- **Releases are arm64 only.** Intel Macs cannot run the Metal backend and none
+  has the unified memory to hold the model, so the x86_64 build could only ever
+  ship the engine-less stub. The bottle and binary tarball are no longer
+  produced, and the Homebrew formula requires `arm64` up front instead of
+  falling back to a source build that would spend twenty minutes producing that
+  same stub.
+
 ## [2.7.9] - 2026-08-03
 
 Beta channel on the 2.7 series.
