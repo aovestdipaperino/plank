@@ -26,6 +26,7 @@ use crate::engine::{
     PrefillProgress, Prompt, ToolSpec,
 };
 use crate::remote::read_sse;
+use std::time::Duration;
 
 /// Which provider API family a [`ProviderEngine`] speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -737,6 +738,17 @@ fn key_omits_top_p(api_key: &str) -> bool {
     api_key.contains("DEADBEEF")
 }
 
+/// Reads the context window out of an Anthropic `GET /v1/models/{id}` body.
+///
+/// The field is `max_input_tokens`; `max_tokens` on the same object is the
+/// *output* cap and must not be confused for it. Older responses carry neither,
+/// hence the `Option`. Pure and unit-testable: no network.
+fn parse_max_input_tokens(body: &str) -> Option<i32> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let n = v.get("max_input_tokens")?.as_i64()?;
+    i32::try_from(n).ok().filter(|n| *n > 0)
+}
+
 fn cache_control() -> serde_json::Value {
     serde_json::json!({ "type": "ephemeral", "ttl": "1h" })
 }
@@ -1017,6 +1029,48 @@ impl ProviderEngine {
             ctx_size: if ctx_size > 0 { ctx_size } else { 128_000 },
             cache,
         })
+    }
+
+    /// Best-effort lookup of the model's real context window, mirroring the
+    /// `/info` handshake the flavor-(a) client does against `plank serve`.
+    ///
+    /// Anthropic only: `GET /v1/models/{model}` reports `max_input_tokens` (the
+    /// context window — there is no `context_window` field). The `OpenAi`
+    /// `/v1/models` payload carries no context length at all, so that path
+    /// returns `None` and the caller keeps its configured value. Every failure
+    /// mode — no key, network error, unexpected shape — is a silent `None`: a
+    /// wrong status-bar gauge is not worth failing startup over.
+    #[must_use]
+    pub fn discover_ctx_size(
+        kind: ProviderKind,
+        base_url: Option<&str>,
+        api_key: &str,
+        model: &str,
+    ) -> Option<i32> {
+        if kind != ProviderKind::Anthropic || model.is_empty() {
+            return None;
+        }
+        // A placeholder key means a key-less or mock endpoint; probing it only
+        // buys a timeout. (`DUMMY` is what `new` substitutes for an empty key.)
+        if api_key.trim().is_empty() || api_key == "DUMMY" || key_omits_top_p(api_key) {
+            return None;
+        }
+        let base = base_url
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| kind.default_base_url())
+            .trim_end_matches('/');
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_secs(5)))
+            .build()
+            .into();
+        let mut resp = agent
+            .get(format!("{base}/models/{model}"))
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01")
+            .call()
+            .ok()?;
+        let body = resp.body_mut().read_to_string().ok()?;
+        parse_max_input_tokens(&body)
     }
 
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
@@ -1508,6 +1562,39 @@ mod tests {
         .unwrap();
         assert_eq!(a.model_name(), "anthropic:claude");
         assert_eq!(a.endpoint(), "/messages");
+    }
+
+    #[test]
+    fn parses_context_window_from_models_payload() {
+        let body = r#"{"id":"claude-haiku-4-5","display_name":"Claude Haiku 4.5",
+                       "max_input_tokens":200000,"max_tokens":64000}"#;
+        assert_eq!(parse_max_input_tokens(body), Some(200_000));
+        // `max_tokens` alone is the output cap, not the window.
+        assert_eq!(parse_max_input_tokens(r#"{"max_tokens":64000}"#), None);
+        // Garbage, absent, and non-positive values all decline.
+        assert_eq!(parse_max_input_tokens("not json"), None);
+        assert_eq!(parse_max_input_tokens(r#"{"max_input_tokens":0}"#), None);
+    }
+
+    #[test]
+    fn ctx_discovery_declines_without_a_real_provider() {
+        // OpenAI's models payload has no context length: never probe.
+        assert_eq!(
+            ProviderEngine::discover_ctx_size(ProviderKind::OpenAi, None, "sk-live", "gpt"),
+            None
+        );
+        // Placeholder keys mark key-less/mock endpoints — probing only stalls.
+        for key in ["", "DUMMY", "sk-DEADBEEF"] {
+            assert_eq!(
+                ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, key, "claude"),
+                None
+            );
+        }
+        // No model name, nothing to look up.
+        assert_eq!(
+            ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, "sk-live", ""),
+            None
+        );
     }
 
     fn collect_anthropic(frames: &[&str]) -> String {

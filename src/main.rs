@@ -192,6 +192,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     if let Some(url) = &cfg.remote_url {
         use plank::remote::ds4_client::RemoteDs4Engine;
         eprintln!("plank: connecting to remote engine {url}...");
+        plank::status::set_engine_origin(&plank::status::url_host(url));
         let engine = RemoteDs4Engine::connect(url, cfg.remote_token.clone())
             .map_err(|e| format!("remote connect: {e}"))?;
         eprintln!("plank: remote engine ready: {}", engine.model_name());
@@ -212,16 +213,39 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             .ok_or_else(|| "--provider requires --model NAME".to_string())?;
         let api_key = cfg.provider_api_key.clone().unwrap_or_default();
         eprintln!("plank: using provider {} model {model}...", kind.label());
+        plank::status::set_engine_origin(&plank::status::url_host(
+            cfg.provider_base_url
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| kind.default_base_url()),
+        ));
+        // With no explicit `-c`, the configured window is the local-model
+        // default and says nothing about this provider's model — ask the
+        // provider. Best-effort: on any failure the configured value stands.
+        let ctx_size = if cfg.ctx_size_explicit {
+            cfg.generation.ctx_size
+        } else {
+            ProviderEngine::discover_ctx_size(
+                kind,
+                cfg.provider_base_url.as_deref(),
+                &api_key,
+                &model,
+            )
+            .unwrap_or(cfg.generation.ctx_size)
+        };
         let engine = ProviderEngine::new(
             kind,
             cfg.provider_base_url.clone(),
             api_key,
             model,
-            cfg.generation.ctx_size,
+            ctx_size,
             cfg.provider_cache,
         )
         .map_err(|e| format!("provider init: {e}"))?;
-        eprintln!("plank: provider engine ready: {}", engine.model_name());
+        eprintln!(
+            "plank: provider engine ready: {} (ctx {ctx_size})",
+            engine.model_name()
+        );
         return Ok(Box::new(engine));
     }
     #[cfg(ds4_engine)]

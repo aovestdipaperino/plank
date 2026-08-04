@@ -20,6 +20,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   prefix changes, so the token transcript and KV are dropped), which `off` ↔
   `medium` still does not.
 
+- **Engine origin in the status bar.** A new segment after the dir prefix says
+  where inference is running: the provider or remote host's domain
+  (`api.anthropic.com`, `localhost`) or `(local)` for the on-device DS4 engine,
+  so a footer never leaves it ambiguous whether a turn is going over the wire.
+- **Context-window discovery for `--provider anthropic`.** Without an explicit
+  `-c/--ctx`, plank asks `GET /v1/models/{model}` for the model's
+  `max_input_tokens` and sizes the ctx gauge from that instead of the local
+  model's 1M default. Best-effort: any failure keeps the configured value, and an
+  explicit `-c` is never overridden. The OpenAI path has no such field to read,
+  so it is unchanged.
+
 ## [2.8.0] - 2026-08-03
 
 Stable release: the 2.7 beta series promoted, plus the compaction and shell-escape

@@ -2119,6 +2119,23 @@ fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, th
     let (segment, sep) = prefix
         .rfind(" | ")
         .map_or((prefix, ""), |i| (&prefix[..i], &prefix[i..]));
+    // The engine origin is its own bar-separated segment after the path/branch,
+    // and stays plain so it never reads as part of the branch name. Peel it here
+    // for the same reason the think segment is peeled: `rfind` above lands on the
+    // separator *before* the origin, not the one before the body.
+    let origin = crate::status::engine_origin_label();
+    let (segment, origin) = match segment.strip_suffix(origin) {
+        Some(head) => {
+            let head = head.trim_end();
+            let head = head.strip_suffix('|').map_or(head, str::trim_end);
+            if head.is_empty() {
+                ("", origin.to_owned())
+            } else {
+                (head, format!(" | {origin}"))
+            }
+        }
+        None => (segment, String::new()),
+    };
     if let Some(gi) = segment.find(glyph) {
         let path = segment[..gi].trim_end();
         let branch = segment[gi + glyph.len_utf8()..].trim();
@@ -2127,6 +2144,9 @@ fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, th
         spans.push(Span::styled(branch.to_string(), theme));
     } else {
         spans.push(Span::styled(segment.trim_end().to_string(), theme));
+    }
+    if !origin.is_empty() {
+        spans.push(Span::styled(origin, base));
     }
     spans.push(Span::styled(sep.to_string(), base));
 }
@@ -3068,6 +3088,38 @@ mod tests {
         let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             joined.contains(&format!("{mark} max | ctx 12%")),
+            "{joined}"
+        );
+    }
+
+    /// The engine origin sits between the branch and the first `|`, and must not
+    /// be absorbed into the themed branch span.
+    #[test]
+    fn status_bar_keeps_the_engine_origin_plain() {
+        let base = Style::default();
+        let theme = Color::Indexed(crate::status::THEME_COLOR);
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let origin = crate::status::engine_origin_label();
+        let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
+        let line = status_bar_line(&text, 0, base, &TaskView::default());
+
+        let branch = line
+            .spans
+            .iter()
+            .find(|s| s.content == "main")
+            .expect("branch span stops before the origin");
+        assert_eq!(branch.style.fg, Some(theme));
+
+        let shown = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains(origin))
+            .expect("origin span");
+        assert_eq!(shown.style.fg, None, "plain, like the ctx gauge");
+
+        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            joined.contains(&format!("main | {origin} | ctx 12%")),
             "{joined}"
         );
     }

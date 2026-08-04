@@ -150,6 +150,51 @@ pub fn git_branch_label() -> Option<String> {
     Some(oid.to_string().chars().take(7).collect())
 }
 
+/// Where inference is running, shown in the footer beside the directory.
+///
+/// A process-wide global rather than a [`Status`] field: it is decided once when
+/// the engine is built and never changes, so threading it through the worker,
+/// the remote-UI protocol, and both front-ends would be noise. Mirrors how
+/// [`cwd_label`] and [`git_branch_label`] read the ambient environment.
+static ENGINE_ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Shown when nothing set an origin: the local Metal-backed ds4 engine (and the
+/// `EchoEngine` stub, which is equally local).
+const LOCAL_ORIGIN: &str = "(local)";
+
+/// Records the engine origin for the footer. First call wins; later calls are
+/// ignored, so a single engine choice per process is the only thing shown.
+pub fn set_engine_origin(label: &str) {
+    let _ = ENGINE_ORIGIN.set(label.to_owned());
+}
+
+/// The engine-origin label: a provider or remote host, else [`LOCAL_ORIGIN`].
+#[must_use]
+pub fn engine_origin_label() -> &'static str {
+    ENGINE_ORIGIN.get().map_or(LOCAL_ORIGIN, String::as_str)
+}
+
+/// Extracts the bare host from a base URL for display: `https://api.anthropic.com/v1`
+/// becomes `api.anthropic.com`. Any credentials, port, and path are dropped —
+/// this is a footer label, not something to reconstruct a request from. Returns
+/// the trimmed input when it has no recognizable host.
+#[must_use]
+pub fn url_host(url: &str) -> String {
+    let rest = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .trim_start_matches('/');
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Strip `user:pass@` and any `:port`.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host.split(':').next().unwrap_or(host);
+    if host.is_empty() {
+        url.trim().to_owned()
+    } else {
+        host.to_owned()
+    }
+}
+
 /// Formats a token count compactly: `8000` becomes `8k`, `2500` becomes `2.5k`.
 #[must_use]
 pub fn format_ctx_size(ctx_size: i32) -> String {
@@ -890,12 +935,19 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         }
     };
     let cwd = cwd_label();
+    // The origin rides with the directory prefix — both answer "where am I?" —
+    // but as its own bar-separated segment, like the think and ctx segments.
+    let origin = format!("{} | ", engine_origin_label());
     let dir = if cwd.is_empty() {
-        String::new()
+        origin
     } else if let Some(branch) = git_branch_label() {
-        format!("{} {POWERLINE_BRANCH} {} | ", theme(&cwd), theme(&branch))
+        format!(
+            "{} {POWERLINE_BRANCH} {} | {origin}",
+            theme(&cwd),
+            theme(&branch)
+        )
     } else {
-        format!("{} | ", theme(&cwd))
+        format!("{} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
     let body = match st.state {
@@ -1036,6 +1088,34 @@ mod tests {
             "{}",
             build_status_text(&st, false, true)
         );
+    }
+
+    #[test]
+    fn url_host_keeps_only_the_domain() {
+        assert_eq!(
+            url_host("https://api.anthropic.com/v1"),
+            "api.anthropic.com"
+        );
+        assert_eq!(url_host("https://api.openai.com/v1"), "api.openai.com");
+        assert_eq!(url_host("http://localhost:8080/v1"), "localhost");
+        assert_eq!(
+            url_host("https://user:pw@gw.example.com/x"),
+            "gw.example.com"
+        );
+        assert_eq!(url_host("api.anthropic.com"), "api.anthropic.com");
+        // Nothing host-shaped: echo the input rather than showing an empty slot.
+        assert_eq!(url_host("://"), "://");
+    }
+
+    #[test]
+    fn footer_shows_the_engine_origin_beside_the_directory() {
+        // No engine set this origin (unit tests build no engine), so the local
+        // ds4/echo default stands. The label sits in the dir prefix, ahead of
+        // the think segment — not appended to the tail.
+        let line = build_status_text(&Status::default(), false, true);
+        let origin = line.find("(local)").expect("origin in footer");
+        let think = line.find(THINK_MARK).expect("think segment in footer");
+        assert!(origin < think, "{line}");
     }
 
     #[test]

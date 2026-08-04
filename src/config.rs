@@ -117,6 +117,12 @@ pub struct AgentConfig {
     /// latency across multi-turn conversations by reusing the cached stable
     /// prefix (tools + system). Only consulted for `ProviderKind::Anthropic`.
     pub provider_cache: bool,
+    /// Whether the context size came from the user (`-c/--ctx` or the settings
+    /// file) rather than [`DEFAULT_CTX_SIZE`]. Only consulted by the provider
+    /// path: an untouched default is a guess sized for the local ds4 model, so
+    /// it may be replaced by the provider's reported window; an explicit value
+    /// is the user's decision and is never overridden.
+    pub ctx_size_explicit: bool,
 }
 
 /// Third-party provider family selector (`--provider`).
@@ -322,6 +328,7 @@ impl Default for AgentConfig {
             provider_base_url: None,
             provider_api_key: None,
             provider_cache: true,
+            ctx_size_explicit: false,
         }
     }
 }
@@ -347,6 +354,7 @@ impl AgentConfig {
         }
         if let Some(ctx) = s.engine.ctx {
             c.generation.ctx_size = ctx;
+            c.ctx_size_explicit = true;
         }
         // Forward recovery from an in-think tool call only pays where such a
         // call is otherwise wasted. With `thinkingToolCalls` on the stanza is
@@ -876,7 +884,10 @@ pub fn parse_options_with(
             }
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
-            "-c" | "--ctx" => c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?,
+            "-c" | "--ctx" => {
+                c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?;
+                c.ctx_size_explicit = true;
+            }
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
                 c.generation.temperature = parse_float_range(need_arg(&mut i)?, arg, 0.0, 100.0)?;
@@ -1023,6 +1034,7 @@ mod tests {
         assert_eq!(c.backend, Some(Backend::Cpu));
         assert_eq!(c.power_percent, 50);
         assert_eq!(c.generation.ctx_size, 4096);
+        assert!(c.ctx_size_explicit, "a settings `ctx` is the user's choice");
         assert_eq!(c.sandbox_override, Some(true));
         assert!(c.btw.suspend);
     }
@@ -1085,6 +1097,12 @@ mod tests {
         let c = parse_options(&[]).unwrap();
         assert_eq!(c.generation.n_predict, DEFAULT_N_PREDICT);
         assert_eq!(c.generation.ctx_size, DEFAULT_CTX_SIZE);
+        assert!(!c.ctx_size_explicit);
+        assert!(
+            parse_options(&["-c".into(), "8192".into()])
+                .unwrap()
+                .ctx_size_explicit
+        );
         assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT);
         assert_eq!(c.generation.think_mode, ThinkMode::Medium);
         assert!(c.prompt.is_none());
