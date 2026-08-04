@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A `low` reasoning level (experimental).** `/think low` and `--think-low` sit
+  below `medium`, asking the model in a preamble to keep its deliberation short.
+  This is a *prompt* level, not an engine level: the ds4 engine has no state
+  below `DS4_THINK_HIGH`, so `low` is `HIGH` at the FFI boundary plus
+  `THINK_LOW_PREFIX` prepended ahead of the system prompt — the same mechanism
+  `max` uses, pulling the other way. Unlike every other model-facing string in
+  plank it has **no C counterpart**, so `tests/c_parity.rs` cannot check it and
+  the model was not trained on it; treat its effect as unverified until measured
+  against real traces. Switching in or out of it costs one re-prefill (the prompt
+  prefix changes, so the token transcript and KV are dropped), which `off` ↔
+  `medium` still does not.
+
 ## [2.8.0] - 2026-08-03
 
 Stable release: the 2.7 beta series promoted, plus the compaction and shell-escape

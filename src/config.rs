@@ -449,6 +449,7 @@ Options:
       --min-p F            minimum-probability threshold (0..1)
       --seed N             RNG seed (positive integer)
       --think              ordinary thinking (default); same as /think medium
+      --think-low          ask for brief reasoning (experimental; prompt-only)
       --think-max          maximum reasoning effort; needs --ctx 393216 or more
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
@@ -886,6 +887,7 @@ pub fn parse_options_with(
             // `--think-max` used to be an alias for ordinary thinking; it now
             // selects the level it names, which the engine has always had.
             "--think" => c.generation.think_mode = ThinkMode::Medium,
+            "--think-low" => c.generation.think_mode = ThinkMode::Low,
             "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
@@ -1289,6 +1291,15 @@ mod tests {
                 .generation
                 .think_mode,
             ThinkMode::Off
+        );
+        // `--think-low` has no context floor: its preamble asks for *less*
+        // reasoning, so there is no budget to fall short of.
+        assert_eq!(
+            parse_options(&args(&["--think-low"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Low
         );
     }
 

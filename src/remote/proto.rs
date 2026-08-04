@@ -130,11 +130,13 @@ impl InfoResponse {
 /// before the levels split still understands it. `"auto"` and `"high"` are
 /// accepted inbound for the same reason — the old `Auto` was `On` in all but
 /// name. Only `"max"` is new, and a peer that rejects it could not have honored
-/// it anyway.
+/// it anyway. `"low"` is newer still, and a peer that does not know it will
+/// reject the frame rather than silently thinking at the wrong level.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WireThinkMode {
     Off,
+    Low,
     #[serde(alias = "auto", alias = "medium", alias = "high")]
     On,
     Max,
@@ -144,6 +146,7 @@ impl From<ThinkMode> for WireThinkMode {
     fn from(m: ThinkMode) -> Self {
         match m {
             ThinkMode::Off => Self::Off,
+            ThinkMode::Low => Self::Low,
             ThinkMode::Medium => Self::On,
             ThinkMode::Max => Self::Max,
         }
@@ -154,6 +157,7 @@ impl From<WireThinkMode> for ThinkMode {
     fn from(m: WireThinkMode) -> Self {
         match m {
             WireThinkMode::Off => Self::Off,
+            WireThinkMode::Low => Self::Low,
             WireThinkMode::On => Self::Medium,
             WireThinkMode::Max => Self::Max,
         }

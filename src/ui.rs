@@ -3352,7 +3352,7 @@ the original is frozen and listed in /tree"
         format!("notifications {}", if new_state { "on" } else { "off" })
     }
 
-    /// Parses a `/think [off|medium|max]` argument and applies it; returns the
+    /// Parses a `/think [off|low|medium|max]` argument and applies it; returns the
     /// status line to report to the user. Shared by both front-ends so the two
     /// dispatchers cannot drift.
     ///
@@ -3368,10 +3368,10 @@ the original is frozen and listed in /tree"
         let current = self.think;
         let arg = arg.trim();
         if arg.is_empty() {
-            return format!("thinking: {} (off|medium|max)", current.name());
+            return format!("thinking: {} (off|low|medium|max)", current.name());
         }
         let Some(level) = ThinkMode::parse(arg) else {
-            return format!("/think: expected off|medium|max, got `{arg}`");
+            return format!("/think: expected off|low|medium|max, got `{arg}`");
         };
         let ctx = self.engine.ctx_size();
         if level == ThinkMode::Max && ctx < THINK_MAX_MIN_CONTEXT {
@@ -3386,11 +3386,11 @@ the original is frozen and listed in /tree"
             return format!("thinking already {}", level.name());
         }
         self.think = level;
-        // Moving in or out of `max` changes the prompt prefix, so the engine
+        // A change of effort preamble changes the prompt prefix, so the engine
         // drops its cached tokens and KV here. Re-warm from the tier
         // checkpoints under the new fingerprint rather than making the next
         // turn re-prefill the system prompt inline.
-        let prefix_changed = (current == ThinkMode::Max) != (level == ThinkMode::Max);
+        let prefix_changed = current.effort_prefix() != level.effort_prefix();
         self.engine.set_think_mode(level);
         if prefix_changed {
             self.rewarm_after_reset(&mut || {});
@@ -9487,6 +9487,30 @@ mod tests {
         let out = agent.think_command("medium");
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // `low` is selectable at any context — unlike `max` it has no floor — and
+    // reaches the engine like any other level.
+    #[test]
+    fn think_command_selects_low_at_any_context() {
+        let dir = scratch_dir("think-low");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        let out = agent.think_command("low");
+        assert!(out.contains("low"), "got: {out}");
+        assert_eq!(agent.think, ThinkMode::Low);
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Low]);
+
+        // And the level listing offers it, so it is discoverable.
+        let out = agent.think_command("");
+        assert!(out.contains("low"), "got: {out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

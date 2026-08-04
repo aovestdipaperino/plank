@@ -287,7 +287,7 @@ impl Ds4Model {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the whole build.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
-        self.append_max_effort_prefix(&mut tokens, think);
+        self.append_effort_prefix(&mut tokens, think);
         self.append_system_text(&mut tokens, system, trusted_len);
         tokens
     }
@@ -343,12 +343,12 @@ impl Ds4Model {
         let mut tokens = Ds4TokensGuard::new();
         // SAFETY: engine and tokens are valid for the call.
         unsafe { ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr()) };
-        self.append_max_effort_prefix(&mut tokens, think);
+        self.append_effort_prefix(&mut tokens, think);
         tokens.to_vec()
     }
 
-    /// Appends the reasoning-effort preamble when the level is
-    /// [`ThinkMode::Max`], and nothing otherwise.
+    /// Appends the level's effort preamble ([`ThinkMode::effort_prefix`]), or
+    /// nothing when the level has none.
     ///
     /// The preamble is plain text with no role wrapper, so its position is
     /// load-bearing: immediately after the `ds4_chat_begin` preamble and ahead
@@ -357,12 +357,22 @@ impl Ds4Model {
     /// the REPL's `repl_chat_apply_max_prefix` (inserted at transcript index 1,
     /// past the BOS). Folding it into the system *string* instead would place
     /// it after the system role marker and diverge.
-    fn append_max_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
-        if think != ThinkMode::Max {
-            return;
+    ///
+    /// `Max` goes through the C's own `ds4_chat_append_max_effort_prefix` so its
+    /// tokens stay byte-identical to the reference; `Low`, which the C does not
+    /// have, is tokenized here from [`crate::engine::THINK_LOW_PREFIX`] through
+    /// the same rendered-chat tokenizer the C symbol uses internally.
+    fn append_effort_prefix(&self, tokens: &mut Ds4TokensGuard, think: ThinkMode) {
+        match think {
+            ThinkMode::Max => {
+                // SAFETY: engine and tokens are valid for the call.
+                unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
+            }
+            ThinkMode::Low => {
+                tokens.push_all(&self.tokenize_rendered(crate::engine::THINK_LOW_PREFIX));
+            }
+            ThinkMode::Off | ThinkMode::Medium => {}
         }
-        // SAFETY: engine and tokens are valid for the call.
-        unsafe { ffi::ds4_chat_append_max_effort_prefix(self.engine, tokens.as_mut_ptr()) };
     }
 
     /// The chat-template tokens for one message (role wrapper + content),
@@ -533,10 +543,10 @@ pub struct Ds4Session {
     /// Cumulative token buffer for an in-progress warm walk (`warm_reset` /
     /// `warm_sync`). Empty outside a walk.
     warm_tokens: Ds4TokensGuard,
-    /// Reasoning level for prompts built from here on. Only [`ThinkMode::Max`]
-    /// changes the prompt *prefix* (it prepends the reasoning-effort preamble
-    /// ahead of the system prompt), so `set_think_mode` drops the token
-    /// transcript when the level moves in or out of `Max`.
+    /// Reasoning level for prompts built from here on. Only the levels carrying
+    /// an effort preamble ([`ThinkMode::effort_prefix`]) change the prompt
+    /// *prefix*, so `set_think_mode` drops the token transcript exactly when the
+    /// preamble changes.
     think: ThinkMode,
     /// Byte length of the system prompt's trusted, control-text prefix; see
     /// [`Engine::set_trusted_system_prefix`]. Zero means "tokenize all of it as
@@ -1262,11 +1272,11 @@ impl Engine for Ds4Session {
         if self.think == mode {
             return;
         }
-        // Only moving in or out of `Max` changes the prompt prefix; `Off` vs
+        // Only a change of effort preamble changes the prompt prefix; `Off` vs
         // `Medium` lives entirely in the per-turn assistant prefix, which is
         // re-derived every turn and never cached. So a level change that keeps
         // the preamble where it is costs nothing.
-        let prefix_changed = (self.think == ThinkMode::Max) != (mode == ThinkMode::Max);
+        let prefix_changed = self.think.effort_prefix() != mode.effort_prefix();
         self.think = mode;
         if prefix_changed {
             // The whole token buffer now starts with the wrong prefix. Drop it
@@ -1772,7 +1782,9 @@ fn cstr_message(buf: &[i8], fallback: &str) -> String {
 fn ds4_think(think: ThinkMode) -> ffi::Ds4ThinkMode {
     match think {
         ThinkMode::Off => ffi::Ds4ThinkMode::None,
-        ThinkMode::Medium => ffi::Ds4ThinkMode::High,
+        // `Low` is `HIGH` to the engine — the brevity request lives entirely in
+        // the prompt preamble, since the engine has no level below `HIGH`.
+        ThinkMode::Low | ThinkMode::Medium => ffi::Ds4ThinkMode::High,
         ThinkMode::Max => ffi::Ds4ThinkMode::Max,
     }
 }

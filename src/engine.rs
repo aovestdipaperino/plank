@@ -11,14 +11,27 @@ use std::fmt::Debug;
 
 /// Reasoning level requested for a generation, mirroring `ds4_think_mode`.
 ///
-/// The three levels are the C's `DS4_THINK_NONE` / `_HIGH` / `_MAX`. plank long
-/// exposed only the first two (an `Auto` and an `On` that both mapped to
-/// `HIGH`); the levels are now one-to-one with the engine's, so `Max` — the
-/// reasoning-effort preamble in [`THINK_MAX_PREFIX`] — is reachable.
+/// The engine has exactly three states — the C's `DS4_THINK_NONE` / `_HIGH` /
+/// `_MAX` — and plank long exposed only the first two (an `Auto` and an `On`
+/// that both mapped to `HIGH`). Today's levels are richer than the engine's
+/// because the top and bottom of the range are *prompt* levels, not engine
+/// levels: `Max` and `Low` are both `HIGH` at the FFI boundary, distinguished
+/// by an effort preamble prepended ahead of the system prompt (see
+/// [`effort_prefix`]).
+///
+/// `Low` is a plank extension with no C counterpart — [`THINK_LOW_PREFIX`] is
+/// text plank invented, unlike [`THINK_MAX_PREFIX`], which `tests/c_parity.rs`
+/// holds byte-equal to the C. Treat its effect as unverified: the model has no
+/// trained response to it.
+///
+/// [`effort_prefix`]: ThinkMode::effort_prefix
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThinkMode {
     /// Suppress thinking: the assistant prefix opens with `</think>`.
     Off,
+    /// Ordinary thinking plus the brief-reasoning preamble in
+    /// [`THINK_LOW_PREFIX`]. A plank extension, not a C level.
+    Low,
     /// Ordinary thinking (the C's `DS4_THINK_HIGH`). The default.
     #[default]
     Medium,
@@ -28,6 +41,11 @@ pub enum ThinkMode {
 }
 
 impl ThinkMode {
+    /// Every level, in increasing order of effort. Lets callers and tests
+    /// enumerate the levels without restating them (and so without silently
+    /// missing one that is added later).
+    pub const ALL: [Self; 4] = [Self::Off, Self::Low, Self::Medium, Self::Max];
+
     /// The level's name, matching the C's `ds4_think_mode_name` for the two
     /// shared levels and naming `Medium` as the user types it to [`parse`].
     ///
@@ -36,13 +54,14 @@ impl ThinkMode {
     pub fn name(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Low => "low",
             Self::Medium => "medium",
             Self::Max => "max",
         }
     }
 
-    /// The level's name abbreviated to a fixed three columns: `off`, `med`,
-    /// `max`.
+    /// The level's name abbreviated to a fixed three columns: `off`, `low`,
+    /// `med`, `max`.
     ///
     /// For the status footer, where every level must occupy the same width — a
     /// segment that grows and shrinks as the level changes shifts everything to
@@ -54,6 +73,7 @@ impl ThinkMode {
     pub fn short_name(self) -> &'static str {
         match self {
             Self::Off => "off",
+            Self::Low => "low",
             Self::Medium => "med",
             Self::Max => "max",
         }
@@ -66,6 +86,7 @@ impl ThinkMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "no" => Some(Self::Off),
+            "low" | "brief" => Some(Self::Low),
             "medium" | "med" | "high" | "on" => Some(Self::Medium),
             "max" | "maximum" => Some(Self::Max),
             _ => None,
@@ -77,6 +98,23 @@ impl ThinkMode {
     #[must_use]
     pub fn thinks(self) -> bool {
         !matches!(self, Self::Off)
+    }
+
+    /// The effort preamble this level prepends ahead of the system prompt, or
+    /// `None` when it prepends nothing.
+    ///
+    /// This is the single answer to "does the prompt *prefix* depend on the
+    /// level", which is what decides whether a level change invalidates the
+    /// token transcript and KV. `Off` and `Medium` differ only in the per-turn
+    /// assistant prefix, which is re-derived every turn and never cached, so
+    /// both return `None` and moving between them is free.
+    #[must_use]
+    pub fn effort_prefix(self) -> Option<&'static str> {
+        match self {
+            Self::Off | Self::Medium => None,
+            Self::Low => Some(THINK_LOW_PREFIX),
+            Self::Max => Some(THINK_MAX_PREFIX),
+        }
     }
 }
 
@@ -91,6 +129,25 @@ pub const THINK_MAX_PREFIX: &str = concat!(
     "Explicitly write out your entire deliberation process, documenting every intermediate step, \
      considered alternative, and rejected hypothesis to ensure absolutely no assumption is left \
      unchecked.\n\n",
+);
+
+/// The brief-reasoning preamble [`ThinkMode::Low`] prepends ahead of the system
+/// prompt, in the same position and by the same mechanism as
+/// [`THINK_MAX_PREFIX`].
+///
+/// **Unlike every other model-facing string in plank, this one has no C
+/// counterpart** — it is not in `refs/ds4`, so `tests/c_parity.rs` cannot check
+/// it and the model was not trained on it. It is a prompt-level experiment: the
+/// engine has no reasoning dial below `DS4_THINK_HIGH`, so asking for brevity in
+/// text is the only lever available. Expect the model to sometimes ignore it.
+/// If it proves ineffective, delete the level rather than escalating the wording.
+pub const THINK_LOW_PREFIX: &str = concat!(
+    "Reasoning Effort: Low. Think only as much as this task actually requires.\n",
+    "Keep your deliberation short and direct: establish what is being asked, settle on an \
+     approach, and act. Do not restate the problem back to yourself, enumerate alternatives you \
+     have already rejected, or re-verify steps that are not in doubt.\n",
+    "If a problem turns out to be genuinely hard, think for as long as it needs — this is a floor \
+     on brevity, not a ceiling on care.\n\n",
 );
 
 /// Smallest context [`ThinkMode::Max`] is allowed at, the C's
@@ -955,7 +1012,8 @@ impl Engine for EchoEngine {
 mod tests {
     use super::{
         EchoEngine, Engine, EngineError, EngineEvent, GenerationOptions, PrefillProgress,
-        ThinkMode, ThinkToolRecovery, Utf8Stream, reusable_prefix,
+        THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery, Utf8Stream,
+        reusable_prefix,
     };
 
     // The default is ordinary thinking, the level plank has always run at.
@@ -968,23 +1026,20 @@ mod tests {
     // The footer's segment must not change width with the level.
     #[test]
     fn think_mode_short_names_are_a_fixed_width() {
-        let names: Vec<&str> = [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max]
-            .iter()
-            .map(|l| l.short_name())
-            .collect();
+        let names: Vec<&str> = ThinkMode::ALL.iter().map(|l| l.short_name()).collect();
         assert!(
             names.iter().all(|n| n.chars().count() == 3),
             "{names:?} must all be three columns wide"
         );
         // And each still parses back, since it is what the user sees and copies.
-        for level in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+        for level in ThinkMode::ALL {
             assert_eq!(ThinkMode::parse(level.short_name()), Some(level));
         }
     }
 
     #[test]
     fn think_mode_round_trips_through_its_name() {
-        for level in [ThinkMode::Off, ThinkMode::Medium, ThinkMode::Max] {
+        for level in ThinkMode::ALL {
             assert_eq!(ThinkMode::parse(level.name()), Some(level), "{level:?}");
         }
     }
@@ -1001,13 +1056,64 @@ mod tests {
         assert_eq!(ThinkMode::parse(""), None);
     }
 
-    // Only `off` suppresses the thinking block; `max` thinks like `medium` and
-    // adds the effort preamble on top.
+    // Only `off` suppresses the thinking block; `max` and `low` think like
+    // `medium` and differ only by the effort preamble on top.
     #[test]
     fn only_off_suppresses_thinking() {
         assert!(!ThinkMode::Off.thinks());
+        assert!(ThinkMode::Low.thinks());
         assert!(ThinkMode::Medium.thinks());
         assert!(ThinkMode::Max.thinks());
+    }
+
+    // `low` is spelled the way the user types it, and does not collide with the
+    // C's `high`/`none` aliases.
+    #[test]
+    fn think_mode_parses_low() {
+        assert_eq!(ThinkMode::parse("low"), Some(ThinkMode::Low));
+        assert_eq!(ThinkMode::parse(" BRIEF "), Some(ThinkMode::Low));
+        assert_eq!(ThinkMode::Low.name(), "low");
+        assert_eq!(ThinkMode::Low.short_name(), "low");
+    }
+
+    // The prefix is what decides KV invalidation, so exactly the two preamble
+    // levels must report one, and the two preambles must differ.
+    #[test]
+    fn only_low_and_max_carry_an_effort_prefix() {
+        assert_eq!(ThinkMode::Off.effort_prefix(), None);
+        assert_eq!(ThinkMode::Medium.effort_prefix(), None);
+        assert_eq!(ThinkMode::Low.effort_prefix(), Some(THINK_LOW_PREFIX));
+        assert_eq!(ThinkMode::Max.effort_prefix(), Some(THINK_MAX_PREFIX));
+        assert_ne!(THINK_LOW_PREFIX, THINK_MAX_PREFIX);
+    }
+
+    // Off↔Medium is free (no prefix moves); every other pair costs a re-prefill.
+    // This is the property `set_think_mode` and `/think` both key on.
+    #[test]
+    fn effort_prefix_identifies_the_free_level_changes() {
+        let changed = |a: ThinkMode, b: ThinkMode| a.effort_prefix() != b.effort_prefix();
+        assert!(!changed(ThinkMode::Off, ThinkMode::Medium));
+        assert!(changed(ThinkMode::Medium, ThinkMode::Low));
+        assert!(changed(ThinkMode::Low, ThinkMode::Max));
+        assert!(changed(ThinkMode::Off, ThinkMode::Low));
+    }
+
+    // The preamble must be plain text with no role wrapper or DSML control
+    // string: it is tokenized as rendered chat and sits ahead of the system
+    // message, so a stray marker would land outside any role.
+    #[test]
+    fn think_low_prefix_is_bare_prose() {
+        assert!(!THINK_LOW_PREFIX.contains('｜'), "no DSML control markers");
+        assert!(!THINK_LOW_PREFIX.contains("<think>"));
+        assert!(
+            THINK_LOW_PREFIX.ends_with("\n\n"),
+            "must separate itself from the system prompt that follows"
+        );
+        // No indentation leaked in from the source literal's continuations.
+        assert!(
+            !THINK_LOW_PREFIX.lines().any(|l| l.starts_with(' ')),
+            "leading whitespace in model-facing text: {THINK_LOW_PREFIX:?}"
+        );
     }
 
     // The trigger: a complete stanza opening while thinking is still open.

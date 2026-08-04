@@ -1272,6 +1272,7 @@ mod tests {
 
         for (level, name) in [
             (ThinkMode::Off, "off"),
+            (ThinkMode::Low, "low"),
             (ThinkMode::Medium, "med"),
             (ThinkMode::Max, "max"),
         ] {
