@@ -238,6 +238,13 @@ pub fn subagent_signpost(label: &str) -> String {
     format!("[sub-agent: {label} — ctrl+o to follow]")
 }
 
+/// The dim line pushed into the main transcript when several sub-agents run
+/// concurrently; the plural counterpart of [`subagent_signpost`].
+#[must_use]
+pub fn subagents_signpost(labels: &[&str]) -> String {
+    format!("[sub-agents: {} — ctrl+o to follow]", labels.join(", "))
+}
+
 #[derive(Debug, Default)]
 pub struct OutputLog {
     lines: Vec<Line<'static>>,

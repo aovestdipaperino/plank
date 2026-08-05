@@ -675,8 +675,37 @@ fn close_open_think(text: &mut String, ended_in_think: bool) {
 fn edit_preflight(
     ctx: &ToolContext,
 ) -> impl FnMut(&ToolCall) -> Result<(), String> + 'static + use<> {
-    let ctx = ToolContext::new(ctx.cwd.clone());
+    edit_preflight_cwd(&ctx.cwd)
+}
+
+/// [`edit_preflight`] from a bare working directory.
+///
+/// The returned closure is `'static` and captures nothing borrowed, so a
+/// parallel fan-out can build one per slot and move each into its own thread —
+/// which it must, the closure not being `Clone`.
+fn edit_preflight_cwd(
+    cwd: &std::path::Path,
+) -> impl FnMut(&ToolCall) -> Result<(), String> + 'static + use<> {
+    let ctx = ToolContext::new(cwd.to_path_buf());
     move |call| crate::tools::edit::preflight_edit_old(&ctx, call)
+}
+
+/// One sub-agent sidechain in a parallel fan-out.
+struct FanoutSlot {
+    /// Cache key, so the engine goes back where it came from.
+    key: EngineKey,
+    engine: Box<dyn Engine>,
+    /// The slot's own transcript, holding just the framed task — fan-out slots
+    /// are always clean-room.
+    session: Session,
+    label: String,
+    /// Model text accumulated for the pane, flushed as one labelled block when
+    /// the whole fan-out finishes.
+    output: String,
+    /// Tool calls carried from the generate phase to the dispatch phase.
+    pending_calls: Vec<ToolCall>,
+    done: bool,
+    error: Option<String>,
 }
 
 /// Parses a `/btw <question>` line, returning the question. Accepts a
@@ -888,6 +917,78 @@ fn split_tool_results(payload: &str, n: usize) -> Vec<String> {
 /// onto the [`ChatRole::Tool`] message(s) that answer it — so multi-turn tool
 /// conversations are well-formed for both the `OpenAI` and Anthropic schemas.
 /// ds4/echo never see these (they read the flat transcript), so parity holds.
+/// Runs one round's generations concurrently, at most `width` at a time, and
+/// returns each slot's outcome in slot order.
+///
+/// Appends whatever each pass rendered to its slot's `output` buffer. Split out
+/// of [`Agent::run_fanout_rounds`] to keep both under the function-length lint,
+/// and because it is the one part that touches threads: nothing borrowed from the
+/// `Agent` crosses the boundary, only `&mut` engines and plain data.
+fn generate_fanout_round(
+    slots: &mut [FanoutSlot],
+    prepared: &[Option<(String, Option<StructuredBufs>)>],
+    width: usize,
+    ctx: &PassCtx<'_>,
+    cwd: &std::path::Path,
+) -> Vec<Option<Result<QuietPass, String>>> {
+    let mut passes: Vec<Option<Result<QuietPass, String>>> = Vec::new();
+    for (slot_chunk, prep_chunk) in slots.chunks_mut(width).zip(prepared.chunks(width)) {
+        let mut chunk: Vec<Option<Result<QuietPass, String>>> =
+            (0..slot_chunk.len()).map(|_| None).collect();
+        let mut texts: Vec<(usize, String)> = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for (i, (slot, prep)) in slot_chunk.iter_mut().zip(prep_chunk.iter()).enumerate() {
+                let Some((prompt, bufs)) = prep else { continue };
+                let sink = crate::viz::CollectSink::default();
+                let collected = sink.clone();
+                // `edit_preflight` is not `Clone`, so build one per slot.
+                let preflight = edit_preflight_cwd(cwd);
+                let engine = slot.engine.as_mut();
+                handles.push((
+                    i,
+                    collected,
+                    scope.spawn(move || {
+                        generate_pass(
+                            engine,
+                            prompt,
+                            bufs.as_ref(),
+                            ctx,
+                            Box::new(sink),
+                            preflight,
+                        )
+                    }),
+                ));
+            }
+            for (i, collected, handle) in handles {
+                chunk[i] = Some(
+                    handle
+                        .join()
+                        .unwrap_or_else(|_| Err("sub-agent panicked".to_string())),
+                );
+                // Buffered here and applied after the scope: the spawned threads
+                // hold `&mut` on the slots until it ends.
+                texts.push((i, collected.take()));
+            }
+        });
+        for (i, text) in texts.drain(..) {
+            slot_chunk[i].output.push_str(&text);
+        }
+        passes.extend(chunk);
+    }
+    passes
+}
+
+/// The last non-empty assistant message in `messages` — a sub-agent's final
+/// report. `None` when it never produced one (interrupted before any output).
+fn last_assistant_text(messages: &[Message]) -> Option<String> {
+    messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty())
+        .map(|m| m.text.trim().to_owned())
+}
+
 /// Concatenates tool outputs into the model-facing result block, given
 /// `(tool name, output)` pairs in the model's call order.
 ///
@@ -1337,9 +1438,19 @@ impl Agent<'_> {
     /// provider gets a machine-readable tool registry and its own system prompt
     /// (never the DS4 byte-parity prompt), plus the flat render as a fallback.
     fn build_structured(&self, rendered: &str) -> StructuredBufs {
+        self.build_structured_for(&self.session, rendered)
+    }
+
+    /// [`build_structured`](Self::build_structured) for an arbitrary session.
+    ///
+    /// A parallel sub-agent slot owns its own transcript, so it cannot use
+    /// `self.session`. This must be used rather than passing no structured
+    /// buffers at all: a provider engine given a flat prompt gets an empty tool
+    /// list, which would leave a remote sub-agent unable to call anything.
+    fn build_structured_for(&self, session: &Session, rendered: &str) -> StructuredBufs {
         StructuredBufs {
             system: sysprompt::provider_system_prompt(&self.cfg.system),
-            messages: session_to_messages(&self.session),
+            messages: session_to_messages(session),
             tools: sysprompt::provider_tool_registry(
                 &self.tool_ctx.mcp,
                 &model_visible_agents(&self.agents),
@@ -1515,6 +1626,11 @@ impl Agent<'_> {
         if calls.is_empty() {
             return "Tool error: empty tool call block\n".to_string();
         }
+        // A block of nothing but remote-backed agent calls runs concurrently.
+        // Anything else falls through to the serial loop below.
+        if let Some(results) = self.run_agent_fanout(calls) {
+            return format_tool_results(&results);
+        }
         // Mirror dispatch_all: clear any undrained previews so cards never leak.
         self.tool_ctx.edit_previews.clear();
         let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
@@ -1611,13 +1727,7 @@ impl Agent<'_> {
         self.tool_ctx.subagent_depth -= 1;
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
-        let report = self.session.transcript[fork_at..]
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty()
-            })
-            .map(|m| m.text.trim().to_owned());
+        let report = last_assistant_text(&self.session.transcript[fork_at..]);
         self.session.transcript.truncate(fork_at);
         self.restore_fork_kv();
         match result {
@@ -1751,7 +1861,7 @@ impl Agent<'_> {
 
     /// Builds the render sink a sub-agent pass writes through, per the current
     /// [`SubSinkTarget`]. Shared by the serial loop and the parallel fan-out.
-    fn sub_sink_render_sink(&self) -> Box<dyn crate::viz::RenderSink> {
+    fn sub_sink_render_sink(&self) -> Box<dyn crate::viz::RenderSink + Send> {
         match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
@@ -1802,7 +1912,7 @@ fn generate_pass(
     prompt_text: &str,
     bufs: Option<&StructuredBufs>,
     ctx: &PassCtx<'_>,
-    sink: Box<dyn crate::viz::RenderSink>,
+    sink: Box<dyn crate::viz::RenderSink + Send>,
     preflight: impl FnMut(&ToolCall) -> Result<(), String> + 'static,
 ) -> Result<QuietPass, String> {
     let mut stream = StreamRenderer::new(sink);
@@ -3952,6 +4062,246 @@ the original is frozen and listed in /tree"
         fork_at
     }
 
+    /// Runs a whole block of remote-backed `agent` calls concurrently, or returns
+    /// `None` when the block is not eligible and the caller should use the serial
+    /// path.
+    ///
+    /// Eligible only when *every* call in the block is an `agent` call naming a
+    /// definition with its own engine whose capability exceeds 1, there are at
+    /// least two, and the effective width exceeds 1. Deliberately conservative:
+    /// if a `bash` call sat between two `agent` calls, running them concurrently
+    /// would reorder side effects relative to it, so a mixed block stays serial.
+    fn run_agent_fanout(&mut self, calls: &[ToolCall]) -> Option<Vec<(String, String)>> {
+        // Read the budget here: `settings::install_for_test` is thread-local, so
+        // reading it inside a spawned pass would silently see defaults.
+        let budget = crate::settings::active().agents.max_parallel;
+        if calls.len() < 2 || budget < 2 || !calls.iter().all(|c| c.name == "agent") {
+            return None;
+        }
+        if self.tool_ctx.subagent_depth >= crate::tools::SUBAGENT_DEPTH_CAP {
+            return None;
+        }
+        // Resolve every call before touching the cache, so an ineligible block
+        // leaves no engine removed and no transcript disturbed.
+        let mut specs = Vec::with_capacity(calls.len());
+        for call in calls {
+            let task = call
+                .arg_value("task")
+                .or_else(|| call.arg_value("prompt"))?
+                .trim();
+            if task.is_empty() {
+                return None;
+            }
+            let name = call.arg_value("name").unwrap_or("").trim();
+            let def = self.agents.iter().find(|d| d.name == name && d.auto)?;
+            let spec = def.engine.clone()?;
+            specs.push((task.to_owned(), def.body.clone(), spec, def.name.clone()));
+        }
+        // Now take the engines. Any that turns out serial-only sends the whole
+        // block back to the serial path with every engine returned.
+        let mut slots: Vec<FanoutSlot> = Vec::with_capacity(specs.len());
+        for (task, body, spec, label) in &specs {
+            match self.take_alt_engine(spec) {
+                Ok((key, engine)) if engine.max_parallel() > 1 => {
+                    let mut session = Session::new();
+                    session.push(Message::user(crate::agents::task_message(
+                        Some(body.as_str()),
+                        task,
+                    )));
+                    slots.push(FanoutSlot {
+                        key,
+                        engine,
+                        session,
+                        label: label.clone(),
+                        output: String::new(),
+                        pending_calls: Vec::new(),
+                        done: false,
+                        error: None,
+                    });
+                }
+                Ok((key, engine)) => {
+                    self.alt_engines.insert(key, engine);
+                    self.return_slot_engines(slots);
+                    return None;
+                }
+                Err(_) => {
+                    self.return_slot_engines(slots);
+                    return None;
+                }
+            }
+        }
+        let cap = slots
+            .iter()
+            .map(|s| s.engine.max_parallel())
+            .min()
+            .unwrap_or(1);
+        let width = budget.min(cap);
+        if width < 2 {
+            self.return_slot_engines(slots);
+            return None;
+        }
+
+        let labels: Vec<&str> = slots.iter().map(|s| s.label.as_str()).collect();
+        self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagents_signpost(
+            &labels,
+        )));
+        self.tool_ctx.subagent_depth += 1;
+        self.run_fanout_rounds(&mut slots, width);
+        self.tool_ctx.subagent_depth -= 1;
+
+        let results = slots
+            .iter()
+            .map(|s| {
+                let out = match (&s.error, last_assistant_text(&s.session.transcript)) {
+                    (Some(e), _) => format!("Tool error: sub-agent failed: {e}\n"),
+                    (None, Some(r)) => format!("Sub-agent report:\n{r}\n"),
+                    (None, None) => "Tool error: sub-agent produced no report\n".to_string(),
+                };
+                ("agent".to_string(), out)
+            })
+            .collect();
+        self.flush_fanout_panes(&slots);
+        self.return_slot_engines(slots);
+        Some(results)
+    }
+
+    /// The lockstep rounds of a fan-out: concurrent generation, then serial
+    /// dispatch.
+    ///
+    /// Each round runs every live slot's generation in a `std::thread::scope`
+    /// (at most `width` at a time), then dispatches all resulting tool calls on
+    /// *this* thread. So [`ToolContext`] — MCP clients, async bash jobs, edit
+    /// previews, consent state, the plan-mode gate — is only ever touched from
+    /// the main thread: no lock, and no two sub-agents mid-edit on the same file.
+    ///
+    /// The cost is a barrier per round: a fast slot waits for the slowest before
+    /// its next generation. Accepted, because the win is still roughly N× on the
+    /// network-bound part, which is essentially all of a remote sidechain's cost.
+    fn run_fanout_rounds(&mut self, slots: &mut [FanoutSlot], width: usize) {
+        const MAX_ROUNDS: usize = 40;
+        let system = self.system.clone();
+        let opts = self.cfg.generation.clone();
+        let ctx = PassCtx {
+            opts: &opts,
+            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
+            tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
+        };
+        let cwd = self.tool_ctx.cwd.clone();
+        for round in 0..MAX_ROUNDS {
+            if slots.iter().all(|s| s.done) || crate::interrupt::pending() {
+                break;
+            }
+            // On the last permitted round ask each live slot to report now, and
+            // treat its text as the answer whatever it asks for. Letting the
+            // budget simply run out would discard all its work.
+            let last_round = round + 1 == MAX_ROUNDS;
+            if last_round {
+                for slot in slots.iter_mut().filter(|s| !s.done) {
+                    slot.session
+                        .push(Message::user(crate::agents::final_round_reminder()));
+                }
+            }
+            // Phase 1, main thread: render each live slot's prompt and build its
+            // structured buffers from its *own* session.
+            let prepared: Vec<Option<(String, Option<StructuredBufs>)>> = slots
+                .iter()
+                .map(|slot| {
+                    if slot.done {
+                        return None;
+                    }
+                    let prompt = render_transcript(&slot.session, &system);
+                    let bufs = slot
+                        .engine
+                        .wants_structured()
+                        .then(|| self.build_structured_for(&slot.session, &prompt));
+                    Some((prompt, bufs))
+                })
+                .collect();
+
+            // Phase 2, `width` threads at a time: generate. Only an engine and
+            // plain data cross the boundary.
+            let passes = generate_fanout_round(slots, &prepared, width, &ctx, &cwd);
+
+            // Phase 3, main thread only: fold results in, then dispatch tools.
+            for (slot, pass) in slots.iter_mut().zip(passes) {
+                let Some(pass) = pass else { continue };
+                match pass {
+                    Err(e) => {
+                        slot.error = Some(e);
+                        slot.done = true;
+                    }
+                    Ok(pass) => {
+                        slot.session.push(Message::assistant(pass.assistant_text));
+                        if last_round {
+                            slot.done = true;
+                        } else if let Some(payload) = pass.tool_error {
+                            slot.session.push(Message::user(format!(
+                                "<tool_result>{payload}</tool_result>"
+                            )));
+                        } else if pass.calls.is_empty() {
+                            slot.done = true;
+                        } else {
+                            slot.pending_calls = pass.calls;
+                        }
+                    }
+                }
+            }
+            // Collect the work first so no slot borrow is held across
+            // `run_tool_calls`, which needs `&mut self`.
+            let pending: Vec<(usize, Vec<ToolCall>)> = slots
+                .iter_mut()
+                .enumerate()
+                .filter_map(|(i, s)| {
+                    let calls = std::mem::take(&mut s.pending_calls);
+                    (!calls.is_empty()).then_some((i, calls))
+                })
+                .collect();
+            for (i, calls) in pending {
+                let observations = self.run_tool_calls(&calls);
+                self.sync_tasks_after_dispatch();
+                // The sidechain has no UI to drain these into.
+                self.tool_ctx.edit_previews.clear();
+                self.tool_ctx.task_completions.clear();
+                self.tool_ctx.hook_warnings.clear();
+                slots[i].session.push(Message::user(format!(
+                    "<tool_result>{observations}</tool_result>"
+                )));
+            }
+        }
+        // Only an interrupt leaves a slot unfinished. Its text, if any, still
+        // becomes its report — nothing is invented here.
+        for slot in slots.iter_mut() {
+            slot.done = true;
+        }
+    }
+
+    /// Returns every slot's engine to the cache. Called on all exit paths,
+    /// including the ineligible-block early returns.
+    fn return_slot_engines(&mut self, slots: Vec<FanoutSlot>) {
+        for slot in slots {
+            self.alt_engines.insert(slot.key, slot.engine);
+        }
+    }
+
+    /// Appends each slot's buffered output to the sub-agent pane as one labelled
+    /// block, in call order.
+    ///
+    /// The pane holds a single label and a single log, so N sidechains streaming
+    /// live would interleave into unreadable output. Fan-out therefore buffers
+    /// and flushes; the serial path still streams live.
+    fn flush_fanout_panes(&mut self, slots: &[FanoutSlot]) {
+        for slot in slots {
+            self.emit_sub(crate::worker::UiEvent::SubStart(slot.label.clone()));
+            if !slot.output.trim().is_empty() {
+                self.emit_sub(crate::worker::UiEvent::Sub(Box::new(
+                    crate::worker::UiEvent::Visible(slot.output.clone()),
+                )));
+            }
+            self.emit_sub(crate::worker::UiEvent::SubEnd);
+        }
+    }
+
     /// Resolves `spec` to an engine, **removing** it from the cache so the
     /// caller owns it for the sidechain's duration.
     ///
@@ -4061,13 +4411,7 @@ the original is frozen and listed in /tree"
     /// the sidechain produced no report (e.g. interrupted before any output);
     /// the transcript is still restored.
     fn finish_subagent_fork(&mut self, fork_at: usize, task: &str) -> bool {
-        let report = self.session.transcript[fork_at..]
-            .iter()
-            .rev()
-            .find(|m| {
-                matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty()
-            })
-            .map(|m| m.text.clone());
+        let report = last_assistant_text(&self.session.transcript[fork_at..]);
         self.session.transcript.truncate(fork_at);
         self.restore_fork_kv();
         match report {
@@ -11680,6 +12024,206 @@ mod tests {
         );
         assert!(pass.calls.is_empty());
         assert!(pass.tool_error.is_none());
+    }
+
+    /// A fan-out-capable stub: reports `max_parallel() > 1` and optionally sleeps
+    /// before replying so completion order can be made to differ from call order.
+    #[derive(Debug, Default)]
+    struct ParallelEngine {
+        reply: String,
+        delay_ms: u64,
+        fail: bool,
+    }
+
+    impl Engine for ParallelEngine {
+        fn max_parallel(&self) -> usize {
+            8
+        }
+        fn ctx_size(&self) -> i32 {
+            100_000
+        }
+        fn generate(
+            &mut self,
+            _prompt: crate::engine::Prompt<'_>,
+            _opts: &crate::engine::GenerationOptions,
+            _interrupt: &dyn Fn() -> bool,
+            _greedy: &dyn Fn() -> bool,
+            on_event: &mut dyn FnMut(EngineEvent),
+        ) -> Result<GenerationStats, EngineError> {
+            if self.delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
+            }
+            if self.fail {
+                return Err(EngineError::new("provider exploded".to_string()));
+            }
+            on_event(EngineEvent::Text(self.reply.clone()));
+            Ok(GenerationStats::default())
+        }
+    }
+
+    /// Installs `n` remote definitions named `a0..`, each with its own key
+    /// variable and a pre-seeded fan-out-capable engine.
+    fn install_parallel_defs(agent: &mut Agent<'_>, engines: &[(&str, u64, bool)]) -> Vec<String> {
+        let mut vars = Vec::new();
+        for (i, (reply, delay_ms, fail)) in engines.iter().enumerate() {
+            let name = format!("a{i}");
+            let var = format!("PLANK_TEST_FANOUT_{i}");
+            unsafe { std::env::set_var(&var, "sk-test") };
+            let mut def = remote_def(&name, &var);
+            // Distinct models so each slot gets its own cache key.
+            if let Some(e) = def.engine.as_mut() {
+                e.model = format!("model-{i}");
+            }
+            agent.agents.push(def);
+            agent.alt_engines.insert(
+                (
+                    crate::remote::provider::ProviderKind::Anthropic,
+                    "https://example.invalid/v1".to_string(),
+                    format!("model-{i}"),
+                    8192,
+                    var.clone(),
+                ),
+                Box::new(ParallelEngine {
+                    reply: (*reply).to_string(),
+                    delay_ms: *delay_ms,
+                    fail: *fail,
+                }),
+            );
+            vars.push(var);
+        }
+        vars
+    }
+
+    fn clear_vars(vars: &[String]) {
+        for v in vars {
+            unsafe { std::env::remove_var(v) };
+        }
+    }
+
+    #[test]
+    fn fanout_returns_results_in_call_order_despite_reversed_completion() {
+        let dir = scratch_dir("fanout-order");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Slot 0 finishes last, so completion order is the reverse of call order.
+        let vars = install_parallel_defs(
+            &mut agent,
+            &[("slow done\n", 120, false), ("fast done\n", 0, false)],
+        );
+        let calls = vec![
+            agent_call("slow work", Some("a0")),
+            agent_call("fast work", Some("a1")),
+        ];
+        let results = agent.run_agent_fanout(&calls).expect("fanned out");
+        assert_eq!(results.len(), 2);
+        assert!(results[0].1.contains("slow done"), "{:?}", results[0]);
+        assert!(results[1].1.contains("fast done"), "{:?}", results[1]);
+        assert_eq!(agent.alt_engines.len(), 2, "both engines back in the cache");
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn one_failing_sidechain_does_not_abort_its_siblings() {
+        let dir = scratch_dir("fanout-fail");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let vars =
+            install_parallel_defs(&mut agent, &[("", 0, true), ("sibling done\n", 0, false)]);
+        let calls = vec![
+            agent_call("broken", Some("a0")),
+            agent_call("working", Some("a1")),
+        ];
+        let results = agent.run_agent_fanout(&calls).expect("fanned out");
+        assert!(results[0].1.starts_with("Tool error"), "{:?}", results[0]);
+        assert!(
+            results[1].1.contains("sibling done"),
+            "the sibling still completed: {:?}",
+            results[1]
+        );
+        assert_eq!(agent.alt_engines.len(), 2);
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn a_mixed_block_does_not_fan_out() {
+        let dir = scratch_dir("fanout-mixed");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let calls = vec![
+            agent_call("work", Some("a0")),
+            ToolCall {
+                name: "read".to_string(),
+                args: vec![crate::dsml::ToolArg {
+                    name: "path".to_string(),
+                    value: "Cargo.toml".to_string(),
+                    is_string: true,
+                }],
+            },
+        ];
+        assert!(
+            agent.run_agent_fanout(&calls).is_none(),
+            "any non-agent tool in the block forces the serial path"
+        );
+        assert_eq!(agent.alt_engines.len(), 2, "no engine left removed");
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn a_local_definition_in_the_block_forces_serial() {
+        let dir = scratch_dir("fanout-local");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false)]);
+        agent.agents.push(named_def("local", true));
+        let calls = vec![agent_call("a", Some("a0")), agent_call("b", Some("local"))];
+        assert!(
+            agent.run_agent_fanout(&calls).is_none(),
+            "a local definition cannot serve a concurrent sidechain"
+        );
+        assert_eq!(agent.alt_engines.len(), 1, "the remote engine was returned");
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn max_parallel_one_forces_serial() {
+        let dir = scratch_dir("fanout-width1");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let mut settings = crate::settings::Settings::default();
+        settings.agents.max_parallel = 1;
+        crate::settings::install_for_test(settings);
+        let calls = vec![agent_call("a", Some("a0")), agent_call("b", Some("a1"))];
+        assert!(
+            agent.run_agent_fanout(&calls).is_none(),
+            "width 1 is the serial path"
+        );
+        assert_eq!(agent.alt_engines.len(), 2, "no engine left removed");
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn fanout_slots_are_clean_room_and_carry_their_own_persona() {
+        let dir = scratch_dir("fanout-cleanroom");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("parent question"));
+        let before = agent.session.transcript.len();
+        let vars = install_parallel_defs(&mut agent, &[("r0\n", 0, false), ("r1\n", 0, false)]);
+        let calls = vec![
+            agent_call("task zero", Some("a0")),
+            agent_call("task one", Some("a1")),
+        ];
+        let results = agent.run_agent_fanout(&calls).expect("fanned out");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the fan-out never touches the parent transcript"
+        );
+        clear_vars(&vars);
     }
 
     #[test]

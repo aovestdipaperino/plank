@@ -124,6 +124,64 @@ impl RenderSink for Box<dyn RenderSink> {
     }
 }
 
+/// The `Send` flavour, for a sink that has to cross into a scoped thread — a
+/// parallel sub-agent fan-out drives several generations at once, each writing
+/// through its own sink.
+impl RenderSink for Box<dyn RenderSink + Send> {
+    fn visible_text(&mut self, text: &str) {
+        (**self).visible_text(text);
+    }
+    fn think_text(&mut self, text: &str) {
+        (**self).think_text(text);
+    }
+    fn tool_text(&mut self, text: &str) {
+        (**self).tool_text(text);
+    }
+    fn error_text(&mut self, text: &str) {
+        (**self).error_text(text);
+    }
+}
+
+/// A sink that accumulates everything it is given into a shared buffer.
+///
+/// Used by the parallel fan-out: the sub-agent pane holds one label and one log,
+/// so N concurrent sidechains streaming live would interleave into unreadable
+/// output. Each slot collects here instead and is flushed as one labelled block
+/// when it finishes.
+#[derive(Debug, Clone, Default)]
+pub struct CollectSink(pub std::sync::Arc<std::sync::Mutex<String>>);
+
+impl CollectSink {
+    /// Takes the collected text, leaving the buffer empty.
+    #[must_use]
+    pub fn take(&self) -> String {
+        let mut guard = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    fn push(&mut self, text: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_str(text);
+    }
+}
+
+impl RenderSink for CollectSink {
+    fn visible_text(&mut self, text: &str) {
+        self.push(text);
+    }
+    // Thinking is deliberately dropped: the pane shows a finished report, and a
+    // sub-agent's reasoning is not what the reader came for.
+    fn think_text(&mut self, _text: &str) {}
+    fn tool_text(&mut self, text: &str) {
+        self.push(text);
+    }
+}
+
 /// Kind of tool parameter, used to select the streaming display style.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum ParamKind {
