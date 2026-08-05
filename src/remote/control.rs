@@ -653,7 +653,8 @@ pub struct RemoteState {
     pub shared: Arc<TurnShared>,
     /// The single-controller policy.
     pub control: Mutex<ControlPolicy>,
-    token: String,
+    /// Shared bearer token every client must present in its `auth` frame.
+    pub token: String,
     /// Browser `Origin`s allowed on the WS upgrade (besides missing/loopback).
     allowed_origins: Vec<String>,
     /// Per-client outbound queue cap in bytes (slow-consumer eviction).
@@ -665,6 +666,14 @@ pub struct RemoteState {
 impl RemoteState {
     fn next_session(&self) -> u64 {
         self.session_ids.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Tells every attached client the session is going away. Best-effort: the
+    /// bus drops frames for a hung-up subscriber, exactly as for output.
+    pub fn say_bye(&self, reason: &str) {
+        self.bus.broadcast(crate::worker::UiEvent::Dim(format!(
+            "[remote control off: {reason}]"
+        )));
     }
 }
 

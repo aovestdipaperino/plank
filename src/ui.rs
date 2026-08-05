@@ -1073,6 +1073,15 @@ struct Agent<'a> {
     /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
     /// was not given, in which case the turn loops behave exactly as before.
     remote: Option<Arc<RemoteState>>,
+    /// The remote-control listener backing [`Agent::remote`], owned here so
+    /// `/remote-control` can start and stop it mid-session. `Drop` on the
+    /// `RemoteServer` joins the accept thread, so dropping the agent tears the
+    /// listener down. `None` whenever `remote` is `None`; the two are installed
+    /// and cleared together.
+    // TODO(remote-control task 3): drop this `allow` once `/remote-control`
+    // calls `remote_on`/`remote_off` and reads the field.
+    #[allow(dead_code)]
+    remote_server: Option<crate::remote::RemoteServer>,
     /// TUI remote-control state (`--ui-remote`). `None` (the default) means
     /// no listener thread, no injected keys and no draw-time recording.
     ui_remote: Option<Arc<Mutex<UiRemote>>>,
@@ -5437,6 +5446,84 @@ impl Agent<'_> {
         }
     }
 
+    /// Whether a remote-control bridge is currently live.
+    // TODO(remote-control task 3): drop this `allow` once `/remote-control`
+    // calls these methods.
+    #[allow(dead_code)]
+    fn remote_is_on(&self) -> bool {
+        self.remote_server.is_some()
+    }
+
+    /// The one-click browser link for a bound server: the token rides in the
+    /// query string, which `serve_http` strips before routing, so the page is
+    /// served normally and reads the token from `location.search`. On a
+    /// loopback-only listener whose lifetime is one toggle this is an accepted
+    /// trade for one-click attach (spec §6).
+    #[allow(dead_code)]
+    fn remote_link(addr: std::net::SocketAddr, token: &str) -> String {
+        format!("http://127.0.0.1:{}/?t={token}", addr.port())
+    }
+
+    /// Starts the remote-control server and installs it on this agent. Returns
+    /// the bound address and the token clients must present. Idempotent: with a
+    /// server already live the existing address and token come back unchanged.
+    ///
+    /// `allow_control` seeds the control policy: `true` lets an attaching client
+    /// take control without a local `/grant`, which is what makes the
+    /// `/remote-control` link usable while the local TUI holds the slot.
+    ///
+    /// # Errors
+    /// Returns the bind error as a string; `self` is left untouched on failure.
+    #[allow(dead_code)]
+    fn remote_on(
+        &mut self,
+        addr: &str,
+        token: Option<String>,
+        allow_control: bool,
+    ) -> Result<(std::net::SocketAddr, String), String> {
+        if let Some(server) = &self.remote_server {
+            return Ok((server.local_addr, server.state.token.clone()));
+        }
+        let token = token
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(crate::remote::generate_token);
+        // Hardening knobs come from the `--control*` flags when they were given,
+        // and from the same defaults otherwise.
+        let rc = self.cfg.remote.clone().unwrap_or_default();
+        let server_cfg = crate::remote::control::ServerConfig {
+            token: token.clone(),
+            local_present: true,
+            allow_control,
+            allowed_origins: rc.allowed_origins,
+            queue_max: rc.queue_max,
+        };
+        let server = crate::remote::RemoteServer::start(
+            addr,
+            server_cfg,
+            Arc::new(crate::worker::BroadcastBus::new()),
+            Arc::new(TurnShared::default()),
+        )
+        .map_err(|e| e.to_string())?;
+        let bound = server.local_addr;
+        self.remote = Some(Arc::clone(&server.state));
+        self.remote_server = Some(server);
+        Ok((bound, token))
+    }
+
+    /// Stops the remote-control server and clears the bridge. Connected clients
+    /// get a `bye` first. Returns whether a server was running. The token dies
+    /// with the server, so an old link is refused by the next one.
+    #[allow(dead_code)]
+    fn remote_off(&mut self) -> bool {
+        let Some(mut server) = self.remote_server.take() else {
+            return false;
+        };
+        server.state.say_bye("remote control turned off");
+        server.shutdown();
+        self.remote = None;
+        true
+    }
+
     /// Worker-side turn loop (the C's `worker_run_turn`): generate, dispatch
     /// tools, drain queued user lines between rounds, repeat until settled.
     /// Runs on the worker thread and talks to the UI only through `tx`.
@@ -7493,6 +7580,7 @@ fn new_agent(
         agents,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote,
+        remote_server: None,
         ui_remote: None,
         usage: SessionUsage::default(),
         stats: SessionStats::default(),
@@ -8627,6 +8715,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -8673,6 +8762,52 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `remote_on` installs a live bridge on an already-running agent and
+    /// `remote_off` tears it down; the link carries the bound port and token.
+    #[test]
+    fn remote_on_installs_a_bridge_and_remote_off_tears_it_down() {
+        let dir = scratch_dir("remote-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(!agent.remote_is_on());
+
+        let (addr, token) = agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds an ephemeral loopback port");
+        assert!(agent.remote_is_on());
+        assert!(agent.remote.is_some());
+        assert_ne!(addr.port(), 0, "an ephemeral bind resolves to a real port");
+        assert_eq!(
+            Agent::remote_link(addr, &token),
+            format!("http://127.0.0.1:{}/?t=tok", addr.port())
+        );
+        // The bound port really accepts connections while on.
+        std::net::TcpStream::connect(addr).expect("listener is live");
+
+        // Idempotent: a second on returns the same address and token.
+        let (again, same_token) = agent
+            .remote_on("127.0.0.1:0", Some("other".to_owned()), true)
+            .expect("second on is a no-op");
+        assert_eq!(again, addr);
+        assert_eq!(same_token, token);
+
+        assert!(agent.remote_off(), "reports that a server was running");
+        assert!(!agent.remote_is_on());
+        assert!(agent.remote.is_none());
+        assert!(!agent.remote_off(), "second off is a no-op");
+    }
+
+    /// A generated token is used when none is supplied, and it is not empty.
+    #[test]
+    fn remote_on_generates_a_token_when_none_is_given() {
+        let dir = scratch_dir("remote-toggle-token");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
+        assert!(!token.is_empty());
+        agent.remote_off();
     }
 
     /// End-to-end (issue #25): a real loopback `RemoteServer` sharing the
@@ -10617,6 +10752,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -10672,6 +10808,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -10792,6 +10929,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -10966,6 +11104,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11045,6 +11184,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11111,6 +11251,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11200,6 +11341,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11354,6 +11496,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11437,6 +11580,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11579,6 +11723,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11643,6 +11788,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
