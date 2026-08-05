@@ -29,7 +29,8 @@ use crate::remote::read_sse;
 use std::time::Duration;
 
 /// Which provider API family a [`ProviderEngine`] speaks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// `Hash`/`Eq` so it can key the per-definition alternate-engine cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     /// OpenAI-compatible `/chat/completions` (also `vLLM`, `Ollama`, `OpenRouter`...).
     OpenAi,

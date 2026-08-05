@@ -307,6 +307,22 @@ pub fn task_message(instructions: Option<&str>, task: &str) -> String {
     out
 }
 
+/// Pushed as the sidechain's last user turn when its round budget is spent.
+///
+/// A subagent that keeps calling tools until the budget runs out would otherwise
+/// return nothing at all, discarding everything it found. Forcing a text answer
+/// converts exhaustion into a usable report. Shared by the serial loop and the
+/// parallel fan-out so the two cannot drift.
+#[must_use]
+pub fn final_round_reminder() -> String {
+    "<system-reminder>\n\
+     This is your final turn. Do not call any more tools — any tool call you \
+     make now is discarded. Write your final report as plain text now, using \
+     what you have already found.\n\
+     </system-reminder>"
+        .to_string()
+}
+
 /// Frames the subagent's final report for the parent conversation.
 #[must_use]
 pub fn report_message(task: &str, report: &str) -> String {

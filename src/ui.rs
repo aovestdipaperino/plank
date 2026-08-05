@@ -1109,7 +1109,31 @@ struct Agent<'a> {
     /// token zero. `None` entries are engines without KV support (Echo),
     /// where the restore no-ops.
     fork_kv: Vec<Option<crate::kvcache::KVCache>>,
+    /// Engines for definitions that override the parent's (cross-provider
+    /// sub-agents). Cached across dispatches so `discover_ctx_size`'s network
+    /// probe happens at most once per key per session.
+    ///
+    /// An engine is *removed* while its sidechain runs and reinserted
+    /// afterwards, which is what lets the borrow checker enforce that a swap
+    /// cannot leak: the value cannot be in the map and in `self.engine` at once.
+    alt_engines: std::collections::HashMap<EngineKey, Box<dyn Engine>>,
 }
+
+/// Identity of an alternate sub-agent engine: provider, resolved base URL,
+/// model, context window, and API-key variable.
+///
+/// The key variable belongs in the identity, not beside it: a cached engine
+/// holds the key *value* it was built with, so two definitions agreeing on
+/// everything else but reading different variables are different engines.
+/// Omitting it would let the second silently reuse the first one's
+/// credentials — the wrong account, with no error to notice.
+type EngineKey = (
+    crate::remote::provider::ProviderKind,
+    String,
+    String,
+    i32,
+    String,
+);
 
 /// Formats a non-negative token count with thousands separators (`12345` →
 /// `12,345`) for the `/usage` report.
@@ -1540,7 +1564,18 @@ impl Agent<'_> {
         };
         let name = matched.as_ref().map_or("", |d| d.name.as_str());
         let instructions = matched.as_ref().map(|d| d.body.clone());
-        let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+        // Resolve the alternate engine *before* forking, so a missing key or an
+        // unbuildable engine leaves the transcript exactly as it was.
+        let alt = match matched.as_ref().and_then(|d| d.engine.clone()) {
+            None => None,
+            Some(spec) => match self.take_alt_engine(&spec) {
+                Ok(pair) => Some(pair),
+                Err(e) => {
+                    return format!("Tool error: agent '{name}' engine unavailable: {e}\n");
+                }
+            },
+        };
+        let fork_at = self.begin_subagent_fork_for(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
             "sub-agent".to_string()
         } else {
@@ -1554,7 +1589,10 @@ impl Agent<'_> {
         )));
         self.emit_sub(crate::worker::UiEvent::SubStart(label));
         self.tool_ctx.subagent_depth += 1;
-        let result = self.run_subagent_loop();
+        let result = match alt {
+            None => self.run_subagent_loop(),
+            Some((key, engine)) => self.run_sidechain_on(key, engine),
+        };
         self.tool_ctx.subagent_depth -= 1;
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
@@ -1617,10 +1655,23 @@ impl Agent<'_> {
     fn run_subagent_rounds(&mut self) -> Result<(), String> {
         const MAX_ROUNDS: usize = 40;
         let turn_start = Instant::now();
-        for _ in 0..MAX_ROUNDS {
+        for round in 0..MAX_ROUNDS {
+            // On the last permitted round, ask for the report instead of letting
+            // the budget simply run out: a sub-agent that calls a tool on every
+            // pass would otherwise hand the parent an error and throw away
+            // everything it found.
+            let last_round = round + 1 == MAX_ROUNDS;
+            if last_round {
+                self.session
+                    .push(Message::user(crate::agents::final_round_reminder()));
+            }
             let prompt_text = render_transcript(&self.session, &self.system);
             let (calls, assistant_text, err) = self.generate_quiet(&prompt_text, turn_start)?;
             self.session.push(Message::assistant(assistant_text));
+            if last_round {
+                // Whatever it asked for, this text is the report.
+                return Ok(());
+            }
             if let Some(payload) = err {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
@@ -1641,7 +1692,9 @@ impl Agent<'_> {
                 "<tool_result>{observations}</tool_result>"
             )));
         }
-        Err("sub-agent exceeded its round budget".to_string())
+        // Unreachable: the final iteration always returns above. `MAX_ROUNDS` is
+        // a non-zero constant, so the loop cannot fall through without it.
+        Ok(())
     }
 
     /// One quiet generation pass for the sub-agent loop: drives the engine with
@@ -3776,17 +3829,130 @@ the original is frozen and listed in /tree"
     /// fork inherits the parent transcript prefix, so the engine's per-turn
     /// sync reuses the parent KV cache.
     fn begin_subagent_fork(&mut self, instructions: Option<&str>, task: &str) -> usize {
+        self.begin_subagent_fork_for(instructions, task, true)
+    }
+
+    /// [`begin_subagent_fork`](Self::begin_subagent_fork) with control over the
+    /// KV snapshot.
+    ///
+    /// A sidechain on an alternate engine passes `snapshot_kv` false: the parent
+    /// engine is never called, so there is no divergence to roll back. It still
+    /// pushes a `None` rather than skipping the push — `restore_fork_kv` pops
+    /// unconditionally, so skipping would unbalance the stack and a nested fork
+    /// would pop the *parent's* snapshot. `None` already means "nothing to
+    /// restore", so the stack stays LIFO-correct.
+    fn begin_subagent_fork_for(
+        &mut self,
+        instructions: Option<&str>,
+        task: &str,
+        snapshot_kv: bool,
+    ) -> usize {
         let fork_at = self.session.transcript.len();
         // Capture the live KV before the sidechain diverges it; the matching
         // restore is `restore_fork_kv`, called by every fork-end path. `None`
         // on engines without snapshot support — the restore then no-ops and
         // the next turn re-prefills as before this guard existed.
-        self.fork_kv.push(self.engine.get_kv());
+        self.fork_kv.push(if snapshot_kv {
+            self.engine.get_kv()
+        } else {
+            None
+        });
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
         )));
         fork_at
+    }
+
+    /// Resolves `spec` to an engine, **removing** it from the cache so the
+    /// caller owns it for the sidechain's duration.
+    ///
+    /// The API key is read first, so a definition whose variable has been unset
+    /// mid-session fails even on a cache hit — the key is part of the engine's
+    /// identity, not a one-time construction detail. Builds and probes only on a
+    /// miss, so the probe costs at most one request per key per session.
+    ///
+    /// # Errors
+    /// When the key variable is unset or empty, or the engine cannot be built.
+    fn take_alt_engine(
+        &mut self,
+        spec: &crate::agents::AgentEngine,
+    ) -> Result<(EngineKey, Box<dyn Engine>), String> {
+        use crate::remote::provider::ProviderEngine;
+        let api_key = std::env::var(&spec.api_key_env)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or_else(|| format!("{} is not set", spec.api_key_env))?;
+        let base_url = spec
+            .base_url
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| spec.kind.default_base_url().to_string())
+            .trim_end_matches('/')
+            .to_string();
+        // A definition that states its window is believed. Otherwise ask the
+        // provider once: the local default is sized for the ds4 model and says
+        // nothing about a provider's, and the parent's window is the last
+        // resort rather than a guess dressed up as an answer.
+        let ctx = match spec.ctx {
+            Some(c) => c,
+            None => ProviderEngine::discover_ctx_size(
+                spec.kind,
+                Some(base_url.as_str()),
+                &api_key,
+                &spec.model,
+            )
+            .unwrap_or_else(|| self.engine.ctx_size()),
+        };
+        let key = (
+            spec.kind,
+            base_url.clone(),
+            spec.model.clone(),
+            ctx,
+            spec.api_key_env.clone(),
+        );
+        if let Some(engine) = self.alt_engines.remove(&key) {
+            return Ok((key, engine));
+        }
+        let engine = ProviderEngine::new(
+            spec.kind,
+            Some(base_url),
+            api_key,
+            spec.model.clone(),
+            ctx,
+            true,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((key, Box::new(engine)))
+    }
+
+    /// Runs a sub-agent sidechain on `engine` instead of the parent's, returning
+    /// the engine to the cache on **every** exit path.
+    ///
+    /// No `fork_kv` snapshot is meaningful here: the parent engine is never
+    /// called during the sidechain, so its KV cannot be dirtied. The sidechain
+    /// always runs clean-room — the parent transcript is stashed and only the
+    /// framed task is visible — so no parent context is sent to the provider and
+    /// only the task is billed.
+    fn run_sidechain_on(&mut self, key: EngineKey, engine: Box<dyn Engine>) -> Result<(), String> {
+        let parent_engine = std::mem::replace(&mut self.engine, engine);
+        // The framed task is the last message; keep it, hide everything before.
+        let stashed = {
+            let mut prefix = std::mem::take(&mut self.session.transcript);
+            let task = prefix.pop();
+            self.session.transcript = task.into_iter().collect();
+            prefix
+        };
+        let result = self.run_subagent_loop();
+        // Unconditional, and with no `?` between the swap in and the swap out: a
+        // leaked swap would leave the whole session pointed at the wrong engine,
+        // which is the worst failure this design can produce.
+        let alt = std::mem::replace(&mut self.engine, parent_engine);
+        self.alt_engines.insert(key, alt);
+        let mut restored = stashed;
+        restored.append(&mut self.session.transcript);
+        self.session.transcript = restored;
+        result
     }
 
     /// Rolls the engine's KV back to the parent prefix captured by
@@ -7540,6 +7706,7 @@ fn new_agent(
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
+        alt_engines: std::collections::HashMap::new(),
     })
 }
 
@@ -8524,6 +8691,10 @@ mod tests {
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
+        /// When set, `generate` fails with this message instead of replying, so
+        /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
+        /// engine is still returned to its cache when the sidechain dies).
+        fail_with: Option<String>,
     }
 
     impl ScriptedEngine {
@@ -8573,6 +8744,9 @@ mod tests {
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            if let Some(msg) = &self.fail_with {
+                return Err(EngineError::new(msg.clone()));
+            }
             Ok(self.play_next(prompt.flat(), on_event))
         }
         fn generate_aside(
@@ -8674,6 +8848,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         }
     }
 
@@ -10664,6 +10839,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -10719,6 +10895,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
 
         // Empty state: no provider turn recorded yet.
@@ -10839,6 +11016,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11013,6 +11191,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11092,6 +11271,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11158,6 +11338,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11247,6 +11428,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -11345,6 +11527,236 @@ mod tests {
             "auto:false is not model-selectable: {out}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A remote-backed definition pinned to a test-only key variable, with an
+    /// explicit `ctx` so `take_alt_engine` never probes the network.
+    fn remote_def(name: &str, key_env: &str) -> crate::agents::AgentDef {
+        crate::agents::AgentDef {
+            name: name.to_string(),
+            description: String::new(),
+            body: "Persona.".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+            engine: Some(crate::agents::AgentEngine {
+                kind: crate::remote::provider::ProviderKind::Anthropic,
+                model: "test-model".to_string(),
+                base_url: Some("https://example.invalid/v1".to_string()),
+                ctx: Some(8192),
+                api_key_env: key_env.to_string(),
+            }),
+            auto: true,
+        }
+    }
+
+    /// The cache key `take_alt_engine` derives from [`remote_def`], so a test can
+    /// pre-seed `alt_engines` and keep the dispatch entirely offline.
+    fn remote_key(key_env: &str) -> EngineKey {
+        (
+            crate::remote::provider::ProviderKind::Anthropic,
+            "https://example.invalid/v1".to_string(),
+            "test-model".to_string(),
+            8192,
+            key_env.to_string(),
+        )
+    }
+
+    #[test]
+    fn remote_definition_runs_on_its_own_engine_and_restores_the_parent() {
+        const KEY: &str = "PLANK_TEST_ALT_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("alt-engine-runs");
+        let cfg = test_cfg();
+        // The parent would say "parent reply"; the alt engine says something
+        // else, so the report text alone proves which engine served the run.
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["parent reply\n".to_string()],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.agents = vec![remote_def("remote", KEY)];
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ScriptedEngine {
+                replies: vec!["remote report\n".to_string()],
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        let out = agent.run_agent_tool(&agent_call("do a thing", Some("remote")));
+
+        assert!(!out.starts_with("Tool error"), "{out}");
+        assert!(
+            out.contains("remote report"),
+            "the alt engine served the sidechain: {out}"
+        );
+        assert!(
+            !out.contains("parent reply"),
+            "the parent engine was not used: {out}"
+        );
+        assert!(
+            agent.alt_engines.contains_key(&remote_key(KEY)),
+            "alt engine returned to the cache"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn clean_room_sidechain_hides_the_parent_transcript() {
+        const KEY: &str = "PLANK_TEST_CLEANROOM_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("alt-engine-cleanroom");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("parent question"));
+        agent.session.push(Message::assistant("parent answer"));
+        let before = agent.session.transcript.len();
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.agents = vec![remote_def("remote", KEY)];
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ScriptedEngine {
+                replies: vec!["remote report\n".to_string()],
+                prompts: std::sync::Arc::clone(&seen),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        let out = agent.run_agent_tool(&agent_call("delegated work", Some("remote")));
+        assert!(!out.starts_with("Tool error"), "{out}");
+
+        let prompt = seen.lock().unwrap().concat();
+        assert!(prompt.contains("delegated work"), "got the task: {prompt}");
+        assert!(
+            !prompt.contains("parent question"),
+            "clean room — no parent context reached the provider: {prompt}"
+        );
+        // The `agent` tool hands its report back as the tool *result* string, so
+        // the sidechain leaves the parent transcript exactly as it found it —
+        // unlike `/subagent`, which pushes a framed report message.
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "parent transcript fully restored"
+        );
+        assert_eq!(
+            agent.session.transcript[0].text, "parent question",
+            "and in the original order"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn the_alt_engine_returns_to_its_cache_when_the_sidechain_fails() {
+        const KEY: &str = "PLANK_TEST_FAIL_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("alt-engine-fails");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("parent question"));
+        let before = agent.session.transcript.len();
+        agent.agents = vec![remote_def("remote", KEY)];
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ScriptedEngine {
+                fail_with: Some("provider exploded".to_string()),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        let out = agent.run_agent_tool(&agent_call("do a thing", Some("remote")));
+
+        assert!(out.starts_with("Tool error"), "failure surfaces: {out}");
+        assert!(
+            agent.alt_engines.contains_key(&remote_key(KEY)),
+            "a leaked swap would leave the session on the wrong engine"
+        );
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the sidechain left no trace on the parent transcript"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn a_missing_api_key_fails_before_the_fork() {
+        const KEY: &str = "PLANK_TEST_ABSENT_KEY";
+        unsafe { std::env::remove_var(KEY) };
+        let dir = scratch_dir("alt-engine-nokey");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.agents = vec![remote_def("remote", KEY)];
+        let before = agent.session.transcript.len();
+
+        let out = agent.run_agent_tool(&agent_call("work", Some("remote")));
+
+        assert!(out.starts_with("Tool error"), "{out}");
+        assert!(out.contains(KEY), "names the missing variable: {out}");
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "no fork started, transcript untouched"
+        );
+    }
+
+    #[test]
+    fn definitions_with_different_key_vars_get_separate_engines() {
+        const A: &str = "PLANK_TEST_KEY_A";
+        const B: &str = "PLANK_TEST_KEY_B";
+        for var in [A, B] {
+            unsafe { std::env::set_var(var, "sk-test") };
+        }
+        let dir = scratch_dir("alt-engine-keys");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Identical provider, model, base URL and ctx — only the key differs.
+        let spec_a = remote_def("work", A).engine.expect("spec a");
+        let spec_b = remote_def("home", B).engine.expect("spec b");
+
+        let (key_a, _) = agent.take_alt_engine(&spec_a).expect("engine a");
+        let (key_b, _) = agent.take_alt_engine(&spec_b).expect("engine b");
+
+        assert_ne!(key_a, key_b, "distinct cache keys");
+        // Parenthesised: `key_a.4` on a tuple-in-tuple would lex as a float.
+        assert_eq!((key_a).4, A);
+        assert_eq!((key_b).4, B);
+        for var in [A, B] {
+            unsafe { std::env::remove_var(var) };
+        }
+    }
+
+    #[test]
+    fn an_exhausted_round_budget_still_returns_a_report() {
+        // An engine that calls a tool on every single pass would otherwise run
+        // out of rounds and hand the parent nothing at all.
+        let dir = scratch_dir("round-budget");
+        let cfg = test_cfg();
+        let stanza = concat!(
+            "Still working.\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![stanza.to_string(); 64],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let out = agent.run_agent_tool(&agent_call("never finish", None));
+        assert!(
+            out.contains("Sub-agent report:"),
+            "exhaustion still yields a report: {out}"
+        );
+        assert!(!out.contains("produced no report"), "{out}");
     }
 
     #[test]
@@ -11517,6 +11929,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -11600,6 +12013,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -11742,6 +12156,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -11806,6 +12221,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            alt_engines: std::collections::HashMap::new(),
         };
         agent.session.push(Message::user("run echo"));
 
