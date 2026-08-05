@@ -50,6 +50,8 @@
   <input id="token" placeholder="token" type="password">
   <button id="connect">connect</button>
   <button id="interrupt" disabled>interrupt</button>
+  <button id="control" disabled>take control</button>
+  <span id="role" class="dim"></span>
   <span id="status">disconnected</span>
 </header>
 <div id="log" aria-live="polite"></div>
@@ -72,8 +74,20 @@ const $ = (id) => document.getElementById(id);
 const logEl = $("log");
 let ws = null;
 let highestId = null;
+// Whether this session believes it holds control. The server has no
+// "control granted" frame — a granted `request_control` is silent and only a
+// refusal comes back as `control_denied` (src/remote/control.rs:1250) — so this
+// is optimistic: we assume the request landed and a `control_denied` reverts it.
+let controller = false;
 
 function setStatus(s) { $("status").textContent = s; }
+
+// Reflects the control role in the toggle button and the header hint.
+function setRole(isController) {
+  controller = isController;
+  $("control").textContent = isController ? "release control" : "take control";
+  $("role").textContent = isController ? "controller" : "mirror";
+}
 
 function append(text, cls) {
   const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
@@ -92,6 +106,7 @@ function handleServerMsg(f) {
     case "hello":
       line("[connected: plank " + f.plank_version + ", session " +
         f.session_id + (f.controller ? ", controller" : ", mirror") + "]", "dim");
+      setRole(!!f.controller);
       break;
     case "snapshot":
       if (f.highest_id !== null && f.highest_id !== undefined)
@@ -116,7 +131,11 @@ function handleServerMsg(f) {
         (s.gen_tps ? "  " + s.gen_tps.toFixed(1) + " tok/s" : ""));
       break;
     }
-    case "control_denied": line("[denied: " + f.reason + "]", "error"); break;
+    // Any refusal means we are not the controller, whatever we assumed.
+    case "control_denied":
+      line("[denied: " + f.reason + "]", "error");
+      setRole(false);
+      break;
     case "pong": break;
     case "bye": line("[server: " + f.reason + "]", "dim"); break;
     default: break;
@@ -139,6 +158,7 @@ function connect() {
     if (highestId !== null) auth.resume_from = highestId;
     send(auth);
     $("interrupt").disabled = false;
+    $("control").disabled = false;
   };
   ws.onmessage = (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
@@ -148,12 +168,31 @@ function connect() {
   ws.onclose = (ev) => {
     setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
     $("interrupt").disabled = true;
+    $("control").disabled = true;
+    $("role").textContent = "";
+    controller = false;
   };
   ws.onerror = () => setStatus("error");
 }
 
 $("connect").addEventListener("click", connect);
 $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+// Take/hand back control. A connect while a local TUI is up leaves us a mirror
+// (the handshake only auto-grants when the control slot is Free), so this button
+// is how a browser becomes the controller. It succeeds when the host ran with
+// --control-allow or the local user granted it; otherwise a `control_denied`
+// lands and flips us back to mirror.
+$("control").addEventListener("click", () => {
+  if (controller) {
+    send({ type: "release_control" });
+    setRole(false);
+    line("[released control]", "dim");
+  } else {
+    send({ type: "request_control" });
+    setRole(true);
+    line("[requested control]", "dim");
+  }
+});
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const el = $("line");
