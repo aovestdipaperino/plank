@@ -521,11 +521,17 @@ fn windowed_change_pair(old: &str, new: &str, width: usize) -> (String, String, 
 
     // Column where the change begins on the rendered `+ ` line: the "+ " gutter,
     // plus a leading `…` when the head was elided, plus the in-window offset.
+    //
+    // A change wider than the window slides `start` past `prefix`, so the change
+    // begins *before* the visible span. Anchor the caret at the first visible
+    // column in that case, and measure its length from the same point — `prefix`
+    // alone would underflow the column and overstate the length.
     let gutter = 2;
     let lead_ellipsis = usize::from(start > 0);
-    let caret_col = gutter + lead_ellipsis + (prefix - start);
+    let caret_from = prefix.max(start);
+    let caret_col = gutter + lead_ellipsis + (caret_from - start);
     let visible_change_end = change_end.min(start + width);
-    let caret_len = visible_change_end.saturating_sub(prefix).max(1);
+    let caret_len = visible_change_end.saturating_sub(caret_from).max(1);
     let caret = format!("{}{}", " ".repeat(caret_col), "^".repeat(caret_len));
 
     (window(&o, start, width), window(&n, start, width), caret)
@@ -821,5 +827,26 @@ mod tests {
             .filter(|r| matches!(r, DiffRow::Hunk { .. }))
             .count();
         assert_eq!(hunks, 2, "far-apart edits should not merge into one hunk");
+    }
+
+    /// A changed span wider than the window pushed `start` past `prefix`, and
+    /// `prefix - start` underflowed. Reachable from the Tier-1 cache-miss
+    /// system-prompt diff, where lines are long and edits are wide.
+    #[test]
+    fn windowed_change_pair_survives_a_change_wider_than_the_window() {
+        let old = format!("{}{}", "same ", "A".repeat(400));
+        let new = format!("{}{}", "same ", "B".repeat(400));
+        let (o, n, caret) = windowed_change_pair(&old, &new, 80);
+        assert!(!o.is_empty() && !n.is_empty());
+        assert!(caret.contains('^'), "caret marks something: {caret:?}");
+    }
+
+    /// A one-sided line (the other empty) makes `max_suffix` subtract from zero.
+    #[test]
+    fn windowed_change_pair_survives_an_empty_side() {
+        for (a, b) in [("", "added text"), ("removed text", "")] {
+            let (o, n, caret) = windowed_change_pair(a, b, 80);
+            let _ = (o, n, caret);
+        }
     }
 }
