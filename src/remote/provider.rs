@@ -838,13 +838,15 @@ pub fn build_anthropic_request(
         }
     }
 
+    // No `temperature`/`top_p`/`top_k`: the current Anthropic models reject the
+    // sampling parameters outright (a 400 on Opus 5, Fable 5, Opus 4.8 and 4.7;
+    // non-default values on Sonnet 5), so sending them fails every request
+    // rather than degrading. Steer these models by prompt instead.
     let mut body = serde_json::json!({
         "model": model,
         "messages": wire_messages,
         "stream": true,
         "max_tokens": if opts.n_predict > 0 { opts.n_predict } else { 4096 },
-        "temperature": round2(opts.temperature),
-        "top_p": round2(opts.top_p),
     });
     if !sys.is_empty() {
         // System as a one-element block array so a cache breakpoint can attach.
@@ -1537,33 +1539,67 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
     }
 
-    // A DEADBEEF sentinel key marks a mock endpoint, so `top_p` is dropped
-    // from the wire body for both providers; every other param survives, and
-    // an ordinary key keeps `top_p`.
+    // A DEADBEEF sentinel key marks a mock endpoint, so `top_p` is dropped from
+    // the OpenAI-compatible body; every other param survives, and an ordinary
+    // key keeps `top_p`.
     #[test]
     fn deadbeef_key_omits_top_p() {
         let opts = GenerationOptions::default();
-        for kind in [ProviderKind::OpenAi, ProviderKind::Anthropic] {
-            let mock = ProviderEngine::new(
-                kind,
+        let mock = ProviderEngine::new(
+            ProviderKind::OpenAi,
+            None,
+            "sk-test-DEADBEEF-01".into(),
+            "m".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        let body = mock.request_for(Prompt::Flat("hi"), &opts);
+        assert!(body.get("top_p").is_none(), "sentinel key omits top_p");
+        assert!(body.get("temperature").is_some(), "kept temperature");
+
+        let real = ProviderEngine::new(
+            ProviderKind::OpenAi,
+            None,
+            "sk-live-01".into(),
+            "m".into(),
+            0,
+            true,
+        )
+        .unwrap();
+        let body = real.request_for(Prompt::Flat("hi"), &opts);
+        assert!(body.get("top_p").is_some(), "a real key sends top_p");
+    }
+
+    /// The current Anthropic models reject the sampling parameters outright — a
+    /// 400 on Opus 5, Fable 5, Opus 4.8 and 4.7 — so sending them fails every
+    /// request rather than degrading. Never emit them on this path, whatever the
+    /// key looks like.
+    #[test]
+    fn anthropic_never_sends_sampling_parameters() {
+        let opts = GenerationOptions::default();
+        for key in ["sk-live-01", "sk-test-DEADBEEF-01", ""] {
+            let engine = ProviderEngine::new(
+                ProviderKind::Anthropic,
                 None,
-                "sk-test-DEADBEEF-01".into(),
-                "m".into(),
+                key.into(),
+                "claude-opus-5".into(),
                 0,
                 true,
             )
             .unwrap();
-            let body = mock.request_for(Prompt::Flat("hi"), &opts);
-            assert!(body.get("top_p").is_none(), "{kind:?} must omit top_p");
-            assert!(
-                body.get("temperature").is_some(),
-                "{kind:?} kept temperature"
-            );
-
-            let real =
-                ProviderEngine::new(kind, None, "sk-live-01".into(), "m".into(), 0, true).unwrap();
-            let body = real.request_for(Prompt::Flat("hi"), &opts);
-            assert!(body.get("top_p").is_some(), "{kind:?} must send top_p");
+            for prompt in [Prompt::Flat("hi")] {
+                let body = engine.request_for(prompt, &opts);
+                for param in ["temperature", "top_p", "top_k"] {
+                    assert!(
+                        body.get(param).is_none(),
+                        "key {key:?} sent {param}: {body}"
+                    );
+                }
+                // The parameters that *are* required must still be there.
+                assert_eq!(body["model"], "claude-opus-5");
+                assert!(body.get("max_tokens").is_some(), "{body}");
+            }
         }
     }
 
