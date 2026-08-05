@@ -1477,6 +1477,22 @@ mod tests {
         assert_eq!(p.holder(), Holder::Local);
     }
 
+    /// `/rc` starts the server with `allow_control` set: the local operator
+    /// typing the command *is* the consent, so a browser's `request_control`
+    /// must succeed even though the local front-end seeded `Holder::Local`.
+    #[test]
+    fn allow_control_grants_over_a_present_local() {
+        let mut p = ControlPolicy::new(true, true);
+        assert_eq!(p.holder(), Holder::Local);
+        assert_eq!(p.request(1), RequestOutcome::Granted);
+        assert_eq!(p.holder(), Holder::Remote(1));
+        assert!(p.remote_can_control(1));
+        // Releasing hands the slot back to the local user, not to the next remote.
+        p.release(1);
+        assert_eq!(p.holder(), Holder::Local);
+        assert!(!p.remote_can_control(1));
+    }
+
     #[test]
     fn allow_control_lets_remote_take_from_local() {
         let mut p = ControlPolicy::new(true, true);
