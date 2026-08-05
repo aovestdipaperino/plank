@@ -6505,6 +6505,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/remote-control" | "/rc" => {
+                for line in self.remote_toggle_lines(cmd, arg) {
+                    log.push_plain(line);
+                }
+            }
             "/btw" => {
                 if arg.is_empty() {
                     log.push_plain("usage: /btw <question>");
