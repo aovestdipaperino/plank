@@ -1078,8 +1078,7 @@ struct Agent<'a> {
     /// `RemoteServer` joins the accept thread, so dropping the agent tears the
     /// listener down. `None` whenever `remote` is `None`; the two are installed
     /// and cleared together.
-    // TODO(remote-control task 3): drop this `allow` once `/remote-control`
-    // calls `remote_on`/`remote_off` and reads the field.
+    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
     #[allow(dead_code)]
     remote_server: Option<crate::remote::RemoteServer>,
     /// TUI remote-control state (`--ui-remote`). `None` (the default) means
@@ -5447,8 +5446,7 @@ impl Agent<'_> {
     }
 
     /// Whether a remote-control bridge is currently live.
-    // TODO(remote-control task 3): drop this `allow` once `/remote-control`
-    // calls these methods.
+    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
     #[allow(dead_code)]
     fn remote_is_on(&self) -> bool {
         self.remote_server.is_some()
@@ -5459,6 +5457,7 @@ impl Agent<'_> {
     /// served normally and reads the token from `location.search`. On a
     /// loopback-only listener whose lifetime is one toggle this is an accepted
     /// trade for one-click attach (spec §6).
+    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
     #[allow(dead_code)]
     fn remote_link(addr: std::net::SocketAddr, token: &str) -> String {
         format!("http://127.0.0.1:{}/?t={token}", addr.port())
@@ -5474,6 +5473,7 @@ impl Agent<'_> {
     ///
     /// # Errors
     /// Returns the bind error as a string; `self` is left untouched on failure.
+    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
     #[allow(dead_code)]
     fn remote_on(
         &mut self,
@@ -5513,14 +5513,15 @@ impl Agent<'_> {
     /// Stops the remote-control server and clears the bridge. Connected clients
     /// get a `bye` first. Returns whether a server was running. The token dies
     /// with the server, so an old link is refused by the next one.
+    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
     #[allow(dead_code)]
     fn remote_off(&mut self) -> bool {
         let Some(mut server) = self.remote_server.take() else {
             return false;
         };
+        self.remote = None;
         server.state.say_bye("remote control turned off");
         server.shutdown();
-        self.remote = None;
         true
     }
 
@@ -8796,6 +8797,10 @@ mod tests {
         assert!(agent.remote_off(), "reports that a server was running");
         assert!(!agent.remote_is_on());
         assert!(agent.remote.is_none());
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the listener is gone after remote_off"
+        );
         assert!(!agent.remote_off(), "second off is a no-op");
     }
 
