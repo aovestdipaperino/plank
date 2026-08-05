@@ -5352,8 +5352,16 @@ impl Agent<'_> {
     /// remote [`BroadcastBus`], driving it from the shared [`TurnShared`] so
     /// remote `interrupt` / `btw` / queued frames steer this turn directly.
     /// Falls back to the plain [`run_turn`](Self::run_turn) when no remote
-    /// bridge is present. Used by the headless remote-serve loop; the TUI path
-    /// mirrors inline in [`busy_ui_loop`] so the local screen stays live too.
+    /// bridge is present.
+    ///
+    /// Test-only: the headless and piped remote-drive front ends that used to
+    /// call this (and [`Self::pump_remote`]) are gone — `/rc` can only be
+    /// typed in the TUI now, and the TUI mirrors turns inline in
+    /// [`busy_ui_loop`] instead of through here. Kept behind `#[cfg(test)]`
+    /// as the end-to-end exercise of `RemoteServer` + [`BroadcastBus`] +
+    /// [`TurnShared`] wiring a real turn and mirroring its output, which the
+    /// TUI path relies on too.
+    #[cfg(test)]
     fn run_turn_mirrored(&mut self) -> Result<(), String> {
         let Some(remote) = self.remote.clone() else {
             return self.run_turn();
@@ -5408,6 +5416,10 @@ impl Agent<'_> {
     /// each queued `prompt`, and `/`-prefixed lines (remote `command` frames)
     /// routed through the shared slash dispatcher exactly like the local REPL.
     /// Returns whether any input was processed. No-op without a remote bridge.
+    ///
+    /// Test-only: see [`Self::run_turn_mirrored`] for why this has no
+    /// production caller anymore.
+    #[cfg(test)]
     fn pump_remote(&mut self) -> Result<bool, String> {
         let Some(remote) = self.remote.clone() else {
             return Ok(false);
@@ -5432,21 +5444,6 @@ impl Agent<'_> {
             self.run_turn_mirrored()?;
         }
         Ok(true)
-    }
-
-    /// Headless remote-serve loop: block until a remote controller sends input,
-    /// process it (mirrored onto the bus), and repeat. Exits on a process-level
-    /// interrupt (Ctrl-C); there is no local stdin to read in this mode.
-    fn run_remote_headless(&mut self) -> Result<(), String> {
-        loop {
-            if crate::interrupt::pending() {
-                crate::interrupt::clear();
-                return Ok(());
-            }
-            if !self.pump_remote()? {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
     }
 
     /// Whether a remote-control bridge is currently live.
@@ -5489,6 +5486,10 @@ impl Agent<'_> {
         // loopback Origin is always accepted. The queue cap keeps its default.
         let server_cfg = crate::remote::control::ServerConfig {
             token: token.clone(),
+            // `local_present: true` is unconditional because `/rc` can only be typed
+            // in the TUI: a headless session has no slash dispatch and no way to
+            // install a bridge. Restoring a headless path means computing this from
+            // whether a local front-end actually exists.
             local_present: true,
             allow_control,
             allowed_origins: Vec::new(),
@@ -7723,7 +7724,7 @@ fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String
         agent.session.push(Message::user(initial));
         agent.run_turn()?;
     }
-    run_repl_plain(agent)
+    run_repl_plain_local(agent)
 }
 
 /// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
@@ -7732,17 +7733,6 @@ fn quit_hint_spans() -> Vec<ratatui::text::Span<'static>> {
         "Press Ctrl-D to quit.",
         ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
     )]
-}
-
-/// Plain line-based REPL used when stdin is not a terminal. With a remote
-/// bridge attached it also interleaves remote-driven input (issue #25); without
-/// one it keeps the classic blocking read loop, behavior-identical to before.
-fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
-    if agent.remote.is_some() {
-        run_repl_plain_remote(agent)
-    } else {
-        run_repl_plain_local(agent)
-    }
 }
 
 /// Streams a plain-REPL `!` command's output to the console as it arrives
@@ -7923,103 +7913,6 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     }
 }
 
-/// Interval at which the remote-aware plain REPL wakes to drain the remote
-/// input queue while waiting on stdin.
-const PLAIN_REMOTE_POLL: Duration = Duration::from_millis(50);
-
-/// Echoes one mirrored bus event to local stdout so a plain-REPL operator sees
-/// remote-driven turns. Only text-bearing events are printed; status footers
-/// and structural markers are skipped (the plain REPL has no live footer).
-fn echo_bus_event(ev: &UiEvent) {
-    let mut out = std::io::stdout();
-    match ev {
-        UiEvent::Visible(t)
-        | UiEvent::Think(t)
-        | UiEvent::Tool(t)
-        | UiEvent::Error(t)
-        | UiEvent::Dim(t)
-        | UiEvent::Plain(t)
-        | UiEvent::UserEcho(t) => {
-            let _ = write!(out, "{t}");
-        }
-        UiEvent::EndLine => {
-            let _ = writeln!(out);
-        }
-        _ => {}
-    }
-    let _ = out.flush();
-}
-
-/// Plain REPL with a remote bridge attached. A dedicated reader thread turns the
-/// blocking `read_line` into channel sends so the main loop can `select` between
-/// local stdin and the remote input queue: on each idle tick it drains
-/// `pump_remote` (mirroring how the TUI idle loop drives remote turns) and
-/// echoes the shared bus to stdout so the local operator sees remote output.
-///
-/// Trade-off: because `read_line` cannot itself be woken, stdin is read on a
-/// helper thread rather than in a true `select`. Remote-driven turns run to
-/// completion inside `pump_remote` before their (batched) output is echoed,
-/// rather than streaming token-by-token as in the TUI; this keeps turn
-/// execution single-threaded and the loop simple.
-fn run_repl_plain_remote(agent: &mut Agent<'_>) -> Result<(), String> {
-    use std::sync::mpsc::{RecvTimeoutError, channel};
-
-    // Reader thread: stdin lines → channel. EOF or error drops the sender,
-    // which surfaces as `Disconnected` on the main side.
-    let (line_tx, line_rx) = channel::<String>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut lock = stdin.lock();
-        loop {
-            let mut line = String::new();
-            match lock.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let sub = agent.remote.as_ref().map(|r| r.bus.subscribe());
-    let drain_bus = |sub: &std::sync::mpsc::Receiver<crate::worker::SeqEvent>| {
-        while let Ok(seq) = sub.try_recv() {
-            echo_bus_event(&seq.event);
-        }
-    };
-
-    loop {
-        print!("{}", status::prompt_text());
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-        // Wait for a typed line or a remote-driven turn; reprint the prompt
-        // once either produces output.
-        loop {
-            if let Some(sub) = &sub {
-                drain_bus(sub);
-            }
-            match line_rx.recv_timeout(PLAIN_REMOTE_POLL) {
-                Ok(line) => {
-                    if !handle_plain_line(agent, &line)? {
-                        return Ok(());
-                    }
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if agent.pump_remote()? {
-                        if let Some(sub) = &sub {
-                            drain_bus(sub);
-                        }
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => return Ok(()), // stdin EOF
-            }
-        }
-    }
-}
-
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
 /// # Errors
@@ -8036,12 +7929,6 @@ pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result
         let r = agent.run_turn();
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         return r;
-    }
-    // Headless with a remote bridge and no `-p`: instead of the stdin protocol,
-    // serve remote controllers — drive turns from their `prompt` frames and
-    // mirror all output onto the bus (design §5 step 4, headless path).
-    if agent.remote.is_some() {
-        return agent.run_remote_headless();
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
