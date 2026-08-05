@@ -131,7 +131,8 @@ fn dsml_syntax_reminder_matches_fixture() {
 fn system_prompt_reminder_matches_fixture() {
     assert_fixture_eq(
         "system_prompt_reminder.txt",
-        &plank::sysprompt::build_system_prompt_reminder(&[], true),
+        // Empty roster: an agent roster must never perturb the parity bytes.
+        &plank::sysprompt::build_system_prompt_reminder(&[], true, &[]),
     );
 }
 

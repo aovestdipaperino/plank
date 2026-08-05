@@ -197,6 +197,32 @@ pub fn load_default(cwd: &Path) -> Vec<AgentDef> {
     load_from(&roots)
 }
 
+/// Whether a remote-backed definition's API-key variable is absent, making it
+/// undispatchable. Always false for a definition with no engine override.
+fn missing_key(def: &AgentDef) -> bool {
+    def.engine
+        .as_ref()
+        .is_some_and(|e| !std::env::var(&e.api_key_env).is_ok_and(|v| !v.trim().is_empty()))
+}
+
+/// The definitions the model may select on its own initiative.
+///
+/// Three gates, all of which must pass: the definition opted in (`auto`),
+/// model-initiated routing is enabled globally (`auto_route`), and — for a
+/// remote-backed definition — its own API-key variable is actually set. A
+/// definition failing the last gate silently vanishing from the model's view is
+/// correct; it stays listed by [`render_list`] with the reason.
+///
+/// `/subagent <name>` deliberately does not consult this: the gates govern
+/// *model* initiative, never what the user can ask for.
+#[must_use]
+pub fn model_visible(defs: &[AgentDef], auto_route: bool) -> Vec<&AgentDef> {
+    if !auto_route {
+        return Vec::new();
+    }
+    defs.iter().filter(|d| d.auto && !missing_key(d)).collect()
+}
+
 /// Resolves a `/subagent` argument against the loaded definitions. When the
 /// first token names a known definition, returns that definition and the rest
 /// as the task. Otherwise returns `None` and the whole argument (today's
@@ -228,6 +254,17 @@ pub fn render_list(defs: &[AgentDef]) -> String {
         if !d.description.is_empty() {
             out.push_str(" — ");
             out.push_str(&d.description);
+        }
+        // A remote-backed definition names its engine, and — when its key
+        // variable is unset — the exact variable to set. The model never sees
+        // such a definition (see `model_visible`), so this listing is the only
+        // place the reason is visible.
+        if let Some(e) = &d.engine {
+            use std::fmt::Write as _;
+            let _ = write!(out, " [{} {}]", e.kind.label(), e.model);
+            if missing_key(d) {
+                let _ = write!(out, " (no {})", e.api_key_env);
+            }
         }
         out.push('\n');
     }
@@ -416,6 +453,114 @@ mod tests {
         assert_eq!(names, vec!["badctx"], "only the recoverable one survives");
         assert_eq!(defs[0].engine.as_ref().expect("engine").ctx, None);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Builds a def with an explicit, test-only key variable. Using a private
+    /// variable name keeps these tests hermetic: they never depend on (or race
+    /// with) a real `ANTHROPIC_API_KEY` in the developer's environment.
+    fn remote_def(name: &str, key_env: &str, auto: bool) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            description: String::new(),
+            body: "Body.".to_string(),
+            path: PathBuf::from(format!("/tmp/{name}.md")),
+            engine: Some(AgentEngine {
+                kind: ProviderKind::Anthropic,
+                model: "m".to_string(),
+                base_url: None,
+                ctx: None,
+                api_key_env: key_env.to_string(),
+            }),
+            auto,
+        }
+    }
+
+    fn local_def(name: &str, auto: bool) -> AgentDef {
+        AgentDef {
+            name: name.to_string(),
+            description: String::new(),
+            body: "Body.".to_string(),
+            path: PathBuf::from(format!("/tmp/{name}.md")),
+            engine: None,
+            auto,
+        }
+    }
+
+    #[test]
+    fn model_visible_applies_every_gate() {
+        const KEY: &str = "PLANK_TEST_VISIBLE_KEY";
+        let defs = vec![
+            local_def("local", true),
+            local_def("hidden", false),
+            remote_def("keyed", KEY, true),
+        ];
+        let names = |auto_route| -> Vec<String> {
+            model_visible(&defs, auto_route)
+                .iter()
+                .map(|d| d.name.clone())
+                .collect()
+        };
+
+        unsafe { std::env::remove_var(KEY) };
+        assert_eq!(names(true), vec!["local"], "no key -> remote def is hidden");
+
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        assert_eq!(
+            names(true),
+            vec!["local", "keyed"],
+            "keyed def appears once its own variable is set; auto:false never does"
+        );
+
+        assert!(
+            names(false).is_empty(),
+            "auto_route off withholds the whole roster"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn a_definition_reads_its_own_key_variable_not_the_provider_default() {
+        const PINNED: &str = "PLANK_TEST_PINNED_KEY";
+        let defs = vec![remote_def("pinned", PINNED, true)];
+        // The provider default being set must not satisfy a def that pinned its
+        // own variable — otherwise a work/personal split silently collapses.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-default") };
+        unsafe { std::env::remove_var(PINNED) };
+        assert!(
+            model_visible(&defs, true).is_empty(),
+            "provider default does not satisfy a pinned variable"
+        );
+        unsafe { std::env::set_var(PINNED, "sk-test") };
+        assert_eq!(model_visible(&defs, true).len(), 1, "own variable does");
+        unsafe { std::env::remove_var(PINNED) };
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
+    }
+
+    #[test]
+    fn render_list_names_the_engine_and_the_missing_variable() {
+        const KEY: &str = "PLANK_TEST_RENDER_KEY";
+        let mut def = remote_def("keyed", KEY, true);
+        def.description = "needs a key".to_string();
+        let defs = vec![def];
+
+        unsafe { std::env::remove_var(KEY) };
+        let out = render_list(&defs);
+        assert!(out.contains("keyed — needs a key"), "{out}");
+        assert!(out.contains("[anthropic m]"), "names the engine: {out}");
+        assert!(
+            out.contains(&format!("(no {KEY})")),
+            "names the exact variable to set: {out}"
+        );
+
+        // With the key present the marker disappears; the engine label stays.
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let out = render_list(&defs);
+        assert!(out.contains("[anthropic m]"), "{out}");
+        assert!(!out.contains("(no "), "no marker once set: {out}");
+        unsafe { std::env::remove_var(KEY) };
+
+        // A local definition gets no engine label at all.
+        assert!(!render_list(&[local_def("plain", true)]).contains('['));
     }
 
     #[test]

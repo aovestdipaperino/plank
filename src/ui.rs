@@ -888,6 +888,20 @@ fn split_tool_results(payload: &str, n: usize) -> Vec<String> {
 /// onto the [`ChatRole::Tool`] message(s) that answer it — so multi-turn tool
 /// conversations are well-formed for both the `OpenAI` and Anthropic schemas.
 /// ds4/echo never see these (they read the flat transcript), so parity holds.
+/// The definitions the model may route to, as an owned slice for the schema
+/// builders.
+///
+/// One gate for every caller — the `Agent` constructor's system prompt and
+/// `build_structured`'s provider registry — so the text and provider paths can
+/// never advertise different rosters. Task 4 replaces the hardcoded `true` with
+/// the `agents.autoRoute` setting.
+fn model_visible_agents(agents: &[crate::agents::AgentDef]) -> Vec<crate::agents::AgentDef> {
+    crate::agents::model_visible(agents, true)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
     use crate::engine::{ChatMessage, ChatRole, ToolCallRef};
     let mut out = Vec::new();
@@ -1277,7 +1291,10 @@ impl Agent<'_> {
         StructuredBufs {
             system: sysprompt::provider_system_prompt(&self.cfg.system),
             messages: session_to_messages(&self.session),
-            tools: sysprompt::provider_tool_registry(&self.tool_ctx.mcp),
+            tools: sysprompt::provider_tool_registry(
+                &self.tool_ctx.mcp,
+                &model_visible_agents(&self.agents),
+            ),
             rendered: rendered.to_string(),
         }
     }
@@ -2000,6 +2017,7 @@ impl Agent<'_> {
         let mut text = sysprompt::build_system_prompt_reminder(
             &self.tool_ctx.mcp,
             !crate::settings::active().engine.thinking_tool_calls,
+            &model_visible_agents(&self.agents),
         );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
@@ -6127,6 +6145,7 @@ impl Agent<'_> {
         let mut text = sysprompt::build_system_prompt_reminder(
             &self.tool_ctx.mcp,
             !crate::settings::active().engine.thinking_tool_calls,
+            &model_visible_agents(&self.agents),
         );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
@@ -7445,10 +7464,17 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
+    // Loaded before the system prompt because the roster is part of it: the
+    // `agent` tool's `name` enum advertises which definitions the model may
+    // select. Definitions are on-disk files, stable across a session, so they
+    // belong inside the fingerprinted prefix — editing one correctly
+    // invalidates `sysprompt.kv` rather than being silently ignored.
+    let agents = crate::agents::load_default(&tool_ctx.cwd);
     let system = sysprompt::build_system_prompt_parts(
         &cfg.system,
         &tool_ctx.mcp,
         !crate::settings::active().engine.thinking_tool_calls,
+        &model_visible_agents(&agents),
     );
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
@@ -7467,7 +7493,6 @@ fn new_agent(
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
-    let agents = crate::agents::load_default(&tool_ctx.cwd);
     Ok(Agent {
         engine,
         cfg,
@@ -8609,7 +8634,7 @@ mod tests {
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -10774,7 +10799,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -10948,7 +10973,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11027,7 +11052,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11093,7 +11118,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11182,7 +11207,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11336,7 +11361,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11419,7 +11444,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11561,7 +11586,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11625,7 +11650,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true),
+            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
