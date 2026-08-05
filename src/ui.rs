@@ -888,6 +888,31 @@ fn split_tool_results(payload: &str, n: usize) -> Vec<String> {
 /// onto the [`ChatRole::Tool`] message(s) that answer it — so multi-turn tool
 /// conversations are well-formed for both the `OpenAI` and Anthropic schemas.
 /// ds4/echo never see these (they read the flat transcript), so parity holds.
+/// Concatenates tool outputs into the model-facing result block, given
+/// `(tool name, output)` pairs in the model's call order.
+///
+/// Kept separate from dispatch so results can be *collected* out of order — a
+/// parallel sub-agent fan-out finishes in completion order — and still render in
+/// call order. Byte stability matters to [`crate::repro`], so the numbering must
+/// follow the call, never the completion.
+fn format_tool_results(results: &[(String, String)]) -> String {
+    use std::fmt::Write as _;
+    let mut all = String::new();
+    for (i, (name, out)) in results.iter().enumerate() {
+        let name = if name.is_empty() {
+            "unknown"
+        } else {
+            name.as_str()
+        };
+        let _ = writeln!(all, "Tool result {} ({}):", i + 1, name);
+        all.push_str(out);
+        if !out.is_empty() && !out.ends_with('\n') {
+            all.push('\n');
+        }
+    }
+    all
+}
+
 /// The definitions the model may route to, as an owned slice for the schema
 /// builders.
 ///
@@ -1468,7 +1493,6 @@ impl Agent<'_> {
     /// for zero behavioral change; the special path only engages when the model
     /// actually delegates.
     fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
-        use std::fmt::Write as _;
         // Holds the tool label in the status bar for the whole dispatch, then
         // clears it on drop whichever way we return.
         let _running = (!calls.is_empty()).then(|| {
@@ -1493,25 +1517,16 @@ impl Agent<'_> {
         }
         // Mirror dispatch_all: clear any undrained previews so cards never leak.
         self.tool_ctx.edit_previews.clear();
-        let mut all = String::new();
-        for (i, call) in calls.iter().enumerate() {
+        let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
+        for call in calls {
             let out = if call.name == "agent" {
                 self.run_agent_tool(call)
             } else {
                 dispatch(call, &mut self.tool_ctx).output
             };
-            let name = if call.name.is_empty() {
-                "unknown"
-            } else {
-                call.name.as_str()
-            };
-            let _ = writeln!(all, "Tool result {} ({}):", i + 1, name);
-            all.push_str(&out);
-            if !out.is_empty() && !out.ends_with('\n') {
-                all.push('\n');
-            }
+            results.push((call.name.clone(), out));
         }
-        all
+        format_tool_results(&results)
     }
 
     /// Sends an event on the worker→UI channel when the front end is listening.
@@ -11558,6 +11573,24 @@ mod tests {
             8192,
             key_env.to_string(),
         )
+    }
+
+    #[test]
+    fn tool_results_are_formatted_in_call_order() {
+        // Encodes today's exact framing: 1-based numbering, `unknown` for an
+        // empty name, and a trailing newline added only when one is missing.
+        let results = vec![
+            ("read".to_string(), "first\n".to_string()),
+            ("agent".to_string(), "second".to_string()),
+            (String::new(), "third\n".to_string()),
+        ];
+        assert_eq!(
+            format_tool_results(&results),
+            "Tool result 1 (read):\nfirst\n\
+             Tool result 2 (agent):\nsecond\n\
+             Tool result 3 (unknown):\nthird\n"
+        );
+        assert_eq!(format_tool_results(&[]), "");
     }
 
     #[test]
