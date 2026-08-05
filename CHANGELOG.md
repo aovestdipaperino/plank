@@ -30,6 +30,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model's 1M default. Best-effort: any failure keeps the configured value, and an
   explicit `-c` is never overridden. The OpenAI path has no such field to read,
   so it is unchanged.
+- **`/remote-control` (`/rc`) starts and stops the remote-control server at
+  runtime**, from inside a running TUI session. Bare `/rc` toggles; `/rc on` and
+  `/rc off` are explicit and case-insensitive. Turning it on always binds an
+  ephemeral loopback port (never a fixed one) and mints a fresh token, printing
+  `http://127.0.0.1:PORT/?t=TOKEN` plus an `ssh -L` tunnel hint. Opening that
+  link auto-connects the bundled web client and claims control immediately,
+  since typing `/rc` is the operator's own consent — no token to paste, no
+  button to press. Without the `?t=` query the page behaves as before: manual
+  URL, manual token, manual connect, manual take-control button. `/rc off`
+  tells connected clients, shuts the listener down, and the token dies with it,
+  so a stale link is refused; a later `/rc` mints a new port and token. The
+  token still lands in browser history and any `Referer` header, an accepted
+  trade for one-click attach on a loopback-only listener, not a claim that the
+  link is secret.
+
+### Removed
+
+- **The `--control`, `--control-token`, `--control-allow`, `--control-origin`,
+  and `--control-queue-max` launch flags.** Remote control now starts only from
+  `/rc` inside a running session (see above); there is no longer a way to bring
+  a session up already listening from the command line. **This is a breaking
+  change** for any launcher or script passing these flags — they are no longer
+  recognized. The browser `Origin` allow-list and the outbound-queue-cap
+  override went with `--control-origin`/`--control-queue-max`: `/rc` binds
+  loopback only, so no Origin allow-list is needed, and the per-client outbound
+  queue keeps its 1 MiB default but can no longer be resized. The headless
+  (`--non-interactive`) and piped plain-REPL remote-drive paths were also
+  deleted: they were unreachable now that starting the server requires typing
+  a slash command in the full-screen TUI, so `/rc` is TUI-only and a piped or
+  headless plank cannot be remote-driven.
 
 ## [2.8.0] - 2026-08-03
 

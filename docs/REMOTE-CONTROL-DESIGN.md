@@ -464,6 +464,16 @@ that the local turn never stalled; verify the printed `ssh` line works verbatim.
 
 ### 8.1 Resolved (hardening, issue #25)
 
+> **Superseded by the `rc-toggle` branch.** The two bullets below described
+> `--control-origin` and `--control-queue-max`, launch-time flags on a
+> `--control` server. Both flags (and `--control` itself) were deleted:
+> starting the server is now only `/rc` from inside a running session, which
+> always binds loopback, so the `Origin` allow-list this section describes no
+> longer exists — there is no non-loopback posture left to allow-list against.
+> The outbound-queue cap is still enforced, but at its 1 MiB default only;
+> there is no flag left to change it. The mechanism descriptions below are kept
+> for history, not as current behavior.
+
 - **`Origin` allow-list.** Enforced on the WebSocket upgrade in
   `control::handle_connection` via `origin_allowed`. Default policy: a missing
   `Origin` (native `plank remote` clients send none) and any loopback `Origin`

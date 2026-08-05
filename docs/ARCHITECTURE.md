@@ -239,8 +239,8 @@ frame left the caret — JSON `null` when it is hidden, never invented
 coordinates); `{"cmd":"uitree"}` → `{"ok":true,"tree":{"name":"root",...}}` (the
 current frame's instrumented regions as nested JSON). The address is not
 configurable — only the port is — so this is deliberately unreachable from
-anything but the local machine, matching `--control`'s existing loopback
-posture. Connections are served one at a time on the listener's own thread;
+anything but the local machine, matching the `/rc` remote-control server's own
+loopback-only posture. Connections are served one at a time on the listener's own thread;
 a second client that connects while the first is attached does not get an
 error, it queues in the kernel's accept backlog and is served once the first
 disconnects — there is no busy-rejection.
