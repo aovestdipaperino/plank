@@ -44,6 +44,8 @@ pub enum FieldId {
     SafetyBtwSuspend,
     McpTimeoutSecs,
     AskMaxOptions,
+    AgentsAutoRoute,
+    AgentsMaxParallel,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -246,6 +248,20 @@ pub static FIELDS: &[Field] = &[
         "ask tool max options",
         Kind::Count,
     ),
+    f(
+        FieldId::AgentsAutoRoute,
+        "agents",
+        "autoRoute",
+        "let the model pick configured agents",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::AgentsMaxParallel,
+        "agents",
+        "maxParallel",
+        "max concurrent sub-agents",
+        Kind::Count,
+    ),
 ];
 
 const fn f(
@@ -306,6 +322,8 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::SafetyBtwSuspend => tri_str(s.safety.btw_suspend),
         FieldId::McpTimeoutSecs => s.mcp.timeout_secs.to_string(),
         FieldId::AskMaxOptions => s.ask.max_options.to_string(),
+        FieldId::AgentsAutoRoute => s.agents.auto_route.to_string(),
+        FieldId::AgentsMaxParallel => s.agents.max_parallel.to_string(),
     }
 }
 
@@ -409,6 +427,12 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
             s.ask.max_options =
                 usize::try_from(parse_pos(ASK_MIN_OPTIONS as u64)?).unwrap_or(usize::MAX);
         }
+        FieldId::AgentsMaxParallel => {
+            // Clamped rather than rejected, matching how the settings-file path
+            // treats an out-of-range value.
+            let n = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
+            s.agents.max_parallel = n.min(crate::settings::AGENT_MAX_PARALLEL);
+        }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
         FieldId::UiNotifications => {
@@ -428,7 +452,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiCrtOff
         | FieldId::UiReducedMotion
         | FieldId::UiEasterEggs
-        | FieldId::UiBuiltinEditor => {
+        | FieldId::UiBuiltinEditor
+        | FieldId::AgentsAutoRoute => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -449,6 +474,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiReducedMotion => s.ui.reduced_motion = b,
         FieldId::UiEasterEggs => s.ui.easter_eggs = b,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
+        FieldId::AgentsAutoRoute => s.agents.auto_route = b,
         _ => {}
     }
 }
@@ -817,7 +843,7 @@ mod tests {
             .filter(|r| r.header)
             .map(|r| r.label.as_str())
             .collect();
-        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask"]);
+        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask", "agents"]);
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }
 }

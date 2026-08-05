@@ -34,7 +34,8 @@
 //!               "screensaver": "1m" },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
-//!   "ask":    { "maxOptions": 7 }
+//!   "ask":    { "maxOptions": 7 },
+//!   "agents": { "autoRoute": true, "maxParallel": 4 }
 //! }
 //! ```
 
@@ -216,6 +217,33 @@ impl Default for UpdateSettings {
     }
 }
 
+/// Bounds on the `agent` tool: whether the model may route to configured
+/// definitions on its own initiative, and how wide a remote fan-out may get.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSettings {
+    /// Whether configured definitions are offered to the model at all. With
+    /// this off the `agent` tool still works, but only as a general-purpose
+    /// sub-agent — the roster is withheld. `/subagent <name>` is unaffected;
+    /// this governs model initiative only.
+    pub auto_route: bool,
+    /// Ceiling on concurrent sub-agents in one tool-call block. Only reachable
+    /// for provider-backed definitions; a KV-backed engine reports
+    /// `max_parallel() == 1` and forces serial regardless of this value.
+    pub max_parallel: usize,
+}
+
+impl Default for AgentSettings {
+    fn default() -> Self {
+        Self {
+            auto_route: true,
+            max_parallel: 4,
+        }
+    }
+}
+
+/// Ceiling on `agents.maxParallel`; a higher configured value clamps to this.
+pub const AGENT_MAX_PARALLEL: usize = 16;
+
 /// The whole of `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Settings {
@@ -231,6 +259,8 @@ pub struct Settings {
     pub ask: AskSettings,
     /// Startup update-available detection.
     pub update: UpdateSettings,
+    /// `agent` tool bounds: model routing and fan-out width.
+    pub agents: AgentSettings,
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -371,6 +401,14 @@ impl Settings {
 
         if let Some(v) = boolean(root.get("update"), "check") {
             self.update.check = v;
+        }
+
+        let agents = root.get("agents");
+        if let Some(v) = boolean(agents, "autoRoute") {
+            self.agents.auto_route = v;
+        }
+        if let Some(v) = num::<usize>(agents, "maxParallel") {
+            self.agents.max_parallel = v.clamp(1, AGENT_MAX_PARALLEL);
         }
     }
 
@@ -521,6 +559,12 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     }
     if s.update.check != d.update.check {
         parts.push(format!("update.check={}", s.update.check));
+    }
+    if s.agents.auto_route != d.agents.auto_route {
+        parts.push(format!("agents.autoRoute={}", s.agents.auto_route));
+    }
+    if s.agents.max_parallel != d.agents.max_parallel {
+        parts.push(format!("agents.maxParallel={}", s.agents.max_parallel));
     }
 
     if parts.is_empty() {
@@ -709,6 +753,11 @@ impl Settings {
             "check",
             Json::Bool(self.update.check),
         );
+        {
+            let a = section(&mut root, "agents");
+            upsert(a, "autoRoute", Json::Bool(self.agents.auto_route));
+            upsert(a, "maxParallel", unum(self.agents.max_parallel as u64));
+        }
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
@@ -1137,6 +1186,62 @@ mod tests {
         reloaded.overlay(&std::fs::read_to_string(&path).unwrap());
         assert!(!reloaded.update.check);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_settings_default_and_round_trip() {
+        let d = Settings::default();
+        assert!(d.agents.auto_route, "model routing on by default");
+        assert_eq!(d.agents.max_parallel, 4);
+
+        let s = from_json(r#"{"agents":{"autoRoute":false,"maxParallel":8}}"#);
+        assert!(!s.agents.auto_route);
+        assert_eq!(s.agents.max_parallel, 8);
+
+        let note = note_for(&s, &[]).expect("a note");
+        assert!(note.contains("agents.autoRoute=false"), "{note}");
+        assert!(note.contains("agents.maxParallel=8"), "{note}");
+
+        let dir = std::env::temp_dir().join(format!("plank-agent-set-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        // An unrelated top-level key must survive the write.
+        std::fs::write(&path, r#"{"unknownTop":{"keep":1}}"#).unwrap();
+        s.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("unknownTop"),
+            "unknown keys preserved: {text}"
+        );
+        let back = from_json(&text);
+        assert!(!back.agents.auto_route);
+        assert_eq!(back.agents.max_parallel, 8);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn max_parallel_clamps_out_of_range_values() {
+        assert_eq!(
+            from_json(r#"{"agents":{"maxParallel":0}}"#)
+                .agents
+                .max_parallel,
+            1,
+            "zero would disable the feature silently; clamp up"
+        );
+        assert_eq!(
+            from_json(r#"{"agents":{"maxParallel":999}}"#)
+                .agents
+                .max_parallel,
+            AGENT_MAX_PARALLEL
+        );
+        // A non-numeric value leaves the default standing rather than poisoning
+        // it — same policy as every other numeric key.
+        assert_eq!(
+            from_json(r#"{"agents":{"maxParallel":"lots"}}"#)
+                .agents
+                .max_parallel,
+            4
+        );
     }
 
     #[test]

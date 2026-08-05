@@ -243,6 +243,7 @@ pub fn resolve<'a>(defs: &'a [AgentDef], arg: &'a str) -> (Option<&'a AgentDef>,
 /// Renders the `/agent` listing.
 #[must_use]
 pub fn render_list(defs: &[AgentDef]) -> String {
+    use std::fmt::Write as _;
     if defs.is_empty() {
         return "no agent definitions found (checked ~/.plank/agents and ./.plank/agents)\n"
             .to_string();
@@ -260,7 +261,6 @@ pub fn render_list(defs: &[AgentDef]) -> String {
         // such a definition (see `model_visible`), so this listing is the only
         // place the reason is visible.
         if let Some(e) = &d.engine {
-            use std::fmt::Write as _;
             let _ = write!(out, " [{} {}]", e.kind.label(), e.model);
             if missing_key(d) {
                 let _ = write!(out, " (no {})", e.api_key_env);
@@ -268,6 +268,17 @@ pub fn render_list(defs: &[AgentDef]) -> String {
         }
         out.push('\n');
     }
+    // The roster is only half the story: whether the *model* may reach for these
+    // is a setting, so say which one and what it currently is. Both `/agent`
+    // front ends render this string, so the two cannot disagree.
+    let s = crate::settings::active();
+    let _ = writeln!(
+        out,
+        "\nModel may pick these on its own: {} (/config agents.autoRoute), \
+         up to {} at once (/config agents.maxParallel).",
+        if s.agents.auto_route { "yes" } else { "no" },
+        s.agents.max_parallel
+    );
     out
 }
 

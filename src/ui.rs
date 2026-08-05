@@ -893,10 +893,10 @@ fn split_tool_results(payload: &str, n: usize) -> Vec<String> {
 ///
 /// One gate for every caller — the `Agent` constructor's system prompt and
 /// `build_structured`'s provider registry — so the text and provider paths can
-/// never advertise different rosters. Task 4 replaces the hardcoded `true` with
-/// the `agents.autoRoute` setting.
+/// never advertise different rosters.
 fn model_visible_agents(agents: &[crate::agents::AgentDef]) -> Vec<crate::agents::AgentDef> {
-    crate::agents::model_visible(agents, true)
+    let auto_route = crate::settings::active().agents.auto_route;
+    crate::agents::model_visible(agents, auto_route)
         .into_iter()
         .cloned()
         .collect()
@@ -11345,6 +11345,40 @@ mod tests {
             "auto:false is not model-selectable: {out}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_route_off_withholds_the_roster_from_the_tool_schema() {
+        let defs = vec![named_def("reviewer", true)];
+
+        // On (the default): the definition reaches the model's `agent` schema.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let visible = model_visible_agents(&defs);
+        assert_eq!(visible.len(), 1);
+        let specs = crate::sysprompt::provider_tool_registry(&[], &visible);
+        let agent_spec = specs.iter().find(|s| s.name == "agent").expect("agent");
+        assert_eq!(
+            agent_spec.parameters["properties"]["name"]["enum"][0],
+            "reviewer"
+        );
+
+        // Off: the schema loses the enum entirely, so the model has no roster to
+        // route with — while `/subagent reviewer` still works (see
+        // `agents::resolve_ignores_the_auto_gate`).
+        let mut settings = crate::settings::Settings::default();
+        settings.agents.auto_route = false;
+        crate::settings::install_for_test(settings);
+        assert!(model_visible_agents(&defs).is_empty());
+        let specs = crate::sysprompt::provider_tool_registry(&[], &model_visible_agents(&defs));
+        let agent_spec = specs.iter().find(|s| s.name == "agent").expect("agent");
+        assert!(
+            agent_spec.parameters["properties"]["name"]
+                .get("enum")
+                .is_none(),
+            "no enum when routing is off"
+        );
+
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     #[test]
