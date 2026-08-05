@@ -8820,25 +8820,40 @@ mod tests {
         assert_eq!(again, addr);
         assert_eq!(same_token, token);
 
-        // Snapshot the shared state before tearing the bridge down: if
-        // `remote_off` genuinely drops the server, this clone becomes the
-        // last owner. A leak (e.g. `mem::forget`-ing the server instead of
-        // shutting it down) leaves the server's own clone alive, so the
-        // count stays above 1. This is deterministic and port-free, unlike
-        // probing whether the ephemeral port is still bound: another test
-        // in the parallel suite can rebind that port the instant it's
-        // released, making a port probe flaky.
-        let state = std::sync::Arc::clone(agent.remote.as_ref().expect("bridge installed"));
-
         assert!(agent.remote_off(), "reports that a server was running");
         assert!(!agent.remote_is_on());
         assert!(agent.remote.is_none());
+        assert!(!agent.remote_off(), "second off is a no-op");
+    }
+
+    /// `remote_off` really drops the server rather than leaking it: the test's
+    /// own clone of the shared state must be the last one standing. A leak
+    /// (`mem::forget`-ing the server instead of shutting it down) keeps the
+    /// server's clone alive and the count stays above 1.
+    ///
+    /// This deliberately never connects to the listener. A connection makes the
+    /// accept loop spawn a handler thread holding its own clone of the state,
+    /// which lingers past `remote_off` and inflates the count — so the live-port
+    /// probe lives in `remote_on_installs_a_bridge_and_remote_off_tears_it_down`
+    /// and the refcount check lives here, never in the same test. Probing the
+    /// port *after* `remote_off` is not an option either: another test in the
+    /// parallel suite can rebind a released ephemeral port immediately.
+    #[test]
+    fn remote_off_drops_the_server_rather_than_leaking_it() {
+        let dir = scratch_dir("remote-off-drops");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds an ephemeral loopback port");
+        let state = std::sync::Arc::clone(agent.remote.as_ref().expect("bridge installed"));
+
+        assert!(agent.remote_off());
         assert_eq!(
             std::sync::Arc::strong_count(&state),
             1,
             "remote_off dropped the server, so the test holds the last RemoteState reference"
         );
-        assert!(!agent.remote_off(), "second off is a no-op");
     }
 
     /// A generated token is used when none is supplied, and it is not empty.
