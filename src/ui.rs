@@ -12033,6 +12033,12 @@ mod tests {
         reply: String,
         delay_ms: u64,
         fail: bool,
+        /// Panics inside `generate`, to prove the fan-out's `join` catches it
+        /// rather than unwinding the whole turn.
+        panics: bool,
+        /// Counts generations served, so a test can prove a cached engine is
+        /// reused across dispatches instead of rebuilt.
+        served: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
     }
 
     impl Engine for ParallelEngine {
@@ -12050,9 +12056,13 @@ mod tests {
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            if let Some(c) = &self.served {
+                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if self.delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(self.delay_ms));
             }
+            assert!(!self.panics, "deliberate sub-agent panic");
             if self.fail {
                 return Err(EngineError::new("provider exploded".to_string()));
             }
@@ -12087,6 +12097,7 @@ mod tests {
                     reply: (*reply).to_string(),
                     delay_ms: *delay_ms,
                     fail: *fail,
+                    ..ParallelEngine::default()
                 }),
             );
             vars.push(var);
@@ -12119,6 +12130,135 @@ mod tests {
         assert!(results[0].1.contains("slow done"), "{:?}", results[0]);
         assert!(results[1].1.contains("fast done"), "{:?}", results[1]);
         assert_eq!(agent.alt_engines.len(), 2, "both engines back in the cache");
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn a_panicking_sidechain_is_reported_and_siblings_still_land() {
+        let dir = scratch_dir("fanout-panic");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let vars = install_parallel_defs(&mut agent, &[("", 0, false), ("ok text\n", 0, false)]);
+        // Turn slot 0 into a panicking engine, keeping its cache key.
+        let key = (
+            crate::remote::provider::ProviderKind::Anthropic,
+            "https://example.invalid/v1".to_string(),
+            "model-0".to_string(),
+            8192,
+            vars[0].clone(),
+        );
+        agent.alt_engines.insert(
+            key,
+            Box::new(ParallelEngine {
+                panics: true,
+                ..ParallelEngine::default()
+            }),
+        );
+        let calls = vec![
+            agent_call("boom", Some("a0")),
+            agent_call("fine", Some("a1")),
+        ];
+        let results = agent.run_agent_fanout(&calls).expect("fanned out");
+        assert!(
+            results[0].1.contains("panicked"),
+            "the panic is reported in its own slot: {:?}",
+            results[0]
+        );
+        assert!(
+            results[1].1.contains("ok text"),
+            "and the sibling still lands: {:?}",
+            results[1]
+        );
+        assert_eq!(agent.alt_engines.len(), 2, "both engines returned");
+        clear_vars(&vars);
+    }
+
+    #[test]
+    fn a_cached_alt_engine_is_reused_across_dispatches() {
+        const KEY: &str = "PLANK_TEST_REUSE_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("alt-engine-reuse");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.agents = vec![remote_def("remote", KEY)];
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ParallelEngine {
+                reply: "report\n".to_string(),
+                served: Some(std::sync::Arc::clone(&served)),
+                ..ParallelEngine::default()
+            }),
+        );
+
+        for _ in 0..3 {
+            let out = agent.run_agent_tool(&agent_call("work", Some("remote")));
+            assert!(!out.starts_with("Tool error"), "{out}");
+        }
+
+        // One cache entry, and the *same* engine served all three — so the
+        // context-window probe cannot be repeating per dispatch.
+        assert_eq!(agent.alt_engines.len(), 1);
+        assert_eq!(
+            served.load(std::sync::atomic::Ordering::Relaxed),
+            3,
+            "the cached engine served every dispatch"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn fanout_flushes_one_labelled_pane_block_per_slot_in_call_order() {
+        let dir = scratch_dir("fanout-pane");
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        // Slot 0 finishes last, so a naive implementation would flush out of order.
+        let vars = install_parallel_defs(
+            &mut agent,
+            &[("slow text\n", 120, false), ("fast text\n", 0, false)],
+        );
+        let calls = vec![
+            agent_call("slow", Some("a0")),
+            agent_call("fast", Some("a1")),
+        ];
+        agent.run_agent_fanout(&calls).expect("fanned out");
+
+        let events: Vec<crate::worker::UiEvent> = rx.try_iter().collect();
+        // One plural signpost, as an ordinary Dim so it also reaches remote
+        // clients, which never see the pane-only Sub* variants.
+        let signposts: Vec<&String> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::Dim(t) if t.contains("sub-agent") => Some(t),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signposts.len(), 1, "exactly one signpost: {signposts:?}");
+        assert!(
+            signposts[0].starts_with("[sub-agents: a0, a1"),
+            "plural, in call order: {}",
+            signposts[0]
+        );
+
+        let labels: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubStart(l) => Some(l.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["a0", "a1"],
+            "one block per slot, in call order rather than completion order"
+        );
+        let ends = events
+            .iter()
+            .filter(|e| matches!(e, crate::worker::UiEvent::SubEnd))
+            .count();
+        assert_eq!(ends, labels.len(), "every block is closed");
         clear_vars(&vars);
     }
 
