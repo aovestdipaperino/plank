@@ -8829,12 +8829,23 @@ mod tests {
         assert_eq!(again, addr);
         assert_eq!(same_token, token);
 
+        // Snapshot the shared state before tearing the bridge down: if
+        // `remote_off` genuinely drops the server, this clone becomes the
+        // last owner. A leak (e.g. `mem::forget`-ing the server instead of
+        // shutting it down) leaves the server's own clone alive, so the
+        // count stays above 1. This is deterministic and port-free, unlike
+        // probing whether the ephemeral port is still bound: another test
+        // in the parallel suite can rebind that port the instant it's
+        // released, making a port probe flaky.
+        let state = std::sync::Arc::clone(agent.remote.as_ref().expect("bridge installed"));
+
         assert!(agent.remote_off(), "reports that a server was running");
         assert!(!agent.remote_is_on());
         assert!(agent.remote.is_none());
-        assert!(
-            std::net::TcpStream::connect(addr).is_err(),
-            "the listener is gone after remote_off"
+        assert_eq!(
+            std::sync::Arc::strong_count(&state),
+            1,
+            "remote_off dropped the server, so the test holds the last RemoteState reference"
         );
         assert!(!agent.remote_off(), "second off is a no-op");
     }
