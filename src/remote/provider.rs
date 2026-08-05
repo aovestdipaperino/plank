@@ -624,6 +624,15 @@ fn round2(x: f32) -> serde_json::Value {
 /// Maximum request attempts before a provider error is surfaced to the user.
 const MAX_ATTEMPTS: u32 = 5;
 
+/// Sub-agent sidechains this engine will serve concurrently
+/// ([`Engine::max_parallel`]).
+///
+/// Deliberately modest rather than unbounded: the binding constraint is the
+/// provider's rate limit, and exceeding it converts would-be parallelism into
+/// 429s and retry backoff — slower than running serially. The user's
+/// `agents.maxParallel` is minimised against this.
+const MAX_PARALLEL_SIDECHAINS: usize = 8;
+
 /// Whether an HTTP error status is worth retrying. Request-timeout (408),
 /// rate-limit (429) and any 5xx server error are transient; auth/permission
 /// and the other 4xx (400, 401, 403, 404, 422, …) are permanent — retrying a
@@ -1134,6 +1143,13 @@ impl Engine for ProviderEngine {
         true
     }
 
+    fn max_parallel(&self) -> usize {
+        // Stateless request/response: there is no live session to interleave, so
+        // the real ceiling is the provider's rate limit rather than anything
+        // plank owns. `agents.maxParallel` is what actually bounds width.
+        MAX_PARALLEL_SIDECHAINS
+    }
+
     fn generate(
         &mut self,
         prompt: Prompt<'_>,
@@ -1284,6 +1300,26 @@ mod tests {
                 EngineEvent::Prefill(_) | EngineEvent::Notice(_) => None,
             })
             .collect()
+    }
+
+    /// Stateless request/response, so several sidechains can generate against
+    /// one provider engine at the same time. `ProviderEngine::new` does no I/O,
+    /// so this makes no network request.
+    #[test]
+    fn provider_engine_reports_concurrency() {
+        let e = ProviderEngine::new(
+            ProviderKind::Anthropic,
+            Some("https://example.invalid/v1".to_string()),
+            "DUMMY".to_string(),
+            "test-model".to_string(),
+            8192,
+            false,
+        )
+        .expect("construct");
+        assert!(
+            e.max_parallel() > 1,
+            "a stateless engine has no single-session constraint"
+        );
     }
 
     #[test]

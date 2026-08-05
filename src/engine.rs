@@ -772,6 +772,25 @@ pub trait Engine: Debug + Send {
     fn model_name(&self) -> String {
         String::new()
     }
+
+    /// How many sub-agent sidechains may generate against this engine at once.
+    ///
+    /// The default of 1 is the honest answer for every KV-backed engine: one
+    /// live session means two concurrent sidechains would interleave and
+    /// corrupt the shared prefix. A stateless engine — HTTP to a provider — has
+    /// no such constraint and overrides this.
+    ///
+    /// The value is a *capability*, not a budget: the user's
+    /// `agents.maxParallel` is minimised against it, so a local engine forces
+    /// serial dispatch no matter what the setting says.
+    ///
+    /// Routing local sidechains through [`crate::host::EngineHost`] sessions
+    /// (which already do admission and round-robin scheduling) would let a
+    /// KV-backed engine report more than 1; that is the seam for parallel local
+    /// sub-agents, which remains future work.
+    fn max_parallel(&self) -> usize {
+        1
+    }
 }
 
 /// Text force-fed to close an unclosed `<think>` before the model retries a
@@ -1015,6 +1034,13 @@ mod tests {
         THINK_LOW_PREFIX, THINK_MAX_PREFIX, ThinkMode, ThinkToolRecovery, Utf8Stream,
         reusable_prefix,
     };
+
+    // A KV-backed engine holds one live session, so concurrent sidechains on it
+    // would interleave and corrupt the shared prefix. 1 is the honest default.
+    #[test]
+    fn echo_engine_is_serial_by_default() {
+        assert_eq!(EchoEngine::new(4096).max_parallel(), 1);
+    }
 
     // The default is ordinary thinking, the level plank has always run at.
     #[test]
