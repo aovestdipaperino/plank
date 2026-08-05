@@ -2914,7 +2914,7 @@ impl Agent<'_> {
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             "/remote-control" | "/rc" => {
-                for line in self.remote_toggle_lines(arg) {
+                for line in self.remote_toggle_lines(cmd, arg) {
                     println!("{line}");
                 }
             }
@@ -5520,23 +5520,26 @@ impl Agent<'_> {
         true
     }
 
-    /// Applies a `/remote-control` toggle and returns the lines to show. `arg`
-    /// is `""` (toggle), `"on"`, or `"off"`; anything else reports usage.
+    /// Applies a `/remote-control` toggle and returns the lines to show. `cmd`
+    /// is the invoked command name (`/remote-control` or `/rc`), used to name
+    /// the command in error messages. `arg` is `""` (toggle), `"on"`, or
+    /// `"off"` (case-insensitive); anything else reports usage.
     ///
     /// Starting from here always uses an ephemeral loopback port, so the command
     /// never collides with another plank or a stale listener, and always sets
     /// `allow_control`: the operator typing the command is the consent that
     /// `--control-allow` otherwise encodes.
-    fn remote_toggle_lines(&mut self, arg: &str) -> Vec<String> {
-        let want_on = match arg {
-            "" => !self.remote_is_on(),
-            "on" => true,
-            "off" => false,
-            other => {
-                return vec![format!(
-                    "/remote-control: unknown argument {other:?} (use on, off, or no argument)"
-                )];
-            }
+    fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
+        let want_on = if arg.is_empty() {
+            !self.remote_is_on()
+        } else if arg.eq_ignore_ascii_case("on") {
+            true
+        } else if arg.eq_ignore_ascii_case("off") {
+            false
+        } else {
+            return vec![format!(
+                "{cmd}: unknown argument {arg:?} (use on, off, or no argument)"
+            )];
         };
         if !want_on {
             return if self.remote_off() {
@@ -5553,7 +5556,7 @@ impl Agent<'_> {
                     format!("tunnel:  ssh -L {port}:localhost:{port} user@thishost"),
                 ]
             }
-            Err(e) => vec![format!("/remote-control: could not start: {e}")],
+            Err(e) => vec![format!("{cmd}: could not start: {e}")],
         }
     }
 
@@ -8855,7 +8858,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
 
-        let on = agent.remote_toggle_lines("");
+        let on = agent.remote_toggle_lines("/rc", "");
         assert!(agent.remote_is_on());
         assert!(
             on.iter()
@@ -8868,7 +8871,7 @@ mod tests {
         );
 
         // `on` again is idempotent and re-prints the same link.
-        let again = agent.remote_toggle_lines("on");
+        let again = agent.remote_toggle_lines("/rc", "on");
         assert!(agent.remote_is_on());
         assert_eq!(
             again.iter().find(|l| l.contains("/?t=")),
@@ -8876,17 +8879,40 @@ mod tests {
             "the same link comes back"
         );
 
-        let off = agent.remote_toggle_lines("off");
+        // Bare toggle while ON turns it off — the command's headline behaviour.
+        let toggled_off = agent.remote_toggle_lines("/rc", "");
+        assert!(!agent.remote_is_on(), "a bare /rc turns a live bridge off");
+        assert!(
+            toggled_off.iter().any(|l| l.contains("off")),
+            "{toggled_off:?}"
+        );
+
+        // Re-establish an ON bridge for the explicit-"off" transition below.
+        agent.remote_toggle_lines("/rc", "on");
+        assert!(agent.remote_is_on());
+
+        let off = agent.remote_toggle_lines("/rc", "off");
         assert!(!agent.remote_is_on());
         assert!(off.iter().any(|l| l.contains("off")), "{off:?}");
 
         // `off` when already off says so rather than erroring.
-        let noop = agent.remote_toggle_lines("off");
+        let noop = agent.remote_toggle_lines("/rc", "off");
         assert!(!agent.remote_is_on());
         assert!(!noop.is_empty());
 
+        // "ON" (uppercase) works the same as "on" — case-insensitive argument.
+        let upper = agent.remote_toggle_lines("/rc", "ON");
+        assert!(
+            agent.remote_is_on(),
+            "ON should turn the bridge on: {upper:?}"
+        );
+
+        // Back to off so the final bare-toggle check below observes off->on.
+        agent.remote_toggle_lines("/rc", "off");
+        assert!(!agent.remote_is_on());
+
         // A bare toggle from off turns it back on with a *new* token.
-        let back = agent.remote_toggle_lines("");
+        let back = agent.remote_toggle_lines("/rc", "");
         assert!(agent.remote_is_on());
         assert_ne!(
             back.iter().find(|l| l.contains("/?t=")),
