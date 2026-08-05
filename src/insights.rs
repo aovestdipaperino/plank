@@ -1177,7 +1177,14 @@ impl ThinkTicker {
             let cut = self.pending.find('\n').or_else(|| {
                 (self.pending.len() > TICK_WIDTH)
                     .then(|| {
-                        self.pending[..TICK_WIDTH]
+                        // TICK_WIDTH is a byte index and may land inside a
+                        // multi-byte char; step back to a char boundary
+                        // before slicing.
+                        let mut end = TICK_WIDTH.min(self.pending.len());
+                        while end > 0 && !self.pending.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        self.pending[..end]
                             .rfind(char::is_whitespace)
                             .filter(|&i| i > 0)
                     })
@@ -2130,6 +2137,20 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let mut t = ThinkTicker::new();
         let long = format!("{}\n", "beta ".repeat(30));
         assert_eq!(t.feed(&long), vec![long.trim().to_owned()]);
+    }
+
+    #[test]
+    fn think_ticker_wraps_without_panicking_on_a_multibyte_boundary() {
+        // Regression: TICK_WIDTH is a byte index, and when it lands inside a
+        // multi-byte char the old `self.pending[..TICK_WIDTH]` slice panicked
+        // with "end byte index 88 is not a char boundary". Lay out 86 ASCII
+        // bytes, a space, then an em-dash starting at byte 87 (bytes 87..90),
+        // so byte 88 falls inside the dash; pad well past the width.
+        let mut t = ThinkTicker::new();
+        let line = format!("{} —{} ", "a".repeat(86), "b".repeat(30));
+        let lines = t.feed(&line);
+        assert!(!lines.is_empty(), "expected a tick, got {lines:?}");
+        assert!(lines.iter().all(|l| l.len() <= TICK_WIDTH), "{lines:?}");
     }
 
     #[test]
