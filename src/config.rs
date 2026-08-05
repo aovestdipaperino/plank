@@ -617,6 +617,8 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/tasks"
             | "/agent"
             | "/hooks"
+            | "/remote-control"
+            | "/rc"
             | "/remote"
             | "/grant"
             | "/version"
@@ -657,6 +659,8 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
         || slash_command_with_args(cmd, "/notify")
+        || slash_command_with_args(cmd, "/remote-control")
+        || slash_command_with_args(cmd, "/rc")
 }
 
 /// Parses one engine-tuning option that takes a value (already extracted as
@@ -1537,10 +1541,16 @@ mod tests {
             "/tasks",
             "/agent",
             "/hooks",
+            "/remote-control",
+            "/rc",
             "/version",
         ] {
             assert!(slash_command_known(cmd), "{cmd}");
         }
+        assert!(slash_command_known("/rc on"));
+        assert!(slash_command_known("/rc off"));
+        assert!(slash_command_known("/remote-control on"));
+        assert!(!slash_command_known("/rcx"));
         assert!(slash_command_known("/btw what is this?"));
         assert!(!slash_command_known("/btwx"));
         assert!(slash_command_known("/subagent count the tests"));
