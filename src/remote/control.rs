@@ -1861,6 +1861,17 @@ mod tests {
         assert!(status.contains("404"), "status: {status}");
     }
 
+    /// The `/remote-control` link carries the token in the query string; the
+    /// router strips it, so the page is served as it is for a bare `/`.
+    #[test]
+    fn serves_web_client_when_the_path_carries_a_token() {
+        let server = test_server(false, false);
+        let addr = server.local_addr;
+        let (status, _, body) = http_get(addr, "/?t=tok");
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains("plank remote"), "body missing marker");
+    }
+
     // --- bounded outbound queue / slow-consumer eviction ---
 
     #[test]
