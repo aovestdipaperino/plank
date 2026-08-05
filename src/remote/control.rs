@@ -30,10 +30,10 @@
 //!
 //! ## Live wiring (issue #25, done)
 //! - The worker's stream events mirror onto the bus and remote
-//!   `prompt`/`command`/`btw`/`interrupt` frames drive the real agent through
-//!   both `ui.rs` turn-loop paths: the TUI mirrors inline in `busy_ui_loop` and
-//!   drives turns from the idle loop; the headless path runs a dedicated
-//!   remote-serve loop (`run_remote_headless`).
+//!   `prompt`/`command`/`btw`/`interrupt` frames drive the real agent through the
+//!   TUI turn loop: `busy_ui_loop` mirrors inline and drives turns from the idle
+//!   loop. There is no headless equivalent — `/rc` is the only way to start the
+//!   server and it can only be typed in the TUI.
 //! - `command` (slash) frames route through the shared slash dispatcher: they
 //!   land in the shared queue and the turn loop sends `/`-prefixed lines through
 //!   the same path the local REPL/TUI uses.
