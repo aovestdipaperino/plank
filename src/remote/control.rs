@@ -41,10 +41,10 @@
 //!   held so a brief drop can reclaim it via `resume_from`.
 //!
 //! ## Follow-up (issue #25, done)
-//! - The plain-REPL fallback (piped stdin, no TTY) now interleaves remote input:
-//!   a helper thread turns the blocking `read_line` into channel sends so the
-//!   loop can `select` stdin against the remote queue, draining `pump_remote`
-//!   and echoing the bus to stdout (see `ui::run_repl_plain_remote`).
+//! - `/rc` is TUI-only: the TUI's idle loop drains the remote queue straight
+//!   from the shared [`crate::worker::TurnShared`] and starts a turn as if the
+//!   queued line had been typed locally, mirroring output back onto the bus
+//!   the same way a local turn does.
 //! - The CLI client `plank remote <url>` connects to this server, authenticates,
 //!   mirrors output, and sends `prompt`/`command`/`btw`/`interrupt` frames (see
 //!   [`crate::remote::client`]).
