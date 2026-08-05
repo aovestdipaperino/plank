@@ -151,8 +151,13 @@ function connect() {
   const url = $("url").value.trim() || "ws://" + location.host + "/";
   if (ws) { try { ws.close(); } catch (_) {} }
   setStatus("connecting…");
-  ws = new WebSocket(url);
-  ws.onopen = () => {
+  // close() is async: the old socket's handlers can still fire after `ws` is
+  // reassigned (even after the new socket's onopen), so every handler below
+  // captures its own socket and ignores events once it's no longer current.
+  const sock = new WebSocket(url);
+  ws = sock;
+  sock.onopen = () => {
+    if (sock !== ws) return;
     setStatus("authenticating…");
     const auth = { type: "auth", token: $("token").value };
     if (highestId !== null) auth.resume_from = highestId;
@@ -161,36 +166,41 @@ function connect() {
     $("control").disabled = false;
     // A tokenized link (`/remote-control`) means the operator already consented,
     // so claim control immediately: the server was started with allow_control,
-    // making this a silent Granted. Without the query token we stay a mirror
-    // until the take-control button is pressed.
+    // making this a silent Granted. Without the query token we don't request
+    // control here; the take-control button below is how the page asks for it.
     if (autoControl) {
       send({ type: "request_control" });
       setRole(true);
       line("[requested control]", "dim");
     }
   };
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
+    if (sock !== ws) return;
     let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
     handleServerMsg(f);
     if (f.type === "hello") setStatus("connected");
   };
-  ws.onclose = (ev) => {
+  sock.onclose = (ev) => {
+    if (sock !== ws) return;
     setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
     $("interrupt").disabled = true;
     $("control").disabled = true;
     $("role").textContent = "";
     controller = false;
   };
-  ws.onerror = () => setStatus("error");
+  sock.onerror = () => {
+    if (sock !== ws) return;
+    setStatus("error");
+  };
 }
 
 $("connect").addEventListener("click", connect);
 $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
 // Take/hand back control. A connect while a local TUI is up leaves us a mirror
 // (the handshake only auto-grants when the control slot is Free), so this button
-// is how a browser becomes the controller. It succeeds when the host has no
-// local front-end (allow-control is implied) or the local user granted it;
-// otherwise a `control_denied` lands and flips us back to mirror.
+// is how a browser becomes the controller. A server started by `/rc` always
+// sets allow_control, so the request always succeeds, even with a local TUI
+// present; otherwise a `control_denied` lands and flips us back to mirror.
 $("control").addEventListener("click", () => {
   if (controller) {
     send({ type: "release_control" });
