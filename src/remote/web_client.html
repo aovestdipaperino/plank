@@ -159,6 +159,15 @@ function connect() {
     send(auth);
     $("interrupt").disabled = false;
     $("control").disabled = false;
+    // A tokenized link (`/remote-control`) means the operator already consented,
+    // so claim control immediately: the server was started with allow_control,
+    // making this a silent Granted. Without the query token we stay a mirror
+    // until the take-control button is pressed.
+    if (autoControl) {
+      send({ type: "request_control" });
+      setRole(true);
+      line("[requested control]", "dim");
+    }
   };
   ws.onmessage = (ev) => {
     let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
@@ -205,6 +214,15 @@ $("inputForm").addEventListener("submit", (e) => {
 
 // Prefill the URL from the page's own origin for the common tunnel case.
 $("url").value = "ws://" + location.host + "/";
+
+// `/remote-control` prints http://HOST:PORT/?t=TOKEN. When we were opened that
+// way, fill the token in, connect without a click, and claim control on open.
+const linkToken = new URLSearchParams(location.search).get("t");
+const autoControl = linkToken !== null && linkToken !== "";
+if (autoControl) {
+  $("token").value = linkToken;
+  connect();
+}
 </script>
 </body>
 </html>
