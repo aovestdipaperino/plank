@@ -616,4 +616,21 @@ mod tests {
         assert_eq!(def.unwrap().name, "reviewer");
         assert_eq!(task, "");
     }
+
+    #[test]
+    fn resolve_ignores_the_auto_gate() {
+        // `/subagent <name>` is explicit user dispatch: it must reach a
+        // definition the *model* is not allowed to select. The `auto` gate and
+        // `agents.autoRoute` govern model initiative only, never what the user
+        // can ask for by name.
+        let defs = vec![local_def("hidden", false)];
+        let (def, task) = resolve(&defs, "hidden do the thing");
+        assert_eq!(
+            def.expect("auto:false is still user-dispatchable").name,
+            "hidden"
+        );
+        assert_eq!(task, "do the thing");
+        // …while the model is offered nothing.
+        assert!(model_visible(&defs, true).is_empty());
+    }
 }

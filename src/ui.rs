@@ -1520,15 +1520,26 @@ impl Agent<'_> {
             return "Tool error: sub-agent nesting limit reached; complete this work directly\n"
                 .to_string();
         }
-        let name = call.arg_value("name").unwrap_or("").trim();
-        let instructions = if name.is_empty() {
+        let requested = call.arg_value("name").unwrap_or("").trim();
+        // A name the model could not have known about must not burn a round:
+        // fall back to the general-purpose sub-agent and say so in the report.
+        // `auto: false` definitions are `/subagent`-only, so they are treated
+        // as absent here exactly like a typo — the model was never offered
+        // them, so from its side there is no difference.
+        let matched = self
+            .agents
+            .iter()
+            .find(|d| d.name == requested && d.auto)
+            .cloned();
+        let fallback_note = if requested.is_empty() || matched.is_some() {
             None
         } else {
-            match self.agents.iter().find(|d| d.name == name) {
-                Some(d) => Some(d.body.clone()),
-                None => return format!("Tool error: unknown agent '{name}'\n"),
-            }
+            Some(format!(
+                "note: no agent named '{requested}' is available; ran a general-purpose sub-agent instead.\n"
+            ))
         };
+        let name = matched.as_ref().map_or("", |d| d.name.as_str());
+        let instructions = matched.as_ref().map(|d| d.body.clone());
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
         let label = if name.is_empty() {
             "sub-agent".to_string()
@@ -1559,7 +1570,12 @@ impl Agent<'_> {
         match result {
             Err(e) => format!("Tool error: sub-agent failed: {e}\n"),
             Ok(()) => match report {
-                Some(r) => format!("Sub-agent report:\n{r}\n"),
+                // The note leads, so the model reads why its chosen persona did
+                // not apply before it reads the report it produced anyway.
+                Some(r) => format!(
+                    "{}Sub-agent report:\n{r}\n",
+                    fallback_note.unwrap_or_default()
+                ),
                 None => "Tool error: sub-agent produced no report\n".to_string(),
             },
         }
@@ -11266,6 +11282,88 @@ mod tests {
         assert_eq!(agent.load_session_payload(&loaded), None);
         // Stripping again still succeeds, like the C's rewrite.
         assert!(agent.strip_session(&id[..8]).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Builds an `agent` tool call, optionally naming a definition.
+    fn agent_call(task: &str, name: Option<&str>) -> ToolCall {
+        let mut args = vec![crate::dsml::ToolArg {
+            name: "task".to_string(),
+            value: task.to_string(),
+            is_string: true,
+        }];
+        if let Some(n) = name {
+            args.push(crate::dsml::ToolArg {
+                name: "name".to_string(),
+                value: n.to_string(),
+                is_string: true,
+            });
+        }
+        ToolCall {
+            name: "agent".to_string(),
+            args,
+        }
+    }
+
+    fn named_def(name: &str, auto: bool) -> crate::agents::AgentDef {
+        crate::agents::AgentDef {
+            name: name.to_string(),
+            description: String::new(),
+            body: "Persona.".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+            engine: None,
+            auto,
+        }
+    }
+
+    #[test]
+    fn unknown_agent_name_falls_back_to_general_purpose() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-agent-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec!["Done.\n".to_string(), "Done again.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.agents = vec![named_def("hidden", false)];
+
+        // A name the model could not have known about must not burn a round.
+        let out = agent.run_agent_tool(&agent_call("do a thing", Some("nonesuch")));
+        assert!(!out.contains("unknown agent"), "no hard error: {out}");
+        assert!(
+            out.contains("note: no agent named 'nonesuch'"),
+            "the report says what happened: {out}"
+        );
+        assert!(out.contains("Sub-agent report:"), "it still ran: {out}");
+
+        // An `auto: false` definition is not model-selectable either, and is
+        // treated exactly like a typo rather than as a distinct error.
+        let out = agent.run_agent_tool(&agent_call("do a thing", Some("hidden")));
+        assert!(
+            out.contains("note: no agent named 'hidden'"),
+            "auto:false is not model-selectable: {out}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_known_auto_agent_runs_without_a_fallback_note() {
+        let dir = std::env::temp_dir().join(format!("plank-ui-agent-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine {
+            replies: vec!["Reviewed.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.agents = vec![named_def("reviewer", true)];
+        let out = agent.run_agent_tool(&agent_call("review it", Some("reviewer")));
+        assert!(
+            !out.contains("note:"),
+            "no note when the name resolves: {out}"
+        );
+        assert!(out.contains("Sub-agent report:"), "{out}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
