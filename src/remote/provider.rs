@@ -739,13 +739,19 @@ pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11"
 /// the whole cached prefix. The 1h tier costs 2x base input on the *write* (vs
 /// 1.25x for 5m) but keeps reads at 0.1x, a clear win when turns are re-read
 /// far more often than the prefix changes. Requires [`EXTENDED_CACHE_TTL_BETA`].
-/// Whether this key marks an endpoint that must not receive `top_p`.
+/// Whether this key marks a mock or stubbed endpoint rather than a real
+/// provider — an empty key, the `DUMMY` placeholder `new` substitutes for one,
+/// or a key carrying the `DEADBEEF` sentinel. The sentinel match is literal and
+/// case-sensitive.
 ///
-/// A key carrying the `DEADBEEF` sentinel denotes a mock or stubbed provider
-/// rather than a real one, so the sampling parameter is left off the wire.
-/// The match is literal and case-sensitive: only the exact sentinel counts.
-fn key_omits_top_p(api_key: &str) -> bool {
-    api_key.contains("DEADBEEF")
+/// Used only to skip the context-window probe, which against a mock endpoint
+/// buys nothing but a timeout. This no longer influences the request body: the
+/// Anthropic path omits the sampling parameters unconditionally (they are
+/// rejected by the current models), and the OpenAI-compatible path sends them
+/// to mocks and real providers alike.
+fn is_placeholder_key(api_key: &str) -> bool {
+    let k = api_key.trim();
+    k.is_empty() || k == "DUMMY" || k.contains("DEADBEEF")
 }
 
 /// Reads the context window out of an Anthropic `GET /v1/models/{id}` body.
@@ -1063,8 +1069,8 @@ impl ProviderEngine {
             return None;
         }
         // A placeholder key means a key-less or mock endpoint; probing it only
-        // buys a timeout. (`DUMMY` is what `new` substitutes for an empty key.)
-        if api_key.trim().is_empty() || api_key == "DUMMY" || key_omits_top_p(api_key) {
+        // buys a timeout.
+        if is_placeholder_key(api_key) {
             return None;
         }
         let base = base_url
@@ -1088,18 +1094,6 @@ impl ProviderEngine {
     /// Builds the request for whatever `Prompt` variant arrives. A `Flat`
     /// prompt (e.g. compaction) becomes a single user message with no tools.
     fn request_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
-        let mut body = self.body_for(prompt, opts);
-        // Sentinel keys mark a mock endpoint that rejects `top_p`.
-        if key_omits_top_p(&self.api_key)
-            && let Some(obj) = body.as_object_mut()
-        {
-            obj.remove("top_p");
-        }
-        body
-    }
-
-    /// The provider-shaped request body, before any key-driven filtering.
-    fn body_for(&self, prompt: Prompt<'_>, opts: &GenerationOptions) -> serde_json::Value {
         match (self.kind, prompt) {
             (ProviderKind::OpenAi, Prompt::Structured(turn)) => {
                 build_openai_request(&self.model, turn.system, turn.messages, turn.tools, opts)
@@ -1539,36 +1533,19 @@ mod tests {
         assert_eq!(body["messages"][1]["role"], "user");
     }
 
-    // A DEADBEEF sentinel key marks a mock endpoint, so `top_p` is dropped from
-    // the OpenAI-compatible body; every other param survives, and an ordinary
-    // key keeps `top_p`.
+    // The key no longer shapes the request body: the OpenAI-compatible path
+    // sends the sampling parameters to a mock and a real provider alike.
     #[test]
-    fn deadbeef_key_omits_top_p() {
+    fn the_key_does_not_shape_the_openai_body() {
         let opts = GenerationOptions::default();
-        let mock = ProviderEngine::new(
-            ProviderKind::OpenAi,
-            None,
-            "sk-test-DEADBEEF-01".into(),
-            "m".into(),
-            0,
-            true,
-        )
-        .unwrap();
-        let body = mock.request_for(Prompt::Flat("hi"), &opts);
-        assert!(body.get("top_p").is_none(), "sentinel key omits top_p");
-        assert!(body.get("temperature").is_some(), "kept temperature");
-
-        let real = ProviderEngine::new(
-            ProviderKind::OpenAi,
-            None,
-            "sk-live-01".into(),
-            "m".into(),
-            0,
-            true,
-        )
-        .unwrap();
-        let body = real.request_for(Prompt::Flat("hi"), &opts);
-        assert!(body.get("top_p").is_some(), "a real key sends top_p");
+        for key in ["sk-test-DEADBEEF-01", "sk-live-01", ""] {
+            let engine =
+                ProviderEngine::new(ProviderKind::OpenAi, None, key.into(), "m".into(), 0, true)
+                    .unwrap();
+            let body = engine.request_for(Prompt::Flat("hi"), &opts);
+            assert!(body.get("top_p").is_some(), "key {key:?}: {body}");
+            assert!(body.get("temperature").is_some(), "key {key:?}: {body}");
+        }
     }
 
     /// The current Anthropic models reject the sampling parameters outright — a
@@ -1657,12 +1634,15 @@ mod tests {
             None
         );
         // Placeholder keys mark key-less/mock endpoints — probing only stalls.
-        for key in ["", "DUMMY", "sk-DEADBEEF"] {
+        // Whitespace counts as empty; a real key is not a placeholder.
+        for key in ["", "  ", "DUMMY", "sk-DEADBEEF"] {
+            assert!(is_placeholder_key(key), "{key:?} should be a placeholder");
             assert_eq!(
                 ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, key, "claude"),
                 None
             );
         }
+        assert!(!is_placeholder_key("sk-live-01"));
         // No model name, nothing to look up.
         assert_eq!(
             ProviderEngine::discover_ctx_size(ProviderKind::Anthropic, None, "sk-live", ""),
