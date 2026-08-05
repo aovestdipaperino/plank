@@ -1078,8 +1078,6 @@ struct Agent<'a> {
     /// `RemoteServer` joins the accept thread, so dropping the agent tears the
     /// listener down. `None` whenever `remote` is `None`; the two are installed
     /// and cleared together.
-    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
-    #[allow(dead_code)]
     remote_server: Option<crate::remote::RemoteServer>,
     /// TUI remote-control state (`--ui-remote`). `None` (the default) means
     /// no listener thread, no injected keys and no draw-time recording.
@@ -2915,6 +2913,11 @@ impl Agent<'_> {
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/remote-control" | "/rc" => {
+                for line in self.remote_toggle_lines(arg) {
+                    println!("{line}");
+                }
+            }
             "/btw" => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
@@ -5446,8 +5449,6 @@ impl Agent<'_> {
     }
 
     /// Whether a remote-control bridge is currently live.
-    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
-    #[allow(dead_code)]
     fn remote_is_on(&self) -> bool {
         self.remote_server.is_some()
     }
@@ -5457,8 +5458,6 @@ impl Agent<'_> {
     /// served normally and reads the token from `location.search`. On a
     /// loopback-only listener whose lifetime is one toggle this is an accepted
     /// trade for one-click attach (spec §6).
-    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
-    #[allow(dead_code)]
     fn remote_link(addr: std::net::SocketAddr, token: &str) -> String {
         format!("http://127.0.0.1:{}/?t={token}", addr.port())
     }
@@ -5473,8 +5472,6 @@ impl Agent<'_> {
     ///
     /// # Errors
     /// Returns the bind error as a string; `self` is left untouched on failure.
-    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
-    #[allow(dead_code)]
     fn remote_on(
         &mut self,
         addr: &str,
@@ -5513,8 +5510,6 @@ impl Agent<'_> {
     /// Stops the remote-control server and clears the bridge. Connected clients
     /// get a `bye` first. Returns whether a server was running. The token dies
     /// with the server, so an old link is refused by the next one.
-    // TODO(remote-control task 4): drop this allow — /remote-control calls it.
-    #[allow(dead_code)]
     fn remote_off(&mut self) -> bool {
         let Some(mut server) = self.remote_server.take() else {
             return false;
@@ -5523,6 +5518,43 @@ impl Agent<'_> {
         server.state.say_bye("remote control turned off");
         server.shutdown();
         true
+    }
+
+    /// Applies a `/remote-control` toggle and returns the lines to show. `arg`
+    /// is `""` (toggle), `"on"`, or `"off"`; anything else reports usage.
+    ///
+    /// Starting from here always uses an ephemeral loopback port, so the command
+    /// never collides with another plank or a stale listener, and always sets
+    /// `allow_control`: the operator typing the command is the consent that
+    /// `--control-allow` otherwise encodes.
+    fn remote_toggle_lines(&mut self, arg: &str) -> Vec<String> {
+        let want_on = match arg {
+            "" => !self.remote_is_on(),
+            "on" => true,
+            "off" => false,
+            other => {
+                return vec![format!(
+                    "/remote-control: unknown argument {other:?} (use on, off, or no argument)"
+                )];
+            }
+        };
+        if !want_on {
+            return if self.remote_off() {
+                vec!["remote control off".to_owned()]
+            } else {
+                vec!["remote control is already off".to_owned()]
+            };
+        }
+        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, true) {
+            Ok((addr, token)) => {
+                let port = addr.port();
+                vec![
+                    format!("remote control on — {}", Self::remote_link(addr, &token)),
+                    format!("tunnel:  ssh -L {port}:localhost:{port} user@thishost"),
+                ]
+            }
+            Err(e) => vec![format!("/remote-control: could not start: {e}")],
+        }
     }
 
     /// Worker-side turn loop (the C's `worker_run_turn`): generate, dispatch
@@ -8812,6 +8844,55 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
         assert!(!token.is_empty());
+        agent.remote_off();
+    }
+
+    /// The shared toggle helper drives the bridge and yields the lines both
+    /// front-ends print, so the plain REPL and the TUI cannot drift.
+    #[test]
+    fn rc_toggle_helper_turns_the_bridge_on_and_off() {
+        let dir = scratch_dir("rc-toggle-helper");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let on = agent.remote_toggle_lines("");
+        assert!(agent.remote_is_on());
+        assert!(
+            on.iter()
+                .any(|l| l.contains("http://127.0.0.1:") && l.contains("/?t=")),
+            "prints the tokenized link: {on:?}"
+        );
+        assert!(
+            on.iter().any(|l| l.contains("ssh -L")),
+            "prints the tunnel hint: {on:?}"
+        );
+
+        // `on` again is idempotent and re-prints the same link.
+        let again = agent.remote_toggle_lines("on");
+        assert!(agent.remote_is_on());
+        assert_eq!(
+            again.iter().find(|l| l.contains("/?t=")),
+            on.iter().find(|l| l.contains("/?t=")),
+            "the same link comes back"
+        );
+
+        let off = agent.remote_toggle_lines("off");
+        assert!(!agent.remote_is_on());
+        assert!(off.iter().any(|l| l.contains("off")), "{off:?}");
+
+        // `off` when already off says so rather than erroring.
+        let noop = agent.remote_toggle_lines("off");
+        assert!(!agent.remote_is_on());
+        assert!(!noop.is_empty());
+
+        // A bare toggle from off turns it back on with a *new* token.
+        let back = agent.remote_toggle_lines("");
+        assert!(agent.remote_is_on());
+        assert_ne!(
+            back.iter().find(|l| l.contains("/?t=")),
+            on.iter().find(|l| l.contains("/?t=")),
+            "a fresh activation mints a new token"
+        );
         agent.remote_off();
     }
 

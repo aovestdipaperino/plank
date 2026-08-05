@@ -40,6 +40,11 @@ pub mod provider;
 pub mod control;
 pub use control::{RemoteServer, generate_token};
 
+/// Bind address for a `/remote-control` activation: loopback, ephemeral port.
+/// A fixed port would collide with another plank instance or a stale listener;
+/// the real port is read back from `RemoteServer::local_addr`.
+pub const LOOPBACK_EPHEMERAL: &str = "127.0.0.1:0";
+
 // Remote-control CLI client (issue #25): `plank remote <url>` connects to a
 // running instance's control WebSocket, mirrors its output, and drives it.
 pub mod client;
