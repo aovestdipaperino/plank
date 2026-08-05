@@ -54,7 +54,7 @@ mkdir -p ~/.plank/agents
 name: remote-reviewer
 description: Reviews a diff for correctness and missed edge cases
 provider: anthropic
-model: claude-opus-4-6
+model: claude-opus-5
 ---
 Review what you are given for defects you can demonstrate. For each one, give
 the input that triggers it and the wrong output. Skip style opinions. Finish
@@ -83,7 +83,7 @@ Answer concisely from the code you read. Finish with a short report.
 ```
 Agents (dispatch with /subagent <name> <task>):
   local-helper — Summarises how a module works
-  remote-reviewer — Reviews a diff for correctness and missed edge cases [anthropic claude-opus-4-6]
+  remote-reviewer — Reviews a diff for correctness and missed edge cases [anthropic claude-opus-5]
 
 Model may pick these on its own: yes (/config agents.autoRoute), up to 4 at once (/config agents.maxParallel).
 ```
@@ -189,7 +189,7 @@ fan-out — a mixed block stays serial so side effects keep their order.
 
 ## 7. Remote main agent
 
-**Run:** `plank --provider anthropic --model claude-opus-4-6`
+**Run:** `plank --provider anthropic --model claude-opus-5`
 
 **Expect:**
 - `/agent` lists both definitions as before.
@@ -215,6 +215,28 @@ After every one of these, `/subagent remote-reviewer ok` must still work. A
 leaked engine swap would leave the whole session pointed at the wrong engine,
 which is the worst failure this design can produce and the thing most worth
 re-checking by hand.
+
+### Two `claude-opus-5` behaviours worth provoking
+
+Neither is a plank bug, and neither shows up on a happy-path run — but both
+surface through the provider path as something that *looks* like a plank defect.
+
+**A refusal is an HTTP 200, not an error.** The model's safety classifiers can
+decline a request, returning success with `stop_reason: "refusal"`, a
+`stop_details` category, and `content` that is empty (declined before any output)
+or partial (declined mid-stream). A request touching security or life-sciences
+topics is the way to provoke one; benign adjacent work sometimes trips them,
+which is exactly why this matters. Ask the sub-agent to review something
+security-shaped and check what comes back: a clear tool error naming the refusal
+is fine, an empty report or a parse failure is not — that means the response path
+reads `content` without checking `stop_reason` first.
+
+**Thinking is on by default and shares the `max_tokens` budget.** Unlike
+Opus 4.8/4.7, omitting the `thinking` parameter on `claude-opus-5` runs adaptive
+thinking, and `max_tokens` caps thinking *plus* response text together. Give a
+definition a deliberately small `ctx:` and a task needing a long answer; if the
+report arrives truncated mid-sentence, the budget is being consumed by thinking.
+Worth knowing before blaming the sidechain loop.
 
 ## 9. Cache and cost sanity
 

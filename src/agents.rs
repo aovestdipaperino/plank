@@ -53,7 +53,7 @@ pub struct AgentDef {
 pub struct AgentEngine {
     /// Which provider wire protocol to speak.
     pub kind: ProviderKind,
-    /// Provider-side model name, e.g. `claude-opus-4-6`.
+    /// Provider-side model name, e.g. `claude-opus-5`.
     pub model: String,
     /// Base URL override; `None` uses the provider default.
     pub base_url: Option<String>,
@@ -403,14 +403,14 @@ mod tests {
             &root,
             "reviewer.md",
             "---\nname: reviewer\ndescription: reviews diffs\nprovider: anthropic\n\
-             model: claude-opus-4-6\nbase-url: https://gw.example/v1\nctx: 200000\n\
+             model: claude-opus-5\nbase-url: https://gw.example/v1\nctx: 200000\n\
              api-key-env: ANTHROPIC_API_KEY_WORK\n---\nBe exacting.\n",
         );
         let defs = load_from(std::slice::from_ref(&root));
         assert_eq!(defs.len(), 1, "{defs:?}");
         let e = defs[0].engine.as_ref().expect("engine spec");
         assert_eq!(e.kind, crate::remote::provider::ProviderKind::Anthropic);
-        assert_eq!(e.model, "claude-opus-4-6");
+        assert_eq!(e.model, "claude-opus-5");
         assert_eq!(e.base_url.as_deref(), Some("https://gw.example/v1"));
         assert_eq!(e.ctx, Some(200_000));
         assert_eq!(
