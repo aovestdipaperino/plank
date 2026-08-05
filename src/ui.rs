@@ -1722,7 +1722,37 @@ impl Agent<'_> {
         prompt_text: &str,
         _turn_start: Instant,
     ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
-        let sink: Box<dyn crate::viz::RenderSink> = match &self.sub_sink {
+        let sink = self.sub_sink_render_sink();
+        let bufs = self
+            .engine
+            .wants_structured()
+            .then(|| self.build_structured(prompt_text));
+        let ctx = PassCtx {
+            opts: &self.cfg.generation,
+            think_off: matches!(self.think, crate::engine::ThinkMode::Off),
+            // Read here, not inside the pass: `settings::install_for_test` is
+            // thread-local, so a spawned pass would silently see defaults.
+            thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
+            tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
+        };
+        let preflight = edit_preflight(&self.tool_ctx);
+        let pass = generate_pass(
+            self.engine.as_mut(),
+            prompt_text,
+            bufs.as_ref(),
+            &ctx,
+            sink,
+            preflight,
+        )?;
+        self.record_usage(&pass.stats);
+        self.last_ctx_used = pass.stats.ctx_used;
+        Ok((pass.calls, pass.assistant_text, pass.tool_error))
+    }
+
+    /// Builds the render sink a sub-agent pass writes through, per the current
+    /// [`SubSinkTarget`]. Shared by the serial loop and the parallel fan-out.
+    fn sub_sink_render_sink(&self) -> Box<dyn crate::viz::RenderSink> {
+        match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
             SubSinkTarget::Stdout => Box::new(TerminalSink {
@@ -1735,76 +1765,119 @@ impl Agent<'_> {
                     },
                 ),
             }),
-        };
-        let mut stream = StreamRenderer::new(sink);
-        stream.set_preflight(edit_preflight(&self.tool_ctx));
-        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
-        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
-        if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
-            stream.begin_in_think();
         }
-        let mut assistant_text = String::new();
-        let preflight_stop = AtomicBool::new(false);
-        let greedy = AtomicBool::new(false);
-        let bufs = self
-            .engine
-            .wants_structured()
-            .then(|| self.build_structured(prompt_text));
-        let st;
-        let prompt = match &bufs {
-            Some(b) => {
-                st = crate::engine::StructuredTurn {
-                    system: &b.system,
-                    messages: &b.messages,
-                    tools: &b.tools,
-                    rendered: &b.rendered,
-                };
-                crate::engine::Prompt::Structured(&st)
-            }
-            None => crate::engine::Prompt::Flat(prompt_text),
-        };
-        let stats = self
-            .engine
-            .generate(
-                prompt,
-                &self.cfg.generation,
-                &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                &|| greedy.load(Ordering::Relaxed),
-                &mut |ev| {
-                    if let EngineEvent::Text(t) = ev {
-                        assistant_text.push_str(&t);
-                        stream.push(&t);
-                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-                        if stream.preflight_error().is_some() {
-                            preflight_stop.store(true, Ordering::Relaxed);
-                        }
-                    }
-                },
-            )
-            .map_err(|e| e.to_string())?;
-        stream.finish();
-        self.record_usage(&stats);
-        self.last_ctx_used = stats.ctx_used;
-        let preflight_error = stream.preflight_error().map(str::to_owned);
-        if stats.interrupted && preflight_error.is_none() {
-            crate::interrupt::clear();
-            return Err("interrupted".to_string());
-        }
-        let finished = stream.finished();
-        let ended_in_think = finished.ended_in_think;
-        if let Some(err) = preflight_error.as_deref().or(finished.error) {
-            let payload = tool_error_payload(
-                pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
-                err,
-            );
-            close_open_think(&mut assistant_text, ended_in_think);
-            return Ok((Vec::new(), assistant_text, Some(payload)));
-        }
-        let calls = finished.calls.to_vec();
-        close_open_think(&mut assistant_text, ended_in_think && !calls.is_empty());
-        Ok((calls, assistant_text, None))
     }
+}
 
+/// Outcome of one quiet generation pass.
+struct QuietPass {
+    calls: Vec<ToolCall>,
+    assistant_text: String,
+    /// A preflight or parse error to feed back as a tool result.
+    tool_error: Option<String>,
+    /// Returned rather than recorded, because usage accounting lives on the
+    /// `Agent` and a pass may run on a thread that cannot touch it.
+    stats: crate::engine::GenerationStats,
+}
+
+/// The `Agent`-derived inputs a quiet pass needs, gathered on the main thread so
+/// the pass itself borrows nothing from `self` and can run on a spawned thread.
+struct PassCtx<'a> {
+    opts: &'a crate::engine::GenerationOptions,
+    think_off: bool,
+    thinking_tool_calls: bool,
+    tool_names: Vec<String>,
+}
+
+/// Runs one quiet generation against `engine`, with no stdout/TUI output beyond
+/// `sink`, and returns the parsed tool calls, assistant text, an optional
+/// tool-error payload, and the pass stats.
+///
+/// A free function over `&mut dyn Engine` rather than a method: the parallel
+/// fan-out needs to drive several engines at once from separate threads, which a
+/// `&mut self` method cannot express. Mirrors the call/greedy detection of
+/// [`Agent::stream_generation`] via the shared [`StreamRenderer`].
+fn generate_pass(
+    engine: &mut dyn Engine,
+    prompt_text: &str,
+    bufs: Option<&StructuredBufs>,
+    ctx: &PassCtx<'_>,
+    sink: Box<dyn crate::viz::RenderSink>,
+    preflight: impl FnMut(&ToolCall) -> Result<(), String> + 'static,
+) -> Result<QuietPass, String> {
+    let mut stream = StreamRenderer::new(sink);
+    stream.set_preflight(preflight);
+    stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
+    stream.set_tool_names(ctx.tool_names.clone());
+    if !ctx.think_off && !engine.wants_structured() {
+        stream.begin_in_think();
+    }
+    let mut assistant_text = String::new();
+    let preflight_stop = AtomicBool::new(false);
+    let greedy = AtomicBool::new(false);
+    let st;
+    let prompt = match bufs {
+        Some(b) => {
+            st = crate::engine::StructuredTurn {
+                system: &b.system,
+                messages: &b.messages,
+                tools: &b.tools,
+                rendered: &b.rendered,
+            };
+            crate::engine::Prompt::Structured(&st)
+        }
+        None => crate::engine::Prompt::Flat(prompt_text),
+    };
+    let stats = engine
+        .generate(
+            prompt,
+            ctx.opts,
+            &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+            &|| greedy.load(Ordering::Relaxed),
+            &mut |ev| {
+                if let EngineEvent::Text(t) = ev {
+                    assistant_text.push_str(&t);
+                    stream.push(&t);
+                    greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
+                    if stream.preflight_error().is_some() {
+                        preflight_stop.store(true, Ordering::Relaxed);
+                    }
+                }
+            },
+        )
+        .map_err(|e| e.to_string())?;
+    stream.finish();
+    let preflight_error = stream.preflight_error().map(str::to_owned);
+    if stats.interrupted && preflight_error.is_none() {
+        crate::interrupt::clear();
+        return Err("interrupted".to_string());
+    }
+    let finished = stream.finished();
+    let ended_in_think = finished.ended_in_think;
+    if let Some(err) = preflight_error.as_deref().or(finished.error) {
+        let payload = tool_error_payload(
+            pass_error_kind(preflight_error.is_some(), finished.in_think_rejected),
+            err,
+        );
+        close_open_think(&mut assistant_text, ended_in_think);
+        return Ok(QuietPass {
+            calls: Vec::new(),
+            assistant_text,
+            tool_error: Some(payload),
+            stats,
+        });
+    }
+    let calls = finished.calls.to_vec();
+    close_open_think(&mut assistant_text, ended_in_think && !calls.is_empty());
+    Ok(QuietPass {
+        calls,
+        assistant_text,
+        tool_error: None,
+        stats,
+    })
+}
+
+impl Agent<'_> {
     /// Runs one model turn: stream text, execute tool calls, repeat until
     /// a turn produces no tool calls. Compacts first when context is tight.
     /// Mirrors the live task list back onto the session after a tool dispatch
@@ -11573,6 +11646,40 @@ mod tests {
             8192,
             key_env.to_string(),
         )
+    }
+
+    #[test]
+    fn generate_pass_runs_without_an_agent() {
+        // The point of the extraction: a pass needs only an engine and plain
+        // data, so several can run on separate threads. If this ever needs an
+        // `Agent`, the fan-out is no longer possible.
+        let mut engine = ScriptedEngine {
+            replies: vec!["hello from the pass\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let opts = crate::engine::GenerationOptions::default();
+        let ctx = PassCtx {
+            opts: &opts,
+            think_off: true,
+            thinking_tool_calls: false,
+            tool_names: Vec::new(),
+        };
+        let pass = generate_pass(
+            &mut engine,
+            "[user]\nhi\n",
+            None,
+            &ctx,
+            Box::new(NullSink),
+            |_call| Ok(()),
+        )
+        .expect("a pass");
+        assert!(
+            pass.assistant_text.contains("hello from the pass"),
+            "{}",
+            pass.assistant_text
+        );
+        assert!(pass.calls.is_empty());
+        assert!(pass.tool_error.is_none());
     }
 
     #[test]
