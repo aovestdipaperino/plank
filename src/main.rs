@@ -17,9 +17,10 @@
 //!
 //! Engine selection is delegated to [`make_engine`] (local ds4 engine on macOS,
 //! provider API engines, or the `EchoEngine` stub elsewhere) and [`make_host`] for
-//! the shared-engine variant. Startup maintenance, RAM checks, instance-lock
-//! guarding, and remote-control server setup are all handled here before
-//! handing control to the UI layer.
+//! the shared-engine variant. Startup maintenance, RAM checks, and
+//! instance-lock guarding are all handled here before handing control to the
+//! UI layer; the remote-control server itself is started at runtime by `/rc`,
+//! not here.
 
 use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
@@ -41,8 +42,8 @@ fn main() -> ExitCode {
     }
 
     // `plank remote <url>` runs the interactive remote-control client (issue
-    // #25): it connects to another instance's `--control` WebSocket, mirrors
-    // its output, and drives it. It never loads an engine of its own.
+    // #25): it connects to another instance's `/rc` WebSocket, mirrors its
+    // output, and drives it. It never loads an engine of its own.
     if args.first().map(String::as_str) == Some("remote") {
         return run_remote_client(&args[1..]);
     }
@@ -306,55 +307,6 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     }
 }
 
-/// Starts the remote-control server when `--control` is configured, resolving
-/// the token (flag → `PLANK_REMOTE_TOKEN` → generated) and printing the token
-/// plus a ready-to-paste SSH tunnel hint once to stderr (design §4.1/§4.10).
-///
-/// The returned server must be kept alive for the process lifetime; dropping it
-/// shuts the listener down. Its `state.bus` / `state.shared` are handed to the
-/// turn loop (`run`), so the running agent mirrors its output onto the bus and
-/// remote `prompt`/`command`/`btw`/`interrupt` frames drive it (issue #25).
-fn start_remote(cfg: &AgentConfig, local_present: bool) -> Option<plank::remote::RemoteServer> {
-    use std::sync::Arc;
-
-    let rc = cfg.remote.as_ref()?;
-    let token = rc
-        .token
-        .clone()
-        .or_else(|| {
-            std::env::var("PLANK_REMOTE_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-        })
-        .unwrap_or_else(plank::remote::generate_token);
-    let allow_control = rc.allow_control || !local_present;
-    let bus = Arc::new(plank::worker::BroadcastBus::new());
-    let shared = Arc::new(plank::worker::TurnShared::default());
-    let server_cfg = plank::remote::control::ServerConfig {
-        token: token.clone(),
-        local_present,
-        allow_control,
-        allowed_origins: rc.allowed_origins.clone(),
-        queue_max: rc.queue_max,
-    };
-    match plank::remote::RemoteServer::start(&rc.addr, server_cfg, bus, shared) {
-        Ok(server) => {
-            let addr = server.local_addr;
-            eprintln!("plank: remote control listening on ws://{addr}/ (loopback only)");
-            eprintln!("plank: remote token: {token}");
-            eprintln!(
-                "plank: tunnel from a client with:  ssh -L {port}:localhost:{port} user@thishost",
-                port = addr.port()
-            );
-            Some(server)
-        }
-        Err(e) => {
-            eprintln!("plank: could not start remote control on {}: {e}", rc.addr);
-            None
-        }
-    }
-}
-
 /// Parses `plank remote <url> [--token <t>] [--resume-from <id>]` and runs the
 /// interactive remote-control client. The token falls back to
 /// `PLANK_REMOTE_TOKEN`; the URL is `ws://host:port/` (tunnel to loopback for a
@@ -373,7 +325,7 @@ fn run_remote_client(args: &[String]) -> ExitCode {
                 eprintln!(
                     "usage: plank remote <ws-url> [--token <token>]\n\
                      \n\
-                     Connects to a plank instance started with --control, mirrors its\n\
+                     Connects to a plank instance with remote control on (/rc), mirrors its\n\
                      output, and sends typed lines as prompts (slash lines as commands,\n\
                      \"/btw <q>\" as a side question) and Ctrl-C as an interrupt.\n\
                      The token defaults to $PLANK_REMOTE_TOKEN."
@@ -546,15 +498,8 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
 
 fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
-    // A local front-end is present unless we are headless (`--non-interactive`).
-    let local_present = !cfg.non_interactive;
-    // Keep the server alive for the whole run (drop shuts the listener down),
-    // and hand its shared bus + turn state to the turn loop so live output
-    // mirrors out and remote frames drive the agent (issue #25).
-    let remote = start_remote(cfg, local_present);
-    let remote_state = remote.as_ref().map(|s| std::sync::Arc::clone(&s.state));
     if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg, remote_state);
+        return plank::ui::run_non_interactive(engine, cfg);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -577,5 +522,5 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, remote_state)
+    plank::ui::run_interactive(engine, cfg)
 }

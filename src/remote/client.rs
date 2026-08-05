@@ -4,7 +4,7 @@
 //! `plank remote <url>`: the interactive remote-control *client* (issue #25).
 //!
 //! Connects to a running plank instance's remote-control WebSocket (started
-//! with `--control`), authenticates with the shared bearer token, and becomes
+//! with `/rc`), authenticates with the shared bearer token, and becomes
 //! another front-end over the same [`crate::worker::UiEvent`] stream: mirrored
 //! server output streams to the terminal while typed lines are sent as
 //! `prompt` / `command` / `btw` frames and Ctrl-C as `interrupt`.

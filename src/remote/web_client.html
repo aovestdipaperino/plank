@@ -179,9 +179,9 @@ $("connect").addEventListener("click", connect);
 $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
 // Take/hand back control. A connect while a local TUI is up leaves us a mirror
 // (the handshake only auto-grants when the control slot is Free), so this button
-// is how a browser becomes the controller. It succeeds when the host ran with
-// --control-allow or the local user granted it; otherwise a `control_denied`
-// lands and flips us back to mirror.
+// is how a browser becomes the controller. It succeeds when the host has no
+// local front-end (allow-control is implied) or the local user granted it;
+// otherwise a `control_denied` lands and flips us back to mirror.
 $("control").addEventListener("click", () => {
   if (controller) {
     send({ type: "release_control" });

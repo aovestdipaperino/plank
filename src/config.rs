@@ -66,9 +66,6 @@ pub struct AgentConfig {
     pub engine: EngineTuning,
     /// `/btw` side-question behavior (mid-generation suspend).
     pub btw: BtwConfig,
-    /// Remote-control server options (issue #25); `None` when `--control` was
-    /// not given.
-    pub remote: Option<RemoteConfig>,
     /// Remote plank host from `--remote URL` (flavor a, issue #26); selects
     /// [`crate::remote::ds4_client::RemoteDs4Engine`] instead of a local engine.
     pub remote_url: Option<String>,
@@ -162,49 +159,10 @@ impl Default for BtwConfig {
     }
 }
 
-/// Default remote-control bind address: loopback only, echoing the reference
-/// note's port (`docs/REMOTE-CONTROL-DESIGN.md` §4.1). Off-box reach is the
-/// user's SSH tunnel, never a wider bind.
-pub const DEFAULT_REMOTE_ADDR: &str = "127.0.0.1:31415";
-
-/// Remote-control server configuration from `--control*` flags.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteConfig {
-    /// Bind address; defaults to [`DEFAULT_REMOTE_ADDR`] (loopback).
-    pub addr: String,
-    /// Shared bearer token. `None` here means "generate one at startup and
-    /// print it once to stderr" — there is no unauthenticated mode.
-    pub token: Option<String>,
-    /// When set (or with no local TTY), a remote client may take control
-    /// without an explicit local `/grant`.
-    pub allow_control: bool,
-    /// Browser `Origin` values allowed on the WebSocket upgrade. Missing and
-    /// loopback Origins are always allowed (native `plank remote` clients send
-    /// none); a non-loopback browser Origin must appear here or the upgrade is
-    /// refused (`docs/REMOTE-CONTROL-DESIGN.md` §8).
-    pub allowed_origins: Vec<String>,
-    /// Per-client outbound queue cap in bytes. A client whose buffered, unsent
-    /// output exceeds this is evicted (slow-consumer backpressure) rather than
-    /// buffered without bound.
-    pub queue_max: usize,
-}
-
-/// Default per-client outbound queue cap (bytes) when `--control-queue-max` is
-/// not given. Generous enough for a healthy client's burst, small enough to
-/// evict a stalled one promptly.
+/// Default per-client outbound queue cap (bytes) for the remote-control
+/// server's per-client backpressure eviction. Generous enough for a healthy
+/// client's burst, small enough to evict a stalled one promptly.
 pub const DEFAULT_CONTROL_QUEUE_MAX: usize = 1 << 20; // 1 MiB
-
-impl Default for RemoteConfig {
-    fn default() -> Self {
-        Self {
-            addr: DEFAULT_REMOTE_ADDR.to_owned(),
-            token: None,
-            allow_control: false,
-            allowed_origins: Vec::new(),
-            queue_max: DEFAULT_CONTROL_QUEUE_MAX,
-        }
-    }
-}
 
 /// Default prefill chunk size (tokens). Non-zero so a long prompt is prefilled
 /// in bounded chunks: the engine checks the cancel callback at each chunk
@@ -314,7 +272,6 @@ impl Default for AgentConfig {
             sandbox_override: None,
             engine: EngineTuning::default(),
             btw: BtwConfig::default(),
-            remote: None,
             remote_url: None,
             remote_token: None,
             insecure: false,
@@ -471,21 +428,6 @@ Options:
                            answer an in-pass /btw by queuing at the next
                            generation boundary instead of freezing/resuming the
                            running generation (freeze/resume is the default)
-      --control[=ADDR]     start the remote-control WebSocket server, bound to
-                           ADDR (default 127.0.0.1:31415, loopback only)
-      --control-token TOKEN shared bearer token (else PLANK_REMOTE_TOKEN, else a
-                           token is generated and printed once to stderr)
-      --control-allow      let a remote client take control without a local
-                           /grant (implied in headless server mode)
-      --control-origin ORIGIN
-                           allow this browser Origin on the WebSocket upgrade
-                           (repeatable or comma-separated); missing and loopback
-                           Origins are always allowed, other browser Origins are
-                           refused by default
-      --control-queue-max BYTES
-                           per-client outbound queue cap; a client whose unsent
-                           output exceeds it is evicted (default 1048576)
-
 Settings file:
       ~/.plank/settings.json, then ./.plank/settings.json (later wins), holds
       defaults for preferences rather than per-run choices. Flags override it.
@@ -703,60 +645,6 @@ fn parse_engine_option(
     Ok(())
 }
 
-/// Parses one `--control*` option, advancing `i` past a consumed value.
-/// Returns `true` if `arg` was a remote option (and was applied), `false`
-/// otherwise so the caller falls through to its unknown-option handling.
-///
-/// # Errors
-/// Returns an error when a required value is missing.
-fn parse_remote_option(
-    c: &mut AgentConfig,
-    arg: &str,
-    args: &[String],
-    i: &mut usize,
-) -> Result<bool, String> {
-    let mut value = || -> Result<&str, String> {
-        if *i + 1 >= args.len() {
-            return Err(format!("missing value for {arg}"));
-        }
-        *i += 1;
-        Ok(args[*i].as_str())
-    };
-    match arg {
-        "--control-token" => {
-            c.remote.get_or_insert_with(RemoteConfig::default).token = Some(value()?.to_owned());
-        }
-        "--control-allow" => {
-            c.remote
-                .get_or_insert_with(RemoteConfig::default)
-                .allow_control = true;
-        }
-        "--control-origin" => {
-            let raw = value()?.to_owned();
-            let rc = c.remote.get_or_insert_with(RemoteConfig::default);
-            // Repeatable, and each occurrence may be a comma-separated list.
-            for o in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                rc.allowed_origins.push(o.to_owned());
-            }
-        }
-        "--control-queue-max" => {
-            let raw = value()?;
-            let n: usize = raw
-                .parse()
-                .map_err(|_| format!("invalid --control-queue-max value: {raw}"))?;
-            c.remote.get_or_insert_with(RemoteConfig::default).queue_max = n;
-        }
-        _ if arg == "--control" || arg.starts_with("--control=") => {
-            c.remote.get_or_insert_with(RemoteConfig::default).addr = arg
-                .strip_prefix("--control=")
-                .filter(|s| !s.is_empty())
-                .map_or_else(|| DEFAULT_REMOTE_ADDR.to_owned(), ToOwned::to_owned);
-        }
-        _ => return Ok(false),
-    }
-    Ok(true)
-}
-
 /// Parses command-line arguments (without the program name) into a config.
 ///
 /// # Errors
@@ -911,8 +799,6 @@ pub fn parse_options_with(
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
             "--disable-btw-suspend" => c.btw.suspend = false,
-            _ if arg.starts_with("--control")
-                && parse_remote_option(&mut c, arg, args, &mut i)? => {}
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
@@ -1593,71 +1479,6 @@ mod tests {
         assert_eq!(c.generation.think_mode, ThinkMode::Off);
         // Not given at all.
         assert!(parse_options(&args(&[])).unwrap().resume.is_none());
-    }
-
-    #[test]
-    fn remote_flags() {
-        // Not given by default.
-        assert!(parse_options(&[]).unwrap().remote.is_none());
-        // Bare --control uses the loopback default.
-        let r = parse_options(&args(&["--control"]))
-            .unwrap()
-            .remote
-            .unwrap();
-        assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
-        assert!(r.token.is_none());
-        assert!(!r.allow_control);
-        // --control=ADDR overrides the bind, and token/allow compose.
-        let r = parse_options(&args(&[
-            "--control=127.0.0.1:9000",
-            "--control-token",
-            "sekret",
-            "--control-allow",
-        ]))
-        .unwrap()
-        .remote
-        .unwrap();
-        assert_eq!(r.addr, "127.0.0.1:9000");
-        assert_eq!(r.token.as_deref(), Some("sekret"));
-        assert!(r.allow_control);
-        // Token given before --control still enables the server.
-        let r = parse_options(&args(&["--control-token", "t"]))
-            .unwrap()
-            .remote
-            .unwrap();
-        assert_eq!(r.addr, DEFAULT_REMOTE_ADDR);
-        assert_eq!(r.token.as_deref(), Some("t"));
-        // Origin allow-list: repeatable and comma-separated, and queue cap.
-        let r = parse_options(&args(&[
-            "--control",
-            "--control-origin",
-            "https://a.example.com, https://b.example.com",
-            "--control-origin",
-            "https://c.example.com",
-            "--control-queue-max",
-            "4096",
-        ]))
-        .unwrap()
-        .remote
-        .unwrap();
-        assert_eq!(
-            r.allowed_origins,
-            vec![
-                "https://a.example.com".to_owned(),
-                "https://b.example.com".to_owned(),
-                "https://c.example.com".to_owned(),
-            ]
-        );
-        assert_eq!(r.queue_max, 4096);
-        // Defaults when the hardening flags are absent.
-        let r = parse_options(&args(&["--control"]))
-            .unwrap()
-            .remote
-            .unwrap();
-        assert!(r.allowed_origins.is_empty());
-        assert_eq!(r.queue_max, DEFAULT_CONTROL_QUEUE_MAX);
-        // A non-numeric queue cap is rejected.
-        assert!(parse_options(&args(&["--control-queue-max", "big"])).is_err());
     }
 
     #[test]

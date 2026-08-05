@@ -52,12 +52,15 @@
 //! ## Hardening (issue #25, done)
 //! - `Origin` allow-list on the WebSocket upgrade: missing / loopback Origins
 //!   are always allowed (native clients send none), other browser Origins must
-//!   be allow-listed via `--control-origin` or the upgrade is refused with an
-//!   HTTP 403 (see [`origin_allowed`]).
+//!   appear in [`ServerConfig::allowed_origins`] or the upgrade is refused with
+//!   an HTTP 403 (see [`origin_allowed`]). `/rc` always starts loopback-only
+//!   with an empty allow-list, which is sufficient since a missing or loopback
+//!   Origin is always accepted; a non-loopback setup would need this wired to
+//!   a config source again.
 //! - Bounded per-client outbound queue: the socket write buffer is capped
-//!   (`--control-queue-max`); a slow/stalled client whose unsent output exceeds
-//!   the cap is evicted (slow-consumer backpressure) instead of buffered
-//!   without bound. The bus prunes the dropped subscriber on the next
+//!   ([`ServerConfig::queue_max`]); a slow/stalled client whose unsent output
+//!   exceeds the cap is evicted (slow-consumer backpressure) instead of
+//!   buffered without bound. The bus prunes the dropped subscriber on the next
 //!   broadcast.
 //! - A minimal self-contained static web client served at `GET /` (see
 //!   [`WEB_CLIENT_HTML`]); it speaks the exact JSON frames below.
@@ -428,8 +431,8 @@ impl ClientFrame {
 // --- Auth -------------------------------------------------------------------
 
 /// Generates a 32-byte, base64url (unpadded) bearer token from the OS CSPRNG.
-/// No default token exists; this is called when `--control` is given without one
-/// (design §4.6).
+/// No default token exists; this is called when `/rc` starts a server without
+/// an explicit token (design §4.6).
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];

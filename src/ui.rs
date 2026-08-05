@@ -1070,8 +1070,9 @@ struct Agent<'a> {
     checkpoints: crate::checkpoint::CheckpointStore,
     /// Live remote-control bridge (issue #25): the shared [`BroadcastBus`] that
     /// this agent's turn output mirrors into, plus the shared [`TurnShared`] that
-    /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
-    /// was not given, in which case the turn loops behave exactly as before.
+    /// remote `prompt`/`btw`/`interrupt` frames drive. `None` until `/rc` (or
+    /// `/remote-control`) starts a server, in which case the turn loops behave
+    /// exactly as before.
     remote: Option<Arc<RemoteState>>,
     /// The remote-control listener backing [`Agent::remote`], owned here so
     /// `/remote-control` can start and stop it mid-session. `Drop` on the
@@ -5484,15 +5485,14 @@ impl Agent<'_> {
         let token = token
             .filter(|t| !t.is_empty())
             .unwrap_or_else(crate::remote::generate_token);
-        // Hardening knobs come from the `--control*` flags when they were given,
-        // and from the same defaults otherwise.
-        let rc = self.cfg.remote.clone().unwrap_or_default();
+        // Loopback-only, so no browser Origin allow-list is needed: a missing or
+        // loopback Origin is always accepted. The queue cap keeps its default.
         let server_cfg = crate::remote::control::ServerConfig {
             token: token.clone(),
             local_present: true,
             allow_control,
-            allowed_origins: rc.allowed_origins,
-            queue_max: rc.queue_max,
+            allowed_origins: Vec::new(),
+            queue_max: crate::config::DEFAULT_CONTROL_QUEUE_MAX,
         };
         let server = crate::remote::RemoteServer::start(
             addr,
@@ -5527,8 +5527,8 @@ impl Agent<'_> {
     ///
     /// Starting from here always uses an ephemeral loopback port, so the command
     /// never collides with another plank or a stale listener, and always sets
-    /// `allow_control`: the operator typing the command is the consent that
-    /// `--control-allow` otherwise encodes.
+    /// `allow_control`: the operator typing the command is the consent that a
+    /// remote-side allow flag would otherwise encode.
     fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
         let want_on = if arg.is_empty() {
             !self.remote_is_on()
@@ -7521,7 +7521,6 @@ fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
-    remote: Option<Arc<RemoteState>>,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -7615,7 +7614,7 @@ fn new_agent(
         templates,
         agents,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
-        remote,
+        remote: None,
         remote_server: None,
         ui_remote: None,
         usage: SessionUsage::default(),
@@ -7630,12 +7629,8 @@ fn new_agent(
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_interactive(
-    engine: Box<dyn Engine>,
-    cfg: &AgentConfig,
-    remote: Option<Arc<RemoteState>>,
-) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true, remote)?;
+pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, true)?;
 
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
@@ -8029,12 +8024,8 @@ fn run_repl_plain_remote(agent: &mut Agent<'_>) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(
-    engine: Box<dyn Engine>,
-    cfg: &AgentConfig,
-    remote: Option<Arc<RemoteState>>,
-) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false, remote)?;
+pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, false)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
     crate::notify::set_mode(crate::settings::active().ui.notifications);
