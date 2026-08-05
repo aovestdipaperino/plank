@@ -8733,6 +8733,63 @@ mod tests {
         agent.remote_off();
     }
 
+    /// The `/remote-control` path end to end: a client that authenticates and
+    /// requests control may submit a prompt even though a local front-end holds
+    /// the slot, and the turn's output reaches the bus.
+    #[test]
+    fn tokenized_attach_takes_control_and_drives_a_turn() {
+        use crate::remote::control::{ClientFrame, ClientMsg};
+        use tungstenite::Message;
+
+        let dir = scratch_dir("rc-e2e");
+        let engine = ScriptedEngine {
+            replies: vec!["hello from echo\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let (addr, token) = agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        assert_eq!(token, "tok");
+
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
+
+        let stream = std::net::TcpStream::connect(addr).unwrap();
+        let (mut ws, _) = tungstenite::client(
+            format!("ws://{addr}/")
+                .parse::<tungstenite::http::Uri>()
+                .unwrap(),
+            stream,
+        )
+        .expect("ws handshake");
+        for m in [
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+            ClientMsg::RequestControl,
+            ClientMsg::Prompt { text: "hi".into() },
+        ] {
+            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
+                .unwrap();
+        }
+
+        // The prompt was accepted (not denied), so it lands in TurnShared for
+        // the turn loop to pick up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut queued = Vec::new();
+        while queued.is_empty() && std::time::Instant::now() < deadline {
+            queued = state.shared.take_queued();
+        }
+        assert_eq!(queued, vec!["hi".to_string()], "the prompt was not denied");
+
+        // Nothing on the wire said denied.
+        drop(sub);
+        agent.remote_off();
+    }
+
     #[test]
     fn session_to_messages_threads_tool_ids_across_turns() {
         use crate::engine::ChatRole;
