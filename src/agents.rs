@@ -18,6 +18,7 @@
 //! subagent's turn. Parallel/team orchestration remains out of scope (blocked
 //! on per-session KV save/restore; see the tracking issue).
 
+use crate::remote::provider::ProviderKind;
 use std::path::{Path, PathBuf};
 
 /// One loaded named agent definition.
@@ -32,6 +33,36 @@ pub struct AgentDef {
     pub body: String,
     /// File the definition was loaded from.
     pub path: PathBuf,
+    /// Engine override; `None` runs the subagent on the parent's engine, as
+    /// every definition did before cross-provider subagents.
+    pub engine: Option<AgentEngine>,
+    /// Whether the model may select this definition on its own initiative.
+    /// Defaults true; `auto: false` makes it `/subagent`-only.
+    pub auto: bool,
+}
+
+/// Engine override for a named definition: which provider and model its
+/// sidechain runs on, instead of the parent's engine.
+///
+/// The key *value* is deliberately absent — only the variable's *name* is
+/// configurable, so a definition file stays committable to a shared repo while
+/// still selecting the right secret. One provider protocol can front several
+/// endpoints that do not share credentials (two gateways, work vs. personal),
+/// which a single global default cannot address.
+#[derive(Debug, Clone)]
+pub struct AgentEngine {
+    /// Which provider wire protocol to speak.
+    pub kind: ProviderKind,
+    /// Provider-side model name, e.g. `claude-opus-4-6`.
+    pub model: String,
+    /// Base URL override; `None` uses the provider default.
+    pub base_url: Option<String>,
+    /// Context window; `None` asks the provider at first dispatch.
+    pub ctx: Option<i32>,
+    /// Environment variable holding this definition's API key. Resolved at
+    /// load: the frontmatter's `api-key-env:` when given, else the provider
+    /// default. Never empty, so every reader has one name to consult.
+    pub api_key_env: String,
 }
 
 /// Splits leading `---` frontmatter from an agent `.md`; returns (frontmatter
@@ -81,11 +112,43 @@ fn load_def(path: &Path) -> Option<AgentDef> {
     if body.trim().is_empty() {
         return None;
     }
+    // Engine override: `provider:` opts in, and requires a `model:`. A
+    // half-specified or unknown provider makes the definition unusable rather
+    // than silently running on the parent's engine — a definition that names a
+    // provider clearly means to use it.
+    let engine = match get("provider").as_str() {
+        "" => None,
+        provider => {
+            let kind = ProviderKind::parse(provider)?;
+            let model = get("model");
+            if model.is_empty() {
+                return None;
+            }
+            // An unparseable ctx is ignored, not fatal: the provider is asked
+            // instead, which is the same path as omitting the key.
+            let ctx = get("ctx").parse::<i32>().ok().filter(|c| *c > 0);
+            // Resolve the key variable once, here, so no downstream reader has
+            // to re-apply the default.
+            let api_key_env = match get("api-key-env") {
+                v if v.is_empty() => kind.api_key_env().to_string(),
+                v => v,
+            };
+            Some(AgentEngine {
+                kind,
+                model,
+                base_url: Some(get("base-url")).filter(|s| !s.is_empty()),
+                ctx,
+                api_key_env,
+            })
+        }
+    };
     Some(AgentDef {
         name,
         description: get("description"),
         body,
         path: path.to_path_buf(),
+        engine,
+        auto: get("auto") != "false",
     })
 }
 
@@ -270,6 +333,92 @@ mod tests {
     }
 
     #[test]
+    fn engine_frontmatter_parses() {
+        let root = temp_root("engine-fm");
+        write_def(
+            &root,
+            "reviewer.md",
+            "---\nname: reviewer\ndescription: reviews diffs\nprovider: anthropic\n\
+             model: claude-opus-4-6\nbase-url: https://gw.example/v1\nctx: 200000\n\
+             api-key-env: ANTHROPIC_API_KEY_WORK\n---\nBe exacting.\n",
+        );
+        let defs = load_from(std::slice::from_ref(&root));
+        assert_eq!(defs.len(), 1, "{defs:?}");
+        let e = defs[0].engine.as_ref().expect("engine spec");
+        assert_eq!(e.kind, crate::remote::provider::ProviderKind::Anthropic);
+        assert_eq!(e.model, "claude-opus-4-6");
+        assert_eq!(e.base_url.as_deref(), Some("https://gw.example/v1"));
+        assert_eq!(e.ctx, Some(200_000));
+        assert_eq!(
+            e.api_key_env, "ANTHROPIC_API_KEY_WORK",
+            "explicit override wins"
+        );
+        assert!(defs[0].auto, "auto defaults true");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn engine_defaults_and_omissions() {
+        let root = temp_root("engine-def");
+        write_def(
+            &root,
+            "plain.md",
+            "---\nname: plain\ndescription: local\n---\nBody.\n",
+        );
+        write_def(
+            &root,
+            "minimal.md",
+            "---\nname: minimal\nprovider: openai\nmodel: gpt-5\n---\nBody.\n",
+        );
+        write_def(
+            &root,
+            "opted-out.md",
+            "---\nname: opted-out\nauto: false\n---\nBody.\n",
+        );
+        let defs = load_from(std::slice::from_ref(&root));
+        let by = |n: &str| defs.iter().find(|d| d.name == n).expect("def");
+        assert!(by("plain").engine.is_none(), "no provider -> no engine");
+        assert!(by("plain").auto);
+        let m = by("minimal").engine.as_ref().expect("engine spec");
+        assert!(m.base_url.is_none(), "base-url omitted -> None");
+        assert!(m.ctx.is_none(), "ctx omitted -> None");
+        assert_eq!(
+            m.api_key_env, "OPENAI_API_KEY",
+            "api-key-env omitted -> the provider default"
+        );
+        assert!(!by("opted-out").auto, "auto: false is honored");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn broken_engine_frontmatter_rejects_the_definition() {
+        let root = temp_root("engine-bad");
+        // A provider without a model is unusable.
+        write_def(
+            &root,
+            "nomodel.md",
+            "---\nname: nomodel\nprovider: anthropic\n---\nBody.\n",
+        );
+        // An unknown provider name is unusable.
+        write_def(
+            &root,
+            "bogus.md",
+            "---\nname: bogus\nprovider: gemini\nmodel: x\n---\nBody.\n",
+        );
+        // A non-numeric ctx is ignored, not fatal — the rest of the def stands.
+        write_def(
+            &root,
+            "badctx.md",
+            "---\nname: badctx\nprovider: openai\nmodel: gpt-5\nctx: lots\n---\nBody.\n",
+        );
+        let defs = load_from(std::slice::from_ref(&root));
+        let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["badctx"], "only the recoverable one survives");
+        assert_eq!(defs[0].engine.as_ref().expect("engine").ctx, None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn project_overrides_global_by_name() {
         let global = temp_root("global");
         let project = temp_root("project");
@@ -306,6 +455,8 @@ mod tests {
             description: String::new(),
             body: "Be strict.".into(),
             path: PathBuf::new(),
+            engine: None,
+            auto: true,
         }];
         // First token names a definition: rest is the task.
         let (def, task) = resolve(&defs, "reviewer check the diff");
