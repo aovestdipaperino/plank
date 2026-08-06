@@ -5235,16 +5235,38 @@ impl Agent<'_> {
     }
 
     fn idle_status_text(&mut self) -> String {
+        let st = self.idle_status();
+        status::build_status_text(&st, false, true)
+    }
+
+    /// The between-turns status snapshot: idle, with the context gauge for the
+    /// transcript as it now stands.
+    fn idle_status(&mut self) -> Status {
         let rendered = render_transcript(&self.session, &self.system);
-        let st = Status {
+        Status {
             state: WorkerState::Idle,
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
             think: self.think,
             ..Status::default()
-        };
-        status::build_status_text(&st, false, true)
+        }
+    }
+
+    /// Publishes the idle snapshot to attached remote clients at the end of a
+    /// turn. Status frames otherwise come only from engine callbacks *during* a
+    /// turn, so without this the last thing a remote ever sees is
+    /// `generating` — its context gauge freezes and anything keyed off "a turn
+    /// is running" (the page's stop button) stays stuck on. Skipped with no
+    /// bridge, since building it re-renders the transcript to count tokens.
+    fn broadcast_idle_status(&mut self) {
+        if self.remote.is_none() {
+            return;
+        }
+        let st = self.idle_status();
+        if let Some(r) = &self.remote {
+            r.bus.broadcast(UiEvent::Status(st));
+        }
     }
 
     /// One TUI turn: runs the generate → tools loop on a worker thread while
@@ -5337,6 +5359,7 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                self.broadcast_idle_status();
                 if crate::notify::should_notify_complete(
                     turn_started.elapsed(),
                     crate::settings::active().ui.notify_after_secs,
@@ -8708,6 +8731,31 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
         assert!(!token.is_empty());
+        agent.remote_off();
+    }
+
+    /// A remote's context gauge and its stop button both key off status
+    /// frames, which otherwise only arrive from engine callbacks *during* a
+    /// turn. Without an idle frame at the end, the last thing a remote ever
+    /// sees is `generating`.
+    #[test]
+    fn turn_end_publishes_an_idle_status_to_the_bus() {
+        let dir = scratch_dir("idle-status-remote");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
+
+        agent.broadcast_idle_status();
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        let found = seen.iter().any(
+            |e| matches!(e, UiEvent::Status(st) if st.state == crate::status::WorkerState::Idle),
+        );
+        assert!(found, "no idle status reached the bus: {seen:?}");
         agent.remote_off();
     }
 
