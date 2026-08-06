@@ -46,6 +46,35 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   token still lands in browser history and any `Referer` header, an accepted
   trade for one-click attach on a loopback-only listener, not a claim that the
   link is secret.
+- **The bundled web client became a real front-end.** It wears plank's own dark
+  theme and logo, renders the model's markdown as it streams (keeping the
+  model's line breaks, which strict markdown would fold), and shows the same
+  directory / branch / engine-origin / reasoning-level segments as the TUI
+  footer beside a live context gauge. The prompt is a three-row box with Enter
+  to send, Shift+Enter for a new line, and ↑/↓ prompt history; `send` is
+  enabled only with something to send and `stop` only while a turn is running.
+  There is no frame-kind selector: everything goes as a prompt and the agent's
+  own slash dispatcher routes it, so `/btw` and friends work from the browser
+  without the page knowing what any of them are.
+- **End-of-turn notification for attached clients.** The desktop notification
+  only reaches whoever is at the machine plank runs on. A finished turn now
+  crosses the wire too: a browser notification where permission allows, an
+  in-page banner that needs none, a blip, and a tab-title flash; the terminal
+  client prints the line with a BEL. Gated by the same `ui.notifyAfterSecs`
+  threshold as the local one, so a turn shorter than it stays quiet everywhere.
+
+### Fixed
+
+- **`/clear` now resets attached remote clients.** It replaced the session and
+  cleared the local log, both local-only, so a browser kept showing a session
+  that no longer existed — and the bus still held the pre-clear scrollback, so
+  a client attaching afterwards was replayed the transcript that had just been
+  cleared. A session reset is now an event on the bus: clients clear, and the
+  scrollback goes with it. `/switch` and `/resume` send it too.
+- **A turn's end reaches remote status.** Status frames came only from engine
+  callbacks during a turn, so the last thing a remote client ever saw was
+  `generating`: its context gauge froze and anything keyed off "a turn is
+  running" stayed stuck on. A turn now publishes an idle snapshot when it ends.
 
 ### Removed
 
