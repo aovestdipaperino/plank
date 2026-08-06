@@ -182,17 +182,66 @@ pub fn set_engine_origin(label: &str) {
     }
 }
 
+/// GPU power cap for the local engine, as a percentage. `0` or `100` means
+/// unlimited and shows no badge.
+///
+/// Process-global beside the origin list rather than carried on [`Status`],
+/// because it has to be readable from *both* sides of the footer: the builder
+/// that composes the origin segment and the TUI that peels that same segment
+/// back off. Two sources would let them disagree about where the segment ends.
+static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Records the local engine's GPU power cap, from startup config or `/power`.
+pub fn set_local_power(percent: i32) {
+    LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The local engine's power badge (`⚡ 60%`), or empty when uncapped.
+#[must_use]
+fn local_power_badge() -> String {
+    let pct = LOCAL_POWER.load(std::sync::atomic::Ordering::Relaxed);
+    if pct > 0 && pct < 100 {
+        format!(" ⚡ {pct}%")
+    } else {
+        String::new()
+    }
+}
+
 /// The engine-origin label: every origin in play, comma-separated in first-seen
 /// order, or [`LOCAL_ORIGIN`] when nothing registered one.
+///
+/// The local entry carries the GPU power cap, because the cap applies to *that*
+/// engine and to no other. Beside a provider it would otherwise read as a
+/// property of the session, which it is not — a `provider: local` sub-agent
+/// under a remote main agent is exactly the case where the distinction matters.
 #[must_use]
 pub fn engine_origin_label() -> String {
+    let local = format!("{LOCAL_ORIGIN}{}", local_power_badge());
     let Ok(origins) = ENGINE_ORIGINS.lock() else {
-        return LOCAL_ORIGIN.to_owned();
+        return local;
     };
     if origins.is_empty() {
-        return LOCAL_ORIGIN.to_owned();
+        return local;
     }
-    origins.join(", ")
+    origins
+        .iter()
+        .map(|o| if o == LOCAL_ORIGIN { &local } else { o })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Serializes tests that touch the process-global origin list or power cap.
+///
+/// These live in two modules (here and [`crate::tui`]), and a reader that calls
+/// [`engine_origin_label`] twice — as `push_dir_prefix` does — sees a torn
+/// result if another test mutates between the calls. Cheaper and more honest
+/// than making every such test tolerate arbitrary global state.
+#[cfg(test)]
+pub(crate) fn origin_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Forgets every recorded origin. Tests only: the list is process-global, and a
@@ -817,12 +866,11 @@ pub fn flash_tip() -> Option<String> {
     }
 }
 
-fn power_suffix(st: &Status) -> String {
-    if st.power_percent > 0 && st.power_percent < 100 {
-        format!(" | ⚡ {}%", st.power_percent)
-    } else {
-        String::new()
-    }
+/// The bar's trailing power slot, now always empty: the reading moved next to
+/// the local origin, where it names the engine it actually caps. Kept as a
+/// seam rather than deleted so the body arms below stay one shape.
+fn power_suffix(_st: &Status) -> String {
+    String::new()
 }
 
 /// Cells in the compaction bar shown in the status bar's tail slot. Much
@@ -1241,6 +1289,7 @@ mod tests {
     /// footer names all of them rather than only whichever registered first.
     #[test]
     fn engine_origins_list_every_engine_in_play() {
+        let _guard = origin_test_guard();
         reset_engine_origins();
         // Nothing registered: the local engine is the implied answer.
         assert_eq!(engine_origin_label(), LOCAL_ORIGIN);
@@ -1559,16 +1608,36 @@ mod tests {
         assert_eq!(&line[mark..ctx], format!("{THINK_MARK} med | "), "{line}");
     }
 
+    /// The power cap rides with the local origin, not the bar's tail: it caps
+    /// that engine and no other, so beside a provider a trailing badge would
+    /// read as a property of the session. Shown only when actually limiting.
     #[test]
-    fn power_suffix_shown_only_when_limited() {
-        let mut st = Status {
+    fn power_badge_rides_with_the_local_origin() {
+        let _guard = origin_test_guard();
+        reset_engine_origins();
+        let st = Status {
             ctx_size: 100,
-            power_percent: 50,
             ..Status::default()
         };
-        assert!(build_status_text(&st, false, true).ends_with("⚡ 50%"));
-        st.power_percent = 100;
+
+        set_local_power(50);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local) ⚡ 50%"), "{line}");
+        assert!(!line.ends_with("⚡ 50%"), "not in the tail slot: {line}");
+
+        // A provider alongside the local engine: the badge stays attached to
+        // the engine it describes.
+        set_engine_origin("regolo.ai");
+        set_engine_origin(LOCAL_ORIGIN);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("regolo.ai, (local) ⚡ 50%"), "{line}");
+
+        // Unlimited: no badge at either end.
+        set_local_power(100);
         assert!(!build_status_text(&st, false, true).contains('⚡'));
+        set_local_power(0);
+        assert!(!build_status_text(&st, false, true).contains('⚡'));
+        reset_engine_origins();
     }
 
     #[test]

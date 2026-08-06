@@ -3177,6 +3177,7 @@ impl Agent<'_> {
                     // No GPU backend yet: record and show it in the footer,
                     // like the C's deferred worker_request_power.
                     self.power_percent = power;
+                    crate::status::set_local_power(power);
                     println!("power limit set to {power}%");
                 }
                 None => println!("usage: /power <1..100>"),
@@ -7437,6 +7438,7 @@ impl Agent<'_> {
             "/power" => match crate::config::parse_power_percent(arg) {
                 Some(power) => {
                     self.power_percent = power;
+                    crate::status::set_local_power(power);
                     log.push_plain(format!("power limit set to {power}%"));
                 }
                 None => log.push_plain("usage: /power <1..100>"),
@@ -8517,6 +8519,7 @@ fn new_agent(
     // combination the fingerprint cannot detect, because it is a disagreement
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
+    crate::status::set_local_power(cfg.power_percent);
     // The alt local engine needs both for the same reasons, and it cannot be
     // skipped as an optimization: `warm_reset` builds its system tokens from
     // these two fields, so an unconfigured engine tokenizes the *same* system

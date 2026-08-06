@@ -3273,6 +3273,7 @@ mod tests {
         let base = Style::default();
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let glyph = crate::status::POWERLINE_BRANCH;
+        let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let rows = status_bar_lines(&text, 0, base, &TaskView::default());
@@ -3347,6 +3348,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let glyph = crate::status::POWERLINE_BRANCH;
+        let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
