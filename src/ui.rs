@@ -1386,12 +1386,48 @@ struct SessionUsage {
 /// local turns too: output is the generated tokens, input the prompt tokens
 /// ingested (from the provider `usage` block when present, else the
 /// context-size delta of the pass).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SessionStats {
     /// Tokens the model ingested (prompt / prefill), summed over all passes.
     input_tokens: u64,
     /// Tokens the model generated, summed over all passes.
     output_tokens: u64,
+    /// The same tally split by the engine that served the pass, in the order
+    /// each engine first contributed.
+    ///
+    /// A `Vec` rather than a map so the main engine leads the report: it is the
+    /// one that served the ordinary turns, and the sub-agent engines below it
+    /// read as the exceptions they are. There are never more than a handful.
+    by_engine: Vec<(String, u64, u64)>,
+}
+
+impl SessionStats {
+    /// Adds one pass's tally, to the total and to `engine`'s row.
+    fn add(&mut self, engine: &str, input: u64, output: u64) {
+        self.input_tokens += input;
+        self.output_tokens += output;
+        if let Some(row) = self.by_engine.iter_mut().find(|r| r.0 == engine) {
+            row.1 += input;
+            row.2 += output;
+        } else {
+            self.by_engine.push((engine.to_owned(), input, output));
+        }
+    }
+}
+
+/// How an engine is named in the end-of-session breakdown: its model, with
+/// local ones marked as such.
+///
+/// The mark is the point of the breakdown — under a provider main agent with a
+/// `provider: local` sub-agent, "which of these tokens cost money" is exactly
+/// the question the split answers.
+fn engine_stats_label(engine: &dyn Engine) -> String {
+    let model = engine.model_name();
+    if engine.is_local() {
+        format!("{model} (local)")
+    } else {
+        model
+    }
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -2606,8 +2642,14 @@ impl Agent<'_> {
                 i64::from(stats.generated),
             )
         };
-        self.stats.input_tokens += u64::try_from(input.max(0)).unwrap_or(0);
-        self.stats.output_tokens += u64::try_from(output.max(0)).unwrap_or(0);
+        // Attributed to `self.engine`, which during a sidechain *is* the alt
+        // engine — the swap happens before the pass, so this needs no notion of
+        // sub-agents to split their tokens out correctly.
+        self.stats.add(
+            &engine_stats_label(&*self.engine),
+            u64::try_from(input.max(0)).unwrap_or(0),
+            u64::try_from(output.max(0)).unwrap_or(0),
+        );
 
         if let Some(u) = stats.usage {
             self.usage.total.add(u);
@@ -3978,7 +4020,7 @@ the original is frozen and listed in /tree"
     /// quiet. Independent of the session save, so it reports even when the
     /// final session was empty (e.g. after `/clear`).
     fn report_run_stats(&self) {
-        let s = self.stats;
+        let s = &self.stats;
         if s.input_tokens == 0 && s.output_tokens == 0 {
             return;
         }
@@ -3994,6 +4036,20 @@ the original is frozen and listed in /tree"
             fmt_u64(s.input_tokens),
             fmt_u64(s.output_tokens),
         );
+        // Only when more than one engine served: with a single one the rows
+        // would just repeat the totals a line lower.
+        if s.by_engine.len() < 2 {
+            return;
+        }
+        let width = s.by_engine.iter().map(|r| r.0.chars().count()).max();
+        for (label, input, output) in &s.by_engine {
+            println!(
+                "  {dim}{label:<w$}{reset}  ↓ {} ↑ {}",
+                fmt_u64(*input),
+                fmt_u64(*output),
+                w = width.unwrap_or(0),
+            );
+        }
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -4265,6 +4321,29 @@ the original is frozen and listed in /tree"
                         slot.done = true;
                     }
                     Ok(pass) => {
+                        // A fan-out slot runs on its own engine, so its tokens
+                        // belong in that engine's row rather than the main
+                        // agent's — and they were never counted at all before
+                        // the breakdown made their absence visible. The usage
+                        // block is the only valid source here: the local
+                        // ctx-delta estimate is keyed to `self.last_ctx_used`,
+                        // which describes the main engine's context, not this
+                        // slot's. Fan-out is provider-only by construction, so
+                        // there is nothing to fall back to.
+                        if let Some(u) = pass.stats.usage {
+                            self.stats.add(
+                                &engine_stats_label(&*slot.engine),
+                                u64::try_from(
+                                    i64::from(u.input_tokens)
+                                        + i64::from(u.cache_read_tokens)
+                                        + i64::from(u.cache_write_tokens),
+                                )
+                                .unwrap_or(0),
+                                u64::try_from(u.output_tokens).unwrap_or(0),
+                            );
+                            self.usage.total.add(u);
+                            self.usage.turns += 1;
+                        }
                         slot.session.push(Message::assistant(pass.assistant_text));
                         if last_round {
                             slot.done = true;
@@ -11736,6 +11815,58 @@ mod tests {
             .expect("still available");
         assert!(agent.local_alt_warmed);
         agent.alt_engines.insert(key, engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every pass is attributed to the engine that served it, so a sidechain on
+    /// an alternate engine lands in its own row rather than the main agent's.
+    /// That split is the whole point under a provider main agent: it answers
+    /// which of the session's tokens were billed and which ran on this machine.
+    #[test]
+    fn run_stats_split_by_the_engine_that_served_the_pass() {
+        let dir = scratch_dir("runstats-by-engine");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let local = |generated, ctx_used| crate::engine::GenerationStats {
+            generated,
+            ctx_used,
+            ..Default::default()
+        };
+        // Two passes on the main engine: in 100 + 30, out 30 + 15.
+        agent.record_usage(&local(30, 130));
+        agent.last_ctx_used = 130;
+        agent.record_usage(&local(15, 175));
+
+        // A sidechain swaps `self.engine` before the pass, which is exactly
+        // what `record_usage` reads — so stand a second engine up the same way.
+        let parent = std::mem::replace(
+            &mut agent.engine,
+            Box::new(ScriptedEngine {
+                local: true,
+                ..ScriptedEngine::default()
+            }),
+        );
+        agent.last_ctx_used = 0;
+        agent.record_usage(&local(7, 57));
+        agent.engine = parent;
+
+        assert_eq!(agent.stats.input_tokens, 180, "totals cover both engines");
+        assert_eq!(agent.stats.output_tokens, 52);
+        assert_eq!(
+            agent.stats.by_engine.len(),
+            2,
+            "{:?}",
+            agent.stats.by_engine
+        );
+        // The main engine leads: it served first.
+        let (_, main_in, main_out) = agent.stats.by_engine[0].clone();
+        assert_eq!((main_in, main_out), (130, 45));
+        let (alt_label, alt_in, alt_out) = agent.stats.by_engine[1].clone();
+        assert_eq!((alt_in, alt_out), (50, 7));
+        assert!(
+            alt_label.contains("(local)"),
+            "a local engine is marked as such: {alt_label}"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
