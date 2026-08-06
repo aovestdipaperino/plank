@@ -577,6 +577,55 @@ test` and review the diff before committing.
   Measured on the real model (`PLANK_TEST_MODEL`): 3263 → 3213 tokens, with 16
   native `｜DSML｜` tokens where there were previously none.
 
+- **A valid deep tier means the tier above it is never written.** `kvtier::warm`
+  restores the *deepest* checkpoint that loads and then skips every tier above
+  it — correct for restoring, because each tier's fingerprint chains its
+  parent's, so a deep hit proves the ancestors match. The consequence is easy to
+  miss: a tier that is skipped is never prefilled, and a tier that is never
+  prefilled is never *persisted*. Once Tier 2 (`project-*.kv`) is valid, Tier 1
+  (`sysprompt-*.kv`) stops being written, and if it was never written before
+  that it never will be.
+
+  This is invisible for the main engine, which restores Tier 2 — a superset of
+  Tier 1 — and is strictly better off. It surfaced only when a `provider: local`
+  sub-agent needed Tier 1 *alone*: a sidechain runs clean-room, so its prompt is
+  the system prompt plus the framed task with no project or session context
+  between them, and restoring Tier 2 would seed the KV with tokens its prompt
+  does not contain. Every first dispatch prefilled the whole system prompt, on a
+  machine carrying a healthy 210 MB Tier 2 checkpoint and not one
+  `sysprompt-*.kv` anywhere.
+
+  The fix is a tier list of **one**: warm the alt engine with only the system
+  tier, so there is nothing deeper to short-circuit it and the checkpoint
+  actually gets built. Still open for the main engine — if its Tier 2 is ever
+  invalidated it rebuilds from token zero rather than restoring Tier 1, and
+  fixing that needs a second snapshot taken at the Tier 1 boundary, since a
+  snapshot captures the whole session and can only be trusted at the boundary it
+  was taken on.
+
+  Two related traps, both of which cost a debugging round here:
+
+  *An engine's warm buffer is built from its own fields.* `warm_reset` calls
+  `build_system_tokens(system, self.trusted_system_len, self.think)`, so an
+  engine that never had `set_trusted_system_prefix`/`set_think_mode` applied
+  tokenizes the same system text differently from the one that wrote the
+  checkpoint. The restore then loads a KV that the token buffer does not
+  describe, the first common-prefix probe truncates back, and the prefill you
+  were avoiding happens anyway — a hit that buys nothing and reports success.
+  Any engine held outside `self.engine` needs the same configuration the main
+  one gets.
+
+  *`warm_sync` cannot be interrupted* (`interrupt: &|| false`) and reports
+  progress only through the sink it is handed. Warming on the thread a front end
+  draws on, with a no-op sink, is a hard freeze for the length of a cold system
+  prompt. Warm at startup where a prefill is expected and drawn, or restore only
+  and leave the prefill to the pass that needs it.
+
+  Corollary for debugging any of this: a silent hit and a silent miss look
+  identical. `kvtier::Restored` names which of the four things happened and the
+  callers print it with the fingerprint and the exact path, because two rounds
+  were spent guessing at it.
+
 ## Part 2 — Environment & tooling
 
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so
