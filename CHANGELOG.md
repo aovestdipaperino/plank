@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.8.2] - 2026-08-06
+
+Beta. The remote-control feature became usable from a browser: `/remote-control`
+(`/rc`) starts the server from inside a session and prints a one-click link, and
+the bundled web client grew into a real front-end. The `--control*` launch flags
+are gone — see Removed.
+
 ### Added
 
 - **A `low` reasoning level (experimental).** `/think low` and `--think-low` sit
@@ -62,6 +69,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in-page banner that needs none, a blip, and a tab-title flash; the terminal
   client prints the line with a BEL. Gated by the same `ui.notifyAfterSecs`
   threshold as the local one, so a turn shorter than it stays quiet everywhere.
+
+- **A dropped connection is unmistakable in the web client.** `disconnected
+  (1006)` renders bold in the error colour rather than as grey small print, and
+  the prompt is disabled with it: nothing typed after the socket closes reaches
+  the agent, and there is no reconnect to wait for, since the token died with
+  the server. The placeholder says to run `/rc` again for a new link.
 
 ### Fixed
 
