@@ -5974,12 +5974,32 @@ impl Agent<'_> {
 
     /// Drops superseded Tier 2 checkpoints for this project once the current
     /// one is known good; they can never be read again and are large.
+    ///
+    /// Every *live* Tier 1 fingerprint is kept, not just the main engine's. A
+    /// `provider: local` sub-agent has its own — keyed on the local model, not
+    /// on the provider's — and collecting against the main engine's alone
+    /// deleted it on every launch, which is why the sub-agent re-prefilled its
+    /// system prompt every single run. Under a provider it was worse than that:
+    /// the provider's fingerprint never has a file, so *nothing* matched the
+    /// keep and the whole directory of system checkpoints went, including ones
+    /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        if let Some(t) = tiers
+        let mut keep: Vec<String> = tiers
             .iter()
-            .find(|t| t.kind == crate::kvtier::TierKind::System)
-        {
-            let _removed = self.store.gc_system_checkpoints(&t.fingerprint);
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+            .map(|t| t.fingerprint.clone())
+            .collect();
+        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
+            keep.extend(
+                self.kv_tiers_for(&alt.model_name())
+                    .into_iter()
+                    .filter(|t| t.kind == crate::kvtier::TierKind::System)
+                    .map(|t| t.fingerprint),
+            );
+        }
+        if !keep.is_empty() {
+            let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+            let _removed = self.store.gc_system_checkpoints(&keep);
         }
         if let Some(t) = tiers
             .iter()
@@ -9536,6 +9556,9 @@ mod tests {
         /// Records each `warm_reset` system text, so a test can assert which
         /// tiers a warm walk actually covered.
         warm_tiers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// Overrides the reported model name, so two spy engines can key
+        /// different Tier 1 checkpoints.
+        model: Option<String>,
         /// When set, `generate` fails with this message instead of replying, so
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
@@ -9672,6 +9695,10 @@ mod tests {
                 seen.lock().unwrap().push(system.to_owned());
             }
             Ok(())
+        }
+
+        fn model_name(&self) -> String {
+            self.model.clone().unwrap_or_default()
         }
     }
 
@@ -12046,6 +12073,55 @@ mod tests {
         // And the live engine's own name reproduces the live plan, so
         // `kv_tiers` is genuinely just this call with one argument filled in.
         assert_eq!(agent.kv_tiers_for(&agent.engine.model_name()), live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The GC keeps every live Tier 1, not just the main engine's. Collecting
+    /// against one fingerprint deleted the alt local engine's checkpoint on
+    /// every launch — so it re-prefilled its system prompt every single run —
+    /// and under a provider main agent it swept the directory clean, the
+    /// provider's own fingerprint never having a file to match.
+    #[test]
+    fn gc_keeps_the_alt_local_engines_system_checkpoint() {
+        let dir = scratch_dir("gc-alt-tier1");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                model: Some("ds4-local".to_string()),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        let main_tiers = agent.kv_tiers();
+        let alt_tiers = agent.kv_tiers_for("ds4-local");
+        let fp = |t: &[crate::kvtier::TierSpec]| {
+            t.iter()
+                .find(|t| t.kind == crate::kvtier::TierKind::System)
+                .expect("a system tier")
+                .fingerprint
+                .clone()
+        };
+        let (main_fp, alt_fp) = (fp(&main_tiers), fp(&alt_tiers));
+        assert_ne!(main_fp, alt_fp, "different models, different Tier 1");
+
+        // Both engines' checkpoints on disk, plus a stale third.
+        let key = |fp: &str| crate::session::KvKey::System { fp: fp.to_owned() };
+        for f in [&main_fp, &alt_fp, &"stale".to_string()] {
+            std::fs::write(agent.store.kv_path(&key(f)), b"x").unwrap();
+        }
+
+        agent.gc_kv_tiers(&main_tiers);
+
+        assert!(
+            agent.store.kv_path(&key(&alt_fp)).exists(),
+            "the sub-agent engine's checkpoint survives its own launch"
+        );
+        assert!(agent.store.kv_path(&key(&main_fp)).exists());
+        assert!(!agent.store.kv_path(&key("stale")).exists(), "stale swept");
         std::fs::remove_dir_all(&dir).ok();
     }
 

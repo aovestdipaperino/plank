@@ -621,6 +621,15 @@ test` and review the diff before committing.
   prompt. Warm at startup where a prefill is expected and drawn, or restore only
   and leave the prefill to the pass that needs it.
 
+  *The checkpoint GC assumed one engine.* `gc_system_checkpoints` deletes every
+  `sysprompt-*.kv` except the fingerprint it is told to keep, and it was told
+  the main engine's. With two engines live that deletes the other's on every
+  launch — and under a provider main agent it deletes *all* of them, since the
+  provider's own fingerprint never has a file and so nothing matches the keep.
+  That, not the tier-skip alone, is why the cache directory held zero system
+  checkpoints. A collector that keys on "the current one" needs every live key,
+  not the first.
+
   Corollary for debugging any of this: a silent hit and a silent miss look
   identical. `kvtier::Restored` names which of the four things happened and the
   callers print it with the fingerprint and the exact path, because two rounds
