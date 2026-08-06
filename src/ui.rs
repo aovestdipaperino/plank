@@ -12076,6 +12076,120 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The whole launch cycle, in the order a launch runs it: warm the alt
+    /// engine, then GC. These two fought — the warm wrote a checkpoint and the
+    /// GC deleted it before the next launch could read it — and neither in
+    /// isolation was wrong. Only the pair is.
+    #[test]
+    fn a_launch_keeps_the_checkpoint_it_just_wrote() {
+        let dir = scratch_dir("launch-cycle");
+        let cfg = test_cfg();
+        // A provider main agent: its Tier 1 fingerprint never has a file, which
+        // is what turned the GC into a full sweep.
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                model: Some("provider-model".to_string()),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.system = "SYSTEM".to_string();
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                model: Some("ds4-local".to_string()),
+                kv_events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+                ..ScriptedEngine::default()
+            }),
+        );
+        let alt_key = crate::session::KvKey::System {
+            fp: agent
+                .kv_tiers_for("ds4-local")
+                .into_iter()
+                .find(|t| t.kind == crate::kvtier::TierKind::System)
+                .expect("a system tier")
+                .fingerprint,
+        };
+
+        agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+        assert!(
+            agent.store.kv_path(&alt_key).exists(),
+            "the warm wrote it: {}",
+            agent.store.kv_path(&alt_key).display()
+        );
+
+        agent.gc_kv_tiers(&agent.kv_tiers());
+
+        assert!(
+            agent.store.kv_path(&alt_key).exists(),
+            "and the GC in the same launch did not take it away again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Three launches in a row: the toll is paid once, not once per launch.
+    /// Each launch gets fresh engines, because carrying one engine across all
+    /// three would hide a checkpoint that never survives to disk.
+    ///
+    /// Measured as "was the checkpoint already there when the launch started" —
+    /// absent once, then present. Counting `warm_reset` would not do: it runs
+    /// on a restore too, so it reads the same whether the launch prefilled or
+    /// not, which is exactly the distinction under test.
+    #[test]
+    fn repeated_launches_warm_the_sub_agent_engine_only_once() {
+        let dir = scratch_dir("launch-repeat");
+        let cfg = test_cfg();
+        let mut found_on_entry = Vec::new();
+
+        for _ in 0..3 {
+            let mut agent = test_agent(
+                &dir,
+                ScriptedEngine {
+                    model: Some("provider-model".to_string()),
+                    ..ScriptedEngine::default()
+                },
+                &cfg,
+            );
+            agent.system = "SYSTEM".to_string();
+            let tiers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            agent.alt_engines.insert(
+                EngineKey::Local,
+                Box::new(ScriptedEngine {
+                    local: true,
+                    model: Some("ds4-local".to_string()),
+                    warm_tiers: Some(std::sync::Arc::clone(&tiers)),
+                    kv_events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+                    ..ScriptedEngine::default()
+                }),
+            );
+
+            let key = crate::session::KvKey::System {
+                fp: agent
+                    .kv_tiers_for("ds4-local")
+                    .into_iter()
+                    .find(|t| t.kind == crate::kvtier::TierKind::System)
+                    .expect("a system tier")
+                    .fingerprint,
+            };
+            found_on_entry.push(agent.store.kv_path(&key).exists());
+
+            agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+            agent.gc_kv_tiers(&agent.kv_tiers());
+            // Warmed exactly once per launch either way — the question is
+            // whether that warm had a checkpoint to restore from.
+            assert_eq!(tiers.lock().unwrap().len(), 1);
+        }
+
+        assert_eq!(
+            found_on_entry,
+            vec![false, true, true],
+            "cold once, then restored — not re-cached every launch"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The GC keeps every live Tier 1, not just the main engine's. Collecting
     /// against one fingerprint deleted the alt local engine's checkpoint on
     /// every launch — so it re-prefilled its system prompt every single run —

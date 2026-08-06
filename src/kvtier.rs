@@ -728,6 +728,9 @@ struct SpyEngine {
     synced: Vec<Option<String>>,
     restored: Vec<Vec<u8>>,
     supports_kv: bool,
+    /// When true `set_kv` fails, standing in for a checkpoint this build cannot
+    /// load — keyed correctly, but not restorable.
+    refuse_kv: bool,
 }
 
 #[cfg(test)]
@@ -767,6 +770,9 @@ impl crate::engine::Engine for SpyEngine {
         ))
     }
     fn set_kv(&mut self, c: &crate::kvcache::KVCache) -> Result<(), crate::engine::EngineError> {
+        if self.refuse_kv {
+            return Err(crate::engine::EngineError::new("refused"));
+        }
         self.restored.push(c.kv().to_vec());
         Ok(())
     }
@@ -848,6 +854,162 @@ mod warm_tests {
         // throw the restored KV away.
         assert_eq!(e.appended, vec![None]);
         assert!(e.synced.is_empty(), "restore never prefills");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system checkpoint is what a sub-agent sidechain restores, and a
+    /// one-tier walk is the only thing that writes it — so assert the *file*,
+    /// not just that a prefill happened. Nothing else in the suite would notice
+    /// if `warm` stopped persisting Tier 1.
+    #[test]
+    fn a_one_tier_warm_persists_the_system_checkpoint() {
+        let (store, dir) = spy_store("tier1-persist");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert!(warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap());
+
+        let key = tiers[0].key.as_ref().expect("system tier is cacheable");
+        assert!(
+            store.kv_path(key).exists(),
+            "the checkpoint a sidechain will look for: {}",
+            store.kv_path(key).display()
+        );
+        assert!(store.kv_load(key).is_some(), "and it loads back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The toll this whole area exists to avoid: a second launch on the same
+    /// fingerprint must restore, not prefill. Two separate engines, because a
+    /// launch is a fresh process — carrying state over in one engine would pass
+    /// while the real thing still re-prefilled.
+    #[test]
+    fn a_second_launch_restores_the_system_tier_instead_of_prefilling() {
+        let (store, dir) = spy_store("tier1-second-launch");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+
+        let mut first = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut first,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(first.synced, vec![None], "the first launch pays for it");
+
+        let mut second = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        let prefilled = warm(
+            &mut second,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(!prefilled, "the second launch prefills nothing");
+        assert!(second.synced.is_empty(), "{:?}", second.synced);
+        assert_eq!(second.restored.len(), 1, "it restored instead");
+        // And the buffer still describes the restored prefix, or the first sync
+        // of the turn would throw the restored KV away.
+        assert_eq!(second.appended, vec![None]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Known gap, pinned deliberately: a valid deep tier means the tier above
+    /// it is never prefilled and so never written. Correct for the main engine,
+    /// which restores the superset — but it means Tier 1 can stay absent
+    /// forever, which is why the sub-agent engine warms a one-tier list of its
+    /// own. If this ever starts passing a checkpoint for Tier 1, that is a
+    /// deliberate improvement and this test should be rewritten, not deleted.
+    #[test]
+    fn a_valid_deep_tier_leaves_the_system_checkpoint_unwritten() {
+        let (store, dir) = spy_store("tier1-skipped");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        // Seed Tier 2 the way a previous launch would have, without Tier 1.
+        let mut seed = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut seed, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        let sys_key = tiers[0].key.as_ref().unwrap();
+        let _ = std::fs::remove_file(store.kv_path(sys_key));
+        assert!(!store.kv_path(sys_key).exists());
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+
+        assert!(
+            !store.kv_path(sys_key).exists(),
+            "Tier 2 restored, so Tier 1 was skipped and never written"
+        );
+        assert!(e.synced.iter().all(|t| t.as_deref() != Some("SYSTEM")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint that is present but will not load is a distinct outcome
+    /// from one that is absent: the first says "something is wrong with this
+    /// file", the second "nothing ever wrote one". Conflating them sent this
+    /// investigation down the wrong path once already.
+    #[test]
+    fn restore_distinguishes_unreadable_from_absent_and_refused() {
+        let (store, dir) = spy_store("restore-outcomes");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let key = tiers[0].key.as_ref().unwrap();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::NoCheckpoint
+        );
+        // No store at all is the same class of miss, reported separately.
+        assert_eq!(restore(&mut e, None, &tiers[0]).unwrap(), Restored::NoKey);
+        // Tier 3 has no key even with a store.
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[2]).unwrap(),
+            Restored::NoKey
+        );
+
+        // Present, correctly named, and garbage inside.
+        std::fs::write(store.kv_path(key), b"not a checkpoint").unwrap();
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::Unreadable
+        );
+        assert_eq!(e.reset_to, None, "and the engine is still untouched");
+
+        // Readable, but this engine will not take it.
+        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        let mut fussy = SpyEngine {
+            supports_kv: true,
+            refuse_kv: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            restore(&mut fussy, Some(&store), &tiers[0]).unwrap(),
+            Restored::EngineRefused
+        );
+        assert!(
+            fussy.synced.is_empty(),
+            "a refusal never falls back to prefill"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
