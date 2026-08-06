@@ -8,7 +8,9 @@
 # hold no credentials — a definition names the key's env var, never the key.
 !multi-provider-tests/*/.plank/
 !multi-provider-tests/*/.plank/**
-/local/
+# `local/` at any depth, not just the root: a scratch directory next to any
+# working tree — including the multi-provider test sessions — stays untracked.
+local/
 /vault/
 # local launch scripts may embed API keys (e.g. scripts/plank-z.sh)
 /scripts/
