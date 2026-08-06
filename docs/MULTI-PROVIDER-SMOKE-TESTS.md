@@ -14,30 +14,40 @@ to delegate. That is what these are for.
 
 | Main engine | Sub-agent engine | Supported |
 |---|---|---|
-| local ds4 | local ds4 (no `provider:`) | yes — the pre-existing behaviour |
+| local ds4 | local ds4 (no `provider:`, or `provider: local`) | yes — the pre-existing behaviour |
 | local ds4 | remote provider (`provider:` set) | **yes — the point of this feature** |
 | remote provider | same or another remote provider | yes |
-| remote provider | local ds4 | **no — see below** |
+| remote provider | local ds4 (`provider: local`) | yes — see below |
+| remote provider | no `provider:` at all | yes, but it runs on the **remote** engine |
 
-### Why "remote main, local sub-agent" does not work
+### "Remote main, local sub-agent": `provider: local`
 
-Not merely unimplemented — there is no local engine in the process to run on.
-`make_host` in `src/main.rs` returns the `ProviderEngine` and **returns early**
-(`src/main.rs:249`), so the ds4 branch never executes and no GGUF is ever
-loaded. A definition without `provider:` runs on "the parent's engine", which in
-that configuration *is* the remote provider.
+`provider: local` names the ds4 engine specifically. When the main agent is a
+provider and any visible definition asks for it, `make_engine` loads the local
+engine *alongside* the provider one and hands it to the `Agent`, which holds it in
+the same cache as any other alternate engine (`EngineKey::Local`). The sidechain
+then runs on the local model while the main conversation stays on the provider.
 
-Making it work would mean loading the local model on demand for a sidechain. The
-default quant needs ~82 GB resident and only one process can hold it
-(`require_min_ram` and the single-instance guard in the same function), so this
-is a real architectural constraint rather than a missing flag. If you want a
-cheap local sub-agent under an expensive remote main agent, the shape that could
-work is a *local plank serving over `--serve`* with the sub-agent pointed at it
-as an OpenAI-compatible endpoint — untested, and out of scope here.
+Two consequences worth knowing before you use it:
 
-**Consequence worth internalising:** with `--provider`, a definition that omits
-`provider:` does not mean "local". It means "whatever the main agent is". Test 7
-checks that this is at least harmless.
+- **It costs the full local residency.** The default quant needs ~82 GB and only
+  one process can hold it (`require_min_ram` plus the single-instance lock), so a
+  provider session with a `provider: local` definition is as heavy to start as a
+  local session. The load happens at startup, deliberately: a missing model or
+  insufficient RAM fails before the prompt rather than mid-turn.
+- **It is opt-in, and only that spelling.** Omitting `provider:` still means "the
+  parent's engine", which under `--provider` is the remote model. The two used to
+  be spelled the same way; they are not the same intention, and only the explicit
+  one triggers the extra load.
+
+Under a *local* main agent, `provider: local` is not an override at all — the
+parent already is the local engine, so the sidechain runs on it and no second
+engine is held.
+
+If the local engine is absent (a build without the ds4 engine, or a session that
+started before the definition existed), dispatching such a definition reports
+`engine unavailable: no local engine in this session` rather than silently running
+on the remote model the definition declined.
 
 ## Setup
 
@@ -192,14 +202,39 @@ fan-out — a mixed block stays serial so side effects keep their order.
 **Run:** `plank --provider anthropic --model claude-opus-5`
 
 **Expect:**
-- `/agent` lists both definitions as before.
+- `/agent` lists every definition as before.
 - `/subagent remote-reviewer …` works (remote main → remote sub-agent).
 - `/subagent local-helper …` **also works, but runs on the remote provider** — it
   has no `provider:`, so it inherits the parent engine. Confirm it is not
   silently doing nothing, and confirm the billing lands on the main key.
 
-There is deliberately no test for "local sub-agent under a remote main agent";
-see the table above.
+### 7b. A local sub-agent under a remote main agent
+
+Add `~/.plank/agents/cheap-local.md`:
+
+```markdown
+---
+name: cheap-local
+description: Grep-and-summarise work that does not need the big model
+provider: local
+---
+Answer from the files you read. Finish with a short report.
+```
+
+**Run:** `plank --provider anthropic --model claude-opus-5` again.
+
+**Expect:**
+- A startup line saying a sub-agent definition asked for the local engine, then
+  the usual model load — the provider session now pays the local load too.
+- `/agent` shows `cheap-local — … [local]`, with no key marker.
+- `/subagent cheap-local summarise src/agents.rs` runs on the **local** model:
+  recognisably the local voice, and slow to first token on a cold KV.
+- The footer's engine-origin indicator still shows the provider afterwards — the
+  swap was restored.
+- `/usage` attributes nothing to the provider for that dispatch.
+
+**Then** remove the definition and restart: no local load, no startup line. The
+cost is paid only when something asks for it.
 
 ## 8. Failure and interruption
 

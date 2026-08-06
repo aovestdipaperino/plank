@@ -101,7 +101,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(engine, &cfg) {
+    match run(engine.main, engine.local, &cfg) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("plank: {e}");
@@ -187,7 +187,30 @@ fn require_min_ram() -> Result<(), String> {
 /// Builds the inference engine: the real ds4 engine on macOS (from `-m`, else
 /// `engine.model` in settings.json, else the default `~/.plank/ds4flash.gguf`,
 /// downloading it if missing), else the stub.
-fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
+/// The engines a session runs on: the main one, and — only when the main engine
+/// is a provider *and* a `provider: local` sub-agent definition exists — the
+/// local ds4 engine held for those sidechains.
+struct Engines {
+    main: Box<dyn Engine>,
+    /// `None` unless a definition explicitly asked for the local engine while
+    /// the main agent is remote. Loading it costs the full ~82 GB residency, so
+    /// it is never speculative.
+    local: Option<Box<dyn Engine>>,
+}
+
+/// Whether any sub-agent definition visible from `cwd` asks for the local
+/// engine explicitly (`provider: local`). Omitting `provider:` does *not* count:
+/// that means "the parent's engine", whatever it happens to be.
+fn wants_local_subagent() -> bool {
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
+    };
+    plank::agents::load_default(&cwd)
+        .iter()
+        .any(|d| matches!(d.engine, Some(plank::agents::AgentEngine::Local)))
+}
+
+fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
     // Remote engine (flavor a, issue #26) is available on every platform and
     // takes precedence over the local selectors when `--remote` is given.
     if let Some(url) = &cfg.remote_url {
@@ -197,7 +220,10 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         let engine = RemoteDs4Engine::connect(url, cfg.remote_token.clone())
             .map_err(|e| format!("remote connect: {e}"))?;
         eprintln!("plank: remote engine ready: {}", engine.model_name());
-        return Ok(Box::new(engine));
+        return Ok(Engines {
+            main: Box::new(engine),
+            local: None,
+        });
     }
     // Provider engine (flavor b, issue #26): third-party LLM APIs behind the
     // Engine trait, available on every platform (pure Rust + HTTP).
@@ -247,8 +273,37 @@ fn make_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             "plank: provider engine ready: {} (ctx {ctx_size})",
             engine.model_name()
         );
-        return Ok(Box::new(engine));
+        // A `provider: local` definition means the ds4 engine specifically, so
+        // load it alongside the provider — otherwise such a sidechain would have
+        // nothing to run on. Costly and deliberate: only an explicit definition
+        // triggers it, and it fails here rather than mid-turn.
+        let local = if wants_local_subagent() {
+            eprintln!(
+                "plank: a sub-agent definition asks for the local engine; loading it alongside the provider..."
+            );
+            Some(make_local_engine(cfg)?)
+        } else {
+            None
+        };
+        return Ok(Engines {
+            main: Box::new(engine),
+            local,
+        });
     }
+    Ok(Engines {
+        main: make_local_engine(cfg)?,
+        local: None,
+    })
+}
+
+/// Loads the local ds4 engine. Used both as the main engine and — when a
+/// `provider: local` sub-agent definition needs one under a provider main agent
+/// — as the spare handed to the `Agent` (see [`make_engine`]).
+///
+/// # Errors
+/// Returns a message when RAM is insufficient, another instance holds the model,
+/// the model file is absent and cannot be fetched, or the engine fails to open.
+fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
     #[cfg(ds4_engine)]
     {
         use plank::config::Backend;
@@ -421,7 +476,7 @@ fn run_serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match plank::serve::run(engine, &ServeConfig { listen, token }) {
+    match plank::serve::run(engine.main, &ServeConfig { listen, token }) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("plank serve: {e}");
@@ -496,10 +551,14 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
     }
 }
 
-fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
+fn run(
+    engine: Box<dyn Engine>,
+    local_engine: Option<Box<dyn Engine>>,
+    cfg: &AgentConfig,
+) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg);
+        return plank::ui::run_non_interactive(engine, cfg, local_engine);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -522,5 +581,5 @@ fn run(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg)
+    plank::ui::run_interactive(engine, cfg, local_engine)
 }

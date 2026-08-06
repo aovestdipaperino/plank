@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-engine sub-agents, including a local one under a remote main agent.** A
+  definition in `~/.plank/agents/*.md` can name the engine its sidechain runs on:
+  `provider:` plus `model:` (with optional `base-url:`, `ctx:`, `api-key-env:`)
+  for a hosted model, or `provider: local` for the local ds4 engine. When the
+  main agent is a provider and a definition asks for `local`, plank loads the
+  local model alongside the provider one so the sidechain has something to run
+  on — at startup, so a missing model or insufficient RAM fails before the
+  prompt rather than mid-turn, and only when a definition actually asks, since it
+  costs the full ~82 GB residency. Under a local main agent `provider: local` is
+  not an override at all and the sidechain runs on the parent engine.
+
+  Note `provider: local` and *omitting* `provider:` are deliberately different:
+  omitting it means "whatever the parent is", which under `--provider` is the
+  remote model. Only the explicit spelling triggers the extra load.
+
 ## [2.8.2] - 2026-08-06
 
 Beta. The remote-control feature became usable from a browser: `/remote-control`

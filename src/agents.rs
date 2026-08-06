@@ -41,8 +41,23 @@ pub struct AgentDef {
     pub auto: bool,
 }
 
-/// Engine override for a named definition: which provider and model its
-/// sidechain runs on, instead of the parent's engine.
+/// Engine override for a named definition: what its sidechain runs on instead
+/// of the parent's engine.
+///
+/// `provider: local` is deliberately distinct from *omitting* `provider:`.
+/// Omitting it means "whatever the parent is", which under `--provider` is the
+/// remote model; `local` means the ds4 engine specifically, and makes plank load
+/// it even when the main agent is remote. Two different intentions that used to
+/// be spelled the same way.
+#[derive(Debug, Clone)]
+pub enum AgentEngine {
+    /// The local ds4 engine, whatever the main agent runs on.
+    Local,
+    /// A provider-backed engine.
+    Provider(ProviderSpec),
+}
+
+/// Which provider and model a definition's sidechain runs on.
 ///
 /// The key *value* is deliberately absent — only the variable's *name* is
 /// configurable, so a definition file stays committable to a shared repo while
@@ -50,7 +65,7 @@ pub struct AgentDef {
 /// endpoints that do not share credentials (two gateways, work vs. personal),
 /// which a single global default cannot address.
 #[derive(Debug, Clone)]
-pub struct AgentEngine {
+pub struct ProviderSpec {
     /// Which provider wire protocol to speak.
     pub kind: ProviderKind,
     /// Provider-side model name, e.g. `claude-opus-5`.
@@ -118,6 +133,8 @@ fn load_def(path: &Path) -> Option<AgentDef> {
     // provider clearly means to use it.
     let engine = match get("provider").as_str() {
         "" => None,
+        // No model, key or URL to give: it is this process's own engine.
+        "local" => Some(AgentEngine::Local),
         provider => {
             let kind = ProviderKind::parse(provider)?;
             let model = get("model");
@@ -133,13 +150,13 @@ fn load_def(path: &Path) -> Option<AgentDef> {
                 v if v.is_empty() => kind.api_key_env().to_string(),
                 v => v,
             };
-            Some(AgentEngine {
+            Some(AgentEngine::Provider(ProviderSpec {
                 kind,
                 model,
                 base_url: Some(get("base-url")).filter(|s| !s.is_empty()),
                 ctx,
                 api_key_env,
-            })
+            }))
         }
     };
     Some(AgentDef {
@@ -200,9 +217,14 @@ pub fn load_default(cwd: &Path) -> Vec<AgentDef> {
 /// Whether a remote-backed definition's API-key variable is absent, making it
 /// undispatchable. Always false for a definition with no engine override.
 fn missing_key(def: &AgentDef) -> bool {
-    def.engine
-        .as_ref()
-        .is_some_and(|e| !std::env::var(&e.api_key_env).is_ok_and(|v| !v.trim().is_empty()))
+    match &def.engine {
+        Some(AgentEngine::Provider(p)) => {
+            !std::env::var(&p.api_key_env).is_ok_and(|v| !v.trim().is_empty())
+        }
+        // A local definition has no credential to be missing. Whether the local
+        // engine is actually loaded is a startup question, not a roster one.
+        Some(AgentEngine::Local) | None => false,
+    }
 }
 
 /// The definitions the model may select on its own initiative.
@@ -260,11 +282,17 @@ pub fn render_list(defs: &[AgentDef]) -> String {
         // variable is unset — the exact variable to set. The model never sees
         // such a definition (see `model_visible`), so this listing is the only
         // place the reason is visible.
-        if let Some(e) = &d.engine {
-            let _ = write!(out, " [{} {}]", e.kind.label(), e.model);
-            if missing_key(d) {
-                let _ = write!(out, " (no {})", e.api_key_env);
+        match &d.engine {
+            Some(AgentEngine::Local) => {
+                let _ = write!(out, " [local]");
             }
+            Some(AgentEngine::Provider(p)) => {
+                let _ = write!(out, " [{} {}]", p.kind.label(), p.model);
+                if missing_key(d) {
+                    let _ = write!(out, " (no {})", p.api_key_env);
+                }
+            }
+            None => {}
         }
         out.push('\n');
     }
@@ -408,7 +436,9 @@ mod tests {
         );
         let defs = load_from(std::slice::from_ref(&root));
         assert_eq!(defs.len(), 1, "{defs:?}");
-        let e = defs[0].engine.as_ref().expect("engine spec");
+        let Some(AgentEngine::Provider(e)) = defs[0].engine.as_ref() else {
+            panic!("expected a provider spec, got {:?}", defs[0].engine);
+        };
         assert_eq!(e.kind, crate::remote::provider::ProviderKind::Anthropic);
         assert_eq!(e.model, "claude-opus-5");
         assert_eq!(e.base_url.as_deref(), Some("https://gw.example/v1"));
@@ -443,7 +473,9 @@ mod tests {
         let by = |n: &str| defs.iter().find(|d| d.name == n).expect("def");
         assert!(by("plain").engine.is_none(), "no provider -> no engine");
         assert!(by("plain").auto);
-        let m = by("minimal").engine.as_ref().expect("engine spec");
+        let Some(AgentEngine::Provider(m)) = by("minimal").engine.as_ref() else {
+            panic!("expected a provider spec");
+        };
         assert!(m.base_url.is_none(), "base-url omitted -> None");
         assert!(m.ctx.is_none(), "ctx omitted -> None");
         assert_eq!(
@@ -451,6 +483,47 @@ mod tests {
             "api-key-env omitted -> the provider default"
         );
         assert!(!by("opted-out").auto, "auto: false is honored");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `provider: local` is its own thing: no model, key or URL to give, and
+    /// distinct from omitting `provider:` (which means "the parent's engine").
+    #[test]
+    fn provider_local_parses_and_needs_nothing_else() {
+        let root = temp_root("engine-local");
+        write_def(
+            &root,
+            "cheap.md",
+            "---\nname: cheap\ndescription: Runs on the local model\nprovider: local\n---\nBody.\n",
+        );
+        write_def(
+            &root,
+            "inherits.md",
+            "---\nname: inherits\ndescription: Runs on whatever the parent is\n---\nBody.\n",
+        );
+        let defs = load_from(std::slice::from_ref(&root));
+        let by = |n: &str| defs.iter().find(|d| d.name == n).expect("def");
+        assert!(
+            matches!(by("cheap").engine, Some(AgentEngine::Local)),
+            "provider: local -> the local engine, got {:?}",
+            by("cheap").engine
+        );
+        assert!(
+            by("inherits").engine.is_none(),
+            "omitting provider: still means the parent's engine"
+        );
+        // No credential to be missing, so it is never hidden from the model.
+        assert!(!missing_key(by("cheap")));
+
+        let listing = render_list(&defs);
+        assert!(
+            listing.contains("cheap — Runs on the local model [local]"),
+            "{listing}"
+        );
+        assert!(
+            !listing.contains("inherits — Runs on whatever the parent is ["),
+            "a parent-engine definition names no engine: {listing}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -478,7 +551,10 @@ mod tests {
         let defs = load_from(std::slice::from_ref(&root));
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["badctx"], "only the recoverable one survives");
-        assert_eq!(defs[0].engine.as_ref().expect("engine").ctx, None);
+        let Some(AgentEngine::Provider(p)) = defs[0].engine.as_ref() else {
+            panic!("expected a provider spec");
+        };
+        assert_eq!(p.ctx, None);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -491,13 +567,13 @@ mod tests {
             description: String::new(),
             body: "Body.".to_string(),
             path: PathBuf::from(format!("/tmp/{name}.md")),
-            engine: Some(AgentEngine {
+            engine: Some(AgentEngine::Provider(ProviderSpec {
                 kind: ProviderKind::Anthropic,
                 model: "m".to_string(),
                 base_url: None,
                 ctx: None,
                 api_key_env: key_env.to_string(),
-            }),
+            })),
             auto,
         }
     }

@@ -1260,13 +1260,21 @@ struct Agent<'a> {
 /// everything else but reading different variables are different engines.
 /// Omitting it would let the second silently reuse the first one's
 /// credentials — the wrong account, with no error to notice.
-type EngineKey = (
-    crate::remote::provider::ProviderKind,
-    String,
-    String,
-    i32,
-    String,
-);
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum EngineKey {
+    /// The local ds4 engine held for `provider: local` definitions when the
+    /// main agent is a provider. There is only ever one.
+    Local,
+    /// A provider-backed engine: provider, resolved base URL, model, context
+    /// window, and API-key variable.
+    Provider(
+        crate::remote::provider::ProviderKind,
+        String,
+        String,
+        i32,
+        String,
+    ),
+}
 
 /// Formats a non-negative token count with thousands separators (`12345` →
 /// `12,345`) for the `/usage` report.
@@ -1704,7 +1712,7 @@ impl Agent<'_> {
         let instructions = matched.as_ref().map(|d| d.body.clone());
         // Resolve the alternate engine *before* forking, so a missing key or an
         // unbuildable engine leaves the transcript exactly as it was.
-        let alt = match matched.as_ref().and_then(|d| d.engine.clone()) {
+        let alt = match self.resolve_alt_spec(matched.as_ref().and_then(|d| d.engine.clone())) {
             None => None,
             Some(spec) => match self.take_alt_engine(&spec) {
                 Ok(pair) => Some(pair),
@@ -4113,7 +4121,7 @@ the original is frozen and listed in /tree"
             }
             let name = call.arg_value("name").unwrap_or("").trim();
             let def = self.agents.iter().find(|d| d.name == name && d.auto)?;
-            let spec = def.engine.clone()?;
+            let spec = self.resolve_alt_spec(def.engine.clone())?;
             specs.push((task.to_owned(), def.body.clone(), spec, def.name.clone()));
         }
         // Now take the engines. Any that turns out serial-only sends the whole
@@ -4331,11 +4339,45 @@ the original is frozen and listed in /tree"
     ///
     /// # Errors
     /// When the key variable is unset or empty, or the engine cannot be built.
+    /// What a definition's engine override resolves to *in this session*.
+    ///
+    /// `provider: local` under a local main agent is not an override at all —
+    /// the parent already *is* the local engine, so running on it is both what
+    /// the definition asked for and one fewer engine to hold. It only becomes a
+    /// real override when the main agent is a provider.
+    fn resolve_alt_spec(
+        &self,
+        spec: Option<crate::agents::AgentEngine>,
+    ) -> Option<crate::agents::AgentEngine> {
+        match spec {
+            Some(crate::agents::AgentEngine::Local) if self.cfg.provider.is_none() => None,
+            other => other,
+        }
+    }
+
     fn take_alt_engine(
         &mut self,
         spec: &crate::agents::AgentEngine,
     ) -> Result<(EngineKey, Box<dyn Engine>), String> {
         use crate::remote::provider::ProviderEngine;
+        let spec = match spec {
+            // The local engine is loaded at startup, never built here: it needs
+            // ~82 GB and a model file, and a mid-turn failure for either would
+            // be far worse than refusing before the prompt. If it is absent,
+            // this session was started without one.
+            crate::agents::AgentEngine::Local => {
+                return self
+                    .alt_engines
+                    .remove(&EngineKey::Local)
+                    .map(|e| (EngineKey::Local, e))
+                    .ok_or_else(|| {
+                        "no local engine in this session (a `provider: local` definition needs one \
+                         at startup; check the roster with /agent)"
+                            .to_owned()
+                    });
+            }
+            crate::agents::AgentEngine::Provider(p) => p,
+        };
         let api_key = std::env::var(&spec.api_key_env)
             .ok()
             .filter(|v| !v.trim().is_empty())
@@ -4361,7 +4403,7 @@ the original is frozen and listed in /tree"
             )
             .unwrap_or_else(|| self.engine.ctx_size()),
         };
-        let key = (
+        let key = EngineKey::Provider(
             spec.kind,
             base_url.clone(),
             spec.model.clone(),
@@ -8135,6 +8177,7 @@ fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
+    local_engine: Option<Box<dyn Engine>>,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -8242,7 +8285,15 @@ fn new_agent(
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
-        alt_engines: std::collections::HashMap::new(),
+        // A local engine handed in alongside a provider main agent lives in the
+        // same cache as any other alternate: `provider: local` definitions take
+        // it out for their sidechain and put it back afterwards, so the
+        // borrow-checked "cannot be in the map and in self.engine at once"
+        // guarantee covers it too.
+        alt_engines: local_engine
+            .map(|e| (EngineKey::Local, e))
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -8250,8 +8301,12 @@ fn new_agent(
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true)?;
+pub fn run_interactive(
+    engine: Box<dyn Engine>,
+    cfg: &AgentConfig,
+    local_engine: Option<Box<dyn Engine>>,
+) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, true, local_engine)?;
 
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
@@ -8537,8 +8592,12 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false)?;
+pub fn run_non_interactive(
+    engine: Box<dyn Engine>,
+    cfg: &AgentConfig,
+    local_engine: Option<Box<dyn Engine>>,
+) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, false, local_engine)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
     crate::notify::set_mode(crate::settings::active().ui.notifications);
@@ -12069,21 +12128,80 @@ mod tests {
             description: String::new(),
             body: "Persona.".to_string(),
             path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
-            engine: Some(crate::agents::AgentEngine {
-                kind: crate::remote::provider::ProviderKind::Anthropic,
-                model: "test-model".to_string(),
-                base_url: Some("https://example.invalid/v1".to_string()),
-                ctx: Some(8192),
-                api_key_env: key_env.to_string(),
-            }),
+            engine: Some(crate::agents::AgentEngine::Provider(
+                crate::agents::ProviderSpec {
+                    kind: crate::remote::provider::ProviderKind::Anthropic,
+                    model: "test-model".to_string(),
+                    base_url: Some("https://example.invalid/v1".to_string()),
+                    ctx: Some(8192),
+                    api_key_env: key_env.to_string(),
+                },
+            )),
             auto: true,
         }
+    }
+
+    /// A `provider: local` definition under a *local* main agent is not an
+    /// override: the parent already is the local engine, so nothing is taken out
+    /// of the cache and no second engine is held.
+    #[test]
+    fn provider_local_runs_on_the_parent_when_the_main_agent_is_local() {
+        let dir = scratch_dir("alt-local-parent");
+        let cfg = test_cfg();
+        assert!(cfg.provider.is_none(), "test_cfg is a local main agent");
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(
+            agent
+                .resolve_alt_spec(Some(crate::agents::AgentEngine::Local))
+                .is_none(),
+            "local under local resolves to the parent engine"
+        );
+    }
+
+    /// Under a provider main agent the same definition *is* an override, and it
+    /// runs on the local engine handed in at startup.
+    #[test]
+    fn provider_local_takes_the_startup_engine_under_a_provider_main() {
+        let dir = scratch_dir("alt-local-provider");
+        let mut cfg = test_cfg();
+        cfg.provider = Some(crate::config::ProviderSelector::Anthropic);
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let spec = crate::agents::AgentEngine::Local;
+
+        // Without one, the dispatch must refuse and say why — never silently run
+        // the sidechain on the remote model the definition declined.
+        let err = agent.take_alt_engine(&spec).expect_err("no local engine");
+        assert!(err.contains("no local engine"), "{err}");
+
+        // Seeded at startup (what `new_agent` does with `--provider` plus a
+        // `provider: local` definition), it is taken out for the sidechain.
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                replies: vec!["from the local model\n".to_string()],
+                ..ScriptedEngine::default()
+            }),
+        );
+        let (key, engine) = agent.take_alt_engine(&spec).expect("local engine");
+        assert_eq!(key, EngineKey::Local);
+        assert!(
+            agent.alt_engines.is_empty(),
+            "removed while its sidechain runs, so it cannot be in two places"
+        );
+        // And the resolver keeps it an override in this configuration.
+        assert!(
+            agent
+                .resolve_alt_spec(Some(crate::agents::AgentEngine::Local))
+                .is_some(),
+            "local under a provider main stays an override"
+        );
+        drop(engine);
     }
 
     /// The cache key `take_alt_engine` derives from [`remote_def`], so a test can
     /// pre-seed `alt_engines` and keep the dispatch entirely offline.
     fn remote_key(key_env: &str) -> EngineKey {
-        (
+        EngineKey::Provider(
             crate::remote::provider::ProviderKind::Anthropic,
             "https://example.invalid/v1".to_string(),
             "test-model".to_string(),
@@ -12181,12 +12299,12 @@ mod tests {
             unsafe { std::env::set_var(&var, "sk-test") };
             let mut def = remote_def(&name, &var);
             // Distinct models so each slot gets its own cache key.
-            if let Some(e) = def.engine.as_mut() {
-                e.model = format!("model-{i}");
+            if let Some(crate::agents::AgentEngine::Provider(p)) = def.engine.as_mut() {
+                p.model = format!("model-{i}");
             }
             agent.agents.push(def);
             agent.alt_engines.insert(
-                (
+                EngineKey::Provider(
                     crate::remote::provider::ProviderKind::Anthropic,
                     "https://example.invalid/v1".to_string(),
                     format!("model-{i}"),
@@ -12240,7 +12358,7 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let vars = install_parallel_defs(&mut agent, &[("", 0, false), ("ok text\n", 0, false)]);
         // Turn slot 0 into a panicking engine, keeping its cache key.
-        let key = (
+        let key = EngineKey::Provider(
             crate::remote::provider::ProviderKind::Anthropic,
             "https://example.invalid/v1".to_string(),
             "model-0".to_string(),
@@ -12645,9 +12763,14 @@ mod tests {
         let (key_b, _) = agent.take_alt_engine(&spec_b).expect("engine b");
 
         assert_ne!(key_a, key_b, "distinct cache keys");
-        // Parenthesised: `key_a.4` on a tuple-in-tuple would lex as a float.
-        assert_eq!((key_a).4, A);
-        assert_eq!((key_b).4, B);
+        // The key-variable is part of the identity: two definitions differing
+        // only in credential must not share a cached engine.
+        let env_of = |k: &EngineKey| match k {
+            EngineKey::Provider(_, _, _, _, env) => env.clone(),
+            EngineKey::Local => panic!("expected a provider key"),
+        };
+        assert_eq!(env_of(&key_a), A);
+        assert_eq!(env_of(&key_b), B);
         for var in [A, B] {
             unsafe { std::env::remove_var(var) };
         }
