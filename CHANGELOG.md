@@ -37,9 +37,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fresh token, printing `http://127.0.0.1:PORT/?t=TOKEN` plus an `ssh -L`
   tunnel hint. Opening that link auto-connects the bundled web client and
   claims control immediately, since typing `/rc` is the operator's own
-  consent — no token to paste, no button to press. Without the `?t=` query the
-  page behaves as before: URL prefilled from `location.host`, but manual
-  token, manual connect, manual take-control button. `/rc off`
+  consent — no token to paste, no button to press. That link is the only way in,
+  so the client's URL and token fields are gone: the token is printed nowhere
+  else, and a page opened without `?t=` says so instead of offering controls
+  that cannot authenticate. `/rc off`
   tells connected clients, shuts the listener down, and the token dies with it,
   so a stale link is refused; a later `/rc` mints a new port and token. The
   token still lands in browser history and any `Referer` header, an accepted
