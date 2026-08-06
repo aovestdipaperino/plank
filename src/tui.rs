@@ -2298,16 +2298,21 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
     //
-    // While the *local* engine is prefilling or generating, its brain blinks —
+    // While the *local* engine is prefilling or generating, its brain flashes —
     // the one on-screen signal that says which engine is actually working, which
     // is otherwise invisible for a `provider: local` sidechain under a remote
-    // main agent. The blink dims rather than blanks, so nothing shifts width.
+    // main agent. The flash swaps the cell *background*, never the glyph, so
+    // nothing shifts width.
+    //
+    // Background and not foreground: `THINK_MARK` is a color emoji, and a
+    // terminal paints those from the glyph's own palette — an `fg` change is
+    // simply not rendered, which is why an earlier dim-the-foreground version
+    // of this ran correctly and showed nothing at all.
     //
     // Phased off the pass's own elapsed time rather than `tick_ms`: the status
     // bar redraws when a prefill/generation event lands — the same event that
-    // moves the `9s` and `t/s` readouts — so tying the blink to that interval
-    // keeps the two in step and makes every pass start on a lit brain.
-    // `tick_ms == 0` still means reduced motion, and there the brain holds lit.
+    // moves the `9s` and `t/s` readouts — so tying the flash to that interval
+    // keeps the two in step and makes every pass start unlit.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
@@ -2321,7 +2326,7 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
             let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
             spans.push(Span::styled(
                 think_mark.to_string(),
-                base.fg(Color::Indexed(240)),
+                base.bg(Color::Indexed(crate::status::THEME_COLOR)),
             ));
             spans.push(Span::styled(rest.to_string(), base));
         }
@@ -3151,69 +3156,121 @@ mod tests {
         );
     }
 
-    /// The brain blinks only while a local pass is in flight, and dims rather
-    /// than disappears so the bar never changes width. This is the only signal
-    /// that says *which* engine is working, so it has to be off when nothing
-    /// local is running and it has to actually alternate when something is.
+    /// The brain flashes only while a local pass is in flight, and does it by
+    /// swapping the cell background so the bar never changes width. This is the
+    /// only signal that says *which* engine is working, so it has to be off
+    /// when nothing local is running and it has to actually alternate when
+    /// something is.
     ///
-    /// The phase comes from the pass's own elapsed time, not from `tick_ms` —
-    /// so the sweep here backdates the pass start rather than moving the clock.
+    /// Asserts on the **background**, which is what a terminal actually paints
+    /// for a color emoji — a foreground assertion passed happily while the
+    /// screen showed nothing.
+    ///
+    /// The phase comes from the pass's own elapsed time, not from `tick_ms`, so
+    /// the sweep here moves the pass clock rather than the animation clock.
     #[test]
-    fn the_brain_blinks_only_while_a_local_pass_runs() {
+    fn the_brain_flashes_only_while_a_local_pass_runs() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
-        let dim = Color::Indexed(240);
+        let flash = Color::Indexed(crate::status::THEME_COLOR);
         let text = format!("~/x | {mark} med | ctx 12% | generating");
-        let brain_style = || -> Option<Color> {
+        let brain_bg = || -> Option<Color> {
             status_bar_lines(&text, 0, base, &TaskView::default())
                 .into_iter()
                 .flat_map(|l| l.spans)
                 .find(|sp| sp.content.contains(mark))
                 .expect("think segment present")
                 .style
-                .fg
+                .bg
         };
 
-        // Idle: lit, whatever the clock is doing.
+        // Idle: unlit, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
         assert_ne!(
-            brain_style(),
-            Some(dim),
-            "no blink when nothing local is running"
+            brain_bg(),
+            Some(flash),
+            "no flash when nothing local is running"
         );
 
-        // A local pass in flight: both phases appear across one cycle. A pass
-        // starts lit, which is the point of phasing off its own clock.
+        // A local pass in flight: both phases appear across one cycle, and it
+        // starts unlit — the point of phasing off the pass's own clock.
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            assert_ne!(brain_style(), Some(dim), "a pass starts on a lit brain");
+            assert_ne!(brain_bg(), Some(flash), "a pass starts unlit");
             let phases: Vec<_> = (0..8u64)
                 .map(|step| {
                     crate::status::set_local_pass_ms(step * crate::status::BRAIN_BLINK_MS / 8);
-                    brain_style()
+                    brain_bg()
                 })
                 .collect();
-            assert!(phases.contains(&Some(dim)), "{phases:?}");
-            assert!(phases.iter().any(|c| *c != Some(dim)), "{phases:?}");
+            assert!(phases.contains(&Some(flash)), "{phases:?}");
+            assert!(phases.iter().any(|c| *c != Some(flash)), "{phases:?}");
 
-            // Reduced motion collapses the blink to its static form like every
-            // other effect: lit, even mid-cycle where it would otherwise be
-            // dark. Asserted here rather than in a test of its own — both the
+            // Reduced motion collapses the flash to its static form like every
+            // other effect: unlit, even mid-cycle where it would otherwise be
+            // on. Asserted here rather than in a test of its own — both the
             // reduced-motion toggle and the local-pass flag are process-global,
             // so two tests holding them would race under the default harness.
             crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
-            assert_eq!(brain_style(), Some(dim), "the phase used for the check");
+            assert_eq!(brain_bg(), Some(flash), "the phase used for the check");
             crate::anim::set_reduced_motion(true);
-            let still_lit = brain_style() != Some(dim);
+            let still_unlit = brain_bg() != Some(flash);
             crate::anim::set_reduced_motion(false);
-            assert!(still_lit, "reduced motion holds the brain lit");
+            assert!(still_unlit, "reduced motion holds the brain unlit");
         }
 
         // And the guard's drop ends it, so a finished pass cannot leave the bar
-        // blinking forever.
+        // flashing forever.
         assert!(!crate::status::local_pass_active());
-        assert_ne!(brain_style(), Some(dim));
+        assert_ne!(brain_bg(), Some(flash));
+    }
+
+    /// End-to-end through a real terminal buffer: the flash has to survive
+    /// `Paragraph::style`, which paints the whole status area before the spans
+    /// are drawn over it. A span style that loses to the widget style would
+    /// pass the span-level test and still show nothing.
+    #[test]
+    fn the_brain_flash_reaches_the_rendered_cells() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::widgets::Paragraph;
+
+        let mark = crate::status::THINK_MARK;
+        let text = format!("~/x | {mark} med | ctx 12% | generating");
+        let status_style = Style::default()
+            .bg(Color::Indexed(238))
+            .fg(Color::Indexed(252));
+        let flash = Color::Indexed(crate::status::THEME_COLOR);
+
+        let brain_cell_bg = || {
+            let mut term = Terminal::new(TestBackend::new(60, 2)).unwrap();
+            term.draw(|f| {
+                f.render_widget(
+                    Paragraph::new(status_bar_lines(
+                        &text,
+                        0,
+                        status_style,
+                        &TaskView::default(),
+                    ))
+                    .style(status_style),
+                    f.area(),
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer().clone();
+            // The emoji's own cell, wherever the two-row split put it.
+            (0..buf.area.height)
+                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
+                .find(|&(x, y)| buf[(x, y)].symbol().contains(mark))
+                .map(|(x, y)| buf[(x, y)].bg)
+        };
+
+        let _guard = crate::status::LocalPass::begin();
+        crate::status::set_local_pass_ms(0);
+        assert_eq!(brain_cell_bg(), Some(Color::Indexed(238)), "unlit half");
+        crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
+        assert_eq!(brain_cell_bg(), Some(flash), "lit half reaches the cell");
     }
 
     /// The bar is two rows: row one is the directory and branch and nothing
