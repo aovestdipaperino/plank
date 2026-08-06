@@ -894,3 +894,32 @@ test` and review the diff before committing.
   and not when reasoning about adjacency. Note also that the log cannot see
   hallucinated non-DSML markup at all, since `log_tool_error` is only reached
   from paths that already classified something as tool markup.
+
+- **Two test shapes that are flaky against a live loopback server.** Both bit
+  the `/remote-control` work; the second bit it twice, the second time after a
+  fix agent had measured 30 clean runs of the test in isolation.
+
+  *Never probe whether a port is still bound after the server shut down.* The
+  server binds `127.0.0.1:0`, so `remote_off` releases an ephemeral port that
+  another test in the parallel suite can be handed immediately — the probe
+  connects, succeeds, and the assertion fails for a reason that has nothing to
+  do with the code under test. It passes in isolation and on an unloaded
+  machine, which is what makes it expensive: it fails in CI, or on the run
+  where you are trying to diagnose something else.
+
+  *Never assert an `Arc` refcount in a test that also opens a connection to the
+  same server.* Counting references to the shared state is the right way to
+  prove a shutdown actually dropped the server rather than leaking it — a
+  `std::mem::forget(server)` passes every other assertion. But a connection
+  makes the accept loop spawn a handler thread that clones the same `Arc`, and
+  that thread can outlive `remote_off`, so the count is above 1 for a reason
+  unrelated to leaking. The fix is not a sleep or a retry: put the two
+  properties in separate tests, one that connects and never counts, one that
+  counts and never connects (`remote_on_installs_a_bridge_and_remote_off_tears_it_down`
+  and `remote_off_drops_the_server_rather_than_leaking_it` in `src/ui.rs`).
+
+  The general shape: a test whose failure mode is *another test's timing* will
+  not reproduce under `cargo test --lib <name>`. Verify this class by running
+  the full suite in a loop ten-plus times, not the test alone — and verify the
+  assertion still discriminates by mutating the code it guards, since the
+  obvious repair for flakiness is an assertion that can no longer fail.
