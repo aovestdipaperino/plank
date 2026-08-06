@@ -791,6 +791,16 @@ pub trait Engine: Debug + Send {
     fn max_parallel(&self) -> usize {
         1
     }
+
+    /// Whether this engine runs the model on this machine's own weights.
+    ///
+    /// Drives the status bar's blinking brain, so the operator can see *which*
+    /// engine is working — the point being a `provider: local` sub-agent under a
+    /// remote main agent, where nothing else on screen distinguishes the two.
+    /// False by default: a provider or a remote host is somebody else's GPU.
+    fn is_local(&self) -> bool {
+        false
+    }
 }
 
 /// Text force-fed to close an unclosed `<think>` before the model retries a

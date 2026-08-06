@@ -612,6 +612,57 @@ pub fn tool_blink_on(tick_ms: u64) -> bool {
     tick_ms % TOOL_BLINK_MS < TOOL_BLINK_MS / 2
 }
 
+/// Whether the engine currently prefilling or generating runs on this machine's
+/// own weights. Process-global for the same reason the tool label is: the TUI
+/// draws on the UI thread while the pass runs on the worker, and the renderer
+/// only ever receives the *rendered* status string, not the engine.
+///
+/// True for exactly the span of a local pass, which is what lets the think
+/// segment's brain blink mean "the local model is working right now" — including
+/// a `provider: local` sub-agent sidechain under a remote main agent, since the
+/// engine swap happens before the pass begins.
+static LOCAL_PASS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a local-engine pass is in flight.
+#[must_use]
+pub fn local_pass_active() -> bool {
+    LOCAL_PASS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Marks a local-engine pass as running for as long as the guard lives.
+///
+/// A guard rather than a set/clear pair for the same reason [`ToolActivity`] is
+/// one: a pass has several early returns and can panic, and a leaked `true`
+/// would leave the brain blinking forever.
+#[derive(Debug)]
+pub struct LocalPass;
+
+impl LocalPass {
+    /// Marks a pass as local; the returned guard clears it.
+    #[must_use]
+    pub fn begin() -> Self {
+        LOCAL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for LocalPass {
+    fn drop(&mut self) {
+        LOCAL_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How long one on/off cycle of the local-engine brain blink takes. Slower than
+/// the tool blink: this is a reassurance, not an alert, and a fast pulse next to
+/// the shimmering verb would be noise.
+pub const BRAIN_BLINK_MS: u64 = 1200;
+
+/// Whether the brain is in the lit half of its blink at `tick_ms`.
+#[must_use]
+pub fn brain_blink_on(tick_ms: u64) -> bool {
+    tick_ms % BRAIN_BLINK_MS < BRAIN_BLINK_MS / 2
+}
+
 /// Sets the running-tools label for as long as the guard lives, then hands it
 /// over to its linger window on drop, so no early return (or panic) can leave
 /// the bar claiming a tool is still running.

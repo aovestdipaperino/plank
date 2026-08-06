@@ -2297,10 +2297,26 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     };
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
+    //
+    // While the *local* engine is prefilling or generating, its brain blinks —
+    // the one on-screen signal that says which engine is actually working, which
+    // is otherwise invisible for a `provider: local` sidechain under a remote
+    // main agent. The blink dims rather than blanks, so nothing shifts width.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
-        spans.push(Span::styled(text[..i].to_string(), base));
+        let segment = &text[..i];
+        let lit = !crate::status::local_pass_active() || crate::status::brain_blink_on(tick_ms);
+        if lit {
+            spans.push(Span::styled(segment.to_string(), base));
+        } else {
+            let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
+            spans.push(Span::styled(
+                think_mark.to_string(),
+                base.fg(Color::Indexed(240)),
+            ));
+            spans.push(Span::styled(rest.to_string(), base));
+        }
         spans.push(Span::styled(" | ".to_string(), base));
         text = &text[i + " | ".len()..];
     }
@@ -3125,6 +3141,53 @@ mod tests {
             joined.contains(&format!("{mark} max | ctx 12%")),
             "{joined}"
         );
+    }
+
+    /// The brain blinks only while a local pass is in flight, and dims rather
+    /// than disappears so the bar never changes width. This is the only signal
+    /// that says *which* engine is working, so it has to be off when nothing
+    /// local is running and it has to actually alternate when something is.
+    #[test]
+    fn the_brain_blinks_only_while_a_local_pass_runs() {
+        let base = Style::default();
+        let mark = crate::status::THINK_MARK;
+        let dim = Color::Indexed(240);
+        let text = format!("~/x | {mark} med | ctx 12% | generating");
+        let brain_style = |tick: u64| -> Option<Color> {
+            status_bar_lines(&text, tick, base, &TaskView::default())
+                .into_iter()
+                .flat_map(|l| l.spans)
+                .find(|sp| sp.content.contains(mark))
+                .expect("think segment present")
+                .style
+                .fg
+        };
+
+        // Idle: lit at every phase of the clock.
+        assert!(!crate::status::local_pass_active());
+        for step in 0..8u64 {
+            assert_ne!(
+                brain_style(step * crate::status::BRAIN_BLINK_MS / 4),
+                Some(dim),
+                "no blink when nothing local is running"
+            );
+        }
+
+        // A local pass in flight: both phases appear across one cycle.
+        {
+            let _guard = crate::status::LocalPass::begin();
+            assert!(crate::status::local_pass_active());
+            let phases: Vec<_> = (0..8u64)
+                .map(|step| brain_style(step * crate::status::BRAIN_BLINK_MS / 8))
+                .collect();
+            assert!(phases.contains(&Some(dim)), "{phases:?}");
+            assert!(phases.iter().any(|c| *c != Some(dim)), "{phases:?}");
+        }
+
+        // And the guard's drop ends it, so a finished pass cannot leave the bar
+        // blinking forever.
+        assert!(!crate::status::local_pass_active());
+        assert_ne!(brain_style(0), Some(dim));
     }
 
     /// The bar is two rows: row one is the directory and branch and nothing

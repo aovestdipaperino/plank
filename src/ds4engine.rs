@@ -857,6 +857,12 @@ impl Ds4Session {
 }
 
 impl Engine for Ds4Session {
+    /// This machine's own weights, which is what the status bar's blinking brain
+    /// reports (see [`crate::status::LocalPass`]).
+    fn is_local(&self) -> bool {
+        true
+    }
+
     #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,

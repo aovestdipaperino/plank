@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The status bar's brain blinks while the local engine works.** The 🧠 already
+  in the think segment pulses for the whole span of a local prefill or
+  generation, and sits still otherwise — so which engine is actually running is
+  visible rather than inferred. It answers a question nothing on screen could:
+  a `provider: local` sub-agent under a remote main agent looks identical to one
+  running on the provider, since the engine-origin segment reports the session's
+  engine and never changes. The blink dims rather than blanks, so the bar never
+  changes width, and it is driven by a guard held across the pass, so an early
+  return or a panic cannot leave it pulsing forever.
+
 ### Changed
 
 - **The status bar is two rows.** Row one is the working directory and the git

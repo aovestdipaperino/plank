@@ -1912,6 +1912,11 @@ fn generate_pass(
     sink: Box<dyn crate::viz::RenderSink + Send>,
     preflight: impl FnMut(&ToolCall) -> Result<(), String> + 'static,
 ) -> Result<QuietPass, String> {
+    // Held for the whole pass, so the status bar's brain blinks while *this*
+    // engine works — and stops when the pass ends, however it ends. A sidechain
+    // on a `provider: local` definition swaps the engine before getting here, so
+    // this reports the engine actually generating rather than the session's.
+    let _local = engine.is_local().then(crate::status::LocalPass::begin);
     let mut stream = StreamRenderer::new(sink);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
@@ -9111,6 +9116,10 @@ mod tests {
     /// after the engine moves into the Agent) and reports the pass at index
     /// `interrupt_at` as user-interrupted.
     #[derive(Debug, Default)]
+    // Independent capability knobs on a test double, not a state machine: each
+    // flag turns one real engine behaviour on or off so a test can stand exactly
+    // where it needs to.
+    #[allow(clippy::struct_excessive_bools)]
     struct ScriptedEngine {
         replies: Vec<String>,
         next: usize,
@@ -9140,6 +9149,13 @@ mod tests {
         /// Overrides the reported context size, so tests can stand on either
         /// side of `THINK_MAX_MIN_CONTEXT`. `None` reports the usual `100_000`.
         ctx_override: Option<i32>,
+        /// When true the engine claims to run on this machine's weights, which is
+        /// what `generate_pass` keys the status bar's blinking brain off.
+        local: bool,
+        /// Records `status::local_pass_active()` as observed from *inside*
+        /// `generate`, so a test can assert the pass marked itself while it was
+        /// actually generating rather than merely before or after.
+        saw_local_pass: Option<std::sync::Arc<AtomicBool>>,
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
@@ -9188,6 +9204,9 @@ mod tests {
     }
 
     impl Engine for ScriptedEngine {
+        fn is_local(&self) -> bool {
+            self.local
+        }
         fn generate(
             &mut self,
             prompt: crate::engine::Prompt<'_>,
@@ -9196,6 +9215,9 @@ mod tests {
             _greedy: &dyn Fn() -> bool,
             on_event: &mut dyn FnMut(EngineEvent),
         ) -> Result<GenerationStats, EngineError> {
+            if let Some(seen) = &self.saw_local_pass {
+                seen.store(crate::status::local_pass_active(), Ordering::Relaxed);
+            }
             if let Some(msg) = &self.fail_with {
                 return Err(EngineError::new(msg.clone()));
             }
@@ -12222,6 +12244,70 @@ mod tests {
         );
         assert!(pass.calls.is_empty());
         assert!(pass.tool_error.is_none());
+    }
+
+    /// The wiring the blink depends on: a pass on a local engine must mark itself
+    /// local *while generating*, and must clear it afterwards. Without this the
+    /// renderer's blink logic would be correct and never triggered.
+    #[test]
+    fn a_local_pass_marks_itself_local_while_it_generates() {
+        let seen = std::sync::Arc::new(AtomicBool::new(false));
+        let mut engine = ScriptedEngine {
+            replies: vec!["done\n".to_string()],
+            local: true,
+            saw_local_pass: Some(std::sync::Arc::clone(&seen)),
+            ..ScriptedEngine::default()
+        };
+        assert!(
+            !crate::status::local_pass_active(),
+            "nothing running before the pass"
+        );
+        let opts = crate::engine::GenerationOptions::default();
+        let ctx = PassCtx {
+            opts: &opts,
+            think_off: true,
+            thinking_tool_calls: false,
+            tool_names: Vec::new(),
+        };
+        generate_pass(
+            &mut engine,
+            "[user]\nhi\n",
+            None,
+            &ctx,
+            Box::new(NullSink),
+            |_call| Ok(()),
+        )
+        .expect("a pass");
+
+        assert!(
+            seen.load(Ordering::Relaxed),
+            "the pass was not marked local while generating"
+        );
+        assert!(
+            !crate::status::local_pass_active(),
+            "and the guard cleared it on the way out"
+        );
+
+        // A non-local engine must not mark it at all.
+        let seen_remote = std::sync::Arc::new(AtomicBool::new(false));
+        let mut remote = ScriptedEngine {
+            replies: vec!["done\n".to_string()],
+            saw_local_pass: Some(std::sync::Arc::clone(&seen_remote)),
+            ..ScriptedEngine::default()
+        };
+        generate_pass(
+            &mut remote,
+            "[user]\nhi\n",
+            None,
+            &ctx,
+            Box::new(NullSink),
+            |_call| Ok(()),
+        )
+        .expect("a pass");
+        assert!(
+            !seen_remote.load(Ordering::Relaxed),
+            "a provider pass must not claim the local engine is working"
+        );
     }
 
     /// A fan-out-capable stub: reports `max_parallel() > 1` and optionally sleeps
