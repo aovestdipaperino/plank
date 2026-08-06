@@ -2298,35 +2298,35 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
     //
-    // While the *local* engine is prefilling or generating, its brain flashes —
+    // While the *local* engine is prefilling or generating, its brain blinks —
     // the one on-screen signal that says which engine is actually working, which
     // is otherwise invisible for a `provider: local` sidechain under a remote
-    // main agent. The flash swaps the cell *background*, never the glyph, so
-    // nothing shifts width.
+    // main agent.
     //
-    // Background and not foreground: `THINK_MARK` is a color emoji, and a
-    // terminal paints those from the glyph's own palette — an `fg` change is
-    // simply not rendered, which is why an earlier dim-the-foreground version
-    // of this ran correctly and showed nothing at all.
+    // The dark half replaces the glyph with its own width in spaces, so the
+    // brain genuinely disappears and the rest of the bar holds still. Styling
+    // the emoji is not an option: `THINK_MARK` is a color emoji, and a terminal
+    // paints those from the glyph's own palette — an earlier version dimmed its
+    // foreground, which a terminal simply does not render.
     //
     // Phased off the pass's own elapsed time rather than `tick_ms`: the status
     // bar redraws when a prefill/generation event lands — the same event that
-    // moves the `9s` and `t/s` readouts — so tying the flash to that interval
-    // keeps the two in step and makes every pass start unlit.
+    // moves the `9s` and `t/s` readouts — so tying the blink to that interval
+    // keeps the two in step and makes every pass start with the brain showing.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        let lit = !crate::status::local_pass_active()
+        let showing = !crate::status::local_pass_active()
             || crate::anim::reduced_motion()
             || crate::status::brain_blink_on(crate::status::local_pass_ms());
-        if lit {
+        if showing {
             spans.push(Span::styled(segment.to_string(), base));
         } else {
             let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
             spans.push(Span::styled(
-                think_mark.to_string(),
-                base.bg(Color::Indexed(crate::status::THEME_COLOR)),
+                " ".repeat(UnicodeWidthStr::width(think_mark)),
+                base,
             ));
             spans.push(Span::styled(rest.to_string(), base));
         }
@@ -3156,121 +3156,112 @@ mod tests {
         );
     }
 
-    /// The brain flashes only while a local pass is in flight, and does it by
-    /// swapping the cell background so the bar never changes width. This is the
-    /// only signal that says *which* engine is working, so it has to be off
-    /// when nothing local is running and it has to actually alternate when
-    /// something is.
+    /// The brain blinks only while a local pass is in flight, and the dark half
+    /// is the glyph's own width in spaces so the bar never reflows. This is the
+    /// only signal that says *which* engine is working, so it has to hold still
+    /// when nothing local is running and actually alternate when something is.
     ///
-    /// Asserts on the **background**, which is what a terminal actually paints
-    /// for a color emoji — a foreground assertion passed happily while the
-    /// screen showed nothing.
+    /// Asserts on the glyph's presence and the row's width, not on a color:
+    /// `THINK_MARK` is a color emoji, and an earlier version that changed its
+    /// foreground passed a color assertion while the screen showed nothing.
     ///
     /// The phase comes from the pass's own elapsed time, not from `tick_ms`, so
     /// the sweep here moves the pass clock rather than the animation clock.
     #[test]
-    fn the_brain_flashes_only_while_a_local_pass_runs() {
+    fn the_brain_blinks_only_while_a_local_pass_runs() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
-        let flash = Color::Indexed(crate::status::THEME_COLOR);
         let text = format!("~/x | {mark} med | ctx 12% | generating");
-        let brain_bg = || -> Option<Color> {
+        let rows = || -> Vec<String> {
             status_bar_lines(&text, 0, base, &TaskView::default())
                 .into_iter()
-                .flat_map(|l| l.spans)
-                .find(|sp| sp.content.contains(mark))
-                .expect("think segment present")
-                .style
-                .bg
+                .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
+                .collect()
         };
+        let brain_showing = || rows().iter().any(|r| r.contains(mark));
+        // Every rendering must occupy the same columns, blinked or not.
+        let widths = |r: &[String]| -> Vec<usize> { r.iter().map(|l| l.width()).collect() };
+        let reference = widths(&rows());
 
-        // Idle: unlit, whatever the clock is doing.
+        // Idle: showing, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        assert_ne!(
-            brain_bg(),
-            Some(flash),
-            "no flash when nothing local is running"
-        );
+        assert!(brain_showing(), "no blink when nothing local is running");
 
         // A local pass in flight: both phases appear across one cycle, and it
-        // starts unlit — the point of phasing off the pass's own clock.
+        // starts showing — the point of phasing off the pass's own clock.
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            assert_ne!(brain_bg(), Some(flash), "a pass starts unlit");
-            let phases: Vec<_> = (0..8u64)
+            assert!(brain_showing(), "a pass starts with the brain showing");
+            let phases: Vec<bool> = (0..8u64)
                 .map(|step| {
                     crate::status::set_local_pass_ms(step * crate::status::BRAIN_BLINK_MS / 8);
-                    brain_bg()
+                    assert_eq!(widths(&rows()), reference, "the bar holds its columns");
+                    brain_showing()
                 })
                 .collect();
-            assert!(phases.contains(&Some(flash)), "{phases:?}");
-            assert!(phases.iter().any(|c| *c != Some(flash)), "{phases:?}");
+            assert!(phases.contains(&false), "{phases:?}");
+            assert!(phases.contains(&true), "{phases:?}");
 
-            // Reduced motion collapses the flash to its static form like every
-            // other effect: unlit, even mid-cycle where it would otherwise be
-            // on. Asserted here rather than in a test of its own — both the
+            // Reduced motion collapses the blink to its static form like every
+            // other effect: showing, even mid-cycle where it would otherwise be
+            // dark. Asserted here rather than in a test of its own — both the
             // reduced-motion toggle and the local-pass flag are process-global,
             // so two tests holding them would race under the default harness.
             crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
-            assert_eq!(brain_bg(), Some(flash), "the phase used for the check");
+            assert!(!brain_showing(), "the phase used for the check");
             crate::anim::set_reduced_motion(true);
-            let still_unlit = brain_bg() != Some(flash);
+            let still_showing = brain_showing();
             crate::anim::set_reduced_motion(false);
-            assert!(still_unlit, "reduced motion holds the brain unlit");
+            assert!(still_showing, "reduced motion holds the brain showing");
+
+            // And end-to-end through a real terminal buffer, which is the only
+            // place the property that matters is visible: the dark half leaves
+            // the emoji's cells genuinely blank and everything after them
+            // exactly where it was. Folded in here rather than given a test of
+            // its own because the local-pass flag is process-global.
+            let rendered = |ms: u64| -> String {
+                crate::status::set_local_pass_ms(ms);
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 2)).unwrap();
+                term.draw(|f| {
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(status_bar_lines(
+                            &text,
+                            0,
+                            base,
+                            &TaskView::default(),
+                        )),
+                        f.area(),
+                    );
+                })
+                .unwrap();
+                let buf = term.backend().buffer().clone();
+                (0..buf.area.height)
+                    .map(|y| {
+                        (0..buf.area.width)
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let on = rendered(0);
+            let off = rendered(crate::status::BRAIN_BLINK_MS * 3 / 4);
+            assert!(on.contains(mark), "the lit half draws the brain: {on:?}");
+            assert!(!off.contains(mark), "the dark half does not: {off:?}");
+            assert_eq!(
+                on.chars().count(),
+                off.chars().count(),
+                "only the glyph's own cells changed"
+            );
+            assert!(off.contains("med | ctx 12%"), "{off:?}");
         }
 
         // And the guard's drop ends it, so a finished pass cannot leave the bar
-        // flashing forever.
+        // blinking forever.
         assert!(!crate::status::local_pass_active());
-        assert_ne!(brain_bg(), Some(flash));
-    }
-
-    /// End-to-end through a real terminal buffer: the flash has to survive
-    /// `Paragraph::style`, which paints the whole status area before the spans
-    /// are drawn over it. A span style that loses to the widget style would
-    /// pass the span-level test and still show nothing.
-    #[test]
-    fn the_brain_flash_reaches_the_rendered_cells() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-        use ratatui::widgets::Paragraph;
-
-        let mark = crate::status::THINK_MARK;
-        let text = format!("~/x | {mark} med | ctx 12% | generating");
-        let status_style = Style::default()
-            .bg(Color::Indexed(238))
-            .fg(Color::Indexed(252));
-        let flash = Color::Indexed(crate::status::THEME_COLOR);
-
-        let brain_cell_bg = || {
-            let mut term = Terminal::new(TestBackend::new(60, 2)).unwrap();
-            term.draw(|f| {
-                f.render_widget(
-                    Paragraph::new(status_bar_lines(
-                        &text,
-                        0,
-                        status_style,
-                        &TaskView::default(),
-                    ))
-                    .style(status_style),
-                    f.area(),
-                );
-            })
-            .unwrap();
-            let buf = term.backend().buffer().clone();
-            // The emoji's own cell, wherever the two-row split put it.
-            (0..buf.area.height)
-                .flat_map(|y| (0..buf.area.width).map(move |x| (x, y)))
-                .find(|&(x, y)| buf[(x, y)].symbol().contains(mark))
-                .map(|(x, y)| buf[(x, y)].bg)
-        };
-
-        let _guard = crate::status::LocalPass::begin();
-        crate::status::set_local_pass_ms(0);
-        assert_eq!(brain_cell_bg(), Some(Color::Indexed(238)), "unlit half");
-        crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
-        assert_eq!(brain_cell_bg(), Some(flash), "lit half reaches the cell");
+        assert!(brain_showing());
     }
 
     /// The bar is two rows: row one is the directory and branch and nothing
