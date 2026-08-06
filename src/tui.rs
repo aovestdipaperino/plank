@@ -2143,12 +2143,12 @@ fn push_dir_prefix(
     // for the same reason the think segment is peeled: `rfind` above lands on the
     // separator *before* the origin, not the one before the body.
     let origin = crate::status::engine_origin_label();
-    let (segment, origin) = match segment.strip_suffix(origin) {
+    let (segment, origin) = match segment.strip_suffix(origin.as_str()) {
         Some(head) => {
             let head = head.trim_end();
             let head = head.strip_suffix('|').map_or(head, str::trim_end);
             if head.is_empty() {
-                ("", origin.to_owned())
+                ("", origin.clone())
             } else {
                 (head, format!(" | {origin}"))
             }
@@ -3291,7 +3291,7 @@ mod tests {
             .expect("branch span");
         assert_eq!(branch.style.fg, Some(theme));
         assert!(
-            !row(0).contains(origin),
+            !row(0).contains(origin.as_str()),
             "origin is not on row one: {}",
             row(0)
         );
@@ -3306,7 +3306,7 @@ mod tests {
         let shown = rows[1]
             .spans
             .iter()
-            .find(|s| s.content.contains(origin))
+            .find(|s| s.content.contains(origin.as_str()))
             .expect("origin span");
         assert_eq!(shown.style.fg, None, "plain, like the ctx gauge");
     }

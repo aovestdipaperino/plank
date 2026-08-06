@@ -281,6 +281,9 @@ fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
             eprintln!(
                 "plank: a sub-agent definition asks for the local engine; loading it alongside the provider..."
             );
+            // Both engines are live for the whole session, so the footer names
+            // both: the provider above, this one here.
+            plank::status::set_engine_origin(plank::status::LOCAL_ORIGIN);
             Some(make_local_engine(cfg)?)
         } else {
             None

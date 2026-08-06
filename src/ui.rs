@@ -4618,6 +4618,10 @@ the original is frozen and listed in /tree"
         if let Some(engine) = self.alt_engines.remove(&key) {
             return Ok((key, engine));
         }
+        // A definition's host joins the footer's origin list the first time it
+        // is actually built, so the bar names every place inference is running
+        // this session rather than only where the main agent runs.
+        crate::status::set_engine_origin(&crate::status::url_host(&base_url));
         let engine = ProviderEngine::new(
             spec.kind,
             Some(base_url),

@@ -156,22 +156,52 @@ pub fn git_branch_label() -> Option<String> {
 /// the engine is built and never changes, so threading it through the worker,
 /// the remote-UI protocol, and both front-ends would be noise. Mirrors how
 /// [`cwd_label`] and [`git_branch_label`] read the ambient environment.
-static ENGINE_ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ENGINE_ORIGINS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Shown when nothing set an origin: the local Metal-backed ds4 engine (and the
-/// `EchoEngine` stub, which is equally local).
-const LOCAL_ORIGIN: &str = "(local)";
+/// Shown for an engine running on this machine's own weights: the Metal-backed
+/// ds4 engine, and the `EchoEngine` stub, which is equally local.
+pub const LOCAL_ORIGIN: &str = "(local)";
 
-/// Records the engine origin for the footer. First call wins; later calls are
-/// ignored, so a single engine choice per process is the only thing shown.
+/// Records an engine origin for the footer, in first-seen order.
+///
+/// A list rather than a single value: a session can hold several engines at
+/// once — a provider main agent with a `provider: local` sub-agent, or
+/// definitions pointing at different hosts — and "where is inference running"
+/// then has more than one answer. Repeats are dropped, so two definitions on
+/// the same host name it once and the main engine stays first.
 pub fn set_engine_origin(label: &str) {
-    let _ = ENGINE_ORIGIN.set(label.to_owned());
+    let label = label.trim();
+    if label.is_empty() {
+        return;
+    }
+    let Ok(mut origins) = ENGINE_ORIGINS.lock() else {
+        return;
+    };
+    if !origins.iter().any(|o| o == label) {
+        origins.push(label.to_owned());
+    }
 }
 
-/// The engine-origin label: a provider or remote host, else [`LOCAL_ORIGIN`].
+/// The engine-origin label: every origin in play, comma-separated in first-seen
+/// order, or [`LOCAL_ORIGIN`] when nothing registered one.
 #[must_use]
-pub fn engine_origin_label() -> &'static str {
-    ENGINE_ORIGIN.get().map_or(LOCAL_ORIGIN, String::as_str)
+pub fn engine_origin_label() -> String {
+    let Ok(origins) = ENGINE_ORIGINS.lock() else {
+        return LOCAL_ORIGIN.to_owned();
+    };
+    if origins.is_empty() {
+        return LOCAL_ORIGIN.to_owned();
+    }
+    origins.join(", ")
+}
+
+/// Forgets every recorded origin. Tests only: the list is process-global, and a
+/// test that registers one would otherwise leak into the next.
+#[cfg(test)]
+pub(crate) fn reset_engine_origins() {
+    if let Ok(mut origins) = ENGINE_ORIGINS.lock() {
+        origins.clear();
+    }
 }
 
 /// Extracts the bare host from a base URL for display: `https://api.anthropic.com/v1`
@@ -1204,6 +1234,40 @@ mod tests {
         assert_eq!(url_host("api.anthropic.com"), "api.anthropic.com");
         // Nothing host-shaped: echo the input rather than showing an empty slot.
         assert_eq!(url_host("://"), "://");
+    }
+
+    /// Several engines can be live at once — a provider main agent with a
+    /// `provider: local` sub-agent, or definitions on different hosts — so the
+    /// footer names all of them rather than only whichever registered first.
+    #[test]
+    fn engine_origins_list_every_engine_in_play() {
+        reset_engine_origins();
+        // Nothing registered: the local engine is the implied answer.
+        assert_eq!(engine_origin_label(), LOCAL_ORIGIN);
+
+        set_engine_origin("regolo.ai");
+        assert_eq!(engine_origin_label(), "regolo.ai");
+
+        // A second engine joins, in first-seen order, so the main agent leads.
+        set_engine_origin(LOCAL_ORIGIN);
+        assert_eq!(engine_origin_label(), format!("regolo.ai, {LOCAL_ORIGIN}"));
+
+        // Repeats are dropped: two definitions on one host name it once.
+        set_engine_origin("regolo.ai");
+        set_engine_origin("api.anthropic.com");
+        set_engine_origin(LOCAL_ORIGIN);
+        assert_eq!(
+            engine_origin_label(),
+            format!("regolo.ai, {LOCAL_ORIGIN}, api.anthropic.com")
+        );
+
+        // An empty label is not a slot in the list.
+        set_engine_origin("   ");
+        assert_eq!(
+            engine_origin_label(),
+            format!("regolo.ai, {LOCAL_ORIGIN}, api.anthropic.com")
+        );
+        reset_engine_origins();
     }
 
     #[test]
