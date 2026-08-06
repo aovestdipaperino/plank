@@ -1235,6 +1235,15 @@ struct Agent<'a> {
     /// afterwards, which is what lets the borrow checker enforce that a swap
     /// cannot leak: the value cannot be in the map and in `self.engine` at once.
     alt_engines: std::collections::HashMap<EngineKey, Box<dyn Engine>>,
+    /// Diagnostic from the last [`warm_alt_local`](Agent::warm_alt_local), for
+    /// the front end to render. Set on every attempt, hit or miss.
+    warm_note: Option<String>,
+    /// Whether the alt *local* engine has had its system prompt warmed
+    /// ([`Agent::warm_alt_local`]). Once is enough: the engine keeps its session
+    /// across sidechains, so every later dispatch already finds the prefix in
+    /// its KV. Set before the walk runs, so a failed warm is not retried on
+    /// every dispatch.
+    local_alt_warmed: bool,
 }
 
 /// Identity of an alternate sub-agent engine: provider, resolved base URL,
@@ -1380,12 +1389,48 @@ struct SessionUsage {
 /// local turns too: output is the generated tokens, input the prompt tokens
 /// ingested (from the provider `usage` block when present, else the
 /// context-size delta of the pass).
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 struct SessionStats {
     /// Tokens the model ingested (prompt / prefill), summed over all passes.
     input_tokens: u64,
     /// Tokens the model generated, summed over all passes.
     output_tokens: u64,
+    /// The same tally split by the engine that served the pass, in the order
+    /// each engine first contributed.
+    ///
+    /// A `Vec` rather than a map so the main engine leads the report: it is the
+    /// one that served the ordinary turns, and the sub-agent engines below it
+    /// read as the exceptions they are. There are never more than a handful.
+    by_engine: Vec<(String, u64, u64)>,
+}
+
+impl SessionStats {
+    /// Adds one pass's tally, to the total and to `engine`'s row.
+    fn add(&mut self, engine: &str, input: u64, output: u64) {
+        self.input_tokens += input;
+        self.output_tokens += output;
+        if let Some(row) = self.by_engine.iter_mut().find(|r| r.0 == engine) {
+            row.1 += input;
+            row.2 += output;
+        } else {
+            self.by_engine.push((engine.to_owned(), input, output));
+        }
+    }
+}
+
+/// How an engine is named in the end-of-session breakdown: its model, with
+/// local ones marked as such.
+///
+/// The mark is the point of the breakdown — under a provider main agent with a
+/// `provider: local` sub-agent, "which of these tokens cost money" is exactly
+/// the question the split answers.
+fn engine_stats_label(engine: &dyn Engine) -> String {
+    let model = engine.model_name();
+    if engine.is_local() {
+        format!("{model} (local)")
+    } else {
+        model
+    }
 }
 
 /// Default number of user turns replayed by `/history`.
@@ -1490,6 +1535,10 @@ impl Agent<'_> {
                 },
             ),
         };
+        // See the matching guard in `worker_generate_kind`: the plain REPL has
+        // no blinking brain to drive, but the flag is process-global and a
+        // remote client attached to this session renders off it.
+        let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(sink);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
@@ -1694,16 +1743,14 @@ impl Agent<'_> {
         let instructions = matched.as_ref().map(|d| d.body.clone());
         // Resolve the alternate engine *before* forking, so a missing key or an
         // unbuildable engine leaves the transcript exactly as it was.
-        let alt = match self.resolve_alt_spec(matched.as_ref().and_then(|d| d.engine.clone())) {
-            None => None,
-            Some(spec) => match self.take_alt_engine(&spec) {
-                Ok(pair) => Some(pair),
-                Err(e) => {
-                    return format!("Tool error: agent '{name}' engine unavailable: {e}\n");
-                }
-            },
+        let alt = match self.resolve_subagent_alt(matched.as_ref().and_then(|d| d.engine.clone())) {
+            Ok(alt) => alt,
+            Err(e) => return format!("Tool error: agent '{name}' engine unavailable: {e}\n"),
         };
-        let fork_at = self.begin_subagent_fork_for(instructions.as_deref(), &task, alt.is_none());
+        if let Some(note) = self.take_warm_note() {
+            self.emit_sub(crate::worker::UiEvent::Dim(note));
+        }
+        let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
             "sub-agent".to_string()
         } else {
@@ -1719,7 +1766,7 @@ impl Agent<'_> {
         self.tool_ctx.subagent_depth += 1;
         let result = match alt {
             None => self.run_subagent_loop(),
-            Some((key, engine)) => self.run_sidechain_on(key, engine),
+            Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_subagent_loop),
         };
         self.tool_ctx.subagent_depth -= 1;
         self.emit_sub(crate::worker::UiEvent::SubEnd);
@@ -2601,8 +2648,14 @@ impl Agent<'_> {
                 i64::from(stats.generated),
             )
         };
-        self.stats.input_tokens += u64::try_from(input.max(0)).unwrap_or(0);
-        self.stats.output_tokens += u64::try_from(output.max(0)).unwrap_or(0);
+        // Attributed to `self.engine`, which during a sidechain *is* the alt
+        // engine — the swap happens before the pass, so this needs no notion of
+        // sub-agents to split their tokens out correctly.
+        self.stats.add(
+            &engine_stats_label(&*self.engine),
+            u64::try_from(input.max(0)).unwrap_or(0),
+            u64::try_from(output.max(0)).unwrap_or(0),
+        );
 
         if let Some(u) = stats.usage {
             self.usage.total.add(u);
@@ -3124,6 +3177,7 @@ impl Agent<'_> {
                     // No GPU backend yet: record and show it in the footer,
                     // like the C's deferred worker_request_power.
                     self.power_percent = power;
+                    crate::status::set_local_power(power);
                     println!("power limit set to {power}%");
                 }
                 None => println!("usage: /power <1..100>"),
@@ -3255,29 +3309,68 @@ impl Agent<'_> {
             },
             "/subagent" => {
                 let (def, task) = crate::agents::resolve(&self.agents, arg);
-                let (instructions, task, started) = match def {
+                let (instructions, spec, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
+                        d.engine.clone(),
                         task.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
-                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                    None => (
+                        None,
+                        None,
+                        task.to_string(),
+                        "[subagent started]".to_string(),
+                    ),
                 };
                 if task.is_empty() {
                     println!("usage: /subagent [<name>] <task>");
                 } else {
+                    // Same resolve the `agent` tool does, and for the same reason:
+                    // a definition that names an engine must actually run on it
+                    // here too, and a missing key must fail before the fork so the
+                    // transcript is left exactly as it was.
+                    let alt = match self.resolve_subagent_alt(spec) {
+                        Ok(alt) => alt,
+                        Err(e) => {
+                            println!("/subagent: engine unavailable: {e}");
+                            return Ok(true);
+                        }
+                    };
+                    if let Some(note) = self.take_warm_note() {
+                        println!("{}", self.debug_line(&note));
+                    }
                     println!("{}", self.debug_line(&started));
-                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+                    let fork_at =
+                        self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     // Restore the transcript even when the turn errored.
-                    let turn = self.run_turn();
+                    let turn = match alt {
+                        None => self.run_turn(),
+                        Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_turn),
+                    };
                     let reported = self.finish_subagent_fork(fork_at, &task);
                     turn?;
-                    let trailer = if reported {
-                        "[subagent report added to the conversation]"
+                    if reported {
+                        println!(
+                            "{}",
+                            self.debug_line("[subagent report added to the conversation]")
+                        );
+                        // The report is delegated work coming back, so the main
+                        // loop runs on it — the same continuation the `agent`
+                        // tool gets by returning its report as a tool result.
+                        // Without this the report lands in the transcript and
+                        // nothing acts on it until the user types again.
+                        //
+                        // The prompt here is the restored parent prefix plus the
+                        // report, which is exactly what `restore_fork_kv` just
+                        // set the KV up for: only the report re-prefills.
+                        self.run_turn()?;
                     } else {
-                        "[subagent produced no report — nothing added]"
-                    };
-                    println!("{}", self.debug_line(trailer));
+                        println!(
+                            "{}",
+                            self.debug_line("[subagent produced no report — nothing added]")
+                        );
+                    }
                 }
             }
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
@@ -3690,7 +3783,19 @@ the original is frozen and listed in /tree"
         // turn re-prefill the system prompt inline.
         let prefix_changed = current.effort_prefix() != level.effort_prefix();
         self.engine.set_think_mode(level);
+        // Cached alt engines too: `self.think` keys their Tier 1 checkpoint and
+        // frames their sidechains, so an engine left at the old level would
+        // build its tokens at one level while being keyed at another — the one
+        // disagreement a fingerprint cannot catch, because it is between the key
+        // and the tokens rather than between two keys. Idempotent when the level
+        // is unchanged, so this costs nothing for engines already at `level`.
+        for engine in self.alt_engines.values_mut() {
+            engine.set_think_mode(level);
+        }
+        // Only the live engine is re-warmed: an alt engine's own first take
+        // restores its Tier 1 checkpoint under the new fingerprint.
         if prefix_changed {
+            self.local_alt_warmed = false;
             self.rewarm_after_reset(&mut || {});
         }
         format!("thinking {}", level.name())
@@ -3952,7 +4057,7 @@ the original is frozen and listed in /tree"
     /// quiet. Independent of the session save, so it reports even when the
     /// final session was empty (e.g. after `/clear`).
     fn report_run_stats(&self) {
-        let s = self.stats;
+        let s = &self.stats;
         if s.input_tokens == 0 && s.output_tokens == 0 {
             return;
         }
@@ -3968,6 +4073,20 @@ the original is frozen and listed in /tree"
             fmt_u64(s.input_tokens),
             fmt_u64(s.output_tokens),
         );
+        // Only when more than one engine served: with a single one the rows
+        // would just repeat the totals a line lower.
+        if s.by_engine.len() < 2 {
+            return;
+        }
+        let width = s.by_engine.iter().map(|r| r.0.chars().count()).max();
+        for (label, input, output) in &s.by_engine {
+            println!(
+                "  {dim}{label:<w$}{reset}  ↓ {} ↑ {}",
+                fmt_u64(*input),
+                fmt_u64(*output),
+                w = width.unwrap_or(0),
+            );
+        }
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -4039,12 +4158,6 @@ the original is frozen and listed in /tree"
     /// transcript and returns the pre-fork length for later truncation. The
     /// fork inherits the parent transcript prefix, so the engine's per-turn
     /// sync reuses the parent KV cache.
-    fn begin_subagent_fork(&mut self, instructions: Option<&str>, task: &str) -> usize {
-        self.begin_subagent_fork_for(instructions, task, true)
-    }
-
-    /// [`begin_subagent_fork`](Self::begin_subagent_fork) with control over the
-    /// KV snapshot.
     ///
     /// A sidechain on an alternate engine passes `snapshot_kv` false: the parent
     /// engine is never called, so there is no divergence to roll back. It still
@@ -4052,7 +4165,7 @@ the original is frozen and listed in /tree"
     /// unconditionally, so skipping would unbalance the stack and a nested fork
     /// would pop the *parent's* snapshot. `None` already means "nothing to
     /// restore", so the stack stays LIFO-correct.
-    fn begin_subagent_fork_for(
+    fn begin_subagent_fork(
         &mut self,
         instructions: Option<&str>,
         task: &str,
@@ -4245,6 +4358,29 @@ the original is frozen and listed in /tree"
                         slot.done = true;
                     }
                     Ok(pass) => {
+                        // A fan-out slot runs on its own engine, so its tokens
+                        // belong in that engine's row rather than the main
+                        // agent's — and they were never counted at all before
+                        // the breakdown made their absence visible. The usage
+                        // block is the only valid source here: the local
+                        // ctx-delta estimate is keyed to `self.last_ctx_used`,
+                        // which describes the main engine's context, not this
+                        // slot's. Fan-out is provider-only by construction, so
+                        // there is nothing to fall back to.
+                        if let Some(u) = pass.stats.usage {
+                            self.stats.add(
+                                &engine_stats_label(&*slot.engine),
+                                u64::try_from(
+                                    i64::from(u.input_tokens)
+                                        + i64::from(u.cache_read_tokens)
+                                        + i64::from(u.cache_write_tokens),
+                                )
+                                .unwrap_or(0),
+                                u64::try_from(u.output_tokens).unwrap_or(0),
+                            );
+                            self.usage.total.add(u);
+                            self.usage.turns += 1;
+                        }
                         slot.session.push(Message::assistant(pass.assistant_text));
                         if last_round {
                             slot.done = true;
@@ -4341,10 +4477,93 @@ the original is frozen and listed in /tree"
         }
     }
 
-    fn take_alt_engine(
+    /// The engine a `/subagent` definition asks for, already taken from the
+    /// cache and ready to run on — or `None` when it runs on the parent's.
+    ///
+    /// Both `/subagent` front ends go through this, so neither can quietly drop
+    /// the engine override the way they both used to.
+    ///
+    /// # Errors
+    /// When the definition names an engine this session cannot provide (an unset
+    /// key, or no local engine loaded at startup).
+    fn resolve_subagent_alt(
         &mut self,
-        spec: &crate::agents::AgentEngine,
-    ) -> Result<(EngineKey, Box<dyn Engine>), String> {
+        spec: Option<crate::agents::AgentEngine>,
+    ) -> Result<Option<AltEngine>, String> {
+        match self.resolve_alt_spec(spec) {
+            None => Ok(None),
+            Some(spec) => self.take_alt_engine(&spec).map(Some),
+        }
+    }
+
+    /// Puts the system prompt into the alt local engine's KV before its first
+    /// sidechain — by **restoring** the Tier 1 checkpoint when one exists, which
+    /// is a disk read rather than a prefill of the whole system prompt.
+    ///
+    /// Only the System tier: a sidechain is clean-room (see
+    /// [`run_sidechain_on`](Self::run_sidechain_on)), so its prompt is the
+    /// system prompt plus the framed task with none of the project/session
+    /// context tiers in between. Restoring a deeper tier would seed the KV with
+    /// tokens the sidechain's prompt does not contain, and the sync would have
+    /// to walk back out of them.
+    ///
+    /// Restore only, never prefill: on a miss the engine is left cold and the
+    /// sidechain's own pass prefills it, with the progress bar and the interrupt
+    /// that a pass has and this call does not. Prefilling here froze the front
+    /// end for the length of a cold system prompt — `warm_sync` cannot be
+    /// interrupted, and on the TUI `/subagent` path this runs on the thread that
+    /// draws (see [`kvtier::restore`](crate::kvtier::restore)).
+    ///
+    /// The consequence is that nothing writes a Tier 1 checkpoint for the local
+    /// engine when the main agent is a provider — a provider never warms — so
+    /// the hit depends on an ordinary local-main session having written one.
+    /// That is the common case, and paying a *visible* prefill when it has not
+    /// is strictly better than the freeze.
+    /// The outcome is stashed in [`warm_note`](Self::warm_note) rather than
+    /// printed here: this runs on the UI thread for `/subagent` and on the
+    /// worker thread for the `agent` tool, and only the caller knows which sink
+    /// its front end is holding. Always noted, hit or miss — a silent hit is
+    /// indistinguishable from a silent miss, which is the position this landed
+    /// in twice.
+    fn warm_alt_local(&mut self, engine: &mut dyn Engine) {
+        let model = engine.model_name();
+        let tiers = self.kv_tiers_for(&model);
+        let Some(system) = tiers
+            .first()
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+        else {
+            return;
+        };
+        let outcome = crate::kvtier::restore(engine, Some(&self.store), system);
+        // Enough to act on without a debugger: which engine, which fingerprint,
+        // what happened, and the exact path that was or was not there. The
+        // fingerprint is the part that usually explains a miss — it covers the
+        // system prompt, and the sub-agent roster is *in* the system prompt, so
+        // a project with its own `.plank/agents` keys differently from the same
+        // model anywhere else.
+        let fp: String = system.fingerprint.chars().take(12).collect();
+        let path = self.store.kv_path(system.key.as_ref().unwrap_or(
+            &crate::session::KvKey::System {
+                fp: system.fingerprint.clone(),
+            },
+        ));
+        self.warm_note = Some(match outcome {
+            Ok(r) => format!(
+                "[{model} sub-agent KV: {} — tier1 {fp} · {}]",
+                r.reason(),
+                path.display()
+            ),
+            Err(e) => format!("[{model} sub-agent KV: warm failed: {e} — tier1 {fp}]"),
+        });
+    }
+
+    /// Takes the pending alt-engine warm diagnostic, if any, for a front end to
+    /// render through whichever sink it owns.
+    fn take_warm_note(&mut self) -> Option<String> {
+        self.warm_note.take()
+    }
+
+    fn take_alt_engine(&mut self, spec: &crate::agents::AgentEngine) -> Result<AltEngine, String> {
         use crate::remote::provider::ProviderEngine;
         let spec = match spec {
             // The local engine is loaded at startup, never built here: it needs
@@ -4352,15 +4571,16 @@ the original is frozen and listed in /tree"
             // be far worse than refusing before the prompt. If it is absent,
             // this session was started without one.
             crate::agents::AgentEngine::Local => {
-                return self
-                    .alt_engines
-                    .remove(&EngineKey::Local)
-                    .map(|e| (EngineKey::Local, e))
-                    .ok_or_else(|| {
-                        "no local engine in this session (a `provider: local` definition needs one \
-                         at startup; check the roster with /agent)"
-                            .to_owned()
-                    });
+                let mut engine = self.alt_engines.remove(&EngineKey::Local).ok_or_else(|| {
+                    "no local engine in this session (a `provider: local` definition needs one \
+                     at startup; check the roster with /agent)"
+                        .to_owned()
+                })?;
+                if !self.local_alt_warmed {
+                    self.local_alt_warmed = true;
+                    self.warm_alt_local(&mut *engine);
+                }
+                return Ok((EngineKey::Local, engine));
             }
             crate::agents::AgentEngine::Provider(p) => p,
         };
@@ -4399,6 +4619,10 @@ the original is frozen and listed in /tree"
         if let Some(engine) = self.alt_engines.remove(&key) {
             return Ok((key, engine));
         }
+        // A definition's host joins the footer's origin list the first time it
+        // is actually built, so the bar names every place inference is running
+        // this session rather than only where the main agent runs.
+        crate::status::set_engine_origin(&crate::status::url_host(&base_url));
         let engine = ProviderEngine::new(
             spec.kind,
             Some(base_url),
@@ -4414,12 +4638,23 @@ the original is frozen and listed in /tree"
     /// Runs a sub-agent sidechain on `engine` instead of the parent's, returning
     /// the engine to the cache on **every** exit path.
     ///
+    /// `run` drives the rounds: the `agent` tool passes
+    /// [`run_subagent_loop`](Self::run_subagent_loop), while `/subagent` passes
+    /// its front end's ordinary turn so the work still renders live. The engine
+    /// swap is the same either way — which is the point of taking it as a
+    /// parameter rather than hardcoding one loop.
+    ///
     /// No `fork_kv` snapshot is meaningful here: the parent engine is never
     /// called during the sidechain, so its KV cannot be dirtied. The sidechain
     /// always runs clean-room — the parent transcript is stashed and only the
     /// framed task is visible — so no parent context is sent to the provider and
     /// only the task is billed.
-    fn run_sidechain_on(&mut self, key: EngineKey, engine: Box<dyn Engine>) -> Result<(), String> {
+    fn run_sidechain_on(
+        &mut self,
+        key: EngineKey,
+        engine: Box<dyn Engine>,
+        run: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
         // The framed task is the last message; keep it, hide everything before.
         let stashed = {
@@ -4428,7 +4663,7 @@ the original is frozen and listed in /tree"
             self.session.transcript = task.into_iter().collect();
             prefix
         };
-        let result = self.run_subagent_loop();
+        let result = run(self);
         // Unconditional, and with no `?` between the swap in and the swap out: a
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
@@ -4535,6 +4770,10 @@ fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::Path
 /// 40%). Owned by [`Agent::tui_loop`] so it persists across turn boundaries —
 /// a finished main task never closes it; only Esc does.
 type BtwPanel = Option<(OutputLog, tui::OutputView)>;
+
+/// An engine taken out of the alt cache, paired with the key it must be put
+/// back under — the two always travel together, so a sidechain cannot lose one.
+type AltEngine = (EngineKey, Box<dyn Engine>);
 
 /// Result of one TUI generation pass.
 struct TurnOutput {
@@ -5701,8 +5940,21 @@ impl Agent<'_> {
     /// Tier 1, and moving them down would needlessly fork Tier 2 while moving
     /// local ones up would fork the model-global Tier 1 per project.
     fn kv_tiers(&self) -> Vec<crate::kvtier::TierSpec> {
+        self.kv_tiers_for(&self.engine.model_name())
+    }
+
+    /// [`kv_tiers`](Self::kv_tiers) for an engine other than the live one.
+    ///
+    /// The model name is a parameter rather than read off `self.engine` because
+    /// a checkpoint belongs to the *model whose KV it holds*: warming the local
+    /// alt engine under a provider main agent must key on `ds4`, not on the
+    /// provider's model, or it would look up a checkpoint that cannot describe
+    /// its KV. Keying it correctly is also what lets it share Tier 1 with an
+    /// ordinary local-main session — which is where most of those checkpoints
+    /// get written.
+    fn kv_tiers_for(&self, model: &str) -> Vec<crate::kvtier::TierSpec> {
         let fp1 = crate::kvtier::system_fingerprint(
-            &self.engine.model_name(),
+            model,
             &self.system,
             self.think,
             self.trusted_system_len,
@@ -5722,12 +5974,32 @@ impl Agent<'_> {
 
     /// Drops superseded Tier 2 checkpoints for this project once the current
     /// one is known good; they can never be read again and are large.
+    ///
+    /// Every *live* Tier 1 fingerprint is kept, not just the main engine's. A
+    /// `provider: local` sub-agent has its own — keyed on the local model, not
+    /// on the provider's — and collecting against the main engine's alone
+    /// deleted it on every launch, which is why the sub-agent re-prefilled its
+    /// system prompt every single run. Under a provider it was worse than that:
+    /// the provider's fingerprint never has a file, so *nothing* matched the
+    /// keep and the whole directory of system checkpoints went, including ones
+    /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        if let Some(t) = tiers
+        let mut keep: Vec<String> = tiers
             .iter()
-            .find(|t| t.kind == crate::kvtier::TierKind::System)
-        {
-            let _removed = self.store.gc_system_checkpoints(&t.fingerprint);
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+            .map(|t| t.fingerprint.clone())
+            .collect();
+        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
+            keep.extend(
+                self.kv_tiers_for(&alt.model_name())
+                    .into_iter()
+                    .filter(|t| t.kind == crate::kvtier::TierKind::System)
+                    .map(|t| t.fingerprint),
+            );
+        }
+        if !keep.is_empty() {
+            let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+            let _removed = self.store.gc_system_checkpoints(&keep);
         }
         if let Some(t) = tiers
             .iter()
@@ -5778,6 +6050,48 @@ impl Agent<'_> {
     /// nothing prefills and nothing is drawn; otherwise a minimal centered
     /// progress bar covers the rebuild, and the caller renders the real UI over
     /// it.
+    /// Warms the alt local engine's Tier 1 at startup: prefilled and persisted
+    /// when no checkpoint exists, restored from disk when one does.
+    ///
+    /// Here rather than at first use because this is the one place a prefill is
+    /// already expected, drawn, and paid for — mid-turn it froze the front end,
+    /// `warm_sync` being uninterruptible.
+    ///
+    /// **Only Tier 1**, which is also what makes the checkpoint appear at all.
+    /// `warm` restores the deepest tier that loads and skips every tier above
+    /// it, so on a machine whose Tier 2 checkpoint is valid, Tier 1 is never
+    /// prefilled and therefore never persisted — which is why `sysprompt-*.kv`
+    /// can be absent on a session that has warmed happily for months. A tier
+    /// list of one has nothing deeper to short-circuit it, so Tier 1 gets built
+    /// and written, and every later session (this engine's sidechains and any
+    /// local-main session on the same fingerprint) restores instead.
+    fn warm_alt_local_tier1(
+        &mut self,
+        on_event: &mut dyn FnMut(EngineEvent),
+        on_stage: &mut dyn FnMut(crate::kvtier::TierKind),
+    ) {
+        let Some(mut engine) = self.alt_engines.remove(&EngineKey::Local) else {
+            return;
+        };
+        let tiers = self.kv_tiers_for(&engine.model_name());
+        if let Some(system) = tiers
+            .first()
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+        {
+            let _ = crate::kvtier::warm(
+                &mut *engine,
+                Some(&self.store),
+                std::slice::from_ref(system),
+                on_event,
+                on_stage,
+            );
+            // Set even on failure: the on-demand restore would fail the same
+            // way, and retrying it per dispatch buys nothing.
+            self.local_alt_warmed = true;
+        }
+        self.alt_engines.insert(EngineKey::Local, engine);
+    }
+
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         if self.skip_warm_after_restore() {
             return Ok(());
@@ -5811,6 +6125,19 @@ impl Agent<'_> {
             &mut |kind| stage.set(kind.warm_label()),
         )
         .map_err(|e| e.to_string())?;
+        // The sub-agent's local engine gets the same treatment on the same
+        // screen; it is a second engine, so it needs its own walk.
+        let alt_stage = "Caching the system prompt for the local sub-agent";
+        self.warm_alt_local_tier1(
+            &mut |ev| {
+                if let EngineEvent::Prefill(p) = ev {
+                    let _ = terminal.draw(|f| {
+                        tui::draw_warm(f, p.done, p.total, p.tps, alt_stage, None);
+                    });
+                }
+            },
+            &mut |_| {},
+        );
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
@@ -5890,6 +6217,16 @@ impl Agent<'_> {
         if announced == 1 && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
+        let mut alt_announced = false;
+        self.warm_alt_local_tier1(
+            &mut |ev| {
+                if matches!(ev, EngineEvent::Prefill(_)) && !alt_announced {
+                    alt_announced = true;
+                    eprintln!("Caching the system prompt for the local sub-agent...");
+                }
+            },
+            &mut |_| {},
+        );
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
@@ -6526,6 +6863,12 @@ impl Agent<'_> {
         if is_main {
             let _ = tx.send(UiEvent::MainCheckpoint);
         }
+        // Held for the whole pass — prefill included, which is most of the wait
+        // — so the status bar's brain blinks while *this* engine works. Taken
+        // here rather than only in `generate_pass`: that one covers the quiet
+        // and fan-out passes, and this is the path every ordinary TUI turn (and
+        // every `/subagent` sidechain) actually runs through.
+        let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
@@ -7180,6 +7523,7 @@ impl Agent<'_> {
             "/power" => match crate::config::parse_power_percent(arg) {
                 Some(power) => {
                     self.power_percent = power;
+                    crate::status::set_local_power(power);
                     log.push_plain(format!("power limit set to {power}%"));
                 }
                 None => log.push_plain("usage: /power <1..100>"),
@@ -7346,27 +7690,50 @@ impl Agent<'_> {
             },
             "/subagent" => {
                 let (def, task) = crate::agents::resolve(&self.agents, arg);
-                let (instructions, task, started) = match def {
+                let (instructions, spec, label, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
+                        d.engine.clone(),
+                        d.name.clone(),
                         task.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
-                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                    None => (
+                        None,
+                        None,
+                        "sub-agent".to_string(),
+                        task.to_string(),
+                        "[subagent started]".to_string(),
+                    ),
                 };
                 if task.is_empty() {
                     log.push_plain("usage: /subagent [<name>] <task>");
                 } else {
-                    log.push_dim(started);
-                    let label = match &def {
-                        Some(d) => d.name.clone(),
-                        None => "sub-agent".to_string(),
+                    // Resolved before the fork, exactly as in `run_agent_tool`: an
+                    // engine this session cannot provide must not leave a framed
+                    // task behind in the transcript.
+                    let alt = match self.resolve_subagent_alt(spec) {
+                        Ok(alt) => alt,
+                        Err(e) => {
+                            log.push_plain(format!("/subagent: engine unavailable: {e}"));
+                            return true;
+                        }
                     };
-                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+                    if let Some(note) = self.take_warm_note() {
+                        log.push_dim(note);
+                    }
+                    log.push_dim(started);
+                    let fork_at =
+                        self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     log.push_dim(tui::subagent_signpost(&label));
                     sub.begin(label);
                     sub.adopt_turn = true;
-                    let outcome = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+                    let outcome = match alt {
+                        None => self.tui_turn(terminal, log, view, input, btw, arcade, sub),
+                        Some((key, engine)) => self.run_sidechain_on(key, engine, |s| {
+                            s.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                        }),
+                    };
                     sub.adopt_turn = false;
                     sub.end();
                     if let Err(e) = outcome {
@@ -7375,6 +7742,13 @@ impl Agent<'_> {
                         log.push_plain(format!("/subagent failed: {e}"));
                     } else if self.finish_subagent_fork(fork_at, &task) {
                         log.push_dim("[subagent report added to the conversation]");
+                        // See the plain-REPL arm: the main loop runs on the
+                        // report, so delegated work is acted on rather than
+                        // parked in the transcript.
+                        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                        {
+                            log.push_plain(format!("/subagent follow-up failed: {e}"));
+                        }
                     } else {
                         log.push_dim("[subagent produced no report — nothing added]");
                     }
@@ -8230,6 +8604,21 @@ fn new_agent(
     // combination the fingerprint cannot detect, because it is a disagreement
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
+    crate::status::set_local_power(cfg.power_percent);
+    // The alt local engine needs both for the same reasons, and it cannot be
+    // skipped as an optimization: `warm_reset` builds its system tokens from
+    // these two fields, so an unconfigured engine tokenizes the *same* system
+    // text differently from the one that wrote `sysprompt.kv`. Its Tier 1
+    // checkpoint would then restore into a session whose token buffer does not
+    // describe it, the first common-prefix probe would truncate back, and the
+    // sidechain would pay the full prefill anyway — the restore would look like
+    // it worked and buy nothing. It also makes a local sidechain generate at the
+    // session's reasoning level rather than the engine's default.
+    let mut local_engine = local_engine;
+    if let Some(local) = local_engine.as_mut() {
+        local.set_trusted_system_prefix(system.trusted_len);
+        local.set_think_mode(cfg.generation.think_mode);
+    }
     let trusted_system_len = system.trusted_len;
     let system = system.text;
     let skills = crate::skills::load_default(&tool_ctx.cwd);
@@ -8278,6 +8667,8 @@ fn new_agent(
             .map(|e| (EngineKey::Local, e))
             .into_iter()
             .collect(),
+        local_alt_warmed: false,
+        warm_note: None,
     })
 }
 
@@ -9159,6 +9550,15 @@ mod tests {
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
+        /// Records every `set_trusted_system_prefix` call, the other half of
+        /// the configuration an engine needs before it tokenizes anything.
+        trusted_lens: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
+        /// Records each `warm_reset` system text, so a test can assert which
+        /// tiers a warm walk actually covered.
+        warm_tiers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
+        /// Overrides the reported model name, so two spy engines can key
+        /// different Tier 1 checkpoints.
+        model: Option<String>,
         /// When set, `generate` fails with this message instead of replying, so
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
@@ -9283,6 +9683,23 @@ mod tests {
                 seen.lock().unwrap().push(mode);
             }
         }
+
+        fn set_trusted_system_prefix(&mut self, len: usize) {
+            if let Some(seen) = &self.trusted_lens {
+                seen.lock().unwrap().push(len);
+            }
+        }
+
+        fn warm_reset(&mut self, system: &str) -> Result<(), crate::engine::EngineError> {
+            if let Some(seen) = &self.warm_tiers {
+                seen.lock().unwrap().push(system.to_owned());
+            }
+            Ok(())
+        }
+
+        fn model_name(&self) -> String {
+            self.model.clone().unwrap_or_default()
+        }
     }
 
     /// Builds an Agent over a scripted engine with the standard test fields.
@@ -9324,6 +9741,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         }
     }
 
@@ -10288,6 +10707,81 @@ mod tests {
         let out = agent.think_command("medium");
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The alt local engine is configured exactly like the main one at startup.
+    /// Without this its `warm_reset` tokenizes the same system text differently
+    /// from the engine that wrote `sysprompt.kv` — trusted-prefix length and
+    /// reasoning level are both inputs to `build_system_tokens` — so its Tier 1
+    /// checkpoint would restore into a session whose token buffer does not
+    /// describe it and the first sync would prefill anyway.
+    #[test]
+    fn the_alt_local_engine_is_configured_like_the_main_one() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trusted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = ThinkMode::Medium;
+        let local = ScriptedEngine {
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            trusted_lens: Some(std::sync::Arc::clone(&trusted)),
+            ..ScriptedEngine::default()
+        };
+
+        let agent = new_agent(
+            Box::new(ScriptedEngine::default()),
+            &cfg,
+            false,
+            Some(Box::new(local)),
+        )
+        .expect("an agent");
+
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Medium]);
+        assert_eq!(
+            *trusted.lock().unwrap(),
+            vec![agent.trusted_system_len],
+            "the same boundary the main engine was given"
+        );
+    }
+
+    /// The level keys an alt engine's Tier 1 checkpoint and frames its
+    /// sidechains, so a cached engine left at the old level would build its
+    /// tokens at one level while being keyed at another — the disagreement a
+    /// fingerprint cannot catch. It also re-arms the alt local warm, since the
+    /// checkpoint to restore is now a different one.
+    #[test]
+    fn think_command_reaches_cached_alt_engines() {
+        let dir = scratch_dir("think-alt");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = test_cfg();
+        // `max` is the level that moves the effort preamble, so it is the one
+        // that both re-keys the checkpoint and invalidates the engine's tokens.
+        // It needs the context to match, or the command refuses before it acts.
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                think_modes: Some(std::sync::Arc::clone(&seen)),
+                ..ScriptedEngine::default()
+            }),
+        );
+        agent.local_alt_warmed = true;
+
+        let out = agent.think_command("max");
+        assert!(out.contains("max"), "got: {out}");
+
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
+        assert!(
+            !agent.local_alt_warmed,
+            "a new fingerprint means a new checkpoint to restore"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -11427,6 +11921,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -11484,6 +11980,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
 
         // Empty state: no provider turn recorded yet.
@@ -11549,6 +12047,318 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A checkpoint belongs to the model whose KV it holds, so Tier 1's key must
+    /// follow the engine being warmed — not the live one. Warming the alt local
+    /// engine under a provider main agent with the *provider's* model name would
+    /// look up a checkpoint that cannot describe its KV.
+    #[test]
+    fn tier_one_is_keyed_by_the_engine_being_warmed() {
+        let dir = scratch_dir("kv-tiers-model");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+
+        let live = agent.kv_tiers();
+        let other = agent.kv_tiers_for("some-other-model");
+
+        assert_eq!(
+            agent.kv_tiers(),
+            live,
+            "keying is a pure function of inputs"
+        );
+        assert_ne!(
+            live[0].fingerprint, other[0].fingerprint,
+            "the model name is part of Tier 1's identity"
+        );
+        // And the live engine's own name reproduces the live plan, so
+        // `kv_tiers` is genuinely just this call with one argument filled in.
+        assert_eq!(agent.kv_tiers_for(&agent.engine.model_name()), live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The whole launch cycle, in the order a launch runs it: warm the alt
+    /// engine, then GC. These two fought — the warm wrote a checkpoint and the
+    /// GC deleted it before the next launch could read it — and neither in
+    /// isolation was wrong. Only the pair is.
+    #[test]
+    fn a_launch_keeps_the_checkpoint_it_just_wrote() {
+        let dir = scratch_dir("launch-cycle");
+        let cfg = test_cfg();
+        // A provider main agent: its Tier 1 fingerprint never has a file, which
+        // is what turned the GC into a full sweep.
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                model: Some("provider-model".to_string()),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.system = "SYSTEM".to_string();
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                model: Some("ds4-local".to_string()),
+                kv_events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+                ..ScriptedEngine::default()
+            }),
+        );
+        let alt_key = crate::session::KvKey::System {
+            fp: agent
+                .kv_tiers_for("ds4-local")
+                .into_iter()
+                .find(|t| t.kind == crate::kvtier::TierKind::System)
+                .expect("a system tier")
+                .fingerprint,
+        };
+
+        agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+        assert!(
+            agent.store.kv_path(&alt_key).exists(),
+            "the warm wrote it: {}",
+            agent.store.kv_path(&alt_key).display()
+        );
+
+        agent.gc_kv_tiers(&agent.kv_tiers());
+
+        assert!(
+            agent.store.kv_path(&alt_key).exists(),
+            "and the GC in the same launch did not take it away again"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Three launches in a row: the toll is paid once, not once per launch.
+    /// Each launch gets fresh engines, because carrying one engine across all
+    /// three would hide a checkpoint that never survives to disk.
+    ///
+    /// Measured as "was the checkpoint already there when the launch started" —
+    /// absent once, then present. Counting `warm_reset` would not do: it runs
+    /// on a restore too, so it reads the same whether the launch prefilled or
+    /// not, which is exactly the distinction under test.
+    #[test]
+    fn repeated_launches_warm_the_sub_agent_engine_only_once() {
+        let dir = scratch_dir("launch-repeat");
+        let cfg = test_cfg();
+        let mut found_on_entry = Vec::new();
+
+        for _ in 0..3 {
+            let mut agent = test_agent(
+                &dir,
+                ScriptedEngine {
+                    model: Some("provider-model".to_string()),
+                    ..ScriptedEngine::default()
+                },
+                &cfg,
+            );
+            agent.system = "SYSTEM".to_string();
+            let tiers = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            agent.alt_engines.insert(
+                EngineKey::Local,
+                Box::new(ScriptedEngine {
+                    local: true,
+                    model: Some("ds4-local".to_string()),
+                    warm_tiers: Some(std::sync::Arc::clone(&tiers)),
+                    kv_events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+                    ..ScriptedEngine::default()
+                }),
+            );
+
+            let key = crate::session::KvKey::System {
+                fp: agent
+                    .kv_tiers_for("ds4-local")
+                    .into_iter()
+                    .find(|t| t.kind == crate::kvtier::TierKind::System)
+                    .expect("a system tier")
+                    .fingerprint,
+            };
+            found_on_entry.push(agent.store.kv_path(&key).exists());
+
+            agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+            agent.gc_kv_tiers(&agent.kv_tiers());
+            // Warmed exactly once per launch either way — the question is
+            // whether that warm had a checkpoint to restore from.
+            assert_eq!(tiers.lock().unwrap().len(), 1);
+        }
+
+        assert_eq!(
+            found_on_entry,
+            vec![false, true, true],
+            "cold once, then restored — not re-cached every launch"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The GC keeps every live Tier 1, not just the main engine's. Collecting
+    /// against one fingerprint deleted the alt local engine's checkpoint on
+    /// every launch — so it re-prefilled its system prompt every single run —
+    /// and under a provider main agent it swept the directory clean, the
+    /// provider's own fingerprint never having a file to match.
+    #[test]
+    fn gc_keeps_the_alt_local_engines_system_checkpoint() {
+        let dir = scratch_dir("gc-alt-tier1");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                model: Some("ds4-local".to_string()),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        let main_tiers = agent.kv_tiers();
+        let alt_tiers = agent.kv_tiers_for("ds4-local");
+        let fp = |t: &[crate::kvtier::TierSpec]| {
+            t.iter()
+                .find(|t| t.kind == crate::kvtier::TierKind::System)
+                .expect("a system tier")
+                .fingerprint
+                .clone()
+        };
+        let (main_fp, alt_fp) = (fp(&main_tiers), fp(&alt_tiers));
+        assert_ne!(main_fp, alt_fp, "different models, different Tier 1");
+
+        // Both engines' checkpoints on disk, plus a stale third.
+        let key = |fp: &str| crate::session::KvKey::System { fp: fp.to_owned() };
+        for f in [&main_fp, &alt_fp, &"stale".to_string()] {
+            std::fs::write(agent.store.kv_path(&key(f)), b"x").unwrap();
+        }
+
+        agent.gc_kv_tiers(&main_tiers);
+
+        assert!(
+            agent.store.kv_path(&key(&alt_fp)).exists(),
+            "the sub-agent engine's checkpoint survives its own launch"
+        );
+        assert!(agent.store.kv_path(&key(&main_fp)).exists());
+        assert!(!agent.store.kv_path(&key("stale")).exists(), "stale swept");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Startup warms only Tier 1 for the alt engine, and that narrowness is
+    /// load-bearing: `warm` restores the deepest tier that loads and skips
+    /// every tier above it, so a valid Tier 2 checkpoint means Tier 1 is never
+    /// prefilled and never written. A one-tier list has nothing deeper to
+    /// short-circuit it, so the checkpoint the sub-agent needs actually
+    /// appears.
+    #[test]
+    fn startup_warms_only_tier_one_for_the_alt_engine() {
+        let dir = scratch_dir("alt-warm-tier1");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+        agent.context_content = crate::context::ContextContent::new();
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                warm_tiers: Some(std::sync::Arc::clone(&stages)),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+
+        assert!(agent.local_alt_warmed, "and it is not redone on first take");
+        let seen = stages.lock().unwrap().clone();
+        assert_eq!(seen, vec!["SYSTEM"], "system tier only: {seen:?}");
+        assert!(
+            agent.alt_engines.contains_key(&EngineKey::Local),
+            "the engine goes back in the cache"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The alt local engine is warmed on its first take and never again: it
+    /// keeps its session across sidechains, so every later dispatch already
+    /// finds the system prefix in its KV.
+    #[test]
+    fn the_alt_local_engine_is_warmed_once() {
+        let dir = scratch_dir("alt-local-warm");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                ..ScriptedEngine::default()
+            }),
+        );
+        assert!(!agent.local_alt_warmed);
+
+        let (key, engine) = agent
+            .take_alt_engine(&crate::agents::AgentEngine::Local)
+            .expect("the local engine is available");
+        assert_eq!(key, EngineKey::Local);
+        assert!(agent.local_alt_warmed, "the first take warms it");
+        agent.alt_engines.insert(key, engine);
+
+        // Second take: still warmed, and the flag is not a per-take toggle.
+        let (key, engine) = agent
+            .take_alt_engine(&crate::agents::AgentEngine::Local)
+            .expect("still available");
+        assert!(agent.local_alt_warmed);
+        agent.alt_engines.insert(key, engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Every pass is attributed to the engine that served it, so a sidechain on
+    /// an alternate engine lands in its own row rather than the main agent's.
+    /// That split is the whole point under a provider main agent: it answers
+    /// which of the session's tokens were billed and which ran on this machine.
+    #[test]
+    fn run_stats_split_by_the_engine_that_served_the_pass() {
+        let dir = scratch_dir("runstats-by-engine");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let local = |generated, ctx_used| crate::engine::GenerationStats {
+            generated,
+            ctx_used,
+            ..Default::default()
+        };
+        // Two passes on the main engine: in 100 + 30, out 30 + 15.
+        agent.record_usage(&local(30, 130));
+        agent.last_ctx_used = 130;
+        agent.record_usage(&local(15, 175));
+
+        // A sidechain swaps `self.engine` before the pass, which is exactly
+        // what `record_usage` reads — so stand a second engine up the same way.
+        let parent = std::mem::replace(
+            &mut agent.engine,
+            Box::new(ScriptedEngine {
+                local: true,
+                ..ScriptedEngine::default()
+            }),
+        );
+        agent.last_ctx_used = 0;
+        agent.record_usage(&local(7, 57));
+        agent.engine = parent;
+
+        assert_eq!(agent.stats.input_tokens, 180, "totals cover both engines");
+        assert_eq!(agent.stats.output_tokens, 52);
+        assert_eq!(
+            agent.stats.by_engine.len(),
+            2,
+            "{:?}",
+            agent.stats.by_engine
+        );
+        // The main engine leads: it served first.
+        let (_, main_in, main_out) = agent.stats.by_engine[0].clone();
+        assert_eq!((main_in, main_out), (130, 45));
+        let (alt_label, alt_in, alt_out) = agent.stats.by_engine[1].clone();
+        assert_eq!((alt_in, alt_out), (50, 7));
+        assert!(
+            alt_label.contains("(local)"),
+            "a local engine is marked as such: {alt_label}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn duration_formats_with_and_without_hours() {
         use std::time::Duration;
@@ -11606,6 +12416,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11782,6 +12594,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11863,6 +12677,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11931,6 +12747,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12022,6 +12840,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -12711,6 +13531,138 @@ mod tests {
         unsafe { std::env::remove_var(KEY) };
     }
 
+    /// Regression: `/subagent` used to resolve only the definition's *persona*
+    /// and then run the fork on the parent engine, silently dropping the engine
+    /// override that the `agent` tool honours. A remote-backed definition looked
+    /// like it ran remotely while the local model was doing all the work.
+    #[test]
+    fn slash_subagent_honours_the_definitions_engine() {
+        const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("slash-subagent-alt");
+        let cfg = test_cfg();
+        let parent_prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["parent reply\n".to_string()],
+                prompts: std::sync::Arc::clone(&parent_prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.agents = vec![remote_def("remote", KEY)];
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ScriptedEngine {
+                replies: vec!["remote report\n".to_string()],
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        agent
+            .slash("/subagent remote do a thing")
+            .expect("the command ran");
+
+        let transcript = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("remote report"),
+            "the alt engine served the fork: {transcript}"
+        );
+        // The parent engine is used exactly once, and not for the sidechain:
+        // its single prompt is the follow-up turn, which sees the report and
+        // not the framed task the sidechain ran on (that was truncated out).
+        let prompts = parent_prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(
+            prompts[0].contains("remote report"),
+            "the follow-up turn acts on the report: {}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("Task: do a thing"),
+            "the sidechain itself never reached the parent: {}",
+            prompts[0]
+        );
+        assert!(
+            agent.alt_engines.contains_key(&remote_key(KEY)),
+            "alt engine returned to the cache"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// The main loop acts on the report: `/subagent` runs a parent turn as soon
+    /// as the report lands, so delegated work comes back into the conversation
+    /// instead of parking in the transcript until the user types again. This is
+    /// the same continuation the `agent` tool gets for free by returning its
+    /// report as a tool result.
+    #[test]
+    fn slash_subagent_runs_a_turn_on_the_report() {
+        let dir = scratch_dir("slash-subagent-followup");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                // Reply 1 is the sidechain's report; reply 2 is the follow-up
+                // turn the report triggers.
+                replies: vec!["the report\n".to_string(), "acting on it\n".to_string()],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+
+        agent
+            .slash("/subagent do a thing")
+            .expect("the command ran");
+
+        let seen = prompts.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "sidechain, then a turn on its report");
+        assert!(
+            seen[1].contains("the report"),
+            "the follow-up prompt carries the report: {}",
+            seen[1]
+        );
+        let last = agent
+            .session
+            .transcript
+            .last()
+            .expect("a transcript")
+            .text
+            .clone();
+        assert!(last.contains("acting on it"), "{last}");
+    }
+
+    /// A definition whose engine this session cannot provide must fail *before*
+    /// the fork, leaving no framed task stranded in the transcript.
+    #[test]
+    fn slash_subagent_reports_an_unavailable_engine_without_forking() {
+        const KEY: &str = "PLANK_TEST_SLASH_MISSING_KEY";
+        unsafe { std::env::remove_var(KEY) };
+        let dir = scratch_dir("slash-subagent-missing");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.agents = vec![remote_def("remote", KEY)];
+        let before = agent.session.transcript.len();
+
+        agent
+            .slash("/subagent remote do a thing")
+            .expect("the command ran");
+
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the transcript is untouched"
+        );
+    }
+
     #[test]
     fn clean_room_sidechain_hides_the_parent_transcript() {
         const KEY: &str = "PLANK_TEST_CLEANROOM_KEY";
@@ -13048,6 +14000,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -13133,11 +14087,13 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
-        let fork_at = agent.begin_subagent_fork(None, "count the tests");
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
         assert_eq!(fork_at, 2);
         agent.run_turn().unwrap();
         // Fork grew: task, assistant(tool call), tool result, final report.
@@ -13152,7 +14108,7 @@ mod tests {
         assert!(!report.contains("echo 42"), "sidechain leaked: {report}");
 
         // A fork with no assistant output restores the transcript untouched.
-        let fork_at = agent.begin_subagent_fork(None, "noop");
+        let fork_at = agent.begin_subagent_fork(None, "noop", true);
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
@@ -13179,7 +14135,7 @@ mod tests {
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
-        let fork_at = agent.begin_subagent_fork(None, "count the tests");
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
         agent.run_turn().unwrap();
         assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
 
@@ -13206,8 +14162,8 @@ mod tests {
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let outer = agent.begin_subagent_fork(None, "outer");
-        let inner = agent.begin_subagent_fork(None, "inner");
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", true);
         assert!(!agent.finish_subagent_fork(inner, "inner"));
         assert!(!agent.finish_subagent_fork(outer, "outer"));
 
@@ -13277,6 +14233,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -13343,6 +14301,8 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("run echo"));
 

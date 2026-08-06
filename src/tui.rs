@@ -2143,12 +2143,12 @@ fn push_dir_prefix(
     // for the same reason the think segment is peeled: `rfind` above lands on the
     // separator *before* the origin, not the one before the body.
     let origin = crate::status::engine_origin_label();
-    let (segment, origin) = match segment.strip_suffix(origin) {
+    let (segment, origin) = match segment.strip_suffix(origin.as_str()) {
         Some(head) => {
             let head = head.trim_end();
             let head = head.strip_suffix('|').map_or(head, str::trim_end);
             if head.is_empty() {
-                ("", origin.to_owned())
+                ("", origin.clone())
             } else {
                 (head, format!(" | {origin}"))
             }
@@ -2301,19 +2301,32 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // While the *local* engine is prefilling or generating, its brain blinks —
     // the one on-screen signal that says which engine is actually working, which
     // is otherwise invisible for a `provider: local` sidechain under a remote
-    // main agent. The blink dims rather than blanks, so nothing shifts width.
+    // main agent.
+    //
+    // The dark half replaces the glyph with its own width in spaces, so the
+    // brain genuinely disappears and the rest of the bar holds still. Styling
+    // the emoji is not an option: `THINK_MARK` is a color emoji, and a terminal
+    // paints those from the glyph's own palette — an earlier version dimmed its
+    // foreground, which a terminal simply does not render.
+    //
+    // Phased off the pass's own elapsed time rather than `tick_ms`: the status
+    // bar redraws when a prefill/generation event lands — the same event that
+    // moves the `9s` and `t/s` readouts — so tying the blink to that interval
+    // keeps the two in step and makes every pass start with the brain showing.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        let lit = !crate::status::local_pass_active() || crate::status::brain_blink_on(tick_ms);
-        if lit {
+        let showing = !crate::status::local_pass_active()
+            || crate::anim::reduced_motion()
+            || crate::status::brain_blink_on(crate::status::local_pass_ms());
+        if showing {
             spans.push(Span::styled(segment.to_string(), base));
         } else {
             let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
             spans.push(Span::styled(
-                think_mark.to_string(),
-                base.fg(Color::Indexed(240)),
+                " ".repeat(UnicodeWidthStr::width(think_mark)),
+                base,
             ));
             spans.push(Span::styled(rest.to_string(), base));
         }
@@ -3143,51 +3156,149 @@ mod tests {
         );
     }
 
-    /// The brain blinks only while a local pass is in flight, and dims rather
-    /// than disappears so the bar never changes width. This is the only signal
-    /// that says *which* engine is working, so it has to be off when nothing
-    /// local is running and it has to actually alternate when something is.
+    /// A fenced code block that opens on the line directly after a paragraph —
+    /// no blank line between, which `CommonMark` §4.5 allows and which is how
+    /// prose normally introduces a code sample — must still render *after* that
+    /// paragraph.
+    ///
+    /// `ratatui-markdown` 0.3.6 parsed the block ahead of the paragraph, so an
+    /// assistant message showed its code sample above the line introducing it.
+    /// Fixed in the pinned fork; this pins the behaviour plank depends on, so a
+    /// future dependency bump that regresses it fails here rather than on
+    /// screen.
+    #[test]
+    fn a_fence_after_a_paragraph_renders_below_it() {
+        let mut log = OutputLog::new();
+        // Through the real streaming sink, the way a turn feeds it.
+        crate::viz::RenderSink::visible_text(&mut log, "Run it with:\n```sh\ncd local\n```\n");
+        log.end_line();
+
+        let rows: Vec<String> = log
+            .to_text()
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let intro = rows
+            .iter()
+            .position(|r| r.contains("Run it with:"))
+            .unwrap_or_else(|| panic!("intro line missing: {rows:?}"));
+        let code = rows
+            .iter()
+            .position(|r| r.contains("cd local"))
+            .unwrap_or_else(|| panic!("code line missing: {rows:?}"));
+        assert!(
+            intro < code,
+            "paragraph must precede its code block: {rows:?}"
+        );
+    }
+
+    /// The brain blinks only while a local pass is in flight, and the dark half
+    /// is the glyph's own width in spaces so the bar never reflows. This is the
+    /// only signal that says *which* engine is working, so it has to hold still
+    /// when nothing local is running and actually alternate when something is.
+    ///
+    /// Asserts on the glyph's presence and the row's width, not on a color:
+    /// `THINK_MARK` is a color emoji, and an earlier version that changed its
+    /// foreground passed a color assertion while the screen showed nothing.
+    ///
+    /// The phase comes from the pass's own elapsed time, not from `tick_ms`, so
+    /// the sweep here moves the pass clock rather than the animation clock.
     #[test]
     fn the_brain_blinks_only_while_a_local_pass_runs() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
-        let dim = Color::Indexed(240);
         let text = format!("~/x | {mark} med | ctx 12% | generating");
-        let brain_style = |tick: u64| -> Option<Color> {
-            status_bar_lines(&text, tick, base, &TaskView::default())
+        let rows = || -> Vec<String> {
+            status_bar_lines(&text, 0, base, &TaskView::default())
                 .into_iter()
-                .flat_map(|l| l.spans)
-                .find(|sp| sp.content.contains(mark))
-                .expect("think segment present")
-                .style
-                .fg
+                .map(|l| l.spans.iter().map(|sp| sp.content.to_string()).collect())
+                .collect()
         };
+        let brain_showing = || rows().iter().any(|r| r.contains(mark));
+        // Every rendering must occupy the same columns, blinked or not.
+        let widths = |r: &[String]| -> Vec<usize> { r.iter().map(|l| l.width()).collect() };
+        let reference = widths(&rows());
 
-        // Idle: lit at every phase of the clock.
+        // Idle: showing, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        for step in 0..8u64 {
-            assert_ne!(
-                brain_style(step * crate::status::BRAIN_BLINK_MS / 4),
-                Some(dim),
-                "no blink when nothing local is running"
-            );
-        }
+        assert!(brain_showing(), "no blink when nothing local is running");
 
-        // A local pass in flight: both phases appear across one cycle.
+        // A local pass in flight: both phases appear across one cycle, and it
+        // starts showing — the point of phasing off the pass's own clock.
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            let phases: Vec<_> = (0..8u64)
-                .map(|step| brain_style(step * crate::status::BRAIN_BLINK_MS / 8))
+            assert!(brain_showing(), "a pass starts with the brain showing");
+            let phases: Vec<bool> = (0..8u64)
+                .map(|step| {
+                    crate::status::set_local_pass_ms(step * crate::status::BRAIN_BLINK_MS / 8);
+                    assert_eq!(widths(&rows()), reference, "the bar holds its columns");
+                    brain_showing()
+                })
                 .collect();
-            assert!(phases.contains(&Some(dim)), "{phases:?}");
-            assert!(phases.iter().any(|c| *c != Some(dim)), "{phases:?}");
+            assert!(phases.contains(&false), "{phases:?}");
+            assert!(phases.contains(&true), "{phases:?}");
+
+            // Reduced motion collapses the blink to its static form like every
+            // other effect: showing, even mid-cycle where it would otherwise be
+            // dark. Asserted here rather than in a test of its own — both the
+            // reduced-motion toggle and the local-pass flag are process-global,
+            // so two tests holding them would race under the default harness.
+            crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
+            assert!(!brain_showing(), "the phase used for the check");
+            crate::anim::set_reduced_motion(true);
+            let still_showing = brain_showing();
+            crate::anim::set_reduced_motion(false);
+            assert!(still_showing, "reduced motion holds the brain showing");
+
+            // And end-to-end through a real terminal buffer, which is the only
+            // place the property that matters is visible: the dark half leaves
+            // the emoji's cells genuinely blank and everything after them
+            // exactly where it was. Folded in here rather than given a test of
+            // its own because the local-pass flag is process-global.
+            let rendered = |ms: u64| -> String {
+                crate::status::set_local_pass_ms(ms);
+                let mut term =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 2)).unwrap();
+                term.draw(|f| {
+                    f.render_widget(
+                        ratatui::widgets::Paragraph::new(status_bar_lines(
+                            &text,
+                            0,
+                            base,
+                            &TaskView::default(),
+                        )),
+                        f.area(),
+                    );
+                })
+                .unwrap();
+                let buf = term.backend().buffer().clone();
+                (0..buf.area.height)
+                    .map(|y| {
+                        (0..buf.area.width)
+                            .map(|x| buf[(x, y)].symbol().to_string())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let on = rendered(0);
+            let off = rendered(crate::status::BRAIN_BLINK_MS * 3 / 4);
+            assert!(on.contains(mark), "the lit half draws the brain: {on:?}");
+            assert!(!off.contains(mark), "the dark half does not: {off:?}");
+            assert_eq!(
+                on.chars().count(),
+                off.chars().count(),
+                "only the glyph's own cells changed"
+            );
+            assert!(off.contains("med | ctx 12%"), "{off:?}");
         }
 
         // And the guard's drop ends it, so a finished pass cannot leave the bar
         // blinking forever.
         assert!(!crate::status::local_pass_active());
-        assert_ne!(brain_style(0), Some(dim));
+        assert!(brain_showing());
     }
 
     /// The bar is two rows: row one is the directory and branch and nothing
@@ -3199,6 +3310,7 @@ mod tests {
         let base = Style::default();
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let glyph = crate::status::POWERLINE_BRANCH;
+        let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let rows = status_bar_lines(&text, 0, base, &TaskView::default());
@@ -3217,7 +3329,7 @@ mod tests {
             .expect("branch span");
         assert_eq!(branch.style.fg, Some(theme));
         assert!(
-            !row(0).contains(origin),
+            !row(0).contains(origin.as_str()),
             "origin is not on row one: {}",
             row(0)
         );
@@ -3232,7 +3344,7 @@ mod tests {
         let shown = rows[1]
             .spans
             .iter()
-            .find(|s| s.content.contains(origin))
+            .find(|s| s.content.contains(origin.as_str()))
             .expect("origin span");
         assert_eq!(shown.style.fg, None, "plain, like the ctx gauge");
     }
@@ -3273,6 +3385,7 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let glyph = crate::status::POWERLINE_BRANCH;
+        let _guard = crate::status::origin_test_guard();
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
         let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
@@ -3290,13 +3403,17 @@ mod tests {
                 .to_string()
         };
         assert_eq!(row(0), format!("~/Code/plank {glyph} main"));
+        // Compared in pieces rather than against `origin` verbatim: the origin
+        // carries the local engine's ⚡ power badge, and ⚡ (U+26A1) has
+        // Emoji_Presentation, so the buffer holds it as one wide cell plus a
+        // blank continuation. Reading cells back therefore yields a space the
+        // source string does not contain.
+        //
         // `starts_with`: the tail notification slot (a rotating tip, or a
         // running tool's label) also lives on row two, after the state.
-        assert!(
-            row(1).starts_with(&format!("{origin} | ctx 12% | idle")),
-            "row two: {}",
-            row(1)
-        );
+        let head = origin.split('⚡').next().unwrap_or_default();
+        assert!(row(1).starts_with(head), "row two: {}", row(1));
+        assert!(row(1).contains("| ctx 12% | idle"), "row two: {}", row(1));
     }
 
     #[test]

@@ -241,6 +241,85 @@ pub fn plan(
     tiers
 }
 
+/// Why a [`restore`] did or did not put a tier's KV into an engine.
+///
+/// A miss has three distinct causes with three different fixes, and "it
+/// prefilled again" cannot tell them apart from the outside — hence an enum
+/// rather than a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// The checkpoint loaded and the engine now holds its KV.
+    Yes,
+    /// The tier is not cacheable, or there is no session store.
+    NoKey,
+    /// Nothing on disk under this tier's key. Either nothing ever warmed this
+    /// exact fingerprint, or something about the prompt changed since.
+    NoCheckpoint,
+    /// The file is there and keyed correctly but would not load — a stale
+    /// format or a signature mismatch. Rebuilt, never trusted.
+    Unreadable,
+    /// The bytes loaded but the engine refused them.
+    EngineRefused,
+}
+
+impl Restored {
+    /// One line for a diagnostic, in the imperative of what happened.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Yes => "restored from checkpoint",
+            Self::NoKey => "tier is not cacheable",
+            Self::NoCheckpoint => "no checkpoint on disk for this fingerprint",
+            Self::Unreadable => "checkpoint present but would not load",
+            Self::EngineRefused => "engine refused the checkpoint",
+        }
+    }
+}
+
+/// Restores `tier`'s checkpoint into `engine`, or leaves the engine cold.
+///
+/// The restore leg of [`warm`] without its prefill leg, for callers that must
+/// not pay a cold prefill *here*. `warm_sync` prefills uninterruptibly
+/// (`interrupt: &|| false`) and reports progress only through the sink it is
+/// given, so a caller with no progress sink — or one holding a thread the UI
+/// draws on — turns a cold cache into a freeze with no output and no way to
+/// cancel. Skipping it leaves the tokens to whichever pass needs them first,
+/// where the ordinary prefill bar and the interrupt already work.
+///
+/// The engine is left untouched on a miss: `warm_reset` runs only once a
+/// checkpoint is in hand, so a cold engine keeps an empty warm buffer rather
+/// than one describing a prefix its KV does not hold.
+///
+/// # Errors
+/// Returns [`EngineError`] only when the engine itself fails. A missing or
+/// unloadable checkpoint is a miss, not an error.
+pub fn restore(
+    engine: &mut dyn Engine,
+    store: Option<&SessionStore>,
+    tier: &TierSpec,
+) -> Result<Restored, EngineError> {
+    let Some((key, store)) = tier.key.as_ref().zip(store) else {
+        return Ok(Restored::NoKey);
+    };
+    let Some(cache) = store.kv_load(key) else {
+        return Ok(if store.kv_path(key).exists() {
+            Restored::Unreadable
+        } else {
+            Restored::NoCheckpoint
+        });
+    };
+    engine.warm_reset(&tier.text)?;
+    if engine.set_kv(&cache).is_err() {
+        return Ok(Restored::EngineRefused);
+    }
+    // Same reason as the `i < resume` branch in `warm`: the engine's cumulative
+    // token buffer must describe the whole restored prefix, or the next sync
+    // sees a common prefix shorter than the buffer and throws the restored KV
+    // away. The system tier's tokens are already there from `warm_reset`.
+    engine.warm_append(None)?;
+    Ok(Restored::Yes)
+}
+
 /// Warms the KV cache over `tiers` (built by [`plan`], most-stable-first).
 ///
 /// Walks deepest-first for the first tier whose checkpoint loads clean,
@@ -649,6 +728,9 @@ struct SpyEngine {
     synced: Vec<Option<String>>,
     restored: Vec<Vec<u8>>,
     supports_kv: bool,
+    /// When true `set_kv` fails, standing in for a checkpoint this build cannot
+    /// load — keyed correctly, but not restorable.
+    refuse_kv: bool,
 }
 
 #[cfg(test)]
@@ -688,6 +770,9 @@ impl crate::engine::Engine for SpyEngine {
         ))
     }
     fn set_kv(&mut self, c: &crate::kvcache::KVCache) -> Result<(), crate::engine::EngineError> {
+        if self.refuse_kv {
+            return Err(crate::engine::EngineError::new("refused"));
+        }
         self.restored.push(c.kv().to_vec());
         Ok(())
     }
@@ -713,7 +798,7 @@ impl crate::engine::Engine for SpyEngine {
 
 #[cfg(test)]
 mod warm_tests {
-    use super::{TierKind, TierSpec, plan, system_fingerprint, warm};
+    use super::{Restored, TierKind, TierSpec, plan, restore, system_fingerprint, warm};
     use std::path::Path;
 
     use super::SpyEngine;
@@ -727,6 +812,205 @@ mod warm_tests {
     fn tiers_for(system: &str, stable: &str, volatile: &str) -> Vec<TierSpec> {
         let fp1 = system_fingerprint("m", system, crate::engine::ThinkMode::default(), 0);
         plan(&fp1, system, stable, volatile, "", Some(Path::new("/p")))
+    }
+
+    /// `restore` is the restore leg alone. On a miss it must leave the engine
+    /// completely untouched — no `warm_reset` — so a cold engine keeps an empty
+    /// warm buffer instead of one describing a prefix its KV does not hold, and
+    /// the pass that needs those tokens prefills them itself.
+    #[test]
+    fn restore_leaves_a_cold_engine_untouched_and_never_prefills() {
+        let (store, dir) = spy_store("restore-miss");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::NoCheckpoint,
+            "a miss, and it says which kind"
+        );
+        assert_eq!(e.reset_to, None, "the engine was not touched at all");
+        assert!(e.appended.is_empty());
+        assert!(e.synced.is_empty(), "restore never prefills");
+
+        // Seed the checkpoint the way a local-main session would, then re-run:
+        // now it restores, still without prefilling.
+        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::Yes,
+            "a hit"
+        );
+        assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
+        assert_eq!(e.restored.len(), 1);
+        // The buffer describes the restored prefix, or the next sync would
+        // throw the restored KV away.
+        assert_eq!(e.appended, vec![None]);
+        assert!(e.synced.is_empty(), "restore never prefills");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The system checkpoint is what a sub-agent sidechain restores, and a
+    /// one-tier walk is the only thing that writes it — so assert the *file*,
+    /// not just that a prefill happened. Nothing else in the suite would notice
+    /// if `warm` stopped persisting Tier 1.
+    #[test]
+    fn a_one_tier_warm_persists_the_system_checkpoint() {
+        let (store, dir) = spy_store("tier1-persist");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert!(warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap());
+
+        let key = tiers[0].key.as_ref().expect("system tier is cacheable");
+        assert!(
+            store.kv_path(key).exists(),
+            "the checkpoint a sidechain will look for: {}",
+            store.kv_path(key).display()
+        );
+        assert!(store.kv_load(key).is_some(), "and it loads back");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The toll this whole area exists to avoid: a second launch on the same
+    /// fingerprint must restore, not prefill. Two separate engines, because a
+    /// launch is a fresh process — carrying state over in one engine would pass
+    /// while the real thing still re-prefilled.
+    #[test]
+    fn a_second_launch_restores_the_system_tier_instead_of_prefilling() {
+        let (store, dir) = spy_store("tier1-second-launch");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+
+        let mut first = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(
+            &mut first,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(first.synced, vec![None], "the first launch pays for it");
+
+        let mut second = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        let prefilled = warm(
+            &mut second,
+            Some(&store),
+            &tiers[..1],
+            &mut |_| {},
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert!(!prefilled, "the second launch prefills nothing");
+        assert!(second.synced.is_empty(), "{:?}", second.synced);
+        assert_eq!(second.restored.len(), 1, "it restored instead");
+        // And the buffer still describes the restored prefix, or the first sync
+        // of the turn would throw the restored KV away.
+        assert_eq!(second.appended, vec![None]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Known gap, pinned deliberately: a valid deep tier means the tier above
+    /// it is never prefilled and so never written. Correct for the main engine,
+    /// which restores the superset — but it means Tier 1 can stay absent
+    /// forever, which is why the sub-agent engine warms a one-tier list of its
+    /// own. If this ever starts passing a checkpoint for Tier 1, that is a
+    /// deliberate improvement and this test should be rewritten, not deleted.
+    #[test]
+    fn a_valid_deep_tier_leaves_the_system_checkpoint_unwritten() {
+        let (store, dir) = spy_store("tier1-skipped");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        // Seed Tier 2 the way a previous launch would have, without Tier 1.
+        let mut seed = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut seed, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+        let sys_key = tiers[0].key.as_ref().unwrap();
+        let _ = std::fs::remove_file(store.kv_path(sys_key));
+        assert!(!store.kv_path(sys_key).exists());
+
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        warm(&mut e, Some(&store), &tiers, &mut |_| {}, &mut |_| {}).unwrap();
+
+        assert!(
+            !store.kv_path(sys_key).exists(),
+            "Tier 2 restored, so Tier 1 was skipped and never written"
+        );
+        assert!(e.synced.iter().all(|t| t.as_deref() != Some("SYSTEM")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A checkpoint that is present but will not load is a distinct outcome
+    /// from one that is absent: the first says "something is wrong with this
+    /// file", the second "nothing ever wrote one". Conflating them sent this
+    /// investigation down the wrong path once already.
+    #[test]
+    fn restore_distinguishes_unreadable_from_absent_and_refused() {
+        let (store, dir) = spy_store("restore-outcomes");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let key = tiers[0].key.as_ref().unwrap();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::NoCheckpoint
+        );
+        // No store at all is the same class of miss, reported separately.
+        assert_eq!(restore(&mut e, None, &tiers[0]).unwrap(), Restored::NoKey);
+        // Tier 3 has no key even with a store.
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[2]).unwrap(),
+            Restored::NoKey
+        );
+
+        // Present, correctly named, and garbage inside.
+        std::fs::write(store.kv_path(key), b"not a checkpoint").unwrap();
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::Unreadable
+        );
+        assert_eq!(e.reset_to, None, "and the engine is still untouched");
+
+        // Readable, but this engine will not take it.
+        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        let mut fussy = SpyEngine {
+            supports_kv: true,
+            refuse_kv: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            restore(&mut fussy, Some(&store), &tiers[0]).unwrap(),
+            Restored::EngineRefused
+        );
+        assert!(
+            fussy.synced.is_empty(),
+            "a refusal never falls back to prefill"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

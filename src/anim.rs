@@ -55,12 +55,23 @@ pub fn reduced_motion() -> bool {
 /// The epoch is captured on first use, so the very first frame reads `~0`.
 #[must_use]
 pub fn clock_ms() -> Option<u64> {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
     if reduced_motion() {
         return None;
     }
-    let ms = u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(0);
-    Some(ms)
+    Some(epoch_ms())
+}
+
+/// Milliseconds since the shared epoch, ignoring reduced motion.
+///
+/// [`clock_ms`] is the clock effects animate off, and it goes dark on purpose.
+/// This is the underlying *measurement*, for callers that need to time a real
+/// interval (how long a pass has been running) rather than to move something —
+/// they branch on reduced motion themselves, at the point where they decide
+/// whether to animate at all.
+#[must_use]
+pub fn epoch_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(0)
 }
 
 /// An 8-bit-per-channel RGB color.

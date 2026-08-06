@@ -352,13 +352,19 @@ pub fn final_round_reminder() -> String {
 }
 
 /// Frames the subagent's final report for the parent conversation.
+///
+/// The framing tells the model to *continue from* the report, because a turn
+/// runs on it as soon as it lands: the report is the delegated work coming
+/// back, not background reading. It also says not to redo that work — the
+/// sidechain is truncated out of the transcript, so the tool calls behind the
+/// report are gone and re-running them is the tempting failure mode.
 #[must_use]
 pub fn report_message(task: &str, report: &str) -> String {
     format!(
         "<system-reminder>\n\
          A subagent completed the delegated task: {}\n\
-         Its final report follows. This is background context from a sidechain \
-         run; do not respond to it directly unless the user asks.\n\
+         Its final report follows. Continue from it: act on what it found, or \
+         answer the user with it. Do not repeat the work it already did.\n\
          </system-reminder>\n\n\
          Subagent report:\n{}",
         task.trim(),

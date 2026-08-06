@@ -101,7 +101,8 @@ loop — with piped stdin there is no live input to multiplex.
 
 ### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
-  `warm_system_prompt`, `count_tokens`, `ctx_size`, plus `generate_aside` /
+  `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,
+  `ctx_size`, plus `generate_aside` /
   `supports_aside` for mid-generation asides and `snapshot_kv` / `restore_kv`
   for checkpoints), the event types (`EngineEvent::{Prefill, Text}`), options,
   stats, and the `EchoEngine` stub. Trait methods default to unsupported so
@@ -349,16 +350,19 @@ is parsed from the very arguments the settings seed.
 ## Data flows worth understanding
 
 ### System-prompt KV cache
-On startup the agent warms the cache before the first turn:
+See **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
+warm walk, the on-disk format, forks, and GC. In outline, on startup the agent
+warms the cache before the first turn:
 
-1. `Ds4Engine::warm_system_prompt` builds system-only chat tokens and computes a
-   fingerprint = `SHA-1(model_name + "\0" + system_prompt)`.
-2. If `sysprompt.kv` exists and its stored fingerprint matches, the snapshot is
-   restored (`ds4_session_load_snapshot`) — no prefill.
-3. Otherwise it prefills the system prompt (streaming the progress bar) and saves
-   a fresh checkpoint. The note above the bar names the tier being rebuilt —
-   `TierKind::warm_label`, e.g. **"Updating system prompt cache…"** for Tier 1 or
-   **"Updating session context…"** when only the volatile tier prefills — and the
+1. `kvtier::plan` builds the tier list, keyed from
+   `system_fingerprint(model, think, trusted_len, system)` downward, each tier's
+   fingerprint chaining its parent's.
+2. `kvtier::warm` restores the deepest tier whose checkpoint loads — a disk read,
+   no prefill — and prefills only the tiers below it, persisting each at its own
+   boundary.
+3. The note above the bar names the tier actually rebuilding
+   (`TierKind::warm_label`, e.g. **"Updating system prompt cache…"** for Tier 1,
+   **"Updating session context…"** when only the volatile tier prefills), and the
    window title stays `🚀 launching...` until the UI accepts input.
 
 Within a run, the live session then makes each turn reuse the common prefix, so

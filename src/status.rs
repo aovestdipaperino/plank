@@ -156,22 +156,116 @@ pub fn git_branch_label() -> Option<String> {
 /// the engine is built and never changes, so threading it through the worker,
 /// the remote-UI protocol, and both front-ends would be noise. Mirrors how
 /// [`cwd_label`] and [`git_branch_label`] read the ambient environment.
-static ENGINE_ORIGIN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+static ENGINE_ORIGINS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
-/// Shown when nothing set an origin: the local Metal-backed ds4 engine (and the
-/// `EchoEngine` stub, which is equally local).
-const LOCAL_ORIGIN: &str = "(local)";
+/// Shown for an engine running on this machine's own weights: the Metal-backed
+/// ds4 engine, and the `EchoEngine` stub, which is equally local.
+pub const LOCAL_ORIGIN: &str = "(local)";
 
-/// Records the engine origin for the footer. First call wins; later calls are
-/// ignored, so a single engine choice per process is the only thing shown.
+/// Records an engine origin for the footer, in first-seen order.
+///
+/// A list rather than a single value: a session can hold several engines at
+/// once — a provider main agent with a `provider: local` sub-agent, or
+/// definitions pointing at different hosts — and "where is inference running"
+/// then has more than one answer. Repeats are dropped, so two definitions on
+/// the same host name it once and the main engine stays first.
 pub fn set_engine_origin(label: &str) {
-    let _ = ENGINE_ORIGIN.set(label.to_owned());
+    let label = label.trim();
+    if label.is_empty() {
+        return;
+    }
+    let Ok(mut origins) = ENGINE_ORIGINS.lock() else {
+        return;
+    };
+    if !origins.iter().any(|o| o == label) {
+        origins.push(label.to_owned());
+    }
 }
 
-/// The engine-origin label: a provider or remote host, else [`LOCAL_ORIGIN`].
+/// GPU power cap for the local engine, as a percentage. `0` or `100` means
+/// unlimited and shows no badge.
+///
+/// Process-global beside the origin list rather than carried on [`Status`],
+/// because it has to be readable from *both* sides of the footer: the builder
+/// that composes the origin segment and the TUI that peels that same segment
+/// back off. Two sources would let them disagree about where the segment ends.
+static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Records the local engine's GPU power cap, from startup config or `/power`.
+pub fn set_local_power(percent: i32) {
+    LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The local engine's origin label, carrying its power share: `(local ⚡100%)`,
+/// or `(local ⚡60%)` under a cap.
+///
+/// Always shown, never hidden at 100%. The reading answers "how much of the GPU
+/// is this engine allowed", and "all of it" is an answer — a badge that appears
+/// only under a cap makes its absence ambiguous between unlimited and not
+/// supported. Unset (`0`) is the default and means uncapped, so it reads 100.
+///
+/// The share goes *inside* the parentheses so the whole thing is one label for
+/// one engine. Outside them it reads as a second segment of the bar, which is
+/// what it used to be and exactly what stopped being true once the footer could
+/// name more than one engine.
+///
+/// Derived from `LOCAL_ORIGIN` rather than spelled out again, so the two cannot
+/// drift apart — and if it ever stops being parenthesized, this degrades to
+/// appending rather than producing a stray bracket.
 #[must_use]
-pub fn engine_origin_label() -> &'static str {
-    ENGINE_ORIGIN.get().map_or(LOCAL_ORIGIN, String::as_str)
+fn local_origin_label() -> String {
+    let pct = LOCAL_POWER.load(std::sync::atomic::Ordering::Relaxed);
+    let pct = if pct <= 0 { 100 } else { pct.min(100) };
+    LOCAL_ORIGIN.strip_suffix(')').map_or_else(
+        || format!("{LOCAL_ORIGIN} ⚡{pct}%"),
+        |head| format!("{head} ⚡{pct}%)"),
+    )
+}
+
+/// The engine-origin label: every origin in play, comma-separated in first-seen
+/// order, or [`LOCAL_ORIGIN`] when nothing registered one.
+///
+/// The local entry carries the GPU power cap, because the cap applies to *that*
+/// engine and to no other. Beside a provider it would otherwise read as a
+/// property of the session, which it is not — a `provider: local` sub-agent
+/// under a remote main agent is exactly the case where the distinction matters.
+#[must_use]
+pub fn engine_origin_label() -> String {
+    let local = local_origin_label();
+    let Ok(origins) = ENGINE_ORIGINS.lock() else {
+        return local;
+    };
+    if origins.is_empty() {
+        return local;
+    }
+    origins
+        .iter()
+        .map(|o| if o == LOCAL_ORIGIN { &local } else { o })
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Serializes tests that touch the process-global origin list or power cap.
+///
+/// These live in two modules (here and [`crate::tui`]), and a reader that calls
+/// [`engine_origin_label`] twice — as `push_dir_prefix` does — sees a torn
+/// result if another test mutates between the calls. Cheaper and more honest
+/// than making every such test tolerate arbitrary global state.
+#[cfg(test)]
+pub(crate) fn origin_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Forgets every recorded origin. Tests only: the list is process-global, and a
+/// test that registers one would otherwise leak into the next.
+#[cfg(test)]
+pub(crate) fn reset_engine_origins() {
+    if let Ok(mut origins) = ENGINE_ORIGINS.lock() {
+        origins.clear();
+    }
 }
 
 /// Extracts the bare host from a base URL for display: `https://api.anthropic.com/v1`
@@ -629,6 +723,10 @@ pub fn local_pass_active() -> bool {
     LOCAL_PASS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// When the live local pass began, as milliseconds on [`crate::anim`]'s shared
+/// epoch. Meaningless unless `LOCAL_PASS` is set.
+static LOCAL_PASS_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Marks a local-engine pass as running for as long as the guard lives.
 ///
 /// A guard rather than a set/clear pair for the same reason [`ToolActivity`] is
@@ -641,6 +739,12 @@ impl LocalPass {
     /// Marks a pass as local; the returned guard clears it.
     #[must_use]
     pub fn begin() -> Self {
+        #[cfg(test)]
+        LOCAL_PASS_OVERRIDE.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        LOCAL_PASS_SINCE.store(
+            crate::anim::epoch_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         LOCAL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -651,6 +755,44 @@ impl Drop for LocalPass {
         LOCAL_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// Milliseconds the live local pass has been running, or `0` when none is.
+///
+/// This — not the free-running animation clock — is what phases the brain
+/// blink, so the blink is a function of *the pass's own elapsed time*: the same
+/// quantity the status bar's `9s` and `t/s` readouts are computed from. A pass
+/// therefore always starts on a lit brain and blinks in step with its own
+/// counters, rather than picking up whatever phase the shared clock happened to
+/// be in when it started.
+#[must_use]
+pub fn local_pass_ms() -> u64 {
+    if !local_pass_active() {
+        return 0;
+    }
+    #[cfg(test)]
+    {
+        let pinned = LOCAL_PASS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if pinned != u64::MAX {
+            return pinned;
+        }
+    }
+    crate::anim::epoch_ms()
+        .saturating_sub(LOCAL_PASS_SINCE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Pins how long the live local pass has been running, so a test can place the
+/// blink at a chosen phase without sleeping through one. Cleared by the next
+/// [`LocalPass::begin`].
+#[cfg(test)]
+pub(crate) fn set_local_pass_ms(ms: u64) {
+    LOCAL_PASS_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test override for [`local_pass_ms`]; `u64::MAX` means "not overridden", a
+/// value no real pass can reach.
+#[cfg(test)]
+static LOCAL_PASS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// How long one on/off cycle of the local-engine brain blink takes. Slower than
 /// the tool blink: this is a reassurance, not an alert, and a fast pulse next to
@@ -739,12 +881,11 @@ pub fn flash_tip() -> Option<String> {
     }
 }
 
-fn power_suffix(st: &Status) -> String {
-    if st.power_percent > 0 && st.power_percent < 100 {
-        format!(" | ⚡ {}%", st.power_percent)
-    } else {
-        String::new()
-    }
+/// The bar's trailing power slot, now always empty: the reading moved next to
+/// the local origin, where it names the engine it actually caps. Kept as a
+/// seam rather than deleted so the body arms below stay one shape.
+fn power_suffix(_st: &Status) -> String {
+    String::new()
 }
 
 /// Cells in the compaction bar shown in the status bar's tail slot. Much
@@ -1158,13 +1299,54 @@ mod tests {
         assert_eq!(url_host("://"), "://");
     }
 
+    /// Several engines can be live at once — a provider main agent with a
+    /// `provider: local` sub-agent, or definitions on different hosts — so the
+    /// footer names all of them rather than only whichever registered first.
+    #[test]
+    fn engine_origins_list_every_engine_in_play() {
+        let _guard = origin_test_guard();
+        reset_engine_origins();
+        // Nothing registered: the local engine is the implied answer.
+        assert_eq!(engine_origin_label(), local_origin_label());
+
+        set_engine_origin("regolo.ai");
+        assert_eq!(engine_origin_label(), "regolo.ai");
+
+        // A second engine joins, in first-seen order, so the main agent leads.
+        // The local one renders through `local_origin_label`, power badge and
+        // all — registering `LOCAL_ORIGIN` is what selects that rendering.
+        let local = local_origin_label();
+        set_engine_origin(LOCAL_ORIGIN);
+        assert_eq!(engine_origin_label(), format!("regolo.ai, {local}"));
+
+        // Repeats are dropped: two definitions on one host name it once.
+        set_engine_origin("regolo.ai");
+        set_engine_origin("api.anthropic.com");
+        set_engine_origin(LOCAL_ORIGIN);
+        assert_eq!(
+            engine_origin_label(),
+            format!("regolo.ai, {local}, api.anthropic.com")
+        );
+
+        // An empty label is not a slot in the list.
+        set_engine_origin("   ");
+        assert_eq!(
+            engine_origin_label(),
+            format!("regolo.ai, {local}, api.anthropic.com")
+        );
+        reset_engine_origins();
+    }
+
     #[test]
     fn footer_shows_the_engine_origin_beside_the_directory() {
         // No engine set this origin (unit tests build no engine), so the local
         // ds4/echo default stands. The label sits in the dir prefix, ahead of
         // the think segment — not appended to the tail.
+        let _guard = origin_test_guard();
         let line = build_status_text(&Status::default(), false, true);
-        let origin = line.find("(local)").expect("origin in footer");
+        let origin = line
+            .find(local_origin_label().as_str())
+            .expect("origin in footer");
         let think = line.find(THINK_MARK).expect("think segment in footer");
         assert!(origin < think, "{line}");
     }
@@ -1447,16 +1629,44 @@ mod tests {
         assert_eq!(&line[mark..ctx], format!("{THINK_MARK} med | "), "{line}");
     }
 
+    /// The power cap rides with the local origin, not the bar's tail: it caps
+    /// that engine and no other, so beside a provider a trailing badge would
+    /// read as a property of the session. Shown only when actually limiting.
     #[test]
-    fn power_suffix_shown_only_when_limited() {
-        let mut st = Status {
+    fn power_badge_rides_with_the_local_origin() {
+        let _guard = origin_test_guard();
+        reset_engine_origins();
+        let st = Status {
             ctx_size: 100,
-            power_percent: 50,
             ..Status::default()
         };
-        assert!(build_status_text(&st, false, true).ends_with("⚡ 50%"));
-        st.power_percent = 100;
-        assert!(!build_status_text(&st, false, true).contains('⚡'));
+
+        set_local_power(50);
+        let line = build_status_text(&st, false, true);
+        // Inside the parentheses, so it reads as one label for one engine.
+        assert!(line.contains("(local ⚡50%)"), "{line}");
+        assert!(!line.contains("(local)"), "not left bare: {line}");
+        assert!(!line.ends_with('%'), "not in the tail slot: {line}");
+
+        // A provider alongside the local engine: the badge stays attached to
+        // the engine it describes.
+        set_engine_origin("regolo.ai");
+        set_engine_origin(LOCAL_ORIGIN);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("regolo.ai, (local ⚡50%)"), "{line}");
+
+        // Uncapped still reads: "all of it" is an answer, and a badge that
+        // vanished at 100% would make its absence ambiguous between unlimited
+        // and unsupported.
+        set_local_power(100);
+        assert!(build_status_text(&st, false, true).contains("(local ⚡100%)"));
+        // Unset is the default and means uncapped, so it reads the same.
+        set_local_power(0);
+        let line = build_status_text(&st, false, true);
+        assert!(line.contains("(local ⚡100%)"), "{line}");
+        assert!(!line.contains("(local)"), "never the bare label: {line}");
+        set_local_power(0);
+        reset_engine_origins();
     }
 
     #[test]

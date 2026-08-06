@@ -492,9 +492,19 @@ impl SessionStore {
     /// checkpoint became content-keyed) goes too — nothing writes that name
     /// any more, so it can never be read again. Best-effort; a failed unlink
     /// is ignored (the next launch retries).
+    ///
+    /// `keep` is a *set* because a session can hold more than one engine, and
+    /// each has its own Tier 1 fingerprint — a provider main agent beside a
+    /// `provider: local` sub-agent has two. Passing only the main engine's
+    /// deletes the other's checkpoint on every launch, and under a provider it
+    /// deletes every checkpoint in the directory: the provider's own
+    /// fingerprint never has a file, so nothing at all matches `keep`.
     #[must_use]
-    pub fn gc_system_checkpoints(&self, keep_fp: &str) -> usize {
-        let keep_name = sysprompt_checkpoint_name(keep_fp);
+    pub fn gc_system_checkpoints(&self, keep: &[&str]) -> usize {
+        let keep_names: Vec<String> = keep
+            .iter()
+            .map(|fp| sysprompt_checkpoint_name(fp))
+            .collect();
         let legacy_name = format!("{SYSPROMPT_STEM}{FILE_EXT}");
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return 0;
@@ -509,7 +519,7 @@ impl SessionStore {
             let collect = name == legacy_name
                 || (name.starts_with(SYSPROMPT_PREFIX)
                     && name.ends_with(FILE_EXT)
-                    && name != keep_name);
+                    && !keep_names.iter().any(|k| k == name));
             if !collect || !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
             }
@@ -539,7 +549,12 @@ impl SessionStore {
     }
 
     /// Filesystem location backing a [`KvKey`].
-    fn kv_path(&self, key: &KvKey) -> PathBuf {
+    ///
+    /// Public so a diagnostic can name the exact file it looked for: "no
+    /// checkpoint" is only actionable if you can go and see whether it is
+    /// there.
+    #[must_use]
+    pub fn kv_path(&self, key: &KvKey) -> PathBuf {
         match key {
             KvKey::System { fp } => self.dir.join(sysprompt_checkpoint_name(fp)),
             KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),
@@ -2004,10 +2019,13 @@ hello\n";
         fs::create_dir_all(store.project_dir(project)).unwrap();
         fs::write(store.project_checkpoint_path(project, "aaa"), b"fp\nkv").unwrap();
 
-        assert_eq!(store.gc_system_checkpoints("bbb"), 3);
+        // Two fingerprints kept: a session can hold two engines, each with its
+        // own Tier 1 — a provider main agent beside a `provider: local`
+        // sub-agent. Keeping only one deletes the other's every launch.
+        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 2);
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
+        assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
-        assert!(!dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join("sysprompt.kv").exists());
         assert!(payload.exists());
         assert!(store.path_for_id(&s.id).exists());
@@ -2015,10 +2033,13 @@ hello\n";
         assert!(store.project_checkpoint_path(project, "aaa").exists());
 
         // Idempotent, and harmless when there is nothing to collect.
-        assert_eq!(store.gc_system_checkpoints("bbb"), 0);
+        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 0);
         let empty = temp_dir("sys-gc-empty");
         let empty_store = SessionStore::open(&empty).unwrap();
-        assert_eq!(empty_store.gc_system_checkpoints("bbb"), 0);
+        assert_eq!(empty_store.gc_system_checkpoints(&["bbb"]), 0);
+        // An empty keep set is a full sweep, not a no-op: the caller decides
+        // what is live, and "nothing" would only ever be a bug upstream.
+        assert_eq!(store.gc_system_checkpoints(&[]), 2);
         let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&dir);
     }
