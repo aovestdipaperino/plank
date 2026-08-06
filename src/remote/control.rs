@@ -1750,6 +1750,38 @@ mod tests {
         );
     }
 
+    /// End of turn reaches an attached client as a `notify` frame. The local
+    /// desktop notification is invisible to whoever is driving from a browser,
+    /// so this is the only signal they get — worth pinning end to end rather
+    /// than only at the `from_event` mapping.
+    #[test]
+    fn end_of_turn_notification_reaches_an_attached_client() {
+        let server = test_server(false, false);
+        let mut ws = connect(server.local_addr);
+        send_client(
+            &mut ws,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut ws).expect("hello");
+        read_server(&mut ws).expect("snapshot");
+
+        server.state.bus.broadcast(UiEvent::Notify {
+            title: "finished: add the button".into(),
+            body: "…and wired it up.".into(),
+        });
+        let frame = read_server(&mut ws).expect("notify frame");
+        assert_eq!(
+            frame.msg,
+            ServerMsg::Notify {
+                title: "finished: add the button".into(),
+                body: "…and wired it up.".into(),
+            }
+        );
+    }
+
     #[test]
     fn auth_rejects_bad_token() {
         let server = test_server(false, false);

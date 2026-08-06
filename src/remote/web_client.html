@@ -87,17 +87,34 @@
   }
   .md hr { border: 0; border-top: 1px solid var(--line); margin: .9em 0; }
 
+  /* Finished-turn banner: the one signal that needs no permission from
+     anybody, so it fires even when desktop notifications are blocked. */
+  #toast {
+    margin: 0 .75rem .5rem; padding: .5rem .7rem;
+    background: var(--paper); border: 1px solid var(--honey);
+    border-left-width: 3px; border-radius: 8px;
+    display: flex; flex-direction: column; gap: .2rem;
+    font-size: .9em; cursor: pointer;
+  }
+  #toast[hidden] { display: none; }
+  #toast strong { color: var(--honey); }
+  #toast span { color: var(--bark-soft); white-space: pre-wrap; }
+
   form.input { display: flex; gap: .5rem; padding: .5rem .75rem;
-    border-top: 1px solid var(--line); background: var(--paper); }
-  form.input select, form.input input, form.input button {
+    border-top: 1px solid var(--line); background: var(--paper);
+    align-items: flex-end; }
+  form.input textarea, form.input button {
     font: inherit; background: var(--birch); color: var(--bark);
     border: 1px solid var(--line); border-radius: 6px;
   }
-  form.input select { padding: .3rem; }
-  form.input input { flex: 1 1 auto; padding: .4rem .5rem; }
-  form.input input::placeholder { color: var(--bark-soft); }
+  form.input textarea {
+    flex: 1 1 auto; padding: .4rem .5rem; resize: none; overflow-y: auto;
+    max-height: 12em; line-height: 1.4;
+  }
+  form.input textarea::placeholder { color: var(--bark-soft); }
   form.input button { padding: .4rem .9rem; cursor: pointer; }
   form.input button:hover { border-color: var(--honey); }
+  form.input #stop:hover { border-color: var(--coral); color: var(--coral); }
 </style>
 </head>
 <body>
@@ -117,14 +134,17 @@
   <span id="status">disconnected</span>
 </header>
 <div id="log" aria-live="polite"></div>
+<div id="toast" role="status" hidden></div>
 <form class="input" id="inputForm">
-  <select id="kind" title="frame kind">
-    <option value="prompt">prompt</option>
-    <option value="command">command</option>
-    <option value="btw">btw</option>
-  </select>
-  <input id="line" placeholder="type a line and press Enter" autocomplete="off">
+  <!-- One field, sent as a `prompt` frame whatever it contains: the agent's own
+       dispatcher already routes a leading `/` to the slash commands (including
+       `/btw`) when it drains the queue, exactly as it does for a line typed
+       into the TUI. A frame-kind selector here would only be a second, worse
+       copy of that parser. -->
+  <textarea id="line" rows="1" placeholder="type a prompt — Enter sends, Shift+Enter for a new line"
+            autocomplete="off" spellcheck="false"></textarea>
   <button type="submit">send</button>
+  <button type="button" id="stop" title="interrupt the running turn (Esc)">stop</button>
 </form>
 <script>
 "use strict";
@@ -184,11 +204,39 @@ function notify(title, body) {
     document.title = "● " + title;
   }
   bell();
-  if (window.Notification && Notification.permission === "granted") {
+  toast(title, body);
+  // A desktop notification needs the browser's permission *and* the OS's, and
+  // the second one is invisible from here — a granted permission that shows
+  // nothing means notifications are off for the browser in system settings.
+  // The toast above fires either way, so this is a bonus, never the only signal.
+  if (!window.Notification) return;
+  if (Notification.permission === "granted") {
     try {
       new Notification(title, { body: body, icon: "/logo.png", tag: "plank-turn" });
-    } catch (_) { /* some browsers refuse a constructed Notification; the title flash stands */ }
+    } catch (_) { /* some browsers refuse a constructed Notification; the toast stands */ }
+  } else if (Notification.permission === "denied") {
+    line("[desktop notifications are blocked for this page]", "dim");
   }
+}
+
+// An in-page banner, so a finished turn is visible even with no notification
+// permission at all. Dismissed by a click or by the next one replacing it.
+let toastTimer = null;
+
+function toast(title, body) {
+  const el = $("toast");
+  el.innerHTML = "";
+  const h = document.createElement("strong");
+  h.textContent = title;
+  el.appendChild(h);
+  if (body) {
+    const p = document.createElement("span");
+    p.textContent = body.length > 240 ? body.slice(0, 240) + "…" : body;
+    el.appendChild(p);
+  }
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 12000);
 }
 
 // Restore the tab title once the operator actually looks at the page.
@@ -491,15 +539,41 @@ function connect() {
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const el = $("line");
-  const text = el.value;
+  const text = el.value.replace(/\s+$/, "");
   if (!text) return;
-  const kind = $("kind").value; // prompt | command | btw
   // This submit is the user gesture browsers require before a notification
   // permission prompt or an audio context is allowed.
   armNotifications();
-  send({ type: kind, text });
+  // Always a `prompt` frame: the agent routes a leading `/` to its own slash
+  // dispatcher when it drains the queue, so `/btw ...` and every other command
+  // work here without this page knowing what any of them are.
+  send({ type: "prompt", text: text });
   el.value = "";
+  grow(el);
 });
+
+// Interrupt the running turn — the browser's Esc. Deliberately outside the
+// form so it never submits, and always enabled: interrupting is exactly what
+// you reach for when something is stuck.
+$("stop").addEventListener("click", () => send({ type: "interrupt" }));
+
+// Enter sends, Shift+Enter (or Alt/Ctrl+Enter) inserts a newline, matching how
+// the TUI's own composer behaves for a multi-line prompt.
+$("line").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    $("inputForm").requestSubmit();
+  }
+});
+
+// Grow with the text up to the CSS max-height, then scroll inside.
+function grow(el) {
+  el.style.height = "auto";
+  el.style.height = el.scrollHeight + "px";
+}
+
+$("line").addEventListener("input", (e) => grow(e.target));
+$("toast").addEventListener("click", () => { $("toast").hidden = true; });
 
 // `/remote-control` prints http://HOST:PORT/?t=TOKEN and that link is the only
 // way in: the token exists nowhere else, so a page reached without one has
