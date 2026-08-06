@@ -3,6 +3,11 @@
 .claude/
 # per-project /config settings (src/config.rs saves them here)
 .plank/
+# ...except the multi-provider test fixtures, where the .plank/ directories ARE
+# the test: they carry the sub-agent definitions those sessions exercise. They
+# hold no credentials — a definition names the key's env var, never the key.
+!multi-provider-tests/*/.plank/
+!multi-provider-tests/*/.plank/**
 /local/
 /vault/
 # local launch scripts may embed API keys (e.g. scripts/plank-z.sh)

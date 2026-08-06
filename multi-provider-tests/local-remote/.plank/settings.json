@@ -1,0 +1,4 @@
+{
+  "agents": { "autoRoute": true, "maxParallel": 4 },
+  "ui": { "notifyAfterSecs": 3 }
+}

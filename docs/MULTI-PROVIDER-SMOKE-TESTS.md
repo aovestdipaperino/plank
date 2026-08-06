@@ -3,6 +3,11 @@
 Manual checks for cross-provider sub-agents: a named definition in
 `~/.plank/agents/*.md` running on a different engine than the main agent.
 
+`multi-provider-tests/` in this repo is a runnable starting point for the two
+main configurations: two prepared session directories plus `test-regolo.sh`,
+which checks the provider side over curl before plank is involved. It needs only
+`REGOLO_API_KEY`. What follows is the fuller matrix.
+
 Everything here is **manual and needs real credentials**. The unit suite covers
 the logic against `EchoEngine` and stubs with no network
 (`cargo test --lib` — see `agents::`, `sysprompt::`, and the `fanout_*` /
