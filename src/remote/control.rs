@@ -94,6 +94,11 @@ const STATUS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// [`PROTOCOL_VERSION`] JSON frames as the native client.
 pub const WEB_CLIENT_HTML: &str = include_str!("web_client.html");
 
+/// The plank logo shown in the web client's header, served at `GET /logo.png`.
+/// A 128px downscale of `assets/logo.png` (the full-size original is ~1 MB,
+/// which has no business inside the binary or on every page load).
+pub const WEB_CLIENT_LOGO: &[u8] = include_bytes!("../../assets/logo-web.png");
+
 // --- Protocol ---------------------------------------------------------------
 
 /// Flattened, serializable view of [`Status`] for `status` frames (§4.3). The
@@ -952,11 +957,25 @@ fn is_loopback_origin(origin: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Serves a plain HTTP request: the web client at `/` (or `/index.html`), else
-/// a 404. Best-effort; write errors just drop the connection.
+/// Serves a plain HTTP request: the web client at `/` (or `/index.html`), its
+/// logo at `/logo.png`, else a 404. Best-effort; write errors just drop the
+/// connection. The query string is stripped before routing, so the tokenized
+/// link `/?t=TOKEN` that `/remote-control` prints lands on the client page.
 fn serve_http(stream: &mut TcpStream, req: &ParsedRequest) {
     let path = req.path.split('?').next().unwrap_or(&req.path);
-    if req.method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/index.html") {
+    if !req.method.eq_ignore_ascii_case("GET") {
+        let _ = write_http_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+        );
+        return;
+    }
+    if path == "/logo.png" {
+        let _ = write_http_response(stream, 200, "OK", "image/png", WEB_CLIENT_LOGO);
+    } else if matches!(path, "/" | "/index.html") {
         let _ = write_http_response(
             stream,
             200,
@@ -1841,6 +1860,44 @@ mod tests {
         let (head, body) = raw.split_once("\r\n\r\n").unwrap_or((&raw, ""));
         let (status, headers) = head.split_once("\r\n").unwrap_or((head, ""));
         (status.to_owned(), headers.to_owned(), body.to_owned())
+    }
+
+    /// Byte-oriented sibling of [`http_get`]: the logo body is PNG, so it
+    /// cannot go through `read_to_string`.
+    fn http_get_bytes(addr: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response has a header/body boundary");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        (head, raw[split + 4..].to_vec())
+    }
+
+    /// The web client's header image is served from the binary, so the page
+    /// stays self-contained: no request ever leaves the loopback listener.
+    #[test]
+    fn serves_the_logo_as_png() {
+        let server = test_server(false, false);
+        let (head, body) = http_get_bytes(server.local_addr, "/logo.png");
+        assert!(head.contains("200"), "head: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: image/png"),
+            "head: {head}"
+        );
+        assert_eq!(body.len(), WEB_CLIENT_LOGO.len(), "whole file served");
+        assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "PNG magic intact");
     }
 
     #[test]

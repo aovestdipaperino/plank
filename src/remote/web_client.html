@@ -4,45 +4,103 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>plank remote</title>
+<link rel="icon" href="/logo.png">
 <style>
-  :root { color-scheme: light dark; }
+  /* plank's dark palette, the same variables the site uses (site/index.html).
+     Forced dark rather than following the OS: this page is a terminal mirror
+     and reads as one. */
+  :root {
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --pine:#5cc797; --coral:#ff7259; --line:#3a2f22;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     display: flex; flex-direction: column;
-    background: #111; color: #ddd;
-  }
-  @media (prefers-color-scheme: light) {
-    body { background: #fafafa; color: #222; }
+    background: var(--birch); color: var(--bark);
   }
   header {
-    display: flex; gap: .5rem; align-items: center;
-    padding: .5rem .75rem; border-bottom: 1px solid #444; flex-wrap: wrap;
+    display: flex; gap: .6rem; align-items: center;
+    padding: .5rem .75rem; border-bottom: 1px solid var(--line);
+    background: var(--paper); flex-wrap: wrap;
   }
-  header button { padding: .3rem .7rem; font: inherit; cursor: pointer; }
-  #status { font-size: .85em; opacity: .8; }
+  header img { width: 26px; height: 26px; border-radius: 5px; }
+  header .wordmark {
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+    font-weight: 800; letter-spacing: .01em;
+  }
+  header .wordmark em { color: var(--honey); font-style: normal; }
+  header button {
+    padding: .3rem .7rem; font: inherit; cursor: pointer;
+    background: var(--birch); color: var(--bark);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  header button:hover:not(:disabled) { border-color: var(--honey); }
+  #role { color: var(--honey); font-size: .85em; }
+  #status { font-size: .85em; color: var(--bark-soft); margin-left: auto; }
   #log {
     flex: 1 1 auto; overflow-y: auto; padding: .75rem;
-    white-space: pre-wrap; word-break: break-word; line-height: 1.35;
+    word-break: break-word; line-height: 1.45;
   }
+  /* Streamed frames that are not markdown keep their literal spacing; rendered
+     markdown blocks manage their own. */
+  #log .raw   { white-space: pre-wrap; }
   #log .think { opacity: .6; font-style: italic; }
-  #log .tool  { color: #4ea1ff; }
-  #log .error { color: #ff6b6b; }
-  #log .dim   { opacity: .55; }
-  #log .echo  { color: #9ad36b; }
+  #log .tool  { color: var(--pine); }
+  #log .error { color: var(--coral); }
+  #log .dim   { color: var(--bark-soft); }
+  #log .echo  { color: var(--honey); }
+
+  /* Rendered markdown. Kept tight: this is a transcript, not an article. */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3, .md h4 {
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+    margin: .9em 0 .35em; line-height: 1.25;
+  }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; }
+  .md h3 { font-size: 1.08em; } .md h4 { font-size: 1em; color: var(--bark-soft); }
+  .md p { margin: .5em 0; }
+  .md ul, .md ol { margin: .5em 0; padding-left: 1.4em; }
+  .md li { margin: .2em 0; }
+  .md a { color: var(--pine); text-underline-offset: 3px; }
+  .md strong { color: #fff; }
+  .md em { font-style: italic; }
+  .md code {
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 4px; padding: .05em .3em; font-size: .95em;
+  }
+  .md pre {
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 8px; padding: .6rem .75rem; margin: .6em 0;
+    overflow-x: auto;
+  }
+  .md pre code { background: none; border: 0; padding: 0; font-size: .92em; }
+  .md blockquote {
+    margin: .6em 0; padding: .1em 0 .1em .8em;
+    border-left: 3px solid var(--honey); color: var(--bark-soft);
+  }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: .9em 0; }
+
   form.input { display: flex; gap: .5rem; padding: .5rem .75rem;
-    border-top: 1px solid #444; }
-  form.input select { font: inherit; }
-  form.input input { flex: 1 1 auto; padding: .4rem .5rem; font: inherit;
-    background: transparent; color: inherit; border: 1px solid #555;
-    border-radius: 4px; }
-  form.input button { padding: .4rem .9rem; font: inherit; cursor: pointer; }
+    border-top: 1px solid var(--line); background: var(--paper); }
+  form.input select, form.input input, form.input button {
+    font: inherit; background: var(--birch); color: var(--bark);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  form.input select { padding: .3rem; }
+  form.input input { flex: 1 1 auto; padding: .4rem .5rem; }
+  form.input input::placeholder { color: var(--bark-soft); }
+  form.input button { padding: .4rem .9rem; cursor: pointer; }
+  form.input button:hover { border-color: var(--honey); }
 </style>
 </head>
 <body>
 <header>
-  <strong>plank remote</strong>
+  <img src="/logo.png" alt="">
+  <span class="wordmark">plank <em>remote</em></span>
   <!-- Parked, not deleted: the page claims control on connect, so the toggle
        had nothing left to do in the normal flow. Restoring either button means
        un-commenting it here and the matching blocks in the script below, each
@@ -87,16 +145,142 @@ function setRole(isController) {
   $("role").textContent = isController ? "controller" : "mirror";
 }
 
+function atBottom() {
+  return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+}
+
 function append(text, cls) {
-  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+  mdFlush();
+  const stick = atBottom();
   const span = document.createElement("span");
-  if (cls) span.className = cls;
+  span.className = cls ? cls + " raw" : "raw";
   span.textContent = text;
   logEl.appendChild(span);
-  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+  if (stick) logEl.scrollTop = logEl.scrollHeight;
 }
 
 function line(text, cls) { append(text + "\n", cls); }
+
+// --- Markdown ---------------------------------------------------------------
+// The model writes markdown, and the wire carries it as plain text in `visible`
+// frames that arrive a chunk at a time. So we accumulate the live block and
+// re-render it on every chunk: headings, lists and code fences take shape as
+// they stream. Anything that is not model prose (tool banners, log lines, the
+// user's own echo) flushes the block first, keeping transcript order intact.
+let mdBuf = "";
+let mdEl = null;
+
+function mdAppend(text) {
+  const stick = atBottom();
+  if (!mdEl) {
+    mdEl = document.createElement("div");
+    mdEl.className = "md";
+    logEl.appendChild(mdEl);
+    mdBuf = "";
+  }
+  mdBuf += text;
+  mdEl.innerHTML = renderMarkdown(mdBuf);
+  if (stick) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function mdFlush() { mdEl = null; mdBuf = ""; }
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Only schemes that cannot execute script. Anything else renders as plain text
+// rather than a link, so a `javascript:` URL in model output is inert.
+function safeHref(url) {
+  return /^(https?:\/\/|mailto:)/i.test(url.trim()) ? url.trim() : null;
+}
+
+// Inline spans. Code first, lifted out behind a sentinel the source cannot
+// contain, so `**` inside a code span is not read as emphasis.
+function inline(s) {
+  const codes = [];
+  const SEP = "\u0000";
+  let out = s.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return SEP + (codes.length - 1) + SEP;
+  });
+  out = out.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (m, text, url) => {
+    const href = safeHref(url);
+    return href ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + text + "</a>" : m;
+  });
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>");
+  out = out.replace(/(^|[^_\w])_([^_\n]+)_(?![_\w])/g, "$1<em>$2</em>");
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[Number(i)] + "</code>");
+}
+
+// Block structure, line by line. Everything is escaped on the way in, so the
+// only tags in the output are the ones produced here. An unterminated fence
+// still renders as a code block: mid-stream, that is the common case.
+function renderMarkdown(src) {
+  const lines = esc(src).split("\n");
+  const out = [];
+  let para = [];
+  let list = null; // "ul" | "ol"
+  let quote = [];
+
+  const closePara = () => {
+    if (para.length) { out.push("<p>" + inline(para.join("\n")) + "</p>"); para = []; }
+  };
+  const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  const closeQuote = () => {
+    if (quote.length) {
+      out.push("<blockquote>" + inline(quote.join("\n")) + "</blockquote>");
+      quote = [];
+    }
+  };
+  const closeAll = () => { closePara(); closeList(); closeQuote(); };
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+
+    const fence = raw.match(/^\s*```(.*)$/);
+    if (fence) {
+      closeAll();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { body.push(lines[i]); i++; }
+      out.push("<pre><code>" + body.join("\n") + "</code></pre>");
+      continue;
+    }
+
+    if (!raw.trim()) { closeAll(); continue; }
+
+    const heading = raw.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      closeAll();
+      const level = heading[1].length;
+      out.push("<h" + level + ">" + inline(heading[2]) + "</h" + level + ">");
+      continue;
+    }
+
+    if (/^\s*([-*_])\s*\1\s*\1[\s-*_]*$/.test(raw)) { closeAll(); out.push("<hr>"); continue; }
+
+    const bullet = raw.match(/^\s*[-*+]\s+(.*)$/);
+    const number = raw.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || number) {
+      closePara(); closeQuote();
+      const want = bullet ? "ul" : "ol";
+      if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
+      out.push("<li>" + inline((bullet || number)[1]) + "</li>");
+      continue;
+    }
+    closeList();
+
+    const q = raw.match(/^\s*&gt;\s?(.*)$/);
+    if (q) { closePara(); quote.push(q[1]); continue; }
+    closeQuote();
+
+    para.push(raw);
+  }
+  closeAll();
+  return out.join("");
+}
 
 function handleServerMsg(f) {
   if (typeof f.id === "number") highestId = f.id;
@@ -111,14 +295,18 @@ function handleServerMsg(f) {
         highestId = f.highest_id;
       for (const e of (f.scrollback || [])) handleServerMsg(e);
       break;
-    case "visible":   append(f.text); break;
+    // Model prose: the one frame kind that is markdown.
+    case "visible":   mdAppend(f.text); break;
     case "think":     append(f.text, "think"); break;
     case "tool":      append(f.text, "tool"); break;
     case "error":     append(f.text, "error"); break;
     case "dim":       append(f.text, "dim"); break;
     case "plain":     append(f.text); break;
     case "user_echo": line("> " + f.text, "echo"); break;
-    case "end_line":  append("\n"); break;
+    // Ends the rendered block rather than emitting a newline: the markdown
+    // already carries its own spacing, and a stray <span> after it would
+    // reopen a raw run below the block.
+    case "end_line":  mdFlush(); break;
     case "btw_begin": line("[btw]", "dim"); break;
     case "btw_end":   break;
     case "main_checkpoint": break;
