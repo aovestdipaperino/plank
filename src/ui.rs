@@ -1694,16 +1694,11 @@ impl Agent<'_> {
         let instructions = matched.as_ref().map(|d| d.body.clone());
         // Resolve the alternate engine *before* forking, so a missing key or an
         // unbuildable engine leaves the transcript exactly as it was.
-        let alt = match self.resolve_alt_spec(matched.as_ref().and_then(|d| d.engine.clone())) {
-            None => None,
-            Some(spec) => match self.take_alt_engine(&spec) {
-                Ok(pair) => Some(pair),
-                Err(e) => {
-                    return format!("Tool error: agent '{name}' engine unavailable: {e}\n");
-                }
-            },
+        let alt = match self.resolve_subagent_alt(matched.as_ref().and_then(|d| d.engine.clone())) {
+            Ok(alt) => alt,
+            Err(e) => return format!("Tool error: agent '{name}' engine unavailable: {e}\n"),
         };
-        let fork_at = self.begin_subagent_fork_for(instructions.as_deref(), &task, alt.is_none());
+        let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
             "sub-agent".to_string()
         } else {
@@ -1719,7 +1714,7 @@ impl Agent<'_> {
         self.tool_ctx.subagent_depth += 1;
         let result = match alt {
             None => self.run_subagent_loop(),
-            Some((key, engine)) => self.run_sidechain_on(key, engine),
+            Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_subagent_loop),
         };
         self.tool_ctx.subagent_depth -= 1;
         self.emit_sub(crate::worker::UiEvent::SubEnd);
@@ -3255,21 +3250,42 @@ impl Agent<'_> {
             },
             "/subagent" => {
                 let (def, task) = crate::agents::resolve(&self.agents, arg);
-                let (instructions, task, started) = match def {
+                let (instructions, spec, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
+                        d.engine.clone(),
                         task.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
-                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                    None => (
+                        None,
+                        None,
+                        task.to_string(),
+                        "[subagent started]".to_string(),
+                    ),
                 };
                 if task.is_empty() {
                     println!("usage: /subagent [<name>] <task>");
                 } else {
+                    // Same resolve the `agent` tool does, and for the same reason:
+                    // a definition that names an engine must actually run on it
+                    // here too, and a missing key must fail before the fork so the
+                    // transcript is left exactly as it was.
+                    let alt = match self.resolve_subagent_alt(spec) {
+                        Ok(alt) => alt,
+                        Err(e) => {
+                            println!("/subagent: engine unavailable: {e}");
+                            return Ok(true);
+                        }
+                    };
                     println!("{}", self.debug_line(&started));
-                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+                    let fork_at =
+                        self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     // Restore the transcript even when the turn errored.
-                    let turn = self.run_turn();
+                    let turn = match alt {
+                        None => self.run_turn(),
+                        Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_turn),
+                    };
                     let reported = self.finish_subagent_fork(fork_at, &task);
                     turn?;
                     let trailer = if reported {
@@ -4039,12 +4055,6 @@ the original is frozen and listed in /tree"
     /// transcript and returns the pre-fork length for later truncation. The
     /// fork inherits the parent transcript prefix, so the engine's per-turn
     /// sync reuses the parent KV cache.
-    fn begin_subagent_fork(&mut self, instructions: Option<&str>, task: &str) -> usize {
-        self.begin_subagent_fork_for(instructions, task, true)
-    }
-
-    /// [`begin_subagent_fork`](Self::begin_subagent_fork) with control over the
-    /// KV snapshot.
     ///
     /// A sidechain on an alternate engine passes `snapshot_kv` false: the parent
     /// engine is never called, so there is no divergence to roll back. It still
@@ -4052,7 +4062,7 @@ the original is frozen and listed in /tree"
     /// unconditionally, so skipping would unbalance the stack and a nested fork
     /// would pop the *parent's* snapshot. `None` already means "nothing to
     /// restore", so the stack stays LIFO-correct.
-    fn begin_subagent_fork_for(
+    fn begin_subagent_fork(
         &mut self,
         instructions: Option<&str>,
         task: &str,
@@ -4341,10 +4351,26 @@ the original is frozen and listed in /tree"
         }
     }
 
-    fn take_alt_engine(
+    /// The engine a `/subagent` definition asks for, already taken from the
+    /// cache and ready to run on — or `None` when it runs on the parent's.
+    ///
+    /// Both `/subagent` front ends go through this, so neither can quietly drop
+    /// the engine override the way they both used to.
+    ///
+    /// # Errors
+    /// When the definition names an engine this session cannot provide (an unset
+    /// key, or no local engine loaded at startup).
+    fn resolve_subagent_alt(
         &mut self,
-        spec: &crate::agents::AgentEngine,
-    ) -> Result<(EngineKey, Box<dyn Engine>), String> {
+        spec: Option<crate::agents::AgentEngine>,
+    ) -> Result<Option<AltEngine>, String> {
+        match self.resolve_alt_spec(spec) {
+            None => Ok(None),
+            Some(spec) => self.take_alt_engine(&spec).map(Some),
+        }
+    }
+
+    fn take_alt_engine(&mut self, spec: &crate::agents::AgentEngine) -> Result<AltEngine, String> {
         use crate::remote::provider::ProviderEngine;
         let spec = match spec {
             // The local engine is loaded at startup, never built here: it needs
@@ -4414,12 +4440,23 @@ the original is frozen and listed in /tree"
     /// Runs a sub-agent sidechain on `engine` instead of the parent's, returning
     /// the engine to the cache on **every** exit path.
     ///
+    /// `run` drives the rounds: the `agent` tool passes
+    /// [`run_subagent_loop`](Self::run_subagent_loop), while `/subagent` passes
+    /// its front end's ordinary turn so the work still renders live. The engine
+    /// swap is the same either way — which is the point of taking it as a
+    /// parameter rather than hardcoding one loop.
+    ///
     /// No `fork_kv` snapshot is meaningful here: the parent engine is never
     /// called during the sidechain, so its KV cannot be dirtied. The sidechain
     /// always runs clean-room — the parent transcript is stashed and only the
     /// framed task is visible — so no parent context is sent to the provider and
     /// only the task is billed.
-    fn run_sidechain_on(&mut self, key: EngineKey, engine: Box<dyn Engine>) -> Result<(), String> {
+    fn run_sidechain_on(
+        &mut self,
+        key: EngineKey,
+        engine: Box<dyn Engine>,
+        run: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
         // The framed task is the last message; keep it, hide everything before.
         let stashed = {
@@ -4428,7 +4465,7 @@ the original is frozen and listed in /tree"
             self.session.transcript = task.into_iter().collect();
             prefix
         };
-        let result = self.run_subagent_loop();
+        let result = run(self);
         // Unconditional, and with no `?` between the swap in and the swap out: a
         // leaked swap would leave the whole session pointed at the wrong engine,
         // which is the worst failure this design can produce.
@@ -4535,6 +4572,10 @@ fn remember_from_arg(cwd: &std::path::Path, arg: &str) -> Result<std::path::Path
 /// 40%). Owned by [`Agent::tui_loop`] so it persists across turn boundaries —
 /// a finished main task never closes it; only Esc does.
 type BtwPanel = Option<(OutputLog, tui::OutputView)>;
+
+/// An engine taken out of the alt cache, paired with the key it must be put
+/// back under — the two always travel together, so a sidechain cannot lose one.
+type AltEngine = (EngineKey, Box<dyn Engine>);
 
 /// Result of one TUI generation pass.
 struct TurnOutput {
@@ -7346,27 +7387,47 @@ impl Agent<'_> {
             },
             "/subagent" => {
                 let (def, task) = crate::agents::resolve(&self.agents, arg);
-                let (instructions, task, started) = match def {
+                let (instructions, spec, label, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
+                        d.engine.clone(),
+                        d.name.clone(),
                         task.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
-                    None => (None, task.to_string(), "[subagent started]".to_string()),
+                    None => (
+                        None,
+                        None,
+                        "sub-agent".to_string(),
+                        task.to_string(),
+                        "[subagent started]".to_string(),
+                    ),
                 };
                 if task.is_empty() {
                     log.push_plain("usage: /subagent [<name>] <task>");
                 } else {
-                    log.push_dim(started);
-                    let label = match &def {
-                        Some(d) => d.name.clone(),
-                        None => "sub-agent".to_string(),
+                    // Resolved before the fork, exactly as in `run_agent_tool`: an
+                    // engine this session cannot provide must not leave a framed
+                    // task behind in the transcript.
+                    let alt = match self.resolve_subagent_alt(spec) {
+                        Ok(alt) => alt,
+                        Err(e) => {
+                            log.push_plain(format!("/subagent: engine unavailable: {e}"));
+                            return true;
+                        }
                     };
-                    let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task);
+                    log.push_dim(started);
+                    let fork_at =
+                        self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     log.push_dim(tui::subagent_signpost(&label));
                     sub.begin(label);
                     sub.adopt_turn = true;
-                    let outcome = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+                    let outcome = match alt {
+                        None => self.tui_turn(terminal, log, view, input, btw, arcade, sub),
+                        Some((key, engine)) => self.run_sidechain_on(key, engine, |s| {
+                            s.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                        }),
+                    };
                     sub.adopt_turn = false;
                     sub.end();
                     if let Err(e) = outcome {
@@ -12711,6 +12772,88 @@ mod tests {
         unsafe { std::env::remove_var(KEY) };
     }
 
+    /// Regression: `/subagent` used to resolve only the definition's *persona*
+    /// and then run the fork on the parent engine, silently dropping the engine
+    /// override that the `agent` tool honours. A remote-backed definition looked
+    /// like it ran remotely while the local model was doing all the work.
+    #[test]
+    fn slash_subagent_honours_the_definitions_engine() {
+        const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
+        unsafe { std::env::set_var(KEY, "sk-test") };
+        let dir = scratch_dir("slash-subagent-alt");
+        let cfg = test_cfg();
+        let parent_prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["parent reply\n".to_string()],
+                prompts: std::sync::Arc::clone(&parent_prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.agents = vec![remote_def("remote", KEY)];
+        agent.alt_engines.insert(
+            remote_key(KEY),
+            Box::new(ScriptedEngine {
+                replies: vec!["remote report\n".to_string()],
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        agent
+            .slash("/subagent remote do a thing")
+            .expect("the command ran");
+
+        let transcript = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("remote report"),
+            "the alt engine served the fork: {transcript}"
+        );
+        assert!(
+            !transcript.contains("parent reply"),
+            "the parent engine was not used: {transcript}"
+        );
+        assert!(
+            parent_prompts.lock().unwrap().is_empty(),
+            "and it was never even prompted"
+        );
+        assert!(
+            agent.alt_engines.contains_key(&remote_key(KEY)),
+            "alt engine returned to the cache"
+        );
+        unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// A definition whose engine this session cannot provide must fail *before*
+    /// the fork, leaving no framed task stranded in the transcript.
+    #[test]
+    fn slash_subagent_reports_an_unavailable_engine_without_forking() {
+        const KEY: &str = "PLANK_TEST_SLASH_MISSING_KEY";
+        unsafe { std::env::remove_var(KEY) };
+        let dir = scratch_dir("slash-subagent-missing");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.agents = vec![remote_def("remote", KEY)];
+        let before = agent.session.transcript.len();
+
+        agent
+            .slash("/subagent remote do a thing")
+            .expect("the command ran");
+
+        assert_eq!(
+            agent.session.transcript.len(),
+            before,
+            "the transcript is untouched"
+        );
+    }
+
     #[test]
     fn clean_room_sidechain_hides_the_parent_transcript() {
         const KEY: &str = "PLANK_TEST_CLEANROOM_KEY";
@@ -13137,7 +13280,7 @@ mod tests {
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
-        let fork_at = agent.begin_subagent_fork(None, "count the tests");
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
         assert_eq!(fork_at, 2);
         agent.run_turn().unwrap();
         // Fork grew: task, assistant(tool call), tool result, final report.
@@ -13152,7 +13295,7 @@ mod tests {
         assert!(!report.contains("echo 42"), "sidechain leaked: {report}");
 
         // A fork with no assistant output restores the transcript untouched.
-        let fork_at = agent.begin_subagent_fork(None, "noop");
+        let fork_at = agent.begin_subagent_fork(None, "noop", true);
         assert!(!agent.finish_subagent_fork(fork_at, "noop"));
         assert_eq!(agent.session.transcript.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
@@ -13179,7 +13322,7 @@ mod tests {
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
 
-        let fork_at = agent.begin_subagent_fork(None, "count the tests");
+        let fork_at = agent.begin_subagent_fork(None, "count the tests", true);
         agent.run_turn().unwrap();
         assert!(agent.finish_subagent_fork(fork_at, "count the tests"));
 
@@ -13206,8 +13349,8 @@ mod tests {
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let outer = agent.begin_subagent_fork(None, "outer");
-        let inner = agent.begin_subagent_fork(None, "inner");
+        let outer = agent.begin_subagent_fork(None, "outer", true);
+        let inner = agent.begin_subagent_fork(None, "inner", true);
         assert!(!agent.finish_subagent_fork(inner, "inner"));
         assert!(!agent.finish_subagent_fork(outer, "outer"));
 
