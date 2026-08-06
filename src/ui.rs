@@ -3773,7 +3773,19 @@ the original is frozen and listed in /tree"
         // turn re-prefill the system prompt inline.
         let prefix_changed = current.effort_prefix() != level.effort_prefix();
         self.engine.set_think_mode(level);
+        // Cached alt engines too: `self.think` keys their Tier 1 checkpoint and
+        // frames their sidechains, so an engine left at the old level would
+        // build its tokens at one level while being keyed at another — the one
+        // disagreement a fingerprint cannot catch, because it is between the key
+        // and the tokens rather than between two keys. Idempotent when the level
+        // is unchanged, so this costs nothing for engines already at `level`.
+        for engine in self.alt_engines.values_mut() {
+            engine.set_think_mode(level);
+        }
+        // Only the live engine is re-warmed: an alt engine's own first take
+        // restores its Tier 1 checkpoint under the new fingerprint.
         if prefix_changed {
+            self.local_alt_warmed = false;
             self.rewarm_after_reset(&mut || {});
         }
         format!("thinking {}", level.name())
@@ -8456,6 +8468,20 @@ fn new_agent(
     // combination the fingerprint cannot detect, because it is a disagreement
     // between the key and the tokens rather than between two keys.
     engine.set_think_mode(cfg.generation.think_mode);
+    // The alt local engine needs both for the same reasons, and it cannot be
+    // skipped as an optimization: `warm_reset` builds its system tokens from
+    // these two fields, so an unconfigured engine tokenizes the *same* system
+    // text differently from the one that wrote `sysprompt.kv`. Its Tier 1
+    // checkpoint would then restore into a session whose token buffer does not
+    // describe it, the first common-prefix probe would truncate back, and the
+    // sidechain would pay the full prefill anyway — the restore would look like
+    // it worked and buy nothing. It also makes a local sidechain generate at the
+    // session's reasoning level rather than the engine's default.
+    let mut local_engine = local_engine;
+    if let Some(local) = local_engine.as_mut() {
+        local.set_trusted_system_prefix(system.trusted_len);
+        local.set_think_mode(cfg.generation.think_mode);
+    }
     let trusted_system_len = system.trusted_len;
     let system = system.text;
     let skills = crate::skills::load_default(&tool_ctx.cwd);
@@ -9386,6 +9412,9 @@ mod tests {
         /// Records every `set_think_mode` call, so a test can assert the level
         /// change reached the engine (where it drops cached tokens and KV).
         think_modes: Option<std::sync::Arc<std::sync::Mutex<Vec<ThinkMode>>>>,
+        /// Records every `set_trusted_system_prefix` call, the other half of
+        /// the configuration an engine needs before it tokenizes anything.
+        trusted_lens: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
         /// When set, `generate` fails with this message instead of replying, so
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
@@ -9508,6 +9537,12 @@ mod tests {
         fn set_think_mode(&mut self, mode: ThinkMode) {
             if let Some(seen) = &self.think_modes {
                 seen.lock().unwrap().push(mode);
+            }
+        }
+
+        fn set_trusted_system_prefix(&mut self, len: usize) {
+            if let Some(seen) = &self.trusted_lens {
+                seen.lock().unwrap().push(len);
             }
         }
     }
@@ -10516,6 +10551,81 @@ mod tests {
         let out = agent.think_command("medium");
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The alt local engine is configured exactly like the main one at startup.
+    /// Without this its `warm_reset` tokenizes the same system text differently
+    /// from the engine that wrote `sysprompt.kv` — trusted-prefix length and
+    /// reasoning level are both inputs to `build_system_tokens` — so its Tier 1
+    /// checkpoint would restore into a session whose token buffer does not
+    /// describe it and the first sync would prefill anyway.
+    #[test]
+    fn the_alt_local_engine_is_configured_like_the_main_one() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let trusted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut cfg = crate::config::AgentConfig::default();
+        cfg.generation.think_mode = ThinkMode::Medium;
+        let local = ScriptedEngine {
+            think_modes: Some(std::sync::Arc::clone(&seen)),
+            trusted_lens: Some(std::sync::Arc::clone(&trusted)),
+            ..ScriptedEngine::default()
+        };
+
+        let agent = new_agent(
+            Box::new(ScriptedEngine::default()),
+            &cfg,
+            false,
+            Some(Box::new(local)),
+        )
+        .expect("an agent");
+
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Medium]);
+        assert_eq!(
+            *trusted.lock().unwrap(),
+            vec![agent.trusted_system_len],
+            "the same boundary the main engine was given"
+        );
+    }
+
+    /// The level keys an alt engine's Tier 1 checkpoint and frames its
+    /// sidechains, so a cached engine left at the old level would build its
+    /// tokens at one level while being keyed at another — the disagreement a
+    /// fingerprint cannot catch. It also re-arms the alt local warm, since the
+    /// checkpoint to restore is now a different one.
+    #[test]
+    fn think_command_reaches_cached_alt_engines() {
+        let dir = scratch_dir("think-alt");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let cfg = test_cfg();
+        // `max` is the level that moves the effort preamble, so it is the one
+        // that both re-keys the checkpoint and invalidates the engine's tokens.
+        // It needs the context to match, or the command refuses before it acts.
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                think_modes: Some(std::sync::Arc::clone(&seen)),
+                ..ScriptedEngine::default()
+            }),
+        );
+        agent.local_alt_warmed = true;
+
+        let out = agent.think_command("max");
+        assert!(out.contains("max"), "got: {out}");
+
+        assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
+        assert!(
+            !agent.local_alt_warmed,
+            "a new fingerprint means a new checkpoint to restore"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
