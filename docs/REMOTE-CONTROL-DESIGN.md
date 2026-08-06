@@ -7,12 +7,33 @@ streaming output of, a running plank instance. This is the **v2.0.0 headline**
 — a local WebSocket server reached over an SSH reverse tunnel, not a claude.ai
 bridge.
 
-Status: **design only.** Nothing below is implemented. The reference agent's
-`/remote-control` (documented in `vault/REMOTE-CONTROL.md`) is a bidirectional
-bridge to a hosted backend with OAuth, environment registration, and work
-polling. plank has no backend and will not grow one here; the note's closing
-"Minimal Emulation for CLI-Only" section — a plain local WebSocket server plus
-`ssh -R` — is the actual design intent, and this document specifies it.
+Status: **shipped.** This document is kept as the design record; where it and
+the code disagree, the code wins. The sections below have been reconciled with
+what was actually built, and the places where the built thing diverged from the
+plan are called out inline rather than quietly edited away — the divergences are
+the interesting part of a design record.
+
+The three that matter, up front:
+
+- **No launch flags.** The design proposed `--remote[=ADDR]`; what shipped first
+  was `--control[=ADDR]` and four siblings, and those were then **deleted**. The
+  server is started only by `/remote-control` (alias `/rc`) from inside a running
+  session, on an ephemeral loopback port, with a token minted per activation.
+- **TUI only.** The design's primary target was headless server mode
+  (`--remote --non-interactive`). That does not exist: `/rc` can only be typed in
+  the full-screen TUI, and the headless and piped-REPL remote-drive paths were
+  written, found unreachable once the flags went, and removed. `/rc` in those
+  front-ends declines rather than starting a server nothing can drive.
+- **No `/grant`.** The local-consent handshake below was never wired. Typing
+  `/rc` *is* the consent, so the server always allows an attaching client to take
+  control; §4.4's `NeedsLocalGrant` path exists in the policy but is unreachable
+  in practice.
+
+The reference agent's `/remote-control` (documented in `vault/REMOTE-CONTROL.md`)
+is a bidirectional bridge to a hosted backend with OAuth, environment
+registration, and work polling. plank has no backend and did not grow one; the
+note's closing "Minimal Emulation for CLI-Only" section — a plain local WebSocket
+server plus an SSH tunnel — is what this document specified and what shipped.
 
 ## 1. Goal
 
@@ -126,22 +147,32 @@ Everything downstream of `UiEvent` is unchanged.
 
 ### 4.1 Front-end selection and startup
 
-Remote control is opt-in, never automatic. Extend `AgentConfig` (`src/config.rs`)
-and the selection table (`docs/ARCHITECTURE.md` "Front-end selection"):
+Remote control is opt-in, never automatic.
 
-- `--remote[=ADDR]` — start the WebSocket server bound to `ADDR`
-  (default `127.0.0.1:31415`, echoing the reference note's port). Composable with
-  the existing front-ends:
-  - `--remote` alone with a TTY → local TUI **plus** remote mirror/controller.
-  - `--remote --non-interactive` (or piped) → **headless server mode**: no local
-    front-end, the process exists only to serve remote clients. This is the
-    "run on a box, drive over SSH" case and the primary target.
-- `--remote-token TOKEN` / `PLANK_REMOTE_TOKEN` env — the shared secret (§4.6).
-  If `--remote` is given without a token, plank generates one, prints it once to
-  stderr, and requires it (no unauthenticated default).
-- `/remote` slash command (both dispatchers — `slash` and `tui_slash`, per the
-  "two parallel paths" rule) toggles the server at runtime and prints the URL,
-  token, and the ready-to-paste `ssh -R` line.
+**As shipped** — one entry point, no configuration:
+
+- `/remote-control`, alias `/rc`, in both dispatchers (`slash` and `tui_slash`,
+  per the "two parallel paths" rule). Bare `/rc` toggles; `/rc on` and `/rc off`
+  are explicit and case-insensitive. The TUI arm starts the server; the plain-REPL
+  arm declines and says why, because only the TUI can mirror output or be driven
+  (its idle loop is what drains the remote queue).
+- Turning it on binds `127.0.0.1:0` — an **ephemeral** port, so the command never
+  collides with another plank or a stale listener — mints a fresh token, and
+  prints `http://127.0.0.1:PORT/?t=TOKEN` plus a ready-to-paste `ssh -L` line.
+- Turning it off tells connected clients, shuts the listener down, and drops the
+  token with it, so a stale link is refused. The next `/rc` mints a new port and
+  a new token.
+- The token is generated per activation. There is no way to pin one, and no
+  unauthenticated mode.
+
+**Divergence from the plan.** The flags above were the design; `--control[=ADDR]`,
+`--control-token`, `--control-allow`, `--control-origin` and `--control-queue-max`
+were what actually shipped first, and all five were later removed. They created a
+second server the runtime toggle could not see: in a session started with the
+flag, `/rc off` reported "already off" while a listener was serving, and a bare
+`/rc` bound a *second* listener and orphaned the first server's bus, silently
+cutting off already-attached clients. Deleting the flags deleted the bug class.
+Headless server mode went with them, since nothing could start a server there.
 
 ### 4.2 The broadcast bus: remote client as another RenderSink
 
@@ -184,11 +215,40 @@ Versioned envelope so the web client and server can evolve:
 | `visible` / `think` / `tool` / `error` | `text` | `UiEvent::{Visible,Think,Tool,Error}` |
 | `dim` / `plain` / `user_echo` | `text` | corresponding `UiEvent`s |
 | `end_line` | — | `UiEvent::EndLine` |
-| `status` | flattened `Status` fields (§2.3) | `UiEvent::Status` (throttled, §4.9) |
-| `turn_begin` / `turn_end` | `interrupted` (bool on end) | worker turn boundaries |
-| `permission_request` | `request_id`, `tool`, `summary` | reserved (§4.5) |
+| `status` | flattened `Status` fields (§2.3), plus `cwd`, `branch`, `origin`, `think` | `UiEvent::Status` (throttled, §4.9) |
+| `btw_begin` / `btw_end` | — | the `/btw` side-answer boundary |
+| `main_checkpoint` / `main_rollback` | — | a preempted main pass |
+| `tasks` | `completed`, `total` | the task-list counter |
+| `reset` | — | the transcript was replaced (`/clear`, `/new`, `/switch`, `/resume`) |
+| `notify` | `title`, `body` | end of turn: the payload of the local desktop notification |
 | `control_denied` | `reason` | e.g. "another client holds control" |
 | `bye` | `reason` | server shutting the session |
+
+`turn_begin` / `turn_end` were never built: a client that needs the turn boundary
+reads it off `status.state`, and end-of-turn arrives as `notify`. `snapshot`
+carries `scrollback` and `highest_id` (the resume cursor), not a `status`.
+
+`reset` and `notify` are the two frames the design did not anticipate, and both
+exist because a *remote* front-end is not the local one:
+
+- **`reset`** — `/clear` replaces the session and clears the local log, both
+  local-only. Without a frame for it a browser kept showing a session that no
+  longer existed, and the bus still held the pre-clear scrollback, so a client
+  attaching afterwards was replayed the transcript that had just been cleared.
+  Broadcasting the reset also drops that scrollback; ids keep climbing, so an
+  attached client's `resume_from` survives the reset.
+- **`notify`** — the local desktop notification reaches whoever is at the machine
+  plank runs on, which is exactly the person a remote session is not.
+
+There is no `permission_request` / `permission_response`: plank still has no
+interactive per-tool approval gate (§4.5), so the reserved pair was never added.
+
+A third late addition is in `status` rather than a frame of its own: the footer's
+`cwd` / `branch` / `origin` / `think` segments ride on every status frame, so a
+client attaching mid-session learns them from the first frame it sees rather than
+waiting for one to change. Status frames come only from engine callbacks *during*
+a turn, so a turn also publishes an idle snapshot when it ends — without it the
+last thing a remote ever saw was `generating`.
 
 **Client → server:**
 
@@ -207,6 +267,11 @@ The frame set is a near-1:1 image of `UiEvent` + `TurnShared`, which is the whol
 point: the remote path adds a transport, not new turn semantics. A CLI client and
 the web client speak the same schema.
 
+Note the web client sends everything as `prompt`, including slash lines: the
+agent's own dispatcher already routes a leading `/` when it drains the queue, so
+a second parser in the page would only be a worse copy of it. `command` remains
+in the protocol and the terminal client still uses it.
+
 ### 4.4 Session multiplexing and the coexistence policy
 
 **One controller, many mirrors.** Multiple clients may connect and all *see*
@@ -214,17 +279,23 @@ output (mirrors), but at most one entity holds *control* (may submit prompts /
 interrupts) at a time. Control is a token held by exactly one of: the local TUI,
 or one remote session.
 
-- **Local TUI present** (`--remote` with a TTY): the local user holds control by
-  default. Remote clients connect as mirrors. A remote `request_control` surfaces
-  a local notice (`push_dim`, e.g. `[remote wants control — /grant to allow]`);
-  control transfers only on explicit local `/grant` (or a `--remote-allow-control`
-  flag set at startup for unattended-but-TTY boxes). This makes the local user's
-  input line never silently contended — the BTW design's "plank deliberately does
-  not steer" caution applied to remoting.
-- **Headless server mode** (no local front-end): the first authenticated client to
-  `request_control` (or auto-request on connect) becomes controller; others
-  mirror. Control releases on disconnect (after a grace window, §4.8) or explicit
-  `release_control`, then the next requester may take it.
+- **Local TUI present** (always, as shipped): the local user holds control by
+  default and remote clients connect as mirrors. `/rc` starts the server with
+  `allow_control` set, so a client's `request_control` is granted immediately —
+  typing the command is the operator's consent, which is the whole reason the
+  design's `/grant` handshake was never needed. Control releases on disconnect
+  (after a grace window, §4.8) or on explicit `release_control`, and returns to
+  the local user.
+- **`/grant` was never wired.** `ControlPolicy` still has the `NeedsLocalGrant`
+  outcome and still surfaces `[remote session N wants control — /grant to allow]`
+  locally, but nothing dispatches `/grant`, and with `allow_control` always set
+  the path is unreachable. It survives as the shape a future
+  "start-without-consent" mode would use.
+- **Headless server mode** does not exist (see the header). There is no
+  no-local-front-end configuration to have a policy for.
+- **A granted request is silent.** There is no `control_granted` frame: only a
+  refusal comes back, as `control_denied`. The web client's role display is
+  therefore optimistic — it assumes the request landed and a denial reverts it.
 - A non-controller's `prompt`/`interrupt`/`command` frames get `control_denied`.
   `btw` is allowed from mirrors (it is ephemeral and read-only by construction —
   see BTW-DESIGN §4.2), giving read-only observers a safe way to ask questions.
@@ -254,9 +325,11 @@ Single shared bearer token, checked on the first frame:
 - Client's first frame **must** be `auth { token }`; anything else → close with
   WS code `1008` (policy violation). A missing/wrong token → `4401` (custom
   "unauthorized"), connection closed, attempt logged to `--trace`.
-- Token comes from `--remote-token` / `PLANK_REMOTE_TOKEN`, else auto-generated
-  (32 bytes, base64url) and printed once to stderr at startup. No default token,
-  no unauthenticated mode — binding to loopback is defense-in-depth, not the auth.
+- The token is generated per `/rc` activation (32 bytes, base64url) and printed
+  once, inside the one-click link. There is no way to supply one, no default
+  token, and no unauthenticated mode — binding to loopback is defense-in-depth,
+  not the auth. It dies with the server, so a link from a previous activation is
+  refused.
 - Constant-time comparison. Optional origin allow-list for the web client
   (reject cross-site WebSocket upgrades whose `Origin` is unexpected), mitigating
   a malicious local web page reaching `127.0.0.1` (the CSRF-for-WebSocket risk).
@@ -319,36 +392,48 @@ only shared state, both already `Send + Sync` (Mutex/Atomic).
 No backend, no public listener. To drive plank on a remote box `host`:
 
 ```sh
-# on host: run plank serving loopback only
-plank --remote --non-interactive          # prints token + tunnel hint
+# on host, inside the running plank TUI:
+/rc
+# prints http://127.0.0.1:PORT/?t=TOKEN and the matching ssh -L line
 
-# from the laptop: forward a local port to host's loopback server
-ssh -L 31415:localhost:31415 user@host
-# then point the web/CLI client at ws://localhost:31415
+# from the laptop: forward that port to host's loopback server
+ssh -L PORT:localhost:PORT user@host
+# then open the printed link, or: plank remote ws://127.0.0.1:PORT/ --token TOKEN
 ```
 
 Or the *reverse* direction (plank behind NAT reaching out to a bastion):
 
 ```sh
 # on the NATed plank box:
-ssh -R 31415:localhost:31415 user@bastion
-# clients on/through the bastion reach ws://localhost:31415
+ssh -R PORT:localhost:PORT user@bastion
+# clients on/through the bastion reach ws://localhost:PORT
 ```
+
+`PORT` is ephemeral and changes on every activation, which is why the `on` output
+reprints the tunnel line each time: an off/on cycle silently invalidates a
+standing tunnel. That is the cost of never colliding with a stale listener.
 
 **Threat model:**
 
 - **Confidentiality & integrity in transit:** provided entirely by SSH. plank's
   socket carries plaintext JSON but only over `127.0.0.1`, which is not on any
   wire.
-- **Bind scope:** default `127.0.0.1` — never `0.0.0.0`. Off-box reach requires an
-  explicit tunnel the operator sets up; plank never opens itself to the LAN unless
-  the user overrides the bind address (and then §4.7's `--remote-tls` is advised).
+- **Bind scope:** `127.0.0.1` — never `0.0.0.0`, and as shipped there is no way to
+  override it: `/rc` passes a loopback constant and the printed link hardcodes
+  `127.0.0.1`, with a `debug_assert` pinning the invariant where a second caller
+  would hit it. Off-box reach requires an explicit tunnel the operator sets up.
+- **Token in the URL:** the one-click link carries the token as `?t=`, so it lands
+  in browser history and any `Referer`. An accepted trade for one-click attach on
+  a loopback listener whose lifetime is a single toggle — not a claim the link is
+  a secret.
 - **On-box multi-user risk:** any local user could connect to the loopback port.
   The token defends against that; combine with OS user isolation. Document that a
   shared host means a shared trust boundary.
 - **Malicious local web page (CSRF-ish):** a browser page could attempt a
-  WebSocket to `ws://127.0.0.1:31415`. Mitigated by the mandatory token
-  (the page can't know it) and the `Origin` allow-list (§4.6).
+  WebSocket to the loopback port. Mitigated by the mandatory token (the page
+  cannot know it — and the port is ephemeral, so it cannot even guess where to
+  knock) and by the `Origin` check, which now refuses every non-loopback browser
+  `Origin` unconditionally (§8.1).
 - **What we explicitly *don't* defend:** a compromised SSH endpoint or a leaked
   token = full control of that plank instance (which can run bash under the
   sandbox). This is equivalent to shell access on the box and is stated plainly:
@@ -373,7 +458,10 @@ Two clients, one schema:
 
 ## 5. Implementation plan
 
-Ordered; each step independently landable and testable with `EchoEngine`.
+**Historical: all of this landed**, except where the header's three divergences
+say otherwise — step 2's flags were built and then removed, and step 4's
+`turn_begin`/`turn_end` were never built (see §4.3). Ordered; each step
+independently landable and testable with `EchoEngine`.
 
 1. **Bus refactor.** Make `UiEvent: Clone`; add `worker::BroadcastBus`
    (subscribe / broadcast / prune) plus a bounded scrollback ring with sequence
@@ -425,9 +513,9 @@ possible):
 - `status_frames_coalesced` — a burst of `Status` emits ≤ throttle rate downstream.
 - `origin_allowlist_rejects_unexpected_origin`.
 
-Manual (real model, macOS): run `plank --remote --non-interactive` on one box,
-`ssh -L`, drive from the CLI client and the web page; confirm mirror sees local
-TUI output when both are active; confirm `/btw` from a mirror works; pull the
+Manual (real model, macOS): type `/rc` in a plank TUI on one box, `ssh -L`, drive
+from the CLI client and the web page; confirm a mirror sees local TUI output when
+both are active; confirm `/btw` from a mirror works; pull the
 network mid-turn and reconnect, verify `snapshot`/`resume_from` continuity and
 that the local turn never stalled; verify the printed `ssh` line works verbatim.
 
@@ -454,13 +542,28 @@ that the local turn never stalled; verify the printed `ssh` line works verbatim.
 
 ## 8. Open questions
 
-- Should headless server mode auto-grant control to the first client, or require
-  an explicit `request_control` even when no local user exists? (Leaning
-  auto-grant for scriptability; revisit if it surprises operators.)
-- Ring-buffer sizing for scrollback replay vs. memory — fixed KB cap, or last-N
-  turns? Start with a KB cap, make it a flag if needed.
-- Whether the CLI client is a `plank remote` subcommand (shared binary, shared
-  render code) or a separate crate. Subcommand preferred for code reuse.
+All three are settled:
+
+- ~~Should headless server mode auto-grant control to the first client?~~ Moot:
+  headless server mode does not exist. The equivalent question for the shipped
+  design — whether typing `/rc` is consent enough to hand an attaching browser
+  control — was answered yes, which is why `/grant` was never wired.
+- ~~Ring-buffer sizing for scrollback replay.~~ A fixed event-count cap
+  (`SCROLLBACK_CAP`), not a KB cap and not a flag. A session reset drops the ring
+  outright, since everything in it belongs to a transcript that no longer exists.
+- ~~CLI client as a subcommand or a separate crate?~~ Subcommand:
+  `plank remote <ws-url>`, sharing the binary and the protocol types.
+
+Still open, small:
+
+- The reconnect grace window makes a page reload look like contention: the new
+  session gets a fresh id, no `resume_from`, so `ControlPolicy::request` reports
+  `another client holds control` for up to `CONTROL_GRACE`. The denial is
+  correct; the *reason string* is a lie, and distinguishing "held for a reconnect
+  grace window" would be the honest fix.
+- Nothing mirrors a `/switch` or `/resume` transcript to a remote: those replay
+  into the local log directly, so the page clears and says the history is local
+  only. Mirroring would mean re-rendering a transcript into events.
 
 ### 8.1 Resolved (hardening, issue #25)
 
