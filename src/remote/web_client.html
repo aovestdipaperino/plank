@@ -43,8 +43,12 @@
 <body>
 <header>
   <strong>plank remote</strong>
-  <button id="interrupt" disabled>interrupt</button>
-  <button id="control" disabled>take control</button>
+  <!-- Parked, not deleted: the page claims control on connect, so the toggle
+       had nothing left to do in the normal flow. Restoring either button means
+       un-commenting it here and the matching blocks in the script below, each
+       marked `parked button`. -->
+  <!-- <button id="interrupt" disabled>interrupt</button> -->
+  <!-- <button id="control" disabled>take control</button> -->
   <span id="role" class="dim"></span>
   <span id="status">disconnected</span>
 </header>
@@ -76,10 +80,10 @@ let controller = false;
 
 function setStatus(s) { $("status").textContent = s; }
 
-// Reflects the control role in the toggle button and the header hint.
+// Reflects the control role in the header hint.
 function setRole(isController) {
   controller = isController;
-  $("control").textContent = isController ? "release control" : "take control";
+  // parked button: $("control").textContent = isController ? "release control" : "take control";
   $("role").textContent = isController ? "controller" : "mirror";
 }
 
@@ -158,8 +162,8 @@ function connect() {
     const auth = { type: "auth", token: linkToken };
     if (highestId !== null) auth.resume_from = highestId;
     send(auth);
-    $("interrupt").disabled = false;
-    $("control").disabled = false;
+    // parked button: $("interrupt").disabled = false;
+    // parked button: $("control").disabled = false;
     // Opening the `/remote-control` link is the operator's own consent, so claim
     // control immediately rather than waiting for a click: `/rc` always starts
     // the server with allow_control, making this a silent Granted.
@@ -176,8 +180,8 @@ function connect() {
   sock.onclose = (ev) => {
     if (sock !== ws) return;
     setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
-    $("interrupt").disabled = true;
-    $("control").disabled = true;
+    // parked button: $("interrupt").disabled = true;
+    // parked button: $("control").disabled = true;
     $("role").textContent = "";
     controller = false;
   };
@@ -187,22 +191,22 @@ function connect() {
   };
 }
 
-$("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
-// Hand control back, and take it again afterwards. The page claims control on
-// connect, so this is only reached after a deliberate release — or after a
-// `control_denied` flipped the role back to mirror, which happens when a
-// previous session still holds the slot inside its reconnect grace window.
-$("control").addEventListener("click", () => {
-  if (controller) {
-    send({ type: "release_control" });
-    setRole(false);
-    line("[released control]", "dim");
-  } else {
-    send({ type: "request_control" });
-    setRole(true);
-    line("[requested control]", "dim");
-  }
-});
+// parked button: $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+// parked button — hand control back, and take it again afterwards. The page
+// claims control on connect, so this was only reachable after a deliberate
+// release, or after a `control_denied` flipped the role back to mirror while a
+// previous session still held the slot inside its reconnect grace window.
+// $("control").addEventListener("click", () => {
+//   if (controller) {
+//     send({ type: "release_control" });
+//     setRole(false);
+//     line("[released control]", "dim");
+//   } else {
+//     send({ type: "request_control" });
+//     setRole(true);
+//     line("[requested control]", "dim");
+//   }
+// });
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const el = $("line");
