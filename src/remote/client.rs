@@ -257,6 +257,11 @@ fn render_server_msg(msg: &ServerMsg) {
         ServerMsg::ControlDenied { reason } => {
             let _ = writeln!(out, "[control denied: {reason}]");
         }
+        // A terminal's scrollback is the user's, not ours to erase: mark the
+        // boundary instead so what follows is not read as the same session.
+        ServerMsg::Reset => {
+            let _ = writeln!(out, "\n--- session cleared ---");
+        }
         // A terminal has no notification centre, so the turn-finished event
         // becomes a line plus a BEL — enough for a terminal that flags the tab
         // on a bell, and harmless in one that does not.

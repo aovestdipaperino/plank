@@ -264,6 +264,10 @@ pub enum ServerMsg {
         /// Total task count.
         total: usize,
     },
+    /// The transcript was replaced (`/clear`, `/new`, `/switch`, `/resume`).
+    /// Everything the client has shown so far belongs to a session that is
+    /// gone: it clears its log rather than appending under a stale transcript.
+    Reset,
     /// The turn finished. Carries the same headline and body as the local
     /// desktop notification so an attached client can raise its own; it is not
     /// transcript text and must not be logged as output.
@@ -308,6 +312,7 @@ impl ServerMsg {
                 text: p.to_ansi(true),
             },
             UiEvent::Plain(t) => Self::Plain { text: t.clone() },
+            UiEvent::SessionReset => Self::Reset,
             UiEvent::Notify { title, body } => Self::Notify {
                 title: title.clone(),
                 body: body.clone(),
@@ -1748,6 +1753,59 @@ mod tests {
                 text: "live".into()
             }
         );
+    }
+
+    /// `/clear` must reach the page two ways: the attached client is told to
+    /// clear, and the scrollback a *later* client would be replayed no longer
+    /// contains the cleared transcript. Before this, a `/clear` was invisible
+    /// remotely — the page kept the old transcript and a fresh attach replayed
+    /// it from the bus.
+    #[test]
+    fn session_reset_reaches_attached_and_later_clients() {
+        let server = test_server(false, false);
+        server
+            .state
+            .bus
+            .broadcast(UiEvent::Visible("from the old session".into()));
+
+        let mut ws = connect(server.local_addr);
+        send_client(
+            &mut ws,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut ws).expect("hello");
+        read_server(&mut ws).expect("snapshot");
+
+        server.state.bus.broadcast(UiEvent::SessionReset);
+        let frame = read_server(&mut ws).expect("reset frame");
+        assert_eq!(frame.msg, ServerMsg::Reset, "attached client is told");
+
+        // A client attaching now must not be replayed the cleared transcript.
+        let mut late = connect(server.local_addr);
+        send_client(
+            &mut late,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut late).expect("hello");
+        let snap = read_server(&mut late).expect("snapshot");
+        match snap.msg {
+            ServerMsg::Snapshot { scrollback, .. } => {
+                assert!(
+                    !scrollback.iter().any(|e| matches!(
+                        &e.msg,
+                        ServerMsg::Visible { text } if text == "from the old session"
+                    )),
+                    "cleared transcript replayed to a late joiner: {scrollback:?}"
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
     }
 
     /// End of turn reaches an attached client as a `notify` frame. The local

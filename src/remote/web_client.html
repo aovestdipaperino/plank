@@ -455,6 +455,14 @@ function handleServerMsg(f) {
         (s.gen_tps ? "  " + s.gen_tps.toFixed(1) + " tok/s" : ""));
       break;
     }
+    // The transcript was replaced (/clear, /new, /switch, /resume): everything
+    // on screen belongs to a session that no longer exists.
+    case "reset":
+      mdFlush();
+      logEl.innerHTML = "";
+      $("toast").hidden = true;
+      line("[session cleared]", "dim");
+      break;
     // Not transcript text: the turn finished, so raise a notification the way
     // the local session raises a desktop one.
     case "notify": notify(f.title, f.body); break;

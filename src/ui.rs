@@ -2671,6 +2671,7 @@ impl Agent<'_> {
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
                 self.session = Session::new();
+                self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
                 push_session_context(&mut self.session, &self.context_content);
@@ -2768,6 +2769,9 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -2800,6 +2804,9 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -5348,6 +5355,24 @@ impl Agent<'_> {
         }
     }
 
+    /// Tells attached remote clients the transcript was replaced, so they clear
+    /// their log instead of appending a new session under an old one. Also
+    /// drops the bus scrollback, so a client attaching *after* the reset is not
+    /// replayed the transcript that was just cleared. A no-op with no bridge.
+    ///
+    /// Call it wherever `self.session` is replaced wholesale — `/clear`,
+    /// `/new`, `/switch`, `/resume` — right after the swap.
+    fn broadcast_session_reset(&self, note: Option<&str>) {
+        let Some(r) = &self.remote else { return };
+        r.bus.broadcast(UiEvent::SessionReset);
+        // `/switch` and `/resume` replay the loaded transcript into the *local*
+        // log directly, not through the bus, so a remote client would be left
+        // looking at an empty page. Say why rather than leave it blank.
+        if let Some(note) = note {
+            r.bus.broadcast(UiEvent::Dim(note.to_owned()));
+        }
+    }
+
     /// Whether a remote-control bridge is currently live.
     fn remote_is_on(&self) -> bool {
         self.remote_server.is_some()
@@ -6265,6 +6290,7 @@ impl Agent<'_> {
             }
             "/new" | "/clear" => {
                 self.session = Session::new();
+                self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
                 push_session_context(&mut self.session, &self.context_content);
@@ -6393,6 +6419,9 @@ impl Agent<'_> {
                 Ok(s) => {
                     let note = self.load_session_payload(&s);
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -6422,6 +6451,9 @@ impl Agent<'_> {
                 Ok(Some(s)) => {
                     let note = self.load_session_payload(&s);
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -8676,6 +8708,32 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
         assert!(!token.is_empty());
+        agent.remote_off();
+    }
+
+    /// `/clear` has to tell attached clients, or the page keeps showing a
+    /// session that no longer exists. The bug this pins was exactly here: the
+    /// arm reset `self.session` and cleared the *local* log, and nothing
+    /// reached the bus.
+    #[test]
+    fn clear_broadcasts_a_session_reset_to_attached_clients() {
+        let dir = scratch_dir("clear-resets-remote");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
+        state.bus.broadcast(UiEvent::Visible("old output".into()));
+
+        agent.slash("/clear").expect("clear runs");
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        assert!(
+            seen.iter().any(|e| matches!(e, UiEvent::SessionReset)),
+            "no reset reached the bus: {seen:?}"
+        );
         agent.remote_off();
     }
 
