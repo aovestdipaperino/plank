@@ -2915,9 +2915,9 @@ impl Agent<'_> {
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             "/remote-control" | "/rc" => {
-                for line in self.remote_toggle_lines(cmd, arg) {
-                    println!("{line}");
-                }
+                println!(
+                    "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
+                );
             }
             "/btw" => {
                 if arg.is_empty() {
@@ -8731,6 +8731,23 @@ mod tests {
             "a fresh activation mints a new token"
         );
         agent.remote_off();
+    }
+
+    /// The plain-REPL `/rc` arm must refuse rather than start a bridge nothing
+    /// can drive: a piped session has no `tui_turn`/`tui_btw` to read `self.remote`
+    /// or the bus, so a server started there would sit unattended forever.
+    #[test]
+    fn plain_repl_rc_refuses_to_start_a_server() {
+        let dir = scratch_dir("rc-plain-repl-refuses");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let keep_running = agent.slash("/rc").expect("slash handles /rc");
+        assert!(keep_running, "/rc must not end the REPL session");
+        assert!(
+            !agent.remote_is_on(),
+            "the plain REPL must not start a remote-control server"
+        );
     }
 
     /// The `/remote-control` path end to end: a client that authenticates and
