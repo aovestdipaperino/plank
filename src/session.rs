@@ -539,7 +539,12 @@ impl SessionStore {
     }
 
     /// Filesystem location backing a [`KvKey`].
-    fn kv_path(&self, key: &KvKey) -> PathBuf {
+    ///
+    /// Public so a diagnostic can name the exact file it looked for: "no
+    /// checkpoint" is only actionable if you can go and see whether it is
+    /// there.
+    #[must_use]
+    pub fn kv_path(&self, key: &KvKey) -> PathBuf {
         match key {
             KvKey::System { fp } => self.dir.join(sysprompt_checkpoint_name(fp)),
             KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),

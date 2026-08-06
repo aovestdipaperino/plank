@@ -241,8 +241,42 @@ pub fn plan(
     tiers
 }
 
+/// Why a [`restore`] did or did not put a tier's KV into an engine.
+///
+/// A miss has three distinct causes with three different fixes, and "it
+/// prefilled again" cannot tell them apart from the outside — hence an enum
+/// rather than a bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restored {
+    /// The checkpoint loaded and the engine now holds its KV.
+    Yes,
+    /// The tier is not cacheable, or there is no session store.
+    NoKey,
+    /// Nothing on disk under this tier's key. Either nothing ever warmed this
+    /// exact fingerprint, or something about the prompt changed since.
+    NoCheckpoint,
+    /// The file is there and keyed correctly but would not load — a stale
+    /// format or a signature mismatch. Rebuilt, never trusted.
+    Unreadable,
+    /// The bytes loaded but the engine refused them.
+    EngineRefused,
+}
+
+impl Restored {
+    /// One line for a diagnostic, in the imperative of what happened.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Yes => "restored from checkpoint",
+            Self::NoKey => "tier is not cacheable",
+            Self::NoCheckpoint => "no checkpoint on disk for this fingerprint",
+            Self::Unreadable => "checkpoint present but would not load",
+            Self::EngineRefused => "engine refused the checkpoint",
+        }
+    }
+}
+
 /// Restores `tier`'s checkpoint into `engine`, or leaves the engine cold.
-/// Returns whether the KV was restored.
 ///
 /// The restore leg of [`warm`] without its prefill leg, for callers that must
 /// not pay a cold prefill *here*. `warm_sync` prefills uninterruptibly
@@ -263,25 +297,27 @@ pub fn restore(
     engine: &mut dyn Engine,
     store: Option<&SessionStore>,
     tier: &TierSpec,
-) -> Result<bool, EngineError> {
-    let Some(cache) = tier
-        .key
-        .as_ref()
-        .zip(store)
-        .and_then(|(key, store)| store.kv_load(key))
-    else {
-        return Ok(false);
+) -> Result<Restored, EngineError> {
+    let Some((key, store)) = tier.key.as_ref().zip(store) else {
+        return Ok(Restored::NoKey);
+    };
+    let Some(cache) = store.kv_load(key) else {
+        return Ok(if store.kv_path(key).exists() {
+            Restored::Unreadable
+        } else {
+            Restored::NoCheckpoint
+        });
     };
     engine.warm_reset(&tier.text)?;
     if engine.set_kv(&cache).is_err() {
-        return Ok(false);
+        return Ok(Restored::EngineRefused);
     }
     // Same reason as the `i < resume` branch in `warm`: the engine's cumulative
     // token buffer must describe the whole restored prefix, or the next sync
     // sees a common prefix shorter than the buffer and throws the restored KV
     // away. The system tier's tokens are already there from `warm_reset`.
     engine.warm_append(None)?;
-    Ok(true)
+    Ok(Restored::Yes)
 }
 
 /// Warms the KV cache over `tiers` (built by [`plan`], most-stable-first).
@@ -756,7 +792,7 @@ impl crate::engine::Engine for SpyEngine {
 
 #[cfg(test)]
 mod warm_tests {
-    use super::{TierKind, TierSpec, plan, restore, system_fingerprint, warm};
+    use super::{Restored, TierKind, TierSpec, plan, restore, system_fingerprint, warm};
     use std::path::Path;
 
     use super::SpyEngine;
@@ -785,7 +821,11 @@ mod warm_tests {
             ..Default::default()
         };
 
-        assert!(!restore(&mut e, Some(&store), &tiers[0]).unwrap(), "a miss");
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::NoCheckpoint,
+            "a miss, and it says which kind"
+        );
         assert_eq!(e.reset_to, None, "the engine was not touched at all");
         assert!(e.appended.is_empty());
         assert!(e.synced.is_empty(), "restore never prefills");
@@ -797,7 +837,11 @@ mod warm_tests {
             supports_kv: true,
             ..Default::default()
         };
-        assert!(restore(&mut e, Some(&store), &tiers[0]).unwrap(), "a hit");
+        assert_eq!(
+            restore(&mut e, Some(&store), &tiers[0]).unwrap(),
+            Restored::Yes,
+            "a hit"
+        );
         assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
         assert_eq!(e.restored.len(), 1);
         // The buffer describes the restored prefix, or the next sync would

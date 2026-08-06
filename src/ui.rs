@@ -1235,6 +1235,9 @@ struct Agent<'a> {
     /// afterwards, which is what lets the borrow checker enforce that a swap
     /// cannot leak: the value cannot be in the map and in `self.engine` at once.
     alt_engines: std::collections::HashMap<EngineKey, Box<dyn Engine>>,
+    /// Diagnostic from the last [`warm_alt_local`](Agent::warm_alt_local), for
+    /// the front end to render. Set on every attempt, hit or miss.
+    warm_note: Option<String>,
     /// Whether the alt *local* engine has had its system prompt warmed
     /// ([`Agent::warm_alt_local`]). Once is enough: the engine keeps its session
     /// across sidechains, so every later dispatch already finds the prefix in
@@ -1744,6 +1747,9 @@ impl Agent<'_> {
             Ok(alt) => alt,
             Err(e) => return format!("Tool error: agent '{name}' engine unavailable: {e}\n"),
         };
+        if let Some(note) = self.take_warm_note() {
+            self.emit_sub(crate::worker::UiEvent::Dim(note));
+        }
         let fork_at = self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
         let label = if name.is_empty() {
             "sub-agent".to_string()
@@ -3330,6 +3336,9 @@ impl Agent<'_> {
                             return Ok(true);
                         }
                     };
+                    if let Some(note) = self.take_warm_note() {
+                        println!("{}", self.debug_line(&note));
+                    }
                     println!("{}", self.debug_line(&started));
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
@@ -4509,15 +4518,48 @@ the original is frozen and listed in /tree"
     /// the hit depends on an ordinary local-main session having written one.
     /// That is the common case, and paying a *visible* prefill when it has not
     /// is strictly better than the freeze.
-    fn warm_alt_local(&self, engine: &mut dyn Engine) {
-        let tiers = self.kv_tiers_for(&engine.model_name());
+    /// The outcome is stashed in [`warm_note`](Self::warm_note) rather than
+    /// printed here: this runs on the UI thread for `/subagent` and on the
+    /// worker thread for the `agent` tool, and only the caller knows which sink
+    /// its front end is holding. Always noted, hit or miss — a silent hit is
+    /// indistinguishable from a silent miss, which is the position this landed
+    /// in twice.
+    fn warm_alt_local(&mut self, engine: &mut dyn Engine) {
+        let model = engine.model_name();
+        let tiers = self.kv_tiers_for(&model);
         let Some(system) = tiers
             .first()
             .filter(|t| t.kind == crate::kvtier::TierKind::System)
         else {
             return;
         };
-        let _ = crate::kvtier::restore(engine, Some(&self.store), system);
+        let outcome = crate::kvtier::restore(engine, Some(&self.store), system);
+        // Enough to act on without a debugger: which engine, which fingerprint,
+        // what happened, and the exact path that was or was not there. The
+        // fingerprint is the part that usually explains a miss — it covers the
+        // system prompt, and the sub-agent roster is *in* the system prompt, so
+        // a project with its own `.plank/agents` keys differently from the same
+        // model anywhere else.
+        let fp: String = system.fingerprint.chars().take(12).collect();
+        let path = self.store.kv_path(system.key.as_ref().unwrap_or(
+            &crate::session::KvKey::System {
+                fp: system.fingerprint.clone(),
+            },
+        ));
+        self.warm_note = Some(match outcome {
+            Ok(r) => format!(
+                "[{model} sub-agent KV: {} — tier1 {fp} · {}]",
+                r.reason(),
+                path.display()
+            ),
+            Err(e) => format!("[{model} sub-agent KV: warm failed: {e} — tier1 {fp}]"),
+        });
+    }
+
+    /// Takes the pending alt-engine warm diagnostic, if any, for a front end to
+    /// render through whichever sink it owns.
+    fn take_warm_note(&mut self) -> Option<String> {
+        self.warm_note.take()
     }
 
     fn take_alt_engine(&mut self, spec: &crate::agents::AgentEngine) -> Result<AltEngine, String> {
@@ -7586,6 +7628,9 @@ impl Agent<'_> {
                             return true;
                         }
                     };
+                    if let Some(note) = self.take_warm_note() {
+                        log.push_dim(note);
+                    }
                     log.push_dim(started);
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
@@ -8531,6 +8576,7 @@ fn new_agent(
             .into_iter()
             .collect(),
         local_alt_warmed: false,
+        warm_note: None,
     })
 }
 
@@ -9587,6 +9633,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         }
     }
 
@@ -11766,6 +11813,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -11824,6 +11872,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
 
         // Empty state: no provider turn recorded yet.
@@ -12061,6 +12110,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12238,6 +12288,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12320,6 +12371,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12389,6 +12441,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12481,6 +12534,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -13640,6 +13694,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -13726,6 +13781,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -13871,6 +13927,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -13938,6 +13995,7 @@ mod tests {
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
+            warm_note: None,
         };
         agent.session.push(Message::user("run echo"));
 
