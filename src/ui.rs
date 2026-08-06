@@ -3340,12 +3340,27 @@ impl Agent<'_> {
                     };
                     let reported = self.finish_subagent_fork(fork_at, &task);
                     turn?;
-                    let trailer = if reported {
-                        "[subagent report added to the conversation]"
+                    if reported {
+                        println!(
+                            "{}",
+                            self.debug_line("[subagent report added to the conversation]")
+                        );
+                        // The report is delegated work coming back, so the main
+                        // loop runs on it — the same continuation the `agent`
+                        // tool gets by returning its report as a tool result.
+                        // Without this the report lands in the transcript and
+                        // nothing acts on it until the user types again.
+                        //
+                        // The prompt here is the restored parent prefix plus the
+                        // report, which is exactly what `restore_fork_kv` just
+                        // set the KV up for: only the report re-prefills.
+                        self.run_turn()?;
                     } else {
-                        "[subagent produced no report — nothing added]"
-                    };
-                    println!("{}", self.debug_line(trailer));
+                        println!(
+                            "{}",
+                            self.debug_line("[subagent produced no report — nothing added]")
+                        );
+                    }
                 }
             }
             _ if slash_command_known(cmd) => println!("{cmd}: not implemented yet"),
@@ -7578,6 +7593,13 @@ impl Agent<'_> {
                         log.push_plain(format!("/subagent failed: {e}"));
                     } else if self.finish_subagent_fork(fork_at, &task) {
                         log.push_dim("[subagent report added to the conversation]");
+                        // See the plain-REPL arm: the main loop runs on the
+                        // report, so delegated work is acted on rather than
+                        // parked in the transcript.
+                        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                        {
+                            log.push_plain(format!("/subagent follow-up failed: {e}"));
+                        }
                     } else {
                         log.push_dim("[subagent produced no report — nothing added]");
                     }
@@ -13081,19 +13103,69 @@ mod tests {
             transcript.contains("remote report"),
             "the alt engine served the fork: {transcript}"
         );
+        // The parent engine is used exactly once, and not for the sidechain:
+        // its single prompt is the follow-up turn, which sees the report and
+        // not the framed task the sidechain ran on (that was truncated out).
+        let prompts = parent_prompts.lock().unwrap().clone();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
         assert!(
-            !transcript.contains("parent reply"),
-            "the parent engine was not used: {transcript}"
+            prompts[0].contains("remote report"),
+            "the follow-up turn acts on the report: {}",
+            prompts[0]
         );
         assert!(
-            parent_prompts.lock().unwrap().is_empty(),
-            "and it was never even prompted"
+            !prompts[0].contains("Task: do a thing"),
+            "the sidechain itself never reached the parent: {}",
+            prompts[0]
         );
         assert!(
             agent.alt_engines.contains_key(&remote_key(KEY)),
             "alt engine returned to the cache"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// The main loop acts on the report: `/subagent` runs a parent turn as soon
+    /// as the report lands, so delegated work comes back into the conversation
+    /// instead of parking in the transcript until the user types again. This is
+    /// the same continuation the `agent` tool gets for free by returning its
+    /// report as a tool result.
+    #[test]
+    fn slash_subagent_runs_a_turn_on_the_report() {
+        let dir = scratch_dir("slash-subagent-followup");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                // Reply 1 is the sidechain's report; reply 2 is the follow-up
+                // turn the report triggers.
+                replies: vec!["the report\n".to_string(), "acting on it\n".to_string()],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+
+        agent
+            .slash("/subagent do a thing")
+            .expect("the command ran");
+
+        let seen = prompts.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "sidechain, then a turn on its report");
+        assert!(
+            seen[1].contains("the report"),
+            "the follow-up prompt carries the report: {}",
+            seen[1]
+        );
+        let last = agent
+            .session
+            .transcript
+            .last()
+            .expect("a transcript")
+            .text
+            .clone();
+        assert!(last.contains("acting on it"), "{last}");
     }
 
     /// A definition whose engine this session cannot provide must fail *before*
