@@ -5358,6 +5358,9 @@ impl Agent<'_> {
     /// served normally and reads the token from `location.search`. On a
     /// loopback-only listener whose lifetime is one toggle this is an accepted
     /// trade for one-click attach (spec §6).
+    ///
+    /// The host is written out rather than taken from `addr`, which is sound
+    /// only because the bind is always loopback — see [`Agent::remote_on`].
     fn remote_link(addr: std::net::SocketAddr, token: &str) -> String {
         format!("http://127.0.0.1:{}/?t={token}", addr.port())
     }
@@ -5381,6 +5384,14 @@ impl Agent<'_> {
         if let Some(server) = &self.remote_server {
             return Ok((server.local_addr, server.state.token.clone()));
         }
+        // Loopback is not merely the default here, it is load-bearing:
+        // `remote_link` writes `127.0.0.1` into the printed URL rather than
+        // reading it back from the bound address, so a non-loopback bind would
+        // hand out a link pointing somewhere else entirely.
+        debug_assert!(
+            addr.starts_with("127.0.0.1:") || addr.starts_with("[::1]:"),
+            "remote control binds loopback only, got {addr}"
+        );
         let token = token
             .filter(|t| !t.is_empty())
             .unwrap_or_else(crate::remote::generate_token);
@@ -8722,12 +8733,21 @@ mod tests {
         agent.remote_toggle_lines("/rc", "off");
         assert!(!agent.remote_is_on());
 
-        // A bare toggle from off turns it back on with a *new* token.
+        // A bare toggle from off turns it back on with a *new* token. Compare
+        // the tokens themselves, not the whole line: the line also carries the
+        // ephemeral port, which differs on every activation, so a line-level
+        // `assert_ne!` would pass even if the token were reused.
+        let token_of = |lines: &[String]| {
+            lines
+                .iter()
+                .find_map(|l| l.split_once("/?t=").map(|(_, t)| t.to_owned()))
+                .expect("the on-line carries a token")
+        };
         let back = agent.remote_toggle_lines("/rc", "");
         assert!(agent.remote_is_on());
         assert_ne!(
-            back.iter().find(|l| l.contains("/?t=")),
-            on.iter().find(|l| l.contains("/?t=")),
+            token_of(&back),
+            token_of(&on),
             "a fresh activation mints a new token"
         );
         agent.remote_off();

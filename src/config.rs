@@ -428,6 +428,7 @@ Options:
                            answer an in-pass /btw by queuing at the next
                            generation boundary instead of freezing/resuming the
                            running generation (freeze/resume is the default)
+
 Settings file:
       ~/.plank/settings.json, then ./.plank/settings.json (later wins), holds
       defaults for preferences rather than per-run choices. Flags override it.
