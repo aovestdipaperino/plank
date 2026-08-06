@@ -196,15 +196,27 @@ pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The local engine's power badge (`⚡ 60%`), or empty when uncapped.
+/// The local engine's origin label, carrying its power cap when it has one:
+/// `(local ⚡60%)`, else plain [`LOCAL_ORIGIN`].
+///
+/// The cap goes *inside* the parentheses so the whole thing reads as one label
+/// for one engine. Outside them it reads as a second segment of the bar, which
+/// is what it used to be and exactly the thing that stopped being true once the
+/// footer could name more than one engine.
+///
+/// Derived from `LOCAL_ORIGIN` rather than spelled out again, so the two cannot
+/// drift apart — and if it ever stops being parenthesized, this degrades to
+/// appending rather than producing a stray bracket.
 #[must_use]
-fn local_power_badge() -> String {
+fn local_origin_label() -> String {
     let pct = LOCAL_POWER.load(std::sync::atomic::Ordering::Relaxed);
-    if pct > 0 && pct < 100 {
-        format!(" ⚡ {pct}%")
-    } else {
-        String::new()
+    if pct <= 0 || pct >= 100 {
+        return LOCAL_ORIGIN.to_owned();
     }
+    LOCAL_ORIGIN.strip_suffix(')').map_or_else(
+        || format!("{LOCAL_ORIGIN} ⚡{pct}%"),
+        |head| format!("{head} ⚡{pct}%)"),
+    )
 }
 
 /// The engine-origin label: every origin in play, comma-separated in first-seen
@@ -216,7 +228,7 @@ fn local_power_badge() -> String {
 /// under a remote main agent is exactly the case where the distinction matters.
 #[must_use]
 pub fn engine_origin_label() -> String {
-    let local = format!("{LOCAL_ORIGIN}{}", local_power_badge());
+    let local = local_origin_label();
     let Ok(origins) = ENGINE_ORIGINS.lock() else {
         return local;
     };
@@ -1622,21 +1634,25 @@ mod tests {
 
         set_local_power(50);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("(local) ⚡ 50%"), "{line}");
-        assert!(!line.ends_with("⚡ 50%"), "not in the tail slot: {line}");
+        // Inside the parentheses, so it reads as one label for one engine.
+        assert!(line.contains("(local ⚡50%)"), "{line}");
+        assert!(!line.contains("(local)"), "not left bare: {line}");
+        assert!(!line.ends_with('%'), "not in the tail slot: {line}");
 
         // A provider alongside the local engine: the badge stays attached to
         // the engine it describes.
         set_engine_origin("regolo.ai");
         set_engine_origin(LOCAL_ORIGIN);
         let line = build_status_text(&st, false, true);
-        assert!(line.contains("regolo.ai, (local) ⚡ 50%"), "{line}");
+        assert!(line.contains("regolo.ai, (local ⚡50%)"), "{line}");
 
         // Unlimited: no badge at either end.
         set_local_power(100);
         assert!(!build_status_text(&st, false, true).contains('⚡'));
         set_local_power(0);
-        assert!(!build_status_text(&st, false, true).contains('⚡'));
+        let line = build_status_text(&st, false, true);
+        assert!(!line.contains('⚡'));
+        assert!(line.contains("(local)"), "back to the plain label: {line}");
         reset_engine_origins();
     }
 
