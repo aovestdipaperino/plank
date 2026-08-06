@@ -196,13 +196,18 @@ pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The local engine's origin label, carrying its power cap when it has one:
-/// `(local ⚡60%)`, else plain [`LOCAL_ORIGIN`].
+/// The local engine's origin label, carrying its power share: `(local ⚡100%)`,
+/// or `(local ⚡60%)` under a cap.
 ///
-/// The cap goes *inside* the parentheses so the whole thing reads as one label
-/// for one engine. Outside them it reads as a second segment of the bar, which
-/// is what it used to be and exactly the thing that stopped being true once the
-/// footer could name more than one engine.
+/// Always shown, never hidden at 100%. The reading answers "how much of the GPU
+/// is this engine allowed", and "all of it" is an answer — a badge that appears
+/// only under a cap makes its absence ambiguous between unlimited and not
+/// supported. Unset (`0`) is the default and means uncapped, so it reads 100.
+///
+/// The share goes *inside* the parentheses so the whole thing is one label for
+/// one engine. Outside them it reads as a second segment of the bar, which is
+/// what it used to be and exactly what stopped being true once the footer could
+/// name more than one engine.
 ///
 /// Derived from `LOCAL_ORIGIN` rather than spelled out again, so the two cannot
 /// drift apart — and if it ever stops being parenthesized, this degrades to
@@ -210,9 +215,7 @@ pub fn set_local_power(percent: i32) {
 #[must_use]
 fn local_origin_label() -> String {
     let pct = LOCAL_POWER.load(std::sync::atomic::Ordering::Relaxed);
-    if pct <= 0 || pct >= 100 {
-        return LOCAL_ORIGIN.to_owned();
-    }
+    let pct = if pct <= 0 { 100 } else { pct.min(100) };
     LOCAL_ORIGIN.strip_suffix(')').map_or_else(
         || format!("{LOCAL_ORIGIN} ⚡{pct}%"),
         |head| format!("{head} ⚡{pct}%)"),
@@ -1304,14 +1307,17 @@ mod tests {
         let _guard = origin_test_guard();
         reset_engine_origins();
         // Nothing registered: the local engine is the implied answer.
-        assert_eq!(engine_origin_label(), LOCAL_ORIGIN);
+        assert_eq!(engine_origin_label(), local_origin_label());
 
         set_engine_origin("regolo.ai");
         assert_eq!(engine_origin_label(), "regolo.ai");
 
         // A second engine joins, in first-seen order, so the main agent leads.
+        // The local one renders through `local_origin_label`, power badge and
+        // all — registering `LOCAL_ORIGIN` is what selects that rendering.
+        let local = local_origin_label();
         set_engine_origin(LOCAL_ORIGIN);
-        assert_eq!(engine_origin_label(), format!("regolo.ai, {LOCAL_ORIGIN}"));
+        assert_eq!(engine_origin_label(), format!("regolo.ai, {local}"));
 
         // Repeats are dropped: two definitions on one host name it once.
         set_engine_origin("regolo.ai");
@@ -1319,14 +1325,14 @@ mod tests {
         set_engine_origin(LOCAL_ORIGIN);
         assert_eq!(
             engine_origin_label(),
-            format!("regolo.ai, {LOCAL_ORIGIN}, api.anthropic.com")
+            format!("regolo.ai, {local}, api.anthropic.com")
         );
 
         // An empty label is not a slot in the list.
         set_engine_origin("   ");
         assert_eq!(
             engine_origin_label(),
-            format!("regolo.ai, {LOCAL_ORIGIN}, api.anthropic.com")
+            format!("regolo.ai, {local}, api.anthropic.com")
         );
         reset_engine_origins();
     }
@@ -1336,8 +1342,11 @@ mod tests {
         // No engine set this origin (unit tests build no engine), so the local
         // ds4/echo default stands. The label sits in the dir prefix, ahead of
         // the think segment — not appended to the tail.
+        let _guard = origin_test_guard();
         let line = build_status_text(&Status::default(), false, true);
-        let origin = line.find("(local)").expect("origin in footer");
+        let origin = line
+            .find(local_origin_label().as_str())
+            .expect("origin in footer");
         let think = line.find(THINK_MARK).expect("think segment in footer");
         assert!(origin < think, "{line}");
     }
@@ -1646,13 +1655,17 @@ mod tests {
         let line = build_status_text(&st, false, true);
         assert!(line.contains("regolo.ai, (local ⚡50%)"), "{line}");
 
-        // Unlimited: no badge at either end.
+        // Uncapped still reads: "all of it" is an answer, and a badge that
+        // vanished at 100% would make its absence ambiguous between unlimited
+        // and unsupported.
         set_local_power(100);
-        assert!(!build_status_text(&st, false, true).contains('⚡'));
+        assert!(build_status_text(&st, false, true).contains("(local ⚡100%)"));
+        // Unset is the default and means uncapped, so it reads the same.
         set_local_power(0);
         let line = build_status_text(&st, false, true);
-        assert!(!line.contains('⚡'));
-        assert!(line.contains("(local)"), "back to the plain label: {line}");
+        assert!(line.contains("(local ⚡100%)"), "{line}");
+        assert!(!line.contains("(local)"), "never the bare label: {line}");
+        set_local_power(0);
         reset_engine_origins();
     }
 

@@ -3366,13 +3366,17 @@ mod tests {
                 .to_string()
         };
         assert_eq!(row(0), format!("~/Code/plank {glyph} main"));
+        // Compared in pieces rather than against `origin` verbatim: the origin
+        // carries the local engine's ⚡ power badge, and ⚡ (U+26A1) has
+        // Emoji_Presentation, so the buffer holds it as one wide cell plus a
+        // blank continuation. Reading cells back therefore yields a space the
+        // source string does not contain.
+        //
         // `starts_with`: the tail notification slot (a rotating tip, or a
         // running tool's label) also lives on row two, after the state.
-        assert!(
-            row(1).starts_with(&format!("{origin} | ctx 12% | idle")),
-            "row two: {}",
-            row(1)
-        );
+        let head = origin.split('⚡').next().unwrap_or_default();
+        assert!(row(1).starts_with(head), "row two: {}", row(1));
+        assert!(row(1).contains("| ctx 12% | idle"), "row two: {}", row(1));
     }
 
     #[test]
