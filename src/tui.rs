@@ -976,6 +976,11 @@ fn render_task_strip(frame: &mut Frame, area: Rect, rows: &[(String, bool)]) {
 /// `has_prompt`; `strip` only when `strip_rows > 0`.
 ///
 /// Split out so layout can be computed (and tested) without a `Frame`.
+/// Rows the status bar occupies: the directory/branch row plus the volatile row
+/// (see [`status_bar_lines`]). Named so the layout and the renderer cannot
+/// disagree about the height.
+const STATUS_ROWS: u16 = 2;
+
 fn frame_geom(
     area: Rect,
     has_prompt: bool,
@@ -984,12 +989,12 @@ fn frame_geom(
 ) -> (Rect, Rect, Rect, Option<Rect>, Option<Rect>, Option<Rect>) {
     if has_prompt {
         let r = Layout::vertical([
-            Constraint::Min(1),             // output
-            Constraint::Length(strip_rows), // task strip (0 when idle-empty)
-            Constraint::Length(1),          // top rule
-            Constraint::Length(input_rows), // input
-            Constraint::Length(1),          // bottom rule
-            Constraint::Length(1),          // status
+            Constraint::Min(1),              // output
+            Constraint::Length(strip_rows),  // task strip (0 when idle-empty)
+            Constraint::Length(1),           // top rule
+            Constraint::Length(input_rows),  // input
+            Constraint::Length(1),           // bottom rule
+            Constraint::Length(STATUS_ROWS), // status (two rows: see status_bar_lines)
         ])
         .split(area);
         let strip = if strip_rows > 0 { Some(r[1]) } else { None };
@@ -998,7 +1003,7 @@ fn frame_geom(
         let r = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(STATUS_ROWS),
         ])
         .split(area);
         (r[0], r[1], r[2], None, None, None)
@@ -1796,7 +1801,7 @@ pub fn draw(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(
+        Paragraph::new(status_bar_lines(
             &with_remote_marker(status),
             anim_tick_ms(),
             status_style,
@@ -1837,7 +1842,7 @@ pub fn draw_ask(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(
+        Paragraph::new(status_bar_lines(
             &with_remote_marker(status),
             anim_tick_ms(),
             status_style,
@@ -2000,7 +2005,7 @@ pub fn draw_btw_split(
         .bg(Color::Indexed(238))
         .fg(Color::Indexed(252));
     frame.render_widget(
-        Paragraph::new(status_bar_line(
+        Paragraph::new(status_bar_lines(
             &with_remote_marker(status),
             anim_tick_ms(),
             status_style,
@@ -2117,10 +2122,17 @@ fn push_shimmered(spans: &mut Vec<Span<'static>>, word: &str, tick_ms: u64, them
 /// Pushes spans for `seg`, painting the accent word — `prefill` before the
 /// bar, or the trailing-`…` spinner verb — in the theme color with the
 /// shimmer animation sweeping across it.
-/// Themes the leading directory segment of the status line. `prefix` looks like
-/// `"<path> | "` or `"<path> ⎇ <branch> | "`; the path and branch render in the
-/// theme green while the powerline glyph, spaces, and `|` separators stay plain.
-fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, theme: Style) {
+/// Themes the leading directory segment across the status bar's two rows.
+/// `prefix` looks like `"<path> | "` or `"<path> ⎇ <branch> | <origin> | "`; the
+/// path and branch go to `first` (row one) in the theme green with the powerline
+/// glyph plain, and the engine origin heads `spans` (row two).
+fn push_dir_prefix(
+    first: &mut Vec<Span<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    prefix: &str,
+    base: Style,
+    theme: Style,
+) {
     let glyph = crate::status::POWERLINE_BRANCH;
     // Trailing " | " separator that hands off to the "ctx …" body.
     let (segment, sep) = prefix
@@ -2146,16 +2158,25 @@ fn push_dir_prefix(spans: &mut Vec<Span<'static>>, prefix: &str, base: Style, th
     if let Some(gi) = segment.find(glyph) {
         let path = segment[..gi].trim_end();
         let branch = segment[gi + glyph.len_utf8()..].trim();
-        spans.push(Span::styled(path.to_string(), theme));
-        spans.push(Span::styled(format!(" {glyph} "), base));
-        spans.push(Span::styled(branch.to_string(), theme));
+        first.push(Span::styled(path.to_string(), theme));
+        first.push(Span::styled(format!(" {glyph} "), base));
+        first.push(Span::styled(branch.to_string(), theme));
     } else {
-        spans.push(Span::styled(segment.trim_end().to_string(), theme));
+        first.push(Span::styled(segment.trim_end().to_string(), theme));
     }
+    // The origin heads the *second* row rather than trailing the first: row one
+    // answers "which tree am I in", and only that, so it stays readable at a
+    // glance while everything volatile lives below it.
     if !origin.is_empty() {
-        spans.push(Span::styled(origin, base));
+        spans.push(Span::styled(
+            origin.trim_start_matches(" | ").to_owned(),
+            base,
+        ));
     }
-    spans.push(Span::styled(sep.to_string(), base));
+    let _ = sep;
+    if !spans.is_empty() {
+        spans.push(Span::styled(" | ".to_string(), base));
+    }
 }
 
 /// Styles the plain progress text (`⠹ Verb… (stats)`) as a standalone output
@@ -2238,18 +2259,26 @@ fn compact_slot_spans(frac: f64, tick_ms: u64, base: Style) -> Vec<Span<'static>
     ]
 }
 
-/// Builds the status line, coloring the progress bar's filled arrows and the
-/// accent word (operation name or spinner verb) in the theme color.
+/// Builds the status bar's two rows, coloring the progress bar's filled arrows
+/// and the accent word (operation name or spinner verb) in the theme color.
+///
+/// Row one is the working directory and git branch, and nothing else: the answer
+/// to "which tree am I in" holds still while the rest of the bar churns. Row two
+/// carries everything volatile — engine origin, think level, context gauge,
+/// progress or state, task counter, power suffix, remote marker — in the order
+/// the single-row bar used.
 ///
 /// The bar segment lives between `[` and `]`; `▶` cells render in the theme
 /// color (military green) and `·` cells a dim gray.
-fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Line<'static> {
+fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Line<'static>> {
     let theme = base
         .fg(Color::Indexed(crate::status::THEME_COLOR))
         .add_modifier(Modifier::BOLD);
     let mut spans = Vec::new();
-    // Peel the leading "<path> ⎇ <branch> | " directory segment and theme the
-    // path and branch green; the powerline glyph and separators stay plain.
+    let mut first = Vec::new();
+    // Peel the leading "<path> ⎇ <branch> | " directory segment onto row one and
+    // theme the path and branch green; the powerline glyph and separators stay
+    // plain.
     //
     // The boundary is the think segment when present, else the ctx gauge. It
     // cannot be the ctx gauge unconditionally: `push_dir_prefix` splits on the
@@ -2261,7 +2290,7 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
         .or_else(|| text.find("ctx "))
         .filter(|&i| i > 0);
     let mut text = if let Some(idx) = boundary {
-        push_dir_prefix(&mut spans, &text[..idx], base, theme);
+        push_dir_prefix(&mut first, &mut spans, &text[..idx], base, theme);
         &text[idx..]
     } else {
         text
@@ -2336,7 +2365,7 @@ fn status_bar_line(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> L
             ));
         }
     }
-    Line::from(spans)
+    vec![Line::from(first), Line::from(spans)]
 }
 
 #[cfg(test)]
@@ -3031,21 +3060,29 @@ mod tests {
         TaskView::from(&list)
     }
 
+    /// Both status rows flattened into one span list, for assertions about
+    /// content rather than placement.
+    fn status_spans(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> Vec<Span<'static>> {
+        status_bar_lines(text, tick_ms, base, tasks)
+            .into_iter()
+            .flat_map(|l| l.spans)
+            .collect()
+    }
+
     #[test]
     fn status_bar_counter_is_themed_in_flight_and_dim_when_done() {
         use crate::tasks::TaskStatus::{Completed, InProgress};
         let base = Style::default();
         // An empty list adds no task counter to the status bar (the "✓ n/n"
         // segment); rotating tips may still contribute other spans.
-        let empty = status_bar_line("idle", 0, base, &TaskView::default());
-        assert!(!empty.spans.iter().any(|s| s.content.contains('✓')));
+        let empty = status_spans("idle", 0, base, &TaskView::default());
+        assert!(!empty.iter().any(|s| s.content.contains('✓')));
 
         // In flight: the counter carries the theme color.
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let tv = task_view_with(&[("a", Completed), ("b", InProgress)]);
-        let line = status_bar_line("idle", 0, base, &tv);
+        let line = status_spans("idle", 0, base, &tv);
         let counter = line
-            .spans
             .iter()
             .find(|s| s.content.contains("1/2"))
             .expect("counter span present");
@@ -3053,12 +3090,8 @@ mod tests {
 
         // Fully complete: the counter goes dim gray, not theme.
         let tv = task_view_with(&[("a", Completed)]);
-        let line = status_bar_line("idle", 0, base, &tv);
-        let counter = line
-            .spans
-            .iter()
-            .find(|s| s.content.contains("1/1"))
-            .unwrap();
+        let line = status_spans("idle", 0, base, &tv);
+        let counter = line.iter().find(|s| s.content.contains("1/1")).unwrap();
         assert_eq!(counter.style.fg, Some(Color::Indexed(240)));
     }
 
@@ -3072,63 +3105,73 @@ mod tests {
         let glyph = crate::status::POWERLINE_BRANCH;
         let mark = crate::status::THINK_MARK;
         let text = format!("~/Code/plank {glyph} main | {mark} max | ctx 12% | idle");
-        let line = status_bar_line(&text, 0, base, &TaskView::default());
+        let line = status_spans(&text, 0, base, &TaskView::default());
 
         let branch = line
-            .spans
             .iter()
             .find(|s| s.content == "main")
             .expect("branch span ends at the branch");
         assert_eq!(branch.style.fg, Some(theme));
 
         // The segment renders as its own plain span, and only once.
-        let think: Vec<_> = line
-            .spans
-            .iter()
-            .filter(|s| s.content.contains(mark))
-            .collect();
-        assert_eq!(think.len(), 1, "{:?}", line.spans);
+        let think: Vec<_> = line.iter().filter(|s| s.content.contains(mark)).collect();
+        assert_eq!(think.len(), 1, "{line:?}");
         assert_eq!(think[0].content, format!("{mark} max"));
         assert_eq!(think[0].style.fg, None, "plain, like the ctx gauge");
 
         // Nothing is dropped: the rendered spans still spell the input.
-        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let joined: String = line.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             joined.contains(&format!("{mark} max | ctx 12%")),
             "{joined}"
         );
     }
 
-    /// The engine origin sits between the branch and the first `|`, and must not
-    /// be absorbed into the themed branch span.
+    /// The bar is two rows: row one is the directory and branch and nothing
+    /// else, row two opens with the engine origin and carries everything
+    /// volatile. The origin moved rows deliberately — row one has to hold still
+    /// while the rest churns — so pin where each piece lands.
     #[test]
-    fn status_bar_keeps_the_engine_origin_plain() {
+    fn status_bar_splits_location_from_everything_volatile() {
         let base = Style::default();
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let glyph = crate::status::POWERLINE_BRANCH;
         let origin = crate::status::engine_origin_label();
         let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
-        let line = status_bar_line(&text, 0, base, &TaskView::default());
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        assert_eq!(rows.len(), 2, "two rows");
 
-        let branch = line
+        let row =
+            |i: usize| -> String { rows[i].spans.iter().map(|s| s.content.as_ref()).collect() };
+
+        // Row one: the location, themed, with the glyph plain — and no origin,
+        // no gauge, no state.
+        assert_eq!(row(0), format!("~/Code/plank {glyph} main"));
+        let branch = rows[0]
             .spans
             .iter()
             .find(|s| s.content == "main")
-            .expect("branch span stops before the origin");
+            .expect("branch span");
         assert_eq!(branch.style.fg, Some(theme));
+        assert!(
+            !row(0).contains(origin),
+            "origin is not on row one: {}",
+            row(0)
+        );
+        assert!(!row(0).contains("ctx "), "no gauge on row one: {}", row(0));
 
-        let shown = line
+        // Row two: origin first, then the rest, in the old order.
+        assert!(
+            row(1).starts_with(&format!("{origin} | ctx 12%")),
+            "row two: {}",
+            row(1)
+        );
+        let shown = rows[1]
             .spans
             .iter()
             .find(|s| s.content.contains(origin))
             .expect("origin span");
         assert_eq!(shown.style.fg, None, "plain, like the ctx gauge");
-
-        let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(
-            joined.contains(&format!("main | {origin} | ctx 12%")),
-            "{joined}"
-        );
     }
 
     #[test]
@@ -3137,17 +3180,15 @@ mod tests {
         let theme = Color::Indexed(crate::status::THEME_COLOR);
         let glyph = crate::status::POWERLINE_BRANCH;
         let text = format!("~/Code/plank {glyph} main | ctx 12% | idle");
-        let line = status_bar_line(&text, 0, base, &TaskView::default());
+        let line = status_spans(&text, 0, base, &TaskView::default());
 
         let path = line
-            .spans
             .iter()
             .find(|s| s.content == "~/Code/plank")
             .expect("path span");
         assert_eq!(path.style.fg, Some(theme));
 
         let branch = line
-            .spans
             .iter()
             .find(|s| s.content == "main")
             .expect("branch span");
@@ -3155,11 +3196,44 @@ mod tests {
 
         // The powerline glyph is not themed green.
         let glyph_span = line
-            .spans
             .iter()
             .find(|s| s.content.contains(glyph))
             .expect("glyph span");
         assert_ne!(glyph_span.style.fg, Some(theme));
+    }
+
+    /// Renders the two rows into a real buffer, since passing geometry is not
+    /// the same as looking right: row one must carry the location and row two
+    /// the gauge and state, with nothing bleeding across.
+    #[test]
+    fn status_rows_render_location_above_state() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let origin = crate::status::engine_origin_label();
+        let text = format!("~/Code/plank {glyph} main | {origin} | ctx 12% | idle");
+        let mut term = Terminal::new(TestBackend::new(70, 2)).unwrap();
+        term.draw(|f| {
+            let rows = status_bar_lines(&text, 0, Style::default(), &TaskView::default());
+            f.render_widget(ratatui::widgets::Paragraph::new(rows), f.area());
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row = |y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        };
+        assert_eq!(row(0), format!("~/Code/plank {glyph} main"));
+        // `starts_with`: the tail notification slot (a rotating tip, or a
+        // running tool's label) also lives on row two, after the state.
+        assert!(
+            row(1).starts_with(&format!("{origin} | ctx 12% | idle")),
+            "row two: {}",
+            row(1)
+        );
     }
 
     #[test]
@@ -3169,6 +3243,11 @@ mod tests {
         // rule directly below it (above the status bar).
         let (out0, in0, st0, rule0, rule_bot0, strip0) = frame_geom(area, true, 1, 0);
         assert!(strip0.is_none());
+        // The status bar is two rows: location above, everything volatile below.
+        // The literal, not `STATUS_ROWS` — comparing the layout against the
+        // constant that produced it asserts nothing.
+        assert_eq!(st0.height, 2, "status bar is two rows");
+        assert_eq!(st0.bottom(), area.bottom(), "and it sits at the bottom");
         let rule0 = rule0.unwrap();
         let rule_bot0 = rule_bot0.expect("bottom rule present");
         assert_eq!(rule0.y + 1, in0.y, "top rule directly above input");
@@ -3209,14 +3288,13 @@ mod tests {
         let text = "◆ Pondering… 3s";
         let mut highlights = Vec::new();
         for step in 0..40u64 {
-            let line = status_bar_line(
+            let line = status_spans(
                 text,
                 step * crate::status::SHIMMER_STEP_MS,
                 base,
                 &TaskView::default(),
             );
             let hit: String = line
-                .spans
                 .iter()
                 .filter(|s| s.style.fg.is_some_and(|c| shades.contains(&c)))
                 .map(|s| s.content.as_ref())
@@ -3245,7 +3323,7 @@ mod tests {
         let dimmest = Color::Indexed(ramp[0]);
         let lines: Vec<_> = (0..40u64)
             .map(|step| {
-                status_bar_line(
+                status_spans(
                     text,
                     step * crate::status::SHIMMER_STEP_MS,
                     base,
@@ -3259,12 +3337,9 @@ mod tests {
         // the travel the window overhangs the word, so only part of the ramp is
         // on screen — which is why this looks for the interior step.)
         let flanked = lines.iter().any(|line| {
-            let first = line.spans.iter().position(|s| s.style.fg == Some(dimmest));
-            let bright = line
-                .spans
-                .iter()
-                .position(|s| s.style.fg == Some(brightest));
-            let last = line.spans.iter().rposition(|s| s.style.fg == Some(dimmest));
+            let first = line.iter().position(|s| s.style.fg == Some(dimmest));
+            let bright = line.iter().position(|s| s.style.fg == Some(brightest));
+            let last = line.iter().rposition(|s| s.style.fg == Some(dimmest));
             match (first, bright, last) {
                 (Some(f), Some(b), Some(l)) => f < b && b < l,
                 _ => false,
@@ -3279,7 +3354,7 @@ mod tests {
         // And no pure white at any point in the cycle.
         for line in &lines {
             assert!(
-                !line.spans.iter().any(|s| {
+                !line.iter().any(|s| {
                     s.style.fg == Some(Color::Indexed(231)) || s.style.fg == Some(Color::White)
                 }),
                 "the shimmer uses shades of the theme hue, never pure white"

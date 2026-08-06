@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The status bar is two rows.** Row one is the working directory and the git
+  branch and nothing else — the answer to "which tree am I in" now holds still
+  instead of being shoved around by whatever the model is doing. Row two carries
+  everything volatile in the order the single row used: engine origin, think
+  level, context gauge, progress or state, task counter, power suffix, remote
+  marker, and the tail notification slot. The engine origin moved rows with the
+  rest; it used to sit beside the path.
 - **The sub-agent roster moved out of the system prompt.** It was the `agent`
   tool's `name` enum plus a per-definition description listing, inside the
   fingerprinted prefix — so editing any definition invalidated `sysprompt.kv`
