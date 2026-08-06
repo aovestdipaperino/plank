@@ -424,6 +424,7 @@ mod tests {
             git_content: Some("GIT-STATUS".to_string()),
             agents_md_content: Some("AGENTS".to_string()),
             memory_content: Some("MEM".to_string()),
+            agents_content: None,
             date_content: "DATE".to_string(),
         };
         // Guard the premise: if this stops being true the bug is gone for a

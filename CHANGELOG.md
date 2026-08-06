@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The sub-agent roster moved out of the system prompt.** It was the `agent`
+  tool's `name` enum plus a per-definition description listing, inside the
+  fingerprinted prefix — so editing any definition invalidated `sysprompt.kv`
+  and cost a full reprefill of a 1M-token prompt. The roster is now part of the
+  Tier-2 project context, which `stable_hash` already keys, so an edit rebuilds
+  that far smaller cache and leaves the expensive prefix intact. `name` is a
+  plain string in both prompt shapes, and both are now independent of what is on
+  disk — which is also what keeps the C-parity fixtures valid, since they lock
+  exactly the no-roster bytes. Dispatch is unchanged: an unmatched name still
+  runs a general-purpose sub-agent with a `note:` line, and the same visibility
+  gates (`auto`, `agents.autoRoute`, a present API-key variable) now filter the
+  context roster instead of the schema.
+
 ### Added
 
 - **Cross-engine sub-agents, including a local one under a remote main agent.** A

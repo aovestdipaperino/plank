@@ -1765,8 +1765,8 @@ mod tests {
             "fp1 must not move across a flap"
         );
         assert_eq!(
-            crate::sysprompt::provider_tool_registry(&flapped, &[]).len(),
-            crate::sysprompt::provider_tool_registry(&live, &[]).len(),
+            crate::sysprompt::provider_tool_registry(&flapped).len(),
+            crate::sysprompt::provider_tool_registry(&live).len(),
             "the structured registry must advertise exactly what the prompt does"
         );
         std::fs::remove_dir_all(root).ok();

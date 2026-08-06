@@ -2009,7 +2009,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let engine =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
-        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true, &[]);
+        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true);
 
         let marker = "｜DSML｜".as_bytes();
         let count_marker_tokens = |toks: &[i32]| {
@@ -2068,7 +2068,7 @@ mod tests {
             return;
         };
         let tuning = crate::config::EngineTuning::default();
-        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true, &[]);
+        let parts = crate::sysprompt::build_system_prompt_parts("", &[], true);
         // The shape an interrupt mid-thinking leaves behind: the last assistant
         // span opens `<think>` and never closes it.
         let transcript = format!(
@@ -2146,7 +2146,7 @@ mod tests {
         let tuning = crate::config::EngineTuning::default();
         let engine =
             super::Ds4Session::open(&model, Ds4Backend::Metal, 4096, 0, 100, &tuning).unwrap();
-        let parts = crate::sysprompt::build_system_prompt_parts("Be terse.", &[], true, &[]);
+        let parts = crate::sysprompt::build_system_prompt_parts("Be terse.", &[], true);
 
         for think in [
             crate::engine::ThinkMode::Off,

@@ -132,7 +132,7 @@ fn system_prompt_reminder_matches_fixture() {
     assert_fixture_eq(
         "system_prompt_reminder.txt",
         // Empty roster: an agent roster must never perturb the parity bytes.
-        &plank::sysprompt::build_system_prompt_reminder(&[], true, &[]),
+        &plank::sysprompt::build_system_prompt_reminder(&[], true),
     );
 }
 

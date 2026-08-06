@@ -1013,21 +1013,6 @@ fn format_tool_results(results: &[(String, String)]) -> String {
     }
     all
 }
-
-/// The definitions the model may route to, as an owned slice for the schema
-/// builders.
-///
-/// One gate for every caller — the `Agent` constructor's system prompt and
-/// `build_structured`'s provider registry — so the text and provider paths can
-/// never advertise different rosters.
-fn model_visible_agents(agents: &[crate::agents::AgentDef]) -> Vec<crate::agents::AgentDef> {
-    let auto_route = crate::settings::active().agents.auto_route;
-    crate::agents::model_visible(agents, auto_route)
-        .into_iter()
-        .cloned()
-        .collect()
-}
-
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
     use crate::engine::{ChatMessage, ChatRole, ToolCallRef};
     let mut out = Vec::new();
@@ -1466,10 +1451,7 @@ impl Agent<'_> {
         StructuredBufs {
             system: sysprompt::provider_system_prompt(&self.cfg.system),
             messages: session_to_messages(session),
-            tools: sysprompt::provider_tool_registry(
-                &self.tool_ctx.mcp,
-                &model_visible_agents(&self.agents),
-            ),
+            tools: sysprompt::provider_tool_registry(&self.tool_ctx.mcp),
             rendered: rendered.to_string(),
         }
     }
@@ -2299,7 +2281,6 @@ impl Agent<'_> {
         let mut text = sysprompt::build_system_prompt_reminder(
             &self.tool_ctx.mcp,
             !crate::settings::active().engine.thinking_tool_calls,
-            &model_visible_agents(&self.agents),
         );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
@@ -6893,7 +6874,6 @@ impl Agent<'_> {
         let mut text = sysprompt::build_system_prompt_reminder(
             &self.tool_ctx.mcp,
             !crate::settings::active().engine.thinking_tool_calls,
-            &model_visible_agents(&self.agents),
         );
         if !self.cfg.system.is_empty() {
             text.push_str("\nAdditional system instructions reminder:\n");
@@ -8234,7 +8214,6 @@ fn new_agent(
         &cfg.system,
         &tool_ctx.mcp,
         !crate::settings::active().engine.thinking_tool_calls,
-        &model_visible_agents(&agents),
     );
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
@@ -9297,7 +9276,7 @@ mod tests {
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -10887,6 +10866,7 @@ mod tests {
             git_content: Some("[git]\nbranch main".to_owned()),
             agents_md_content: Some("do the thing".to_owned()),
             memory_content: None,
+            agents_content: None,
             date_content: "[date]\n2026-07-25".to_owned(),
         };
         let mut session = Session::new();
@@ -11578,7 +11558,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11754,7 +11734,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11835,7 +11815,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11903,7 +11883,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -11994,7 +11974,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -12806,37 +12786,41 @@ mod tests {
         assert!(!out.contains("produced no report"), "{out}");
     }
 
+    /// The roster is no longer in the tool schema at all: it moved to the
+    /// session context so that editing a definition rebuilds the small
+    /// project-tier cache instead of invalidating the fingerprinted system
+    /// prompt. `name` is a plain string in both prompt shapes.
     #[test]
-    fn auto_route_off_withholds_the_roster_from_the_tool_schema() {
+    fn the_tool_schema_carries_no_roster() {
         let defs = vec![named_def("reviewer", true)];
-
-        // On (the default): the definition reaches the model's `agent` schema.
         crate::settings::install_for_test(crate::settings::Settings::default());
-        let visible = model_visible_agents(&defs);
-        assert_eq!(visible.len(), 1);
-        let specs = crate::sysprompt::provider_tool_registry(&[], &visible);
-        let agent_spec = specs.iter().find(|s| s.name == "agent").expect("agent");
-        assert_eq!(
-            agent_spec.parameters["properties"]["name"]["enum"][0],
-            "reviewer"
-        );
 
-        // Off: the schema loses the enum entirely, so the model has no roster to
-        // route with — while `/subagent reviewer` still works (see
-        // `agents::resolve_ignores_the_auto_gate`).
-        let mut settings = crate::settings::Settings::default();
-        settings.agents.auto_route = false;
-        crate::settings::install_for_test(settings);
-        assert!(model_visible_agents(&defs).is_empty());
-        let specs = crate::sysprompt::provider_tool_registry(&[], &model_visible_agents(&defs));
+        let specs = crate::sysprompt::provider_tool_registry(&[]);
         let agent_spec = specs.iter().find(|s| s.name == "agent").expect("agent");
         assert!(
             agent_spec.parameters["properties"]["name"]
                 .get("enum")
                 .is_none(),
-            "no enum when routing is off"
+            "no enum: {}",
+            agent_spec.parameters
+        );
+        let text_prompt = crate::sysprompt::build_system_prompt("", &[], true);
+        assert!(
+            !text_prompt.contains("reviewer"),
+            "a definition name must not reach the system prompt"
         );
 
+        // It reaches the model through the session context instead, and
+        // `autoRoute off` withholds it there — the gate moved with the roster.
+        let roster = crate::context::agent_roster_context(&defs).expect("roster");
+        assert!(roster.contains("reviewer"), "{roster}");
+        let mut settings = crate::settings::Settings::default();
+        settings.agents.auto_route = false;
+        crate::settings::install_for_test(settings);
+        assert!(
+            crate::context::agent_roster_context(&defs).is_none(),
+            "autoRoute off withholds the roster"
+        );
         crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
@@ -12952,7 +12936,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -13037,7 +13021,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -13181,7 +13165,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
@@ -13247,7 +13231,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            system: crate::sysprompt::build_system_prompt("", &[], true, &[]),
+            system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,

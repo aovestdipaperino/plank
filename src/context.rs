@@ -25,6 +25,12 @@ pub struct ContextContent {
     pub git_content: Option<String>,
     /// AGENTS.md content (if found).
     pub agents_md_content: Option<String>,
+    /// The model-visible sub-agent roster, when any definition is dispatchable
+    /// by the model. Lives here rather than in the `agent` tool's schema so
+    /// editing a definition does not invalidate the fingerprinted system prompt
+    /// — a 1M-token reprefill — and instead only rebuilds the far smaller
+    /// Tier-2 project cache, which [`Self::stable_hash`] already keys.
+    pub agents_content: Option<String>,
     /// Persistent memory section (if any memory file has content).
     pub memory_content: Option<String>,
     /// Current date context line.
@@ -40,11 +46,15 @@ impl ContextContent {
         let memory_content = std::env::current_dir()
             .ok()
             .and_then(|cwd| crate::memory::load_default(&cwd));
+        let agents_content = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| agent_roster_context(&crate::agents::load_default(&cwd)));
         let date_content = date_context_line();
 
         Self {
             git_content,
             agents_md_content,
+            agents_content,
             memory_content,
             date_content,
         }
@@ -66,6 +76,14 @@ impl ContextContent {
 
         if let Some(memory) = &self.memory_content {
             out.push_str(memory);
+            out.push('\n');
+        }
+
+        // Tier 2 rather than Tier 3: definitions are on-disk files that change
+        // only when edited, so the roster is cacheable — and an edit costs a
+        // project-tier rebuild instead of a system-prompt one.
+        if let Some(agents) = &self.agents_content {
+            out.push_str(agents);
             out.push('\n');
         }
 
@@ -379,6 +397,39 @@ fn format_local_date() -> Result<String, ()> {
     Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
+/// Renders the model-visible sub-agent roster for the session context, or `None`
+/// when the model may not select any definition.
+///
+/// Filtered exactly as the tool schema used to be: a definition the model must
+/// not reach for — `auto: false`, `agents.autoRoute` off, or a missing API-key
+/// variable — is absent here too, so the roster never advertises something that
+/// would fail on dispatch. `/agent` still lists those, with the reason.
+///
+/// Names only need to be recognisable, not enumerated in a schema: an unmatched
+/// name runs a general-purpose sub-agent and says so, so the model self-corrects
+/// from the note rather than from JSON validation.
+#[must_use]
+pub fn agent_roster_context(defs: &[crate::agents::AgentDef]) -> Option<String> {
+    use std::fmt::Write as _;
+    let auto_route = crate::settings::active().agents.auto_route;
+    let visible = crate::agents::model_visible(defs, auto_route);
+    if visible.is_empty() {
+        return None;
+    }
+    let mut out =
+        String::from("Configured sub-agents, selectable by passing `name` to the `agent` tool:\n");
+    for d in visible {
+        let _ = write!(out, "  {}", d.name);
+        if d.description.is_empty() {
+            out.push_str(": (no description)");
+        } else {
+            let _ = write!(out, ": {}", d.description);
+        }
+        out.push('\n');
+    }
+    Some(out)
+}
+
 /// Formats the current date as a context line.
 #[must_use]
 pub fn date_context_line() -> String {
@@ -402,6 +453,7 @@ mod tests {
             git_content: Some("Git info".to_string()),
             agents_md_content: Some("AGENTS.md content".to_string()),
             memory_content: Some("Persistent memory: prefers tabs".to_string()),
+            agents_content: None,
             date_content: "Today's date is 2026-01-01.".to_string(),
         };
 
@@ -420,6 +472,7 @@ mod tests {
             git_content: Some("GIT-STATUS".to_string()),
             agents_md_content: Some("AGENTS".to_string()),
             memory_content: Some("MEM".to_string()),
+            agents_content: None,
             date_content: "DATE".to_string(),
         };
 
@@ -443,6 +496,7 @@ mod tests {
             git_content: Some("GIT-STATUS".to_string()),
             agents_md_content: Some("AGENTS".to_string()),
             memory_content: Some("MEM".to_string()),
+            agents_content: None,
             date_content: "DATE".to_string(),
         };
         let stable = content.stable_context();
@@ -460,6 +514,7 @@ mod tests {
             git_content: Some("differs-every-session".to_string()),
             agents_md_content: Some("AGENTS".to_string()),
             memory_content: Some("MEM".to_string()),
+            agents_content: None,
             date_content: "differs-every-day".to_string(),
         };
         // Same stable content, different volatile content → same stable hash.
@@ -467,6 +522,7 @@ mod tests {
             git_content: Some("other-git".to_string()),
             agents_md_content: Some("AGENTS".to_string()),
             memory_content: Some("MEM".to_string()),
+            agents_content: None,
             date_content: "other-date".to_string(),
         };
         assert_eq!(a.stable_hash(), b.stable_hash());
@@ -486,6 +542,7 @@ mod tests {
             git_content: Some("git".to_string()),
             agents_md_content: None,
             memory_content: None,
+            agents_content: None,
             date_content: "date".to_string(),
         };
         assert_eq!(content.stable_hash(), None);
@@ -497,6 +554,7 @@ mod tests {
             git_content: Some("git".to_string()),
             agents_md_content: Some("agents".to_string()),
             memory_content: Some("mem".to_string()),
+            agents_content: None,
             date_content: "date".to_string(),
         };
 
@@ -514,6 +572,7 @@ mod tests {
             git_content: None,
             agents_md_content: None,
             memory_content: None,
+            agents_content: None,
             date_content: "date".to_string(),
         };
 
@@ -522,5 +581,85 @@ mod tests {
         assert_eq!(tokens.agents_md, 0);
         assert_eq!(tokens.date, 4);
         assert_eq!(tokens.total, 4);
+    }
+
+    /// The point of moving the roster here: editing a definition must cost the
+    /// Tier-2 project cache, not the fingerprinted system prompt. So the roster
+    /// has to be inside `stable_context` (and therefore inside `stable_hash`),
+    /// and absent from the prompt entirely.
+    #[test]
+    fn the_roster_keys_the_project_tier_not_the_system_prompt() {
+        use crate::agents::AgentDef;
+        let def = |name: &str, desc: &str| AgentDef {
+            name: name.to_string(),
+            description: desc.to_string(),
+            body: "Body.".to_string(),
+            path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
+            engine: None,
+            auto: true,
+        };
+        crate::settings::install_for_test(crate::settings::Settings::default());
+
+        let one = ContextContent {
+            agents_content: agent_roster_context(&[def("reviewer", "reviews diffs")]),
+            ..ContextContent::default()
+        };
+        let two = ContextContent {
+            agents_content: agent_roster_context(&[def("reviewer", "reviews diffs BUT EDITED")]),
+            ..ContextContent::default()
+        };
+
+        assert!(
+            one.stable_context().contains("reviewer: reviews diffs"),
+            "the roster rides in the stable tier: {}",
+            one.stable_context()
+        );
+        assert!(
+            !one.volatile_context().contains("reviewer"),
+            "not in the volatile tier, which is never cached"
+        );
+        assert_ne!(
+            one.stable_hash(),
+            two.stable_hash(),
+            "editing a description must rekey project.kv"
+        );
+
+        // And the expensive prefix is untouched by any of it.
+        let prompt = crate::sysprompt::build_system_prompt("", &[], true);
+        assert!(
+            !prompt.contains("reviewer"),
+            "roster stayed out of the prompt"
+        );
+    }
+
+    /// A definition the model must not select is withheld here too, so the
+    /// roster never advertises something that would fail on dispatch.
+    #[test]
+    fn the_roster_applies_the_model_visibility_gates() {
+        use crate::agents::AgentDef;
+        let mut manual = AgentDef {
+            name: "manual-only".to_string(),
+            description: "only by hand".to_string(),
+            body: String::new(),
+            path: std::path::PathBuf::from("/tmp/m.md"),
+            engine: None,
+            auto: false,
+        };
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        assert!(
+            agent_roster_context(std::slice::from_ref(&manual)).is_none(),
+            "auto: false is withheld"
+        );
+        manual.auto = true;
+        assert!(agent_roster_context(std::slice::from_ref(&manual)).is_some());
+
+        let mut settings = crate::settings::Settings::default();
+        settings.agents.auto_route = false;
+        crate::settings::install_for_test(settings);
+        assert!(
+            agent_roster_context(std::slice::from_ref(&manual)).is_none(),
+            "autoRoute off withholds everything"
+        );
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 }

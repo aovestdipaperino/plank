@@ -136,9 +136,7 @@ ask permission to start a browser.\n\n\
 /// `<name>` tags are the model reaching for a real tool.
 #[must_use]
 pub fn tool_names(mcp: &[crate::tools::mcp::McpServer]) -> Vec<String> {
-    // The roster adds no tool *names*, only an enum on `agent`'s `name`, so an
-    // empty roster is correct here and keeps this cheap.
-    provider_tool_registry(mcp, &[])
+    provider_tool_registry(mcp)
         .into_iter()
         .map(|spec| spec.name)
         .collect()
@@ -153,7 +151,6 @@ pub fn tool_names(mcp: &[crate::tools::mcp::McpServer]) -> Vec<String> {
 #[must_use]
 pub fn provider_tool_registry(
     mcp_servers: &[crate::tools::mcp::McpServer],
-    agents: &[crate::agents::AgentDef],
 ) -> Vec<crate::engine::ToolSpec> {
     let mut specs = parse_builtin_tool_schemas();
     // Native plank tools beyond the C table are appended to the text prompt by
@@ -211,7 +208,7 @@ pub fn provider_tool_registry(
             "required": ["question", "header", "options"]
         }),
     });
-    push_agent_and_plan_specs(&mut specs, agents);
+    push_agent_and_plan_specs(&mut specs);
     for server in mcp_servers {
         // No `alive` filter, deliberately: a non-alive server is either an
         // offline shadow — whose tools must stay advertised so this registry
@@ -252,55 +249,28 @@ pub fn provider_tool_registry(
     specs
 }
 
-/// Today's `name` description, used verbatim when the roster is empty so both
-/// schema paths stay byte-identical to the pre-roster output.
+/// The `agent` tool's `name` description, used verbatim by both schema paths.
+///
+/// No roster is interpolated into it: definitions are advertised in the session
+/// context instead (`context::agent_roster_context`), so that editing one
+/// rebuilds the small project-tier cache rather than invalidating the
+/// fingerprinted system prompt. Keeping this text fixed is also what keeps the
+/// C-parity fixtures valid.
 const AGENT_NAME_DESC_EMPTY: &str =
     "optional configured agent name to act as; omit for a general-purpose sub-agent";
-
-/// The `agent` tool's `name` property as (enum values, description), or `None`
-/// when there is no roster to advertise.
-///
-/// `None` is load-bearing: with no definitions both schema paths must emit
-/// exactly the bytes they emitted before agent rosters existed, because the
-/// C-parity fixtures lock them. Shared by the provider and text paths so the
-/// two cannot drift.
-fn agent_name_property(agents: &[crate::agents::AgentDef]) -> Option<(Vec<String>, String)> {
-    if agents.is_empty() {
-        return None;
-    }
-    let mut desc =
-        String::from("optional configured agent to act as; omit for a general-purpose sub-agent.");
-    for d in agents {
-        desc.push_str("\n  ");
-        desc.push_str(&d.name);
-        desc.push_str(": ");
-        // A bare name gives the model nothing to route on, so say so outright
-        // rather than leaving it to guess.
-        if d.description.is_empty() {
-            desc.push_str("(no description; should only be called manually by the user)");
-        } else {
-            desc.push_str(&d.description);
-        }
-    }
-    Some((agents.iter().map(|d| d.name.clone()).collect(), desc))
-}
 
 /// Pushes the provider-path [`ToolSpec`](crate::engine::ToolSpec)s for the
 /// `agent` and plan-mode tools (issue #50). Mirrors the text-path schemas in
 /// [`append_agent_and_plan_schemas`]; split out to keep
 /// [`provider_tool_registry`] under the function-length lint.
-fn push_agent_and_plan_specs(
-    specs: &mut Vec<crate::engine::ToolSpec>,
-    agents: &[crate::agents::AgentDef],
-) {
-    let name_prop = match agent_name_property(agents) {
-        Some((names, desc)) => serde_json::json!({
-            "type": "string", "enum": names, "description": desc
-        }),
-        None => serde_json::json!({
-            "type": "string", "description": AGENT_NAME_DESC_EMPTY
-        }),
-    };
+fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
+    // No enum of definition names: the roster lives in the session context
+    // (`context::agent_roster_context`) so that editing a definition rebuilds
+    // the small project-tier cache instead of invalidating the fingerprinted
+    // system prompt. An unmatched name still falls back with a note.
+    let name_prop = serde_json::json!({
+        "type": "string", "description": AGENT_NAME_DESC_EMPTY
+    });
     specs.push(crate::engine::ToolSpec {
         name: "agent".to_string(),
         description: "Delegate a self-contained sub-task to a fresh sub-agent that works in its own scoped context and returns only a final report. Use this to keep your own context small: hand off open-ended research or a bounded multi-step chore, then continue from its report. 'task' is a complete, standalone instruction; 'name' optionally selects a configured agent persona. The sub-agent cannot ask you questions, so make 'task' fully specified.".to_string(),
@@ -381,7 +351,7 @@ fn parse_builtin_tool_schemas() -> Vec<crate::engine::ToolSpec> {
 /// followed by the schemas of any MCP tools loaded at startup.
 #[must_use]
 pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: bool) -> String {
-    build_tools_prompt_parts(mcp_servers, parity, &[]).0
+    build_tools_prompt_parts(mcp_servers, parity).0
 }
 
 /// [`build_tools_prompt`] plus the byte length of its leading **trusted** span.
@@ -396,12 +366,11 @@ pub fn build_tools_prompt(mcp_servers: &[crate::tools::mcp::McpServer], parity: 
 fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
-    agents: &[crate::agents::AgentDef],
 ) -> (String, usize) {
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
-    append_native_extra_schemas(&mut out, agents);
+    append_native_extra_schemas(&mut out);
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
@@ -517,7 +486,7 @@ const TASK_SCHEMA: &str = "{\n\
      \x20 }\n\
      }\n";
 
-fn append_native_extra_schemas(out: &mut String, agents: &[crate::agents::AgentDef]) {
+fn append_native_extra_schemas(out: &mut String) {
     out.push_str(
         "\n{\n\
          \x20 \"type\": \"function\",\n\
@@ -569,35 +538,21 @@ fn append_native_extra_schemas(out: &mut String, agents: &[crate::agents::AgentD
          \x20 }\n\
          }\n",
     );
-    append_agent_and_plan_schemas(out, agents);
+    append_agent_and_plan_schemas(out);
 }
 
 /// Appends the `agent` (sub-agent delegation) and plan-mode tool schemas
 /// (issue #50). Split from [`append_native_extra_schemas`] to keep each under
 /// the function-length lint; both are native tools outside the C-trained table.
-fn append_agent_and_plan_schemas(out: &mut String, agents: &[crate::agents::AgentDef]) {
+fn append_agent_and_plan_schemas(out: &mut String) {
     // Built as an owned line rather than inlined into the continued literal: a
     // `\`-continued literal strips the next line's leading whitespace, which
-    // would corrupt the schema indentation (see CLAUDE.md). With an empty roster
-    // this reproduces the previous line byte-for-byte.
-    let name_line = match agent_name_property(agents) {
-        None => format!(
-            "\x20       \"name\": {{\"type\": \"string\", \"description\": \"{AGENT_NAME_DESC_EMPTY}\"}}\n"
-        ),
-        Some((names, desc)) => {
-            let names = names
-                .iter()
-                .map(|n| format!("\"{n}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            // `Value::String` does the JSON escaping, so the listing's newlines
-            // arrive as `\n` and the block stays parseable.
-            format!(
-                "\x20       \"name\": {{\"type\": \"string\", \"enum\": [{names}], \"description\": {}}}\n",
-                serde_json::Value::String(desc)
-            )
-        }
-    };
+    // would corrupt the schema indentation (see CLAUDE.md). No roster is listed
+    // here — see `push_agent_and_plan_specs` — so this is byte-identical to the
+    // pre-roster build, which is what keeps the parity fixtures valid.
+    let name_line = format!(
+        "\x20       \"name\": {{\"type\": \"string\", \"description\": \"{AGENT_NAME_DESC_EMPTY}\"}}\n"
+    );
     out.push_str(
         "{\n\
          \x20 \"type\": \"function\",\n\
@@ -665,10 +620,9 @@ pub fn dsml_syntax_reminder() -> &'static str {
 pub fn build_system_prompt_reminder(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
-    agents: &[crate::agents::AgentDef],
 ) -> String {
     let mut out = String::from("\n\n[System prompt reminder follows.]\n");
-    out.push_str(&build_tools_prompt_parts(mcp_servers, parity, agents).0);
+    out.push_str(&build_tools_prompt_parts(mcp_servers, parity).0);
     out.push_str("[End system prompt reminder.]\n\n");
     out
 }
@@ -692,9 +646,8 @@ pub fn build_system_prompt(
     user_system: &str,
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
-    agents: &[crate::agents::AgentDef],
 ) -> String {
-    build_system_prompt_parts(user_system, mcp_servers, parity, agents).text
+    build_system_prompt_parts(user_system, mcp_servers, parity).text
 }
 
 /// A composed system prompt together with the boundary that decides how each
@@ -735,9 +688,8 @@ pub fn build_system_prompt_parts(
     user_system: &str,
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
-    agents: &[crate::agents::AgentDef],
 ) -> SplitSystemPrompt {
-    let (mut text, trusted_len) = build_tools_prompt_parts(mcp_servers, parity, agents);
+    let (mut text, trusted_len) = build_tools_prompt_parts(mcp_servers, parity);
     if !user_system.is_empty() {
         text.push_str("\n\n");
         text.push_str(user_system);
@@ -841,7 +793,7 @@ mod tests {
         // The `task`, `agent`, and plan-mode tools used to be gated behind
         // `settings.tools`; they are unconditional now, so a default-settings
         // build must still advertise all four.
-        let specs = provider_tool_registry(&[], &[]);
+        let specs = provider_tool_registry(&[]);
         for name in ["task", "agent", "EnterPlanMode", "ExitPlanMode"] {
             assert!(
                 specs.iter().any(|s| s.name == name),
@@ -849,7 +801,7 @@ mod tests {
             );
         }
         let mut text = String::new();
-        append_native_extra_schemas(&mut text, &[]);
+        append_native_extra_schemas(&mut text);
         for name in [
             "\"task\"",
             "\"agent\"",
@@ -891,8 +843,8 @@ mod tests {
     /// the first user turn (`context::ContextContent`), never here.
     #[test]
     fn fingerprinted_prompt_contains_no_volatile_bytes() {
-        let a = build_system_prompt("user -sys text", &[], true, &[]);
-        let b = build_system_prompt("user -sys text", &[], true, &[]);
+        let a = build_system_prompt("user -sys text", &[], true);
+        let b = build_system_prompt("user -sys text", &[], true);
         assert_eq!(a, b, "system prompt must be deterministic");
         let today = crate::context::current_local_iso_date();
         assert!(
@@ -927,17 +879,6 @@ mod tests {
         assert!(p.ends_with("Be terse."));
     }
 
-    fn test_def(name: &str, description: &str) -> crate::agents::AgentDef {
-        crate::agents::AgentDef {
-            name: name.to_string(),
-            description: description.to_string(),
-            body: "b".to_string(),
-            path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
-            engine: None,
-            auto: true,
-        }
-    }
-
     /// The C-parity fixtures depend on this: an empty roster must not perturb a
     /// single byte of either schema path. If this fails, the fix is in the code,
     /// never `PLANK_REGEN_FIXTURES=1`.
@@ -949,7 +890,7 @@ mod tests {
             !text.contains("\"enum\""),
             "no enum key with an empty roster: {text}"
         );
-        let specs = provider_tool_registry(&[], &[]);
+        let specs = provider_tool_registry(&[]);
         let agent = specs
             .iter()
             .find(|s| s.name == "agent")
@@ -960,100 +901,41 @@ mod tests {
         );
     }
 
+    /// The roster deliberately does *not* reach either prompt shape any more: it
+    /// lives in the session context (`context::agent_roster_context`) so editing
+    /// a definition rebuilds the small project-tier cache instead of
+    /// invalidating the fingerprinted system prompt. Both shapes must therefore
+    /// be independent of what is on disk, which is also what keeps the parity
+    /// fixtures valid.
     #[test]
-    fn roster_populates_the_agent_name_enum_on_both_paths() {
-        let defs = vec![
-            test_def("reviewer", "reviews diffs"),
-            test_def("scribe", ""),
-        ];
+    fn no_roster_reaches_either_prompt_shape() {
+        let (text, trusted) = build_tools_prompt_parts(&[], true);
+        assert!(!text.contains("\"enum\""), "no enum key at all: {text}");
+        assert!(
+            text.contains("\"name\": {\"type\": \"string\", \"description\":"),
+            "`name` is a plain string: {text}"
+        );
 
-        let specs = provider_tool_registry(&[], &defs);
+        let specs = provider_tool_registry(&[]);
         let agent = specs
             .iter()
             .find(|s| s.name == "agent")
             .expect("agent spec");
-        let enum_vals = agent.parameters["properties"]["name"]["enum"]
-            .as_array()
-            .expect("enum array");
-        assert_eq!(enum_vals.len(), 2);
-        assert_eq!(enum_vals[0], "reviewer");
-        let desc = agent.parameters["properties"]["name"]["description"]
-            .as_str()
-            .expect("description");
-        assert!(desc.contains("reviewer: reviews diffs"), "{desc}");
         assert!(
-            desc.contains("scribe: (no description; should only be called manually by the user)"),
-            "a description-less def gets an explicit placeholder: {desc}"
+            agent.parameters["properties"]["name"].get("enum").is_none(),
+            "no enum in the structured spec either"
         );
 
-        let (text, _) = build_tools_prompt_parts(&[], true, &defs);
-        assert!(
-            text.contains("\"enum\": [\"reviewer\", \"scribe\"]"),
-            "{text}"
-        );
-        assert!(text.contains("reviewer: reviews diffs"), "{text}");
-        // The listing's newlines must be JSON-escaped, not raw, or the schema
-        // block stops being parseable.
-        assert!(
-            !text.contains("user)\"\n  scribe"),
-            "escaped, not raw: {text}"
-        );
-    }
-
-    /// The text path hand-builds the `agent` schema as a string with the roster
-    /// interpolated, so a stray quote or raw newline in a name or description
-    /// would silently produce an unparseable block. Extract it and parse it.
-    #[test]
-    fn text_path_agent_schema_is_valid_json_with_a_roster() {
-        let defs = vec![
-            test_def("reviewer", "reviews \"diffs\", carefully"),
-            test_def("scribe", ""),
-        ];
-        let (text, _) = build_tools_prompt_parts(&[], true, &defs);
-        let start = text
-            .find("{\n  \"type\": \"function\",\n  \"function\": {\n    \"name\": \"agent\"")
-            .expect("agent block present");
-        // Walk braces to the matching close, skipping those inside strings, so
-        // the nested parameters object is included.
-        let mut depth = 0usize;
-        let mut end = start;
-        let mut in_str = false;
-        let mut escaped = false;
-        for (i, &b) in text.as_bytes().iter().enumerate().skip(start) {
-            if escaped {
-                escaped = false;
-            } else if in_str && b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                in_str = !in_str;
-            } else if !in_str && b == b'{' {
-                depth += 1;
-            } else if !in_str && b == b'}' {
-                depth -= 1;
-                if depth == 0 {
-                    end = i + 1;
-                    break;
-                }
-            }
-        }
-        assert!(end > start, "found the matching close brace");
-        let block = &text[start..end];
-        let parsed: serde_json::Value =
-            serde_json::from_str(block).unwrap_or_else(|e| panic!("invalid JSON: {e}\n{block}"));
-        let name = &parsed["function"]["parameters"]["properties"]["name"];
-        assert_eq!(name["enum"][0], "reviewer");
-        assert_eq!(name["enum"][1], "scribe");
-        let desc = name["description"].as_str().expect("description");
-        assert!(
-            desc.contains("reviewer: reviews \"diffs\", carefully"),
-            "quotes survive escaping: {desc}"
-        );
-        assert!(desc.contains("scribe: (no description"), "{desc}");
+        // Definitions on disk cannot move a byte of it. Same inputs, same
+        // output, regardless of what a roster would have said.
+        let (again, trusted_again) = build_tools_prompt_parts(&[], true);
+        assert_eq!(text, again);
+        assert_eq!(trusted, trusted_again);
     }
 
     #[test]
     fn provider_tool_registry_parses_builtin_schemas() {
-        let specs = provider_tool_registry(&[], &[]);
+        let specs = provider_tool_registry(&[]);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
         for want in ["read", "write", "edit", "bash", "search", "google_search"] {
             assert!(names.contains(&want), "missing {want} in {names:?}");
@@ -1074,7 +956,7 @@ mod tests {
 
     #[test]
     fn system_prompt_reminder_framing() {
-        let r = build_system_prompt_reminder(&[], true, &[]);
+        let r = build_system_prompt_reminder(&[], true);
         assert!(r.starts_with("\n\n[System prompt reminder follows.]\n"));
         assert!(r.ends_with("[End system prompt reminder.]\n\n"));
         assert!(r.contains("## Tools"));
@@ -1089,7 +971,7 @@ mod tests {
     #[test]
     fn trusted_span_covers_the_dsml_examples_and_nothing_untrusted() {
         for parity in [true, false] {
-            let p = build_system_prompt_parts("USER SYS TEXT", &[], parity, &[]);
+            let p = build_system_prompt_parts("USER SYS TEXT", &[], parity);
             let trusted = &p.text[..p.trusted_len];
             let rest = &p.text[p.trusted_len..];
 
@@ -1113,10 +995,10 @@ mod tests {
     /// outside, and the trusted prefix itself never moves.
     #[test]
     fn trusted_span_ends_before_anything_appended() {
-        let bare = build_system_prompt_parts("", &[], true, &[]);
+        let bare = build_system_prompt_parts("", &[], true);
         assert_eq!(bare.trusted_len, bare.text.len(), "nothing untrusted yet");
 
-        let with_user = build_system_prompt_parts("Be terse.", &[], true, &[]);
+        let with_user = build_system_prompt_parts("Be terse.", &[], true);
         assert_eq!(with_user.trusted_len, bare.trusted_len);
         assert!(with_user.text.len() > with_user.trusted_len);
         assert!(with_user.text.starts_with(&bare.text[..bare.trusted_len]));
@@ -1129,8 +1011,8 @@ mod tests {
         for parity in [true, false] {
             for user in ["", "Be terse."] {
                 assert_eq!(
-                    build_system_prompt_parts(user, &[], parity, &[]).text,
-                    build_system_prompt(user, &[], parity, &[]),
+                    build_system_prompt_parts(user, &[], parity).text,
+                    build_system_prompt(user, &[], parity),
                 );
             }
         }
@@ -1148,8 +1030,8 @@ mod tests {
                 + "</｜DSML｜tool_calls>\n\n".len();
             assert!(prompt[shape_end..].starts_with(MARKER_SPELLING_NOTE));
             // The reminder re-sends the tools prompt, so it inherits the note.
-            assert!(build_system_prompt_reminder(&[], parity, &[]).contains(MARKER_SPELLING_NOTE));
-            assert!(build_system_prompt("", &[], parity, &[]).contains(MARKER_SPELLING_NOTE));
+            assert!(build_system_prompt_reminder(&[], parity).contains(MARKER_SPELLING_NOTE));
+            assert!(build_system_prompt("", &[], parity).contains(MARKER_SPELLING_NOTE));
         }
     }
 
@@ -1168,17 +1050,17 @@ mod tests {
             let anchor = "then explain that and use chunks.\n\n";
             let at = prompt.find(anchor).unwrap() + anchor.len();
             assert!(prompt[at..].starts_with(DOCUMENT_READ_NOTE));
-            assert!(build_system_prompt_reminder(&[], parity, &[]).contains(DOCUMENT_READ_NOTE));
+            assert!(build_system_prompt_reminder(&[], parity).contains(DOCUMENT_READ_NOTE));
         }
     }
 
     #[test]
     fn system_prompt_composition() {
         assert_eq!(
-            build_system_prompt("", &[], true, &[]),
+            build_system_prompt("", &[], true),
             build_tools_prompt(&[], true)
         );
-        let with_extra = build_system_prompt("Be terse.", &[], true, &[]);
+        let with_extra = build_system_prompt("Be terse.", &[], true);
         assert!(with_extra.starts_with(&build_tools_prompt(&[], true)));
         assert!(with_extra.ends_with("\n\nBe terse."));
     }
@@ -1207,12 +1089,9 @@ mod tests {
         assert!(!build_tools_prompt(&[], false).contains("Tool calls are not allowed inside"));
         assert!(build_tools_prompt(&[], true).contains(IN_THINK_PROHIBITION));
         assert!(
-            !build_system_prompt_reminder(&[], false, &[])
-                .contains("Tool calls are not allowed inside")
+            !build_system_prompt_reminder(&[], false).contains("Tool calls are not allowed inside")
         );
-        assert!(
-            !build_system_prompt("", &[], false, &[]).contains("Tool calls are not allowed inside")
-        );
+        assert!(!build_system_prompt("", &[], false).contains("Tool calls are not allowed inside"));
     }
 
     #[test]
