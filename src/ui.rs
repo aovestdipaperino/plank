@@ -6030,6 +6030,48 @@ impl Agent<'_> {
     /// nothing prefills and nothing is drawn; otherwise a minimal centered
     /// progress bar covers the rebuild, and the caller renders the real UI over
     /// it.
+    /// Warms the alt local engine's Tier 1 at startup: prefilled and persisted
+    /// when no checkpoint exists, restored from disk when one does.
+    ///
+    /// Here rather than at first use because this is the one place a prefill is
+    /// already expected, drawn, and paid for — mid-turn it froze the front end,
+    /// `warm_sync` being uninterruptible.
+    ///
+    /// **Only Tier 1**, which is also what makes the checkpoint appear at all.
+    /// `warm` restores the deepest tier that loads and skips every tier above
+    /// it, so on a machine whose Tier 2 checkpoint is valid, Tier 1 is never
+    /// prefilled and therefore never persisted — which is why `sysprompt-*.kv`
+    /// can be absent on a session that has warmed happily for months. A tier
+    /// list of one has nothing deeper to short-circuit it, so Tier 1 gets built
+    /// and written, and every later session (this engine's sidechains and any
+    /// local-main session on the same fingerprint) restores instead.
+    fn warm_alt_local_tier1(
+        &mut self,
+        on_event: &mut dyn FnMut(EngineEvent),
+        on_stage: &mut dyn FnMut(crate::kvtier::TierKind),
+    ) {
+        let Some(mut engine) = self.alt_engines.remove(&EngineKey::Local) else {
+            return;
+        };
+        let tiers = self.kv_tiers_for(&engine.model_name());
+        if let Some(system) = tiers
+            .first()
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+        {
+            let _ = crate::kvtier::warm(
+                &mut *engine,
+                Some(&self.store),
+                std::slice::from_ref(system),
+                on_event,
+                on_stage,
+            );
+            // Set even on failure: the on-demand restore would fail the same
+            // way, and retrying it per dispatch buys nothing.
+            self.local_alt_warmed = true;
+        }
+        self.alt_engines.insert(EngineKey::Local, engine);
+    }
+
     fn tui_warm(&mut self, terminal: &mut ratatui::DefaultTerminal) -> Result<(), String> {
         if self.skip_warm_after_restore() {
             return Ok(());
@@ -6063,6 +6105,19 @@ impl Agent<'_> {
             &mut |kind| stage.set(kind.warm_label()),
         )
         .map_err(|e| e.to_string())?;
+        // The sub-agent's local engine gets the same treatment on the same
+        // screen; it is a second engine, so it needs its own walk.
+        let alt_stage = "Caching the system prompt for the local sub-agent";
+        self.warm_alt_local_tier1(
+            &mut |ev| {
+                if let EngineEvent::Prefill(p) = ev {
+                    let _ = terminal.draw(|f| {
+                        tui::draw_warm(f, p.done, p.total, p.tps, alt_stage, None);
+                    });
+                }
+            },
+            &mut |_| {},
+        );
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
@@ -6142,6 +6197,16 @@ impl Agent<'_> {
         if announced == 1 && color && notice.is_none() {
             eprint!("\x1b[A\x1b[2K\r");
         }
+        let mut alt_announced = false;
+        self.warm_alt_local_tier1(
+            &mut |ev| {
+                if matches!(ev, EngineEvent::Prefill(_)) && !alt_announced {
+                    alt_announced = true;
+                    eprintln!("Caching the system prompt for the local sub-agent...");
+                }
+            },
+            &mut |_| {},
+        );
         self.gc_kv_tiers(&tiers);
         Ok(())
     }
@@ -9468,6 +9533,9 @@ mod tests {
         /// Records every `set_trusted_system_prefix` call, the other half of
         /// the configuration an engine needs before it tokenizes anything.
         trusted_lens: Option<std::sync::Arc<std::sync::Mutex<Vec<usize>>>>,
+        /// Records each `warm_reset` system text, so a test can assert which
+        /// tiers a warm walk actually covered.
+        warm_tiers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         /// When set, `generate` fails with this message instead of replying, so
         /// tests can exercise the error paths (e.g. that a swapped-in sub-agent
         /// engine is still returned to its cache when the sidechain dies).
@@ -9597,6 +9665,13 @@ mod tests {
             if let Some(seen) = &self.trusted_lens {
                 seen.lock().unwrap().push(len);
             }
+        }
+
+        fn warm_reset(&mut self, system: &str) -> Result<(), crate::engine::EngineError> {
+            if let Some(seen) = &self.warm_tiers {
+                seen.lock().unwrap().push(system.to_owned());
+            }
+            Ok(())
         }
     }
 
@@ -11971,6 +12046,41 @@ mod tests {
         // And the live engine's own name reproduces the live plan, so
         // `kv_tiers` is genuinely just this call with one argument filled in.
         assert_eq!(agent.kv_tiers_for(&agent.engine.model_name()), live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Startup warms only Tier 1 for the alt engine, and that narrowness is
+    /// load-bearing: `warm` restores the deepest tier that loads and skips
+    /// every tier above it, so a valid Tier 2 checkpoint means Tier 1 is never
+    /// prefilled and never written. A one-tier list has nothing deeper to
+    /// short-circuit it, so the checkpoint the sub-agent needs actually
+    /// appears.
+    #[test]
+    fn startup_warms_only_tier_one_for_the_alt_engine() {
+        let dir = scratch_dir("alt-warm-tier1");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+        agent.context_content = crate::context::ContextContent::new();
+        let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                warm_tiers: Some(std::sync::Arc::clone(&stages)),
+                ..ScriptedEngine::default()
+            }),
+        );
+
+        agent.warm_alt_local_tier1(&mut |_| {}, &mut |_| {});
+
+        assert!(agent.local_alt_warmed, "and it is not redone on first take");
+        let seen = stages.lock().unwrap().clone();
+        assert_eq!(seen, vec!["SYSTEM"], "system tier only: {seen:?}");
+        assert!(
+            agent.alt_engines.contains_key(&EngineKey::Local),
+            "the engine goes back in the cache"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
