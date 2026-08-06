@@ -20,9 +20,6 @@
     display: flex; gap: .5rem; align-items: center;
     padding: .5rem .75rem; border-bottom: 1px solid #444; flex-wrap: wrap;
   }
-  header input { flex: 1 1 12rem; min-width: 8rem; padding: .3rem .4rem;
-    font: inherit; background: transparent; color: inherit;
-    border: 1px solid #555; border-radius: 4px; }
   header button { padding: .3rem .7rem; font: inherit; cursor: pointer; }
   #status { font-size: .85em; opacity: .8; }
   #log {
@@ -46,9 +43,6 @@
 <body>
 <header>
   <strong>plank remote</strong>
-  <input id="url" placeholder="ws://127.0.0.1:31415/" size="24">
-  <input id="token" placeholder="token" type="password">
-  <button id="connect">connect</button>
   <button id="interrupt" disabled>interrupt</button>
   <button id="control" disabled>take control</button>
   <span id="role" class="dim"></span>
@@ -148,7 +142,9 @@ function send(msg) {
 }
 
 function connect() {
-  const url = $("url").value.trim() || "ws://" + location.host + "/";
+  // Always this page's own origin: the server serves the client, so the socket
+  // and the page are necessarily the same host and port.
+  const url = "ws://" + location.host + "/";
   if (ws) { try { ws.close(); } catch (_) {} }
   setStatus("connecting…");
   // close() is async: the old socket's handlers can still fire after `ws` is
@@ -159,20 +155,17 @@ function connect() {
   sock.onopen = () => {
     if (sock !== ws) return;
     setStatus("authenticating…");
-    const auth = { type: "auth", token: $("token").value };
+    const auth = { type: "auth", token: linkToken };
     if (highestId !== null) auth.resume_from = highestId;
     send(auth);
     $("interrupt").disabled = false;
     $("control").disabled = false;
-    // A tokenized link (`/remote-control`) means the operator already consented,
-    // so claim control immediately: the server was started with allow_control,
-    // making this a silent Granted. Without the query token we don't request
-    // control here; the take-control button below is how the page asks for it.
-    if (autoControl) {
-      send({ type: "request_control" });
-      setRole(true);
-      line("[requested control]", "dim");
-    }
+    // Opening the `/remote-control` link is the operator's own consent, so claim
+    // control immediately rather than waiting for a click: `/rc` always starts
+    // the server with allow_control, making this a silent Granted.
+    send({ type: "request_control" });
+    setRole(true);
+    line("[requested control]", "dim");
   };
   sock.onmessage = (ev) => {
     if (sock !== ws) return;
@@ -194,13 +187,11 @@ function connect() {
   };
 }
 
-$("connect").addEventListener("click", connect);
 $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
-// Take/hand back control. A connect while a local TUI is up leaves us a mirror
-// (the handshake only auto-grants when the control slot is Free), so this button
-// is how a browser becomes the controller. A server started by `/rc` always
-// sets allow_control, so the request always succeeds, even with a local TUI
-// present; otherwise a `control_denied` lands and flips us back to mirror.
+// Hand control back, and take it again afterwards. The page claims control on
+// connect, so this is only reached after a deliberate release — or after a
+// `control_denied` flipped the role back to mirror, which happens when a
+// previous session still holds the slot inside its reconnect grace window.
 $("control").addEventListener("click", () => {
   if (controller) {
     send({ type: "release_control" });
@@ -222,16 +213,15 @@ $("inputForm").addEventListener("submit", (e) => {
   el.value = "";
 });
 
-// Prefill the URL from the page's own origin for the common tunnel case.
-$("url").value = "ws://" + location.host + "/";
-
-// `/remote-control` prints http://HOST:PORT/?t=TOKEN. When we were opened that
-// way, fill the token in, connect without a click, and claim control on open.
+// `/remote-control` prints http://HOST:PORT/?t=TOKEN and that link is the only
+// way in: the token exists nowhere else, so a page reached without one has
+// nothing to authenticate with and there is no manual entry to fall back to.
 const linkToken = new URLSearchParams(location.search).get("t");
-const autoControl = linkToken !== null && linkToken !== "";
-if (autoControl) {
-  $("token").value = linkToken;
+if (linkToken) {
   connect();
+} else {
+  setStatus("no token");
+  line("[open the link printed by /rc — this page needs the token from its ?t= parameter]", "error");
 }
 </script>
 </body>
