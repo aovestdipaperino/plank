@@ -1235,6 +1235,12 @@ struct Agent<'a> {
     /// afterwards, which is what lets the borrow checker enforce that a swap
     /// cannot leak: the value cannot be in the map and in `self.engine` at once.
     alt_engines: std::collections::HashMap<EngineKey, Box<dyn Engine>>,
+    /// Whether the alt *local* engine has had its system prompt warmed
+    /// ([`Agent::warm_alt_local`]). Once is enough: the engine keeps its session
+    /// across sidechains, so every later dispatch already finds the prefix in
+    /// its KV. Set before the walk runs, so a failed warm is not retried on
+    /// every dispatch.
+    local_alt_warmed: bool,
 }
 
 /// Identity of an alternate sub-agent engine: provider, resolved base URL,
@@ -4374,6 +4380,39 @@ the original is frozen and listed in /tree"
         }
     }
 
+    /// Puts the system prompt into the alt local engine's KV before its first
+    /// sidechain — by **restoring** the Tier 1 checkpoint when one exists, which
+    /// is a disk read rather than a prefill of the whole system prompt.
+    ///
+    /// Only the System tier: a sidechain is clean-room (see
+    /// [`run_sidechain_on`](Self::run_sidechain_on)), so its prompt is the
+    /// system prompt plus the framed task with none of the project/session
+    /// context tiers in between. Restoring a deeper tier would seed the KV with
+    /// tokens the sidechain's prompt does not contain, and the sync would have
+    /// to walk back out of them.
+    ///
+    /// Best-effort and silent on a hit; a miss prefills once and persists the
+    /// checkpoint, so the cost is paid at most once per system prompt across
+    /// *all* sessions — including ordinary local-main ones, which key Tier 1
+    /// identically. The note is post-hoc because `kvtier::warm` only knows a
+    /// tier is cold once the restore leg has already missed.
+    fn warm_alt_local(&self, engine: &mut dyn Engine) {
+        let mut tiers = self.kv_tiers_for(&engine.model_name());
+        tiers.truncate(1);
+        if tiers.first().map(|t| t.kind) != Some(crate::kvtier::TierKind::System) {
+            return;
+        }
+        let prefilled = std::cell::Cell::new(false);
+        let _ = crate::kvtier::warm(engine, Some(&self.store), &tiers, &mut |_| {}, &mut |_| {
+            prefilled.set(true);
+        });
+        if prefilled.get() {
+            self.emit_sub(crate::worker::UiEvent::Dim(
+                "[local engine: system prompt prefilled and cached for next time]".to_owned(),
+            ));
+        }
+    }
+
     fn take_alt_engine(&mut self, spec: &crate::agents::AgentEngine) -> Result<AltEngine, String> {
         use crate::remote::provider::ProviderEngine;
         let spec = match spec {
@@ -4382,15 +4421,16 @@ the original is frozen and listed in /tree"
             // be far worse than refusing before the prompt. If it is absent,
             // this session was started without one.
             crate::agents::AgentEngine::Local => {
-                return self
-                    .alt_engines
-                    .remove(&EngineKey::Local)
-                    .map(|e| (EngineKey::Local, e))
-                    .ok_or_else(|| {
-                        "no local engine in this session (a `provider: local` definition needs one \
-                         at startup; check the roster with /agent)"
-                            .to_owned()
-                    });
+                let mut engine = self.alt_engines.remove(&EngineKey::Local).ok_or_else(|| {
+                    "no local engine in this session (a `provider: local` definition needs one \
+                     at startup; check the roster with /agent)"
+                        .to_owned()
+                })?;
+                if !self.local_alt_warmed {
+                    self.local_alt_warmed = true;
+                    self.warm_alt_local(&mut *engine);
+                }
+                return Ok((EngineKey::Local, engine));
             }
             crate::agents::AgentEngine::Provider(p) => p,
         };
@@ -5746,8 +5786,21 @@ impl Agent<'_> {
     /// Tier 1, and moving them down would needlessly fork Tier 2 while moving
     /// local ones up would fork the model-global Tier 1 per project.
     fn kv_tiers(&self) -> Vec<crate::kvtier::TierSpec> {
+        self.kv_tiers_for(&self.engine.model_name())
+    }
+
+    /// [`kv_tiers`](Self::kv_tiers) for an engine other than the live one.
+    ///
+    /// The model name is a parameter rather than read off `self.engine` because
+    /// a checkpoint belongs to the *model whose KV it holds*: warming the local
+    /// alt engine under a provider main agent must key on `ds4`, not on the
+    /// provider's model, or it would look up a checkpoint that cannot describe
+    /// its KV. Keying it correctly is also what lets it share Tier 1 with an
+    /// ordinary local-main session — which is where most of those checkpoints
+    /// get written.
+    fn kv_tiers_for(&self, model: &str) -> Vec<crate::kvtier::TierSpec> {
         let fp1 = crate::kvtier::system_fingerprint(
-            &self.engine.model_name(),
+            model,
             &self.system,
             self.think,
             self.trusted_system_len,
@@ -8349,6 +8402,7 @@ fn new_agent(
             .map(|e| (EngineKey::Local, e))
             .into_iter()
             .collect(),
+        local_alt_warmed: false,
     })
 }
 
@@ -9395,6 +9449,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         }
     }
 
@@ -11498,6 +11553,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
 
         // The stub engine has no KV support, so `kvtier::warm` emits nothing at
@@ -11555,6 +11611,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
 
         // Empty state: no provider turn recorded yet.
@@ -11620,6 +11677,68 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A checkpoint belongs to the model whose KV it holds, so Tier 1's key must
+    /// follow the engine being warmed — not the live one. Warming the alt local
+    /// engine under a provider main agent with the *provider's* model name would
+    /// look up a checkpoint that cannot describe its KV.
+    #[test]
+    fn tier_one_is_keyed_by_the_engine_being_warmed() {
+        let dir = scratch_dir("kv-tiers-model");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.system = "SYSTEM".to_string();
+
+        let live = agent.kv_tiers();
+        let other = agent.kv_tiers_for("some-other-model");
+
+        assert_eq!(
+            agent.kv_tiers(),
+            live,
+            "keying is a pure function of inputs"
+        );
+        assert_ne!(
+            live[0].fingerprint, other[0].fingerprint,
+            "the model name is part of Tier 1's identity"
+        );
+        // And the live engine's own name reproduces the live plan, so
+        // `kv_tiers` is genuinely just this call with one argument filled in.
+        assert_eq!(agent.kv_tiers_for(&agent.engine.model_name()), live);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The alt local engine is warmed on its first take and never again: it
+    /// keeps its session across sidechains, so every later dispatch already
+    /// finds the system prefix in its KV.
+    #[test]
+    fn the_alt_local_engine_is_warmed_once() {
+        let dir = scratch_dir("alt-local-warm");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.alt_engines.insert(
+            EngineKey::Local,
+            Box::new(ScriptedEngine {
+                local: true,
+                ..ScriptedEngine::default()
+            }),
+        );
+        assert!(!agent.local_alt_warmed);
+
+        let (key, engine) = agent
+            .take_alt_engine(&crate::agents::AgentEngine::Local)
+            .expect("the local engine is available");
+        assert_eq!(key, EngineKey::Local);
+        assert!(agent.local_alt_warmed, "the first take warms it");
+        agent.alt_engines.insert(key, engine);
+
+        // Second take: still warmed, and the flag is not a per-take toggle.
+        let (key, engine) = agent
+            .take_alt_engine(&crate::agents::AgentEngine::Local)
+            .expect("still available");
+        assert!(agent.local_alt_warmed);
+        agent.alt_engines.insert(key, engine);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn duration_formats_with_and_without_hours() {
         use std::time::Duration;
@@ -11677,6 +11796,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11853,6 +11973,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -11934,6 +12055,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12002,6 +12124,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("go"));
         agent.run_turn().unwrap();
@@ -12093,6 +12216,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("kv payload flow"));
         agent.session.push(Message::assistant("ack"));
@@ -13201,6 +13325,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("please count the tests"));
         agent.run_turn().unwrap();
@@ -13286,6 +13411,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant("hello"));
@@ -13430,6 +13556,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("run echo"));
         agent.run_turn().unwrap();
@@ -13496,6 +13623,7 @@ mod tests {
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
             alt_engines: std::collections::HashMap::new(),
+            local_alt_warmed: false,
         };
         agent.session.push(Message::user("run echo"));
 
