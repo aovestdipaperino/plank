@@ -30,10 +30,10 @@
 //!
 //! ## Live wiring (issue #25, done)
 //! - The worker's stream events mirror onto the bus and remote
-//!   `prompt`/`command`/`btw`/`interrupt` frames drive the real agent through
-//!   both `ui.rs` turn-loop paths: the TUI mirrors inline in `busy_ui_loop` and
-//!   drives turns from the idle loop; the headless path runs a dedicated
-//!   remote-serve loop (`run_remote_headless`).
+//!   `prompt`/`command`/`btw`/`interrupt` frames drive the real agent through the
+//!   TUI turn loop: `busy_ui_loop` mirrors inline and drives turns from the idle
+//!   loop. There is no headless equivalent — `/rc` is the only way to start the
+//!   server and it can only be typed in the TUI.
 //! - `command` (slash) frames route through the shared slash dispatcher: they
 //!   land in the shared queue and the turn loop sends `/`-prefixed lines through
 //!   the same path the local REPL/TUI uses.
@@ -41,10 +41,10 @@
 //!   held so a brief drop can reclaim it via `resume_from`.
 //!
 //! ## Follow-up (issue #25, done)
-//! - The plain-REPL fallback (piped stdin, no TTY) now interleaves remote input:
-//!   a helper thread turns the blocking `read_line` into channel sends so the
-//!   loop can `select` stdin against the remote queue, draining `pump_remote`
-//!   and echoing the bus to stdout (see `ui::run_repl_plain_remote`).
+//! - `/rc` is TUI-only: the TUI's idle loop drains the remote queue straight
+//!   from the shared [`crate::worker::TurnShared`] and starts a turn as if the
+//!   queued line had been typed locally, mirroring output back onto the bus
+//!   the same way a local turn does.
 //! - The CLI client `plank remote <url>` connects to this server, authenticates,
 //!   mirrors output, and sends `prompt`/`command`/`btw`/`interrupt` frames (see
 //!   [`crate::remote::client`]).
@@ -52,12 +52,15 @@
 //! ## Hardening (issue #25, done)
 //! - `Origin` allow-list on the WebSocket upgrade: missing / loopback Origins
 //!   are always allowed (native clients send none), other browser Origins must
-//!   be allow-listed via `--control-origin` or the upgrade is refused with an
-//!   HTTP 403 (see [`origin_allowed`]).
+//!   appear in [`ServerConfig::allowed_origins`] or the upgrade is refused with
+//!   an HTTP 403 (see [`origin_allowed`]). `/rc` always starts loopback-only
+//!   with an empty allow-list, which is sufficient since a missing or loopback
+//!   Origin is always accepted; a non-loopback setup would need this wired to
+//!   a config source again.
 //! - Bounded per-client outbound queue: the socket write buffer is capped
-//!   (`--control-queue-max`); a slow/stalled client whose unsent output exceeds
-//!   the cap is evicted (slow-consumer backpressure) instead of buffered
-//!   without bound. The bus prunes the dropped subscriber on the next
+//!   ([`ServerConfig::queue_max`]); a slow/stalled client whose unsent output
+//!   exceeds the cap is evicted (slow-consumer backpressure) instead of
+//!   buffered without bound. The bus prunes the dropped subscriber on the next
 //!   broadcast.
 //! - A minimal self-contained static web client served at `GET /` (see
 //!   [`WEB_CLIENT_HTML`]); it speaks the exact JSON frames below.
@@ -91,6 +94,11 @@ const STATUS_MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// [`PROTOCOL_VERSION`] JSON frames as the native client.
 pub const WEB_CLIENT_HTML: &str = include_str!("web_client.html");
 
+/// The plank logo shown in the web client's header, served at `GET /logo.png`.
+/// A 128px downscale of `assets/logo.png` (the full-size original is ~1 MB,
+/// which has no business inside the binary or on every page load).
+pub const WEB_CLIENT_LOGO: &[u8] = include_bytes!("../../assets/logo-web.png");
+
 // --- Protocol ---------------------------------------------------------------
 
 /// Flattened, serializable view of [`Status`] for `status` frames (§4.3). The
@@ -117,6 +125,14 @@ pub struct StatusWire {
     pub ctx_size: i32,
     /// Error text (empty unless `state == "error"`).
     pub error: String,
+    /// Working directory label, home collapsed to `~` (the footer's dir prefix).
+    pub cwd: String,
+    /// Current git branch, empty outside a repo.
+    pub branch: String,
+    /// Engine origin: a provider or remote host, else `(local)`.
+    pub origin: String,
+    /// Reasoning level short name (`off`, `low`, `med`, `high`, `max`).
+    pub think: String,
 }
 
 fn state_name(s: WorkerState) -> &'static str {
@@ -144,6 +160,15 @@ impl From<&Status> for StatusWire {
             ctx_used: s.ctx_used,
             ctx_size: s.ctx_size,
             error: s.error.clone(),
+            // The footer's "where am I?" segments. They are process-wide rather
+            // than per-snapshot, but they ride along here so a remote front-end
+            // can show the same header the local footer does without a second
+            // frame kind — and so a client attaching mid-session learns them
+            // from the first status frame instead of only on a change.
+            cwd: crate::status::cwd_label(),
+            branch: crate::status::git_branch_label().unwrap_or_default(),
+            origin: crate::status::engine_origin_label().to_owned(),
+            think: s.think.short_name().to_owned(),
         }
     }
 }
@@ -239,6 +264,19 @@ pub enum ServerMsg {
         /// Total task count.
         total: usize,
     },
+    /// The transcript was replaced (`/clear`, `/new`, `/switch`, `/resume`).
+    /// Everything the client has shown so far belongs to a session that is
+    /// gone: it clears its log rather than appending under a stale transcript.
+    Reset,
+    /// The turn finished. Carries the same headline and body as the local
+    /// desktop notification so an attached client can raise its own; it is not
+    /// transcript text and must not be logged as output.
+    Notify {
+        /// Notification headline.
+        title: String,
+        /// Notification body.
+        body: String,
+    },
     /// A control request from a non-controller was refused.
     ControlDenied {
         /// Human-readable reason.
@@ -274,6 +312,11 @@ impl ServerMsg {
                 text: p.to_ansi(true),
             },
             UiEvent::Plain(t) => Self::Plain { text: t.clone() },
+            UiEvent::SessionReset => Self::Reset,
+            UiEvent::Notify { title, body } => Self::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            },
             UiEvent::UserEcho(t) => Self::UserEcho { text: t.clone() },
             UiEvent::EndLine => Self::EndLine,
             UiEvent::BtwBegin => Self::BtwBegin,
@@ -428,8 +471,8 @@ impl ClientFrame {
 // --- Auth -------------------------------------------------------------------
 
 /// Generates a 32-byte, base64url (unpadded) bearer token from the OS CSPRNG.
-/// No default token exists; this is called when `--control` is given without one
-/// (design §4.6).
+/// No default token exists; this is called when `/rc` starts a server without
+/// an explicit token (design §4.6).
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 32];
@@ -653,7 +696,8 @@ pub struct RemoteState {
     pub shared: Arc<TurnShared>,
     /// The single-controller policy.
     pub control: Mutex<ControlPolicy>,
-    token: String,
+    /// Shared bearer token every client must present in its `auth` frame.
+    pub token: String,
     /// Browser `Origin`s allowed on the WS upgrade (besides missing/loopback).
     allowed_origins: Vec<String>,
     /// Per-client outbound queue cap in bytes (slow-consumer eviction).
@@ -665,6 +709,14 @@ pub struct RemoteState {
 impl RemoteState {
     fn next_session(&self) -> u64 {
         self.session_ids.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Tells every attached client the session is going away. Best-effort: the
+    /// bus drops frames for a hung-up subscriber, exactly as for output.
+    pub fn say_bye(&self, reason: &str) {
+        self.bus.broadcast(crate::worker::UiEvent::Dim(format!(
+            "[remote control off: {reason}]"
+        )));
     }
 }
 
@@ -940,11 +992,25 @@ fn is_loopback_origin(origin: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1")
 }
 
-/// Serves a plain HTTP request: the web client at `/` (or `/index.html`), else
-/// a 404. Best-effort; write errors just drop the connection.
+/// Serves a plain HTTP request: the web client at `/` (or `/index.html`), its
+/// logo at `/logo.png`, else a 404. Best-effort; write errors just drop the
+/// connection. The query string is stripped before routing, so the tokenized
+/// link `/?t=TOKEN` that `/remote-control` prints lands on the client page.
 fn serve_http(stream: &mut TcpStream, req: &ParsedRequest) {
     let path = req.path.split('?').next().unwrap_or(&req.path);
-    if req.method.eq_ignore_ascii_case("GET") && matches!(path, "/" | "/index.html") {
+    if !req.method.eq_ignore_ascii_case("GET") {
+        let _ = write_http_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+        );
+        return;
+    }
+    if path == "/logo.png" {
+        let _ = write_http_response(stream, 200, "OK", "image/png", WEB_CLIENT_LOGO);
+    } else if matches!(path, "/" | "/index.html") {
         let _ = write_http_response(
             stream,
             200,
@@ -1335,6 +1401,41 @@ mod tests {
 
     // --- protocol round-trip ---
 
+    /// The end-of-turn notification crosses the wire: locally it is a desktop
+    /// notification, which reaches only whoever is at that machine.
+    #[test]
+    fn notify_event_reaches_the_wire_with_both_fields() {
+        let ev = UiEvent::Notify {
+            title: "finished: rename the thing".into(),
+            body: "…done.".into(),
+        };
+        let Some(msg) = ServerMsg::from_event(&ev) else {
+            panic!("notify must have a wire representation");
+        };
+        let json = ServerFrame::control(msg).to_json().unwrap();
+        assert!(json.contains(r#""type":"notify""#), "{json}");
+        assert!(json.contains("finished: rename the thing"), "{json}");
+        assert!(json.contains("…done."), "{json}");
+    }
+
+    /// A remote header shows the same "where am I?" segments as the local
+    /// footer, so they ride on every status frame rather than a change event.
+    #[test]
+    fn status_wire_carries_the_footer_segments() {
+        let st = Status {
+            think: crate::engine::ThinkMode::Medium,
+            ..Status::default()
+        };
+        let wire = StatusWire::from(&st);
+        assert_eq!(wire.think, "med");
+        assert_eq!(wire.origin, crate::status::engine_origin_label());
+        assert_eq!(wire.cwd, crate::status::cwd_label());
+        assert_eq!(
+            wire.branch,
+            crate::status::git_branch_label().unwrap_or_default()
+        );
+    }
+
     #[test]
     fn from_event_none_for_sub_agent_variants() {
         assert!(ServerMsg::from_event(&UiEvent::SubStart("agent".into())).is_none());
@@ -1475,6 +1576,22 @@ mod tests {
         // Releasing returns control to the local user.
         p.release(1);
         assert_eq!(p.holder(), Holder::Local);
+    }
+
+    /// `/rc` starts the server with `allow_control` set: the local operator
+    /// typing the command *is* the consent, so a browser's `request_control`
+    /// must succeed even though the local front-end seeded `Holder::Local`.
+    #[test]
+    fn allow_control_grants_over_a_present_local() {
+        let mut p = ControlPolicy::new(true, true);
+        assert_eq!(p.holder(), Holder::Local);
+        assert_eq!(p.request(1), RequestOutcome::Granted);
+        assert_eq!(p.holder(), Holder::Remote(1));
+        assert!(p.remote_can_control(1));
+        // Releasing hands the slot back to the local user, not to the next remote.
+        p.release(1);
+        assert_eq!(p.holder(), Holder::Local);
+        assert!(!p.remote_can_control(1));
     }
 
     #[test]
@@ -1634,6 +1751,91 @@ mod tests {
             live.msg,
             ServerMsg::Visible {
                 text: "live".into()
+            }
+        );
+    }
+
+    /// `/clear` must reach the page two ways: the attached client is told to
+    /// clear, and the scrollback a *later* client would be replayed no longer
+    /// contains the cleared transcript. Before this, a `/clear` was invisible
+    /// remotely — the page kept the old transcript and a fresh attach replayed
+    /// it from the bus.
+    #[test]
+    fn session_reset_reaches_attached_and_later_clients() {
+        let server = test_server(false, false);
+        server
+            .state
+            .bus
+            .broadcast(UiEvent::Visible("from the old session".into()));
+
+        let mut ws = connect(server.local_addr);
+        send_client(
+            &mut ws,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut ws).expect("hello");
+        read_server(&mut ws).expect("snapshot");
+
+        server.state.bus.broadcast(UiEvent::SessionReset);
+        let frame = read_server(&mut ws).expect("reset frame");
+        assert_eq!(frame.msg, ServerMsg::Reset, "attached client is told");
+
+        // A client attaching now must not be replayed the cleared transcript.
+        let mut late = connect(server.local_addr);
+        send_client(
+            &mut late,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut late).expect("hello");
+        let snap = read_server(&mut late).expect("snapshot");
+        match snap.msg {
+            ServerMsg::Snapshot { scrollback, .. } => {
+                assert!(
+                    !scrollback.iter().any(|e| matches!(
+                        &e.msg,
+                        ServerMsg::Visible { text } if text == "from the old session"
+                    )),
+                    "cleared transcript replayed to a late joiner: {scrollback:?}"
+                );
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+    }
+
+    /// End of turn reaches an attached client as a `notify` frame. The local
+    /// desktop notification is invisible to whoever is driving from a browser,
+    /// so this is the only signal they get — worth pinning end to end rather
+    /// than only at the `from_event` mapping.
+    #[test]
+    fn end_of_turn_notification_reaches_an_attached_client() {
+        let server = test_server(false, false);
+        let mut ws = connect(server.local_addr);
+        send_client(
+            &mut ws,
+            ClientMsg::Auth {
+                token: "tok".into(),
+                resume_from: None,
+            },
+        );
+        read_server(&mut ws).expect("hello");
+        read_server(&mut ws).expect("snapshot");
+
+        server.state.bus.broadcast(UiEvent::Notify {
+            title: "finished: add the button".into(),
+            body: "…and wired it up.".into(),
+        });
+        let frame = read_server(&mut ws).expect("notify frame");
+        assert_eq!(
+            frame.msg,
+            ServerMsg::Notify {
+                title: "finished: add the button".into(),
+                body: "…and wired it up.".into(),
             }
         );
     }
@@ -1815,6 +2017,44 @@ mod tests {
         (status.to_owned(), headers.to_owned(), body.to_owned())
     }
 
+    /// Byte-oriented sibling of [`http_get`]: the logo body is PNG, so it
+    /// cannot go through `read_to_string`.
+    fn http_get_bytes(addr: std::net::SocketAddr, path: &str) -> (String, Vec<u8>) {
+        use std::io::{Read, Write};
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .write_all(
+                format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).unwrap();
+        let split = raw
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("response has a header/body boundary");
+        let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+        (head, raw[split + 4..].to_vec())
+    }
+
+    /// The web client's header image is served from the binary, so the page
+    /// stays self-contained: no request ever leaves the loopback listener.
+    #[test]
+    fn serves_the_logo_as_png() {
+        let server = test_server(false, false);
+        let (head, body) = http_get_bytes(server.local_addr, "/logo.png");
+        assert!(head.contains("200"), "head: {head}");
+        assert!(
+            head.to_ascii_lowercase()
+                .contains("content-type: image/png"),
+            "head: {head}"
+        );
+        assert_eq!(body.len(), WEB_CLIENT_LOGO.len(), "whole file served");
+        assert_eq!(&body[..8], b"\x89PNG\r\n\x1a\n", "PNG magic intact");
+    }
+
     #[test]
     fn serves_web_client_at_root() {
         let server = test_server(false, false);
@@ -1831,6 +2071,17 @@ mod tests {
         // A bogus path 404s.
         let (status, _, _) = http_get(addr, "/nope");
         assert!(status.contains("404"), "status: {status}");
+    }
+
+    /// The `/remote-control` link carries the token in the query string; the
+    /// router strips it, so the page is served as it is for a bare `/`.
+    #[test]
+    fn serves_web_client_when_the_path_carries_a_token() {
+        let server = test_server(false, false);
+        let addr = server.local_addr;
+        let (status, _, body) = http_get(addr, "/?t=tok");
+        assert!(status.contains("200"), "status: {status}");
+        assert!(body.contains("plank remote"), "body missing marker");
     }
 
     // --- bounded outbound queue / slow-consumer eviction ---

@@ -4,7 +4,7 @@
 //! `plank remote <url>`: the interactive remote-control *client* (issue #25).
 //!
 //! Connects to a running plank instance's remote-control WebSocket (started
-//! with `--control`), authenticates with the shared bearer token, and becomes
+//! with `/rc`), authenticates with the shared bearer token, and becomes
 //! another front-end over the same [`crate::worker::UiEvent`] stream: mirrored
 //! server output streams to the terminal while typed lines are sent as
 //! `prompt` / `command` / `btw` frames and Ctrl-C as `interrupt`.
@@ -256,6 +256,17 @@ fn render_server_msg(msg: &ServerMsg) {
         }
         ServerMsg::ControlDenied { reason } => {
             let _ = writeln!(out, "[control denied: {reason}]");
+        }
+        // A terminal's scrollback is the user's, not ours to erase: mark the
+        // boundary instead so what follows is not read as the same session.
+        ServerMsg::Reset => {
+            let _ = writeln!(out, "\n--- session cleared ---");
+        }
+        // A terminal has no notification centre, so the turn-finished event
+        // becomes a line plus a BEL — enough for a terminal that flags the tab
+        // on a bell, and harmless in one that does not.
+        ServerMsg::Notify { title, .. } => {
+            let _ = writeln!(out, "\x07[{title}]");
         }
         ServerMsg::Bye { reason } => {
             let _ = writeln!(out, "[server: {reason}]");

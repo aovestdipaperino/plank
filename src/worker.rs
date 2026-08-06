@@ -46,6 +46,23 @@ pub enum UiEvent {
     Plain(String),
     /// A user-echo line (queued prompts, `/btw` questions).
     UserEcho(String),
+    /// The transcript was replaced — `/clear`, `/new`, `/switch`, `/resume`.
+    /// Everything above it belongs to a session that no longer exists, so a
+    /// remote front-end clears its log, and [`BroadcastBus::broadcast`] drops
+    /// the scrollback rather than replaying a cleared transcript to whoever
+    /// attaches next. The local UI clears its own log at the call site.
+    SessionReset,
+    /// The turn finished: the same headline and body the local desktop
+    /// notification carries, so an attached remote front-end can raise its own
+    /// (a browser notification, a bell, a title flash) instead of the operator
+    /// having to watch the page. Carries no on-screen text — the local UI
+    /// already showed the turn — so the TUI ignores it.
+    Notify {
+        /// Notification headline (the prompt, or that the turn was interrupted).
+        title: String,
+        /// Notification body (the tail of the answer).
+        body: String,
+    },
     /// Terminates the in-progress rendered line.
     EndLine,
     /// Worker progress snapshot for the status footer.
@@ -247,6 +264,13 @@ impl BroadcastBus {
     /// live subscriber, dropping any that have hung up.
     pub fn broadcast(&self, event: UiEvent) {
         let mut inner = Self::lock(&self.inner);
+        // A reset invalidates everything before it: drop the retained tail so a
+        // client attaching afterwards is not replayed the transcript the
+        // operator just cleared. Ids keep climbing, so an already-connected
+        // client's `resume_from` stays meaningful across the reset.
+        if matches!(event, UiEvent::SessionReset) {
+            inner.scrollback.clear();
+        }
         let id = inner.next_id;
         inner.next_id += 1;
         let seq = SeqEvent { id, event };
@@ -417,7 +441,11 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),
-        UiEvent::Status(_)
+        // Both are for remote front-ends only: locally the desktop notification
+        // has already fired, and the log was cleared at the `/clear` call site.
+        UiEvent::Notify { .. }
+        | UiEvent::SessionReset
+        | UiEvent::Status(_)
         | UiEvent::Tasks(_)
         | UiEvent::BtwBegin
         | UiEvent::BtwEnd
@@ -588,6 +616,32 @@ mod tests {
         assert_eq!(highest, Some((SCROLLBACK_CAP + 10 - 1) as u64));
         // Oldest ids were evicted; resume from a rolled-past id yields the tail.
         assert_eq!(tail.first().unwrap().id, 10);
+    }
+
+    /// A session reset drops the scrollback with it. Otherwise a client that
+    /// attaches after `/clear` is replayed the transcript the operator just
+    /// cleared — the reset would only be visible to whoever was already
+    /// connected to see the frame go past.
+    #[test]
+    fn session_reset_drops_the_scrollback_it_invalidates() {
+        let bus = BroadcastBus::new();
+        bus.broadcast(UiEvent::Visible("stale answer".into()));
+        bus.broadcast(UiEvent::UserEcho("stale prompt".into()));
+        let before = bus.scrollback_since(None).0.len();
+        assert_eq!(before, 2);
+
+        bus.broadcast(UiEvent::SessionReset);
+        let (tail, highest) = bus.scrollback_since(None);
+        assert_eq!(tail.len(), 1, "only the reset survives: {tail:?}");
+        assert!(matches!(tail[0].event, UiEvent::SessionReset));
+        // Ids stay monotonic across the reset, so an already-connected client's
+        // `resume_from` is still meaningful and does not replay the reset twice.
+        assert_eq!(highest, Some(2));
+        assert_eq!(tail[0].id, 2);
+
+        // Output after the reset accumulates normally again.
+        bus.broadcast(UiEvent::Visible("fresh".into()));
+        assert_eq!(bus.scrollback_since(None).0.len(), 2);
     }
 
     #[test]

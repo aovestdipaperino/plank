@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [2.8.2] - 2026-08-06
+
+Beta. The remote-control feature became usable from a browser: `/remote-control`
+(`/rc`) starts the server from inside a session and prints a one-click link, and
+the bundled web client grew into a real front-end. The `--control*` launch flags
+are gone — see Removed.
+
 ### Added
 
 - **A `low` reasoning level (experimental).** `/think low` and `--think-low` sit
@@ -30,6 +37,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   model's 1M default. Best-effort: any failure keeps the configured value, and an
   explicit `-c` is never overridden. The OpenAI path has no such field to read,
   so it is unchanged.
+- **`/remote-control` (`/rc`) starts and stops the remote-control server at
+  runtime**, from inside a running TUI session. Bare `/rc` toggles; `/rc on` and
+  `/rc off` are explicit and case-insensitive. Turning it on always binds an
+  ephemeral loopback port (never a fixed one), and a new activation mints a
+  fresh token, printing `http://127.0.0.1:PORT/?t=TOKEN` plus an `ssh -L`
+  tunnel hint. Opening that link auto-connects the bundled web client and
+  claims control immediately, since typing `/rc` is the operator's own
+  consent — no token to paste, no button to press. That link is the only way in,
+  so the client's URL and token fields are gone: the token is printed nowhere
+  else, and a page opened without `?t=` says so instead of offering controls
+  that cannot authenticate. `/rc off`
+  tells connected clients, shuts the listener down, and the token dies with it,
+  so a stale link is refused; a later `/rc` mints a new port and token. The
+  token still lands in browser history and any `Referer` header, an accepted
+  trade for one-click attach on a loopback-only listener, not a claim that the
+  link is secret.
+- **The bundled web client became a real front-end.** It wears plank's own dark
+  theme and logo, renders the model's markdown as it streams (keeping the
+  model's line breaks, which strict markdown would fold), and shows the same
+  directory / branch / engine-origin / reasoning-level segments as the TUI
+  footer beside a live context gauge. The prompt is a three-row box with Enter
+  to send, Shift+Enter for a new line, and ↑/↓ prompt history; `send` is
+  enabled only with something to send and `stop` only while a turn is running.
+  There is no frame-kind selector: everything goes as a prompt and the agent's
+  own slash dispatcher routes it, so `/btw` and friends work from the browser
+  without the page knowing what any of them are.
+- **End-of-turn notification for attached clients.** The desktop notification
+  only reaches whoever is at the machine plank runs on. A finished turn now
+  crosses the wire too: a browser notification where permission allows, an
+  in-page banner that needs none, a blip, and a tab-title flash; the terminal
+  client prints the line with a BEL. Gated by the same `ui.notifyAfterSecs`
+  threshold as the local one, so a turn shorter than it stays quiet everywhere.
+
+- **A dropped connection is unmistakable in the web client.** `disconnected
+  (1006)` renders bold in the error colour rather than as grey small print, and
+  the prompt is disabled with it: nothing typed after the socket closes reaches
+  the agent, and there is no reconnect to wait for, since the token died with
+  the server. The placeholder says to run `/rc` again for a new link.
+
+### Fixed
+
+- **`/clear` now resets attached remote clients.** It replaced the session and
+  cleared the local log, both local-only, so a browser kept showing a session
+  that no longer existed — and the bus still held the pre-clear scrollback, so
+  a client attaching afterwards was replayed the transcript that had just been
+  cleared. A session reset is now an event on the bus: clients clear, and the
+  scrollback goes with it. `/switch` and `/resume` send it too.
+- **A turn's end reaches remote status.** Status frames came only from engine
+  callbacks during a turn, so the last thing a remote client ever saw was
+  `generating`: its context gauge froze and anything keyed off "a turn is
+  running" stayed stuck on. A turn now publishes an idle snapshot when it ends.
+
+### Removed
+
+- **The `--control`, `--control-token`, `--control-allow`, `--control-origin`,
+  and `--control-queue-max` launch flags.** Remote control now starts only from
+  `/rc` inside a running session (see above); there is no longer a way to bring
+  a session up already listening from the command line. **This is a breaking
+  change** for any launcher or script passing these flags — they are no longer
+  recognized. Only the *overrides* went with `--control-origin`/
+  `--control-queue-max`: the browser `Origin` allow-list keeps its
+  default-deny policy (loopback only) but can no longer be extended, and the
+  per-client outbound queue keeps its 1 MiB default but can no longer be
+  resized. The headless
+  (`--non-interactive`) and piped plain-REPL remote-drive paths were also
+  deleted: they were unreachable now that starting the server requires typing
+  a slash command in the full-screen TUI, so `/rc` is TUI-only and a piped or
+  headless plank cannot be remote-driven.
 
 ## [2.8.0] - 2026-08-03
 

@@ -1210,9 +1210,16 @@ struct Agent<'a> {
     checkpoints: crate::checkpoint::CheckpointStore,
     /// Live remote-control bridge (issue #25): the shared [`BroadcastBus`] that
     /// this agent's turn output mirrors into, plus the shared [`TurnShared`] that
-    /// remote `prompt`/`btw`/`interrupt` frames drive. `None` when `--control`
-    /// was not given, in which case the turn loops behave exactly as before.
+    /// remote `prompt`/`btw`/`interrupt` frames drive. `None` until `/rc` (or
+    /// `/remote-control`) starts a server, in which case the turn loops behave
+    /// exactly as before.
     remote: Option<Arc<RemoteState>>,
+    /// The remote-control listener backing [`Agent::remote`], owned here so
+    /// `/remote-control` can start and stop it mid-session. `Drop` on the
+    /// `RemoteServer` joins the accept thread, so dropping the agent tears the
+    /// listener down. `None` whenever `remote` is `None`; the two are installed
+    /// and cleared together.
+    remote_server: Option<crate::remote::RemoteServer>,
     /// TUI remote-control state (`--ui-remote`). `None` (the default) means
     /// no listener thread, no injected keys and no draw-time recording.
     ui_remote: Option<Arc<Mutex<UiRemote>>>,
@@ -2949,6 +2956,7 @@ impl Agent<'_> {
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
                 self.session = Session::new();
+                self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
                 push_session_context(&mut self.session, &self.context_content);
@@ -3046,6 +3054,9 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -3078,6 +3089,9 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -3192,6 +3206,11 @@ impl Agent<'_> {
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
+            "/remote-control" | "/rc" => {
+                println!(
+                    "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
+                );
+            }
             "/btw" => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
@@ -5848,16 +5867,38 @@ impl Agent<'_> {
     }
 
     fn idle_status_text(&mut self) -> String {
+        let st = self.idle_status();
+        status::build_status_text(&st, false, true)
+    }
+
+    /// The between-turns status snapshot: idle, with the context gauge for the
+    /// transcript as it now stands.
+    fn idle_status(&mut self) -> Status {
         let rendered = render_transcript(&self.session, &self.system);
-        let st = Status {
+        Status {
             state: WorkerState::Idle,
             ctx_used: self.engine.count_tokens(&rendered),
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
             think: self.think,
             ..Status::default()
-        };
-        status::build_status_text(&st, false, true)
+        }
+    }
+
+    /// Publishes the idle snapshot to attached remote clients at the end of a
+    /// turn. Status frames otherwise come only from engine callbacks *during* a
+    /// turn, so without this the last thing a remote ever sees is
+    /// `generating` — its context gauge freezes and anything keyed off "a turn
+    /// is running" (the page's stop button) stays stuck on. Skipped with no
+    /// bridge, since building it re-renders the transcript to count tokens.
+    fn broadcast_idle_status(&mut self) {
+        if self.remote.is_none() {
+            return;
+        }
+        let st = self.idle_status();
+        if let Some(r) = &self.remote {
+            r.bus.broadcast(UiEvent::Status(st));
+        }
     }
 
     /// One TUI turn: runs the generate → tools loop on a worker thread while
@@ -5950,6 +5991,7 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                self.broadcast_idle_status();
                 if crate::notify::should_notify_complete(
                     turn_started.elapsed(),
                     crate::settings::active().ui.notify_after_secs,
@@ -5968,104 +6010,147 @@ impl Agent<'_> {
         }
     }
 
-    /// Runs one worker turn while mirroring every render/output event onto the
-    /// remote [`BroadcastBus`], driving it from the shared [`TurnShared`] so
-    /// remote `interrupt` / `btw` / queued frames steer this turn directly.
-    /// Falls back to the plain [`run_turn`](Self::run_turn) when no remote
-    /// bridge is present. Used by the headless remote-serve loop; the TUI path
-    /// mirrors inline in [`busy_ui_loop`] so the local screen stays live too.
-    fn run_turn_mirrored(&mut self) -> Result<(), String> {
-        let Some(remote) = self.remote.clone() else {
-            return self.run_turn();
-        };
-        self.tool_ctx.skill_invocations = 0;
-        // Outermost per-user-turn boundary for the headless remote path: when
-        // a remote bridge is present this function (not `worker_turn`, which
-        // it drives on a scoped thread) is the single call per queued line in
-        // `pump_remote`, so the stamp/notify belongs here, not in the delegate.
-        let turn_started = Instant::now();
-        let bus = Arc::clone(&remote.bus);
-        let shared = &remote.shared;
-        let (tx, rx) = std::sync::mpsc::channel::<UiEvent>();
-        let result = std::thread::scope(|s| {
-            let worker = s.spawn(|| self.worker_turn(&tx, shared));
-            loop {
-                while let Ok(ev) = rx.try_recv() {
-                    if !ev.is_local_pane_only() {
-                        bus.broadcast(ev);
-                    }
-                }
-                if worker.is_finished() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            // Drain anything sent between the last poll and the worker returning.
-            while let Ok(ev) = rx.try_recv() {
-                if !ev.is_local_pane_only() {
-                    bus.broadcast(ev);
-                }
-            }
-            worker
-                .join()
-                .map_err(|_| "worker thread panicked".to_owned())?
-        });
-        if result.is_ok() {
-            if crate::notify::should_notify_complete(
-                turn_started.elapsed(),
-                crate::settings::active().ui.notify_after_secs,
-            ) {
-                self.notify_task_complete();
-            }
-            // Turn over: the front end is back at the prompt.
-            crate::title::set(crate::title::State::Idle);
-            crate::warp::emit("stop", &self.session.id);
+    /// Tells attached remote clients the transcript was replaced, so they clear
+    /// their log instead of appending a new session under an old one. Also
+    /// drops the bus scrollback, so a client attaching *after* the reset is not
+    /// replayed the transcript that was just cleared. A no-op with no bridge.
+    ///
+    /// Call it wherever `self.session` is replaced wholesale — `/clear`,
+    /// `/new`, `/switch`, `/resume` — right after the swap.
+    fn broadcast_session_reset(&self, note: Option<&str>) {
+        let Some(r) = &self.remote else { return };
+        r.bus.broadcast(UiEvent::SessionReset);
+        // `/switch` and `/resume` replay the loaded transcript into the *local*
+        // log directly, not through the bus, so a remote client would be left
+        // looking at an empty page. Say why rather than leave it blank.
+        if let Some(note) = note {
+            r.bus.broadcast(UiEvent::Dim(note.to_owned()));
         }
-        result
     }
 
-    /// Drains the remote controller's pending input once: a mirrored turn for
-    /// each queued `prompt`, and `/`-prefixed lines (remote `command` frames)
-    /// routed through the shared slash dispatcher exactly like the local REPL.
-    /// Returns whether any input was processed. No-op without a remote bridge.
-    fn pump_remote(&mut self) -> Result<bool, String> {
-        let Some(remote) = self.remote.clone() else {
-            return Ok(false);
-        };
-        let queued = remote.shared.take_queued();
-        if queued.is_empty() {
-            return Ok(false);
-        }
-        for line in queued {
-            let line = line.trim().to_owned();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('/') {
-                // Remote `command` routing: the same slash path the local REPL
-                // uses. Its textual report goes to stdout (the headless sink).
-                let _ = self.slash(&line)?;
-                continue;
-            }
-            remote.bus.broadcast(UiEvent::UserEcho(line.clone()));
-            self.session.push(Message::user(line));
-            self.run_turn_mirrored()?;
-        }
-        Ok(true)
+    /// Whether a remote-control bridge is currently live.
+    fn remote_is_on(&self) -> bool {
+        self.remote_server.is_some()
     }
 
-    /// Headless remote-serve loop: block until a remote controller sends input,
-    /// process it (mirrored onto the bus), and repeat. Exits on a process-level
-    /// interrupt (Ctrl-C); there is no local stdin to read in this mode.
-    fn run_remote_headless(&mut self) -> Result<(), String> {
-        loop {
-            if crate::interrupt::pending() {
-                crate::interrupt::clear();
-                return Ok(());
+    /// The one-click browser link for a bound server: the token rides in the
+    /// query string, which `serve_http` strips before routing, so the page is
+    /// served normally and reads the token from `location.search`. On a
+    /// loopback-only listener whose lifetime is one toggle this is an accepted
+    /// trade for one-click attach (spec §6).
+    ///
+    /// The host is written out rather than taken from `addr`, which is sound
+    /// only because the bind is always loopback — see [`Agent::remote_on`].
+    fn remote_link(addr: std::net::SocketAddr, token: &str) -> String {
+        format!("http://127.0.0.1:{}/?t={token}", addr.port())
+    }
+
+    /// Starts the remote-control server and installs it on this agent. Returns
+    /// the bound address and the token clients must present. Idempotent: with a
+    /// server already live the existing address and token come back unchanged.
+    ///
+    /// `allow_control` seeds the control policy: `true` lets an attaching client
+    /// take control without a local `/grant`, which is what makes the
+    /// `/remote-control` link usable while the local TUI holds the slot.
+    ///
+    /// # Errors
+    /// Returns the bind error as a string; `self` is left untouched on failure.
+    fn remote_on(
+        &mut self,
+        addr: &str,
+        token: Option<String>,
+        allow_control: bool,
+    ) -> Result<(std::net::SocketAddr, String), String> {
+        if let Some(server) = &self.remote_server {
+            return Ok((server.local_addr, server.state.token.clone()));
+        }
+        // Loopback is not merely the default here, it is load-bearing:
+        // `remote_link` writes `127.0.0.1` into the printed URL rather than
+        // reading it back from the bound address, so a non-loopback bind would
+        // hand out a link pointing somewhere else entirely.
+        debug_assert!(
+            addr.starts_with("127.0.0.1:") || addr.starts_with("[::1]:"),
+            "remote control binds loopback only, got {addr}"
+        );
+        let token = token
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(crate::remote::generate_token);
+        // Loopback-only, so no browser Origin allow-list is needed: a missing or
+        // loopback Origin is always accepted. The queue cap keeps its default.
+        let server_cfg = crate::remote::control::ServerConfig {
+            token: token.clone(),
+            // `local_present: true` is unconditional because `/rc` can only be typed
+            // in the TUI: a headless session has no slash dispatch and no way to
+            // install a bridge. Restoring a headless path means computing this from
+            // whether a local front-end actually exists.
+            local_present: true,
+            allow_control,
+            allowed_origins: Vec::new(),
+            queue_max: crate::config::DEFAULT_CONTROL_QUEUE_MAX,
+        };
+        let server = crate::remote::RemoteServer::start(
+            addr,
+            server_cfg,
+            Arc::new(crate::worker::BroadcastBus::new()),
+            Arc::new(TurnShared::default()),
+        )
+        .map_err(|e| e.to_string())?;
+        let bound = server.local_addr;
+        self.remote = Some(Arc::clone(&server.state));
+        self.remote_server = Some(server);
+        Ok((bound, token))
+    }
+
+    /// Stops the remote-control server and clears the bridge. Connected clients
+    /// get a `bye` first. Returns whether a server was running. The token dies
+    /// with the server, so an old link is refused by the next one.
+    fn remote_off(&mut self) -> bool {
+        let Some(mut server) = self.remote_server.take() else {
+            return false;
+        };
+        self.remote = None;
+        server.state.say_bye("remote control turned off");
+        server.shutdown();
+        true
+    }
+
+    /// Applies a `/remote-control` toggle and returns the lines to show. `cmd`
+    /// is the invoked command name (`/remote-control` or `/rc`), used to name
+    /// the command in error messages. `arg` is `""` (toggle), `"on"`, or
+    /// `"off"` (case-insensitive); anything else reports usage.
+    ///
+    /// Starting from here always uses an ephemeral loopback port, so the command
+    /// never collides with another plank or a stale listener, and always sets
+    /// `allow_control`: the operator typing the command is the consent that a
+    /// remote-side allow flag would otherwise encode.
+    fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
+        let want_on = if arg.is_empty() {
+            !self.remote_is_on()
+        } else if arg.eq_ignore_ascii_case("on") {
+            true
+        } else if arg.eq_ignore_ascii_case("off") {
+            false
+        } else {
+            return vec![format!(
+                "{cmd}: unknown argument {arg:?} (use on, off, or no argument)"
+            )];
+        };
+        if !want_on {
+            return if self.remote_off() {
+                vec!["remote control off".to_owned()]
+            } else {
+                vec!["remote control is already off".to_owned()]
+            };
+        }
+        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, true) {
+            Ok((addr, token)) => {
+                let port = addr.port();
+                vec![
+                    format!("remote control on — {}", Self::remote_link(addr, &token)),
+                    format!("tunnel:  ssh -L {port}:localhost:{port} user@thishost"),
+                ]
             }
-            if !self.pump_remote()? {
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            Err(e) => vec![format!("{cmd}: could not start: {e}")],
         }
     }
 
@@ -6643,11 +6728,18 @@ impl Agent<'_> {
             .rev()
             .find(|m| m.role == crate::session::Role::Assistant)
             .map_or("", |m| m.text.as_str());
-        crate::notify::notify_sticky(
-            &crate::notify::finished_title(prompt, interrupted),
-            None,
-            &crate::notify::latest_output_body(output, interrupted),
-        );
+        let title = crate::notify::finished_title(prompt, interrupted);
+        let body = crate::notify::latest_output_body(output, interrupted);
+        // Attached remote front-ends raise their own notification from this:
+        // the local desktop one only reaches whoever is at this machine, which
+        // is exactly the person a remote session is not.
+        if let Some(r) = &self.remote {
+            r.bus.broadcast(UiEvent::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        crate::notify::notify_sticky(&title, None, &body);
     }
 
     /// Compacts before a TUI turn when context is tight; progress goes to
@@ -6854,6 +6946,7 @@ impl Agent<'_> {
             }
             "/new" | "/clear" => {
                 self.session = Session::new();
+                self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
                 push_session_context(&mut self.session, &self.context_content);
@@ -6982,6 +7075,9 @@ impl Agent<'_> {
                 Ok(s) => {
                     let note = self.load_session_payload(&s);
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -7011,6 +7107,9 @@ impl Agent<'_> {
                 Ok(Some(s)) => {
                     let note = self.load_session_payload(&s);
                     self.session = s;
+                    self.broadcast_session_reset(Some(
+                        "[session replaced — its history is on the local screen only]",
+                    ));
                     self.last_ctx_used = 0;
                     self.checkpoints.clear();
                     self.usage = SessionUsage::default();
@@ -7110,6 +7209,11 @@ impl Agent<'_> {
             "/hooks" => {
                 for line in crate::hooks::render_list(&self.tool_ctx.hooks).lines() {
                     log.push_plain(line.to_owned());
+                }
+            }
+            "/remote-control" | "/rc" => {
+                for line in self.remote_toggle_lines(cmd, arg) {
+                    log.push_plain(line);
                 }
             }
             "/btw" => {
@@ -8031,7 +8135,6 @@ fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
-    remote: Option<Arc<RemoteState>>,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -8131,7 +8234,8 @@ fn new_agent(
         templates,
         agents,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
-        remote,
+        remote: None,
+        remote_server: None,
         ui_remote: None,
         usage: SessionUsage::default(),
         stats: SessionStats::default(),
@@ -8146,12 +8250,8 @@ fn new_agent(
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_interactive(
-    engine: Box<dyn Engine>,
-    cfg: &AgentConfig,
-    remote: Option<Arc<RemoteState>>,
-) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true, remote)?;
+pub fn run_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, true)?;
 
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
@@ -8244,7 +8344,7 @@ fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String
         agent.session.push(Message::user(initial));
         agent.run_turn()?;
     }
-    run_repl_plain(agent)
+    run_repl_plain_local(agent)
 }
 
 /// Yellow hint shown when Ctrl-C is pressed on an empty idle prompt.
@@ -8253,17 +8353,6 @@ fn quit_hint_spans() -> Vec<ratatui::text::Span<'static>> {
         "Press Ctrl-D to quit.",
         ratatui::style::Style::default().fg(ratatui::style::Color::Yellow),
     )]
-}
-
-/// Plain line-based REPL used when stdin is not a terminal. With a remote
-/// bridge attached it also interleaves remote-driven input (issue #25); without
-/// one it keeps the classic blocking read loop, behavior-identical to before.
-fn run_repl_plain(agent: &mut Agent<'_>) -> Result<(), String> {
-    if agent.remote.is_some() {
-        run_repl_plain_remote(agent)
-    } else {
-        run_repl_plain_local(agent)
-    }
 }
 
 /// Streams a plain-REPL `!` command's output to the console as it arrives
@@ -8444,113 +8533,12 @@ fn run_repl_plain_local(agent: &mut Agent<'_>) -> Result<(), String> {
     }
 }
 
-/// Interval at which the remote-aware plain REPL wakes to drain the remote
-/// input queue while waiting on stdin.
-const PLAIN_REMOTE_POLL: Duration = Duration::from_millis(50);
-
-/// Echoes one mirrored bus event to local stdout so a plain-REPL operator sees
-/// remote-driven turns. Only text-bearing events are printed; status footers
-/// and structural markers are skipped (the plain REPL has no live footer).
-fn echo_bus_event(ev: &UiEvent) {
-    let mut out = std::io::stdout();
-    match ev {
-        UiEvent::Visible(t)
-        | UiEvent::Think(t)
-        | UiEvent::Tool(t)
-        | UiEvent::Error(t)
-        | UiEvent::Dim(t)
-        | UiEvent::Plain(t)
-        | UiEvent::UserEcho(t) => {
-            let _ = write!(out, "{t}");
-        }
-        UiEvent::EndLine => {
-            let _ = writeln!(out);
-        }
-        _ => {}
-    }
-    let _ = out.flush();
-}
-
-/// Plain REPL with a remote bridge attached. A dedicated reader thread turns the
-/// blocking `read_line` into channel sends so the main loop can `select` between
-/// local stdin and the remote input queue: on each idle tick it drains
-/// `pump_remote` (mirroring how the TUI idle loop drives remote turns) and
-/// echoes the shared bus to stdout so the local operator sees remote output.
-///
-/// Trade-off: because `read_line` cannot itself be woken, stdin is read on a
-/// helper thread rather than in a true `select`. Remote-driven turns run to
-/// completion inside `pump_remote` before their (batched) output is echoed,
-/// rather than streaming token-by-token as in the TUI; this keeps turn
-/// execution single-threaded and the loop simple.
-fn run_repl_plain_remote(agent: &mut Agent<'_>) -> Result<(), String> {
-    use std::sync::mpsc::{RecvTimeoutError, channel};
-
-    // Reader thread: stdin lines → channel. EOF or error drops the sender,
-    // which surfaces as `Disconnected` on the main side.
-    let (line_tx, line_rx) = channel::<String>();
-    std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        let mut lock = stdin.lock();
-        loop {
-            let mut line = String::new();
-            match lock.read_line(&mut line) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    if line_tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let sub = agent.remote.as_ref().map(|r| r.bus.subscribe());
-    let drain_bus = |sub: &std::sync::mpsc::Receiver<crate::worker::SeqEvent>| {
-        while let Ok(seq) = sub.try_recv() {
-            echo_bus_event(&seq.event);
-        }
-    };
-
-    loop {
-        print!("{}", status::prompt_text());
-        std::io::stdout().flush().map_err(|e| e.to_string())?;
-        // Wait for a typed line or a remote-driven turn; reprint the prompt
-        // once either produces output.
-        loop {
-            if let Some(sub) = &sub {
-                drain_bus(sub);
-            }
-            match line_rx.recv_timeout(PLAIN_REMOTE_POLL) {
-                Ok(line) => {
-                    if !handle_plain_line(agent, &line)? {
-                        return Ok(());
-                    }
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    if agent.pump_remote()? {
-                        if let Some(sub) = &sub {
-                            drain_bus(sub);
-                        }
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Disconnected) => return Ok(()), // stdin EOF
-            }
-        }
-    }
-}
-
 /// Runs headless mode: one-shot with `-p`, else a stdin-driven protocol.
 ///
 /// # Errors
 /// Returns an error string on unrecoverable I/O or engine failure.
-pub fn run_non_interactive(
-    engine: Box<dyn Engine>,
-    cfg: &AgentConfig,
-    remote: Option<Arc<RemoteState>>,
-) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false, remote)?;
+pub fn run_non_interactive(engine: Box<dyn Engine>, cfg: &AgentConfig) -> Result<(), String> {
+    let mut agent = new_agent(engine, cfg, false)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
     crate::notify::set_mode(crate::settings::active().ui.notifications);
@@ -8561,12 +8549,6 @@ pub fn run_non_interactive(
         let r = agent.run_turn();
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         return r;
-    }
-    // Headless with a remote bridge and no `-p`: instead of the stdin protocol,
-    // serve remote controllers — drive turns from their `prompt` frames and
-    // mirror all output onto the bus (design §5 step 4, headless path).
-    if agent.remote.is_some() {
-        return agent.run_remote_headless();
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
     // until stdin has been quiet for 200 ms, submit that buffer as one prompt,
@@ -9274,6 +9256,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -9323,44 +9306,254 @@ mod tests {
         dir
     }
 
-    /// End-to-end (issue #25): a real loopback `RemoteServer` sharing the
-    /// agent's bus + turn state. A remote `prompt` frame lands in the shared
-    /// queue, `pump_remote` drives a real Echo/scripted turn, and the turn's
-    /// output is observed mirrored back onto the bus.
+    /// `remote_on` installs a live bridge on an already-running agent and
+    /// `remote_off` tears it down; the link carries the bound port and token.
     #[test]
-    fn remote_prompt_drives_turn_and_mirrors_to_bus() {
-        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer, ServerConfig};
+    fn remote_on_installs_a_bridge_and_remote_off_tears_it_down() {
+        let dir = scratch_dir("remote-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        assert!(!agent.remote_is_on());
+
+        let (addr, token) = agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds an ephemeral loopback port");
+        assert!(agent.remote_is_on());
+        assert!(agent.remote.is_some());
+        assert_ne!(addr.port(), 0, "an ephemeral bind resolves to a real port");
+        assert_eq!(
+            Agent::remote_link(addr, &token),
+            format!("http://127.0.0.1:{}/?t=tok", addr.port())
+        );
+        // The bound port really accepts connections while on.
+        std::net::TcpStream::connect(addr).expect("listener is live");
+
+        // Idempotent: a second on returns the same address and token.
+        let (again, same_token) = agent
+            .remote_on("127.0.0.1:0", Some("other".to_owned()), true)
+            .expect("second on is a no-op");
+        assert_eq!(again, addr);
+        assert_eq!(same_token, token);
+
+        assert!(agent.remote_off(), "reports that a server was running");
+        assert!(!agent.remote_is_on());
+        assert!(agent.remote.is_none());
+        assert!(!agent.remote_off(), "second off is a no-op");
+    }
+
+    /// `remote_off` really drops the server rather than leaking it: the test's
+    /// own clone of the shared state must be the last one standing. A leak
+    /// (`mem::forget`-ing the server instead of shutting it down) keeps the
+    /// server's clone alive and the count stays above 1.
+    ///
+    /// This deliberately never connects to the listener. A connection makes the
+    /// accept loop spawn a handler thread holding its own clone of the state,
+    /// which lingers past `remote_off` and inflates the count — so the live-port
+    /// probe lives in `remote_on_installs_a_bridge_and_remote_off_tears_it_down`
+    /// and the refcount check lives here, never in the same test. Probing the
+    /// port *after* `remote_off` is not an option either: another test in the
+    /// parallel suite can rebind a released ephemeral port immediately.
+    #[test]
+    fn remote_off_drops_the_server_rather_than_leaking_it() {
+        let dir = scratch_dir("remote-off-drops");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds an ephemeral loopback port");
+        let state = std::sync::Arc::clone(agent.remote.as_ref().expect("bridge installed"));
+
+        assert!(agent.remote_off());
+        assert_eq!(
+            std::sync::Arc::strong_count(&state),
+            1,
+            "remote_off dropped the server, so the test holds the last RemoteState reference"
+        );
+    }
+
+    /// A generated token is used when none is supplied, and it is not empty.
+    #[test]
+    fn remote_on_generates_a_token_when_none_is_given() {
+        let dir = scratch_dir("remote-toggle-token");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let (_addr, token) = agent.remote_on("127.0.0.1:0", None, true).expect("binds");
+        assert!(!token.is_empty());
+        agent.remote_off();
+    }
+
+    /// A remote's context gauge and its stop button both key off status
+    /// frames, which otherwise only arrive from engine callbacks *during* a
+    /// turn. Without an idle frame at the end, the last thing a remote ever
+    /// sees is `generating`.
+    #[test]
+    fn turn_end_publishes_an_idle_status_to_the_bus() {
+        let dir = scratch_dir("idle-status-remote");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
+
+        agent.broadcast_idle_status();
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        let found = seen.iter().any(
+            |e| matches!(e, UiEvent::Status(st) if st.state == crate::status::WorkerState::Idle),
+        );
+        assert!(found, "no idle status reached the bus: {seen:?}");
+        agent.remote_off();
+    }
+
+    /// `/clear` has to tell attached clients, or the page keeps showing a
+    /// session that no longer exists. The bug this pins was exactly here: the
+    /// arm reset `self.session` and cleared the *local* log, and nothing
+    /// reached the bus.
+    #[test]
+    fn clear_broadcasts_a_session_reset_to_attached_clients() {
+        let dir = scratch_dir("clear-resets-remote");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
+        state.bus.broadcast(UiEvent::Visible("old output".into()));
+
+        agent.slash("/clear").expect("clear runs");
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        assert!(
+            seen.iter().any(|e| matches!(e, UiEvent::SessionReset)),
+            "no reset reached the bus: {seen:?}"
+        );
+        agent.remote_off();
+    }
+
+    /// The shared toggle helper drives the bridge and yields the lines both
+    /// front-ends print, so the plain REPL and the TUI cannot drift.
+    #[test]
+    fn rc_toggle_helper_turns_the_bridge_on_and_off() {
+        let dir = scratch_dir("rc-toggle-helper");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let on = agent.remote_toggle_lines("/rc", "");
+        assert!(agent.remote_is_on());
+        assert!(
+            on.iter()
+                .any(|l| l.contains("http://127.0.0.1:") && l.contains("/?t=")),
+            "prints the tokenized link: {on:?}"
+        );
+        assert!(
+            on.iter().any(|l| l.contains("ssh -L")),
+            "prints the tunnel hint: {on:?}"
+        );
+
+        // `on` again is idempotent and re-prints the same link.
+        let again = agent.remote_toggle_lines("/rc", "on");
+        assert!(agent.remote_is_on());
+        assert_eq!(
+            again.iter().find(|l| l.contains("/?t=")),
+            on.iter().find(|l| l.contains("/?t=")),
+            "the same link comes back"
+        );
+
+        // Bare toggle while ON turns it off — the command's headline behaviour.
+        let toggled_off = agent.remote_toggle_lines("/rc", "");
+        assert!(!agent.remote_is_on(), "a bare /rc turns a live bridge off");
+        assert!(
+            toggled_off.iter().any(|l| l.contains("off")),
+            "{toggled_off:?}"
+        );
+
+        // Re-establish an ON bridge for the explicit-"off" transition below.
+        agent.remote_toggle_lines("/rc", "on");
+        assert!(agent.remote_is_on());
+
+        let off = agent.remote_toggle_lines("/rc", "off");
+        assert!(!agent.remote_is_on());
+        assert!(off.iter().any(|l| l.contains("off")), "{off:?}");
+
+        // `off` when already off says so rather than erroring.
+        let noop = agent.remote_toggle_lines("/rc", "off");
+        assert!(!agent.remote_is_on());
+        assert!(!noop.is_empty());
+
+        // "ON" (uppercase) works the same as "on" — case-insensitive argument.
+        let upper = agent.remote_toggle_lines("/rc", "ON");
+        assert!(
+            agent.remote_is_on(),
+            "ON should turn the bridge on: {upper:?}"
+        );
+
+        // Back to off so the final bare-toggle check below observes off->on.
+        agent.remote_toggle_lines("/rc", "off");
+        assert!(!agent.remote_is_on());
+
+        // A bare toggle from off turns it back on with a *new* token. Compare
+        // the tokens themselves, not the whole line: the line also carries the
+        // ephemeral port, which differs on every activation, so a line-level
+        // `assert_ne!` would pass even if the token were reused.
+        let token_of = |lines: &[String]| {
+            lines
+                .iter()
+                .find_map(|l| l.split_once("/?t=").map(|(_, t)| t.to_owned()))
+                .expect("the on-line carries a token")
+        };
+        let back = agent.remote_toggle_lines("/rc", "");
+        assert!(agent.remote_is_on());
+        assert_ne!(
+            token_of(&back),
+            token_of(&on),
+            "a fresh activation mints a new token"
+        );
+        agent.remote_off();
+    }
+
+    /// The plain-REPL `/rc` arm must refuse rather than start a bridge nothing
+    /// can drive: a piped session has no `tui_turn`/`tui_btw` to read `self.remote`
+    /// or the bus, so a server started there would sit unattended forever.
+    #[test]
+    fn plain_repl_rc_refuses_to_start_a_server() {
+        let dir = scratch_dir("rc-plain-repl-refuses");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let keep_running = agent.slash("/rc").expect("slash handles /rc");
+        assert!(keep_running, "/rc must not end the REPL session");
+        assert!(
+            !agent.remote_is_on(),
+            "the plain REPL must not start a remote-control server"
+        );
+    }
+
+    /// The `/remote-control` path end to end: a client that authenticates and
+    /// requests control may submit a prompt even though a local front-end holds
+    /// the slot, and the turn's output reaches the bus.
+    #[test]
+    fn tokenized_attach_takes_control_and_drives_a_turn() {
+        use crate::remote::control::{ClientFrame, ClientMsg};
         use tungstenite::Message;
 
-        let dir = scratch_dir("remote-live");
+        let dir = scratch_dir("rc-e2e");
         let engine = ScriptedEngine {
             replies: vec!["hello from echo\n".to_string()],
             ..ScriptedEngine::default()
         };
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
+        let (addr, token) = agent
+            .remote_on("127.0.0.1:0", Some("tok".to_owned()), true)
+            .expect("binds");
+        assert_eq!(token, "tok");
 
-        // Headless server; the agent adopts its shared bus + turn state.
-        let server = RemoteServer::start(
-            "127.0.0.1:0",
-            ServerConfig {
-                token: "tok".to_owned(),
-                local_present: false,
-                allow_control: false,
-                allowed_origins: Vec::new(),
-                queue_max: 1 << 20,
-            },
-            Arc::new(BroadcastBus::new()),
-            Arc::new(TurnShared::default()),
-        )
-        .expect("server binds");
-        agent.remote = Some(Arc::clone(&server.state));
+        let state = agent.remote.clone().expect("bridge installed");
+        let sub = state.bus.subscribe();
 
-        // Observe the bus directly (subscribe before the turn runs).
-        let sub = server.state.bus.subscribe();
-
-        // Connect a controller and send auth + prompt.
-        let addr = server.local_addr;
         let stream = std::net::TcpStream::connect(addr).unwrap();
         let (mut ws, _) = tungstenite::client(
             format!("ws://{addr}/")
@@ -9374,125 +9567,25 @@ mod tests {
                 token: "tok".into(),
                 resume_from: None,
             },
+            ClientMsg::RequestControl,
             ClientMsg::Prompt { text: "hi".into() },
         ] {
             ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
                 .unwrap();
-            ws.flush().unwrap();
         }
 
-        // Wait for the prompt to reach the shared queue, then drive the turn.
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !agent.pump_remote().unwrap() {
-            assert!(Instant::now() < deadline, "remote prompt never arrived");
-            std::thread::sleep(Duration::from_millis(10));
+        // The prompt was accepted (not denied), so it lands in TurnShared for
+        // the turn loop to pick up.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut queued = Vec::new();
+        while queued.is_empty() && std::time::Instant::now() < deadline {
+            queued = state.shared.take_queued();
         }
+        assert_eq!(queued, vec!["hi".to_string()], "the prompt was not denied");
 
-        // The turn's assistant text was mirrored onto the bus, and the user
-        // echo was mirrored too.
-        let mut visible = String::new();
-        let mut echoed = false;
-        while let Ok(seq) = sub.try_recv() {
-            match seq.event {
-                UiEvent::Visible(t) => visible.push_str(&t),
-                UiEvent::UserEcho(t) if t == "hi" => echoed = true,
-                _ => {}
-            }
-        }
-        assert!(echoed, "user echo not mirrored");
-        assert!(
-            visible.contains("hello from echo"),
-            "mirrored assistant output missing: {visible:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// Plain-REPL path (issue #25 follow-up): the shared `handle_plain_line`
-    /// drives a local turn, and a remote `prompt` frame delivered over a real
-    /// loopback `RemoteServer` drives a turn via `pump_remote` (the same call
-    /// the plain-REPL remote loop makes on each idle tick) with its output
-    /// observed mirrored back onto the bus.
-    #[test]
-    fn plain_repl_handles_local_line_and_remote_drive() {
-        use crate::remote::control::{ClientFrame, ClientMsg, RemoteServer, ServerConfig};
-        use tungstenite::Message;
-
-        let dir = scratch_dir("plain-remote");
-        let engine = ScriptedEngine {
-            replies: vec!["local reply\n".to_string(), "remote reply\n".to_string()],
-            ..ScriptedEngine::default()
-        };
-        let cfg = test_cfg();
-        let mut agent = test_agent(&dir, engine, &cfg);
-
-        let server = RemoteServer::start(
-            "127.0.0.1:0",
-            ServerConfig {
-                token: "tok".to_owned(),
-                local_present: false,
-                allow_control: false,
-                allowed_origins: Vec::new(),
-                queue_max: 1 << 20,
-            },
-            Arc::new(BroadcastBus::new()),
-            Arc::new(TurnShared::default()),
-        )
-        .expect("server binds");
-        agent.remote = Some(Arc::clone(&server.state));
-        let sub = server.state.bus.subscribe();
-
-        // A locally-typed prompt runs a turn through the shared handler.
-        let before = agent.session.transcript.len();
-        assert!(handle_plain_line(&mut agent, "local ask").unwrap());
-        assert!(
-            agent.session.transcript.len() > before,
-            "local line did not advance the session"
-        );
-
-        // A remote controller's prompt drives a mirrored turn via pump_remote.
-        let addr = server.local_addr;
-        let stream = std::net::TcpStream::connect(addr).unwrap();
-        let (mut ws, _) = tungstenite::client(
-            format!("ws://{addr}/")
-                .parse::<tungstenite::http::Uri>()
-                .unwrap(),
-            stream,
-        )
-        .expect("ws handshake");
-        for m in [
-            ClientMsg::Auth {
-                token: "tok".into(),
-                resume_from: None,
-            },
-            ClientMsg::Prompt {
-                text: "remote ask".into(),
-            },
-        ] {
-            ws.send(Message::Text(ClientFrame::new(m).to_json().unwrap()))
-                .unwrap();
-            ws.flush().unwrap();
-        }
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while !agent.pump_remote().unwrap() {
-            assert!(Instant::now() < deadline, "remote prompt never arrived");
-            std::thread::sleep(Duration::from_millis(10));
-        }
-
-        let mut visible = String::new();
-        let mut echoed = false;
-        while let Ok(seq) = sub.try_recv() {
-            match seq.event {
-                UiEvent::Visible(t) => visible.push_str(&t),
-                UiEvent::UserEcho(t) if t == "remote ask" => echoed = true,
-                _ => {}
-            }
-        }
-        assert!(echoed, "remote user echo not mirrored");
-        assert!(
-            visible.contains("remote reply"),
-            "mirrored remote output missing: {visible:?}"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+        // Nothing on the wire said denied.
+        drop(sub);
+        agent.remote_off();
     }
 
     #[test]
@@ -11265,6 +11358,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11321,6 +11415,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11442,6 +11537,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11617,6 +11713,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11697,6 +11794,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11764,6 +11862,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -11854,6 +11953,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -12747,6 +12847,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -12831,6 +12932,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -12974,6 +13076,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),
@@ -13039,6 +13142,7 @@ mod tests {
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
             remote: None,
+            remote_server: None,
             ui_remote: None,
             usage: SessionUsage::default(),
             stats: SessionStats::default(),

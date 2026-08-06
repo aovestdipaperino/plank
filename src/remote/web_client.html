@@ -4,63 +4,156 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>plank remote</title>
+<link rel="icon" href="/logo.png">
 <style>
-  :root { color-scheme: light dark; }
+  /* plank's dark palette, the same variables the site uses (site/index.html).
+     Forced dark rather than following the OS: this page is a terminal mirror
+     and reads as one. */
+  :root {
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --pine:#5cc797; --coral:#ff7259; --line:#3a2f22;
+    color-scheme: dark;
+  }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     display: flex; flex-direction: column;
-    background: #111; color: #ddd;
-  }
-  @media (prefers-color-scheme: light) {
-    body { background: #fafafa; color: #222; }
+    background: var(--birch); color: var(--bark);
   }
   header {
-    display: flex; gap: .5rem; align-items: center;
-    padding: .5rem .75rem; border-bottom: 1px solid #444; flex-wrap: wrap;
+    display: flex; gap: .6rem; align-items: center;
+    padding: .5rem .75rem; border-bottom: 1px solid var(--line);
+    background: var(--paper); flex-wrap: wrap;
   }
-  header input { flex: 1 1 12rem; min-width: 8rem; padding: .3rem .4rem;
-    font: inherit; background: transparent; color: inherit;
-    border: 1px solid #555; border-radius: 4px; }
-  header button { padding: .3rem .7rem; font: inherit; cursor: pointer; }
-  #status { font-size: .85em; opacity: .8; }
+  header img { width: 26px; height: 26px; border-radius: 5px; }
+  header .wordmark {
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+    font-weight: 800; letter-spacing: .01em;
+  }
+  header .wordmark em { color: var(--honey); font-style: normal; }
+  header button {
+    padding: .3rem .7rem; font: inherit; cursor: pointer;
+    background: var(--birch); color: var(--bark);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  header button:hover:not(:disabled) { border-color: var(--honey); }
+  #role { color: var(--honey); font-size: .85em; }
+  .where { font-size: .85em; color: var(--bark-soft); }
+  .where b { color: var(--pine); font-weight: 700; }
+  .where .sep { opacity: .5; margin: 0 .35em; }
+  #status { font-size: .85em; color: var(--bark-soft); margin-left: auto; }
+  /* A dropped socket is not a status detail: nothing typed after it goes
+     anywhere, so it reads as an error, not as small print. */
+  #status.dead { color: var(--coral); font-weight: 700; }
   #log {
     flex: 1 1 auto; overflow-y: auto; padding: .75rem;
-    white-space: pre-wrap; word-break: break-word; line-height: 1.35;
+    word-break: break-word; line-height: 1.45;
   }
+  /* Streamed frames that are not markdown keep their literal spacing; rendered
+     markdown blocks manage their own. */
+  #log .raw   { white-space: pre-wrap; }
   #log .think { opacity: .6; font-style: italic; }
-  #log .tool  { color: #4ea1ff; }
-  #log .error { color: #ff6b6b; }
-  #log .dim   { opacity: .55; }
-  #log .echo  { color: #9ad36b; }
+  #log .tool  { color: var(--pine); }
+  #log .error { color: var(--coral); }
+  #log .dim   { color: var(--bark-soft); }
+  #log .echo  { color: var(--honey); }
+
+  /* Rendered markdown. Kept tight: this is a transcript, not an article. */
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md h1, .md h2, .md h3, .md h4 {
+    font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif;
+    margin: .9em 0 .35em; line-height: 1.25;
+  }
+  .md h1 { font-size: 1.35em; } .md h2 { font-size: 1.2em; }
+  .md h3 { font-size: 1.08em; } .md h4 { font-size: 1em; color: var(--bark-soft); }
+  .md p { margin: .5em 0; }
+  .md ul, .md ol { margin: .5em 0; padding-left: 1.4em; }
+  .md li { margin: .2em 0; }
+  .md a { color: var(--pine); text-underline-offset: 3px; }
+  .md strong { color: #fff; }
+  .md em { font-style: italic; }
+  .md code {
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 4px; padding: .05em .3em; font-size: .95em;
+  }
+  .md pre {
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 8px; padding: .6rem .75rem; margin: .6em 0;
+    overflow-x: auto;
+  }
+  .md pre code { background: none; border: 0; padding: 0; font-size: .92em; }
+  .md blockquote {
+    margin: .6em 0; padding: .1em 0 .1em .8em;
+    border-left: 3px solid var(--honey); color: var(--bark-soft);
+  }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: .9em 0; }
+
+  /* Finished-turn banner: the one signal that needs no permission from
+     anybody, so it fires even when desktop notifications are blocked. */
+  #toast {
+    margin: 0 .75rem .5rem; padding: .5rem .7rem;
+    background: var(--paper); border: 1px solid var(--honey);
+    border-left-width: 3px; border-radius: 8px;
+    display: flex; flex-direction: column; gap: .2rem;
+    font-size: .9em; cursor: pointer;
+  }
+  #toast[hidden] { display: none; }
+  #toast strong { color: var(--honey); }
+  #toast span { color: var(--bark-soft); white-space: pre-wrap; }
+
   form.input { display: flex; gap: .5rem; padding: .5rem .75rem;
-    border-top: 1px solid #444; }
-  form.input select { font: inherit; }
-  form.input input { flex: 1 1 auto; padding: .4rem .5rem; font: inherit;
-    background: transparent; color: inherit; border: 1px solid #555;
-    border-radius: 4px; }
-  form.input button { padding: .4rem .9rem; font: inherit; cursor: pointer; }
+    border-top: 1px solid var(--line); background: var(--paper);
+    align-items: flex-end; }
+  form.input textarea, form.input button {
+    font: inherit; background: var(--birch); color: var(--bark);
+    border: 1px solid var(--line); border-radius: 6px;
+  }
+  form.input textarea {
+    flex: 1 1 auto; padding: .4rem .5rem; resize: none; overflow-y: auto;
+    /* Three rows of text: 3 x 1.4em line-height, plus .8rem of padding and
+       the border, on a border-box. `rows="3"` sets the same intrinsic
+       size, but grow() writes an explicit height, so the floor has to be
+       a min-height to survive it. */
+    min-height: 5.2em; max-height: 14em; line-height: 1.4;
+  }
+  form.input textarea::placeholder { color: var(--bark-soft); }
+  form.input textarea:disabled { opacity: .5; cursor: not-allowed; }
+  form.input button { padding: .4rem .9rem; cursor: pointer; }
+  form.input button:hover:not(:disabled) { border-color: var(--honey); }
+  form.input #stop:hover:not(:disabled) { border-color: var(--coral); color: var(--coral); }
+  form.input button:disabled { opacity: .45; cursor: default; }
 </style>
 </head>
 <body>
 <header>
-  <strong>plank remote</strong>
-  <input id="url" placeholder="ws://127.0.0.1:31415/" size="24">
-  <input id="token" placeholder="token" type="password">
-  <button id="connect">connect</button>
-  <button id="interrupt" disabled>interrupt</button>
+  <img src="/logo.png" alt="">
+  <span class="wordmark">plank <em>remote</em></span>
+  <!-- Parked, not deleted: the page claims control on connect, so the toggle
+       had nothing left to do in the normal flow. Restoring either button means
+       un-commenting it here and the matching blocks in the script below, each
+       marked `parked button`. -->
+  <!-- <button id="interrupt" disabled>interrupt</button> -->
+  <!-- <button id="control" disabled>take control</button> -->
+  <span id="role" class="dim"></span>
+  <!-- The footer's "where am I?" segments, in the footer's own order:
+       dir ⑂ branch | origin | 🧠 think. Filled from every status frame. -->
+  <span id="where" class="where"></span>
   <span id="status">disconnected</span>
 </header>
 <div id="log" aria-live="polite"></div>
+<div id="toast" role="status" hidden></div>
 <form class="input" id="inputForm">
-  <select id="kind" title="frame kind">
-    <option value="prompt">prompt</option>
-    <option value="command">command</option>
-    <option value="btw">btw</option>
-  </select>
-  <input id="line" placeholder="type a line and press Enter" autocomplete="off">
-  <button type="submit">send</button>
+  <!-- One field, sent as a `prompt` frame whatever it contains: the agent's own
+       dispatcher already routes a leading `/` to the slash commands (including
+       `/btw`) when it drains the queue, exactly as it does for a line typed
+       into the TUI. A frame-kind selector here would only be a second, worse
+       copy of that parser. -->
+  <textarea id="line" rows="3" placeholder="type a prompt — Enter sends, Shift+Enter for a new line, ↑/↓ for history"
+            autocomplete="off" spellcheck="false"></textarea>
+  <button type="submit" id="send" disabled>send</button>
+  <button type="button" id="stop" title="interrupt the running turn (Esc)" disabled>stop</button>
 </form>
 <script>
 "use strict";
@@ -72,19 +165,287 @@ const $ = (id) => document.getElementById(id);
 const logEl = $("log");
 let ws = null;
 let highestId = null;
+// Whether this session believes it holds control. The server has no
+// "control granted" frame — a granted `request_control` is silent and only a
+// refusal comes back as `control_denied` (src/remote/control.rs:1250) — so this
+// is optimistic: we assume the request landed and a `control_denied` reverts it.
+let controller = false;
 
-function setStatus(s) { $("status").textContent = s; }
+function setStatus(s, dead) {
+  $("status").textContent = s;
+  $("status").classList.toggle("dead", !!dead);
+}
+
+// Reflects the control role in the header hint.
+function setRole(isController) {
+  controller = isController;
+  // parked button: $("control").textContent = isController ? "release control" : "take control";
+  $("role").textContent = isController ? "controller" : "mirror";
+}
+
+// The footer's dir/branch/origin/think segments, in the footer's order. Every
+// status frame carries them, so a client attaching mid-session gets them from
+// the first one rather than waiting for something to change.
+function setWhere(s) {
+  const seg = [];
+  if (s.cwd) seg.push(esc(s.cwd) + (s.branch ? " ⑂ <b>" + esc(s.branch) + "</b>" : ""));
+  if (s.origin) seg.push(esc(s.origin));
+  if (s.think) seg.push("🧠 " + esc(s.think));
+  $("where").innerHTML = seg.join('<span class="sep">|</span>');
+}
+
+// Send needs something to send; stop needs something to stop. Both need a
+// live socket. Recomputed on every input, status frame, and connection change,
+// so the pair always describes what the page can actually do right now.
+let turnRunning = false;
+
+// States in which a turn is in flight, from `state_name` in
+// src/remote/control.rs. `saving` counts: it is the tail of a turn, and an
+// interrupt during it is still meaningful.
+const RUNNING_STATES = ["prefill", "generating", "compacting", "saving"];
+
+function updateButtons() {
+  const live = !!ws && ws.readyState === WebSocket.OPEN && !$("line").disabled;
+  $("send").disabled = !live || !$("line").value.trim();
+  $("stop").disabled = !live || !turnRunning;
+}
+
+function atBottom() {
+  return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+}
+
+// The turn finished. A browser tab is not a terminal the operator is staring
+// at, so say so three ways, cheapest first: the tab title always flashes, a
+// bell rings if the page has been interacted with (autoplay rules), and a real
+// desktop notification is raised when permission is already granted.
+//
+// Permission is never requested on load — browsers reject a request without a
+// user gesture, and a modal on first paint is hostile. It is asked for once,
+// on the first prompt the operator sends, which is both a gesture and the
+// moment the answer becomes something worth being told about.
+let pendingTitle = null;
+
+function notify(title, body) {
+  line("[" + title + "]", "dim");
+  if (document.hidden) {
+    pendingTitle = title;
+    document.title = "● " + title;
+  }
+  bell();
+  toast(title, body);
+  // A desktop notification needs the browser's permission *and* the OS's, and
+  // the second one is invisible from here — a granted permission that shows
+  // nothing means notifications are off for the browser in system settings.
+  // The toast above fires either way, so this is a bonus, never the only signal.
+  if (!window.Notification) return;
+  if (Notification.permission === "granted") {
+    try {
+      new Notification(title, { body: body, icon: "/logo.png", tag: "plank-turn" });
+    } catch (_) { /* some browsers refuse a constructed Notification; the toast stands */ }
+  } else if (Notification.permission === "denied") {
+    line("[desktop notifications are blocked for this page]", "dim");
+  }
+}
+
+// An in-page banner, so a finished turn is visible even with no notification
+// permission at all. Dismissed by a click or by the next one replacing it.
+let toastTimer = null;
+
+function toast(title, body) {
+  const el = $("toast");
+  el.innerHTML = "";
+  const h = document.createElement("strong");
+  h.textContent = title;
+  el.appendChild(h);
+  if (body) {
+    const p = document.createElement("span");
+    p.textContent = body.length > 240 ? body.slice(0, 240) + "…" : body;
+    el.appendChild(p);
+  }
+  el.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.hidden = true; }, 12000);
+}
+
+// Restore the tab title once the operator actually looks at the page.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && pendingTitle !== null) {
+    pendingTitle = null;
+    document.title = "plank remote";
+  }
+});
+
+// A short blip through WebAudio: no asset to embed, and nothing to load.
+// Silently does nothing until the page has been interacted with.
+let audioCtx = null;
+
+function bell() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = audioCtx || new Ctx();
+    if (audioCtx.state !== "running") return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.05, audioCtx.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.18);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.2);
+  } catch (_) { /* audio is a courtesy, never a failure */ }
+}
+
+// Called from the first prompt the operator sends: a user gesture, so both the
+// permission prompt and the audio context are allowed to start here.
+function armNotifications() {
+  if (window.Notification && Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) { audioCtx = audioCtx || new Ctx(); audioCtx.resume().catch(() => {}); }
+  } catch (_) { /* no audio, no problem */ }
+}
 
 function append(text, cls) {
-  const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+  mdFlush();
+  const stick = atBottom();
   const span = document.createElement("span");
-  if (cls) span.className = cls;
+  span.className = cls ? cls + " raw" : "raw";
   span.textContent = text;
   logEl.appendChild(span);
-  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+  if (stick) logEl.scrollTop = logEl.scrollHeight;
 }
 
 function line(text, cls) { append(text + "\n", cls); }
+
+// --- Markdown ---------------------------------------------------------------
+// The model writes markdown, and the wire carries it as plain text in `visible`
+// frames that arrive a chunk at a time. So we accumulate the live block and
+// re-render it on every chunk: headings, lists and code fences take shape as
+// they stream. Anything that is not model prose (tool banners, log lines, the
+// user's own echo) flushes the block first, keeping transcript order intact.
+let mdBuf = "";
+let mdEl = null;
+
+function mdAppend(text) {
+  const stick = atBottom();
+  if (!mdEl) {
+    mdEl = document.createElement("div");
+    mdEl.className = "md";
+    logEl.appendChild(mdEl);
+    mdBuf = "";
+  }
+  mdBuf += text;
+  mdEl.innerHTML = renderMarkdown(mdBuf);
+  if (stick) logEl.scrollTop = logEl.scrollHeight;
+}
+
+function mdFlush() { mdEl = null; mdBuf = ""; }
+
+function esc(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// Only schemes that cannot execute script. Anything else renders as plain text
+// rather than a link, so a `javascript:` URL in model output is inert.
+function safeHref(url) {
+  return /^(https?:\/\/|mailto:)/i.test(url.trim()) ? url.trim() : null;
+}
+
+// Inline spans. Code first, lifted out behind a sentinel the source cannot
+// contain, so `**` inside a code span is not read as emphasis.
+function inline(s) {
+  const codes = [];
+  const SEP = "\u0000";
+  let out = s.replace(/`([^`]+)`/g, (_, c) => {
+    codes.push(c);
+    return SEP + (codes.length - 1) + SEP;
+  });
+  out = out.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (m, text, url) => {
+    const href = safeHref(url);
+    return href ? '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + text + "</a>" : m;
+  });
+  out = out.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  out = out.replace(/(^|[^*\w])\*([^*\n]+)\*(?![*\w])/g, "$1<em>$2</em>");
+  out = out.replace(/(^|[^_\w])_([^_\n]+)_(?![_\w])/g, "$1<em>$2</em>");
+  return out.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[Number(i)] + "</code>");
+}
+
+// Joins the lines of one paragraph or blockquote, keeping every newline as a
+// visible break. Strict markdown folds a single newline into a space, but this
+// is a terminal transcript: the model's own line breaks are how its output is
+// laid out, and collapsing them runs consecutive lines together.
+function block(lines) {
+  return inline(lines.join("\n")).replace(/\n/g, "<br>");
+}
+
+// Block structure, line by line. Everything is escaped on the way in, so the
+// only tags in the output are the ones produced here. An unterminated fence
+// still renders as a code block: mid-stream, that is the common case.
+function renderMarkdown(src) {
+  const lines = esc(src).split("\n");
+  const out = [];
+  let para = [];
+  let list = null; // "ul" | "ol"
+  let quote = [];
+
+  const closePara = () => {
+    if (para.length) { out.push("<p>" + block(para) + "</p>"); para = []; }
+  };
+  const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+  const closeQuote = () => {
+    if (quote.length) { out.push("<blockquote>" + block(quote) + "</blockquote>"); quote = []; }
+  };
+  const closeAll = () => { closePara(); closeList(); closeQuote(); };
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i];
+
+    const fence = raw.match(/^\s*```(.*)$/);
+    if (fence) {
+      closeAll();
+      const body = [];
+      i++;
+      while (i < lines.length && !/^\s*```/.test(lines[i])) { body.push(lines[i]); i++; }
+      out.push("<pre><code>" + body.join("\n") + "</code></pre>");
+      continue;
+    }
+
+    if (!raw.trim()) { closeAll(); continue; }
+
+    const heading = raw.match(/^(#{1,4})\s+(.*)$/);
+    if (heading) {
+      closeAll();
+      const level = heading[1].length;
+      out.push("<h" + level + ">" + inline(heading[2]) + "</h" + level + ">");
+      continue;
+    }
+
+    if (/^\s*([-*_])\s*\1\s*\1[\s-*_]*$/.test(raw)) { closeAll(); out.push("<hr>"); continue; }
+
+    const bullet = raw.match(/^\s*[-*+]\s+(.*)$/);
+    const number = raw.match(/^\s*\d+[.)]\s+(.*)$/);
+    if (bullet || number) {
+      closePara(); closeQuote();
+      const want = bullet ? "ul" : "ol";
+      if (list !== want) { closeList(); out.push("<" + want + ">"); list = want; }
+      out.push("<li>" + inline((bullet || number)[1]) + "</li>");
+      continue;
+    }
+    closeList();
+
+    const q = raw.match(/^\s*&gt;\s?(.*)$/);
+    if (q) { closePara(); quote.push(q[1]); continue; }
+    closeQuote();
+
+    para.push(raw);
+  }
+  closeAll();
+  return out.join("");
+}
 
 function handleServerMsg(f) {
   if (typeof f.id === "number") highestId = f.id;
@@ -92,31 +453,54 @@ function handleServerMsg(f) {
     case "hello":
       line("[connected: plank " + f.plank_version + ", session " +
         f.session_id + (f.controller ? ", controller" : ", mirror") + "]", "dim");
+      setRole(!!f.controller);
       break;
     case "snapshot":
       if (f.highest_id !== null && f.highest_id !== undefined)
         highestId = f.highest_id;
       for (const e of (f.scrollback || [])) handleServerMsg(e);
       break;
-    case "visible":   append(f.text); break;
+    // Model prose: the one frame kind that is markdown.
+    case "visible":   mdAppend(f.text); break;
     case "think":     append(f.text, "think"); break;
     case "tool":      append(f.text, "tool"); break;
     case "error":     append(f.text, "error"); break;
     case "dim":       append(f.text, "dim"); break;
     case "plain":     append(f.text); break;
     case "user_echo": line("> " + f.text, "echo"); break;
-    case "end_line":  append("\n"); break;
+    // Ends the rendered block rather than emitting a newline: the markdown
+    // already carries its own spacing, and a stray <span> after it would
+    // reopen a raw run below the block.
+    case "end_line":  mdFlush(); break;
     case "btw_begin": line("[btw]", "dim"); break;
     case "btw_end":   break;
     case "main_checkpoint": break;
     case "main_rollback": break;
     case "status": {
       const s = f.status;
+      setWhere(s);
+      turnRunning = RUNNING_STATES.includes(s.state);
+      updateButtons();
       setStatus(s.state + "  ctx " + s.ctx_used + "/" + s.ctx_size +
         (s.gen_tps ? "  " + s.gen_tps.toFixed(1) + " tok/s" : ""));
       break;
     }
-    case "control_denied": line("[denied: " + f.reason + "]", "error"); break;
+    // The transcript was replaced (/clear, /new, /switch, /resume): everything
+    // on screen belongs to a session that no longer exists.
+    case "reset":
+      mdFlush();
+      logEl.innerHTML = "";
+      $("toast").hidden = true;
+      line("[session cleared]", "dim");
+      break;
+    // Not transcript text: the turn finished, so raise a notification the way
+    // the local session raises a desktop one.
+    case "notify": notify(f.title, f.body); break;
+    // Any refusal means we are not the controller, whatever we assumed.
+    case "control_denied":
+      line("[denied: " + f.reason + "]", "error");
+      setRole(false);
+      break;
     case "pong": break;
     case "bye": line("[server: " + f.reason + "]", "dim"); break;
     default: break;
@@ -129,43 +513,190 @@ function send(msg) {
 }
 
 function connect() {
-  const url = $("url").value.trim() || "ws://" + location.host + "/";
+  // Always this page's own origin: the server serves the client, so the socket
+  // and the page are necessarily the same host and port.
+  const url = "ws://" + location.host + "/";
   if (ws) { try { ws.close(); } catch (_) {} }
   setStatus("connecting…");
-  ws = new WebSocket(url);
-  ws.onopen = () => {
+  // close() is async: the old socket's handlers can still fire after `ws` is
+  // reassigned (even after the new socket's onopen), so every handler below
+  // captures its own socket and ignores events once it's no longer current.
+  const sock = new WebSocket(url);
+  ws = sock;
+  sock.onopen = () => {
+    if (sock !== ws) return;
     setStatus("authenticating…");
-    const auth = { type: "auth", token: $("token").value };
+    const auth = { type: "auth", token: linkToken };
     if (highestId !== null) auth.resume_from = highestId;
     send(auth);
-    $("interrupt").disabled = false;
+    // parked button: $("interrupt").disabled = false;
+    // parked button: $("control").disabled = false;
+    updateButtons();
+    // Opening the `/remote-control` link is the operator's own consent, so claim
+    // control immediately rather than waiting for a click: `/rc` always starts
+    // the server with allow_control, making this a silent Granted.
+    send({ type: "request_control" });
+    setRole(true);
+    line("[requested control]", "dim");
   };
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
+    if (sock !== ws) return;
     let f; try { f = JSON.parse(ev.data); } catch (_) { return; }
     handleServerMsg(f);
     if (f.type === "hello") setStatus("connected");
   };
-  ws.onclose = (ev) => {
-    setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
-    $("interrupt").disabled = true;
+  sock.onclose = (ev) => {
+    if (sock !== ws) return;
+    setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""), true);
+    // parked button: $("interrupt").disabled = true;
+    // parked button: $("control").disabled = true;
+    $("role").textContent = "";
+    controller = false;
+    turnRunning = false;
+    // Nothing typed from here reaches the agent — `/rc off`, a quit, or a
+    // dropped tunnel all land here — so take the prompt away rather than let it
+    // accept text that goes nowhere. There is no reconnect: the token died with
+    // the server, and a fresh `/rc` prints a fresh link.
+    $("line").disabled = true;
+    $("line").placeholder = "disconnected — run /rc again for a new link";
+    updateButtons();
   };
-  ws.onerror = () => setStatus("error");
+  sock.onerror = () => {
+    if (sock !== ws) return;
+    setStatus("error", true);
+  };
 }
 
-$("connect").addEventListener("click", connect);
-$("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+// parked button: $("interrupt").addEventListener("click", () => send({ type: "interrupt" }));
+// parked button — hand control back, and take it again afterwards. The page
+// claims control on connect, so this was only reachable after a deliberate
+// release, or after a `control_denied` flipped the role back to mirror while a
+// previous session still held the slot inside its reconnect grace window.
+// $("control").addEventListener("click", () => {
+//   if (controller) {
+//     send({ type: "release_control" });
+//     setRole(false);
+//     line("[released control]", "dim");
+//   } else {
+//     send({ type: "request_control" });
+//     setRole(true);
+//     line("[requested control]", "dim");
+//   }
+// });
 $("inputForm").addEventListener("submit", (e) => {
   e.preventDefault();
   const el = $("line");
-  const text = el.value;
+  const text = el.value.replace(/\s+$/, "");
   if (!text) return;
-  const kind = $("kind").value; // prompt | command | btw
-  send({ type: kind, text });
+  // This submit is the user gesture browsers require before a notification
+  // permission prompt or an audio context is allowed.
+  armNotifications();
+  // Always a `prompt` frame: the agent routes a leading `/` to its own slash
+  // dispatcher when it drains the queue, so `/btw ...` and every other command
+  // work here without this page knowing what any of them are.
+  send({ type: "prompt", text: text });
+  // Record it for ↑, skipping an immediate repeat of the same line.
+  if (history[history.length - 1] !== text) history.push(text);
+  histIdx = null;
+  draft = "";
   el.value = "";
+  grow(el);
+  updateButtons();
 });
 
-// Prefill the URL from the page's own origin for the common tunnel case.
-$("url").value = "ws://" + location.host + "/";
+// Interrupt the running turn — the browser's Esc. Deliberately outside the
+// form so it never submits, and enabled only while a turn is actually running
+// (see `updateButtons`), so the pair of buttons says what the session can do.
+$("stop").addEventListener("click", () => send({ type: "interrupt" }));
+
+// Enter sends, Shift+Enter (or Alt/Ctrl+Enter) inserts a newline, matching how
+// the TUI's own composer behaves for a multi-line prompt.
+$("line").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey && !e.altKey && !e.ctrlKey && !e.metaKey) {
+    e.preventDefault();
+    $("inputForm").requestSubmit();
+    return;
+  }
+  if (historyKey(e)) e.preventDefault();
+});
+
+// Grow with the text between the CSS min- and max-height, then scroll inside.
+// Clearing the height first lets it shrink back after a long prompt is sent.
+function grow(el) {
+  el.style.height = "auto";
+  el.style.height = el.scrollHeight + "px";
+}
+
+$("line").addEventListener("input", (e) => {
+  grow(e.target);
+  // Editing abandons the history position: what is in the box is now a draft,
+  // not the recalled entry.
+  histIdx = null;
+  updateButtons();
+});
+
+// --- Prompt history ------------------------------------------------------
+// Sent prompts, oldest first, walked with ↑/↓ like a shell. In memory only:
+// the page's origin carries the ephemeral port, so a stored history would be
+// orphaned by the next `/rc` anyway.
+const history = [];
+let histIdx = null;   // null = editing a draft, else an index into `history`
+let draft = "";       // what was in the box before ↑ started walking
+
+function recall(idx) {
+  const el = $("line");
+  if (idx === null) {
+    el.value = draft;
+  } else {
+    el.value = history[idx];
+  }
+  histIdx = idx;
+  // Caret to the end, so ↑ then typing appends rather than inserting mid-line.
+  el.selectionStart = el.selectionEnd = el.value.length;
+  grow(el);
+  updateButtons();
+}
+
+// ↑/↓ only take over at the edges of the text, so they still move the caret
+// inside a multi-line prompt — the same rule a shell's multi-line editor uses.
+function atFirstLine(el) {
+  return el.selectionStart === el.selectionEnd
+    && el.value.lastIndexOf("\n", el.selectionStart - 1) === -1;
+}
+
+function atLastLine(el) {
+  return el.selectionStart === el.selectionEnd
+    && el.value.indexOf("\n", el.selectionEnd) === -1;
+}
+
+function historyKey(e) {
+  const el = $("line");
+  if (e.key === "ArrowUp" && atFirstLine(el)) {
+    if (!history.length) return false;
+    if (histIdx === null) { draft = el.value; recall(history.length - 1); }
+    else if (histIdx > 0) { recall(histIdx - 1); }
+    return true;
+  }
+  if (e.key === "ArrowDown" && atLastLine(el) && histIdx !== null) {
+    // Walking off the end restores the draft that ↑ interrupted.
+    recall(histIdx + 1 >= history.length ? null : histIdx + 1);
+    return true;
+  }
+  return false;
+}
+$("toast").addEventListener("click", () => { $("toast").hidden = true; });
+
+// `/remote-control` prints http://HOST:PORT/?t=TOKEN and that link is the only
+// way in: the token exists nowhere else, so a page reached without one has
+// nothing to authenticate with and there is no manual entry to fall back to.
+const linkToken = new URLSearchParams(location.search).get("t");
+if (linkToken) {
+  connect();
+} else {
+  setStatus("no token", true);
+  $("line").disabled = true;
+  line("[open the link printed by /rc — this page needs the token from its ?t= parameter]", "error");
+}
 </script>
 </body>
 </html>
