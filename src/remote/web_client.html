@@ -214,6 +214,14 @@ function inline(s) {
   return out.replace(/\u0000(\d+)\u0000/g, (_, i) => "<code>" + codes[Number(i)] + "</code>");
 }
 
+// Joins the lines of one paragraph or blockquote, keeping every newline as a
+// visible break. Strict markdown folds a single newline into a space, but this
+// is a terminal transcript: the model's own line breaks are how its output is
+// laid out, and collapsing them runs consecutive lines together.
+function block(lines) {
+  return inline(lines.join("\n")).replace(/\n/g, "<br>");
+}
+
 // Block structure, line by line. Everything is escaped on the way in, so the
 // only tags in the output are the ones produced here. An unterminated fence
 // still renders as a code block: mid-stream, that is the common case.
@@ -225,14 +233,11 @@ function renderMarkdown(src) {
   let quote = [];
 
   const closePara = () => {
-    if (para.length) { out.push("<p>" + inline(para.join("\n")) + "</p>"); para = []; }
+    if (para.length) { out.push("<p>" + block(para) + "</p>"); para = []; }
   };
   const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
   const closeQuote = () => {
-    if (quote.length) {
-      out.push("<blockquote>" + inline(quote.join("\n")) + "</blockquote>");
-      quote = [];
-    }
+    if (quote.length) { out.push("<blockquote>" + block(quote) + "</blockquote>"); quote = []; }
   };
   const closeAll = () => { closePara(); closeList(); closeQuote(); };
 
