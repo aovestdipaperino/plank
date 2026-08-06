@@ -3156,6 +3156,43 @@ mod tests {
         );
     }
 
+    /// A fenced code block that opens on the line directly after a paragraph —
+    /// no blank line between, which `CommonMark` §4.5 allows and which is how
+    /// prose normally introduces a code sample — must still render *after* that
+    /// paragraph.
+    ///
+    /// `ratatui-markdown` 0.3.6 parsed the block ahead of the paragraph, so an
+    /// assistant message showed its code sample above the line introducing it.
+    /// Fixed in the pinned fork; this pins the behaviour plank depends on, so a
+    /// future dependency bump that regresses it fails here rather than on
+    /// screen.
+    #[test]
+    fn a_fence_after_a_paragraph_renders_below_it() {
+        let mut log = OutputLog::new();
+        // Through the real streaming sink, the way a turn feeds it.
+        crate::viz::RenderSink::visible_text(&mut log, "Run it with:\n```sh\ncd local\n```\n");
+        log.end_line();
+
+        let rows: Vec<String> = log
+            .to_text()
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        let intro = rows
+            .iter()
+            .position(|r| r.contains("Run it with:"))
+            .unwrap_or_else(|| panic!("intro line missing: {rows:?}"));
+        let code = rows
+            .iter()
+            .position(|r| r.contains("cd local"))
+            .unwrap_or_else(|| panic!("code line missing: {rows:?}"));
+        assert!(
+            intro < code,
+            "paragraph must precede its code block: {rows:?}"
+        );
+    }
+
     /// The brain blinks only while a local pass is in flight, and the dark half
     /// is the glyph's own width in spaces so the bar never reflows. This is the
     /// only signal that says *which* engine is working, so it has to hold still
