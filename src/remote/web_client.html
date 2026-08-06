@@ -43,6 +43,9 @@
   .where b { color: var(--pine); font-weight: 700; }
   .where .sep { opacity: .5; margin: 0 .35em; }
   #status { font-size: .85em; color: var(--bark-soft); margin-left: auto; }
+  /* A dropped socket is not a status detail: nothing typed after it goes
+     anywhere, so it reads as an error, not as small print. */
+  #status.dead { color: var(--coral); font-weight: 700; }
   #log {
     flex: 1 1 auto; overflow-y: auto; padding: .75rem;
     word-break: break-word; line-height: 1.45;
@@ -116,6 +119,7 @@
     min-height: 5.2em; max-height: 14em; line-height: 1.4;
   }
   form.input textarea::placeholder { color: var(--bark-soft); }
+  form.input textarea:disabled { opacity: .5; cursor: not-allowed; }
   form.input button { padding: .4rem .9rem; cursor: pointer; }
   form.input button:hover:not(:disabled) { border-color: var(--honey); }
   form.input #stop:hover:not(:disabled) { border-color: var(--coral); color: var(--coral); }
@@ -167,7 +171,10 @@ let highestId = null;
 // is optimistic: we assume the request landed and a `control_denied` reverts it.
 let controller = false;
 
-function setStatus(s) { $("status").textContent = s; }
+function setStatus(s, dead) {
+  $("status").textContent = s;
+  $("status").classList.toggle("dead", !!dead);
+}
 
 // Reflects the control role in the header hint.
 function setRole(isController) {
@@ -198,7 +205,7 @@ let turnRunning = false;
 const RUNNING_STATES = ["prefill", "generating", "compacting", "saving"];
 
 function updateButtons() {
-  const live = !!ws && ws.readyState === WebSocket.OPEN;
+  const live = !!ws && ws.readyState === WebSocket.OPEN && !$("line").disabled;
   $("send").disabled = !live || !$("line").value.trim();
   $("stop").disabled = !live || !turnRunning;
 }
@@ -540,17 +547,23 @@ function connect() {
   };
   sock.onclose = (ev) => {
     if (sock !== ws) return;
-    setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""));
+    setStatus("disconnected" + (ev.code ? " (" + ev.code + ")" : ""), true);
     // parked button: $("interrupt").disabled = true;
     // parked button: $("control").disabled = true;
     $("role").textContent = "";
     controller = false;
     turnRunning = false;
+    // Nothing typed from here reaches the agent — `/rc off`, a quit, or a
+    // dropped tunnel all land here — so take the prompt away rather than let it
+    // accept text that goes nowhere. There is no reconnect: the token died with
+    // the server, and a fresh `/rc` prints a fresh link.
+    $("line").disabled = true;
+    $("line").placeholder = "disconnected — run /rc again for a new link";
     updateButtons();
   };
   sock.onerror = () => {
     if (sock !== ws) return;
-    setStatus("error");
+    setStatus("error", true);
   };
 }
 
@@ -680,7 +693,8 @@ const linkToken = new URLSearchParams(location.search).get("t");
 if (linkToken) {
   connect();
 } else {
-  setStatus("no token");
+  setStatus("no token", true);
+  $("line").disabled = true;
   line("[open the link printed by /rc — this page needs the token from its ?t= parameter]", "error");
 }
 </script>
