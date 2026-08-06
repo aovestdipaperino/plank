@@ -2302,11 +2302,19 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // the one on-screen signal that says which engine is actually working, which
     // is otherwise invisible for a `provider: local` sidechain under a remote
     // main agent. The blink dims rather than blanks, so nothing shifts width.
+    //
+    // Phased off the pass's own elapsed time rather than `tick_ms`: the status
+    // bar redraws when a prefill/generation event lands — the same event that
+    // moves the `9s` and `t/s` readouts — so tying the blink to that interval
+    // keeps the two in step and makes every pass start on a lit brain.
+    // `tick_ms == 0` still means reduced motion, and there the brain holds lit.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        let lit = !crate::status::local_pass_active() || crate::status::brain_blink_on(tick_ms);
+        let lit = !crate::status::local_pass_active()
+            || crate::anim::reduced_motion()
+            || crate::status::brain_blink_on(crate::status::local_pass_ms());
         if lit {
             spans.push(Span::styled(segment.to_string(), base));
         } else {
@@ -3147,14 +3155,17 @@ mod tests {
     /// than disappears so the bar never changes width. This is the only signal
     /// that says *which* engine is working, so it has to be off when nothing
     /// local is running and it has to actually alternate when something is.
+    ///
+    /// The phase comes from the pass's own elapsed time, not from `tick_ms` —
+    /// so the sweep here backdates the pass start rather than moving the clock.
     #[test]
     fn the_brain_blinks_only_while_a_local_pass_runs() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
         let dim = Color::Indexed(240);
         let text = format!("~/x | {mark} med | ctx 12% | generating");
-        let brain_style = |tick: u64| -> Option<Color> {
-            status_bar_lines(&text, tick, base, &TaskView::default())
+        let brain_style = || -> Option<Color> {
+            status_bar_lines(&text, 0, base, &TaskView::default())
                 .into_iter()
                 .flat_map(|l| l.spans)
                 .find(|sp| sp.content.contains(mark))
@@ -3163,31 +3174,46 @@ mod tests {
                 .fg
         };
 
-        // Idle: lit at every phase of the clock.
+        // Idle: lit, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        for step in 0..8u64 {
-            assert_ne!(
-                brain_style(step * crate::status::BRAIN_BLINK_MS / 4),
-                Some(dim),
-                "no blink when nothing local is running"
-            );
-        }
+        assert_ne!(
+            brain_style(),
+            Some(dim),
+            "no blink when nothing local is running"
+        );
 
-        // A local pass in flight: both phases appear across one cycle.
+        // A local pass in flight: both phases appear across one cycle. A pass
+        // starts lit, which is the point of phasing off its own clock.
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
+            assert_ne!(brain_style(), Some(dim), "a pass starts on a lit brain");
             let phases: Vec<_> = (0..8u64)
-                .map(|step| brain_style(step * crate::status::BRAIN_BLINK_MS / 8))
+                .map(|step| {
+                    crate::status::set_local_pass_ms(step * crate::status::BRAIN_BLINK_MS / 8);
+                    brain_style()
+                })
                 .collect();
             assert!(phases.contains(&Some(dim)), "{phases:?}");
             assert!(phases.iter().any(|c| *c != Some(dim)), "{phases:?}");
+
+            // Reduced motion collapses the blink to its static form like every
+            // other effect: lit, even mid-cycle where it would otherwise be
+            // dark. Asserted here rather than in a test of its own — both the
+            // reduced-motion toggle and the local-pass flag are process-global,
+            // so two tests holding them would race under the default harness.
+            crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
+            assert_eq!(brain_style(), Some(dim), "the phase used for the check");
+            crate::anim::set_reduced_motion(true);
+            let still_lit = brain_style() != Some(dim);
+            crate::anim::set_reduced_motion(false);
+            assert!(still_lit, "reduced motion holds the brain lit");
         }
 
         // And the guard's drop ends it, so a finished pass cannot leave the bar
         // blinking forever.
         assert!(!crate::status::local_pass_active());
-        assert_ne!(brain_style(0), Some(dim));
+        assert_ne!(brain_style(), Some(dim));
     }
 
     /// The bar is two rows: row one is the directory and branch and nothing

@@ -629,6 +629,10 @@ pub fn local_pass_active() -> bool {
     LOCAL_PASS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// When the live local pass began, as milliseconds on [`crate::anim`]'s shared
+/// epoch. Meaningless unless `LOCAL_PASS` is set.
+static LOCAL_PASS_SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Marks a local-engine pass as running for as long as the guard lives.
 ///
 /// A guard rather than a set/clear pair for the same reason [`ToolActivity`] is
@@ -641,6 +645,12 @@ impl LocalPass {
     /// Marks a pass as local; the returned guard clears it.
     #[must_use]
     pub fn begin() -> Self {
+        #[cfg(test)]
+        LOCAL_PASS_OVERRIDE.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+        LOCAL_PASS_SINCE.store(
+            crate::anim::epoch_ms(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         LOCAL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -651,6 +661,44 @@ impl Drop for LocalPass {
         LOCAL_PASS.store(false, std::sync::atomic::Ordering::Relaxed);
     }
 }
+
+/// Milliseconds the live local pass has been running, or `0` when none is.
+///
+/// This — not the free-running animation clock — is what phases the brain
+/// blink, so the blink is a function of *the pass's own elapsed time*: the same
+/// quantity the status bar's `9s` and `t/s` readouts are computed from. A pass
+/// therefore always starts on a lit brain and blinks in step with its own
+/// counters, rather than picking up whatever phase the shared clock happened to
+/// be in when it started.
+#[must_use]
+pub fn local_pass_ms() -> u64 {
+    if !local_pass_active() {
+        return 0;
+    }
+    #[cfg(test)]
+    {
+        let pinned = LOCAL_PASS_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if pinned != u64::MAX {
+            return pinned;
+        }
+    }
+    crate::anim::epoch_ms()
+        .saturating_sub(LOCAL_PASS_SINCE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Pins how long the live local pass has been running, so a test can place the
+/// blink at a chosen phase without sleeping through one. Cleared by the next
+/// [`LocalPass::begin`].
+#[cfg(test)]
+pub(crate) fn set_local_pass_ms(ms: u64) {
+    LOCAL_PASS_OVERRIDE.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test override for [`local_pass_ms`]; `u64::MAX` means "not overridden", a
+/// value no real pass can reach.
+#[cfg(test)]
+static LOCAL_PASS_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// How long one on/off cycle of the local-engine brain blink takes. Slower than
 /// the tool blink: this is a reassurance, not an alert, and a fast pulse next to

@@ -1490,6 +1490,10 @@ impl Agent<'_> {
                 },
             ),
         };
+        // See the matching guard in `worker_generate_kind`: the plain REPL has
+        // no blinking brain to drive, but the flag is process-global and a
+        // remote client attached to this session renders off it.
+        let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(sink);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
@@ -6567,6 +6571,12 @@ impl Agent<'_> {
         if is_main {
             let _ = tx.send(UiEvent::MainCheckpoint);
         }
+        // Held for the whole pass — prefill included, which is most of the wait
+        // — so the status bar's brain blinks while *this* engine works. Taken
+        // here rather than only in `generate_pass`: that one covers the quiet
+        // and fan-out passes, and this is the path every ordinary TUI turn (and
+        // every `/subagent` sidechain) actually runs through.
+        let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
