@@ -241,6 +241,49 @@ pub fn plan(
     tiers
 }
 
+/// Restores `tier`'s checkpoint into `engine`, or leaves the engine cold.
+/// Returns whether the KV was restored.
+///
+/// The restore leg of [`warm`] without its prefill leg, for callers that must
+/// not pay a cold prefill *here*. `warm_sync` prefills uninterruptibly
+/// (`interrupt: &|| false`) and reports progress only through the sink it is
+/// given, so a caller with no progress sink — or one holding a thread the UI
+/// draws on — turns a cold cache into a freeze with no output and no way to
+/// cancel. Skipping it leaves the tokens to whichever pass needs them first,
+/// where the ordinary prefill bar and the interrupt already work.
+///
+/// The engine is left untouched on a miss: `warm_reset` runs only once a
+/// checkpoint is in hand, so a cold engine keeps an empty warm buffer rather
+/// than one describing a prefix its KV does not hold.
+///
+/// # Errors
+/// Returns [`EngineError`] only when the engine itself fails. A missing or
+/// unloadable checkpoint is a miss, not an error.
+pub fn restore(
+    engine: &mut dyn Engine,
+    store: Option<&SessionStore>,
+    tier: &TierSpec,
+) -> Result<bool, EngineError> {
+    let Some(cache) = tier
+        .key
+        .as_ref()
+        .zip(store)
+        .and_then(|(key, store)| store.kv_load(key))
+    else {
+        return Ok(false);
+    };
+    engine.warm_reset(&tier.text)?;
+    if engine.set_kv(&cache).is_err() {
+        return Ok(false);
+    }
+    // Same reason as the `i < resume` branch in `warm`: the engine's cumulative
+    // token buffer must describe the whole restored prefix, or the next sync
+    // sees a common prefix shorter than the buffer and throws the restored KV
+    // away. The system tier's tokens are already there from `warm_reset`.
+    engine.warm_append(None)?;
+    Ok(true)
+}
+
 /// Warms the KV cache over `tiers` (built by [`plan`], most-stable-first).
 ///
 /// Walks deepest-first for the first tier whose checkpoint loads clean,
@@ -713,7 +756,7 @@ impl crate::engine::Engine for SpyEngine {
 
 #[cfg(test)]
 mod warm_tests {
-    use super::{TierKind, TierSpec, plan, system_fingerprint, warm};
+    use super::{TierKind, TierSpec, plan, restore, system_fingerprint, warm};
     use std::path::Path;
 
     use super::SpyEngine;
@@ -727,6 +770,41 @@ mod warm_tests {
     fn tiers_for(system: &str, stable: &str, volatile: &str) -> Vec<TierSpec> {
         let fp1 = system_fingerprint("m", system, crate::engine::ThinkMode::default(), 0);
         plan(&fp1, system, stable, volatile, "", Some(Path::new("/p")))
+    }
+
+    /// `restore` is the restore leg alone. On a miss it must leave the engine
+    /// completely untouched — no `warm_reset` — so a cold engine keeps an empty
+    /// warm buffer instead of one describing a prefix its KV does not hold, and
+    /// the pass that needs those tokens prefills them itself.
+    #[test]
+    fn restore_leaves_a_cold_engine_untouched_and_never_prefills() {
+        let (store, dir) = spy_store("restore-miss");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+
+        assert!(!restore(&mut e, Some(&store), &tiers[0]).unwrap(), "a miss");
+        assert_eq!(e.reset_to, None, "the engine was not touched at all");
+        assert!(e.appended.is_empty());
+        assert!(e.synced.is_empty(), "restore never prefills");
+
+        // Seed the checkpoint the way a local-main session would, then re-run:
+        // now it restores, still without prefilling.
+        warm(&mut e, Some(&store), &tiers[..1], &mut |_| {}, &mut |_| {}).unwrap();
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        assert!(restore(&mut e, Some(&store), &tiers[0]).unwrap(), "a hit");
+        assert_eq!(e.reset_to.as_deref(), Some("SYSTEM"));
+        assert_eq!(e.restored.len(), 1);
+        // The buffer describes the restored prefix, or the next sync would
+        // throw the restored KV away.
+        assert_eq!(e.appended, vec![None]);
+        assert!(e.synced.is_empty(), "restore never prefills");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

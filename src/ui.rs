@@ -4485,26 +4485,27 @@ the original is frozen and listed in /tree"
     /// tokens the sidechain's prompt does not contain, and the sync would have
     /// to walk back out of them.
     ///
-    /// Best-effort and silent on a hit; a miss prefills once and persists the
-    /// checkpoint, so the cost is paid at most once per system prompt across
-    /// *all* sessions — including ordinary local-main ones, which key Tier 1
-    /// identically. The note is post-hoc because `kvtier::warm` only knows a
-    /// tier is cold once the restore leg has already missed.
+    /// Restore only, never prefill: on a miss the engine is left cold and the
+    /// sidechain's own pass prefills it, with the progress bar and the interrupt
+    /// that a pass has and this call does not. Prefilling here froze the front
+    /// end for the length of a cold system prompt — `warm_sync` cannot be
+    /// interrupted, and on the TUI `/subagent` path this runs on the thread that
+    /// draws (see [`kvtier::restore`](crate::kvtier::restore)).
+    ///
+    /// The consequence is that nothing writes a Tier 1 checkpoint for the local
+    /// engine when the main agent is a provider — a provider never warms — so
+    /// the hit depends on an ordinary local-main session having written one.
+    /// That is the common case, and paying a *visible* prefill when it has not
+    /// is strictly better than the freeze.
     fn warm_alt_local(&self, engine: &mut dyn Engine) {
-        let mut tiers = self.kv_tiers_for(&engine.model_name());
-        tiers.truncate(1);
-        if tiers.first().map(|t| t.kind) != Some(crate::kvtier::TierKind::System) {
+        let tiers = self.kv_tiers_for(&engine.model_name());
+        let Some(system) = tiers
+            .first()
+            .filter(|t| t.kind == crate::kvtier::TierKind::System)
+        else {
             return;
-        }
-        let prefilled = std::cell::Cell::new(false);
-        let _ = crate::kvtier::warm(engine, Some(&self.store), &tiers, &mut |_| {}, &mut |_| {
-            prefilled.set(true);
-        });
-        if prefilled.get() {
-            self.emit_sub(crate::worker::UiEvent::Dim(
-                "[local engine: system prompt prefilled and cached for next time]".to_owned(),
-            ));
-        }
+        };
+        let _ = crate::kvtier::restore(engine, Some(&self.store), system);
     }
 
     fn take_alt_engine(&mut self, spec: &crate::agents::AgentEngine) -> Result<AltEngine, String> {
