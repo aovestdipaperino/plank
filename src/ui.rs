@@ -6048,11 +6048,18 @@ impl Agent<'_> {
             .rev()
             .find(|m| m.role == crate::session::Role::Assistant)
             .map_or("", |m| m.text.as_str());
-        crate::notify::notify_sticky(
-            &crate::notify::finished_title(prompt, interrupted),
-            None,
-            &crate::notify::latest_output_body(output, interrupted),
-        );
+        let title = crate::notify::finished_title(prompt, interrupted);
+        let body = crate::notify::latest_output_body(output, interrupted);
+        // Attached remote front-ends raise their own notification from this:
+        // the local desktop one only reaches whoever is at this machine, which
+        // is exactly the person a remote session is not.
+        if let Some(r) = &self.remote {
+            r.bus.broadcast(UiEvent::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            });
+        }
+        crate::notify::notify_sticky(&title, None, &body);
     }
 
     /// Compacts before a TUI turn when context is tight; progress goes to

@@ -39,6 +39,9 @@
   }
   header button:hover:not(:disabled) { border-color: var(--honey); }
   #role { color: var(--honey); font-size: .85em; }
+  .where { font-size: .85em; color: var(--bark-soft); }
+  .where b { color: var(--pine); font-weight: 700; }
+  .where .sep { opacity: .5; margin: 0 .35em; }
   #status { font-size: .85em; color: var(--bark-soft); margin-left: auto; }
   #log {
     flex: 1 1 auto; overflow-y: auto; padding: .75rem;
@@ -108,6 +111,9 @@
   <!-- <button id="interrupt" disabled>interrupt</button> -->
   <!-- <button id="control" disabled>take control</button> -->
   <span id="role" class="dim"></span>
+  <!-- The footer's "where am I?" segments, in the footer's own order:
+       dir ⑂ branch | origin | 🧠 think. Filled from every status frame. -->
+  <span id="where" class="where"></span>
   <span id="status">disconnected</span>
 </header>
 <div id="log" aria-live="polite"></div>
@@ -145,8 +151,86 @@ function setRole(isController) {
   $("role").textContent = isController ? "controller" : "mirror";
 }
 
+// The footer's dir/branch/origin/think segments, in the footer's order. Every
+// status frame carries them, so a client attaching mid-session gets them from
+// the first one rather than waiting for something to change.
+function setWhere(s) {
+  const seg = [];
+  if (s.cwd) seg.push(esc(s.cwd) + (s.branch ? " ⑂ <b>" + esc(s.branch) + "</b>" : ""));
+  if (s.origin) seg.push(esc(s.origin));
+  if (s.think) seg.push("🧠 " + esc(s.think));
+  $("where").innerHTML = seg.join('<span class="sep">|</span>');
+}
+
 function atBottom() {
   return logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+}
+
+// The turn finished. A browser tab is not a terminal the operator is staring
+// at, so say so three ways, cheapest first: the tab title always flashes, a
+// bell rings if the page has been interacted with (autoplay rules), and a real
+// desktop notification is raised when permission is already granted.
+//
+// Permission is never requested on load — browsers reject a request without a
+// user gesture, and a modal on first paint is hostile. It is asked for once,
+// on the first prompt the operator sends, which is both a gesture and the
+// moment the answer becomes something worth being told about.
+let pendingTitle = null;
+
+function notify(title, body) {
+  line("[" + title + "]", "dim");
+  if (document.hidden) {
+    pendingTitle = title;
+    document.title = "● " + title;
+  }
+  bell();
+  if (window.Notification && Notification.permission === "granted") {
+    try {
+      new Notification(title, { body: body, icon: "/logo.png", tag: "plank-turn" });
+    } catch (_) { /* some browsers refuse a constructed Notification; the title flash stands */ }
+  }
+}
+
+// Restore the tab title once the operator actually looks at the page.
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && pendingTitle !== null) {
+    pendingTitle = null;
+    document.title = "plank remote";
+  }
+});
+
+// A short blip through WebAudio: no asset to embed, and nothing to load.
+// Silently does nothing until the page has been interacted with.
+let audioCtx = null;
+
+function bell() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = audioCtx || new Ctx();
+    if (audioCtx.state !== "running") return;
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.frequency.value = 880;
+    gain.gain.setValueAtTime(0.0001, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.05, audioCtx.currentTime + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.18);
+    osc.connect(gain).connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.2);
+  } catch (_) { /* audio is a courtesy, never a failure */ }
+}
+
+// Called from the first prompt the operator sends: a user gesture, so both the
+// permission prompt and the audio context are allowed to start here.
+function armNotifications() {
+  if (window.Notification && Notification.permission === "default") {
+    Notification.requestPermission().catch(() => {});
+  }
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (Ctx) { audioCtx = audioCtx || new Ctx(); audioCtx.resume().catch(() => {}); }
+  } catch (_) { /* no audio, no problem */ }
 }
 
 function append(text, cls) {
@@ -318,10 +402,14 @@ function handleServerMsg(f) {
     case "main_rollback": break;
     case "status": {
       const s = f.status;
+      setWhere(s);
       setStatus(s.state + "  ctx " + s.ctx_used + "/" + s.ctx_size +
         (s.gen_tps ? "  " + s.gen_tps.toFixed(1) + " tok/s" : ""));
       break;
     }
+    // Not transcript text: the turn finished, so raise a notification the way
+    // the local session raises a desktop one.
+    case "notify": notify(f.title, f.body); break;
     // Any refusal means we are not the controller, whatever we assumed.
     case "control_denied":
       line("[denied: " + f.reason + "]", "error");
@@ -406,6 +494,9 @@ $("inputForm").addEventListener("submit", (e) => {
   const text = el.value;
   if (!text) return;
   const kind = $("kind").value; // prompt | command | btw
+  // This submit is the user gesture browsers require before a notification
+  // permission prompt or an audio context is allowed.
+  armNotifications();
   send({ type: kind, text });
   el.value = "";
 });

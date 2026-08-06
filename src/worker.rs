@@ -46,6 +46,17 @@ pub enum UiEvent {
     Plain(String),
     /// A user-echo line (queued prompts, `/btw` questions).
     UserEcho(String),
+    /// The turn finished: the same headline and body the local desktop
+    /// notification carries, so an attached remote front-end can raise its own
+    /// (a browser notification, a bell, a title flash) instead of the operator
+    /// having to watch the page. Carries no on-screen text — the local UI
+    /// already showed the turn — so the TUI ignores it.
+    Notify {
+        /// Notification headline (the prompt, or that the turn was interrupted).
+        title: String,
+        /// Notification body (the tail of the answer).
+        body: String,
+    },
     /// Terminates the in-progress rendered line.
     EndLine,
     /// Worker progress snapshot for the status footer.
@@ -417,7 +428,10 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
         UiEvent::EndLine => log.end_line(),
-        UiEvent::Status(_)
+        // `Notify` is for remote front-ends only: locally the desktop
+        // notification has already fired and the turn is on screen.
+        UiEvent::Notify { .. }
+        | UiEvent::Status(_)
         | UiEvent::Tasks(_)
         | UiEvent::BtwBegin
         | UiEvent::BtwEnd

@@ -257,6 +257,12 @@ fn render_server_msg(msg: &ServerMsg) {
         ServerMsg::ControlDenied { reason } => {
             let _ = writeln!(out, "[control denied: {reason}]");
         }
+        // A terminal has no notification centre, so the turn-finished event
+        // becomes a line plus a BEL — enough for a terminal that flags the tab
+        // on a bell, and harmless in one that does not.
+        ServerMsg::Notify { title, .. } => {
+            let _ = writeln!(out, "\x07[{title}]");
+        }
         ServerMsg::Bye { reason } => {
             let _ = writeln!(out, "[server: {reason}]");
         }

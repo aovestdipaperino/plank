@@ -125,6 +125,14 @@ pub struct StatusWire {
     pub ctx_size: i32,
     /// Error text (empty unless `state == "error"`).
     pub error: String,
+    /// Working directory label, home collapsed to `~` (the footer's dir prefix).
+    pub cwd: String,
+    /// Current git branch, empty outside a repo.
+    pub branch: String,
+    /// Engine origin: a provider or remote host, else `(local)`.
+    pub origin: String,
+    /// Reasoning level short name (`off`, `low`, `med`, `high`, `max`).
+    pub think: String,
 }
 
 fn state_name(s: WorkerState) -> &'static str {
@@ -152,6 +160,15 @@ impl From<&Status> for StatusWire {
             ctx_used: s.ctx_used,
             ctx_size: s.ctx_size,
             error: s.error.clone(),
+            // The footer's "where am I?" segments. They are process-wide rather
+            // than per-snapshot, but they ride along here so a remote front-end
+            // can show the same header the local footer does without a second
+            // frame kind — and so a client attaching mid-session learns them
+            // from the first status frame instead of only on a change.
+            cwd: crate::status::cwd_label(),
+            branch: crate::status::git_branch_label().unwrap_or_default(),
+            origin: crate::status::engine_origin_label().to_owned(),
+            think: s.think.short_name().to_owned(),
         }
     }
 }
@@ -247,6 +264,15 @@ pub enum ServerMsg {
         /// Total task count.
         total: usize,
     },
+    /// The turn finished. Carries the same headline and body as the local
+    /// desktop notification so an attached client can raise its own; it is not
+    /// transcript text and must not be logged as output.
+    Notify {
+        /// Notification headline.
+        title: String,
+        /// Notification body.
+        body: String,
+    },
     /// A control request from a non-controller was refused.
     ControlDenied {
         /// Human-readable reason.
@@ -282,6 +308,10 @@ impl ServerMsg {
                 text: p.to_ansi(true),
             },
             UiEvent::Plain(t) => Self::Plain { text: t.clone() },
+            UiEvent::Notify { title, body } => Self::Notify {
+                title: title.clone(),
+                body: body.clone(),
+            },
             UiEvent::UserEcho(t) => Self::UserEcho { text: t.clone() },
             UiEvent::EndLine => Self::EndLine,
             UiEvent::BtwBegin => Self::BtwBegin,
@@ -1365,6 +1395,41 @@ mod tests {
     use super::*;
 
     // --- protocol round-trip ---
+
+    /// The end-of-turn notification crosses the wire: locally it is a desktop
+    /// notification, which reaches only whoever is at that machine.
+    #[test]
+    fn notify_event_reaches_the_wire_with_both_fields() {
+        let ev = UiEvent::Notify {
+            title: "finished: rename the thing".into(),
+            body: "…done.".into(),
+        };
+        let Some(msg) = ServerMsg::from_event(&ev) else {
+            panic!("notify must have a wire representation");
+        };
+        let json = ServerFrame::control(msg).to_json().unwrap();
+        assert!(json.contains(r#""type":"notify""#), "{json}");
+        assert!(json.contains("finished: rename the thing"), "{json}");
+        assert!(json.contains("…done."), "{json}");
+    }
+
+    /// A remote header shows the same "where am I?" segments as the local
+    /// footer, so they ride on every status frame rather than a change event.
+    #[test]
+    fn status_wire_carries_the_footer_segments() {
+        let st = Status {
+            think: crate::engine::ThinkMode::Medium,
+            ..Status::default()
+        };
+        let wire = StatusWire::from(&st);
+        assert_eq!(wire.think, "med");
+        assert_eq!(wire.origin, crate::status::engine_origin_label());
+        assert_eq!(wire.cwd, crate::status::cwd_label());
+        assert_eq!(
+            wire.branch,
+            crate::status::git_branch_label().unwrap_or_default()
+        );
+    }
 
     #[test]
     fn from_event_none_for_sub_agent_variants() {
