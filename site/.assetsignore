@@ -1,0 +1,4 @@
+# The guide generator ships with the repo, not with the site: it is a build
+# tool, and Wrangler otherwise uploads every file under the assets directory —
+# publishing it at https://plank-agent.dev/build-guide.py.
+build-guide.py
