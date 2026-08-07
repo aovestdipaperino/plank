@@ -1,7 +1,8 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Builds the ds4 C engine from the `refs/ds4` submodule on macOS.
+//! Builds the ds4 C engine from the `refs/ds4` submodule on macOS, and packs
+//! the minions sprite sheet.
 //!
 //! Produces `libds4core.a` from the Metal-backend objects and links the
 //! required frameworks. On other platforms (or if the submodule is missing)
@@ -11,7 +12,14 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The sprite codec, compiled here as well as into the crate so the encoder
+/// that runs at build time and the decoder that runs in the binary are one
+/// piece of code rather than two that agree today.
+#[path = "src/arcade/minions/codec.rs"]
+mod minions_codec;
+
 fn main() {
+    pack_minions();
     println!("cargo:rustc-check-cfg=cfg(ds4_engine)");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
@@ -67,4 +75,48 @@ fn main() {
     ] {
         println!("cargo:rerun-if-changed={}", ds4.join(f).display());
     }
+}
+
+/// Packs `src/resources/minions.txt` into the blob the binary carries.
+///
+/// The readable sheet stays in the repository and out of the executable: what
+/// ships is the delta-and-run coding of it, decoded once when the screensaver
+/// first comes up. The two sizes are emitted alongside it as consts so the
+/// module can state its own footprint instead of a number in a comment going
+/// stale — see `src/arcade/minions.rs`.
+///
+/// The round-trip is asserted here rather than only in the test suite: a blob
+/// that does not decode back to the sheet must fail the build, not draw
+/// garbage at three in the morning on an idle terminal.
+fn pack_minions() {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let sheet = Path::new(&manifest).join("src/resources/minions.txt");
+    println!("cargo:rerun-if-changed={}", sheet.display());
+    println!("cargo:rerun-if-changed=src/arcade/minions/codec.rs");
+    let text = std::fs::read_to_string(&sheet)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", sheet.display()));
+    let cells =
+        minions_codec::parse_sheet(&text).unwrap_or_else(|e| panic!("{}: {e}", sheet.display()));
+    let blob = minions_codec::encode(&cells);
+    assert_eq!(
+        minions_codec::decode(&blob),
+        cells,
+        "the packed sprite sheet does not decode back to the art"
+    );
+
+    let out = std::env::var("OUT_DIR").unwrap();
+    let out = Path::new(&out);
+    std::fs::write(out.join("minions.bin"), &blob).expect("cannot write the sprite blob");
+    std::fs::write(
+        out.join("minions_stats.rs"),
+        format!(
+            "/// Ink codes in the sheet: one byte per cell, before packing.\n\
+             pub const SHEET_BYTES: usize = {};\n\
+             /// Bytes the packed sheet occupies in the executable.\n\
+             pub const BLOB_BYTES: usize = {};\n",
+            cells.len(),
+            blob.len()
+        ),
+    )
+    .expect("cannot write the sprite stats");
 }

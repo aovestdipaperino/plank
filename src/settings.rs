@@ -129,7 +129,7 @@ pub struct UiSettings {
     /// games this is not an easter egg, so `ui.easterEggs` does not gate it.
     pub screensaver: crate::arcade::ScreensaverDelay,
     /// Which ambient screen the screensaver puts up: the matrix rain, the
-    /// starfield, or a fresh coin flip each time.
+    /// starfield, the minions, or a fresh draw each time.
     pub screensaver_face: crate::arcade::ScreensaverFace,
     /// Whether the arcade easter eggs (`/pelota`, …) exist. On by
     /// default. Turned off they are not merely hidden — they stop being known
@@ -1002,6 +1002,7 @@ mod tests {
             ("rain", ScreensaverFace::Matrix),
             ("starfield", ScreensaverFace::Starfield),
             ("stars", ScreensaverFace::Starfield),
+            ("minions", ScreensaverFace::Minions),
             ("random", ScreensaverFace::Random),
             ("either", ScreensaverFace::Random),
             ("  MATRIX  ", ScreensaverFace::Matrix),
