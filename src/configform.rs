@@ -204,7 +204,7 @@ pub static FIELDS: &[Field] = &[
         FieldId::UiScreensaverFace,
         "ui",
         "screensaverFace",
-        "which screensaver: matrix, starfield, random",
+        "which screensaver: matrix, starfield, minions, random",
         Kind::Bool,
     ),
     f(
@@ -458,7 +458,9 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         FieldId::UiScreensaverFace => {
             s.ui.screensaver_face =
                 crate::arcade::ScreensaverFace::parse(raw).ok_or_else(|| {
-                    format!("screensaverFace must be matrix, starfield, or random (got {raw})")
+                    format!(
+                        "screensaverFace must be matrix, starfield, minions, or random (got {raw})"
+                    )
                 })?;
         }
         FieldId::EngineThinkingToolCalls

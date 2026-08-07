@@ -1,13 +1,15 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Hidden arcade: five games, a matrix rain and a perspective starfield.
+//! Hidden arcade: five games, a matrix rain, a perspective starfield and two
+//! minions.
 //!
-//! The games and the rain are easter eggs behind `/pelota` and friends. None is
-//! listed in [`crate::config::usage`] nor offered by the completion popup —
-//! that is the point — but all are known commands, so the dispatcher runs them
-//! instead of forwarding the line to the model. The starfield and the rain are
-//! also what the idle screensaver puts up, which is not gated at all.
+//! The games, the rain and the minions are easter eggs behind `/pelota` and
+//! friends. None is listed in [`crate::config::usage`] nor offered by the
+//! completion popup — that is the point — but all are known commands, so the
+//! dispatcher runs them instead of forwarding the line to the model. The three
+//! ambient screens are also what the idle screensaver puts up, which is not
+//! gated at all.
 //!
 //! # Design
 //!
@@ -34,6 +36,7 @@ pub mod centipede;
 pub mod frogger;
 pub mod invaders;
 pub mod matrix;
+pub mod minions;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
@@ -972,10 +975,12 @@ impl Sound {
 /// Which easter egg is open.
 #[derive(Debug)]
 pub enum Game {
-    /// A starfield: the screensaver's first face (`ui.screensaver`).
+    /// A starfield: one of the screensaver's faces (`ui.screensaverFace`).
     Stars(Starfield),
-    /// Falling glyphs: `/matrix`, and the screensaver's other face.
+    /// Falling glyphs: `/matrix`, and one of the screensaver's faces.
     Matrix(matrix::Rain),
+    /// Two minions by a lake: `/minions`, and one of the screensaver's faces.
+    Minions(Box<minions::Skit>),
     /// `/pelota`
     Pelota(Box<Pelota>),
     /// `/breakout`
@@ -992,19 +997,20 @@ impl Game {
     /// Whether this is weather rather than a game: something to watch, with no
     /// score, no ending and no state a player could come back to.
     ///
-    /// The cabinet uses this to decide *not* to park one — resuming rain would
-    /// be indistinguishable from fresh rain, so the slot and the "resumed
-    /// where you left off" notice would both be lies.
+    /// The cabinet uses this to decide *not* to park one — resumed rain is
+    /// indistinguishable from fresh rain and a resumed skit from a fresh skit,
+    /// so both the slot it would take and the "resumed where you left off"
+    /// notice would be lies.
     #[must_use]
     pub const fn ambient(&self) -> bool {
-        matches!(self, Self::Stars(_) | Self::Matrix(_))
+        matches!(self, Self::Stars(_) | Self::Matrix(_) | Self::Minions(_))
     }
 
     /// Whether this game is over, either way. The ambient ones never end.
     #[must_use]
     pub fn finished(&self) -> bool {
         match self {
-            Self::Stars(_) | Self::Matrix(_) => false,
+            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => false,
             Self::Pelota(p) => p.finished(),
             Self::Breakout(b) => b.finished(),
             Self::Invaders(i) => i.finished(),
@@ -1018,7 +1024,7 @@ impl Game {
     pub fn closing_line(&self) -> Option<String> {
         match self {
             // Nothing happened that a scrollback line could report.
-            Self::Stars(_) | Self::Matrix(_) => None,
+            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => None,
             Self::Pelota(p) => Some(format!(
                 "pelota: level {} — {} to {}{}",
                 p.level(),
@@ -1071,7 +1077,7 @@ impl Game {
         match self {
             // No score, no lives, no levels: nothing that could earn a blip,
             // which is what keeps the ambient screens silent even with sound on.
-            Self::Stars(_) | Self::Matrix(_) => Vitals {
+            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => Vitals {
                 score: 0,
                 lives: 0,
                 level: 0,
@@ -1180,7 +1186,7 @@ pub struct Arcade {
     screensaver: bool,
 }
 
-/// How long the TUI sits idle before the starfield screensaver comes up
+/// How long the TUI sits idle before the screensaver comes up
 /// (`ui.screensaver`).
 ///
 /// A short fixed menu rather than a free-form number: the useful range is
@@ -1210,10 +1216,12 @@ pub enum ScreensaverFace {
     Matrix,
     /// A perspective starfield.
     Starfield,
+    /// Two minions on the shore of a night lake.
+    Minions,
     /// Whichever the seed lands on, decided afresh each time the screensaver
     /// opens. This was the behaviour before the setting existed, and it is
-    /// worth keeping reachable: coming back to an idle terminal and finding
-    /// the *other* sky is a small pleasure, and neither face is doing anything
+    /// worth keeping reachable: coming back to an idle terminal and finding a
+    /// *different* screen is a small pleasure, and no face is doing anything
     /// you could be interrupted in the middle of.
     Random,
 }
@@ -1225,17 +1233,19 @@ impl ScreensaverFace {
         match self {
             Self::Matrix => "matrix",
             Self::Starfield => "starfield",
+            Self::Minions => "minions",
             Self::Random => "random",
         }
     }
 
     /// Parses a settings value. `rain` and `stars` are accepted as the names
-    /// people reach for first, and `either` for the coin flip.
+    /// people reach for first, and `either` for the draw.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "matrix" | "rain" => Some(Self::Matrix),
             "starfield" | "stars" => Some(Self::Starfield),
+            "minions" => Some(Self::Minions),
             "random" | "either" => Some(Self::Random),
             _ => None,
         }
@@ -1246,7 +1256,8 @@ impl ScreensaverFace {
     pub const fn cycle(self) -> Self {
         match self {
             Self::Matrix => Self::Starfield,
-            Self::Starfield => Self::Random,
+            Self::Starfield => Self::Minions,
+            Self::Minions => Self::Random,
             Self::Random => Self::Matrix,
         }
     }
@@ -1259,8 +1270,11 @@ impl ScreensaverFace {
     #[must_use]
     fn resolve(self, seed: u64) -> Self {
         match self {
-            Self::Random if Rng::new(seed).next_u64().is_multiple_of(2) => Self::Starfield,
-            Self::Random => Self::Matrix,
+            Self::Random => match Rng::new(seed).next_u64() % 3 {
+                0 => Self::Matrix,
+                1 => Self::Starfield,
+                _ => Self::Minions,
+            },
             concrete => concrete,
         }
     }
@@ -1341,13 +1355,14 @@ pub fn command_of(line: &str) -> Option<&'static str> {
 impl Arcade {
     /// Every command this module answers to. Kept next to [`Self::open`] so the
     /// dispatcher's list and the constructors cannot drift apart.
-    pub const COMMANDS: [&'static str; 6] = [
+    pub const COMMANDS: [&'static str; 7] = [
         "/pelota",
         "/breakout",
         "/invaders",
         "/centipede",
         "/frogger",
         "/matrix",
+        "/minions",
     ];
     /// The argument that throws the parked game away and deals a new one.
     pub const NEW_ARGS: [&'static str; 2] = ["new", "reset"];
@@ -1410,6 +1425,7 @@ impl Arcade {
             "/centipede" => Game::Centipede(Box::new(centipede::Centipede::new(seed))),
             "/frogger" => Game::Frogger(Box::new(frogger::Frogger::new(seed))),
             "/matrix" => Self::rain(seed),
+            "/minions" => Self::minions(seed),
             // `open` has already rejected commands that are not ours, and the
             // starfield is no longer one of them — it is the screensaver now.
             _ => Self::stars(seed, w, h),
@@ -1428,6 +1444,12 @@ impl Arcade {
         Game::Matrix(matrix::Rain::new(seed))
     }
 
+    /// Two minions by a lake. They need no size: the pair walks a normalized
+    /// crossing and the scene is laid out from whatever height it is given.
+    fn minions(seed: u64) -> Game {
+        Game::Minions(Box::new(minions::Skit::new(seed)))
+    }
+
     /// Opens an ambient screen as a screensaver: full screen rather than
     /// translucent, dismissed by any key or mouse event rather than played.
     ///
@@ -1437,7 +1459,7 @@ impl Arcade {
     ///
     /// Which face comes up is [`ScreensaverFace`](crate::settings::UiSettings)
     /// (`ui.screensaverFace`), defaulting to the rain;
-    /// [`ScreensaverFace::Random`] restores the coin flip this used to do
+    /// [`ScreensaverFace::Random`] restores the draw this used to do
     /// unconditionally.
     pub fn open_screensaver(&mut self, seed: u64, w: u16, h: u16) {
         self.open_screensaver_as(crate::settings::active().ui.screensaver_face, seed, w, h);
@@ -1449,7 +1471,8 @@ impl Arcade {
         self.park();
         self.open = Some(match face.resolve(seed) {
             ScreensaverFace::Starfield => Self::stars(seed, w, h),
-            // `resolve` has already collapsed `Random` into one of the two.
+            ScreensaverFace::Minions => Self::minions(seed),
+            // `resolve` has already collapsed `Random` into a concrete face.
             _ => Self::rain(seed),
         });
         self.screensaver = true;
@@ -1517,6 +1540,7 @@ impl Arcade {
         match game {
             Game::Stars(s) => s.step(dt_ms),
             Game::Matrix(m) => m.step(dt_ms),
+            Game::Minions(m) => m.step(dt_ms),
             Game::Pelota(p) => p.step(dt_ms),
             Game::Breakout(b) => b.step(dt_ms),
             Game::Invaders(i) => i.step(dt_ms),
@@ -1534,6 +1558,7 @@ impl Arcade {
         match game {
             Game::Stars(s) => s.glyphs(w, h),
             Game::Matrix(m) => m.glyphs(w, h),
+            Game::Minions(m) => m.glyphs(w, h),
             Game::Pelota(p) => p.glyphs(w, h),
             Game::Breakout(b) => b.glyphs(w, h),
             Game::Invaders(i) => i.glyphs(w, h),
@@ -1555,7 +1580,7 @@ impl Arcade {
             return Some(format!("serve un terminale di almeno {MIN_W}x{MIN_H}"));
         }
         match game {
-            Game::Stars(_) | Game::Matrix(_) => None,
+            Game::Stars(_) | Game::Matrix(_) | Game::Minions(_) => None,
             Game::Pelota(p) => p.banner(),
             Game::Breakout(b) => b.banner(),
             Game::Invaders(i) => i.banner(),
@@ -1585,6 +1610,11 @@ impl Arcade {
                 "↑↓/wheel speed ({:.2}×) · c glyphs ({}) · t {veil} · b {blips}",
                 m.speed(),
                 m.charset().label()
+            ),
+            Game::Minions(m) => format!(
+                "↑↓/wheel pace ({:.2}×) · r scene ({}) · t {veil} · b {blips}",
+                m.speed(),
+                if m.scenery() { "on" } else { "off" }
             ),
             Game::Pelota(p) => {
                 let charge = if p.charged() {
@@ -1633,6 +1663,11 @@ impl Arcade {
                 _ => {}
             },
             Game::Matrix(m) => match ev.kind {
+                MouseEventKind::ScrollUp => m.scale_speed(1.3),
+                MouseEventKind::ScrollDown => m.scale_speed(1.0 / 1.3),
+                _ => {}
+            },
+            Game::Minions(m) => match ev.kind {
                 MouseEventKind::ScrollUp => m.scale_speed(1.3),
                 MouseEventKind::ScrollDown => m.scale_speed(1.0 / 1.3),
                 _ => {}
@@ -1704,6 +1739,15 @@ impl Arcade {
                 // `c` re-letters the rain: the katakana are the point, but a
                 // font without them draws boxes, and this is the way out.
                 KeyCode::Char('c') => m.cycle_charset(),
+                _ => {}
+            },
+            Game::Minions(m) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => m.scale_speed(1.3),
+                KeyCode::Down | KeyCode::Char('j') => m.scale_speed(1.0 / 1.3),
+                // `r` strips the night back to the two of them. Over live
+                // model output every star painted costs a character of the
+                // text underneath, and this is the way to say no.
+                KeyCode::Char('r') => m.toggle_scenery(),
                 _ => {}
             },
             Game::Pelota(p) => {
@@ -2137,6 +2181,41 @@ mod tests {
         );
     }
 
+    /// The minions are weather, not a game: closing them leaves nothing behind
+    /// and takes no slot, so the next `/minions` is a fresh walk rather than a
+    /// resume notice about a thing that has no state.
+    #[test]
+    fn the_minions_are_not_parked() {
+        let mut a = Arcade::new();
+        a.open("/minions", false, 1, 80, 24);
+        assert!(matches!(a.open.as_ref(), Some(Game::Minions(_))));
+        for _ in 0..200 {
+            a.step(50);
+        }
+        assert_eq!(a.close(), None, "the minions left a line in the scrollback");
+        assert!(!a.has_parked("/minions"), "the minions took a parking slot");
+        assert!(a.parked.iter().all(Option::is_none));
+    }
+
+    /// `r` strips the night back to the two of them rather than quitting or
+    /// steering: over live model output it is the difference between a layer
+    /// and a wall.
+    #[test]
+    fn r_toggles_the_minions_scenery() {
+        let mut a = Arcade::new();
+        a.open("/minions", false, 1, 80, 24);
+        let scenery = |a: &Arcade| match a.open.as_ref() {
+            Some(Game::Minions(m)) => m.scenery(),
+            _ => panic!("the minions are not open"),
+        };
+        assert!(scenery(&a), "the scene should start dressed");
+        assert!(matches!(
+            a.handle_key(key(KeyCode::Char('r'))),
+            Outcome::Stay
+        ));
+        assert!(!scenery(&a), "r did not strip the scene");
+    }
+
     #[test]
     fn esc_closes_pelota_with_the_score() {
         let mut a = Arcade::new();
@@ -2199,23 +2278,28 @@ mod tests {
         assert!(a.parked.iter().all(Option::is_none));
     }
 
-    /// Both ambient screens are reachable under `random` — the point of the
-    /// coin flip is that you do not always get the same one.
+    /// Every ambient screen is reachable under `random` — the point of the draw
+    /// is that you do not always get the same one. A face that fell out of
+    /// `resolve` entirely would still leave the other two looking healthy, so
+    /// each is counted rather than merely one being seen.
     #[test]
-    fn the_random_screensaver_shows_both_skies() {
-        let mut stars = 0;
-        let mut rain = 0;
-        for seed in 1..60u64 {
+    fn the_random_screensaver_shows_every_face() {
+        let (mut stars, mut rain, mut minions) = (0, 0, 0);
+        for seed in 1..90u64 {
             let mut a = Arcade::new();
             a.open_screensaver_as(ScreensaverFace::Random, seed, 80, 24);
             assert!(a.is_screensaver());
             match a.open.as_ref() {
                 Some(Game::Stars(_)) => stars += 1,
                 Some(Game::Matrix(_)) => rain += 1,
+                Some(Game::Minions(_)) => minions += 1,
                 _ => panic!("the screensaver opened something playable"),
             }
         }
-        assert!(stars > 5 && rain > 5, "lopsided flip: {stars} vs {rain}");
+        assert!(
+            stars > 5 && rain > 5 && minions > 5,
+            "lopsided draw: {stars} stars, {rain} rain, {minions} minions"
+        );
     }
 
     /// The settings-reading entry point, which the tests above bypass by
@@ -2233,10 +2317,17 @@ mod tests {
 
         // ...and the starfield when asked for.
         settings.ui.screensaver_face = ScreensaverFace::Starfield;
-        crate::settings::install_for_test(settings);
+        crate::settings::install_for_test(settings.clone());
         let mut a = Arcade::new();
         a.open_screensaver(1, 80, 24);
         assert!(matches!(a.open.as_ref(), Some(Game::Stars(_))));
+
+        // ...and the minions, which reach the screen the same way.
+        settings.ui.screensaver_face = ScreensaverFace::Minions;
+        crate::settings::install_for_test(settings);
+        let mut a = Arcade::new();
+        a.open_screensaver(1, 80, 24);
+        assert!(matches!(a.open.as_ref(), Some(Game::Minions(_))));
     }
 
     /// A chosen face is honoured every time, not most of the time — the whole
@@ -2258,6 +2349,13 @@ mod tests {
                 matches!(a.open.as_ref(), Some(Game::Stars(_))),
                 "seed {seed} opened something other than the starfield"
             );
+
+            let mut a = Arcade::new();
+            a.open_screensaver_as(ScreensaverFace::Minions, seed, 80, 24);
+            assert!(
+                matches!(a.open.as_ref(), Some(Game::Minions(_))),
+                "seed {seed} opened something other than the minions"
+            );
         }
     }
 
@@ -2268,6 +2366,7 @@ mod tests {
         for face in [
             ScreensaverFace::Matrix,
             ScreensaverFace::Starfield,
+            ScreensaverFace::Minions,
             ScreensaverFace::Random,
         ] {
             assert_eq!(ScreensaverFace::parse(face.as_str()), Some(face));
@@ -2275,15 +2374,15 @@ mod tests {
         assert_eq!(ScreensaverFace::default(), ScreensaverFace::Matrix);
         assert_eq!(ScreensaverFace::parse("nope"), None);
 
-        // The `/config` row cycles through all three and comes home.
+        // The `/config` row cycles through all four and comes home.
         let mut f = ScreensaverFace::default();
         let mut seen = vec![f];
-        for _ in 0..3 {
+        for _ in 0..4 {
             f = f.cycle();
             seen.push(f);
         }
         assert_eq!(seen.first(), seen.last(), "the cycle must return home");
-        assert_eq!(seen.len() - 1, 3, "and visit each face once");
+        assert_eq!(seen.len() - 1, 4, "and visit each face once");
     }
 
     /// `c` re-letters the rain rather than quitting or steering — the escape

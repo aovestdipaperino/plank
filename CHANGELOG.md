@@ -8,6 +8,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A third screensaver face: two minions.** `ui.screensaverFace` gains
+  `minions` alongside `matrix` and `starfield`, and `random` now draws from all
+  three: a pair of minions on the shore of a night lake, who walk, blink, elbow
+  each other and fall about laughing, reflected in the water underneath.
+  `/minions` opens the same screen on demand, gated by `ui.easterEggs` like the
+  games; `↑`/`↓` and the wheel set the pace, `r` strips the scene back to the
+  two of them, `t` lays them over live model output. Being weather rather than
+  a game it is never parked, scores nothing and leaves no line in the
+  scrollback.
+
+  **The whole animation is 218 bytes of the binary.** Six poses of ASCII
+  paint-by-numbers live in `src/resources/minions.txt` — 1 440 cells, readable
+  and diffable — and that file does not ship: `build.rs` packs it with a
+  three-op coder (same cell as the pose before, same ink again, something
+  already drawn up to 256 cells back, anything else a literal) into `OUT_DIR`,
+  a seventh of the size, and a `const` assertion fails the build if that ever
+  stops being true. Nothing else about the scene is stored: the walk, the bob,
+  the nudge, the laughter, the stars, the ripples and the reflection all come
+  out of one seeded generator and a clock.
+
+  It is also as close to transparency as a terminal gets, in three parts: a
+  cell too faint to matter is not drawn at all, `█ ▓ ▒ ░` make the coverage
+  ramp into an alpha channel that fading walks down, and glyphs that are shapes
+  rather than fills fade by colour instead. Over live output that means the
+  model's text survives where the minions are thin, rather than being punched
+  out by cells too dark to see.
+
 - **Git worktrees.** `EnterWorktree` / `ExitWorktree` move the session into an
   isolated second checkout of the repository — `.plank/worktrees/<name>`, on
   branch `worktree-<name>` — so a large or speculative change never lands in the

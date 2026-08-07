@@ -1015,3 +1015,48 @@ test` and review the diff before committing.
   is a genuine end-to-end check of key handling, layout and highlighting; strip
   the SGR escapes and diff the last ~20 rows, since the banner logo dominates
   the rest.
+
+- **A terminal has no alpha, but it has three things that add up to one.** The
+  minions screensaver (`src/arcade/minions.rs`) needed a sprite to fade — up
+  when the screen opens, down into its reflection — over a layer that may be
+  live model output. What works, in the order it matters:
+
+  *Not drawing is the only real transparency.* Every glyph painted over live
+  output **replaces** the character under it, so a cell dimmed to near-black
+  does not fade, it punches a hole in the text that is invisible on black and
+  obvious over a transcript. Below `FAINTEST` the cell is skipped instead.
+
+  *The block-element ramp is an alpha channel.* `█ ▓ ▒ ░` cover a known
+  fraction of a cell and the terminal composites them against whatever is
+  behind for free, so an ink's place on that ramp is its opacity and fading is
+  walking down it. This is what rounds a sprite's shoulders without a second
+  colour, and it costs nothing.
+
+  *Shapes cannot use it.* A goggle rim or an eye is a glyph whose identity is
+  its outline; at quarter coverage it is not a fainter rim, it is a different
+  character. Those fade toward the background by colour and then stop being
+  drawn. Splitting the ink table into fills (which carry a ramp position) and
+  shapes (which do not) is what made one `paint` function serve both.
+
+  The same width-1 rule as the matrix rain applies to all of it: box drawing
+  and block elements are one cell, and a test asserts it for every ink, because
+  one double-width glyph shears the whole grid to its right.
+
+- **Sharing one file between `build.rs` and the crate beats generating a
+  format twice.** The minions sprite sheet is packed at build time and unpacked
+  at runtime, which normally means an encoder in `build.rs` and a decoder in
+  `src/` that agree until the day they do not. `#[path = "src/arcade/minions/
+  codec.rs"] mod minions_codec;` in `build.rs` compiles the *same file* into
+  both, so the format has one definition; `build.rs` then asserts the blob
+  decodes back to the sheet, which fails the build rather than the screensaver.
+  The sizes it measured are written out as consts (`OUT_DIR/minions_stats.rs`)
+  and included by the module, so the documented footprint cannot go stale.
+
+- **A hash that does not mix puts every ripple in a row next to the last one.**
+  The lake's ripples are placed by hashing (row, index) rather than kept as
+  state, so the water is a pure function of the clock — a screensaver may be up
+  for hours. The obvious `row * A + i * B` is not a hash: consecutive `i` land
+  a constant apart, and after `% width` that constant was *one*, so five
+  ripples drew as `~~~~~`. Running the key through the splitmix64 finalizer
+  first fixed it. The lesson is narrow but recurring: multiply-and-add is a
+  *sequence*, not a scatter, and modulo does not rescue it.

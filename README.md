@@ -168,7 +168,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
 | | `builtinEditor` | `true` | `Ctrl-G` opens the built-in editor (a fork of Microsoft Edit, in-process). `false` shells out to `$EDITOR` as before. |
 | | `screensaver` | `1m` | Idle time before the screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
-| | `screensaverFace` | `matrix` | Which screen it puts up: `matrix` (the rain), `starfield`, or `random` for a fresh coin flip each time. |
+| | `screensaverFace` | `matrix` | Which screen it puts up: `matrix` (the rain), `starfield`, `minions`, or `random` for a fresh draw each time. |
 | `safety` | `sandbox` | on (macOS) | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
@@ -296,7 +296,7 @@ Only the variable's *name* lives in the file, never the key, so definitions stay
 
 ## The arcade
 
-Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are five games behind undocumented-in-`/help` slash commands, and they are meant to be played **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
+Waiting on a long generation is the one moment a coding agent has nothing for you to do. So there are five games — and one thing to just watch — behind undocumented-in-`/help` slash commands, and they are meant to be used **during** a turn: type one while the model is streaming and it opens as a translucent layer over the live output, which keeps scrolling underneath.
 
 <p align="center">
   <img src="assets/arcade-breakout.png" alt="/breakout played over a live plank turn: the brick wall, ball and paddle sit above the model's still-streaming poem, which stays readable through the dimmed layer" width="700">
@@ -311,6 +311,7 @@ That is a real turn underneath — the model is 1m 49s into writing a poem at 20
 | `/invaders` | hold the line against the marching fleet |
 | `/centipede` | shoot it apart before it walks into you |
 | `/frogger` | cross the road, then ride the river home |
+| `/minions` | nothing to play: two of them, giggling by a lake |
 
 And one that is not a game at all:
 
@@ -327,12 +328,21 @@ Two arguments, combinable — `/breakout new sound`:
 
 **Controls** — arrows (or `hjkl`/`wasd`), space to serve or fire, `p` to pause, `t` to switch between the translucent and opaque layer, `b` for sound, `Esc`/`q` to leave. The mouse works everywhere: the wheel and trackpad steer, click and drag place the paddle or the ship, and clicking fires in the two shooters. While a game is up, the first `Ctrl-C` closes it and a second one interrupts the model, so you are never locked out of stopping a turn.
 
-Two honest notes about what the terminal can and cannot do:
+Pelota has one extra move worth knowing: hold **Shift** while steering and the paddle shrinks to a third of its length, but a hit that lands leaves at triple speed — usually past the CPU. The boost lasts exactly one crossing.
+
+### The screensaver, and the minions
+
+After a minute of an idle prompt (`ui.screensaver`) the screen is taken by an ambient screen — the matrix rain, the perspective starfield, or two minions on the shore of a night lake — whichever `ui.screensaverFace` names, or a fresh draw each time under `random`. None is an easter egg: `ui.easterEggs` does not gate them, they never come up mid-turn or over a dialog, and the next key, click or paste puts the UI back (consumed, not typed).
+
+The minions are also a command, `/minions`, which *is* gated like the games. They walk the shore, blink, elbow each other and fall about laughing, reflected in the water underneath. `↑`/`↓` and the wheel set the pace, `r` strips the night back to just the two of them, and `t` lays them over live model output like any other easter egg.
+
+**The whole animation is 218 bytes of the binary.** The art is six poses of ASCII paint-by-numbers in `src/resources/minions.txt` — 1 440 cells, one byte each, readable and diffable — and that file never ships. `build.rs` packs it at build time with a three-op coder (same cell as the pose before / same ink again / something already drawn up to 256 cells back, everything else a literal) and writes the result into `OUT_DIR`, so **1 440 bytes of art become 218: about a seventh, or 85% saved**. A `const` assertion fails the build if a change to the art or the coder ever gives most of that back. Nothing else about the scene is stored at all: the walk, the bob, the nudge, the laughter, the stars, the ripples and the reflection are generated from one seeded generator and a clock.
+
+Three honest notes about what the terminal can and cannot do:
 
 - **Translucency is not alpha.** A cell holds one character and one pair of colors; there is nothing to composite. What happens instead is that these games are sparse, so the layer underneath is dimmed rather than erased and the glyphs land in the gaps. It reads as a veil, and the model's output stays legible behind it — but it is a trick, not blending.
+- **What passes for transparency, where it can.** The minions get as close as a terminal allows, with three mechanisms and no alpha channel anywhere: cells too faint to matter are **not drawn at all** — the only true transparency there is, and what keeps the layer from punching holes in the model's text; `█ ▓ ▒ ░` cover a known fraction of a cell, so the *coverage ramp is the alpha channel* and fading is walking down it, which is what rounds their shoulders, fades the scene up when it opens and sinks their reflection into the water; and glyphs that are shapes rather than fills — a goggle rim, an eye — fade toward the night by colour instead, because a rim at quarter coverage is not a fainter rim, it is a different character.
 - **Sound is the terminal bell**, and nothing else. That is deliberate: it adds **zero bytes** to the binary, where real audio would mean a synthesis crate and a system audio dependency. The cost is that `BEL` has no pitch and no length, so the only thing distinguishing one cue from another is how many — one blip for a hit, two for a life lost, three for a level. Terminals set to a visual bell will flash instead, which is why it is off unless you ask.
-
-Pelota has one extra move worth knowing: hold **Shift** while steering and the paddle shrinks to a third of its length, but a hit that lands leaves at triple speed — usually past the CPU. The boost lasts exactly one crossing.
 
 None of these appear in `/help` or the completion popup. That is the point.
 
@@ -346,13 +356,14 @@ Leave the TUI idle and it puts something on the screen. By default that is the m
   <img src="assets/screensaver-matrix.gif" alt="The plank screensaver: green half-width katakana falling down a black terminal, brighter at the head of each column and fading down the trail" width="900">
 </p>
 
-There are two faces, and `ui.screensaverFace` picks which one you get:
+There are three faces, and `ui.screensaverFace` picks which one you get:
 
 | Value | |
 |---|---|
 | `matrix` | the falling glyphs above — the default |
 | `starfield` | a perspective starfield rushing outward past the edges |
-| `random` | a fresh coin flip each time it opens |
+| `minions` | two minions on the shore of a night lake |
+| `random` | a fresh draw each time it opens |
 
 `ui.screensaver` says *when*: `1m` (the default), `2m`, `5m`, or `never` to switch it off. Both are editable live with `/config`, which cycles the values rather than making you type them.
 
@@ -369,7 +380,7 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
 - `worktree.rs`, `tools/worktree.rs` — git-worktree isolation and the `EnterWorktree`/`ExitWorktree` tools
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
-- `arcade.rs`, `arcade/` — the easter-egg games, the matrix rain and the starfield (see above)
+- `arcade.rs`, `arcade/` — the easter-egg games, the matrix rain, the starfield and the minions (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
 
 ## Star History

@@ -258,20 +258,24 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - **Screensaver** (`arcade.rs` + the TUI input loop): after `ui.screensaver`
   of idleness (`1m` by default; `2m`, `5m`, `never`) one of the two ambient
   screens takes the whole screen — the matrix rain (`arcade/matrix.rs`) by
-  default, the perspective starfield, or a coin flip off the opening seed,
-  per `ui.screensaverFace`. `open_screensaver` reads the setting;
-  `open_screensaver_as` takes the face directly, so tests drive each one
-  without touching process-wide state. The next key,
-  click or paste puts the UI back — consumed, not typed. Idleness is measured
-  in the outer input loop, which is the only place that can be idle: a running turn is
-  inside `tui_turn`, so a long generation is never mistaken for an absent
-  user. Focus and resize events deliberately do not count as activity, or a
-  window manager moving focus around would pin the timer at zero. It reuses
-  the arcade's draw and step path but is not an easter egg: no command, no
-  parking slot, no footer, and `ui.easterEggs` does not gate it. The rain is
-  also reachable on demand as `/matrix`, which *is* gated — same screen, two
-  ways in. Being ambient (`Game::ambient`), neither is ever parked: rain
-  resumed is indistinguishable from rain dealt fresh.
+  default, the perspective starfield, the minions (`arcade/minions.rs`), or a
+  fresh draw off the opening seed, per `ui.screensaverFace`.
+  `open_screensaver` reads the setting; `open_screensaver_as` takes the face
+  directly, so tests drive each one without touching process-wide state. The
+  next key, click or paste puts the UI back — consumed, not typed. Idleness is
+  measured in the outer input loop, which is the only place that can be idle: a
+  running turn is inside `tui_turn`, so a long generation is never mistaken for
+  an absent user. Focus and resize events deliberately do not count as
+  activity, or a window manager moving focus around would pin the timer at
+  zero. It reuses the arcade's draw and step path but is not an easter egg: no
+  command, no parking slot, no footer, and `ui.easterEggs` does not gate it.
+  The rain and the minions are also reachable on demand as `/matrix` and
+  `/minions`, which *are* gated — same screens, two ways in. Being ambient
+  (`Game::ambient`), none is ever parked: rain resumed is indistinguishable
+  from rain dealt fresh, and so is a skit. The minions' six poses are the only
+  art in the tree that ships packed: `build.rs` runs `minions/codec.rs` over
+  `src/resources/minions.txt` and writes the blob into `OUT_DIR`, so the
+  readable sheet stays in the repository and 218 bytes reach the binary.
 - **Built-in editor** (`miniedit/`, feature `builtin_editor`): Ctrl-G opens an
   in-process, single-buffer fork of Microsoft Edit (`refs/edit`, MIT) on the
   half-typed prompt. plank suspends its own TUI through `with_tui_suspended`

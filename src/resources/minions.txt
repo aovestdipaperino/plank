@@ -1,0 +1,140 @@
+# Sprite sheet for the two-minion screensaver (src/arcade/minions.rs).
+#
+# This file is the *source* of the art and never ships: build.rs parses it,
+# packs it, and writes the compressed blob into OUT_DIR, which is what the
+# binary carries. Edit here, rebuild, and the sheet follows.
+#
+# Every cell is one ASCII byte naming an ink; the ink table (which glyph, which
+# colour, how much of the cell it covers) lives in `minions.rs`, next to the
+# code that paints it. The letters are mnemonics for what they *are*, not for
+# what they look like, so the art stays diffable and the glyphs stay free to
+# change:
+#
+#   .  nothing — the cell is left alone, which is the only real transparency a
+#      terminal has
+#   Y  body, solid          y  body, in shadow
+#   s  body, soft edge      t  body, faint edge   (the ▒/░ that round a corner)
+#   S  goggle strap
+#   [ ] { } | -             goggle rim: corners, sides, top and bottom bar
+#   W  eye white            e  open eye
+#   c  closed eye (blink)   ^  eye squeezed shut (laughing)
+#   < = >                   closed smile: left corner, middle, right corner
+#   1 2 3 / 4 5 6           open mouth, upper row then lower row
+#   B  overalls             p  pocket stitching
+#   G  glove                F  shoe                h  hair
+#
+# Every pose is exactly 15x16 so a pose can be delta-coded against the one
+# before it — poses that differ in two cells cost two cells. Keep the order:
+# each minion's poses are adjacent, and the blink sits between the idle and the
+# laugh because that is the cheapest chain through the six.
+#
+# The pair is drawn shoulder to shoulder and both sheets are bottom-aligned, so
+# the short one simply starts two rows down rather than being a shorter grid.
+
+@kevin.idle
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tsYYYYYYYst..
+..tS[-]S[-]St..
+..tS|e|S|e|St..
+..tS{-}S{-}St..
+..tsYYYYYYYst..
+..tsY<===>Yst..
+..tsYYYYYYYst..
+..YsByBBByBsY..
+..YsBBBBBBBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
+
+@kevin.blink
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tsYYYYYYYst..
+..tS[-]S[-]St..
+..tS|c|S|c|St..
+..tS{-}S{-}St..
+..tsYYYYYYYst..
+..tsY<===>Yst..
+..tsYYYYYYYst..
+..YsByBBByBsY..
+..YsBBBBBBBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
+
+@kevin.laugh
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tsYYYYYYYst..
+..tS[-]S[-]St..
+..tS|^|S|^|St..
+..tS{-}S{-}St..
+..tsYYYYYYYst..
+..tsY12223Yst..
+..tsY45556Yst..
+..YsByBBByBsY..
+..YsBBBBBBBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
+
+@stuart.idle
+...............
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tSS[---]SSt..
+..tSS|WeW|SSt..
+..tSS{---}SSt..
+..tsYYYYYYYst..
+..tsY<===>Yst..
+..YsYYYYYYYsY..
+..YsByBBByBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
+
+@stuart.blink
+...............
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tSS[---]SSt..
+..tSS|ccc|SSt..
+..tSS{---}SSt..
+..tsYYYYYYYst..
+..tsY<===>Yst..
+..YsYYYYYYYsY..
+..YsByBBByBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
+
+@stuart.laugh
+...............
+......h.h......
+....tsYYYst....
+...tsYYYYYst...
+..tSS[---]SSt..
+..tSS|^^^|SSt..
+..tSS{---}SSt..
+..tsYYYYYYYst..
+..tsY12223Yst..
+..YsY45556YsY..
+..YsByBBByBsY..
+..GsBBpppBBsG..
+..tsBBBBBBBst..
+..tsBBBBBBBst..
+....sBB.BBs....
+....FFF.FFF....
