@@ -311,9 +311,14 @@ on</td>
 written to the conversation</td>
 </tr>
 <tr>
-<td><code>/subagent [&lt;name&gt;] &lt;task&gt;</code></td>
-<td>delegate a task to a subagent; only its final report enters the
-transcript, and the turn continues from it</td>
+<td><code>/subagent &lt;task&gt;</code></td>
+<td>delegate a task to a general-purpose subagent; only its final report
+enters the transcript, and the turn continues from it</td>
+</tr>
+<tr>
+<td><code>/subagent:&lt;name&gt; &lt;task&gt;</code></td>
+<td>the same, using a named definition. The <code>:&lt;name&gt;</code>
+shows green while you type if it exists and red if it does not</td>
 </tr>
 </tbody>
 </table>

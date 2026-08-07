@@ -222,7 +222,16 @@ cleanly on the next real turn.</p>
 markdown files:</p>
 <pre><code>~/.plank/agents/reviewer.md</code></pre>
 <p>Each supplies extra instructions that frame the subagent's turn.
-<code>/agent</code> lists them.</p>
+Dispatch one by name with a colon on the command itself:</p>
+<pre><code>/subagent:reviewer check the diff on this branch</code></pre>
+<p><code>/agent</code> lists them. The name is part of the command
+rather than the first word of the task, so a task that happens to start
+with a definition's name is never quietly reinterpreted as a persona —
+and because the name is explicit, one that does not exist is reported
+rather than silently falling back to the general-purpose subagent. While
+you type, the TUI colours the <code>:&lt;name&gt;</code>
+<strong>green</strong> when it resolves and <strong>red</strong> when it
+does not, so a typo shows up before you press Enter.</p>
 <p>The model can delegate on its own with the <code>agent</code> tool.
 Delegation is bounded at one level — a subagent cannot itself delegate —
 which keeps a runaway from spawning a tree.</p>
