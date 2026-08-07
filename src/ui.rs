@@ -3392,24 +3392,38 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("repro failed: {e}"),
             },
-            "/subagent" => {
-                let (def, task) = crate::agents::resolve(&self.agents, arg);
+            c if crate::agents::is_subagent_command(c) => {
+                // The name now rides on the command token (`/subagent:name`),
+                // so the whole argument is the task — no first-token guessing,
+                // and a task whose first word happens to match a definition is
+                // no longer silently reinterpreted as a persona.
+                let mut def = None;
+                if let Some(name) = crate::agents::command_name(c) {
+                    // A named definition that is not there is an error, not a
+                    // fallback: the user asked for a specific persona, and
+                    // running a different one would be worse than saying so.
+                    let Some(d) = crate::agents::resolve_named(&self.agents, name) else {
+                        println!("{}", crate::agents::unknown_name_error(&self.agents, name));
+                        return Ok(true);
+                    };
+                    def = Some(d);
+                }
                 let (instructions, spec, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
                         d.engine.clone(),
-                        task.to_string(),
+                        arg.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
                     None => (
                         None,
                         None,
-                        task.to_string(),
+                        arg.to_string(),
                         "[subagent started]".to_string(),
                     ),
                 };
                 if task.is_empty() {
-                    println!("usage: /subagent [<name>] <task>");
+                    println!("usage: /subagent[:<name>] <task>");
                 } else {
                     // Same resolve the `agent` tool does, and for the same reason:
                     // a definition that names an engine must actually run on it
@@ -7795,26 +7809,35 @@ impl Agent<'_> {
                 Ok(path) => log.push_dim(format!("[repro written to {}]", path.display())),
                 Err(e) => log.push_plain(format!("repro failed: {e}")),
             },
-            "/subagent" => {
-                let (def, task) = crate::agents::resolve(&self.agents, arg);
+            c if crate::agents::is_subagent_command(c) => {
+                // See the plain-REPL arm: the name is part of the command
+                // token, so the whole argument is the task.
+                let mut def = None;
+                if let Some(name) = crate::agents::command_name(c) {
+                    let Some(d) = crate::agents::resolve_named(&self.agents, name) else {
+                        log.push_plain(crate::agents::unknown_name_error(&self.agents, name));
+                        return true;
+                    };
+                    def = Some(d);
+                }
                 let (instructions, spec, label, task, started) = match def {
                     Some(d) => (
                         Some(d.body.clone()),
                         d.engine.clone(),
                         d.name.clone(),
-                        task.to_string(),
+                        arg.to_string(),
                         format!("[subagent started: {}]", d.name),
                     ),
                     None => (
                         None,
                         None,
                         "sub-agent".to_string(),
-                        task.to_string(),
+                        arg.to_string(),
                         "[subagent started]".to_string(),
                     ),
                 };
                 if task.is_empty() {
-                    log.push_plain("usage: /subagent [<name>] <task>");
+                    log.push_plain("usage: /subagent[:<name>] <task>");
                 } else {
                     // Resolved before the fork, exactly as in `run_agent_tool`: an
                     // engine this session cannot provide must not leave a framed
@@ -8700,6 +8723,10 @@ fn new_agent(
     // belong inside the fingerprinted prefix — editing one correctly
     // invalidates `sysprompt.kv` rather than being silently ignored.
     let agents = crate::agents::load_default(&tool_ctx.cwd);
+    // Publishes the names so the input line can colour `/subagent:<name>` by
+    // whether the name resolves, three call layers below anything that holds
+    // the definitions themselves.
+    crate::agents::set_roster(&agents);
     let system = sysprompt::build_system_prompt_parts(
         &cfg.system,
         &tool_ctx.mcp,
@@ -13683,7 +13710,7 @@ mod tests {
         );
 
         agent
-            .slash("/subagent remote do a thing")
+            .slash("/subagent:remote do a thing")
             .expect("the command ran");
 
         let transcript = agent
@@ -13775,7 +13802,7 @@ mod tests {
         let before = agent.session.transcript.len();
 
         agent
-            .slash("/subagent remote do a thing")
+            .slash("/subagent:remote do a thing")
             .expect("the command ran");
 
         assert_eq!(

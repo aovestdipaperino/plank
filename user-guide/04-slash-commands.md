@@ -63,7 +63,8 @@ See [Extending plank](09-extending.md).
 | Command | What it does |
 |---|---|
 | `/btw <question>` | ask a side question mid-task; answered in a split panel, nothing written to the conversation |
-| `/subagent [<name>] <task>` | delegate a task to a subagent; only its final report enters the transcript, and the turn continues from it |
+| `/subagent <task>` | delegate a task to a general-purpose subagent; only its final report enters the transcript, and the turn continues from it |
+| `/subagent:<name> <task>` | the same, using a named definition. The `:<name>` shows green while you type if it exists and red if it does not |
 
 `/btw` genuinely suspends the running generation, answers, and resumes byte-for-byte with no re-prefill (`safety.btwSuspend`, on by default). With suspend off, the question is queued and answered at the next generation boundary instead.
 

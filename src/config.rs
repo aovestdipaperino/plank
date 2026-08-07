@@ -532,6 +532,12 @@ pub fn parse_power_percent(arg: &str) -> Option<i32> {
     arg.parse::<i32>().ok().filter(|v| (1..=100).contains(v))
 }
 
+/// The leading whitespace-delimited token of `cmd`.
+#[must_use]
+fn first_token(cmd: &str) -> &str {
+    cmd.split_once(char::is_whitespace).map_or(cmd, |(t, _)| t)
+}
+
 /// True when `cmd` is `name` alone or `name` followed by whitespace.
 #[must_use]
 pub fn slash_command_with_args(cmd: &str, name: &str) -> bool {
@@ -596,7 +602,12 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/config")
         || slash_command_with_args(cmd, "/fork")
         || slash_command_with_args(cmd, "/btw")
-        || slash_command_with_args(cmd, "/subagent")
+        // `/subagent` also takes a `:<name>` suffix selecting a definition, so
+        // it needs its own recognizer rather than the plain with-args form.
+        // Any name is *known* here; whether it exists is dispatch's business,
+        // and reporting a bad name beats silently forwarding the line to the
+        // model as an ordinary prompt.
+        || crate::agents::is_subagent_command(first_token(cmd))
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/export")
@@ -1459,6 +1470,12 @@ mod tests {
         assert!(!slash_command_known("/btwx"));
         assert!(slash_command_known("/subagent count the tests"));
         assert!(!slash_command_known("/subagentx"));
+        // The `:<name>` form is known whatever the name — an unknown name is
+        // reported by dispatch, not silently sent to the model as a prompt.
+        assert!(slash_command_known("/subagent:reviewer count the tests"));
+        assert!(slash_command_known("/subagent:nope count the tests"));
+        // ...but the name must actually be there: a bare colon selects nothing.
+        assert!(!slash_command_known("/subagent:"));
         assert!(slash_command_known("/power 50"));
         assert!(slash_command_known("/power"));
         assert!(slash_command_known("/switch 2"));

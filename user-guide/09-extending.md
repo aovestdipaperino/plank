@@ -73,7 +73,13 @@ Beyond the built-in general-purpose subagent, define named ones as markdown file
 ~/.plank/agents/reviewer.md
 ```
 
-Each supplies extra instructions that frame the subagent's turn. `/agent` lists them.
+Each supplies extra instructions that frame the subagent's turn. Dispatch one by name with a colon on the command itself:
+
+```
+/subagent:reviewer check the diff on this branch
+```
+
+`/agent` lists them. The name is part of the command rather than the first word of the task, so a task that happens to start with a definition's name is never quietly reinterpreted as a persona — and because the name is explicit, one that does not exist is reported rather than silently falling back to the general-purpose subagent. While you type, the TUI colours the `:<name>` **green** when it resolves and **red** when it does not, so a typo shows up before you press Enter.
 
 The model can delegate on its own with the `agent` tool. Delegation is bounded at one level — a subagent cannot itself delegate — which keeps a runaway from spawning a tree.
 

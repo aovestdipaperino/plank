@@ -96,7 +96,7 @@ Answer concisely from the code you read. Finish with a short report.
 **Expect:**
 
 ```
-Agents (dispatch with /subagent <name> <task>):
+Agents (dispatch with /subagent:<name> <task>):
   local-helper — Summarises how a module works
   remote-reviewer — Reviews a diff for correctness and missed edge cases [anthropic claude-opus-5]
 
@@ -112,7 +112,7 @@ the *model*, not from you.
 
 ## 2. Explicit dispatch to a remote definition
 
-**Run:** `/subagent remote-reviewer summarise what src/agents.rs does`
+**Run:** `/subagent:remote-reviewer summarise what src/agents.rs does`
 
 **Expect:**
 - A `[sub-agent: remote-reviewer — ctrl+o to follow]` line.

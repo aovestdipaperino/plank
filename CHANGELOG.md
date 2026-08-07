@@ -45,6 +45,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Named subagents are dispatched as `/subagent:<name>`, not `/subagent <name>`.**
+  The name now rides on the command token instead of being the first word of the
+  argument. Two things follow from that. A task whose first word happens to match
+  a definition — `/subagent reviewer notes are stale`, say — is no longer silently
+  reinterpreted as that persona; the whole argument is the task. And because the
+  name is explicit, one that does not resolve is an error naming what *is*
+  available, rather than a quiet fallback to the general-purpose subagent that
+  looks like it worked. The TUI colours the `:<name>` green when it resolves and
+  red when it does not, so a typo shows while you type rather than after you press
+  Enter; a half-typed `/subagent:` stays unhighlighted, like any other incomplete
+  command. Bare `/subagent <task>` is unchanged.
+
 - **The status bar is two rows.** Row one is the working directory and the git
   branch and nothing else — the answer to "which tree am I in" now holds still
   instead of being shoved around by whatever the model is doing. Row two carries

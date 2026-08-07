@@ -1055,6 +1055,9 @@ fn frame_geom(
 /// Validity mirrors dispatch: the green highlight appears only when the whole
 /// line parses as a known command ([`crate::config::slash_command_known`]), so
 /// partial (`/hel`) and unknown (`/nope`) inputs stay plain until complete.
+///
+/// `/subagent:<name>` splits further — see [`subagent_spans`] — because the
+/// command being known says nothing about the name being known.
 fn input_spans(input: &str) -> Vec<Span<'static>> {
     // Shell escape: the marker is colored by consequence, which is the one
     // thing the two forms differ in and the one thing that is invisible once
@@ -1078,16 +1081,42 @@ fn input_spans(input: &str) -> Vec<Span<'static>> {
     if input.starts_with('/') && crate::config::slash_command_known(input) {
         let token_len = input.find(char::is_whitespace).unwrap_or(input.len());
         let (cmd, rest) = input.split_at(token_len);
-        let mut spans = vec![Span::styled(
-            cmd.to_string(),
-            Style::default().fg(THEME_GREEN),
-        )];
+        let mut spans = subagent_spans(cmd).unwrap_or_else(|| {
+            vec![Span::styled(
+                cmd.to_string(),
+                Style::default().fg(THEME_GREEN),
+            )]
+        });
         if !rest.is_empty() {
             spans.push(Span::raw(rest.to_string()));
         }
         return spans;
     }
     vec![Span::raw(input.to_string())]
+}
+
+/// Splits a `/subagent:<name>` token into a green `/subagent` and a `:<name>`
+/// coloured by whether that definition exists — green when it resolves, red
+/// when it does not.
+///
+/// `None` for any other command, so the caller falls back to colouring the
+/// whole token green. The point is to answer "did I spell it right?" while the
+/// line is still being typed: dispatch rejects an unknown name outright, and
+/// finding that out after pressing Enter is finding out too late.
+fn subagent_spans(cmd: &str) -> Option<Vec<Span<'static>>> {
+    let name = crate::agents::command_name(cmd)?;
+    let color = if crate::agents::is_known(name) {
+        THEME_GREEN
+    } else {
+        Color::Red
+    };
+    Some(vec![
+        Span::styled(
+            crate::agents::SUBAGENT_COMMAND.to_string(),
+            Style::default().fg(THEME_GREEN),
+        ),
+        Span::styled(format!(":{name}"), Style::default().fg(color)),
+    ])
 }
 
 /// Computes the popup rect: it floats up from the top edge of the input,
@@ -2738,6 +2767,125 @@ mod tests {
         assert_eq!(parts("/nope"), vec![("/nope".to_owned(), None)]);
         // A no-arg command given args is not a valid invocation: no highlight.
         assert_eq!(parts("/help me"), vec![("/help me".to_owned(), None)]);
+    }
+
+    #[test]
+    fn input_spans_colors_the_subagent_name_by_whether_it_exists() {
+        // The roster is a process-global; these names are distinctive enough
+        // not to collide with anything a concurrent test would publish.
+        crate::agents::set_roster(&[crate::agents::AgentDef {
+            name: "spanreviewer".into(),
+            description: String::new(),
+            body: "b".into(),
+            path: std::path::PathBuf::new(),
+            engine: None,
+            auto: true,
+            isolate: false,
+        }]);
+
+        // A name that resolves: both halves green.
+        assert_eq!(
+            parts("/subagent:spanreviewer check the diff"),
+            vec![
+                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                (":spanreviewer".to_owned(), Some(THEME_GREEN)),
+                (" check the diff".to_owned(), None),
+            ]
+        );
+        // A name that does not: the command stays green, the name goes red —
+        // the command *is* valid, it is the name that is wrong.
+        assert_eq!(
+            parts("/subagent:nosuchagent check the diff"),
+            vec![
+                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                (":nosuchagent".to_owned(), Some(Color::Red)),
+                (" check the diff".to_owned(), None),
+            ]
+        );
+        // The name is coloured while the task is still unwritten, which is the
+        // whole point: the answer arrives before Enter, not after.
+        assert_eq!(
+            parts("/subagent:nosuchagent"),
+            vec![
+                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                (":nosuchagent".to_owned(), Some(Color::Red)),
+            ]
+        );
+        // The bare form has no name to judge and stays one green token.
+        assert_eq!(
+            parts("/subagent check the diff"),
+            vec![
+                ("/subagent".to_owned(), Some(THEME_GREEN)),
+                (" check the diff".to_owned(), None),
+            ]
+        );
+        crate::agents::set_roster(&[]);
+    }
+
+    /// The colours that actually reach the screen for `input`, as
+    /// `(char, fg)` for the drawn input row.
+    ///
+    /// Goes through `render_input` and a real ratatui backend rather than
+    /// calling `input_spans` directly: the span-to-cell path in `wrap_input`
+    /// is exactly where a style can be dropped without any unit test noticing.
+    fn drawn_input_colors(input: &str) -> Vec<(char, Color)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        term.draw(|f| {
+            render_input(f, Rect::new(0, 0, 60, 1), input, 0);
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..60)
+            .map(|x| {
+                let cell = &buf[(x, 0)];
+                (cell.symbol().chars().next().unwrap_or(' '), cell.fg)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_subagent_name_reaches_the_screen_in_its_colour() {
+        crate::agents::set_roster(&[crate::agents::AgentDef {
+            name: "drawnreviewer".into(),
+            description: String::new(),
+            body: "b".into(),
+            path: std::path::PathBuf::new(),
+            engine: None,
+            auto: true,
+            isolate: false,
+        }]);
+
+        // The colour of the `r` in `:drawnreviewer` is the whole question:
+        // green when the definition exists, red when it does not.
+        let known = drawn_input_colors("/subagent:drawnreviewer check the diff");
+        let unknown = drawn_input_colors("/subagent:nosuchagent check the diff");
+        let name_cell = |cells: &[(char, Color)], name: &str| -> Color {
+            let text: String = cells.iter().map(|&(c, _)| c).collect();
+            let at = text.find(name).expect("the name is drawn");
+            cells[at].1
+        };
+        assert_eq!(name_cell(&known, "drawnreviewer"), THEME_GREEN);
+        assert_eq!(name_cell(&unknown, "nosuchagent"), Color::Red);
+        // The command half stays green in both cases: the command is valid
+        // either way, and only the name is in question.
+        assert_eq!(name_cell(&known, "subagent"), THEME_GREEN);
+        assert_eq!(name_cell(&unknown, "subagent"), THEME_GREEN);
+        // The task text is not coloured at all.
+        assert_eq!(name_cell(&known, "check"), Color::Reset);
+
+        crate::agents::set_roster(&[]);
+    }
+
+    #[test]
+    fn a_known_command_reaches_the_screen_green() {
+        // The plain case, drawn rather than computed — this is what catches a
+        // regression between `input_spans` and the terminal.
+        let cells = drawn_input_colors("/btw what is this");
+        let text: String = cells.iter().map(|&(c, _)| c).collect();
+        let at = text.find("/btw").expect("the command is drawn");
+        assert_eq!(cells[at].1, THEME_GREEN, "drawn as: {text:?}");
     }
 
     #[test]

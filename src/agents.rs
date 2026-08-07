@@ -3,7 +3,8 @@
 
 //! Single-subagent sidechain support (issue #10, reduced scope).
 //!
-//! `/subagent <task>` runs a delegated task as a *fork* of the current
+//! `/subagent <task>` (or `/subagent:<name> <task>` for a named definition)
+//! runs a delegated task as a *fork* of the current
 //! conversation: the framed task is appended to the live transcript, the
 //! normal turn loop runs (tools included), and afterwards the fork is
 //! truncated so only the subagent's final report — framed by
@@ -24,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// One loaded named agent definition.
 #[derive(Debug, Clone)]
 pub struct AgentDef {
-    /// Definition name; matched as the first token of `/subagent <name> …`.
+    /// Definition name; the `:<name>` suffix of `/subagent:<name> …`.
     /// Defaults to the file stem.
     pub name: String,
     /// One-line description shown by `/agent`.
@@ -124,9 +125,14 @@ fn load_def(path: &Path) -> Option<AgentDef> {
     if name.is_empty() {
         name = path.file_stem()?.to_string_lossy().into_owned();
     }
-    // The name is matched as a bare `/subagent` argument token: reject anything
-    // with whitespace or a slash that could never be typed as one token.
-    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('/') {
+    // The name is typed as the `:<name>` suffix of the command token: reject
+    // anything containing whitespace, a slash, or a colon, which could never
+    // be spelled there unambiguously.
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains('/')
+        || name.contains(':')
+    {
         return None;
     }
     if body.trim().is_empty() {
@@ -267,7 +273,7 @@ fn missing_key(def: &AgentDef) -> bool {
 /// definition failing the last gate silently vanishing from the model's view is
 /// correct; it stays listed by [`render_list`] with the reason.
 ///
-/// `/subagent <name>` deliberately does not consult this: the gates govern
+/// `/subagent:<name>` deliberately does not consult this: the gates govern
 /// *model* initiative, never what the user can ask for.
 #[must_use]
 pub fn model_visible(defs: &[AgentDef], auto_route: bool) -> Vec<&AgentDef> {
@@ -277,21 +283,92 @@ pub fn model_visible(defs: &[AgentDef], auto_route: bool) -> Vec<&AgentDef> {
     defs.iter().filter(|d| d.auto && !missing_key(d)).collect()
 }
 
-/// Resolves a `/subagent` argument against the loaded definitions. When the
-/// first token names a known definition, returns that definition and the rest
-/// as the task. Otherwise returns `None` and the whole argument (today's
-/// general-purpose behavior).
+/// The definition named by a `/subagent:<name>` command token.
+///
+/// `None` for bare `/subagent`, which runs the general-purpose sub-agent, and
+/// for any command that is not `/subagent` at all. The name is returned
+/// whether or not it matches a definition — deciding that is
+/// [`resolve_named`]'s job, and the two are separate so the input line can
+/// colour an unknown name without dispatch having to agree that it is valid.
 #[must_use]
-pub fn resolve<'a>(defs: &'a [AgentDef], arg: &'a str) -> (Option<&'a AgentDef>, &'a str) {
-    let arg = arg.trim();
-    let (first, rest) = match arg.split_once(char::is_whitespace) {
-        Some((f, r)) => (f, r.trim()),
-        None => (arg, ""),
-    };
-    match defs.iter().find(|d| d.name == first) {
-        Some(def) => (Some(def), rest),
-        None => (None, arg),
+pub fn command_name(cmd: &str) -> Option<&str> {
+    cmd.strip_prefix(SUBAGENT_COMMAND)?
+        .strip_prefix(':')
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+}
+
+/// The `/subagent` command token, without its optional `:<name>` suffix.
+pub const SUBAGENT_COMMAND: &str = "/subagent";
+
+/// True when `cmd` is `/subagent` or `/subagent:<name>`.
+///
+/// A dangling `/subagent:` is *not* a command: it is half-typed, and treating
+/// it as the bare form would highlight it green and then run something the
+/// user was still in the middle of naming. It stays unrecognized until the
+/// name is there, exactly as `/hel` does.
+#[must_use]
+pub fn is_subagent_command(cmd: &str) -> bool {
+    match cmd.strip_prefix(SUBAGENT_COMMAND) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(':') && command_name(cmd).is_some(),
+        None => false,
     }
+}
+
+/// Looks up the definition `name` refers to.
+///
+/// Unlike [`model_visible`], no gate applies: the gates govern *model*
+/// initiative, never what the user may ask for by name.
+#[must_use]
+pub fn resolve_named<'a>(defs: &'a [AgentDef], name: &str) -> Option<&'a AgentDef> {
+    defs.iter().find(|d| d.name == name)
+}
+
+/// Names of the definitions loaded for this session, for the input line to
+/// colour `/subagent:<name>` by whether the name exists.
+///
+/// A process-global rather than a threaded parameter because the roster is
+/// loaded once at startup and never changes, while the drawing code that needs
+/// it sits three call layers below anything holding an [`AgentDef`] — the same
+/// trade the settings and status globals already make.
+static ROSTER: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Publishes the loaded definitions' names for [`is_known`].
+pub fn set_roster(defs: &[AgentDef]) {
+    if let Ok(mut roster) = ROSTER.write() {
+        *roster = defs.iter().map(|d| d.name.clone()).collect();
+    }
+}
+
+/// True when `name` is one of this session's definitions. Answers `false`
+/// before [`set_roster`] runs, which is what library consumers and tests get.
+#[must_use]
+pub fn is_known(name: &str) -> bool {
+    ROSTER
+        .read()
+        .is_ok_and(|roster| roster.iter().any(|n| n == name))
+}
+
+/// The message shown when `/subagent:<name>` names something that is not there.
+///
+/// Lists what *is* available rather than only rejecting: a mistyped name and a
+/// forgotten one look identical from the user's side, and the roster answers
+/// both.
+#[must_use]
+pub fn unknown_name_error(defs: &[AgentDef], name: &str) -> String {
+    if defs.is_empty() {
+        return format!(
+            "no agent named '{name}' (no definitions found in ~/.plank/agents or \
+             ./.plank/agents). Use /subagent <task> for a general-purpose sub-agent."
+        );
+    }
+    let known: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
+    format!(
+        "no agent named '{name}'. Available: {}. Use /subagent <task> for a general-purpose \
+         sub-agent.",
+        known.join(", ")
+    )
 }
 
 /// Renders the `/agent` listing.
@@ -302,7 +379,7 @@ pub fn render_list(defs: &[AgentDef]) -> String {
         return "no agent definitions found (checked ~/.plank/agents and ./.plank/agents)\n"
             .to_string();
     }
-    let mut out = String::from("Agents (dispatch with /subagent <name> <task>):\n");
+    let mut out = String::from("Agents (dispatch with /subagent:<name> <task>):\n");
     for d in defs {
         out.push_str("  ");
         out.push_str(&d.name);
@@ -737,44 +814,65 @@ mod tests {
     }
 
     #[test]
-    fn resolve_name_vs_freeform() {
-        let defs = vec![AgentDef {
-            name: "reviewer".into(),
-            description: String::new(),
-            body: "Be strict.".into(),
-            path: PathBuf::new(),
-            engine: None,
-            auto: true,
-            isolate: false,
-        }];
-        // First token names a definition: rest is the task.
-        let (def, task) = resolve(&defs, "reviewer check the diff");
-        assert_eq!(def.unwrap().name, "reviewer");
-        assert_eq!(task, "check the diff");
-        // Unknown first token: whole argument is a freeform task.
-        let (def, task) = resolve(&defs, "count the tests");
-        assert!(def.is_none());
-        assert_eq!(task, "count the tests");
-        // Bare name with no task resolves the definition and an empty task.
-        let (def, task) = resolve(&defs, "reviewer");
-        assert_eq!(def.unwrap().name, "reviewer");
-        assert_eq!(task, "");
+    fn the_command_token_carries_the_name() {
+        // Bare `/subagent` is the general-purpose sub-agent...
+        assert!(is_subagent_command("/subagent"));
+        assert_eq!(command_name("/subagent"), None);
+        // ...and `:<name>` selects a definition.
+        assert!(is_subagent_command("/subagent:reviewer"));
+        assert_eq!(command_name("/subagent:reviewer"), Some("reviewer"));
+        // A dangling colon is half-typed: no name, and not yet a command.
+        assert_eq!(command_name("/subagent:"), None);
+        assert!(!is_subagent_command("/subagent:"));
+        // Neighbouring commands must not be captured.
+        assert!(!is_subagent_command("/subagentx"));
+        assert!(!is_subagent_command("/sub"));
+        assert!(!is_subagent_command("/agent"));
+        assert_eq!(command_name("/agent:reviewer"), None);
     }
 
     #[test]
-    fn resolve_ignores_the_auto_gate() {
-        // `/subagent <name>` is explicit user dispatch: it must reach a
+    fn a_task_is_never_mistaken_for_a_name() {
+        let defs = vec![local_def("reviewer", true)];
+        // The whole argument is the task now: `/subagent reviewer the diff`
+        // asks the general-purpose sub-agent to review the diff, and no longer
+        // silently adopts the "reviewer" persona because of one word.
+        assert_eq!(command_name("/subagent"), None);
+        // Only the explicit form reaches the definition.
+        let hit = command_name("/subagent:reviewer").and_then(|n| resolve_named(&defs, n));
+        assert_eq!(hit.expect("the named form resolves").name, "reviewer");
+        assert!(resolve_named(&defs, "nope").is_none());
+    }
+
+    #[test]
+    fn named_dispatch_ignores_the_auto_gate() {
+        // `/subagent:<name>` is explicit user dispatch: it must reach a
         // definition the *model* is not allowed to select. The `auto` gate and
         // `agents.autoRoute` govern model initiative only, never what the user
         // can ask for by name.
         let defs = vec![local_def("hidden", false)];
-        let (def, task) = resolve(&defs, "hidden do the thing");
+        let name = command_name("/subagent:hidden").expect("named form");
         assert_eq!(
-            def.expect("auto:false is still user-dispatchable").name,
+            resolve_named(&defs, name)
+                .expect("auto:false is still user-dispatchable")
+                .name,
             "hidden"
         );
-        assert_eq!(task, "do the thing");
         // …while the model is offered nothing.
         assert!(model_visible(&defs, true).is_empty());
+    }
+
+    #[test]
+    fn an_unknown_name_is_told_what_does_exist() {
+        let defs = vec![local_def("reviewer", true), local_def("hidden", false)];
+        let msg = unknown_name_error(&defs, "reviewr");
+        assert!(msg.contains("no agent named 'reviewr'"), "{msg}");
+        // Both are listed: `auto:false` is still user-dispatchable, so leaving
+        // it out would make a valid name look wrong.
+        assert!(msg.contains("reviewer"), "{msg}");
+        assert!(msg.contains("hidden"), "{msg}");
+        // With nothing loaded, say that rather than printing an empty list.
+        let empty = unknown_name_error(&[], "reviewr");
+        assert!(empty.contains("no definitions found"), "{empty}");
     }
 }

@@ -150,7 +150,7 @@ The `task` tool keeps a plan the model can add to and update — statuses are `p
 
 The `agent` tool hands a self-contained sub-task to a fresh subagent working in its own scoped context, and returns **only its final report** to the main conversation. This is how a long research detour stays out of your transcript.
 
-Delegation is bounded: a subagent cannot itself delegate. You can also start one yourself with `/subagent <task>`, and define named subagents with their own instructions — see [Extending plank](09-extending.md).
+Delegation is bounded: a subagent cannot itself delegate. You can also start one yourself with `/subagent <task>` (or `/subagent:<name> <task>`), and define named subagents with their own instructions — see [Extending plank](09-extending.md).
 
 ## Watching (or not watching) tools run
 
