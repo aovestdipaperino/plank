@@ -981,3 +981,37 @@ test` and review the diff before committing.
   the full suite in a loop ten-plus times, not the test alone — and verify the
   assertion still discriminates by mutating the code it guards, since the
   obvious repair for flakiness is an assertion that can no longer fail.
+
+- **A terminal grid only survives width-1 glyphs, and the katakana come in both
+  widths.** The matrix rain (`src/arcade/matrix.rs`) paints one glyph per cell,
+  so a single full-width character shears every column to its right for as long
+  as it is on screen. The kana used here are the *half-width* forms
+  (U+FF66..U+FF9D), which `unicode_width` reports as 1 and which look identical
+  at terminal sizes; the full-width block (U+30A1..) reports 2 and must not be
+  used. `every_glyph_is_one_cell_wide` asserts it for all three alphabets,
+  because the failure is invisible in a diff and obvious only on screen.
+
+  The second half of the same problem is not solvable in code: a font that has
+  no kana draws boxes, and nothing in the program can tell. Hence `c`, which
+  cycles the rain to binary and then to ASCII — an escape hatch in the UI
+  rather than a probe that cannot work.
+
+- **The real TUI *can* be driven headlessly — with a pty, not `script`.**
+  `tests/ui_remote.rs` notes that `tui_loop` is hardwired to
+  `Terminal<CrosstermBackend<Stdout>>` and so cannot take a `TestBackend`, but
+  the loop runs fine against a pty, and `--ui-remote=PORT` then drives it
+  end-to-end. Two traps make the obvious attempts fail:
+
+  - `script -q /dev/null plank --ui-remote=…` dies with `tcgetattr/ioctl:
+    Operation not supported on socket` the moment its own stdin is not a tty —
+    which it never is when launched from a tool runner. Use `pty.openpty()`
+    from Python (or any direct pty spawn) instead.
+  - stdin must stay *open*, not merely exist. Pointing it at `/dev/null` EOFs
+    immediately, which the key loop reads as Ctrl-D and exits cleanly — the CRT
+    power-off frames in the captured output are the tell.
+
+  Also drain the pty master, or a chatty frame stream eventually blocks the
+  child. With those three in place, `{"cmd":"keypress"}` → `{"cmd":"snapshot"}`
+  is a genuine end-to-end check of key handling, layout and highlighting; strip
+  the SGR escapes and diff the last ~20 rows, since the banner logo dominates
+  the rest.

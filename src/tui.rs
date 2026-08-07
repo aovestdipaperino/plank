@@ -860,6 +860,29 @@ pub fn copy_to_clipboard(text: &str) {
     let _ = out.flush();
 }
 
+/// Reads the system clipboard as text, for an explicit Ctrl-V.
+///
+/// `pbpaste` only, with no OSC 52 counterpart: reading the clipboard back over
+/// an escape sequence needs a terminal reply, which would mean draining the
+/// event stream mid-keypress. Over SSH the terminal's own paste (which arrives
+/// as a bracketed [`ratatui::crossterm::event::Event::Paste`]) is the working
+/// path, and it is already handled.
+///
+/// Returns `None` when the clipboard is empty or holds no text — an image, for
+/// instance, which the paste handler routes to `crate::imagepaste` instead.
+#[must_use]
+pub fn paste_from_clipboard() -> Option<String> {
+    let out = std::process::Command::new("pbpaste")
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    (!text.is_empty()).then_some(text)
+}
+
 /// Scroll state of the output log viewport.
 ///
 /// While `follow` is set the view tracks the bottom of the log (the streaming
@@ -1242,6 +1265,116 @@ pub fn draw_popup(frame: &mut Frame, input_text: &str, popup: &crate::complete::
     render_popup(frame, popup_rect(output, input, rows), popup);
 }
 
+/// Splits a slash-menu row into its command column width and the description
+/// budget left over, given the total `width` a row has to work with.
+///
+/// The command column is sized to the widest label actually on screen (so the
+/// descriptions line up as one block) but never takes more than half the row —
+/// one long `argument_hint` must not squeeze every description out of view.
+#[must_use]
+fn slash_columns(labels: &[String], width: usize) -> (usize, usize) {
+    use unicode_width::UnicodeWidthStr;
+    let widest = labels.iter().map(|l| l.width()).max().unwrap_or(0);
+    let cmd = widest.min(width / 2);
+    // Two spaces separate the columns.
+    (cmd, width.saturating_sub(cmd + 2))
+}
+
+/// Draws the `/` command menu: the command (with its argument hint) on the
+/// left, its one-line description dimmed on the right, and the source tag for
+/// skills and templates after that.
+fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &crate::slashmenu::SlashMenu) {
+    use ratatui::widgets::{Clear, List, ListItem, ListState, StatefulWidget};
+    let rows = menu.rows();
+    if area.height == 0 || rows.is_empty() {
+        return;
+    }
+    if crate::uiremote::recording_enabled() {
+        crate::uiremote::region(
+            "slashmenu",
+            area,
+            &[
+                (
+                    "rows",
+                    crate::tools::mcp::Json::Num(f64::from(
+                        u32::try_from(rows.len()).unwrap_or(u32::MAX),
+                    )),
+                ),
+                (
+                    "selected",
+                    crate::tools::mcp::Json::Num(f64::from(
+                        u32::try_from(menu.selected()).unwrap_or(u32::MAX),
+                    )),
+                ),
+            ],
+        );
+    }
+    frame.render_widget(Clear, area);
+    let labels: Vec<String> = rows.iter().map(|e| e.label()).collect();
+    // The highlight symbol ("> ") eats two columns of every row.
+    let (cmd_w, desc_w) = slash_columns(&labels, usize::from(area.width).saturating_sub(2));
+    let items: Vec<ListItem> = rows
+        .iter()
+        .zip(&labels)
+        .map(|(e, label)| {
+            let tag = e.source.tag();
+            let desc = if tag.is_empty() {
+                e.desc.clone()
+            } else {
+                format!("{} · {tag}", e.desc)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<cmd_w$}", elide_right(label, cmd_w)),
+                    Style::default().fg(THEME_GREEN),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    elide_right(&desc, desc_w),
+                    Style::default().fg(Color::Indexed(245)),
+                ),
+            ]))
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol("> ");
+    let mut state = ListState::default();
+    state.select(Some(menu.selected()));
+    StatefulWidget::render(list, area, frame.buffer_mut(), &mut state);
+}
+
+/// Trims `text` to `budget` display columns from the *right*, marking the cut
+/// with `…`. Mirror of [`elide_left`], for text whose informative end is the
+/// start (command names, prose descriptions).
+fn elide_right(text: &str, budget: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if text.width() <= budget {
+        return text.to_string();
+    }
+    if budget <= 1 {
+        return "…".repeat(budget);
+    }
+    let mut head = String::new();
+    for c in text.chars() {
+        if head.width() + char_width(c) + 1 > budget {
+            break;
+        }
+        head.push(c);
+    }
+    format!("{head}…")
+}
+
+/// Draws the `/` menu over the frame just rendered, anchored above the input
+/// exactly like [`draw_popup`].
+pub fn draw_slash_menu(frame: &mut Frame, input_text: &str, menu: &crate::slashmenu::SlashMenu) {
+    let tw = input_text_width(frame.area().width);
+    let (output, input, _, _, _, _) =
+        frame_geom(frame.area(), true, input_height(input_text, tw), 0);
+    let rows = u16::try_from(menu.rows().len()).unwrap_or(u16::MAX);
+    render_slash_menu(frame, popup_rect(output, input, rows), menu);
+}
+
 /// Display width of the prompt glyph (`🪵> `), the left indent shared by every
 /// input row.
 fn prompt_width() -> u16 {
@@ -1327,13 +1460,23 @@ fn cells_to_spans(cells: &[(char, Style)]) -> Vec<Span<'static>> {
 /// Word-wraps `input` into styled visual rows and locates the cursor's visual
 /// `(row, col)` for the char index `cursor_char`. Line 0 keeps its
 /// command/`!` highlighting; continuation lines render plain.
-fn wrap_input(input: &str, width: u16, cursor_char: usize) -> (Vec<Line<'static>>, u16, u16) {
+///
+/// `sel` is the selected char range (half-open, in char indices over the whole
+/// input), painted as reversed video on top of whatever styling a cell already
+/// had — the same treatment [`highlight_selection`] gives the output pane, so
+/// selections read identically wherever they are made.
+fn wrap_input(
+    input: &str,
+    width: u16,
+    cursor_char: usize,
+    sel: Option<(usize, usize)>,
+) -> (Vec<Line<'static>>, u16, u16) {
     let width = (width as usize).max(1);
     let mut lines: Vec<Line<'static>> = Vec::new();
     let (mut cur_row, mut cur_col) = (0u16, 0u16);
     let mut base = 0usize; // input char index at the start of the logical line
     for (li, logical) in input.split('\n').enumerate() {
-        let styled: Vec<(char, Style)> = if li == 0 {
+        let mut styled: Vec<(char, Style)> = if li == 0 {
             input_spans(logical)
                 .into_iter()
                 .flat_map(|s| {
@@ -1344,6 +1487,13 @@ fn wrap_input(input: &str, width: u16, cursor_char: usize) -> (Vec<Line<'static>
         } else {
             logical.chars().map(|c| (c, Style::default())).collect()
         };
+        if let Some((lo, hi)) = sel {
+            for (k, (_, st)) in styled.iter_mut().enumerate() {
+                if (lo..hi).contains(&(base + k)) {
+                    *st = st.add_modifier(Modifier::REVERSED);
+                }
+            }
+        }
         let chars: Vec<char> = styled.iter().map(|&(c, _)| c).collect();
         let offsets = wrap_offsets(&chars, width);
         let len = chars.len();
@@ -1371,12 +1521,111 @@ fn wrap_input(input: &str, width: u16, cursor_char: usize) -> (Vec<Line<'static>
     (lines, cur_row, cur_col)
 }
 
+/// The prompt's text plus where the cursor and any selection sit inside it.
+///
+/// Bundled rather than passed as three parallel arguments so a caller cannot
+/// hand [`draw`] a cursor or a selection belonging to different text than the
+/// one it renders.
+#[derive(Debug, Clone, Copy)]
+pub struct InputState<'a> {
+    /// The prompt text being edited.
+    pub text: &'a str,
+    /// Cursor position as a char index into `text`.
+    pub cursor: usize,
+    /// Selected char range (half-open), when one is active.
+    pub sel: Option<(usize, usize)>,
+}
+
+impl<'a> InputState<'a> {
+    /// A plain cursor-only state, for callers with nothing selected.
+    #[must_use]
+    pub fn new(text: &'a str, cursor: usize) -> Self {
+        Self {
+            text,
+            cursor,
+            sel: None,
+        }
+    }
+}
+
+/// Screen rect the prompt text last occupied — everything right of the prompt
+/// glyph, which is the region [`input_hit`] maps clicks over.
+///
+/// Recorded at render time rather than recomputed, because the input's position
+/// depends on the task strip's height, which the mouse handler does not
+/// otherwise know. `None` until a prompt has been drawn (and while the agent is
+/// busy with the prompt hidden), which is exactly when a click cannot land in
+/// it anyway.
+static INPUT_TEXT_RECT: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
+
+/// The prompt text rect from the last drawn frame, for mouse hit-testing.
+#[must_use]
+pub fn last_input_rect() -> Option<Rect> {
+    INPUT_TEXT_RECT.lock().ok().and_then(|r| *r)
+}
+
+/// Records (or, with `None`, forgets) the prompt's text rect. Forgetting it is
+/// what keeps a click from steering an invisible cursor on a frame drawn
+/// without a prompt.
+fn set_input_rect(rect: Option<Rect>) {
+    if let Ok(mut slot) = INPUT_TEXT_RECT.lock() {
+        *slot = rect;
+    }
+}
+
+/// Maps a screen cell to a char index into `input`, using the same word wrap
+/// [`wrap_input`] draws with.
+///
+/// Returns `None` only when the *row* misses the prompt entirely — the column
+/// is clamped into `area`, so a click on the prompt glyph left of the text
+/// lands at the start of its row and one past the end of a row lands at that
+/// row's end. Dragging off either edge therefore selects to the boundary
+/// instead of doing nothing.
+#[must_use]
+pub fn input_hit(area: Rect, input: &str, col: u16, row: u16) -> Option<usize> {
+    if area.width == 0 || area.height == 0 || row < area.y || row >= area.bottom() {
+        return None;
+    }
+    let width = usize::from(area.width).max(1);
+    let target = usize::from(row - area.y);
+    let want_col = usize::from(col.clamp(area.x, area.right().saturating_sub(1)) - area.x);
+    let mut visual = 0usize;
+    let mut base = 0usize;
+    let mut last_end = 0usize;
+    for logical in input.split('\n') {
+        let chars: Vec<char> = logical.chars().collect();
+        let offsets = wrap_offsets(&chars, width);
+        for (si, &start) in offsets.iter().enumerate() {
+            let end = offsets.get(si + 1).copied().unwrap_or(chars.len());
+            if visual == target {
+                // Walk the row's cells until the click column is covered; a
+                // wide char claims the columns it spans.
+                let mut w = 0usize;
+                for (k, c) in chars[start..end].iter().enumerate() {
+                    let cw = char_width(*c).max(1);
+                    if want_col < w + cw {
+                        return Some(base + start + k);
+                    }
+                    w += cw;
+                }
+                return Some(base + end);
+            }
+            visual += 1;
+            last_end = base + end;
+        }
+        base += chars.len() + 1; // +1 for the consumed newline
+    }
+    // Below the last drawn row: clamp to the end of the text.
+    Some(last_end)
+}
+
 /// Draws the prompt glyph and the word-wrapped input text into `input_area`,
-/// placing the terminal cursor for the char index `cursor_char`.
+/// placing the terminal cursor for `state.cursor` and reversing `state.sel`.
 ///
 /// The text is indented under the prompt and wraps to the next row instead of
 /// scrolling horizontally.
-fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor_char: usize) {
+fn render_input(frame: &mut Frame, input_area: Rect, state: InputState<'_>) {
+    let input = state.text;
     // The input region carries its text, so a harness can assert on what is
     // typed without decoding the ANSI snapshot. It is registered here rather
     // than in `frame_rows` because only this function sees the text; while the
@@ -1407,7 +1656,8 @@ fn render_input(frame: &mut Frame, input_area: Rect, input: &str, cursor_char: u
         width: input_area.width.saturating_sub(pw),
         height: input_area.height,
     };
-    let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, cursor_char);
+    set_input_rect(Some(text_area));
+    let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, state.cursor, state.sel);
     frame.render_widget(Paragraph::new(lines), text_area);
 
     let cursor = Position::new(
@@ -1827,7 +2077,7 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
 
 /// Draws one frame: output log, input line, and status bar.
 ///
-/// `input` is the current prompt text and `cursor` its `(row, col)` position.
+/// `input` carries the prompt text with its cursor and selection.
 /// `input` is `None` while the agent is busy (prefill/generation): the prompt
 /// line renders empty and the cursor stays hidden until input is accepted again.
 /// `view` is the scroll state; it is clamped in place to the scrollable range
@@ -1838,8 +2088,7 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
 pub fn draw(
     frame: &mut Frame,
     log: &OutputLog,
-    input: Option<&str>,
-    cursor: usize,
+    input: Option<InputState<'_>>,
     status: &str,
     view: &mut OutputView,
     selection: Option<ContentSelection>,
@@ -1852,7 +2101,7 @@ pub fn draw(
         frame,
         area,
         input.is_some(),
-        input.map_or(1, |t| input_height(t, tw)),
+        input.map_or(1, |s| input_height(s.text, tw)),
         tasks,
     );
 
@@ -1864,8 +2113,11 @@ pub fn draw(
     }
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
-    if let Some(input) = input {
-        render_input(frame, input_row, input, cursor);
+    match input {
+        Some(input) => render_input(frame, input_row, input),
+        // No prompt on this frame: forget its rect so a stray click cannot
+        // steer a cursor that is not on screen.
+        None => set_input_rect(None),
     }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
@@ -2032,8 +2284,7 @@ pub fn draw_btw_split(
     log: &OutputLog,
     btw_log: &OutputLog,
     btw_view: &mut OutputView,
-    input: Option<&str>,
-    cursor: usize,
+    input: Option<InputState<'_>>,
     status: &str,
     view: &mut OutputView,
     tasks: &TaskView,
@@ -2046,7 +2297,7 @@ pub fn draw_btw_split(
         frame,
         area,
         input.is_some(),
-        input.map_or(1, |t| input_height(t, tw)),
+        input.map_or(1, |s| input_height(s.text, tw)),
         tasks,
     );
     let cols =
@@ -2070,8 +2321,11 @@ pub fn draw_btw_split(
     render_output(frame, inner, btw_log, btw_view, None);
 
     // Input line and status bar span the full width, identical to `draw`.
-    if let Some(input) = input {
-        render_input(frame, input_row, input, cursor);
+    match input {
+        Some(input) => render_input(frame, input_row, input),
+        // No prompt on this frame: forget its rect so a stray click cannot
+        // steer a cursor that is not on screen.
+        None => set_input_rect(None),
     }
     let status_style = Style::default()
         .bg(Color::Indexed(238))
@@ -2568,8 +2822,7 @@ mod tests {
                 draw(
                     f,
                     &log,
-                    Some(""),
-                    0,
+                    Some(InputState::new("", 0)),
                     "idle",
                     &mut view,
                     None,
@@ -2833,7 +3086,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
         term.draw(|f| {
-            render_input(f, Rect::new(0, 0, 60, 1), input, 0);
+            render_input(f, Rect::new(0, 0, 60, 1), InputState::new(input, 0));
         })
         .unwrap();
         let buf = term.backend().buffer().clone();
@@ -2922,7 +3175,7 @@ mod tests {
     #[test]
     fn word_wrap_breaks_at_spaces_and_maps_the_cursor() {
         // "hello world" at width 8 wraps after "hello " → "hello ", "world".
-        let (lines, row, col) = wrap_input("hello world", 8, 11);
+        let (lines, row, col) = wrap_input("hello world", 8, 11, None);
         assert_eq!(lines.len(), 2);
         let row0: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(row0, "hello ");
@@ -2933,12 +3186,142 @@ mod tests {
     #[test]
     fn word_wrap_hard_breaks_a_too_long_token() {
         // No spaces: a hard break at the width boundary.
-        let (lines, _, _) = wrap_input("abcdefgh", 4, 0);
+        let (lines, _, _) = wrap_input("abcdefgh", 4, 0, None);
         let texts: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert_eq!(texts, vec!["abcd".to_string(), "efgh".to_string()]);
+    }
+
+    /// Every cell the selection covers is reversed, and nothing outside it is —
+    /// including across a wrap, where the range is expressed over the whole
+    /// input but applied per visual row.
+    #[test]
+    fn a_selection_reverses_exactly_its_own_cells() {
+        let reversed = |line: &Line<'static>| -> String {
+            line.spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
+                .map(|s| s.content.as_ref())
+                .collect()
+        };
+        // "hello world" wraps after "hello " at width 8; select "lo wo".
+        let (lines, _, _) = wrap_input("hello world", 8, 0, Some((3, 8)));
+        assert_eq!(reversed(&lines[0]), "lo ");
+        assert_eq!(reversed(&lines[1]), "wo");
+        // Without a selection nothing is reversed at all.
+        let (plain, _, _) = wrap_input("hello world", 8, 0, None);
+        assert_eq!(reversed(&plain[0]), "");
+        assert_eq!(reversed(&plain[1]), "");
+    }
+
+    /// The selection highlight rides on top of the command highlighting rather
+    /// than replacing it: a selected `/help` stays green *and* reverses.
+    #[test]
+    fn a_selection_over_a_command_keeps_the_command_colour() {
+        let (lines, _, _) = wrap_input("/help", 20, 0, Some((0, 5)));
+        for span in &lines[0].spans {
+            assert!(span.style.add_modifier.contains(Modifier::REVERSED));
+            assert_eq!(span.style.fg, Some(THEME_GREEN));
+        }
+    }
+
+    #[test]
+    fn a_click_maps_to_the_char_under_it() {
+        let area = Rect::new(4, 10, 8, 2);
+        // Row 0 is "hello ", row 1 is "world".
+        assert_eq!(input_hit(area, "hello world", 4, 10), Some(0));
+        assert_eq!(input_hit(area, "hello world", 8, 10), Some(4));
+        assert_eq!(input_hit(area, "hello world", 6, 11), Some(8));
+    }
+
+    #[test]
+    fn a_click_past_a_row_lands_on_its_end_and_off_the_prompt_misses() {
+        let area = Rect::new(4, 10, 8, 2);
+        // Right of the text on row 0: the end of that wrapped segment.
+        assert_eq!(input_hit(area, "hello world", 11, 10), Some(6));
+        // Left of the text area (on the prompt glyph): the row's start.
+        assert_eq!(input_hit(area, "hello world", 0, 11), Some(6));
+        // A different row entirely: not the prompt.
+        assert_eq!(input_hit(area, "hello world", 6, 3), None);
+        assert_eq!(input_hit(area, "hello world", 6, 12), None);
+    }
+
+    #[test]
+    fn a_click_below_the_last_row_clamps_to_the_end_of_the_text() {
+        // A three-row area holding one row of text: the spare rows clamp.
+        let area = Rect::new(0, 0, 10, 3);
+        assert_eq!(input_hit(area, "abc", 0, 2), Some(3));
+    }
+
+    #[test]
+    fn a_click_lands_on_a_wide_char_rather_than_between_its_columns() {
+        let area = Rect::new(0, 0, 10, 1);
+        // "a漢b": 漢 occupies columns 1 and 2.
+        assert_eq!(input_hit(area, "a漢b", 1, 0), Some(1));
+        assert_eq!(input_hit(area, "a漢b", 2, 0), Some(1));
+        assert_eq!(input_hit(area, "a漢b", 3, 0), Some(2));
+    }
+
+    #[test]
+    fn the_slash_menu_columns_never_starve_the_descriptions() {
+        let short = vec!["/new".to_string(), "/help".to_string()];
+        let (cmd, desc) = slash_columns(&short, 40);
+        assert_eq!(cmd, 5, "sized to the widest label");
+        assert_eq!(desc, 33);
+        // A label wider than half the row is capped rather than taking it all.
+        let long = vec!["/verylongcommand [with args]".to_string()];
+        let (cmd, desc) = slash_columns(&long, 40);
+        assert_eq!(cmd, 20);
+        assert_eq!(desc, 18);
+    }
+
+    #[test]
+    fn eliding_right_keeps_the_start_and_marks_the_cut() {
+        assert_eq!(elide_right("abcdef", 10), "abcdef");
+        assert_eq!(elide_right("abcdef", 4), "abc…");
+        assert_eq!(elide_right("abcdef", 1), "…");
+        assert_eq!(elide_right("abcdef", 0), "");
+    }
+
+    #[test]
+    fn the_slash_menu_draws_the_command_and_its_description() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let menu = crate::slashmenu::SlashMenu::new(
+            vec![crate::slashmenu::Entry {
+                name: "/compact".into(),
+                args: "[instructions]".into(),
+                desc: "summarize the transcript".into(),
+                source: crate::slashmenu::Source::Builtin,
+            }],
+            "",
+        );
+        let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        term.draw(|f| {
+            draw(
+                f,
+                &OutputLog::new(),
+                Some(InputState::new("/comp", 5)),
+                "idle",
+                &mut OutputView::default(),
+                None,
+                &TaskView::default(),
+                None,
+            );
+            draw_slash_menu(f, "/comp", &menu);
+        })
+        .unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
+        assert!(text.contains("/compact"), "{text}");
+        assert!(text.contains("summarize the transcript"), "{text}");
     }
 
     #[test]
@@ -3856,8 +4239,7 @@ mod tests {
             draw(
                 f,
                 &log,
-                Some("hi"),
-                2,
+                Some(InputState::new("hi", 2)),
                 "idle",
                 &mut view,
                 None,
@@ -3905,8 +4287,7 @@ mod tests {
             draw(
                 f,
                 &log,
-                Some("hi"),
-                2,
+                Some(InputState::new("hi", 2)),
                 "idle",
                 &mut view,
                 None,
@@ -3930,7 +4311,6 @@ mod tests {
                 f,
                 &log,
                 None,
-                0,
                 "generating",
                 &mut view,
                 None,
@@ -3960,8 +4340,7 @@ mod tests {
             draw(
                 f,
                 &log,
-                Some("aa\nbb"),
-                5,
+                Some(InputState::new("aa\nbb", 5)),
                 "idle",
                 &mut view,
                 None,

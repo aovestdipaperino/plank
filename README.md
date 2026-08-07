@@ -90,6 +90,8 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Git worktrees** — `EnterWorktree`/`ExitWorktree` move the session into an isolated second checkout (`.plank/worktrees/<name>`, on branch `worktree-<name>`), so a large or speculative change never touches the tree you're working in; `--worktree NAME` / `--worktree-pr N` start a whole session in one, and `isolation: worktree` gives each sub-agent its own so a fan-out can't overwrite itself. Removal is fail-closed: a worktree holding uncommitted files or unpushed commits is not deleted without an explicit discard, and neither is one whose state git couldn't be asked about. `WorktreeCreate`/`WorktreeRemove` hooks replace git entirely for a non-git VCS.
 - **Plan mode** — `EnterPlanMode` holds the model read-only (research only) until it proposes a plan you approve with `ExitPlanMode`, before any edits land.
 - **`@` file completion, `glob`, and a model-visible task list** that survives compaction.
+- **`/` command menu** — typing `/` raises a drop-up above the prompt listing every command with its argument hint and a one-line explanation beside it, filtered as you keep typing. Skills and prompt templates appear alongside the built-ins, tagged as such, so what a project adds is as discoverable as what ships.
+- **Editable, selectable prompt** — Shift with the arrows, Home/End, or a word-wise Alt/Ctrl arrow selects text in the prompt; so does click-and-drag. `Ctrl-C` copies the selection (and still clears the line when nothing is selected), `Ctrl-X` cuts, `Ctrl-V` pastes, `Ctrl-Shift-A` selects everything. It all works mid-turn too, on the prompt that stays live while the model generates.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
 - **`ask` tool** — when a turn is genuinely ambiguous the model can pose a multiple-choice question instead of guessing; you pick in a panel (or numbered list in the REPL), and it degrades cleanly when there's no user to ask.
 - **Desktop notifications & live window title** — long turns end with a persistent macOS banner (`'<prompt>' finished` and the tail of the answer; `interrupted` for aborted turns), configurable to fire `always`, only while `unfocused`, or `never`; the terminal title tracks the task (`🪵 plank - fix the bug…`).
@@ -164,7 +166,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
 | | `builtinEditor` | `true` | `Ctrl-G` opens the built-in editor (a fork of Microsoft Edit, in-process). `false` shells out to `$EDITOR` as before. |
-| | `screensaver` | `1m` | Idle time before the starfield screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
+| | `screensaver` | `1m` | Idle time before the screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. It comes up as either the starfield or the matrix rain, a coin flip each time. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
 | `safety` | `sandbox` | on (macOS) | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
@@ -297,6 +299,14 @@ That is a real turn underneath — the model is 1m 49s into writing a poem at 20
 | `/centipede` | shoot it apart before it walks into you |
 | `/frogger` | cross the road, then ride the river home |
 
+And one that is not a game at all:
+
+| Command | |
+|---|---|
+| `/matrix` | glyphs falling down a black screen, for when you would rather just watch something |
+
+`/matrix` keeps no state — there is nothing in rain to come back to, so closing it and reopening it deals a fresh downpour and `new` has nothing to undo. `↑`/`↓` and the wheel change how fast it falls; `c` cycles the alphabet through half-width katakana, binary, and punctuation-heavy ASCII. The katakana are the whole point, but they are also the one thing a terminal font can fail to draw: if you get a screen of boxes, press `c`.
+
 Two arguments, combinable — `/breakout new sound`:
 
 - **`new`** (or `reset`) — deal a fresh game. Without it a command **resumes the game you left**: each one keeps its own slot, so you can close pelota, run three turns, open breakout, and come back to pelota exactly where it was. A finished game is not kept, so the next command deals a new one.
@@ -324,7 +334,7 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
 - `worktree.rs`, `tools/worktree.rs` — git-worktree isolation and the `EnterWorktree`/`ExitWorktree` tools
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
-- `arcade.rs`, `arcade/` — the six easter-egg games (see above)
+- `arcade.rs`, `arcade/` — the easter-egg games, the matrix rain and the starfield (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling
 
 ## Star History

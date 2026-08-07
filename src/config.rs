@@ -538,6 +538,247 @@ fn first_token(cmd: &str) -> &str {
     cmd.split_once(char::is_whitespace).map_or(cmd, |(t, _)| t)
 }
 
+/// One built-in slash command as the `/` menu shows it: the command itself, a
+/// hint for what it takes, and a one-line explanation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlashCommand {
+    /// Command including the leading slash, e.g. `/compact`.
+    pub name: &'static str,
+    /// Argument hint shown after the name; empty when it takes none.
+    pub args: &'static str,
+    /// One-line help, shown beside the name in the menu.
+    pub desc: &'static str,
+}
+
+/// Every built-in slash command the `/` menu offers, in the order it lists them
+/// — roughly most-reached-for first rather than alphabetical.
+///
+/// Deliberately excluded, matching what [`slash_command_known_with`] treats as
+/// hidden: the `crate::arcade` easter eggs and `/renotify` (a screenshot aid).
+/// Skills and templates are *not* here — they are discovered at runtime and
+/// appended by `crate::slashmenu::catalog`.
+///
+/// A test in this module asserts every entry is a command dispatch actually
+/// knows, so the menu can never advertise something that would be forwarded to
+/// the model as an ordinary prompt.
+pub const SLASH_COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "/help",
+        args: "",
+        desc: "show the full option and command reference",
+    },
+    SlashCommand {
+        name: "/new",
+        args: "",
+        desc: "start a fresh conversation, dropping the transcript",
+    },
+    SlashCommand {
+        name: "/clear",
+        args: "",
+        desc: "alias for /new",
+    },
+    SlashCommand {
+        name: "/compact",
+        args: "[instructions]",
+        desc: "summarize the transcript to reclaim context",
+    },
+    SlashCommand {
+        name: "/context",
+        args: "",
+        desc: "report what is filling the context window",
+    },
+    SlashCommand {
+        name: "/usage",
+        args: "",
+        desc: "report token usage and timings for this session",
+    },
+    SlashCommand {
+        name: "/config",
+        args: "[section.key value]",
+        desc: "edit settings in a form, or set one inline",
+    },
+    SlashCommand {
+        name: "/save",
+        args: "",
+        desc: "save the current session to ~/.plank",
+    },
+    SlashCommand {
+        name: "/list",
+        args: "",
+        desc: "list saved sessions",
+    },
+    SlashCommand {
+        name: "/resume",
+        args: "[prefix]",
+        desc: "resume a saved session (sha prefix or list number)",
+    },
+    SlashCommand {
+        name: "/switch",
+        args: "<prefix>",
+        desc: "switch to another saved session by id",
+    },
+    SlashCommand {
+        name: "/del",
+        args: "<prefix>",
+        desc: "delete a saved session",
+    },
+    SlashCommand {
+        name: "/tag",
+        args: "<text>",
+        desc: "label this session (\"-\" clears the label)",
+    },
+    SlashCommand {
+        name: "/fork",
+        args: "[name]",
+        desc: "branch the conversation at the current turn",
+    },
+    SlashCommand {
+        name: "/clone",
+        args: "",
+        desc: "copy the current branch into a new session",
+    },
+    SlashCommand {
+        name: "/tree",
+        args: "",
+        desc: "show the branch tree of this session",
+    },
+    SlashCommand {
+        name: "/checkpoint",
+        args: "[name]",
+        desc: "snapshot the working tree so a turn can be undone",
+    },
+    SlashCommand {
+        name: "/rollback",
+        args: "[name]",
+        desc: "restore the working tree from a checkpoint",
+    },
+    SlashCommand {
+        name: "/history",
+        args: "",
+        desc: "show the prompt history for this directory",
+    },
+    SlashCommand {
+        name: "/btw",
+        args: "<question>",
+        desc: "ask a side question without disturbing the main task",
+    },
+    SlashCommand {
+        name: "/subagent",
+        args: "<task>",
+        desc: "run a task in a sub-agent with its own context",
+    },
+    SlashCommand {
+        name: "/agent",
+        args: "",
+        desc: "list the sub-agents available to the model",
+    },
+    SlashCommand {
+        name: "/tasks",
+        args: "",
+        desc: "show the model's task list for this session",
+    },
+    SlashCommand {
+        name: "/skills",
+        args: "",
+        desc: "list the skills loaded from SKILL.md files",
+    },
+    SlashCommand {
+        name: "/templates",
+        args: "",
+        desc: "list the prompt templates available as commands",
+    },
+    SlashCommand {
+        name: "/hooks",
+        args: "",
+        desc: "list the configured hooks and what triggers them",
+    },
+    SlashCommand {
+        name: "/mcp",
+        args: "",
+        desc: "report connected MCP servers and their tools",
+    },
+    SlashCommand {
+        name: "/init",
+        args: "",
+        desc: "write an AGENTS.md describing this repository",
+    },
+    SlashCommand {
+        name: "/remember",
+        args: "[user] <text>",
+        desc: "append a durable note to project or user memory",
+    },
+    SlashCommand {
+        name: "/think",
+        args: "[low|medium|max|off]",
+        desc: "set how much reasoning to ask the model for",
+    },
+    SlashCommand {
+        name: "/power",
+        args: "<1-100>",
+        desc: "set the GPU power cap percentage",
+    },
+    SlashCommand {
+        name: "/notify",
+        args: "[mode]",
+        desc: "choose when a finished turn notifies you",
+    },
+    SlashCommand {
+        name: "/strip",
+        args: "[on|off]",
+        desc: "toggle stripping thinking blocks from the transcript",
+    },
+    SlashCommand {
+        name: "/export",
+        args: "[md|html] [path]",
+        desc: "write the transcript to a shareable file",
+    },
+    SlashCommand {
+        name: "/insights",
+        args: "[fast]",
+        desc: "report on how you have been using plank",
+    },
+    SlashCommand {
+        name: "/repro",
+        args: "[path]",
+        desc: "write a reproducer bundle for the current session",
+    },
+    SlashCommand {
+        name: "/remote-control",
+        args: "",
+        desc: "show the TUI remote-control endpoint",
+    },
+    SlashCommand {
+        name: "/rc",
+        args: "",
+        desc: "alias for /remote-control",
+    },
+    SlashCommand {
+        name: "/remote",
+        args: "",
+        desc: "report the remote engine this session is driving",
+    },
+    SlashCommand {
+        name: "/grant",
+        args: "",
+        desc: "review and grant pending tool permissions",
+    },
+    SlashCommand {
+        name: "/version",
+        args: "",
+        desc: "print the plank version",
+    },
+    SlashCommand {
+        name: "/quit",
+        args: "",
+        desc: "leave plank",
+    },
+    SlashCommand {
+        name: "/exit",
+        args: "",
+        desc: "alias for /quit",
+    },
+];
+
 /// True when `cmd` is `name` alone or `name` followed by whitespace.
 #[must_use]
 pub fn slash_command_with_args(cmd: &str, name: &str) -> bool {
@@ -1468,6 +1709,44 @@ mod tests {
         assert!(!slash_command_known("/rcx"));
         assert!(slash_command_known("/btw what is this?"));
         assert!(!slash_command_known("/btwx"));
+    }
+
+    /// The `/` menu offers exactly what dispatch will accept: advertising a
+    /// name dispatch does not know would send the line to the model as an
+    /// ordinary prompt the moment the user picked it.
+    #[test]
+    fn every_menu_command_is_known_to_the_dispatcher() {
+        for c in SLASH_COMMANDS {
+            assert!(
+                slash_command_known_with(c.name, true),
+                "{} is offered by the menu but unknown to dispatch",
+                c.name
+            );
+            assert!(c.name.starts_with('/'), "{}", c.name);
+            assert!(!c.desc.is_empty(), "{} has no description", c.name);
+        }
+    }
+
+    #[test]
+    fn the_menu_catalog_has_no_duplicate_commands() {
+        let mut names: Vec<&str> = SLASH_COMMANDS.iter().map(|c| c.name).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "duplicate entry in SLASH_COMMANDS");
+    }
+
+    /// The arcade easter eggs and `/renotify` are deliberately undiscoverable;
+    /// the menu is the place that would leak them.
+    #[test]
+    fn hidden_commands_stay_out_of_the_menu() {
+        for hidden in crate::arcade::Arcade::COMMANDS {
+            assert!(
+                !SLASH_COMMANDS.iter().any(|c| c.name == hidden),
+                "{hidden} must stay hidden"
+            );
+        }
+        assert!(!SLASH_COMMANDS.iter().any(|c| c.name == "/renotify"));
         assert!(slash_command_known("/subagent count the tests"));
         assert!(!slash_command_known("/subagentx"));
         // The `:<name>` form is known whatever the name — an unknown name is
