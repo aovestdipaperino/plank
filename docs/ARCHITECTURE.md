@@ -257,8 +257,11 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   depends on the task strip's height.
 - **Screensaver** (`arcade.rs` + the TUI input loop): after `ui.screensaver`
   of idleness (`1m` by default; `2m`, `5m`, `never`) one of the two ambient
-  screens — the perspective starfield or the matrix rain (`arcade/matrix.rs`),
-  a coin flip off the opening seed — takes the whole screen, and the next key,
+  screens takes the whole screen — the matrix rain (`arcade/matrix.rs`) by
+  default, the perspective starfield, or a coin flip off the opening seed,
+  per `ui.screensaverFace`. `open_screensaver` reads the setting;
+  `open_screensaver_as` takes the face directly, so tests drive each one
+  without touching process-wide state. The next key,
   click or paste puts the UI back — consumed, not typed. Idleness is measured
   in the outer input loop, which is the only place that can be idle: a running turn is
   inside `tui_turn`, so a long generation is never mistaken for an absent
@@ -364,7 +367,7 @@ groups:
 | Group | Keys | Replaces |
 |---|---|---|
 | `engine` | `model`, `threads`, `backend`, `power`, `ctx` | `-m`/`-t`/`--backend`/`--power`/`-c`, and the hardcoded `~/.plank/ds4flash.gguf` fallback |
-| `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize`, `showToolCalls`, `showToolResults`, `showThinking` | magic numbers in `complete.rs` and `ui.rs` |
+| `ui` | `respectGitignore`, `popupRows`, `indexRefreshSecs`, `historySize`, `showToolCalls`, `showToolResults`, `showThinking`, `screensaver`, `screensaverFace` | magic numbers in `complete.rs` and `ui.rs` |
 | `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
 | `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
 | `ask` | `maxOptions` | the `ask` tool's option cap |

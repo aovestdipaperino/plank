@@ -205,6 +205,43 @@ mean a synthesis crate and a system audio dependency. The cost is that
 distinguishing one cue from another is how many — one blip for a hit,
 two for a life lost, three for a level. Terminals set to a visual bell
 flash instead, which is why it is off unless you ask.</p>
+<h2 id="the-screensaver">The screensaver</h2>
+<p>Leave the prompt idle and plank puts an ambient screen up.
+<code>ui.screensaverFace</code> picks which:</p>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>matrix</code></td>
+<td>the falling glyphs — the default</td>
+</tr>
+<tr>
+<td><code>starfield</code></td>
+<td>a perspective starfield rushing past the edges</td>
+</tr>
+<tr>
+<td><code>random</code></td>
+<td>a fresh coin flip each time it opens</td>
+</tr>
+</tbody>
+</table>
+<p><code>ui.screensaver</code> says when: <code>1m</code> (the default),
+<code>2m</code>, <code>5m</code>, or <code>never</code>. Both cycle in
+<code>/config</code> rather than needing to be typed.</p>
+<p>Any key or mouse event brings the UI back, and the event that wakes
+it is swallowed rather than acted on — waking a screensaver should not
+leave a stray character in your prompt or click a button you could not
+see. It never comes up mid-turn or over a dialog.</p>
+<p>The screensaver is <strong>not</strong> behind
+<code>ui.easterEggs</code>. Turning the games off still leaves you an
+idle screen, because a game you invoke and what an unattended terminal
+shows are different decisions. Set <code>ui.screensaver</code> to
+<code>never</code> if you want neither.</p>
 <h2 id="turning-them-off">Turning them off</h2>
 <p>They live behind <code>ui.easterEggs</code>, on by default. Setting
 it to <code>false</code> does more than hide them: they stop being

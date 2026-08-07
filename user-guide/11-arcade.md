@@ -35,6 +35,22 @@ Pelota has one extra move: hold **Shift** while steering and the paddle shrinks 
 
 **Sound is the terminal bell**, and nothing else. That is deliberate: it adds zero bytes to the binary, where real audio would mean a synthesis crate and a system audio dependency. The cost is that `BEL` has no pitch and no length, so the only thing distinguishing one cue from another is how many — one blip for a hit, two for a life lost, three for a level. Terminals set to a visual bell flash instead, which is why it is off unless you ask.
 
+## The screensaver
+
+Leave the prompt idle and plank puts an ambient screen up. `ui.screensaverFace` picks which:
+
+| Value | |
+|---|---|
+| `matrix` | the falling glyphs — the default |
+| `starfield` | a perspective starfield rushing past the edges |
+| `random` | a fresh coin flip each time it opens |
+
+`ui.screensaver` says when: `1m` (the default), `2m`, `5m`, or `never`. Both cycle in `/config` rather than needing to be typed.
+
+Any key or mouse event brings the UI back, and the event that wakes it is swallowed rather than acted on — waking a screensaver should not leave a stray character in your prompt or click a button you could not see. It never comes up mid-turn or over a dialog.
+
+The screensaver is **not** behind `ui.easterEggs`. Turning the games off still leaves you an idle screen, because a game you invoke and what an unattended terminal shows are different decisions. Set `ui.screensaver` to `never` if you want neither.
+
 ## Turning them off
 
 They live behind `ui.easterEggs`, on by default. Setting it to `false` does more than hide them: they stop being commands at all, so `/pelota` goes to the model as an ordinary prompt exactly like any other unrecognized slash line. That is the honest behaviour for a shared or managed install that wants no games in it, and the startup line names the setting when it is off — so a `settings.json` cannot quietly remove them without saying so.
