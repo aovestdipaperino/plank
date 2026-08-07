@@ -1,12 +1,13 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Hidden arcade: a perspective starfield and a multi-level pelota match.
+//! Hidden arcade: five games, a matrix rain and a perspective starfield.
 //!
-//! The games are easter eggs behind `/pelota` and friends. Neither is listed in
-//! [`crate::config::usage`] nor offered by the completion popup — that is the
-//! point — but both are known commands, so the dispatcher runs them instead of
-//! forwarding the line to the model.
+//! The games and the rain are easter eggs behind `/pelota` and friends. None is
+//! listed in [`crate::config::usage`] nor offered by the completion popup —
+//! that is the point — but all are known commands, so the dispatcher runs them
+//! instead of forwarding the line to the model. The starfield and the rain are
+//! also what the idle screensaver puts up, which is not gated at all.
 //!
 //! # Design
 //!
@@ -32,6 +33,7 @@ pub mod breakout;
 pub mod centipede;
 pub mod frogger;
 pub mod invaders;
+pub mod matrix;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
@@ -970,8 +972,10 @@ impl Sound {
 /// Which easter egg is open.
 #[derive(Debug)]
 pub enum Game {
-    /// The screensaver's starfield (`ui.screensaver`).
+    /// A starfield: the screensaver's first face (`ui.screensaver`).
     Stars(Starfield),
+    /// Falling glyphs: `/matrix`, and the screensaver's other face.
+    Matrix(matrix::Rain),
     /// `/pelota`
     Pelota(Box<Pelota>),
     /// `/breakout`
@@ -985,11 +989,22 @@ pub enum Game {
 }
 
 impl Game {
-    /// Whether this game is over, either way. The starfield never ends.
+    /// Whether this is weather rather than a game: something to watch, with no
+    /// score, no ending and no state a player could come back to.
+    ///
+    /// The cabinet uses this to decide *not* to park one — resuming rain would
+    /// be indistinguishable from fresh rain, so the slot and the "resumed
+    /// where you left off" notice would both be lies.
+    #[must_use]
+    pub const fn ambient(&self) -> bool {
+        matches!(self, Self::Stars(_) | Self::Matrix(_))
+    }
+
+    /// Whether this game is over, either way. The ambient ones never end.
     #[must_use]
     pub fn finished(&self) -> bool {
         match self {
-            Self::Stars(_) => false,
+            Self::Stars(_) | Self::Matrix(_) => false,
             Self::Pelota(p) => p.finished(),
             Self::Breakout(b) => b.finished(),
             Self::Invaders(i) => i.finished(),
@@ -1002,7 +1017,8 @@ impl Game {
     #[must_use]
     pub fn closing_line(&self) -> Option<String> {
         match self {
-            Self::Stars(_) => None,
+            // Nothing happened that a scrollback line could report.
+            Self::Stars(_) | Self::Matrix(_) => None,
             Self::Pelota(p) => Some(format!(
                 "pelota: level {} — {} to {}{}",
                 p.level(),
@@ -1053,7 +1069,9 @@ struct Vitals {
 impl Game {
     fn vitals(&self) -> Vitals {
         match self {
-            Self::Stars(_) => Vitals {
+            // No score, no lives, no levels: nothing that could earn a blip,
+            // which is what keeps the ambient screens silent even with sound on.
+            Self::Stars(_) | Self::Matrix(_) => Vitals {
                 score: 0,
                 lives: 0,
                 level: 0,
@@ -1255,12 +1273,13 @@ pub fn command_of(line: &str) -> Option<&'static str> {
 impl Arcade {
     /// Every command this module answers to. Kept next to [`Self::open`] so the
     /// dispatcher's list and the constructors cannot drift apart.
-    pub const COMMANDS: [&'static str; 5] = [
+    pub const COMMANDS: [&'static str; 6] = [
         "/pelota",
         "/breakout",
         "/invaders",
         "/centipede",
         "/frogger",
+        "/matrix",
     ];
     /// The argument that throws the parked game away and deals a new one.
     pub const NEW_ARGS: [&'static str; 2] = ["new", "reset"];
@@ -1322,6 +1341,7 @@ impl Arcade {
             "/invaders" => Game::Invaders(Box::new(invaders::Invaders::new(seed))),
             "/centipede" => Game::Centipede(Box::new(centipede::Centipede::new(seed))),
             "/frogger" => Game::Frogger(Box::new(frogger::Frogger::new(seed))),
+            "/matrix" => Self::rain(seed),
             // `open` has already rejected commands that are not ours, and the
             // starfield is no longer one of them — it is the screensaver now.
             _ => Self::stars(seed, w, h),
@@ -1334,15 +1354,33 @@ impl Arcade {
         Game::Stars(Starfield::new(seed, count))
     }
 
-    /// Opens the starfield as a screensaver: full screen rather than
+    /// A field of falling glyphs. It needs no size: everything vertical is a
+    /// fraction of the height and the columns outnumber any terminal's.
+    fn rain(seed: u64) -> Game {
+        Game::Matrix(matrix::Rain::new(seed))
+    }
+
+    /// Opens an ambient screen as a screensaver: full screen rather than
     /// translucent, dismissed by any key or mouse event rather than played.
     ///
     /// Not a command and not an easter egg — this is what `ui.screensaver`
     /// runs after an idle stretch, so it stays available with
     /// `ui.easterEggs` off.
+    ///
+    /// Which of the two comes up is a coin flip off the same seed that dresses
+    /// it. Coming back to an idle terminal and finding the *other* sky is
+    /// worth more than the predictability, and neither of them is doing
+    /// anything you could be interrupted in the middle of.
     pub fn open_screensaver(&mut self, seed: u64, w: u16, h: u16) {
         self.park();
-        self.open = Some(Self::stars(seed, w, h));
+        // Through the Rng rather than a bare bit test: `arcade_seed` mixes the
+        // wall clock, whose low bit merely alternates second by second.
+        let stars = Rng::new(seed).next_u64().is_multiple_of(2);
+        self.open = Some(if stars {
+            Self::stars(seed, w, h)
+        } else {
+            Self::rain(seed)
+        });
         self.screensaver = true;
         self.translucent = false;
     }
@@ -1357,7 +1395,8 @@ impl Arcade {
     ///
     /// A game that has already ended is dropped rather than parked: resuming
     /// onto a game-over banner is not resuming, and the next `/breakout` should
-    /// deal a new wall.
+    /// deal a new wall. So is an [ambient](Game::ambient) one, which has no
+    /// state worth coming back to.
     fn park(&mut self) {
         let Some(game) = self.open.take() else {
             return;
@@ -1368,7 +1407,7 @@ impl Arcade {
             self.screensaver = false;
             return;
         }
-        if !game.finished() {
+        if !game.finished() && !game.ambient() {
             self.parked[self.open_slot] = Some(game);
         }
     }
@@ -1406,6 +1445,7 @@ impl Arcade {
         };
         match game {
             Game::Stars(s) => s.step(dt_ms),
+            Game::Matrix(m) => m.step(dt_ms),
             Game::Pelota(p) => p.step(dt_ms),
             Game::Breakout(b) => b.step(dt_ms),
             Game::Invaders(i) => i.step(dt_ms),
@@ -1422,6 +1462,7 @@ impl Arcade {
         };
         match game {
             Game::Stars(s) => s.glyphs(w, h),
+            Game::Matrix(m) => m.glyphs(w, h),
             Game::Pelota(p) => p.glyphs(w, h),
             Game::Breakout(b) => b.glyphs(w, h),
             Game::Invaders(i) => i.glyphs(w, h),
@@ -1434,14 +1475,16 @@ impl Arcade {
     #[must_use]
     pub fn banner(&self, w: u16, h: u16) -> Option<String> {
         let game = self.open.as_ref()?;
-        if matches!(game, Game::Stars(_)) {
+        // The ambient screens fill whatever they are given and have nothing to
+        // announce, so they never carry a banner — not even the size warning.
+        if game.ambient() {
             return None;
         }
         if w < MIN_W || h < MIN_H {
             return Some(format!("serve un terminale di almeno {MIN_W}x{MIN_H}"));
         }
         match game {
-            Game::Stars(_) => None,
+            Game::Stars(_) | Game::Matrix(_) => None,
             Game::Pelota(p) => p.banner(),
             Game::Breakout(b) => b.banner(),
             Game::Invaders(i) => i.banner(),
@@ -1467,6 +1510,11 @@ impl Arcade {
             Game::Stars(s) => {
                 format!("↑↓/wheel speed ({:.2}×) · t {veil} · b {blips}", s.speed())
             }
+            Game::Matrix(m) => format!(
+                "↑↓/wheel speed ({:.2}×) · c glyphs ({}) · t {veil} · b {blips}",
+                m.speed(),
+                m.charset().label()
+            ),
             Game::Pelota(p) => {
                 let charge = if p.charged() {
                     "⚡CHARGED"
@@ -1511,6 +1559,11 @@ impl Arcade {
             Game::Stars(s) => match ev.kind {
                 MouseEventKind::ScrollUp => s.scale_speed(1.3),
                 MouseEventKind::ScrollDown => s.scale_speed(1.0 / 1.3),
+                _ => {}
+            },
+            Game::Matrix(m) => match ev.kind {
+                MouseEventKind::ScrollUp => m.scale_speed(1.3),
+                MouseEventKind::ScrollDown => m.scale_speed(1.0 / 1.3),
                 _ => {}
             },
             Game::Pelota(p) => {
@@ -1572,6 +1625,14 @@ impl Arcade {
             Game::Stars(s) => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => s.scale_speed(1.3),
                 KeyCode::Down | KeyCode::Char('j') => s.scale_speed(1.0 / 1.3),
+                _ => {}
+            },
+            Game::Matrix(m) => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => m.scale_speed(1.3),
+                KeyCode::Down | KeyCode::Char('j') => m.scale_speed(1.0 / 1.3),
+                // `c` re-letters the rain: the katakana are the point, but a
+                // font without them draws boxes, and this is the way out.
+                KeyCode::Char('c') => m.cycle_charset(),
                 _ => {}
             },
             Game::Pelota(p) => {
@@ -2049,6 +2110,79 @@ mod tests {
             a.parked.iter().all(Option::is_none),
             "the screensaver must not occupy a game's slot"
         );
+    }
+
+    /// The rain is weather, not a game: closing it leaves nothing behind and
+    /// takes no slot, so the next `/matrix` is a fresh downpour rather than a
+    /// resume notice about a thing that has no state.
+    #[test]
+    fn the_rain_is_not_parked() {
+        let mut a = Arcade::new();
+        a.open("/matrix", false, 1, 80, 24);
+        assert!(matches!(a.open.as_ref(), Some(Game::Matrix(_))));
+        for _ in 0..200 {
+            a.step(50);
+        }
+        assert_eq!(a.close(), None, "the rain left a line in the scrollback");
+        assert!(!a.has_parked("/matrix"), "the rain took a parking slot");
+        assert!(a.parked.iter().all(Option::is_none));
+    }
+
+    /// Both ambient screens are reachable from the idle timer — the point of
+    /// the coin flip is that you do not always get the same one.
+    #[test]
+    fn the_screensaver_shows_both_skies() {
+        let mut stars = 0;
+        let mut rain = 0;
+        for seed in 1..60u64 {
+            let mut a = Arcade::new();
+            a.open_screensaver(seed, 80, 24);
+            assert!(a.is_screensaver());
+            match a.open.as_ref() {
+                Some(Game::Stars(_)) => stars += 1,
+                Some(Game::Matrix(_)) => rain += 1,
+                _ => panic!("the screensaver opened something playable"),
+            }
+        }
+        assert!(stars > 5 && rain > 5, "lopsided flip: {stars} vs {rain}");
+    }
+
+    /// `c` re-letters the rain rather than quitting or steering — the escape
+    /// hatch for a terminal font without katakana has to be reachable.
+    #[test]
+    fn c_cycles_the_rain_glyphs() {
+        let mut a = Arcade::new();
+        a.open("/matrix", false, 1, 80, 24);
+        let charset = |a: &Arcade| match a.open.as_ref() {
+            Some(Game::Matrix(m)) => m.charset(),
+            _ => panic!("the rain is not open"),
+        };
+        let first = charset(&a);
+        assert!(matches!(
+            a.handle_key(key(KeyCode::Char('c'))),
+            Outcome::Stay
+        ));
+        assert_ne!(charset(&a), first, "c did not change the alphabet");
+        // ...and the whole cycle comes back around, whatever its length.
+        while charset(&a) != first {
+            a.handle_key(key(KeyCode::Char('c')));
+        }
+        assert!(a.is_open(), "cycling closed the rain");
+    }
+
+    /// The rain has no score and no lives, so it must stay as silent as the
+    /// starfield even with the blips on.
+    #[test]
+    fn the_rain_never_blips() {
+        let mut a = Arcade::new();
+        a.open("/matrix", false, 1, 80, 24);
+        a.sound.set(true);
+        let before = a.open.as_ref().map(Game::vitals).unwrap();
+        for _ in 0..100 {
+            a.step(50);
+        }
+        let after = a.open.as_ref().map(Game::vitals).unwrap();
+        assert_eq!(cue_for(before, after), None);
     }
 
     /// `/stars` is gone: it is the screensaver now, not a command.
