@@ -128,3 +128,4 @@ echo
 echo "regolo.ai is reachable with this key. Now try:"
 echo "  cd local-remote && ./run.sh     # local main, remote sub-agent"
 echo "  cd remote-local && ./run.sh     # remote main, local sub-agent"
+echo "  cd remote-remote && ./run.sh    # both remote, one key (no local model)"

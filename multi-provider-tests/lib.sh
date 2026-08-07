@@ -8,6 +8,9 @@
 # and a base URL; plank appends /chat/completions to it.
 : "${REGOLO_BASE_URL:=https://api.regolo.ai/v1}"
 : "${REGOLO_MODEL:=glm5.2}"
+# The second hosted model, used by remote-remote/ for the sub-agent so the two
+# sides of that test are distinguishable while sharing one key.
+: "${REGOLO_SUB_MODEL:=qwen3-coder-next}"
 
 die() { echo "error: $*" >&2; exit 1; }
 

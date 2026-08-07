@@ -1,7 +1,7 @@
 # Multi-provider sub-agent tests
 
-Two runnable plank sessions that exercise cross-engine sub-agents in both
-directions, checked into the repo so anyone with a provider key can run them.
+Three runnable plank sessions that exercise cross-engine sub-agents in every
+direction, checked into the repo so anyone with a provider key can run them.
 They hold no credentials: the key is read from the environment, and a sub-agent
 definition names the *variable* rather than the secret. The remote side is [regolo.ai](https://regolo.ai) — OpenAI-compatible,
 so plank reaches it with `--provider openai` and a base URL.
@@ -10,13 +10,14 @@ so plank reaches it with `--provider openai` and a base URL.
 |---|---|---|
 | [`local-remote/`](local-remote) | local ds4 model | `glm5.2` on regolo.ai |
 | [`remote-local/`](remote-local) | `glm5.2` on regolo.ai | local ds4 model (`provider: local`) |
+| [`remote-remote/`](remote-remote) | `glm5.2` on regolo.ai | `qwen3-coder-next` on regolo.ai, same key |
 
 ## One thing to set
 
 ```sh
 export REGOLO_API_KEY=...        # https://regolo.ai
 ./test-regolo.sh                 # is the remote side working at all?
-cd local-remote && ./run.sh      # or: cd remote-local && ./run.sh
+cd local-remote && ./run.sh      # or remote-local/, or remote-remote/
 ```
 
 Start with `./test-regolo.sh`: one chat completion straight over curl, using the
@@ -32,6 +33,7 @@ Overridable if you want something other than the defaults:
 |---|---|---|
 | `REGOLO_API_KEY` | — | Required. The only thing you must set. |
 | `REGOLO_MODEL` | `glm5.2` | List what your key can reach with `./test-regolo.sh --models`. |
+| `REGOLO_SUB_MODEL` | `qwen3-coder-next` | `remote-remote/` only: the sub-agent's model. |
 | `REGOLO_BASE_URL` | `https://api.regolo.ai/v1` | plank appends `/chat/completions`. |
 | `PLANK` | — | An explicit plank binary. |
 | `PLANK_REPO` | the repo root | Where to look for `target/{release,debug}/plank`. Defaults to this directory's parent, so a plain `cargo build --release` is enough. |
@@ -46,7 +48,12 @@ only the sub-agent costs tokens. It answers "does a hosted sub-agent work at all
 — tools inside the sidechain, the roster's engine label, the key-variable
 handling, and that the engine swap is restored afterwards.
 
-**`remote-local/`** is the inverse and the expensive one to start: because a
+**`remote-remote/`** needs no local model at all, so it is the one to run on a
+machine that cannot host one, and the fastest to start. It is the only direction
+where the two engines differ *only* by model name while sharing a base URL and a
+key, which is what makes a collapsed-engine or wrong-restore bug visible.
+
+**`remote-local/`** is the inverse of the first and the expensive one to start: because a
 definition asks for `provider: local`, plank loads the local model *alongside*
 regolo.ai, so startup pays the full local residency (~82 GB, and only one plank
 process can hold it). Read that directory's README before running it.
@@ -57,8 +64,8 @@ parallel fan-out timing, and the failure cases.
 
 ## Shared plumbing
 
-`lib.sh` holds the endpoint defaults, the key check, and the binary lookup; both
-`run.sh` scripts and `test-regolo.sh` source it. Nothing here writes to the repo,
+`lib.sh` holds the endpoint defaults, the key check, and the binary lookup; all
+three `run.sh` scripts and `test-regolo.sh` source it. Nothing here writes to the repo,
 and no key is ever passed to the sub-agent on a command line — a definition names
 the *variable*
 (`api-key-env: REGOLO_API_KEY`) and plank reads it from the environment, which is
