@@ -341,10 +341,37 @@ pub fn set_roster(defs: &[AgentDef]) {
     }
 }
 
+// Test-only roster override, scoped to the calling thread. The libtest harness
+// runs tests in parallel on separate threads, so a test that published to the
+// process-wide slot would silently rewrite what a concurrently running test is
+// asserting against — a failure that reproduces only under the right
+// interleaving. Same treatment, and same reason, as `settings::install_for_test`.
+#[cfg(test)]
+thread_local! {
+    static TEST_ROSTER: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes [`is_known`] answer from `names` on the current thread only.
+#[cfg(test)]
+pub fn set_roster_for_test(names: &[&str]) {
+    TEST_ROSTER.with(|r| {
+        *r.borrow_mut() = Some(names.iter().map(|n| (*n).to_string()).collect());
+    });
+}
+
 /// True when `name` is one of this session's definitions. Answers `false`
-/// before [`set_roster`] runs, which is what library consumers and tests get.
+/// before [`set_roster`] runs, which is what library consumers get.
 #[must_use]
 pub fn is_known(name: &str) -> bool {
+    #[cfg(test)]
+    if let Some(hit) = TEST_ROSTER.with(|r| {
+        r.borrow()
+            .as_ref()
+            .map(|names| names.iter().any(|n| n == name))
+    }) {
+        return hit;
+    }
     ROSTER
         .read()
         .is_ok_and(|roster| roster.iter().any(|n| n == name))

@@ -2773,15 +2773,7 @@ mod tests {
     fn input_spans_colors_the_subagent_name_by_whether_it_exists() {
         // The roster is a process-global; these names are distinctive enough
         // not to collide with anything a concurrent test would publish.
-        crate::agents::set_roster(&[crate::agents::AgentDef {
-            name: "spanreviewer".into(),
-            description: String::new(),
-            body: "b".into(),
-            path: std::path::PathBuf::new(),
-            engine: None,
-            auto: true,
-            isolate: false,
-        }]);
+        crate::agents::set_roster_for_test(&["spanreviewer"]);
 
         // A name that resolves: both halves green.
         assert_eq!(
@@ -2819,7 +2811,6 @@ mod tests {
                 (" check the diff".to_owned(), None),
             ]
         );
-        crate::agents::set_roster(&[]);
     }
 
     /// The colours that actually reach the screen for `input`, as
@@ -2847,15 +2838,7 @@ mod tests {
 
     #[test]
     fn the_subagent_name_reaches_the_screen_in_its_colour() {
-        crate::agents::set_roster(&[crate::agents::AgentDef {
-            name: "drawnreviewer".into(),
-            description: String::new(),
-            body: "b".into(),
-            path: std::path::PathBuf::new(),
-            engine: None,
-            auto: true,
-            isolate: false,
-        }]);
+        crate::agents::set_roster_for_test(&["drawnreviewer"]);
 
         // The colour of the `r` in `:drawnreviewer` is the whole question:
         // green when the definition exists, red when it does not.
@@ -2874,8 +2857,6 @@ mod tests {
         assert_eq!(name_cell(&unknown, "subagent"), THEME_GREEN);
         // The task text is not coloured at all.
         assert_eq!(name_cell(&known, "check"), Color::Reset);
-
-        crate::agents::set_roster(&[]);
     }
 
     #[test]
