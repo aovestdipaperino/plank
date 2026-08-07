@@ -31,7 +31,7 @@
 //!   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
 //!               "historySize": 512, "showToolCalls": false, "showToolResults": false,
 //!               "showThinking": true, "crtOff": true, "easterEggs": true,
-//!               "screensaver": "1m" },
+//!               "screensaver": "1m", "screensaverFace": "matrix" },
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 },
@@ -128,6 +128,9 @@ pub struct UiSettings {
     /// up. Default one minute; `never` switches it off. Unlike the arcade
     /// games this is not an easter egg, so `ui.easterEggs` does not gate it.
     pub screensaver: crate::arcade::ScreensaverDelay,
+    /// Which ambient screen the screensaver puts up: the matrix rain, the
+    /// starfield, or a fresh coin flip each time.
+    pub screensaver_face: crate::arcade::ScreensaverFace,
     /// Whether the arcade easter eggs (`/pelota`, …) exist. On by
     /// default. Turned off they are not merely hidden — they stop being known
     /// commands, so the line goes to the model like any other unrecognized
@@ -155,6 +158,7 @@ impl Default for UiSettings {
             crt_off: true,
             reduced_motion: false,
             screensaver: crate::arcade::ScreensaverDelay::default(),
+            screensaver_face: crate::arcade::ScreensaverFace::default(),
             easter_eggs: true,
             builtin_editor: true,
         }
@@ -386,6 +390,11 @@ impl Settings {
         {
             self.ui.screensaver = d;
         }
+        if let Some(v) = string(ui, "screensaverFace")
+            && let Some(f) = crate::arcade::ScreensaverFace::parse(&v)
+        {
+            self.ui.screensaver_face = f;
+        }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).
         if let Some(v) = boolean(ui, "notifications") {
@@ -593,6 +602,12 @@ pub fn startup_note(s: &Settings, cfg: &crate::config::AgentConfig) -> Option<St
     if s.ui.reduced_motion != d.ui.reduced_motion {
         parts.push(format!("reducedMotion={}", s.ui.reduced_motion));
     }
+    if s.ui.screensaver_face != d.ui.screensaver_face {
+        parts.push(format!(
+            "screensaverFace={}",
+            s.ui.screensaver_face.as_str()
+        ));
+    }
     if s.ui.screensaver != d.ui.screensaver {
         parts.push(format!("screensaver={}", s.ui.screensaver.as_str()));
     }
@@ -781,6 +796,11 @@ impl Settings {
                 "screensaver",
                 Json::Str(self.ui.screensaver.as_str().to_string()),
             );
+            upsert(
+                u,
+                "screensaverFace",
+                Json::Str(self.ui.screensaver_face.as_str().to_string()),
+            );
             upsert(u, "easterEggs", Json::Bool(self.ui.easter_eggs));
             upsert(u, "builtinEditor", Json::Bool(self.ui.builtin_editor));
         }
@@ -965,6 +985,43 @@ mod tests {
             !note.contains("tools."),
             "legacy key leaked into the note: {note}"
         );
+    }
+
+    #[test]
+    fn the_screensaver_face_defaults_to_matrix_and_accepts_its_spellings() {
+        use crate::arcade::ScreensaverFace;
+
+        // The rain is what an untouched install shows.
+        assert_eq!(
+            Settings::default().ui.screensaver_face,
+            ScreensaverFace::Matrix
+        );
+
+        for (text, want) in [
+            ("matrix", ScreensaverFace::Matrix),
+            ("rain", ScreensaverFace::Matrix),
+            ("starfield", ScreensaverFace::Starfield),
+            ("stars", ScreensaverFace::Starfield),
+            ("random", ScreensaverFace::Random),
+            ("either", ScreensaverFace::Random),
+            ("  MATRIX  ", ScreensaverFace::Matrix),
+        ] {
+            let mut s = Settings::default();
+            s.overlay(&format!("{{\"ui\":{{\"screensaverFace\":\"{text}\"}}}}"));
+            assert_eq!(s.ui.screensaver_face, want, "parsing {text:?}");
+        }
+
+        // An unusable value leaves the default in place rather than breaking
+        // the rest of the file, like every other key here.
+        let mut s = Settings::default();
+        s.overlay(r#"{"ui":{"screensaverFace":"lava lamp","crtOff":false}}"#);
+        assert_eq!(s.ui.screensaver_face, ScreensaverFace::Matrix);
+        assert!(!s.ui.crt_off, "one bad key must not discard the others");
+
+        // The delay and the face are independent: setting one leaves the other.
+        let mut s = Settings::default();
+        s.overlay(r#"{"ui":{"screensaverFace":"starfield"}}"#);
+        assert_eq!(s.ui.screensaver, crate::arcade::ScreensaverDelay::M1);
     }
 
     #[test]

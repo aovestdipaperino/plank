@@ -37,6 +37,7 @@ pub enum FieldId {
     UiNotifyAfterSecs,
     UiCrtOff,
     UiScreensaver,
+    UiScreensaverFace,
     UiReducedMotion,
     UiEasterEggs,
     UiBuiltinEditor,
@@ -196,7 +197,14 @@ pub static FIELDS: &[Field] = &[
         FieldId::UiScreensaver,
         "ui",
         "screensaver",
-        "idle starfield after: 1m, 2m, 5m, never",
+        "idle screensaver after: 1m, 2m, 5m, never",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::UiScreensaverFace,
+        "ui",
+        "screensaverFace",
+        "which screensaver: matrix, starfield, random",
         Kind::Bool,
     ),
     f(
@@ -315,6 +323,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
         FieldId::UiScreensaver => s.ui.screensaver.as_str().to_string(),
+        FieldId::UiScreensaverFace => s.ui.screensaver_face.as_str().to_string(),
         FieldId::UiReducedMotion => s.ui.reduced_motion.to_string(),
         FieldId::UiEasterEggs => s.ui.easter_eggs.to_string(),
         FieldId::UiBuiltinEditor => s.ui.builtin_editor.to_string(),
@@ -356,6 +365,8 @@ fn toggle(s: &mut Settings, id: FieldId) {
         }
         // Cycles 1m -> 2m -> 5m -> never, like the notification modes.
         FieldId::UiScreensaver => s.ui.screensaver = s.ui.screensaver.cycle(),
+        // Cycles matrix -> starfield -> random.
+        FieldId::UiScreensaverFace => s.ui.screensaver_face = s.ui.screensaver_face.cycle(),
         FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
         FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
@@ -443,6 +454,12 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         FieldId::UiScreensaver => {
             s.ui.screensaver = crate::arcade::ScreensaverDelay::parse(raw)
                 .ok_or_else(|| format!("screensaver must be 1m, 2m, 5m, or never (got {raw})"))?;
+        }
+        FieldId::UiScreensaverFace => {
+            s.ui.screensaver_face =
+                crate::arcade::ScreensaverFace::parse(raw).ok_or_else(|| {
+                    format!("screensaverFace must be matrix, starfield, or random (got {raw})")
+                })?;
         }
         FieldId::EngineThinkingToolCalls
         | FieldId::UiRespectGitignore

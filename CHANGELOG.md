@@ -57,6 +57,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The matrix rain is the default screensaver, and which face you get is now a
+  setting.** `ui.screensaverFace` takes `matrix` (the default), `starfield`, or
+  `random`. The screensaver used to flip a coin between the two every time it
+  opened, which is a nice surprise and a poor default — if you like one of them
+  you had no way to say so. `random` keeps the old behaviour for anyone who
+  wants it. `ui.screensaver` still says *when* (`1m`/`2m`/`5m`/`never`); the two
+  are separate because wanting the rain at five minutes should not require
+  spelling that as one combined value. Both cycle in `/config`.
+
+
 - **Named subagents are dispatched as `/subagent:<name>`, not `/subagent <name>`.**
   The name now rides on the command token instead of being the first word of the
   argument. Two things follow from that. A task whose first word happens to match

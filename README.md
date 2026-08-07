@@ -137,7 +137,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
               "thinkingToolCalls": true },
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-              "showThinking": true, "notifications": "always", "notifyAfterSecs": 10 },
+              "showThinking": true, "notifications": "always", "notifyAfterSecs": 10,
+              "screensaver": "1m", "screensaverFace": "matrix" },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
@@ -166,7 +167,8 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
 | | `builtinEditor` | `true` | `Ctrl-G` opens the built-in editor (a fork of Microsoft Edit, in-process). `false` shells out to `$EDITOR` as before. |
-| | `screensaver` | `1m` | Idle time before the screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. It comes up as either the starfield or the matrix rain, a coin flip each time. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
+| | `screensaver` | `1m` | Idle time before the screensaver takes the screen: `1m`, `2m`, `5m`, or `never`. Any key or mouse event dismisses it; it never comes up mid-turn or over a dialog. |
+| | `screensaverFace` | `matrix` | Which screen it puts up: `matrix` (the rain), `starfield`, or `random` for a fresh coin flip each time. |
 | `safety` | `sandbox` | on (macOS) | Default for the bash write sandbox. Same as `--sandbox`/`--no-sandbox`. |
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
@@ -335,6 +337,28 @@ Pelota has one extra move worth knowing: hold **Shift** while steering and the p
 None of these appear in `/help` or the completion popup. That is the point.
 
 They live behind `ui.easterEggs`, on by default. Setting it to `false` does more than hide them — it stops them being commands at all, so `/pelota` goes to the model as an ordinary prompt exactly like any other unrecognized slash command. That is the honest behaviour for a shared or managed install that wants no games in it, and the startup line names the setting when it is off, so a `settings.json` cannot quietly remove them without saying so.
+
+## Screensaver
+
+Leave the TUI idle and it puts something on the screen. By default that is the matrix rain:
+
+<p align="center">
+  <img src="assets/screensaver-matrix.gif" alt="The plank screensaver: green half-width katakana falling down a black terminal, brighter at the head of each column and fading down the trail" width="900">
+</p>
+
+There are two faces, and `ui.screensaverFace` picks which one you get:
+
+| Value | |
+|---|---|
+| `matrix` | the falling glyphs above — the default |
+| `starfield` | a perspective starfield rushing outward past the edges |
+| `random` | a fresh coin flip each time it opens |
+
+`ui.screensaver` says *when*: `1m` (the default), `2m`, `5m`, or `never` to switch it off. Both are editable live with `/config`, which cycles the values rather than making you type them.
+
+Any key or mouse event dismisses it, and the keystroke that wakes the screen is swallowed rather than typed into your prompt. It never comes up mid-turn or over a dialog — an idle timer that interrupted a running generation, or covered a question waiting on an answer, would be a bug rather than a feature.
+
+Unlike the games, the screensaver is **not** behind `ui.easterEggs`. Turning the arcade off in a shared or managed install stops `/pelota` and `/matrix` being commands at all, but it does not take the idle screen with it: one is a game you invoke, the other is what an unattended terminal shows, and they are not the same decision. Set `ui.screensaver` to `never` if you want no idle screen either.
 
 ## Project layout
 

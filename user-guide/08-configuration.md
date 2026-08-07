@@ -68,7 +68,8 @@ Changes write `./.plank/settings.json` and apply immediately.
 | `notifyAfterSecs` | 10 | minimum turn duration before a completion notification |
 | `crtOff` | `true` | CRT power-off animation on clean TUI exit |
 | `reducedMotion` | `false` | collapse every animation to a static fallback |
-| `screensaver` | `1m` | idle delay before the starfield: `1m`, `2m`, `5m`, `never` |
+| `screensaver` | `1m` | idle delay before the screensaver: `1m`, `2m`, `5m`, `never` |
+| `screensaverFace` | `matrix` | which screen it shows: `matrix`, `starfield`, or `random` for a coin flip each time |
 | `easterEggs` | `true` | whether the arcade commands exist at all |
 | `builtinEditor` | `true` | `Ctrl-G` uses the built-in editor; `false` shells out to `$EDITOR` |
 

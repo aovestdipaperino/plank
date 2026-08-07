@@ -1198,6 +1198,74 @@ pub enum ScreensaverDelay {
     Never,
 }
 
+/// Which ambient screen the idle screensaver puts up (`ui.screensaverFace`).
+///
+/// Separate from [`ScreensaverDelay`], which says *when*: the two answer
+/// different questions and a user who wants the rain at two minutes should not
+/// have to spell that as one combined value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScreensaverFace {
+    /// Falling glyphs — the default.
+    #[default]
+    Matrix,
+    /// A perspective starfield.
+    Starfield,
+    /// Whichever the seed lands on, decided afresh each time the screensaver
+    /// opens. This was the behaviour before the setting existed, and it is
+    /// worth keeping reachable: coming back to an idle terminal and finding
+    /// the *other* sky is a small pleasure, and neither face is doing anything
+    /// you could be interrupted in the middle of.
+    Random,
+}
+
+impl ScreensaverFace {
+    /// The settings-file spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Matrix => "matrix",
+            Self::Starfield => "starfield",
+            Self::Random => "random",
+        }
+    }
+
+    /// Parses a settings value. `rain` and `stars` are accepted as the names
+    /// people reach for first, and `either` for the coin flip.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "matrix" | "rain" => Some(Self::Matrix),
+            "starfield" | "stars" => Some(Self::Starfield),
+            "random" | "either" => Some(Self::Random),
+            _ => None,
+        }
+    }
+
+    /// The next value in the `/config` cycle.
+    #[must_use]
+    pub const fn cycle(self) -> Self {
+        match self {
+            Self::Matrix => Self::Starfield,
+            Self::Starfield => Self::Random,
+            Self::Random => Self::Matrix,
+        }
+    }
+
+    /// Resolves [`Random`](Self::Random) against `seed`, so callers only ever
+    /// deal with a concrete face.
+    ///
+    /// Through the Rng rather than a bare bit test: `arcade_seed` mixes the
+    /// wall clock, whose low bit merely alternates second by second.
+    #[must_use]
+    fn resolve(self, seed: u64) -> Self {
+        match self {
+            Self::Random if Rng::new(seed).next_u64().is_multiple_of(2) => Self::Starfield,
+            Self::Random => Self::Matrix,
+            concrete => concrete,
+        }
+    }
+}
+
 impl ScreensaverDelay {
     /// The settings-file spelling.
     #[must_use]
@@ -1367,19 +1435,22 @@ impl Arcade {
     /// runs after an idle stretch, so it stays available with
     /// `ui.easterEggs` off.
     ///
-    /// Which of the two comes up is a coin flip off the same seed that dresses
-    /// it. Coming back to an idle terminal and finding the *other* sky is
-    /// worth more than the predictability, and neither of them is doing
-    /// anything you could be interrupted in the middle of.
+    /// Which face comes up is [`ScreensaverFace`](crate::settings::UiSettings)
+    /// (`ui.screensaverFace`), defaulting to the rain;
+    /// [`ScreensaverFace::Random`] restores the coin flip this used to do
+    /// unconditionally.
     pub fn open_screensaver(&mut self, seed: u64, w: u16, h: u16) {
+        self.open_screensaver_as(crate::settings::active().ui.screensaver_face, seed, w, h);
+    }
+
+    /// [`open_screensaver`](Self::open_screensaver) with the face passed in, so
+    /// a test can drive each one without touching the process-wide settings.
+    pub fn open_screensaver_as(&mut self, face: ScreensaverFace, seed: u64, w: u16, h: u16) {
         self.park();
-        // Through the Rng rather than a bare bit test: `arcade_seed` mixes the
-        // wall clock, whose low bit merely alternates second by second.
-        let stars = Rng::new(seed).next_u64().is_multiple_of(2);
-        self.open = Some(if stars {
-            Self::stars(seed, w, h)
-        } else {
-            Self::rain(seed)
+        self.open = Some(match face.resolve(seed) {
+            ScreensaverFace::Starfield => Self::stars(seed, w, h),
+            // `resolve` has already collapsed `Random` into one of the two.
+            _ => Self::rain(seed),
         });
         self.screensaver = true;
         self.translucent = false;
@@ -2128,15 +2199,15 @@ mod tests {
         assert!(a.parked.iter().all(Option::is_none));
     }
 
-    /// Both ambient screens are reachable from the idle timer — the point of
-    /// the coin flip is that you do not always get the same one.
+    /// Both ambient screens are reachable under `random` — the point of the
+    /// coin flip is that you do not always get the same one.
     #[test]
-    fn the_screensaver_shows_both_skies() {
+    fn the_random_screensaver_shows_both_skies() {
         let mut stars = 0;
         let mut rain = 0;
         for seed in 1..60u64 {
             let mut a = Arcade::new();
-            a.open_screensaver(seed, 80, 24);
+            a.open_screensaver_as(ScreensaverFace::Random, seed, 80, 24);
             assert!(a.is_screensaver());
             match a.open.as_ref() {
                 Some(Game::Stars(_)) => stars += 1,
@@ -2145,6 +2216,74 @@ mod tests {
             }
         }
         assert!(stars > 5 && rain > 5, "lopsided flip: {stars} vs {rain}");
+    }
+
+    /// The settings-reading entry point, which the tests above bypass by
+    /// injecting a face. Without this, `ui.screensaverFace` could be parsed
+    /// and stored correctly and still never reach the screen.
+    #[test]
+    fn the_idle_screensaver_opens_the_configured_face() {
+        let mut settings = crate::settings::Settings::default();
+
+        // The default, untouched: the rain.
+        crate::settings::install_for_test(settings.clone());
+        let mut a = Arcade::new();
+        a.open_screensaver(1, 80, 24);
+        assert!(matches!(a.open.as_ref(), Some(Game::Matrix(_))));
+
+        // ...and the starfield when asked for.
+        settings.ui.screensaver_face = ScreensaverFace::Starfield;
+        crate::settings::install_for_test(settings);
+        let mut a = Arcade::new();
+        a.open_screensaver(1, 80, 24);
+        assert!(matches!(a.open.as_ref(), Some(Game::Stars(_))));
+    }
+
+    /// A chosen face is honoured every time, not most of the time — the whole
+    /// point of picking one is that the other never turns up.
+    #[test]
+    fn a_chosen_screensaver_face_is_the_one_that_opens() {
+        for seed in 1..40u64 {
+            let mut a = Arcade::new();
+            a.open_screensaver_as(ScreensaverFace::Matrix, seed, 80, 24);
+            assert!(
+                matches!(a.open.as_ref(), Some(Game::Matrix(_))),
+                "seed {seed} opened something other than the rain"
+            );
+            assert!(a.is_screensaver());
+
+            let mut a = Arcade::new();
+            a.open_screensaver_as(ScreensaverFace::Starfield, seed, 80, 24);
+            assert!(
+                matches!(a.open.as_ref(), Some(Game::Stars(_))),
+                "seed {seed} opened something other than the starfield"
+            );
+        }
+    }
+
+    #[test]
+    fn the_face_setting_round_trips_and_cycles() {
+        // Every spelling the settings file accepts maps back to its canonical
+        // name, so `/config` writing what it read cannot drift.
+        for face in [
+            ScreensaverFace::Matrix,
+            ScreensaverFace::Starfield,
+            ScreensaverFace::Random,
+        ] {
+            assert_eq!(ScreensaverFace::parse(face.as_str()), Some(face));
+        }
+        assert_eq!(ScreensaverFace::default(), ScreensaverFace::Matrix);
+        assert_eq!(ScreensaverFace::parse("nope"), None);
+
+        // The `/config` row cycles through all three and comes home.
+        let mut f = ScreensaverFace::default();
+        let mut seen = vec![f];
+        for _ in 0..3 {
+            f = f.cycle();
+            seen.push(f);
+        }
+        assert_eq!(seen.first(), seen.last(), "the cycle must return home");
+        assert_eq!(seen.len() - 1, 3, "and visit each face once");
     }
 
     /// `c` re-letters the rain rather than quitting or steering — the escape
