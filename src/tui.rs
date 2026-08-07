@@ -3253,6 +3253,42 @@ mod tests {
         assert!(st.add_modifier.contains(Modifier::BOLD));
     }
 
+    /// The plug renders through the same path as any other tip: same 💡 prefix,
+    /// same yellow-bold styling, same slot. "Shows like one" is the point — an
+    /// advertisement that looked different would read as an advertisement.
+    #[test]
+    fn the_promo_tip_renders_exactly_like_a_tip() {
+        let base = Style::default();
+        let text = format!("~/x | {} med | ctx 12% | idle", crate::status::THINK_MARK);
+        let tip_spans = |rotation: u64| -> Vec<(String, Option<Color>, bool)> {
+            let tick = crate::status::TIP_ROTATE_MS * rotation;
+            status_bar_lines(&text, tick, base, &TaskView::default())
+                .into_iter()
+                .flat_map(|l| l.spans)
+                .filter(|s| s.content.contains('💡'))
+                .map(|s| {
+                    (
+                        s.content.to_string(),
+                        s.style.fg,
+                        s.style.add_modifier.contains(Modifier::BOLD),
+                    )
+                })
+                .collect()
+        };
+
+        let ordinary = tip_spans(1);
+        let promo = tip_spans(crate::status::PROMO_EVERY);
+        assert_eq!(ordinary.len(), 1, "an ordinary rotation shows one tip");
+        assert_eq!(promo.len(), 1, "so does the promo rotation");
+        assert!(promo[0].0.contains("free-tokens"), "{}", promo[0].0);
+        assert_eq!(
+            (promo[0].1, promo[0].2),
+            (ordinary[0].1, ordinary[0].2),
+            "same colour and weight as a real tip"
+        );
+        assert!(promo[0].0.starts_with("💡 "), "same prefix: {}", promo[0].0);
+    }
+
     /// A fenced code block that opens on the line directly after a paragraph —
     /// no blank line between, which `CommonMark` §4.5 allows and which is how
     /// prose normally introduces a code sample — must still render *after* that

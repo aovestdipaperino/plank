@@ -615,6 +615,19 @@ pub const TIPS: &[&str] = &[
 /// window before the tip section auto-hides until the next rotation.
 pub const TIP_VISIBLE_MS: u64 = 10_000;
 
+/// The one tip that is an advertisement, for the one product that is free.
+///
+/// Takes a rotation slot rather than a banner or a startup notice, so it costs
+/// exactly what any other tip costs and can be ignored the same way.
+pub const PROMO_TIP: &str = "10,000,000 free tokens, already claimed — plank-agent.dev/free-tokens";
+
+/// How often [`PROMO_TIP`] displaces an ordinary tip, counted in rotations.
+///
+/// At [`TIP_ROTATE_MS`] that is once every hundred minutes of wall clock — rare
+/// enough to read as a joke rather than a nag, and never on the first rotation
+/// of a session, where a useful tip earns its place more.
+pub const PROMO_EVERY: u64 = 50;
+
 /// The tip to show for the given animation clock, or `""` when none exist or
 /// the current tip's [`TIP_VISIBLE_MS`] visibility window has lapsed (the tip
 /// section disappears until the next rotation).
@@ -623,8 +636,12 @@ pub fn rotating_tip(tick_ms: u64) -> &'static str {
     if tick_ms % TIP_ROTATE_MS >= TIP_VISIBLE_MS {
         return "";
     }
+    let rotation = tick_ms / TIP_ROTATE_MS;
+    if rotation > 0 && rotation.is_multiple_of(PROMO_EVERY) {
+        return PROMO_TIP;
+    }
     // TIPS is a non-empty compile-time table, so the modulo never divides by zero.
-    let idx = usize::try_from(tick_ms / TIP_ROTATE_MS).unwrap_or(0) % TIPS.len();
+    let idx = usize::try_from(rotation).unwrap_or(0) % TIPS.len();
     TIPS[idx]
 }
 
@@ -1520,6 +1537,37 @@ mod tests {
         // After a full cycle it wraps back to the first.
         let cycle = TIP_ROTATE_MS * TIPS.len() as u64;
         assert_eq!(rotating_tip(cycle), TIPS[0]);
+    }
+
+    /// The plug takes a rotation slot like any other tip — same window, same
+    /// styling — and never the first one of a session.
+    #[test]
+    fn the_promo_takes_one_rotation_in_fifty() {
+        let at = |rotation: u64| rotating_tip(TIP_ROTATE_MS * rotation);
+        assert_ne!(at(0), PROMO_TIP, "a session opens on a useful tip");
+        assert_eq!(at(PROMO_EVERY), PROMO_TIP);
+        assert_eq!(at(PROMO_EVERY * 2), PROMO_TIP);
+        assert_ne!(at(PROMO_EVERY - 1), PROMO_TIP);
+        assert_ne!(at(PROMO_EVERY + 1), PROMO_TIP);
+
+        // Exactly one slot in fifty, and it obeys the same visibility window as
+        // the rest — no lingering advertisement.
+        let promos = (1..=200).filter(|&r| at(r) == PROMO_TIP).count();
+        assert_eq!(promos, 4, "one in {PROMO_EVERY}");
+        assert_eq!(
+            rotating_tip(TIP_ROTATE_MS * PROMO_EVERY + TIP_VISIBLE_MS),
+            ""
+        );
+
+        // And it is a tip, not a banner: it never displaces the whole table.
+        let distinct = (0..TIPS.len() as u64)
+            .map(at)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            distinct.len() > 40,
+            "the ordinary tips still rotate: {}",
+            distinct.len()
+        );
     }
 
     #[test]
