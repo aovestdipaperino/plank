@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>12. Advanced workflows — plank user guide</title>
+<meta name="description" content="branching, delegation, long sessions, repeatability">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Advanced workflows</p>
+  <article>
+<h1 id="12-advanced-workflows">12. Advanced workflows</h1>
+<p>The basics get you a good conversation. This page is about the things
+that make a <em>long</em> one hold together: exploring more than one
+approach, keeping context clean over hours, and not losing work when an
+approach turns out to be wrong.</p>
+<h2 id="branching-exploring-more-than-one-answer">Branching: exploring
+more than one answer</h2>
+<p>The core insight is that a conversation is a tree, not a line. You
+asked for something, the model did it, and now you want to know what a
+different approach would have looked like — without throwing away the
+one you have.</p>
+<pre><code>/tree            # where am I, and what can I fork from?
+/fork 3          # rewind to just before my 3rd prompt, go a different way
+/clone           # freeze this branch, continue on a copy</code></pre>
+<h3 id="fork--try-a-different-prompt"><code>/fork</code> — try a
+different prompt</h3>
+<p><code>/fork n</code> rewinds the live transcript to just before your
+<code>n</code>-th real prompt. That prompt and everything the model did
+after it stay in the tree as a sibling branch, still listed in
+<code>/tree</code> and still reachable.</p>
+<p>Use it when <strong>the prompt was wrong</strong>. You asked for a
+caching layer, got one, and realised the real problem was the query.
+Fork back to before you asked, ask the better question, and the caching
+detour is preserved rather than argued with.</p>
+<p>Fork points are your <em>real</em> prompts — tool results do not
+count — so <code>/fork 2</code> means "the second thing I actually
+asked."</p>
+<h3 id="clone--try-a-different-continuation"><code>/clone</code> — try a
+different continuation</h3>
+<p><code>/clone</code> duplicates the current branch and makes the copy
+live, freezing the original exactly where it stands.</p>
+<p>Use it when <strong>the conversation is good and the next step is
+risky</strong>. You have twenty turns of hard-won context about a
+subsystem and you are about to ask for a refactor that might go badly.
+Clone first: if it goes badly, <code>/tree</code> still shows the branch
+where it had not happened yet.</p>
+<h3 id="fork-clone-or-checkpoint">Fork, clone, or checkpoint?</h3>
+<p>All three let you go back. They differ in what "back" means:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Rewinds to</th>
+<th>Keeps the discarded work</th>
+<th>Survives compaction</th>
+<th>Persisted</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/fork n</code></td>
+<td>before one of your prompts</td>
+<td>yes, as a sibling branch</td>
+<td>yes</td>
+<td>yes, in the session file</td>
+</tr>
+<tr>
+<td><code>/clone</code></td>
+<td>nowhere — copies forward</td>
+<td>yes, the frozen original</td>
+<td>yes</td>
+<td>yes</td>
+</tr>
+<tr>
+<td><code>/checkpoint</code> + <code>/rollback</code></td>
+<td>a point you marked</td>
+<td>yes, as <code>pre-rollback</code></td>
+<td>yes, exactly</td>
+<td>no, in-memory only</td>
+</tr>
+</tbody>
+</table>
+<p>The practical split: <strong>checkpoints are for undo, branches are
+for comparison.</strong> A checkpoint is the thing you take before a
+risky operation and forget about if it went fine. A branch is the thing
+you keep because you genuinely want both versions available.</p>
+<p>Checkpoints are also dropped by <code>/new</code>,
+<code>/switch</code>, and <code>/resume</code>; branches are written
+into the session file and come back with it.</p>
+<h3 id="why-branching-is-cheap">Why branching is cheap</h3>
+<p>Both operations are shaped so the model does not have to re-read the
+conversation. A fork leaves the transcript a strict prefix of what it
+was; a clone leaves it byte-identical. Nothing about the engine's cached
+state is copied or reinterpreted — the next turn reconciles the prompt
+against what is already loaded and only pays for what genuinely
+differs.</p>
+<p>Practically: forking back ten turns is not a ten-turn penalty.
+Cloning is nearly free.</p>
+<h3 id="a-worked-pattern">A worked pattern</h3>
+<pre><code>… fifteen turns establishing how the scheduler works …
+/checkpoint understood        (cheap insurance)
+/clone                        (freeze the understanding)
+
+  &quot;rewrite the scheduler to be lock-free&quot;
+  … it goes badly …
+
+/tree                         (the frozen branch is right there)
+/fork 16                      (back to just after the understanding)
+  &quot;what would it take to make the existing scheduler lock-free?
+   don&#39;t write anything yet&quot;</code></pre>
+<p>You now have two branches from the same fifteen turns of context: one
+that tried it, one that scoped it first. Neither cost you the
+understanding.</p>
+<h2 id="keeping-a-long-session-sharp">Keeping a long session sharp</h2>
+<h3 id="delegate-the-detours">Delegate the detours</h3>
+<p>The single biggest cause of a session going vague is a research
+detour eating the context. Hand those to a subagent:</p>
+<pre><code>/subagent find every place we assume the config is loaded before the logger,
+          and report the ones that would break if that changed</code></pre>
+<p>The subagent does the reading in its own scoped context and only its
+<strong>final report</strong> enters your transcript. Twenty file reads
+become one paragraph. The model does the same thing on its own with the
+<code>agent</code> tool when it recognises a bounded chore.</p>
+<h3 id="ask-sideways-with-btw">Ask sideways with <code>/btw</code></h3>
+<pre><code>/btw what&#39;s the difference between Arc&lt;Mutex&lt;T&gt;&gt; and RwLock again?</code></pre>
+<p>The running generation genuinely suspends, answers in a split panel,
+and resumes byte-for-byte — and <strong>nothing is written to the
+conversation</strong>. Use it for the question you would otherwise open
+a browser for. The main task does not learn that you asked.</p>
+<p><code>Esc</code> at an idle prompt dismisses a panel left open from
+an earlier turn.</p>
+<h3 id="compact-deliberately">Compact deliberately</h3>
+<p>Do not wait for the automatic pass to fire in the middle of something
+delicate. Before handing the model a large new job:</p>
+<pre><code>/context      # see what is actually taking up room
+/compact      # rebuild: summary + recent tail + recently read files</code></pre>
+<p>When you already know what the next stretch of work needs, say so and
+the summary will keep it:</p>
+<pre><code>/compact keep the failing test cases verbatim</code></pre>
+<p>A <code>/checkpoint</code> taken beforehand makes even that
+reversible — a checkpoint stores the whole transcript, so
+<code>/rollback</code> reconstructs the pre-compaction conversation
+exactly.</p>
+<h3 id="give-it-a-plan-that-survives">Give it a plan that survives</h3>
+<p>Ask the model to keep a task list. The <code>task</code> tool's list
+survives compaction by design, so a long job does not lose its plan when
+the transcript is summarized. <code>/tasks</code> shows it and the
+status bar counts it.</p>
+<h3 id="write-down-what-it-cannot-re-derive">Write down what it cannot
+re-derive</h3>
+<pre><code>/remember the integration tests need DOCKER_HOST set; CI sets it, local shells don&#39;t</code></pre>
+<p>Anything the model would otherwise rediscover — or worse, get wrong
+the same way twice — belongs in memory or <code>AGENTS.md</code>.
+Anything it can read out of the repository does not; that is context you
+pay for twice.</p>
+<h2 id="working-carefully">Working carefully</h2>
+<h3 id="plan-before-editing">Plan before editing</h3>
+<p>For anything risky or ambiguous, ask for a plan first:</p>
+<blockquote>
+<p>plan this out before you touch anything</p>
+</blockquote>
+<p>The model enters read-only plan mode, where every mutating tool is
+refused until it proposes a plan and you approve it. Rejecting the plan
+keeps the gate on, so you can iterate on the approach with no risk of an
+edit landing mid-discussion.</p>
+<h3 id="phrasings-that-hold-the-model-back">Phrasings that hold the
+model back</h3>
+<p>You do not have to name plan mode to get its effect. These work, and
+they are worth keeping in your fingers:</p>
+<blockquote>
+<p><strong>don't make changes, just investigate</strong></p>
+<p><strong>show me, without writing anything, what a reasonable plan
+would look like</strong></p>
+<p><strong>give it a fast review and save the findings in
+<code>docs/CODE-REVIEW.md</code></strong></p>
+</blockquote>
+<p>The last one is the general shape worth internalising: <strong>say
+where the output goes.</strong> A review that lands in a file survives
+the session; a review that lands in the transcript is gone at the next
+compaction.</p>
+<p>The same applies to delegation and to style. "Use a subagent to …" is
+a valid instruction, not just something the model decides on its own.
+And handing over a style file — "write this using the style in
+<code>local/medium-post-style.md</code>" — beats describing the style in
+the prompt every time.</p>
+<h3 id="tighten-the-sandbox">Tighten the sandbox</h3>
+<p>The bash sandbox already limits writes to the working directory and
+temp. If a project needs more, name it explicitly rather than switching
+the sandbox off:</p>
+<pre class="json"><code>{ &quot;writablePaths&quot;: [&quot;/Users/me/.cache/my-build&quot;] }</code></pre>
+<p><code>excludedCommands</code> is a convenience, not a boundary — a
+command it matches runs unsandboxed.</p>
+<h3 id="do-the-interactive-things-yourself">Do the interactive things
+yourself</h3>
+<p>The model's <code>bash</code> tool cannot drive a login prompt, a
+pager, or an editor. Use <code>!</code>:</p>
+<pre><code>!!gh auth login</code></pre>
+<p>Your command, your shell, never sandboxed. Use <code>!!</code> when
+the output is only for you — a login flow is noise the model does not
+need — and plain <code>!</code> when you want the result recorded so the
+model can act on it in your next message.</p>
+<h2 id="making-it-repeatable">Making it repeatable</h2>
+<h3 id="skills-for-procedures">Skills for procedures</h3>
+<p>Anything you have explained twice should be a skill. A skill is both
+a slash command <em>and</em> something the model can invoke itself when
+the task matches:</p>
+<pre><code>~/.plank/skills/release/SKILL.md   →   /release 2.8.0</code></pre>
+<h3 id="templates-for-prompt-shapes">Templates for prompt shapes</h3>
+<p>Anything you retype with small variations should be a template — one
+file, <code>{{named}}</code> holes:</p>
+<pre><code>~/.plank/templates/review.md   →   /review src/parser.rs &quot;error handling&quot;</code></pre>
+<h3 id="hooks-for-policy">Hooks for policy</h3>
+<p>Anything that must happen <em>every</em> time belongs in a hook, not
+in your memory of what to check. A <code>PreToolUse</code> hook exiting
+2 blocks a tool and tells the model why, which is how you enforce "never
+edit generated files" without repeating it every session.</p>
+<pre class="json"><code>{
+  &quot;PreToolUse&quot;: [
+    { &quot;matcher&quot;: &quot;edit(*/generated/*)|write(*/generated/*)&quot;,
+      &quot;hooks&quot;: [ { &quot;type&quot;: &quot;command&quot;, &quot;command&quot;: &quot;echo &#39;generated code — edit the template instead&#39; &gt;&amp;2; exit 2&quot; } ] }
+  ]
+}</code></pre>
+<h3 id="project-settings-in-the-repo">Project settings in the repo</h3>
+<p><code>./.plank/settings.json</code> is committable, and sharing it is
+the point: everyone on the project gets the same context size, the same
+sandbox policy, the same display defaults. Keep secrets out — the file
+is inside the working tree.</p>
+<h2 id="getting-more-out-of-the-hardware">Getting more out of the
+hardware</h2>
+<ul>
+<li><strong><code>/power &lt;1..100&gt;</code></strong> caps GPU draw
+mid-session, for when you want the laptop to stay cool or quiet.</li>
+<li><strong><code>--ssd-streaming</code></strong> streams experts from
+SSD rather than loading them resident, which is how you run a model that
+does not fit in RAM. <code>--ssd-streaming-cache-experts</code> and
+<code>--ssd-streaming-preload-experts</code> trade memory for
+latency.</li>
+<li><strong><code>--mtp PATH</code></strong> adds a
+multi-token-prediction draft model, with <code>--mtp-draft</code> and
+<code>--mtp-margin</code> tuning how aggressively drafts are
+accepted.</li>
+<li><strong><code>plank serve</code> + <code>--remote</code></strong>
+puts the work on the machine with the GPU and the typing on the machine
+you are sitting at. See <a href="10-remote-and-providers.html">Remote and
+hosted engines</a>.</li>
+</ul>
+<h2 id="when-something-goes-wrong">When something goes wrong</h2>
+<pre><code>/repro</code></pre>
+<p>before you change anything. It captures the exact rendered prompt the
+engine would see plus every runtime knob — model, backend, context size,
+sampling, think mode, engine tuning — in one self-contained file,
+without touching the live session. That is a far better bug report than
+a description, and it is the only artifact that makes a generation bug
+reproducible after the fact.</p>
+<hr />
+<p>Next: <a href="13-troubleshooting.html">Troubleshooting →</a></p>
+
+  </article>
+  <nav class="pager"><a href="11-arcade.html">← The arcade</a><a href="13-troubleshooting.html">Troubleshooting →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

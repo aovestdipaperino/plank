@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>13. Troubleshooting — plank user guide</title>
+<meta name="description" content="when something goes wrong">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Troubleshooting</p>
+  <article>
+<h1 id="13-troubleshooting">13. Troubleshooting</h1>
+<h2 id="plank-feels-slow-or-forgetful">plank feels slow, or
+forgetful</h2>
+<p>Check the startup line first:</p>
+<pre><code>plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cpu, ctx=65536</code></pre>
+<p>A <code>settings.json</code> that moved you off Metal or shrank the
+context is invisible once the UI is up and shows only as "plank got
+slow". plank prints that line precisely so you can catch it, and it
+lists only settings actually in effect — with no settings file, or one
+that changes nothing, there is no line at all.</p>
+<p>Then check <code>/context</code>. A window that is nearly full
+compacts often, and a conversation that has been compacted several times
+has lost detail by design. <code>/compact</code> deliberately, or start
+a fresh session for a new task.</p>
+<h2 id="compaction-produced-no-summary">"Compaction produced no
+summary"</h2>
+<p>The pass ran but the model returned nothing usable, so plank kept
+your conversation instead of rebuilding it on a bad summary — nothing
+was lost, but nothing was reclaimed either, and the turn was abandoned
+rather than continuing on a full window.</p>
+<p>Run <code>/compact</code> again; it usually succeeds on a second
+attempt. If it keeps failing, give it something to aim at
+(<code>/compact summarize the parser work so far</code>), or start a
+fresh session and carry over what matters by hand.</p>
+<p>Interrupting a pass with <code>Esc</code> is the same outcome by a
+different route, and says so separately:
+<code>Compaction interrupted; keeping the previous conversation state.</code></p>
+<h2 id="the-model-isnt-using-my-instructions">"the model isn't using my
+instructions"</h2>
+<ul>
+<li>Is <code>AGENTS.md</code> where plank will find it? It is discovered
+from the <strong>working directory</strong>, and <code>--chdir</code>
+does not carry project settings with it.</li>
+<li>Is the instruction something the model can already read from the
+repo? Those get diluted. Memory and <code>AGENTS.md</code> are for what
+it <em>cannot</em> re-derive.</li>
+<li>Did the conversation get compacted? Session-start context is
+re-injected, but a specific instruction you gave in turn three may not
+have survived as a verbatim sentence. Put durable ones in a file, not in
+a message.</li>
+</ul>
+<h2 id="a-tool-did-something-i-did-not-expect">A tool did something I
+did not expect</h2>
+<p>Turn the machinery on and watch it:</p>
+<pre><code>/config ui.showToolCalls true
+/config ui.showToolResults true</code></pre>
+<p>Neither changes what the model receives — only what you see.</p>
+<p>If it is a class of action you want prevented rather than observed,
+that is a <code>PreToolUse</code> hook exiting 2, or plan mode. See <a
+href="12-advanced-workflows.html">Advanced workflows</a>.</p>
+<h2 id="a-bash-command-failed-with-a-permission-error">A bash command
+failed with a permission error</h2>
+<p>The sandbox limits model-initiated writes to the working directory
+and temp. A build that writes to a shared cache outside the tree will
+fail.</p>
+<p>Name the path rather than switching the sandbox off:</p>
+<pre class="json"><code>{ &quot;writablePaths&quot;: [&quot;/Users/me/.cache/my-build&quot;] }</code></pre>
+<p>in <code>./.plank/sandbox.json</code>. Commands you type with
+<code>!</code> or <code>!!</code> are never sandboxed.</p>
+<h2 id="an-interactive-command-hangs">An interactive command hangs</h2>
+<p>The model's <code>bash</code> tool cannot answer a prompt, page
+through output, or drive an editor. Run those yourself with
+<code>!</code> (or <code>!!</code> to keep the output out of the
+conversation).</p>
+<h2 id="the-two-log-files">The two log files</h2>
+<p>The messages the model and the UI see are terse one-liners
+(<code>Tool error: visit_page failed: …</code>). The detail lives on
+disk:</p>
+<table>
+<thead>
+<tr>
+<th>File</th>
+<th>What is in it</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>~/.plank/errors.log</code></td>
+<td>which subsystem failed, for which input, with the full error
+text</td>
+</tr>
+<tr>
+<td><code>~/.plank/tool-call-errors.log</code></td>
+<td>tool calls the model emitted that plank could not parse or would not
+run</td>
+</tr>
+</tbody>
+</table>
+<p>Check the first one whenever a tool failed for a reason the on-screen
+message did not explain. Logging is best-effort by design — it never
+turns a recoverable tool error into a crash — so the absence of a line
+is not proof that nothing happened.</p>
+<p>The second one is mostly of interest when the model seems to be
+<em>trying</em> to use a tool and nothing happens. Two entries dominate
+in practice:</p>
+<ul>
+<li><strong><code>tool calling is not allowed inside &lt;think&gt;&lt;/think&gt;</code></strong>
+— the model tried to act mid-reasoning. Whether that is dispatched or
+refused is <code>engine.thinkingToolCalls</code> (default
+<code>true</code>, which dispatches it). If you have set it to
+<code>false</code> for ds4 parity, this is the expected
+consequence.</li>
+<li><strong><code>DSML markup outside a valid tool_calls block</code></strong>
+/ <strong><code>unexpected DSML tag</code></strong> — a malformed call.
+Usually transient; the model recovers on the next attempt.</li>
+</ul>
+<h2 id="an-mcp-servers-tools-vanished--or-worse-didnt">An MCP server's
+tools vanished — or worse, didn't</h2>
+<p><code>/mcp</code> shows what is connected. A server that misses the
+response deadline is dropped <strong>along with all of its
+tools</strong>, so a slow-starting server looks like a server that has
+no tools. Raise <code>mcp.timeoutSecs</code>.</p>
+<p>But a <strong>global</strong> server that fails to start does the
+opposite of vanishing. Its tool schemas are part of the cached system
+prompt, so plank substitutes the server's last-known-good advertisement
+from <code>~/.plank/mcp-advert/</code> rather than change that prompt
+and force a full reload. The model therefore still believes the tools
+exist and calls fail at dispatch. <code>~/.plank/errors.log</code> names
+it explicitly:</p>
+<pre><code>mcp: server &quot;x&quot; failed to start (…); substituted its cached advertisement so the
+system prompt is byte-identical and the Tier 1 system-prompt KV cache stays valid</code></pre>
+<p>If a server's tools are failing in a way that makes no sense, that
+line is the answer. Project-local servers have no cached record and
+simply are not advertised.</p>
+<p>If a server is connected but the model does not seem to know its
+tools in detail, check <code>primaryTools</code>: non-primary tools
+appear only as a compact directory entry until the model calls
+<code>mcp_describe</code>.</p>
+<h2 id="which-model-am-i-actually-talking-to">Which model am I actually
+talking to?</h2>
+<p>Do not ask the model. "Which model are you?" is answered from
+training data, not from your configuration, and it is wrong often enough
+to be useless — a local model will happily claim to be something
+else.</p>
+<p>Check the configuration instead:</p>
+<ul>
+<li>the <strong>startup line</strong>, which names the backend and
+context actually in force</li>
+<li><strong><code>/version</code></strong> for plank itself</li>
+<li><strong><code>/usage</code></strong>, which reports billed tokens
+only when you are on a hosted provider — a local run has nothing to
+bill</li>
+</ul>
+<p>To confirm a provider or gateway is really wired up end to end, send
+a prompt whose answer proves the round trip happened rather than one you
+have to judge:</p>
+<pre><code>reply with exactly: OLLAMA-OK</code></pre>
+<p>Run it once per configuration you are testing, with a different token
+each time. It fails loudly and unambiguously when the request never
+left, went to the wrong endpoint, or came back from a cache.</p>
+<h2 id="a-pdf-came-back-as-an-error">A PDF came back as an error</h2>
+<p><code>read</code> converts PDFs through a parser before the model
+sees them. <code>Tool error: convert &lt;file&gt;: …</code> means the
+conversion failed, not that the model refused — the file is corrupt,
+encrypted, or not actually a PDF.</p>
+<p>A successfully converted document is cached under
+<code>~/.plank/doc-cache/</code> by content, so re-reading it is free.
+PDF is the only format converted this way; other binary files read as
+bytes.</p>
+<h2 id="a-pasted-image-did-nothing">A pasted image did nothing</h2>
+<p>Pasting attaches the image and gives the model its
+<strong>path</strong>, not its contents. The local ds4 engine is
+text-only — there is no vision model wired in yet — so a screenshot
+reaches the model as a filename. Transcribe the part that matters into
+your prompt.</p>
+<h2 id="the-model-downloads-stopped-or-wont-start">The model downloads
+stopped, or won't start</h2>
+<p>The model download streams to a <code>.part</code> file next to the
+destination and resumes on the next launch, so an interrupted transfer
+is not lost.</p>
+<p>It refuses outright below 96 GB of RAM, because the default quant
+needs about 82 GB resident. That is a hard guard, not a warning — you
+find out before spending hours on the transfer rather than after.</p>
+<p>With stdin not attached to a terminal there is nobody to answer the
+download prompt, so plank exits with instructions rather than hanging
+your script.</p>
+<h2 id="no-api-key-from-a-provider">"no API key" from a provider</h2>
+<p><code>--api-key</code> wins if given, otherwise
+<code>$OPENAI_API_KEY</code> or <code>$ANTHROPIC_API_KEY</code>. With
+neither set, startup fails with a clear message rather than a confusing
+API error. The key is deliberately not a <code>settings.json</code> key
+— that file lives inside your working tree.</p>
+<p>Also: <code>--provider</code> cannot be combined with
+<code>--remote</code> or the local backend selectors. It <em>is</em> the
+engine for that run.</p>
+<h2 id="a-remote-connection-is-refused">A remote connection is
+refused</h2>
+<ul>
+<li>Plain <code>http://</code> is allowed to localhost only. For
+anything else, use TLS or pass <code>--insecure</code> knowingly.</li>
+<li>The token comes from <code>--remote-token</code> or
+<code>$PLANK_REMOTE_TOKEN</code>.</li>
+<li>A browser client needs its Origin allowed with
+<code>--control-origin</code>; missing and loopback Origins are always
+allowed, other browser Origins are refused by default.</li>
+<li>A remote client that needs to <em>drive</em> (not just mirror)
+currently needs the server started with <code>--control-allow</code>,
+because the local <code>/grant</code> approval is not wired into the UI
+yet.</li>
+<li>A client whose unsent output exceeds
+<code>--control-queue-max</code> is evicted. A very slow link
+disconnecting mid-turn is that.</li>
+</ul>
+<h2 id="ctrl-c-is-not-stopping-anything">Ctrl-C is not stopping
+anything</h2>
+<ul>
+<li>During a turn, <code>Ctrl-C</code> and <code>Esc</code> both
+interrupt the generation.</li>
+<li>With an arcade game open, the <strong>first</strong>
+<code>Ctrl-C</code> closes the game and the second interrupts the
+model.</li>
+<li>At an idle prompt, <code>Ctrl-C</code> clears the input line;
+<code>Ctrl-D</code> on an empty line quits.</li>
+</ul>
+<h2 id="shiftenter-inserts-nothing">Shift+Enter inserts nothing</h2>
+<p>Your terminal does not report it — that needs the kitty keyboard
+protocol. <code>Alt+Enter</code> and <code>Ctrl-J</code> insert a
+newline everywhere.</p>
+<h2 id="the-screen-keeps-going-to-a-starfield">The screen keeps going to
+a starfield</h2>
+<p>That is the screensaver. <code>ui.screensaver</code> takes
+<code>1m</code>, <code>2m</code>, <code>5m</code>, or
+<code>never</code>. It never comes up mid-turn or over a dialog, and any
+key dismisses it.</p>
+<h2 id="animations-are-distracting">Animations are distracting</h2>
+<pre><code>/config ui.reducedMotion true</code></pre>
+<p>collapses every animation — throbber, shimmer, pulse, flash,
+stall-fade — to a static fallback. <code>ui.crtOff false</code> removes
+the power-off animation on exit.</p>
+<h2 id="i-typed-a-slash-command-and-the-model-answered-it">I typed a
+slash command and the model answered it</h2>
+<p>Unrecognized slash lines go to the model as ordinary text. Check the
+spelling against <code>/help</code>.</p>
+<p>One deliberate case: with <code>ui.easterEggs</code> set to
+<code>false</code>, the arcade commands stop being commands at all, so
+<code>/pelota</code> reaches the model like any other prompt.</p>
+<h2 id="my-settings-file-has-a-mistake-in-it">My settings file has a
+mistake in it</h2>
+<p>Nothing breaks. Malformed JSON, a wrongly-typed value, an unknown
+key, or an unrecognised backend name each fall back to that key's
+default, because a settings file must never stop plank from starting.
+The same bad name passed to <code>--backend</code> <em>is</em> an error
+— a flag is an explicit instruction, a config file is a preference.</p>
+<h2 id="reporting-a-bug">Reporting a bug</h2>
+<pre><code>/repro</code></pre>
+<p>Run it before you change anything. It writes
+<code>~/.plank/repro/repro-&lt;timestamp&gt;.md</code> containing the
+exact prompt the engine would see plus the model, backend, context size,
+sampling settings, think mode and engine tuning — self-contained,
+read-only, and enough for a maintainer to reproduce the state that
+triggered the problem without your session.</p>
+<p>Attach that to an issue at <a
+href="https://github.com/aovestdipaperino/plank/issues">github.com/aovestdipaperino/plank</a>.
+Strip anything proprietary first — a repro carries your actual prompt
+and transcript.</p>
+<hr />
+<p><a href="./">← Back to the index</a></p>
+
+  </article>
+  <nav class="pager"><a href="12-advanced-workflows.html">← Advanced workflows</a><a href="/free-tokens">A word from our sponsor →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

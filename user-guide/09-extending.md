@@ -77,6 +77,28 @@ Each supplies extra instructions that frame the subagent's turn. `/agent` lists 
 
 The model can delegate on its own with the `agent` tool. Delegation is bounded at one level — a subagent cannot itself delegate — which keeps a runaway from spawning a tree.
 
+When the subagent reports back, plank runs a turn on that report: delegated work comes back into the conversation and gets acted on, rather than sitting in the transcript until you type again.
+
+### Running a subagent on a different engine
+
+A definition can name its own engine, and then its sidechain runs there instead of on whatever the main agent uses:
+
+```markdown
+---
+name: cheap-local
+description: grep-and-summarise work that does not need the expensive model
+provider: local
+---
+Be terse. Report findings, not process.
+```
+
+`provider: local` means the local ds4 engine specifically. Under a hosted main agent, plank loads it alongside the provider at startup — that is a real memory cost, and it says so before it loads, so only an explicit definition triggers it. A definition can equally point at a hosted provider (`provider: anthropic`, a model, and the environment variable holding the key); `/agent` lists each one's engine and tells you when its key variable is unset.
+
+Two consequences worth knowing:
+
+- **A cross-engine sidechain is clean-room.** The parent transcript is hidden and only the framed task is sent, so a hosted subagent is never billed for your conversation and a local one never has to prefill it.
+- **`/agent` and the status bar both show it.** Every engine in play is named in the bar, so you can see which one is working — see [The interface](03-the-interface.md#the-screen).
+
 ## Hooks
 
 Hooks run your shell commands (or inject static prompts) at lifecycle points. Configuration is JSON, merged from `~/.plank/hooks.json` then `./.plank/hooks.json`, with both lists running.

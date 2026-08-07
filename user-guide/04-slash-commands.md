@@ -52,7 +52,7 @@ See [Context](07-context.md).
 | `/mcp` | connected MCP servers and the tools they expose |
 | `/skills` | skills available to the model |
 | `/templates` | your `{{var}}` prompt templates |
-| `/agent` | named subagents you can delegate to |
+| `/agent` | named subagents you can delegate to, and which engine each runs on |
 | `/hooks` | which hooks are configured and on what events |
 | `/tasks` | the model's task list |
 
@@ -63,7 +63,7 @@ See [Extending plank](09-extending.md).
 | Command | What it does |
 |---|---|
 | `/btw <question>` | ask a side question mid-task; answered in a split panel, nothing written to the conversation |
-| `/subagent <task>` | delegate a task to a subagent; only its final report enters the transcript |
+| `/subagent [<name>] <task>` | delegate a task to a subagent; only its final report enters the transcript, and the turn continues from it |
 
 `/btw` genuinely suspends the running generation, answers, and resumes byte-for-byte with no re-prefill (`safety.btwSuspend`, on by default). With suspend off, the question is queued and answered at the next generation boundary instead.
 
@@ -73,7 +73,7 @@ See [Extending plank](09-extending.md).
 |---|---|
 | `/config` | open the interactive settings form |
 | `/config <section>.<key> <value>` | set one setting, e.g. `/config ui.showThinking false` |
-| `/power <1..100>` | cap GPU power draw for this run |
+| `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
 | `/help` | full command and flag reference |

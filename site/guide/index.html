@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>plank user guide</title>
+<meta name="description" content="Using plank: the TUI, slash commands, tools, sessions, context, configuration, and more.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › User guide</p>
+  <article>
+<h1 id="plank-user-guide">plank user guide</h1>
+<p>plank is an interactive coding agent for the terminal: a full-screen
+TUI, a plain line REPL, and a headless one-shot mode, driving either a
+local DeepSeek V4 Flash model on Apple's Metal backend or a hosted
+provider.</p>
+<p>This guide is for people <em>using</em> plank. For how it is built,
+see <a
+href="https://github.com/aovestdipaperino/plank/blob/main/docs/ARCHITECTURE.md"><code>docs/ARCHITECTURE.md</code></a>;
+for the exhaustive feature list, <a
+href="https://github.com/aovestdipaperino/plank/blob/main/docs/FEATURES.md"><code>docs/FEATURES.md</code></a>.</p>
+<blockquote>
+<p><strong>macOS only.</strong> Real inference uses the ds4 C engine
+with the Metal backend. Other platforms build and run against the echo
+stub, which is useful for development but not for real work.</p>
+</blockquote>
+
+    <h2>Contents</h2>
+    <ul class="toc">
+    <li><a href="01-installation.html"><span class="n">1.</span>Installation<span class="d">Homebrew, channels, building from source, getting the model</span></a></li>
+    <li><a href="02-getting-started.html"><span class="n">2.</span>Getting started<span class="d">your first session, the three front ends, one-shot mode</span></a></li>
+    <li><a href="03-the-interface.html"><span class="n">3.</span>The interface<span class="d">the TUI tour, keybindings, <code>@</code> completion, <code>!</code> commands, images</span></a></li>
+    <li><a href="04-slash-commands.html"><span class="n">4.</span>Slash commands<span class="d">the complete command reference</span></a></li>
+    <li><a href="05-tools.html"><span class="n">5.</span>Tools<span class="d">what the model can do, the sandbox, plan mode, questions, task lists</span></a></li>
+    <li><a href="06-sessions.html"><span class="n">6.</span>Sessions<span class="d">saving, resuming, checkpoints, branching, export</span></a></li>
+    <li><a href="07-context.html"><span class="n">7.</span>Context<span class="d">the context window, compaction, <code>AGENTS.md</code>, memory</span></a></li>
+    <li><a href="08-configuration.html"><span class="n">8.</span>Configuration<span class="d"><code>settings.json</code>, command-line flags, precedence</span></a></li>
+    <li><a href="09-extending.html"><span class="n">9.</span>Extending plank<span class="d">skills, templates, subagents, hooks, MCP servers</span></a></li>
+    <li><a href="10-remote-and-providers.html"><span class="n">10.</span>Remote and hosted engines<span class="d"><code>serve</code>, <code>--remote</code>, shared engines, providers</span></a></li>
+    <li><a href="11-arcade.html"><span class="n">11.</span>The arcade<span class="d">the games that run over a live turn</span></a></li>
+    <li><a href="12-advanced-workflows.html"><span class="n">12.</span>Advanced workflows<span class="d">branching, delegation, long sessions, repeatability</span></a></li>
+    <li><a href="13-troubleshooting.html"><span class="n">13.</span>Troubleshooting<span class="d">when something goes wrong</span></a></li>
+    </ul>
+<h2 id="the-five-minute-version">The five-minute version</h2>
+<pre class="sh"><code>brew install aovestdipaperino/tap/plank-agent
+plank                  # first run offers to download the model</code></pre>
+<p>Then type. Ask a question, ask for a change, let it read and edit
+files. When you want to know what plank can do, <code>/help</code>; when
+you want to know where your context went, <code>/context</code>; when
+you want to come back tomorrow, just quit — the session saves itself and
+<code>/resume</code> brings it back.</p>
+
+  </article>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

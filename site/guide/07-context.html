@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7. Context — plank user guide</title>
+<meta name="description" content="the context window, compaction, AGENTS.md, memory">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Context</p>
+  <article>
+<h1 id="7-context">7. Context</h1>
+<p>Everything the model can see at once — the system prompt, your
+project's instructions, the conversation so far, the files it has read,
+the tool output it received — lives in a fixed-size <strong>context
+window</strong>. Managing it is most of what separates a session that
+stays sharp from one that goes vague after an hour.</p>
+<p>plank does the management for you. This page is about understanding
+it, and about the handful of levers worth pulling.</p>
+<h2 id="seeing-where-it-went">Seeing where it went</h2>
+<pre><code>/context</code></pre>
+<p>reports usage by category: the system prompt, session context, the
+conversation, tool results, and so on. The status bar carries a live
+gauge of the same number, so you normally notice pressure before you
+have to think about it.</p>
+<h2 id="what-goes-in-at-session-start">What goes in at session
+start</h2>
+<p>Before your first message the model receives:</p>
+<ul>
+<li><strong>The system prompt</strong> — plank's instructions, tool
+definitions, and the environment. Override it for one run with
+<code>-sys "…"</code>.</li>
+<li><strong>Session context</strong> — git status, the date, and the
+working directory.</li>
+<li><strong><code>AGENTS.md</code></strong> — project instructions,
+discovered from the working tree.</li>
+<li><strong>Memory</strong> — <code>~/.plank/MEMORY.md</code> and
+<code>./.plank/MEMORY.md</code>.</li>
+</ul>
+<p>The system prompt is cached on disk as a fingerprinted snapshot, so
+restarts do not pay to re-read it.</p>
+<h2 id="agentsmd"><code>AGENTS.md</code></h2>
+<p>The conventional place for "things anyone working in this repo needs
+to know": build commands, architecture, house style, gotchas. plank
+finds it and injects it at session start.</p>
+<pre><code>/init</code></pre>
+<p>has the model read your repository and write one. Review what it
+produces — it is a starting point, not a finished document.</p>
+<h2 id="memory">Memory</h2>
+<p>Memory is two plain markdown files, layered like the rest of plank's
+config:</p>
+<ul>
+<li><code>~/.plank/MEMORY.md</code> — <strong>user scope</strong>: who
+you are, durable preferences.</li>
+<li><code>./.plank/MEMORY.md</code> — <strong>project scope</strong>:
+goals and constraints of this checkout.</li>
+</ul>
+<p>Both load at session start. Append to them from the prompt:</p>
+<pre><code>/remember prefers small commits with imperative subject lines
+/remember user I work in Rust and TypeScript, mostly on macOS</code></pre>
+<p>Without <code>user</code>, the entry goes to project memory. Entries
+are dated bullets.</p>
+<p>Four kinds of entry are worth keeping, and they share one test:
+<strong>facts the model cannot re-derive from the
+repository.</strong></p>
+<table>
+<thead>
+<tr>
+<th>Type</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>user</code></td>
+<td>who you are</td>
+</tr>
+<tr>
+<td><code>feedback</code></td>
+<td>corrections on how you want work done, and why</td>
+</tr>
+<tr>
+<td><code>project</code></td>
+<td>goals and constraints not visible in the code</td>
+</tr>
+<tr>
+<td><code>reference</code></td>
+<td>external URLs, tickets, dashboards</td>
+</tr>
+</tbody>
+</table>
+<p>Do not record what the code, the git history, or
+<code>AGENTS.md</code> already says. That is context you are paying for
+twice.</p>
+<h2 id="compaction">Compaction</h2>
+<p>When the conversation approaches the window, plank reclaims space in
+escalating steps, cheapest first.</p>
+<p><strong>Microcompact</strong> clears the <em>bodies</em> of old tool
+results, keeping the newest few. No model round-trip, no summary,
+nothing lost that the model still needs — a file it read twenty turns
+ago and has not mentioned since is the cheapest thing in the transcript
+to give up.</p>
+<p><strong>Full compaction</strong> runs when that is not enough. plank
+asks the model for durable task state, then rebuilds the live transcript
+as: system prompt + summary + the recent verbatim tail + a budgeted
+re-injection of recently read files. You keep the shape of the
+conversation and the exact text of its recent part.</p>
+<pre><code>/compact</code></pre>
+<p>runs it on demand — useful just before handing the model a big new
+job, so it starts with room.</p>
+<p><strong>Steering the summary.</strong> Anything after
+<code>/compact</code> is extra instruction for that one pass:</p>
+<pre><code>/compact keep the failing test cases verbatim
+/compact focus on the parser work and drop the deployment detour</code></pre>
+<p>Your instruction is <em>added</em> to what plank already asks for,
+not substituted for it, so the summary keeps its structure and gains
+your emphasis. Use it when you know which thread matters next and the
+default summary would flatten it. Automatic compaction has no
+instructions, and asks exactly what it always did.</p>
+<p>While a pass runs the status bar shows its progress and the window
+title reads <code>🗑️ compacting...</code>. <code>Esc</code> interrupts
+it, which leaves the conversation exactly as it was.</p>
+<p><strong>If it fails, nothing is lost.</strong> An interrupted pass,
+or one where the model returns no usable summary, leaves the transcript
+untouched and abandons the turn rather than rebuilding on a bad summary.
+You will see
+<code>Compaction produced no summary; keeping the previous conversation state.</code>
+— retry it, or <code>/compact</code> with an instruction to nudge the
+model.</p>
+<p>Two things deliberately survive compaction: the <strong>task
+list</strong> (that is what the <code>task</code> tool is for) and
+<strong>memory</strong>.</p>
+<p>And one thing makes compaction reversible: a <code>/checkpoint</code>
+taken before it stores the whole transcript, so <code>/rollback</code>
+reconstructs the pre-compaction conversation exactly. See <a
+href="06-sessions.html">Sessions</a>.</p>
+<h2 id="context-size">Context size</h2>
+<p>The window defaults to 1048576 tokens. Set it with <code>-c N</code>
+or <code>engine.ctx</code>. Bigger costs memory; smaller compacts
+sooner.</p>
+<p>If plank feels unexpectedly slow or forgetful, check the startup line
+— a <code>settings.json</code> that shrank <code>ctx</code> or moved you
+off Metal is otherwise invisible once the UI is up, so plank names what
+is in force:</p>
+<pre><code>plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cpu, ctx=65536</code></pre>
+<h2 id="thinking">Thinking</h2>
+<p>The model reasons before it answers. <code>--think</code> (the
+default), <code>--think-max</code>, and <code>--nothink</code> set the
+effort; <code>ui.showThinking</code> controls whether you see it. Hiding
+thinking does not stop it — the model still produces it, and it still
+occupies context.</p>
+<h2 id="token-usage-on-hosted-providers">Token usage on hosted
+providers</h2>
+<pre><code>/usage</code></pre>
+<p>reports billed input and output tokens for the session, including
+Anthropic cache reads, cache writes, and the hit rate. Local engines
+have nothing to bill, so it is a provider-only report.</p>
+<hr />
+<p>Next: <a href="08-configuration.html">Configuration →</a></p>
+
+  </article>
+  <nav class="pager"><a href="06-sessions.html">← Sessions</a><a href="08-configuration.html">Configuration →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

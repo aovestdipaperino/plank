@@ -139,6 +139,19 @@
   .why h3{margin:8px 0 3px;font-size:17.5px;font-weight:800}
   .why p{margin:0;font-size:14.5px;color:var(--bark-soft)}
 
+
+  /* user-guide index */
+  .guidelist{list-style:none;padding:0;margin:0;display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(255px,1fr));gap:10px}
+  .guidelist a{display:block;text-decoration:none;color:var(--bark);background:var(--paper);
+    border:2px solid var(--line);border-radius:14px;padding:12px 14px;
+    transition:transform .12s,border-color .12s}
+  .guidelist a:hover{transform:translateY(-2px);border-color:var(--honey)}
+  .guidelist .gn{display:inline-block;min-width:1.4em;font-weight:800;color:var(--honey-ink)}
+  .guidelist .gd{display:block;color:var(--bark-soft);font-size:14px;margin-top:2px}
+  .guidelist code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.92em;
+    background:var(--birch);border:1px solid var(--line);border-radius:5px;padding:.04em .3em}
+
   /* feature cards */
   .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
   .card{
@@ -191,7 +204,10 @@
   <header>
     <div class="bar">
       <div class="brand rounded"><span class="chip">🪵</span> plank</div>
-      <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      <div style="display:flex;gap:10px;align-items:center">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
     </div>
   </header>
 
@@ -321,6 +337,30 @@
       </div>
     </section>
 
+    <section id="guide">
+      <p class="kicker">Read the manual</p>
+      <h2 class="rounded">The whole thing, explained.</h2>
+      <p style="color:var(--bark-soft);margin:0 0 18px;max-width:640px">Thirteen chapters, from
+      <em>brew install</em> to branching a session mid-turn. Written for people using plank, not
+      building it.</p>
+      <ul class="guidelist">
+        <li><a href="/guide/01-installation.html"><span class="gn">1</span>Installation<span class="gd">Homebrew, channels, building from source, getting the model</span></a></li>
+        <li><a href="/guide/02-getting-started.html"><span class="gn">2</span>Getting started<span class="gd">your first session, the three front ends, one-shot mode</span></a></li>
+        <li><a href="/guide/03-the-interface.html"><span class="gn">3</span>The interface<span class="gd">the TUI tour, keybindings, <code>@</code> completion, <code>!</code> commands, images</span></a></li>
+        <li><a href="/guide/04-slash-commands.html"><span class="gn">4</span>Slash commands<span class="gd">the complete command reference</span></a></li>
+        <li><a href="/guide/05-tools.html"><span class="gn">5</span>Tools<span class="gd">what the model can do, the sandbox, plan mode, questions, task lists</span></a></li>
+        <li><a href="/guide/06-sessions.html"><span class="gn">6</span>Sessions<span class="gd">saving, resuming, checkpoints, branching, export</span></a></li>
+        <li><a href="/guide/07-context.html"><span class="gn">7</span>Context<span class="gd">the context window, compaction, <code>AGENTS.md</code>, memory</span></a></li>
+        <li><a href="/guide/08-configuration.html"><span class="gn">8</span>Configuration<span class="gd"><code>settings.json</code>, command-line flags, precedence</span></a></li>
+        <li><a href="/guide/09-extending.html"><span class="gn">9</span>Extending plank<span class="gd">skills, templates, subagents, hooks, MCP servers</span></a></li>
+        <li><a href="/guide/10-remote-and-providers.html"><span class="gn">10</span>Remote and hosted engines<span class="gd"><code>serve</code>, <code>--remote</code>, shared engines, providers</span></a></li>
+        <li><a href="/guide/11-arcade.html"><span class="gn">11</span>The arcade<span class="gd">the games that run over a live turn</span></a></li>
+        <li><a href="/guide/12-advanced-workflows.html"><span class="gn">12</span>Advanced workflows<span class="gd">branching, delegation, long sessions, repeatability</span></a></li>
+        <li><a href="/guide/13-troubleshooting.html"><span class="gn">13</span>Troubleshooting<span class="gd">when something goes wrong</span></a></li>
+      </ul>
+      <p style="margin:16px 0 0"><a class="ghost" href="/guide/">Open the guide →</a></p>
+    </section>
+
     <section>
       <p class="kicker">A day in the life</p>
       <h2 class="rounded">You talk. Plank works.</h2>
@@ -341,6 +381,7 @@
     <div class="footgrid">
       <div class="brand rounded"><span class="chip">🪵</span> plank</div>
       <div>
+        <a href="/guide/">User guide</a> ·
         <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
         <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a> ·
         <a href="https://github.com/aovestdipaperino/homebrew-tap" target="_blank" rel="noopener">Homebrew tap</a>

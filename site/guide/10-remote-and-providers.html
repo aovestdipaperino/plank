@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10. Remote and hosted engines — plank user guide</title>
+<meta name="description" content="serve, --remote, shared engines, providers">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Remote and hosted engines</p>
+  <article>
+<h1 id="10-remote-and-hosted-engines">10. Remote and hosted engines</h1>
+<p>All of this is off by default. A plain <code>plank</code> runs the
+local Metal engine and nothing else.</p>
+<h2 id="hosted-providers">Hosted providers</h2>
+<p>plank can drive a hosted model instead of the local one. The provider
+sits behind the same engine boundary as the Metal backend, so tools,
+sessions, <code>/btw</code>, compaction, and the rest of the agent loop
+behave identically — native provider tool calls are translated back into
+plank's own tool protocol on the way through.</p>
+<pre class="sh"><code>export OPENAI_API_KEY=sk-...
+plank --provider openai --model gpt-4o
+
+export ANTHROPIC_API_KEY=sk-ant-...
+plank --provider anthropic --model claude-sonnet-4-5</code></pre>
+<p>One-shot works too:
+<code>plank --provider anthropic --model &lt;name&gt; -p "…"</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--provider openai|anthropic</code></td>
+<td>provider family. <code>openai</code> speaks OpenAI-compatible Chat
+Completions; <code>anthropic</code> speaks the Messages API.</td>
+</tr>
+<tr>
+<td><code>--model NAME</code></td>
+<td>the provider's model name, not a GGUF path. Required with
+<code>--provider</code>.</td>
+</tr>
+<tr>
+<td><code>--api-key KEY</code></td>
+<td>the key, if you would rather not use the env var. Prefer the env var
+— a key on the command line lands in your shell history.</td>
+</tr>
+<tr>
+<td><code>--base-url URL</code></td>
+<td>override the endpoint. Defaults to
+<code>https://api.openai.com/v1</code> and
+<code>https://api.anthropic.com/v1</code>.</td>
+</tr>
+<tr>
+<td><code>--provider-cache on|off</code></td>
+<td>Anthropic prompt caching over the stable prefix (tools + system). On
+by default; ignored for OpenAI.</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Key resolution</strong> — <code>--api-key</code> wins,
+otherwise <code>$OPENAI_API_KEY</code> or
+<code>$ANTHROPIC_API_KEY</code>. With neither, startup fails with a
+clear message rather than a confusing API error.</p>
+<p><strong>OpenAI-compatible gateways</strong> —
+<code>--provider openai</code> plus <code>--base-url</code> reaches
+anything speaking that shape: vLLM, Ollama, OpenRouter, Together, LM
+Studio.</p>
+<pre class="sh"><code>plank --provider openai --model llama3.3 \
+      --base-url http://localhost:11434/v1 --api-key ollama</code></pre>
+<p><strong>What stays the same</strong> — every tool, MCP tools,
+<code>@</code> completion, sessions and <code>/resume</code>,
+<code>/btw</code>, compaction. The one difference is the system prompt:
+a provider gets plank's own prompt with native tool definitions, never
+the byte-parity DeepSeek prompt, which is meant only for the local model
+it was trained on.</p>
+<p><strong>Notes</strong> — <code>--provider</code> cannot be combined
+with <code>--remote</code> or the local backend selectors; it
+<em>is</em> the engine for that run. <code>/usage</code> reports billed
+tokens including cache reads, writes, and hit rate. The key is never
+written to <code>settings.json</code>.</p>
+<h2 id="serve-and-connect">Serve and connect</h2>
+<p>Run the model on the machine that has the GPU, work from the machine
+you are sitting at.</p>
+<pre class="sh"><code># on the Metal box
+plank serve
+
+# on the laptop
+plank --remote https://metal-box:PORT</code></pre>
+<p>The transport is synchronous, adds no async runtime, and streams
+tokens as they generate.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--remote URL</code></td>
+<td>drive a remote <code>plank serve</code> host instead of a local
+engine</td>
+</tr>
+<tr>
+<td><code>--remote-token TOK</code></td>
+<td>bearer token (or <code>$PLANK_REMOTE_TOKEN</code>)</td>
+</tr>
+<tr>
+<td><code>--insecure</code></td>
+<td>allow plaintext <code>http://</code> to a non-loopback host</td>
+</tr>
+</tbody>
+</table>
+<p>Plain <code>http://</code> is allowed to localhost and refused
+elsewhere unless you pass <code>--insecure</code>. Keep a real
+deployment behind an SSH tunnel or a TLS reverse proxy.</p>
+<h2 id="shared-engine">Shared engine</h2>
+<pre class="sh"><code>plank serve --shared-engine</code></pre>
+<p>loads the weights once and serves many concurrent sessions from a
+single cooperative GPU thread. The scheduler round-robins at token
+granularity, so sessions are <strong>time-sliced, not parallel</strong>
+— there is one Metal queue. A freshly attached session restores the warm
+system-prompt prefix instead of cold-prefilling it.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--max-sessions N</code></td>
+<td>admission cap (default 8)</td>
+</tr>
+<tr>
+<td><code>--kv-budget-bytes B</code></td>
+<td>aggregate KV-bytes budget; reject an attach past it rather than
+OOM</td>
+</tr>
+<tr>
+<td><code>--session-ctx-size N</code></td>
+<td>per-session context window (0 = model max; a client's own request
+overrides)</td>
+</tr>
+<tr>
+<td><code>--idle-reclaim-secs S</code></td>
+<td>snapshot an idle session's KV to disk and restore it on the next
+request</td>
+</tr>
+</tbody>
+</table>
+<p><code>/info</code> reports live-session and KV accounting.</p>
+<h2 id="remote-control">Remote control</h2>
+<pre class="sh"><code>plank --control            # loopback WebSocket on 127.0.0.1:31415</code></pre>
+<p>Another process, a browser, or a terminal client can attach to a
+<strong>running</strong> plank instance: it mirrors the output, sends
+prompts, commands, <code>/btw</code> questions and interrupts, and can
+take or hand back control. One controller at a time, many mirrors, with
+a reconnect grace window. A self-contained web client is served at
+<code>/</code>.</p>
+<pre class="sh"><code>plank remote ws://127.0.0.1:31415/</code></pre>
+<p>is the terminal client: typed lines become prompts, slash lines
+become commands, <code>/btw &lt;q&gt;</code> becomes a side question,
+and Ctrl-C interrupts. The token defaults to
+<code>$PLANK_REMOTE_TOKEN</code>.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--control[=ADDR]</code></td>
+<td>start the server (default <code>127.0.0.1:31415</code>, loopback
+only)</td>
+</tr>
+<tr>
+<td><code>--control-token TOKEN</code></td>
+<td>shared bearer token; otherwise <code>$PLANK_REMOTE_TOKEN</code>,
+otherwise one is generated and printed once to stderr</td>
+</tr>
+<tr>
+<td><code>--control-allow</code></td>
+<td>let a remote client take control without a local grant (implied in
+headless server mode)</td>
+</tr>
+<tr>
+<td><code>--control-origin ORIGIN</code></td>
+<td>allow a browser Origin on the WebSocket upgrade (repeatable or
+comma-separated)</td>
+</tr>
+<tr>
+<td><code>--control-queue-max BYTES</code></td>
+<td>per-client outbound queue cap; a client that exceeds it is evicted
+(default 1048576)</td>
+</tr>
+</tbody>
+</table>
+<p>Missing and loopback Origins are always allowed; other browser
+Origins are refused by default.</p>
+<p>A remote client asking for control surfaces a notice locally and
+waits for approval. The local <code>/grant</code> command that approves
+it is not wired into the UI yet, so for now run the server with
+<code>--control-allow</code> when a remote client needs to drive.</p>
+<h2 id="--ui-remote"><code>--ui-remote</code></h2>
+<p>For driving the TUI from a test harness:</p>
+<pre class="sh"><code>plank --ui-remote=7777</code></pre>
+<p>Opens a <code>127.0.0.1</code>-only listener (bare
+<code>--ui-remote</code> picks an ephemeral port and prints it to
+stderr) accepting line-delimited JSON <code>keypress</code>,
+<code>snapshot</code>, and <code>uitree</code> commands.
+<code>snapshot</code> and <code>uitree</code> replies are held until the
+screen reflects any keys sent first, so a harness can assert without
+sleeping. One client at a time; a second queues.</p>
+<hr />
+<p>Next: <a href="11-arcade.html">The arcade →</a></p>
+
+  </article>
+  <nav class="pager"><a href="09-extending.html">← Extending plank</a><a href="11-arcade.html">The arcade →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

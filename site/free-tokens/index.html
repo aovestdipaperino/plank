@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10,000,000 free tokens — plank</title>
+<meta name="description" content="A limited-time offer of ten million free local tokens. Terms: you own the GPU. Also every other day is limited-time. Also there is no limit.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+  :root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --card:#fdf6e9; --card-line:#1d1710; --band:#8fd0b0;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0;
+      --card:#f3ead9; --card-line:#12100c; --band:#66c39c;
+    }
+  }
+  :root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --line:#e6d9c1; --card:#fdf6e9;
+  }
+  :root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --line:#3a2f22; --card:#f3ead9;
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.6; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;
+         letter-spacing:-.01em;color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;white-space:nowrap;
+    transition:border-color .15s,color .15s,transform .1s}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .lede{text-align:center;margin:26px 0 6px}
+  .lede h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:clamp(28px,5vw,42px);line-height:1.1;letter-spacing:-.02em;margin:.2em 0}
+  .lede p{color:var(--bark-soft);max-width:560px;margin:0 auto}
+
+  /* the card */
+  .stage{display:flex;justify-content:center;padding:26px 0 10px;perspective:1200px}
+  .card{
+    width:min(420px,100%); background:var(--card); color:#1d1710;
+    border:2px solid var(--card-line); border-radius:10px;
+    box-shadow:0 18px 44px rgb(var(--shadow) / .22), 0 2px 0 var(--card-line);
+    padding:0 0 22px; transform:rotate(-1.4deg);
+    transition:transform .25s ease;
+  }
+  .card:hover{transform:rotate(0deg) translateY(-4px)}
+  .band{
+    background:var(--band); border-bottom:2px solid var(--card-line);
+    border-radius:8px 8px 0 0; padding:14px 16px 12px; text-align:center;
+  }
+  .band .kicker{
+    font-size:12px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;opacity:.72
+  }
+  .band .glyph{font-size:38px;line-height:1;margin:6px 0 2px}
+  .cardbody{padding:20px 24px 0;text-align:center}
+  .cardbody h2{
+    font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:26px;line-height:1.2;letter-spacing:-.01em;margin:.1em 0 .35em
+  }
+  .amount{
+    font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:clamp(38px,9vw,56px);font-weight:900;letter-spacing:-.03em;
+    margin:.15em 0 .05em;color:#1d1710
+  }
+  .amount small{display:block;font-size:14px;font-weight:800;letter-spacing:.12em;
+    text-transform:uppercase;opacity:.6;margin-top:4px}
+  .rule{height:2px;background:var(--card-line);opacity:.18;margin:16px 22px}
+  .terms{padding:0 24px;font-size:14.5px;color:#3b3227;text-align:left}
+  .terms li{margin:.42em 0}
+  .terms b{color:#1d1710}
+  .sig{padding:14px 24px 0;font-size:12px;color:#6a5c47;text-align:center;font-style:italic}
+
+  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin:26px 0 8px}
+  .btn{
+    font-weight:800;text-decoration:none;border-radius:999px;padding:12px 20px;
+    border:2px solid var(--card-line);background:var(--honey);color:#1d1710;
+    transition:transform .1s,filter .15s
+  }
+  .btn:hover{transform:translateY(-2px);filter:brightness(1.05)}
+  .btn.alt{background:transparent;border-color:var(--line);color:var(--bark)}
+
+  .fineprint{
+    max-width:640px;margin:22px auto 0;font-size:13px;line-height:1.65;
+    color:var(--bark-soft);text-align:center
+  }
+  .fineprint p{margin:.55em 0}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;margin-top:34px;
+    color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (prefers-reduced-motion:reduce){
+    .card,.card:hover,.btn:hover{transition:none;transform:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="lede">
+      <h1 class="rounded">A limited-time offer.</h1>
+      <p>Limited to the lifetime of your GPU. Which, frankly, is longer than most funding rounds.</p>
+    </section>
+
+    <div class="stage">
+      <div class="card" role="img" aria-label="A card in the style of a board-game chance card, awarding ten million free local tokens.">
+        <div class="band">
+          <div class="kicker rounded">Community Chest</div>
+          <div class="glyph">🪵</div>
+        </div>
+
+        <div class="cardbody">
+          <h2 class="rounded">BANK ERROR IN YOUR FAVOUR</h2>
+          <div class="amount rounded">10,000,000
+            <small>free tokens</small>
+          </div>
+        </div>
+
+        <div class="rule"></div>
+
+        <ul class="terms">
+          <li><b>No credit card.</b> No card reader either. No card.</li>
+          <li><b>No rate limit.</b> There is a limit. It is your fan.</li>
+          <li><b>No data leaves the board.</b> Nothing to leak, nowhere to leak to.</li>
+          <li><b>Offer repeats daily.</b> And nightly. And while you sleep.</li>
+          <li><b>Not redeemable</b> for cash, credits, or a seat on the waitlist.</li>
+        </ul>
+
+        <p class="sig">Advance token to GO. Do not pass a billing page.<br>Do not collect an invoice.</p>
+      </div>
+    </div>
+
+    <div class="cta">
+      <a class="btn rounded" href="/">Claim by installing plank</a>
+      <a class="btn alt rounded" href="/guide/01-installation.html">How to claim →</a>
+    </div>
+
+    <div class="fineprint">
+      <p><b>Terms and conditions.</b> Ten million tokens is an arbitrary number chosen because it
+      sounds generous. The actual figure is “as many as you like”, which tested poorly in focus
+      groups — nobody believes a free thing that admits it is unlimited.</p>
+
+      <p>Tokens are generated on your own machine by a model you downloaded once, using electricity
+      you were already buying. Plank does not meter them, count them, or send them anywhere.
+      The <span class="mono">/usage</span> command will happily bill you in imaginary currency if
+      you miss the ritual.</p>
+
+      <p>Offer void where a GPU is absent. Offer also void on Linux and Windows, not out of
+      spite but out of Metal. Your tokens may be smaller than they appear; a token is roughly
+      three quarters of a word, and nobody has ever been happy about that.</p>
+
+      <p>By reading this page you agree that “free” meaning <em>free</em> is a strange enough
+      claim in 2026 to warrant a whole page about it.</p>
+    </div>
+  </main>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">Not affiliated with any board game, its hotels, or its little metal dog.
+    No tokens were minted in the making of this page.</p>
+  </footer>
+</div>
+</body>
+</html>

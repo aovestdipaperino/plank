@@ -8,7 +8,17 @@ The TUI is three regions: **scrollback** (the conversation), the **prompt**, and
 
 Assistant replies render as markdown — headings, lists, tables, and fenced code blocks with tree-sitter syntax highlighting. The model's thinking appears dimmed above its answer (turn it off with `ui.showThinking`). File edits render as git-style **diff cards**: an `Update(path)` header, an added/removed summary, and red/green `@@` hunks. A brand-new file streams its contents dimmed as it is written.
 
-The status bar shows, left to right: the working directory and git branch, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and a power/remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
+The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory and git branch, and nothing else. The bottom one carries everything that churns — where inference is running, the reasoning level, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
+
+**Where inference runs** is named on the second row, and there can be more than one answer:
+
+```
+api.regolo.ai, (local ⚡100%)
+```
+
+Every engine in play is listed in the order it first appeared, so a hosted main agent beside a `provider: local` subagent shows both. The local engine carries its GPU power share (`/power`, `--power`), because the cap applies to that engine and to no other.
+
+**The brain blinks** while the local model is prefilling or generating. It is the one signal that says *which* engine is working right now, which is otherwise invisible when a local subagent runs under a hosted main agent. It blinks in step with the elapsed and tokens/second readouts beside it.
 
 While plank is compacting, the throbber-and-verb line is replaced by a flashing `compacting` with a progress bar and percentage:
 
@@ -17,6 +27,14 @@ compacting ▰▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱ 21%
 ```
 
 Most of the bar tracks re-reading the conversation, which is the slow part; the tail tracks the summary being written. It goes away as soon as the pass ends. See [Compaction](07-context.md#compaction).
+
+Every turn closes with a line of its own before the prompt comes back:
+
+```
+✻ Planked for 0h 02m 20s
+```
+
+That clock covers the whole turn — every generate-and-tools round, plus any lines you typed while it was busy and it absorbed — not just the last pass. It is the number to quote when something felt slow.
 
 ## Keys
 
@@ -90,6 +108,8 @@ Recorded output is capped (200 lines, 16 KB) with a truncation marker, so one ru
 Either form is **your** command, not the model's, so it is **never sandboxed** — you typing it is the authorization. Both are also the right way to do anything interactive (a login flow, an editor, a pager) that the model's `bash` tool cannot drive.
 
 `Esc` or `Ctrl-C` kills a running command, and `Up`/`Down` on a line that starts with `!` walks only your previous shell commands.
+
+The marker is coloured as you type, by where the output goes: **red `!`** feeds the command and its output to the model, **green `!!`** keeps it between you and the shell. That is the only difference between the two forms and the only thing you cannot see once the line is typed. When the command finishes, plank says `done.` in green — a command that printed nothing is otherwise indistinguishable from one still running. An interrupted command says `[interrupted]` instead, and a non-zero exit adds `[exit code: N]`.
 
 ## Pasting images
 

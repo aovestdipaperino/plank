@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5. Tools — plank user guide</title>
+<meta name="description" content="what the model can do, the sandbox, plan mode, questions, task lists">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Tools</p>
+  <article>
+<h1 id="5-tools">5. Tools</h1>
+<p>Tools are what turn a chat model into an agent. The model asks for
+one, plank runs it, feeds the result back, and the model continues —
+repeating until a generation asks for nothing more. That whole loop is
+one <em>turn</em>.</p>
+<p>You do not invoke tools directly; you ask for an outcome and the
+model chooses. What you control is the <em>policy</em>: the sandbox,
+plan mode, which extensions are installed, and how much of the machinery
+you see.</p>
+<h2 id="the-built-in-set">The built-in set</h2>
+<h3 id="files">Files</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>read</code></td>
+<td>read a file (or a slice of one)</td>
+</tr>
+<tr>
+<td><code>more</code></td>
+<td>continue reading where the last <code>read</code> stopped</td>
+</tr>
+<tr>
+<td><code>write</code></td>
+<td>create a file, or overwrite one</td>
+</tr>
+<tr>
+<td><code>list</code></td>
+<td>list a directory</td>
+</tr>
+<tr>
+<td><code>glob</code></td>
+<td>find files by name pattern across a tree — <code>**</code> crosses
+directories, <code>*</code> stays within one component</td>
+</tr>
+<tr>
+<td><code>edit</code></td>
+<td>replace a region of a file, anchored on surrounding text</td>
+</tr>
+<tr>
+<td><code>search</code></td>
+<td>search file contents</td>
+</tr>
+</tbody>
+</table>
+<p><code>edit</code> and an overwriting <code>write</code> render as
+<strong>diff cards</strong> in the TUI: an <code>Update(path)</code>
+header, an added/removed summary, and red/green <code>@@</code> hunks. A
+genuinely new file streams its contents dimmed as it is written, so you
+can watch it appear.</p>
+<h3 id="shell">Shell</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>bash</code></td>
+<td>run a shell command</td>
+</tr>
+<tr>
+<td><code>bash_status</code></td>
+<td>poll a running job's output</td>
+</tr>
+<tr>
+<td><code>bash_stop</code></td>
+<td>stop a running job</td>
+</tr>
+</tbody>
+</table>
+<p>Bash commands are <strong>tracked jobs</strong>, not blocking
+one-shot calls: each owns a process, reader threads, and an output file,
+so the model can start a long build, do something else, and check back.
+The first observation is head-biased so headers and early errors are
+visible; later ones are tail-biased so you see recent output rather than
+the top of a log.</p>
+<h3 id="documents">Documents</h3>
+<p><code>read</code> on a <code>.pdf</code> transparently converts the
+file to Markdown first, so a PDF is just a readable file:</p>
+<pre><code>summarize the first few pages of Claude-Code-Manuale-Completo.pdf</code></pre>
+<p>Conversion uses spatial text extraction, with OCR filling in pages
+that have no text layer — so both born-digital and scanned PDFs work.
+The result is cached in <code>~/.plank/doc-cache/</code>, keyed by
+content, so a second read of the same document costs nothing.</p>
+<p>Everything else behaves normally: paging, line numbers, and
+<code>more</code> continuation all work, and the model only ever sees
+<em>your</em> path, never the cache path. A file that cannot be parsed
+comes back as a plain tool error.</p>
+<p>PDF is currently the only converted format.</p>
+<h3 id="web">Web</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>google_search</code></td>
+<td>search the web</td>
+</tr>
+<tr>
+<td><code>visit_page</code></td>
+<td>fetch and read a page</td>
+</tr>
+</tbody>
+</table>
+<p>Web access asks for your consent the first time, and you can grant it
+standing so it stops asking.</p>
+<p>The pattern that works is to say what you want done with the results,
+not just what to look up:</p>
+<pre><code>search the web for the latest news about &lt;topic&gt; and summarize</code></pre>
+<p>The model searches, opens the pages worth opening, and reports. If it
+answers from memory when you wanted current information, say so — "it's
+a different one, find it online" — and it will go look.</p>
+<h3 id="agent-machinery">Agent machinery</h3>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>task</code></td>
+<td>maintain a task list that survives compaction</td>
+</tr>
+<tr>
+<td><code>agent</code></td>
+<td>delegate a bounded sub-task to a fresh subagent</td>
+</tr>
+<tr>
+<td><code>skill</code></td>
+<td>invoke an installed skill by name</td>
+</tr>
+<tr>
+<td><code>ask</code></td>
+<td>ask you a multiple-choice question</td>
+</tr>
+<tr>
+<td><code>EnterPlanMode</code> / <code>ExitPlanMode</code></td>
+<td>enter and leave read-only plan mode</td>
+</tr>
+<tr>
+<td><code>mcp_describe</code></td>
+<td>fetch the full schema of a non-primary MCP tool</td>
+</tr>
+<tr>
+<td><code>mcp_list_resources</code> /
+<code>mcp_read_resource</code></td>
+<td>list and read MCP resources</td>
+</tr>
+<tr>
+<td><code>mcp__&lt;server&gt;__&lt;tool&gt;</code></td>
+<td>any tool from a connected MCP server</td>
+</tr>
+</tbody>
+</table>
+<h2 id="the-bash-sandbox">The bash sandbox</h2>
+<p>On macOS, model-initiated shell commands run under
+<code>/usr/bin/sandbox-exec</code> with a generated Seatbelt profile:
+<strong>read everywhere, write only under the working directory, temp
+directories, and any roots you allow</strong>. It is on by default,
+because a model-chosen command should not be able to write outside the
+project it was pointed at.</p>
+<p>Commands <em>you</em> type with <code>!</code> or <code>!!</code> are
+never sandboxed — you typing the command is the authorization.</p>
+<p>Configure it in <code>~/.plank/sandbox.json</code>, overlaid by
+<code>./.plank/sandbox.json</code>:</p>
+<pre class="json"><code>{
+  &quot;enabled&quot;: true,
+  &quot;writablePaths&quot;: [&quot;/some/extra/root&quot;],
+  &quot;excludedCommands&quot;: [&quot;git push*&quot;, &quot;brew *&quot;]
+}</code></pre>
+<p>Scalars come from the most specific file; lists concatenate.
+<code>excludedCommands</code> glob-matches the whole command line and
+skips the sandbox for it — a convenience escape hatch, <strong>not a
+security boundary</strong>.</p>
+<p>Turn it off for a run with <code>--no-sandbox</code>, or permanently
+with <code>safety.sandbox: false</code>.</p>
+<h2 id="plan-mode">Plan mode</h2>
+<p>When a task is risky or ambiguous, the model can call
+<code>EnterPlanMode</code>. While it is active, every workspace-mutating
+tool is refused — <code>write</code>, <code>edit</code>,
+<code>bash</code> — and only read-only tools work, so the model
+researches and designs without touching anything.</p>
+<p>It leaves by calling <code>ExitPlanMode</code> with a proposed plan,
+which you approve or reject. On approval the gate lifts and it may edit;
+on rejection plan mode stays on and it refines the plan.</p>
+<p>You can also just ask for it: "plan this out before you touch
+anything."</p>
+<h2 id="questions">Questions</h2>
+<p>When a turn is genuinely ambiguous, the model can call
+<code>ask</code> instead of guessing: a multiple-choice question with a
+short header and two to seven options, shown as a panel in the TUI or a
+numbered list in the REPL. It blocks until you answer, and degrades
+cleanly when there is nobody to ask (headless mode).</p>
+<p><code>ask.maxOptions</code> caps how many options one question may
+offer (default 7; the minimum of 2 is fixed).</p>
+<h2 id="task-lists">Task lists</h2>
+<p>The <code>task</code> tool keeps a plan the model can add to and
+update — statuses are <code>pending</code>, <code>in_progress</code>,
+and done. The list is <strong>model-visible and survives
+compaction</strong>, which is the point: a long job does not lose its
+plan when the conversation is summarized. <code>/tasks</code> shows it,
+and the status bar carries a task counter.</p>
+<h2 id="subagents">Subagents</h2>
+<p>The <code>agent</code> tool hands a self-contained sub-task to a
+fresh subagent working in its own scoped context, and returns
+<strong>only its final report</strong> to the main conversation. This is
+how a long research detour stays out of your transcript.</p>
+<p>Delegation is bounded: a subagent cannot itself delegate. You can
+also start one yourself with <code>/subagent &lt;task&gt;</code>, and
+define named subagents with their own instructions — see <a
+href="09-extending.html">Extending plank</a>.</p>
+<h2 id="watching-or-not-watching-tools-run">Watching (or not watching)
+tools run</h2>
+<p>By default the UI stays clean: tool-call banners and tool output are
+hidden, and the status bar just names what is running. Turn them on when
+you want to see the mechanics:</p>
+<pre><code>/config ui.showToolCalls true
+/config ui.showToolResults true</code></pre>
+<p>Neither changes what the model receives — the tools run and the
+results are fed back either way.</p>
+<h2 id="tool-calls-inside-thinking">Tool calls inside thinking</h2>
+<p>By default plank dispatches tool calls the model emits inside its
+thinking block. Set <code>engine.thinkingToolCalls</code> to
+<code>false</code> for strict parity with the ds4 reference, where such
+a call is instead recovered forward by force-closing the thinking
+block.</p>
+<hr />
+<p>Next: <a href="06-sessions.html">Sessions →</a></p>
+
+  </article>
+  <nav class="pager"><a href="04-slash-commands.html">← Slash commands</a><a href="06-sessions.html">Sessions →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

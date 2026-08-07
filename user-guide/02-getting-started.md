@@ -87,6 +87,16 @@ plank /resume amused     # by name prefix
 
 or from inside plank, `/resume` with no argument to pick from a list. A resumed session replays through the same renderer, so history comes back as markdown with thinking dimmed — and plank restores the engine KV alongside the transcript, so it does not have to re-read the whole conversation before your first new message.
 
+On the way out plank prints what the run cost:
+
+```
+Session stats  ↓ 128,209 ↑ 8,269  ·  12:20
+  glm5.2          ↓ 120,000 ↑ 7,900
+  ds4 (local)     ↓   8,209 ↑   369
+```
+
+Tokens in and out, and the wall clock. The per-engine breakdown appears only when more than one engine served the session — which is the case worth reading, since it separates what a hosted provider billed you for from what ran on your own machine.
+
 See [Sessions](06-sessions.md) for the full story.
 
 ## Telling plank about your project

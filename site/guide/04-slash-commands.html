@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4. Slash commands — plank user guide</title>
+<meta name="description" content="the complete command reference">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › Slash commands</p>
+  <article>
+<h1 id="4-slash-commands">4. Slash commands</h1>
+<p>A line beginning with <code>/</code> is a command, not a prompt.
+Unknown slash lines are passed to the model as ordinary text.
+<code>/help</code> prints the full usage text; completion offers the
+known commands as you type.</p>
+<p>Every command below works identically in the TUI and the plain
+REPL.</p>
+<h2 id="session-lifecycle">Session lifecycle</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/new</code>, <code>/clear</code></td>
+<td>start a fresh session, dropping the current transcript</td>
+</tr>
+<tr>
+<td><code>/save</code></td>
+<td>write the current session to disk (sessions also save
+automatically)</td>
+</tr>
+<tr>
+<td><code>/list</code></td>
+<td>list saved sessions, most recent first</td>
+</tr>
+<tr>
+<td><code>/switch &lt;id&gt;</code></td>
+<td>load another saved session by name or number</td>
+</tr>
+<tr>
+<td><code>/resume [prefix]</code></td>
+<td>resume a saved session; no argument picks the most recent, or shows
+a list</td>
+</tr>
+<tr>
+<td><code>/del &lt;id&gt;</code></td>
+<td>delete a saved session</td>
+</tr>
+<tr>
+<td><code>/tag &lt;text&gt;</code></td>
+<td>label the current session so it is recognizable in
+<code>/list</code></td>
+</tr>
+<tr>
+<td><code>/strip &lt;id&gt;</code></td>
+<td>trim a saved session's oldest turns to reclaim space</td>
+</tr>
+<tr>
+<td><code>/history</code></td>
+<td>reprint recent turns</td>
+</tr>
+<tr>
+<td><code>/quit</code>, <code>/exit</code></td>
+<td>leave (the session is saved)</td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="06-sessions.html">Sessions</a>.</p>
+<h2 id="branching-and-rollback">Branching and rollback</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/checkpoint [name]</code></td>
+<td>mark a named return point in this session</td>
+</tr>
+<tr>
+<td><code>/rollback [name]</code></td>
+<td>return to a checkpoint; the discarded tail is kept as
+<code>pre-rollback</code></td>
+</tr>
+<tr>
+<td><code>/tree</code></td>
+<td>draw the session tree and number its fork points</td>
+</tr>
+<tr>
+<td><code>/fork [n]</code></td>
+<td>rewind to fork point <code>n</code> and explore a different path; no
+argument shows the tree</td>
+</tr>
+<tr>
+<td><code>/clone</code></td>
+<td>freeze the current branch and continue on a copy</td>
+</tr>
+</tbody>
+</table>
+<h2 id="context">Context</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/context</code></td>
+<td>report context-window usage by category</td>
+</tr>
+<tr>
+<td><code>/compact [instructions]</code></td>
+<td>compact the conversation now, rather than waiting for the automatic
+pass; an argument steers what this one summary keeps</td>
+</tr>
+<tr>
+<td><code>/usage</code></td>
+<td>billed token counts for the session (hosted providers, including
+cache hit rate)</td>
+</tr>
+<tr>
+<td><code>/remember [user] &lt;fact&gt;</code></td>
+<td>append a dated entry to project memory (or user memory with
+<code>user</code>)</td>
+</tr>
+<tr>
+<td><code>/init</code></td>
+<td>have the model read the repo and generate an
+<code>AGENTS.md</code></td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="07-context.html">Context</a>.</p>
+<h2 id="extensions-and-inspection">Extensions and inspection</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/mcp</code></td>
+<td>connected MCP servers and the tools they expose</td>
+</tr>
+<tr>
+<td><code>/skills</code></td>
+<td>skills available to the model</td>
+</tr>
+<tr>
+<td><code>/templates</code></td>
+<td>your <code>{{var}}</code> prompt templates</td>
+</tr>
+<tr>
+<td><code>/agent</code></td>
+<td>named subagents you can delegate to, and which engine each runs
+on</td>
+</tr>
+<tr>
+<td><code>/hooks</code></td>
+<td>which hooks are configured and on what events</td>
+</tr>
+<tr>
+<td><code>/tasks</code></td>
+<td>the model's task list</td>
+</tr>
+</tbody>
+</table>
+<p>See <a href="09-extending.html">Extending plank</a>.</p>
+<h2 id="asides-and-delegation">Asides and delegation</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/btw &lt;question&gt;</code></td>
+<td>ask a side question mid-task; answered in a split panel, nothing
+written to the conversation</td>
+</tr>
+<tr>
+<td><code>/subagent [&lt;name&gt;] &lt;task&gt;</code></td>
+<td>delegate a task to a subagent; only its final report enters the
+transcript, and the turn continues from it</td>
+</tr>
+</tbody>
+</table>
+<p><code>/btw</code> genuinely suspends the running generation, answers,
+and resumes byte-for-byte with no re-prefill
+(<code>safety.btwSuspend</code>, on by default). With suspend off, the
+question is queued and answered at the next generation boundary
+instead.</p>
+<h2 id="configuration-and-runtime">Configuration and runtime</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/config</code></td>
+<td>open the interactive settings form</td>
+</tr>
+<tr>
+<td><code>/config &lt;section&gt;.&lt;key&gt; &lt;value&gt;</code></td>
+<td>set one setting, e.g.
+<code>/config ui.showThinking false</code></td>
+</tr>
+<tr>
+<td><code>/power &lt;1..100&gt;</code></td>
+<td>cap GPU power draw for this run; shown as <code>(local ⚡60%)</code>
+in the status bar</td>
+</tr>
+<tr>
+<td><code>/notify &lt;mode&gt;</code></td>
+<td>change notification mode for this session</td>
+</tr>
+<tr>
+<td><code>/version</code></td>
+<td>the running version</td>
+</tr>
+<tr>
+<td><code>/help</code></td>
+<td>full command and flag reference</td>
+</tr>
+</tbody>
+</table>
+<p><code>/config</code> changes write to
+<code>./.plank/settings.json</code> and apply immediately. See <a
+href="08-configuration.html">Configuration</a>.</p>
+<h2 id="output-and-diagnostics">Output and diagnostics</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/export [md|html] [path]</code></td>
+<td>write the transcript to a shareable file (markdown by default,
+auto-named; HTML is standalone)</td>
+</tr>
+<tr>
+<td><code>/insights [fast]</code></td>
+<td>a usage report computed from every saved session, written to
+<code>~/.plank/usage-data/report.html</code> (<code>fast</code> skips
+the model-written prose)</td>
+</tr>
+<tr>
+<td><code>/repro [note]</code></td>
+<td>dump the exact engine input and runtime knobs to
+<code>~/.plank/repro/</code> for a bug report</td>
+</tr>
+</tbody>
+</table>
+<p><code>/repro</code> is the one to reach for when you want to report a
+problem: it captures the rendered prompt the engine would see plus the
+model, backend, context size, sampling settings and think mode, in a
+single self-contained file. It never touches the live session.</p>
+<p><code>/insights</code> computes <strong>every number in code</strong>
+and uses the model only for prose it cannot replace — a failed or
+skipped model call costs the report its narrative, never its
+statistics.</p>
+<h2 id="remote-control">Remote control</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/remote</code></td>
+<td>recognized as a command</td>
+</tr>
+<tr>
+<td><code>/grant</code></td>
+<td>recognized; approves a remote client's control request</td>
+</tr>
+</tbody>
+</table>
+<p>Both are part of the remote-control surface described in <a
+href="10-remote-and-providers.html">Remote and hosted engines</a>. The
+local <code>/grant</code> handler is not wired into the UI yet, so today
+a remote client that needs to take control should be started against a
+server run with <code>--control-allow</code>.</p>
+<h2 id="not-in-help">Not in <code>/help</code></h2>
+<p>Five arcade commands are deliberately absent from <code>/help</code>
+and from the completion popup. They are covered in <a
+href="11-arcade.html">The arcade</a>, and they can be removed entirely
+with <code>ui.easterEggs: false</code>.</p>
+<h2 id="skills-and-templates-as-commands">Skills and templates as
+commands</h2>
+<p>Any installed skill or template also becomes a slash command:
+<code>/&lt;name&gt; [args]</code>. Built-in commands always win over a
+template or skill with the same name. <code>/skills</code> and
+<code>/templates</code> list what is available.</p>
+<hr />
+<p>Next: <a href="05-tools.html">Tools →</a></p>
+
+  </article>
+  <nav class="pager"><a href="03-the-interface.html">← The interface</a><a href="05-tools.html">Tools →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>

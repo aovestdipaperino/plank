@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>11. The arcade — plank user guide</title>
+<meta name="description" content="the games that run over a live turn">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › <a href="./">User guide</a> › The arcade</p>
+  <article>
+<h1 id="11-the-arcade">11. The arcade</h1>
+<p>Waiting on a long generation is the one moment a coding agent has
+nothing for you to do. So there are five games behind slash commands,
+and they are meant to be played <strong>during</strong> a turn: type one
+while the model is streaming and it opens as a translucent layer over
+the live output, which keeps scrolling underneath.</p>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/pelota</code></td>
+<td>pong against a five-level CPU</td>
+</tr>
+<tr>
+<td><code>/breakout</code></td>
+<td>knock the wall down, five walls deep</td>
+</tr>
+<tr>
+<td><code>/invaders</code></td>
+<td>hold the line against the marching fleet</td>
+</tr>
+<tr>
+<td><code>/centipede</code></td>
+<td>shoot it apart before it walks into you</td>
+</tr>
+<tr>
+<td><code>/frogger</code></td>
+<td>cross the road, then ride the river home</td>
+</tr>
+</tbody>
+</table>
+<h2 id="arguments">Arguments</h2>
+<p>Two, combinable — <code>/breakout new sound</code>:</p>
+<ul>
+<li><strong><code>new</code></strong> (or <code>reset</code>) — deal a
+fresh game. Without it, a command <strong>resumes the game you
+left</strong>. Each game keeps its own slot, so you can close pelota,
+run three turns, open breakout, and come back to pelota exactly where it
+was. A finished game is not kept, so the next command deals a new
+one.</li>
+<li><strong><code>sound</code></strong> — blips on. Off by default;
+<code>b</code> toggles it in-game.</li>
+</ul>
+<h2 id="controls">Controls</h2>
+<p>Arrows, or <code>hjkl</code>, or <code>wasd</code>. Space serves or
+fires. <code>p</code> pauses, <code>t</code> switches between the
+translucent and opaque layer, <code>b</code> toggles sound,
+<code>Esc</code> or <code>q</code> leaves.</p>
+<p>The mouse works everywhere: the wheel and trackpad steer, click and
+drag place the paddle or the ship, and clicking fires in the two
+shooters.</p>
+<p>While a game is up, the <strong>first <code>Ctrl-C</code> closes it
+and a second interrupts the model</strong>, so you are never locked out
+of stopping a turn.</p>
+<p>Pelota has one extra move: hold <strong>Shift</strong> while steering
+and the paddle shrinks to a third of its length, but a hit that lands
+leaves at triple speed — usually past the CPU. The boost lasts exactly
+one crossing.</p>
+<h2 id="two-honest-notes">Two honest notes</h2>
+<p><strong>Translucency is not alpha.</strong> A terminal cell holds one
+character and one pair of colors; there is nothing to composite. What
+happens instead is that these games are sparse, so the layer underneath
+is dimmed rather than erased and the glyphs land in the gaps. It reads
+as a veil and the model's output stays legible behind it, but it is a
+trick, not blending.</p>
+<p><strong>Sound is the terminal bell</strong>, and nothing else. That
+is deliberate: it adds zero bytes to the binary, where real audio would
+mean a synthesis crate and a system audio dependency. The cost is that
+<code>BEL</code> has no pitch and no length, so the only thing
+distinguishing one cue from another is how many — one blip for a hit,
+two for a life lost, three for a level. Terminals set to a visual bell
+flash instead, which is why it is off unless you ask.</p>
+<h2 id="turning-them-off">Turning them off</h2>
+<p>They live behind <code>ui.easterEggs</code>, on by default. Setting
+it to <code>false</code> does more than hide them: they stop being
+commands at all, so <code>/pelota</code> goes to the model as an
+ordinary prompt exactly like any other unrecognized slash line. That is
+the honest behaviour for a shared or managed install that wants no games
+in it, and the startup line names the setting when it is off — so a
+<code>settings.json</code> cannot quietly remove them without saying
+so.</p>
+<p>None of them appear in <code>/help</code> or the completion popup.
+That is the point.</p>
+<hr />
+<p>Next: <a href="12-advanced-workflows.html">Advanced workflows →</a></p>
+
+  </article>
+  <nav class="pager"><a href="10-remote-and-providers.html">← Remote and hosted engines</a><a href="12-advanced-workflows.html">Advanced workflows →</a></nav>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>
