@@ -982,20 +982,6 @@ test` and review the diff before committing.
   assertion still discriminates by mutating the code it guards, since the
   obvious repair for flakiness is an assertion that can no longer fail.
 
-- **A terminal grid only survives width-1 glyphs, and the katakana come in both
-  widths.** The matrix rain (`src/arcade/matrix.rs`) paints one glyph per cell,
-  so a single full-width character shears every column to its right for as long
-  as it is on screen. The kana used here are the *half-width* forms
-  (U+FF66..U+FF9D), which `unicode_width` reports as 1 and which look identical
-  at terminal sizes; the full-width block (U+30A1..) reports 2 and must not be
-  used. `every_glyph_is_one_cell_wide` asserts it for all three alphabets,
-  because the failure is invisible in a diff and obvious only on screen.
-
-  The second half of the same problem is not solvable in code: a font that has
-  no kana draws boxes, and nothing in the program can tell. Hence `c`, which
-  cycles the rain to binary and then to ASCII — an escape hatch in the UI
-  rather than a probe that cannot work.
-
 - **The real TUI *can* be driven headlessly — with a pty, not `script`.**
   `tests/ui_remote.rs` notes that `tui_loop` is hardwired to
   `Terminal<CrosstermBackend<Stdout>>` and so cannot take a `TestBackend`, but

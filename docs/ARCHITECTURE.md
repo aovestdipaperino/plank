@@ -256,19 +256,15 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   which is why it is recorded rather than recomputed — the prompt's position
   depends on the task strip's height.
 - **Screensaver** (`arcade.rs` + the TUI input loop): after `ui.screensaver`
-  of idleness (`1m` by default; `2m`, `5m`, `never`) one of the two ambient
-  screens — the perspective starfield or the matrix rain (`arcade/matrix.rs`),
-  a coin flip off the opening seed — takes the whole screen, and the next key,
-  click or paste puts the UI back — consumed, not typed. Idleness is measured
-  in the outer input loop, which is the only place that can be idle: a running turn is
+  of idleness (`1m` by default; `2m`, `5m`, `never`) the perspective
+  starfield takes the whole screen, and the next key, click or paste puts
+  the UI back — consumed, not typed. Idleness is measured in the outer
+  input loop, which is the only place that can be idle: a running turn is
   inside `tui_turn`, so a long generation is never mistaken for an absent
   user. Focus and resize events deliberately do not count as activity, or a
   window manager moving focus around would pin the timer at zero. It reuses
   the arcade's draw and step path but is not an easter egg: no command, no
-  parking slot, no footer, and `ui.easterEggs` does not gate it. The rain is
-  also reachable on demand as `/matrix`, which *is* gated — same screen, two
-  ways in. Being ambient (`Game::ambient`), neither is ever parked: rain
-  resumed is indistinguishable from rain dealt fresh.
+  parking slot, no footer, and `ui.easterEggs` does not gate it.
 - **Built-in editor** (`miniedit/`, feature `builtin_editor`): Ctrl-G opens an
   in-process, single-buffer fork of Microsoft Edit (`refs/edit`, MIT) on the
   half-typed prompt. plank suspends its own TUI through `with_tui_suspended`
