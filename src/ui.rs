@@ -5921,8 +5921,17 @@ impl Agent<'_> {
             Ok(out) => {
                 if out.interrupted {
                     log.push_dim("[interrupted]");
-                } else if out.exit_code != 0 {
-                    log.push_dim(format!("[exit code: {}]", out.exit_code));
+                } else {
+                    if out.exit_code != 0 {
+                        log.push_dim(format!("[exit code: {}]", out.exit_code));
+                    }
+                    // A command that prints nothing is otherwise indis-
+                    // tinguishable from one still running, so say it finished.
+                    // Only when it did: an interrupted command did not.
+                    log.push_spans(vec![ratatui::text::Span::styled(
+                        "done.",
+                        crate::tui::done_style(),
+                    )]);
                 }
             }
             Err(e) => log.push_dim(format!("!{cmd}: {e}")),
@@ -6356,6 +6365,15 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                // Closing line, before anything switches to idle: `turn_started`
+                // covers the whole user turn — every generate/tools round, plus
+                // any leftover-queued follow-ups this loop absorbed — not the
+                // last pass, which is what the status bar's elapsed shows while
+                // the turn runs.
+                log.push_spans(vec![ratatui::text::Span::styled(
+                    tui::turn_footer(turn_started.elapsed()),
+                    tui::turn_footer_style(),
+                )]);
                 self.broadcast_idle_status();
                 if crate::notify::should_notify_complete(
                     turn_started.elapsed(),

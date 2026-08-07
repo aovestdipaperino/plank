@@ -40,6 +40,43 @@ fn visible_style() -> Style {
 }
 
 /// Barely-visible gray, italic, for thinking text.
+/// Theme green, for the note that a `!` command finished.
+#[must_use]
+pub fn done_style() -> Style {
+    Style::default().fg(THEME_GREEN)
+}
+
+/// Bold grey, for the turn's closing "Planked for …" line: present enough to
+/// find when scrolling back to a turn boundary, quiet enough not to compete
+/// with the model's own output.
+#[must_use]
+pub fn turn_footer_style() -> Style {
+    Style::default()
+        .fg(Color::Indexed(245))
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Formats a turn's wall-clock duration as `Xh YYm ZZs`.
+///
+/// Every unit is always shown, hours unpadded and the rest to two digits, so
+/// the line has one shape and consecutive turns align when scrolling back.
+#[must_use]
+pub fn fmt_turn_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    format!(
+        "{}h {:02}m {:02}s",
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// The turn's closing line: a marker, and how long the turn took.
+#[must_use]
+pub fn turn_footer(d: std::time::Duration) -> String {
+    format!("\u{271b} Planked for {}", fmt_turn_duration(d))
+}
+
 fn think_style() -> Style {
     Style::default()
         .fg(Color::Indexed(238))
@@ -1012,19 +1049,25 @@ fn frame_geom(
 
 /// Splits the resting-prompt input into styled spans so a valid command is
 /// highlighted live as the user types: a known `/command` token in theme green,
-/// and the `!` shell-escape marker in red. Anything else stays default-styled.
+/// and the shell-escape marker colored by where its output goes. Anything else
+/// stays default-styled.
 ///
 /// Validity mirrors dispatch: the green highlight appears only when the whole
 /// line parses as a known command ([`crate::config::slash_command_known`]), so
 /// partial (`/hel`) and unknown (`/nope`) inputs stay plain until complete.
 fn input_spans(input: &str) -> Vec<Span<'static>> {
-    // Shell escape (`!cmd`): only the `!` marker is colored, red; the shell
-    // command text after it stays plain (any non-empty command is "valid").
+    // Shell escape: the marker is colored by consequence, which is the one
+    // thing the two forms differ in and the one thing that is invisible once
+    // typed. Red `!` feeds the command and its output to the model as history;
+    // green `!!` keeps it between the user and the shell. Only the marker is
+    // colored — any non-empty command is "valid", so the text after it stays
+    // plain.
     if let Some(rest) = input.strip_prefix('!') {
-        let mut spans = vec![Span::styled(
-            "!".to_string(),
-            Style::default().fg(Color::Red),
-        )];
+        let (marker, color, rest) = match rest.strip_prefix('!') {
+            Some(rest) => ("!!", THEME_GREEN, rest),
+            None => ("!", Color::Red, rest),
+        };
+        let mut spans = vec![Span::styled(marker.to_string(), Style::default().fg(color))];
         if !rest.is_empty() {
             spans.push(Span::raw(rest.to_string()));
         }
@@ -3154,6 +3197,60 @@ mod tests {
             joined.contains(&format!("{mark} max | ctx 12%")),
             "{joined}"
         );
+    }
+
+    /// The shell-escape marker is colored by *consequence*, which is the one
+    /// thing the two forms differ in and the one thing invisible once typed:
+    /// red `!` feeds the command and its output to the model, green `!!` keeps
+    /// it between the user and the shell. Only the marker is colored.
+    #[test]
+    fn the_bang_marker_is_colored_by_where_its_output_goes() {
+        let colored = |input: &str| -> Vec<(String, Option<Color>)> {
+            input_spans(input)
+                .into_iter()
+                .map(|s| (s.content.to_string(), s.style.fg))
+                .collect()
+        };
+
+        assert_eq!(
+            colored("!ls -la"),
+            vec![
+                ("!".to_string(), Some(Color::Red)),
+                ("ls -la".to_string(), None),
+            ],
+            "a single bang reaches the model, so it is the loud one"
+        );
+        assert_eq!(
+            colored("!!ls -la"),
+            vec![
+                ("!!".to_string(), Some(THEME_GREEN)),
+                ("ls -la".to_string(), None),
+            ],
+            "a double bang stays local"
+        );
+        // Bare markers still color, so the cue appears on the first keystroke.
+        assert_eq!(colored("!"), vec![("!".to_string(), Some(Color::Red))]);
+        assert_eq!(colored("!!"), vec![("!!".to_string(), Some(THEME_GREEN))]);
+    }
+
+    /// The turn footer always shows all three units, so consecutive turns line
+    /// up when scrolling back through a session.
+    #[test]
+    fn the_turn_footer_reads_as_one_shape() {
+        use std::time::Duration;
+        assert_eq!(fmt_turn_duration(Duration::from_secs(0)), "0h 00m 00s");
+        assert_eq!(fmt_turn_duration(Duration::from_secs(9)), "0h 00m 09s");
+        assert_eq!(fmt_turn_duration(Duration::from_secs(247)), "0h 04m 07s");
+        assert_eq!(fmt_turn_duration(Duration::from_secs(3729)), "1h 02m 09s");
+        assert_eq!(fmt_turn_duration(Duration::from_hours(24)), "24h 00m 00s");
+        assert_eq!(
+            turn_footer(Duration::from_secs(3729)),
+            "\u{271b} Planked for 1h 02m 09s"
+        );
+        // Bold grey: findable at a turn boundary without competing with output.
+        let st = turn_footer_style();
+        assert_eq!(st.fg, Some(Color::Indexed(245)));
+        assert!(st.add_modifier.contains(Modifier::BOLD));
     }
 
     /// A fenced code block that opens on the line directly after a paragraph —
