@@ -18,6 +18,7 @@ pub mod files;
 pub mod mcp;
 pub mod mcp_advert;
 pub mod web;
+pub mod worktree;
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -114,6 +115,10 @@ pub struct ToolContext {
     /// once it reaches [`SUBAGENT_DEPTH_CAP`], bounding agent-invokes-agent
     /// recursion the same way [`SKILL_DEPTH_CAP`] bounds skills.
     pub subagent_depth: usize,
+    /// The worktree this session has moved into, if any. In-memory only: a
+    /// resumed session always starts where it was launched, never inside a
+    /// worktree a previous run happened to enter.
+    pub worktree: Option<crate::worktree::WorktreeSession>,
     /// True while a read-only plan-mode gate is active (issue #50). Mutating
     /// tools refuse until `ExitPlanMode` clears it.
     pub plan_mode: bool,
@@ -157,7 +162,7 @@ pub const SUBAGENT_DEPTH_CAP: usize = 1;
 /// active (issue #50). Read-only tools stay available so the model can research
 /// before proposing a plan. `bash` is included because it can run arbitrary
 /// side-effecting commands.
-const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &["write", "edit", "bash"];
+const PLAN_MODE_BLOCKED_TOOLS: &[&str] = &["write", "edit", "bash", "EnterWorktree"];
 
 /// True when `name` is a workspace-mutating tool blocked under plan mode.
 #[must_use]
@@ -200,6 +205,7 @@ impl ToolContext {
             skills: Vec::new(),
             skill_invocations: 0,
             subagent_depth: 0,
+            worktree: None,
             plan_mode: false,
             hook_stop: None,
             tasks: crate::tasks::TaskList::new(),
@@ -293,6 +299,8 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         ));
     }
     let output = match call.name.as_str() {
+        "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
+        "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
         "EnterPlanMode" => tool_enter_plan_mode(ctx),
         "ExitPlanMode" => tool_exit_plan_mode(ctx, call),
         "read" => files::tool_read(ctx, call),

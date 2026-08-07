@@ -302,6 +302,35 @@ fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
             "required": ["plan"]
         }),
     });
+    push_worktree_specs(specs);
+}
+
+/// Pushes the provider-path specs for the worktree tools. Mirrors the text-path
+/// schemas in [`append_worktree_schemas`].
+fn push_worktree_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
+    specs.push(crate::engine::ToolSpec {
+        name: "EnterWorktree".to_string(),
+        description: "Move into an isolated git worktree: a separate checkout of this repository, on its own branch, where your edits cannot affect the main working copy. Every tool's working directory switches into it until you call ExitWorktree. Use this ONLY when the user explicitly asks for a worktree or for isolation from their current checkout. Do NOT use it for ordinary branch or feature work — run git through bash for that. 'name' is the worktree name; letters, digits, '.', '_', '-' and '/' only.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "name for the worktree, e.g. 'refactor-parser'"}
+            },
+            "required": ["name"]
+        }),
+    });
+    specs.push(crate::engine::ToolSpec {
+        name: "ExitWorktree".to_string(),
+        description: "Leave the worktree entered with EnterWorktree and return to the original working directory. action 'keep' leaves the worktree and its branch on disk so the user can review, merge, or resume the work; action 'remove' deletes both. A remove is refused when the worktree holds uncommitted files or commits that are not on the base branch, unless you also pass discard_changes true — so prefer 'keep' whenever there is work worth saving.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "'keep' to leave the worktree in place, 'remove' to delete it"},
+                "discard_changes": {"type": "string", "description": "true to remove the worktree even though it holds work that would be lost"}
+            },
+            "required": ["action"]
+        }),
+    });
 }
 
 /// Parses the built-in OpenAI-shaped tool schemas out of the DS4 tools prompt
@@ -595,6 +624,48 @@ fn append_agent_and_plan_schemas(out: &mut String) {
          \x20       \"plan\": {\"type\": \"string\", \"description\": \"the full plan to carry out, for the user to approve\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"plan\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+    append_worktree_schemas(out);
+}
+
+/// Appends the `EnterWorktree` / `ExitWorktree` schemas.
+///
+/// The descriptions are deliberately restrictive. A worktree is a whole second
+/// checkout, and a model that reaches for one whenever it sees the word
+/// "branch" would strand the user's work in a directory they never asked for —
+/// so the tool is scoped to an explicit request, and ordinary branch work is
+/// pointed back at `bash` and git.
+fn append_worktree_schemas(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"EnterWorktree\",\n\
+         \x20   \"description\": \"Move into an isolated git worktree: a separate checkout of this repository, on its own branch, where your edits cannot affect the main working copy. Every tool's working directory switches into it until you call ExitWorktree. Use this ONLY when the user explicitly asks for a worktree or for isolation from their current checkout. Do NOT use it for ordinary branch or feature work — run git through bash for that. 'name' is the worktree name; letters, digits, '.', '_', '-' and '/' only.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"name\": {\"type\": \"string\", \"description\": \"name for the worktree, e.g. 'refactor-parser'\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"name\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n\
+         {\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"ExitWorktree\",\n\
+         \x20   \"description\": \"Leave the worktree entered with EnterWorktree and return to the original working directory. action 'keep' leaves the worktree and its branch on disk so the user can review, merge, or resume the work; action 'remove' deletes both. A remove is refused when the worktree holds uncommitted files or commits that are not on the base branch, unless you also pass discard_changes true — so prefer 'keep' whenever there is work worth saving.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"action\": {\"type\": \"string\", \"description\": \"'keep' to leave the worktree in place, 'remove' to delete it\"},\n\
+         \x20       \"discard_changes\": {\"type\": \"string\", \"description\": \"true to remove the worktree even though it holds work that would be lost\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"action\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",

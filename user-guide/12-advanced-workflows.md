@@ -79,6 +79,8 @@ The single biggest cause of a session going vague is a research detour eating th
 
 The subagent does the reading in its own scoped context and only its **final report** enters your transcript. Twenty file reads become one paragraph. The model does the same thing on its own with the `agent` tool when it recognises a bounded chore.
 
+If you fan several subagents out over work that touches the same files, give them worktrees — `isolation: worktree` in the definition, or `worktree.isolateAgents` for all of them. Otherwise two agents editing one file is a race, and the loser's work is simply gone. A subagent that leaves changes in its worktree keeps it, and reports the path back so you can merge.
+
 ### Ask sideways with `/btw`
 
 ```
@@ -127,6 +129,25 @@ For anything risky or ambiguous, ask for a plan first:
 > plan this out before you touch anything
 
 The model enters read-only plan mode, where every mutating tool is refused until it proposes a plan and you approve it. Rejecting the plan keeps the gate on, so you can iterate on the approach with no risk of an edit landing mid-discussion.
+
+### Isolate the edit instead of holding it back
+
+Plan mode stops the model from editing. A worktree lets it edit *somewhere else*. When the change is large or speculative and you would rather see it finished than approve it up front, ask for a worktree:
+
+> in a worktree called big-refactor, split this module in two and make the tests pass
+
+The model works in a second checkout on its own branch, under `.plank/worktrees/big-refactor`. Your files never move, so you can keep reading, editing, and running things in the main tree while it goes. When it finishes it leaves the worktree in place and tells you where: review the branch, merge it, or delete it, the same as any other branch.
+
+The safety property worth knowing is what happens on the way out. If the model tries to delete a worktree that still holds uncommitted files or commits that exist nowhere else, plank refuses and names what would be lost. It refuses too when it cannot check — a git failure is not evidence that there was nothing there. Work has to be discarded on purpose, never by accident.
+
+For a whole session rather than one task, start in the worktree:
+
+```sh
+plank --worktree big-refactor
+plank --worktree-pr 412
+```
+
+This is the form to reach for when you want two plank sessions on the same repository at once. Give each its own worktree and they cannot overwrite each other, which the same checkout shared between them absolutely can.
 
 ### Phrasings that hold the model back
 

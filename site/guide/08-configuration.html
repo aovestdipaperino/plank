@@ -149,7 +149,10 @@ need not exist, and any subset of keys works.</p>
   &quot;safety&quot;: { &quot;sandbox&quot;: true, &quot;btwSuspend&quot;: true },
   &quot;mcp&quot;:    { &quot;timeoutSecs&quot;: 30 },
   &quot;ask&quot;:    { &quot;maxOptions&quot;: 7 },
-  &quot;update&quot;: { &quot;check&quot;: true }
+  &quot;update&quot;: { &quot;check&quot;: true },
+  &quot;agents&quot;: { &quot;autoRoute&quot;: true, &quot;maxParallel&quot;: 4 },
+  &quot;worktree&quot;: { &quot;sparsePaths&quot;: [&quot;src&quot;, &quot;docs&quot;],
+                &quot;symlinkDirectories&quot;: [&quot;target&quot;], &quot;isolateAgents&quot;: false }
 }</code></pre>
 <p>Edit it in-session with <code>/config</code> (an interactive form) or
 one key at a time:</p>
@@ -312,8 +315,8 @@ see.</p>
 </tr>
 </tbody>
 </table>
-<h3 id="mcp-ask-update"><code>mcp</code>, <code>ask</code>,
-<code>update</code></h3>
+<h3 id="mcp-ask-update-agents"><code>mcp</code>, <code>ask</code>,
+<code>update</code>, <code>agents</code></h3>
 <table>
 <thead>
 <tr>
@@ -341,6 +344,50 @@ dropped along with all its tools.</td>
 <td><code>true</code></td>
 <td>check GitHub Releases at startup for a newer version</td>
 </tr>
+<tr>
+<td><code>agents.autoRoute</code></td>
+<td><code>true</code></td>
+<td>let the model pick a subagent definition on its own</td>
+</tr>
+<tr>
+<td><code>agents.maxParallel</code></td>
+<td>4</td>
+<td>how many subagents may run at once (capped at 16)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="worktree"><code>worktree</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>sparsePaths</code></td>
+<td><code>[]</code> (everything)</td>
+<td>cone-mode sparse-checkout paths for a new worktree. Worth setting
+for a repository large enough that a second full checkout is
+painful.</td>
+</tr>
+<tr>
+<td><code>symlinkDirectories</code></td>
+<td><code>[]</code></td>
+<td>directories linked from the main checkout instead of duplicated,
+e.g. <code>target</code> or <code>node_modules</code>. A name that could
+climb out of the worktree is ignored.</td>
+</tr>
+<tr>
+<td><code>isolateAgents</code></td>
+<td><code>false</code></td>
+<td>give every subagent its own throwaway worktree. Off because a
+checkout per agent costs disk and time, and the work then has to be
+merged back; turn it on per-definition with
+<code>isolation: worktree</code> instead if only some need it.</td>
+</tr>
 </tbody>
 </table>
 <h3 id="two-things-the-file-deliberately-will-not-do">Two things the
@@ -352,9 +399,9 @@ there is no API-key setting. Keep keys on <code>--api-key</code> or the
 provider's environment variable.</li>
 <li><strong>No per-run choices.</strong> <code>--prompt</code>,
 <code>--non-interactive</code>, <code>--ui-remote</code>,
-<code>--trace</code>, <code>--chdir</code>, <code>--seed</code>, and the
-serve/control options describe one invocation, not a preference, so they
-have no settings key.</li>
+<code>--trace</code>, <code>--chdir</code>, <code>--seed</code>,
+<code>--worktree</code>, and the serve/control options describe one
+invocation, not a preference, so they have no settings key.</li>
 </ul>
 <h3 id="when-it-goes-wrong">When it goes wrong</h3>
 <p>A broken settings file never stops plank from starting. Malformed
@@ -475,6 +522,15 @@ likely to want:</p>
 <tr>
 <td><code>--chdir PATH</code></td>
 <td>change working directory before starting</td>
+</tr>
+<tr>
+<td><code>--worktree NAME</code></td>
+<td>start inside an isolated git worktree of this repository</td>
+</tr>
+<tr>
+<td><code>--worktree-pr N</code></td>
+<td>base that worktree on pull request N (implies
+<code>--worktree</code>)</td>
 </tr>
 <tr>
 <td><code>--trace PATH</code></td>

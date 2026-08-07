@@ -1190,6 +1190,8 @@ struct Agent<'a> {
     /// Named agent definitions loaded from ~/.plank/agents overlaid by
     /// ./.plank/agents; dispatched via `/subagent <name> <task>`.
     agents: Vec<crate::agents::AgentDef>,
+    /// Per-process counter naming each isolated sub-agent's throwaway worktree.
+    isolation_seq: u32,
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
@@ -1478,6 +1480,20 @@ const HISTORY_MAX_TURNS: usize = 200;
 /// itself undoable via `/rollback pre-rollback`.
 const PRE_ROLLBACK_CHECKPOINT: &str = "pre-rollback";
 
+/// A sub-agent's throwaway worktree, and what it displaced.
+///
+/// Held only for the duration of one `agent` call: created before the fork,
+/// unwound after it, never persisted.
+struct AgentIsolation {
+    /// The live worktree session, for the removal that may follow.
+    session: crate::worktree::WorktreeSession,
+    /// The worktree's directory, kept separately so the message written after
+    /// `session` is consumed can still name it.
+    path: std::path::PathBuf,
+    /// The parent's working directory, restored when the sub-agent finishes.
+    outer_cwd: std::path::PathBuf,
+}
+
 impl Agent<'_> {
     /// Builds owned structured-turn buffers for a provider engine (§4.4). The
     /// provider gets a machine-readable tool registry and its own system prompt
@@ -1747,6 +1763,25 @@ impl Agent<'_> {
             Ok(alt) => alt,
             Err(e) => return format!("Tool error: agent '{name}' engine unavailable: {e}\n"),
         };
+        // `isolation: worktree` gives this sub-agent its own checkout, so a
+        // fan-out of agents editing the same files cannot overwrite each other.
+        // Set up before the fork: a failure here must leave the transcript
+        // untouched, exactly like the engine resolution above.
+        let isolation = if matched.as_ref().is_some_and(|d| d.isolate) {
+            match self.begin_agent_isolation() {
+                Ok(iso) => iso,
+                Err(e) => return format!("Tool error: agent '{name}' worktree unavailable: {e}\n"),
+            }
+        } else {
+            None
+        };
+        let instructions = match &isolation {
+            Some(iso) => Some(crate::agents::worktree_notice(
+                instructions.as_deref(),
+                &iso.path,
+            )),
+            None => instructions,
+        };
         if let Some(note) = self.take_warm_note() {
             self.emit_sub(crate::worker::UiEvent::Dim(note));
         }
@@ -1769,6 +1804,7 @@ impl Agent<'_> {
             Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_subagent_loop),
         };
         self.tool_ctx.subagent_depth -= 1;
+        let isolation_note = self.end_agent_isolation(isolation);
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
         let report = last_assistant_text(&self.session.transcript[fork_at..]);
@@ -1780,12 +1816,61 @@ impl Agent<'_> {
                 // The note leads, so the model reads why its chosen persona did
                 // not apply before it reads the report it produced anyway.
                 Some(r) => format!(
-                    "{}Sub-agent report:\n{r}\n",
-                    fallback_note.unwrap_or_default()
+                    "{}Sub-agent report:\n{r}\n{}",
+                    fallback_note.unwrap_or_default(),
+                    isolation_note.unwrap_or_default()
                 ),
                 None => "Tool error: sub-agent produced no report\n".to_string(),
             },
         }
+    }
+
+    /// Creates the throwaway worktree for an `isolation: worktree` sub-agent
+    /// and points the tool context at it, returning what is needed to undo
+    /// both. `Ok(None)` means the parent is not in a git repository at all,
+    /// which is not an error — there is simply nothing to isolate from.
+    ///
+    /// # Errors
+    /// Returns a message when the worktree could not be created.
+    fn begin_agent_isolation(&mut self) -> Result<Option<AgentIsolation>, String> {
+        if crate::worktree::canonical_git_root(&self.tool_ctx.cwd).is_none() {
+            return Ok(None);
+        }
+        // Unique per run within this process, which is all the slug has to be:
+        // a leaked worktree from a *previous* process is the stale sweep's job,
+        // and it recognizes any name of this shape.
+        let id = self.isolation_seq;
+        self.isolation_seq += 1;
+        let slug = crate::worktree::agent_slug(u64::from(std::process::id()) << 8 | u64::from(id));
+        let session = crate::worktree::create_agent_worktree(&self.tool_ctx.cwd, &slug)?;
+        let outer_cwd = std::mem::replace(&mut self.tool_ctx.cwd, session.path.clone());
+        Ok(Some(AgentIsolation {
+            path: session.path.clone(),
+            session,
+            outer_cwd,
+        }))
+    }
+
+    /// Restores the parent's working directory after an isolated sub-agent and
+    /// disposes of its worktree.
+    ///
+    /// A clean worktree is removed; one holding edits or commits is **kept**,
+    /// and its path is reported back to the model. Deleting it would silently
+    /// throw away the very work the sub-agent was asked to do, so the choice is
+    /// always to leave it for the parent to inspect and merge.
+    fn end_agent_isolation(&mut self, isolation: Option<AgentIsolation>) -> Option<String> {
+        let iso = isolation?;
+        self.tool_ctx.cwd = iso.outer_cwd;
+        if !crate::worktree::has_changes(&iso.path, iso.session.original_head.as_deref()) {
+            let _ = crate::worktree::cleanup(&iso.session, &self.tool_ctx.hooks);
+            return None;
+        }
+        Some(format!(
+            "The sub-agent worked in an isolated worktree and left changes there: {}. They are \
+             not in your working copy — review and merge them from that directory if you want \
+             them.\n",
+            iso.path.display()
+        ))
     }
 
     /// Headless generate→dispatch loop for a sub-agent sidechain (issue #50):
@@ -5591,7 +5676,7 @@ impl Agent<'_> {
                         match crate::settings::project_path() {
                             Some(path) => match settings.save_to(&path) {
                                 Ok(()) => {
-                                    crate::settings::reinstall(settings);
+                                    crate::settings::reinstall(*settings);
                                     log.push_plain(format!("config saved to {}", path.display()));
                                 }
                                 Err(e) => log.push_plain(format!("config save failed: {e}")),
@@ -8575,6 +8660,10 @@ fn new_agent(
     // `save_for_exit`.)
     session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
+    // `--worktree` already created the worktree and moved the process into it,
+    // so `cwd` above is the worktree; adopting the session it left behind is
+    // what lets `ExitWorktree` find its way back out.
+    tool_ctx.worktree = crate::worktree::take_startup_session();
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
     tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
@@ -8671,6 +8760,7 @@ fn new_agent(
         skills,
         templates,
         agents,
+        isolation_seq: 0,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
         remote: None,
         remote_server: None,
@@ -9737,6 +9827,7 @@ mod tests {
             store: SessionStore::open(dir).unwrap(),
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -11917,6 +12008,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: "system prompt".to_string(),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -11976,6 +12068,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: String::new(),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12412,6 +12505,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12590,6 +12684,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12673,6 +12768,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12743,6 +12839,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12836,6 +12933,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -12930,6 +13028,7 @@ mod tests {
             path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
             engine: None,
             auto,
+            isolate: false,
         }
     }
 
@@ -12982,6 +13081,7 @@ mod tests {
                 },
             )),
             auto: true,
+            isolate: false,
         }
     }
 
@@ -13996,6 +14096,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -14083,6 +14184,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -14229,6 +14331,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
@@ -14297,6 +14400,7 @@ mod tests {
             store,
             pending_aside: None,
             tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
+            isolation_seq: 0,
             system: crate::sysprompt::build_system_prompt("", &[], true),
             reminder: SystemPromptReminder::new(),
             power_percent: 0,

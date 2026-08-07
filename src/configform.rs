@@ -534,8 +534,9 @@ pub enum Outcome {
     Stay,
     /// Close without saving.
     Cancel,
-    /// Close and persist these settings.
-    Save(Settings),
+    /// Close and persist these settings. Boxed because the payload dwarfs the
+    /// other variants, which would otherwise pay for it on every key press.
+    Save(Box<Settings>),
 }
 
 /// Interactive editor state over a working copy of [`Settings`].
@@ -584,7 +585,7 @@ impl ConfigForm {
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Cancel,
             KeyCode::Char('q' | 'Q') => return Outcome::Cancel,
-            KeyCode::Esc => return Outcome::Save(self.working.clone()),
+            KeyCode::Esc => return Outcome::Save(Box::new(self.working.clone())),
             KeyCode::Up => {
                 self.status = None;
                 self.cursor = self.cursor.checked_sub(1).unwrap_or(FIELDS.len() - 1);

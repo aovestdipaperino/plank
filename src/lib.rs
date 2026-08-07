@@ -83,3 +83,4 @@ pub mod upgrade;
 pub mod viz;
 pub mod warp;
 pub mod worker;
+pub mod worktree;

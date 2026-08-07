@@ -87,6 +87,7 @@ plank tracks `ds4_agent` for the core agent loop but moves faster on the user-fa
 - **Git-style diff cards** — an `edit` (or an overwriting `write`) renders as a change card with an `Update(path)` header, an added/removed summary, and red/green `@@` hunks; a brand-new file streams its content dimmed as it is written.
 - **`agent` sub-agent tool** — the model delegates a bounded task to a fresh scoped sub-agent and gets back only its conclusion, keeping the main transcript clean; bounded so a sub-agent can't itself delegate.
 - **Cross-engine sub-agents** — a definition in `~/.plank/agents/*.md` (or `./.plank/agents`) can name the engine its sidechain runs on: `provider:` plus `model:` for a hosted model, or `provider: local` for the local one. A local sub-agent under a remote main agent works — plank loads the local model alongside the provider when a definition asks for it. Only the *name* of the API-key variable lives in the file, never the key, so definitions stay committable. The roster the model sees rides in the session context rather than the system prompt, so editing a definition rebuilds a small project-tier KV cache instead of invalidating the fingerprinted 1M-token prefix.
+- **Git worktrees** — `EnterWorktree`/`ExitWorktree` move the session into an isolated second checkout (`.plank/worktrees/<name>`, on branch `worktree-<name>`), so a large or speculative change never touches the tree you're working in; `--worktree NAME` / `--worktree-pr N` start a whole session in one, and `isolation: worktree` gives each sub-agent its own so a fan-out can't overwrite itself. Removal is fail-closed: a worktree holding uncommitted files or unpushed commits is not deleted without an explicit discard, and neither is one whose state git couldn't be asked about. `WorktreeCreate`/`WorktreeRemove` hooks replace git entirely for a non-git VCS.
 - **Plan mode** — `EnterPlanMode` holds the model read-only (research only) until it proposes a plan you approve with `ExitPlanMode`, before any edits land.
 - **`@` file completion, `glob`, and a model-visible task list** that survives compaction.
 - **Extensible** — skills (user- *and* model-invoked), named subagents, an expanded hook system, MCP tools and resources, and a `settings.json` for durable preferences.
@@ -137,7 +138,10 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
               "showThinking": true, "notifications": "always", "notifyAfterSecs": 10 },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
-  "ask":    { "maxOptions": 7 }
+  "ask":    { "maxOptions": 7 },
+  "agents": { "autoRoute": true, "maxParallel": 4 },
+  "worktree": { "sparsePaths": ["src", "docs"],
+                "symlinkDirectories": ["target"], "isolateAgents": false }
 }
 ```
 
@@ -165,6 +169,11 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `btwSuspend` | `true` | Default for `/btw` mid-generation suspend. Same as `--btw-suspend`/`--disable-btw-suspend`. |
 | `mcp` | `timeoutSecs` | 30 | How long an MCP server has to answer before it's considered dead. Raise it for a slow-starting server, since a server that misses the deadline is dropped along with all of its tools. |
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
+| `agents` | `autoRoute` | `true` | Whether the model may select a sub-agent definition on its own initiative. |
+| | `maxParallel` | 4 | How many sub-agents may run concurrently (clamped to 16). |
+| `worktree` | `sparsePaths` | `[]` | Cone-mode sparse-checkout paths for a new worktree. Empty checks out everything; set it when a second full checkout of the repo is painful. |
+| | `symlinkDirectories` | `[]` | Directories symlinked from the main checkout rather than duplicated, e.g. `target` or `node_modules`. A name that could climb out of the worktree is ignored. |
+| | `isolateAgents` | `false` | Give every sub-agent its own throwaway worktree. Off because a checkout per agent costs disk and time and the work must then be merged back; use `isolation: worktree` on the definitions that need it instead. |
 
 Precedence runs left to right, each layer overriding the one before:
 
@@ -183,7 +192,7 @@ It lists only settings actually in effect: a value a command-line flag overrode 
 Two things the file deliberately does **not** do:
 
 - **It holds no secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting — keep it on `--api-key` or the provider's environment variable.
-- **It holds no per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and `serve` describe one invocation rather than a preference, so they have no settings key.
+- **It holds no per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and `serve` describe one invocation rather than a preference, so they have no settings key.
 
 A broken settings file never stops plank from starting: malformed JSON, a wrongly-typed value, an unknown key, or an unrecognised backend name each fall back to that key's default. (The same unrecognised name passed to `--backend` is still an error — a flag is an explicit instruction, a config file is a preference.) One limitation: settings are read from the directory plank launches in, so project-scoped settings do not follow `--chdir`.
 
@@ -313,6 +322,7 @@ Each module in `src/` maps to one functional section of the original `ds4_agent.
 - `engine.rs` / `ds4engine.rs` / `ffi.rs` — inference engine abstraction and native ds4 bindings
 - `session.rs`, `compact.rs`, `sysprompt.rs` — conversation state, compaction, system prompt
 - `tools/` — built-in agent tools (bash, edit, files, web) and the MCP client
+- `worktree.rs`, `tools/worktree.rs` — git-worktree isolation and the `EnterWorktree`/`ExitWorktree` tools
 - `ui.rs`, `render.rs`, `statusbar.rs`, `editor.rs`, `viz.rs` — terminal UI
 - `arcade.rs`, `arcade/` — the six easter-egg games (see above)
 - `config.rs`, `settings.rs`, `trace.rs`, `interrupt.rs`, `status.rs` — configuration, persistent settings, tracing, signal handling

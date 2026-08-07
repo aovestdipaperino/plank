@@ -171,6 +171,40 @@ uncorrupted.
 search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`).
 Output framing matches the C byte-for-byte.
 
+### Worktree isolation (`worktree.rs`, `tools/worktree.rs`)
+
+An isolated second checkout of the repository, under
+`<mainRepoRoot>/.plank/worktrees/<slug>` on branch `worktree-<slug>`, so a
+session's edits cannot collide with the main working copy or with another
+session. `worktree.rs` owns the mechanics (slug validation, git plumbing,
+create/resume/remove, change accounting, the stale sweep);
+`tools/worktree.rs` is the model-facing `EnterWorktree` / `ExitWorktree` pair.
+
+Three entry points, all sharing that core:
+
+- **`EnterWorktree` / `ExitWorktree`** — the model moves the session in and
+  out mid-turn. The session lives on `ToolContext::worktree`, and switching
+  `ToolContext::cwd` is what actually isolates every other tool. Exit takes
+  `keep` (leave it on disk) or `remove`; a `remove` that would destroy
+  uncommitted files or commits is refused unless `discard_changes` is passed.
+- **`--worktree NAME` / `--worktree-pr N`** — `main.rs` creates the worktree
+  and `chdir`s into it *before* the agent is built, so the worktree becomes the
+  session's project: its hooks, agent definitions, and settings are the ones
+  found there. The session is parked in `worktree::set_startup_session` and
+  adopted by `new_agent`, so `ExitWorktree` can still leave it.
+- **`isolation: worktree` sub-agents** — an agent definition (or the
+  `worktree.isolateAgents` setting) gives each sub-agent run a throwaway
+  worktree named `agent-a<7 hex>`, so a fan-out cannot overwrite itself. A
+  clean one is removed when the run ends; one holding work is kept and its path
+  reported back to the parent.
+
+`WorktreeCreate` / `WorktreeRemove` hooks replace the git backend entirely when
+configured, for non-git VCS. Everything destructive is fail-closed:
+`count_changes` returns `None` for unverifiable state and callers must read that
+as "there is work here", and the stale sweep only ever considers directory names
+of the exact ephemeral shape plank itself generates. Worktree state is
+in-memory only — a resumed session always starts where it was launched.
+
 ### Sessions & context (`session.rs`, `compact.rs`, `sysprompt.rs`)
 
 See `docs/SYSTEM-PROMPT.md` for the full story of how the system prompt is
@@ -300,8 +334,9 @@ built-in defaults < ~/.plank/settings.json < ./.plank/settings.json < env < CLI 
 ```
 
 The file holds only *stable preferences*, never per-run choices — `--prompt`,
-`--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and the
-serve/control options deliberately have no key. Six groups:
+`--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`,
+`--worktree`, and the serve/control options deliberately have no key. Seven
+groups:
 
 | Group | Keys | Replaces |
 |---|---|---|
@@ -310,6 +345,8 @@ serve/control options deliberately have no key. Six groups:
 | `safety` | `sandbox`, `btwSuspend` | the defaults behind `--sandbox`/`--no-sandbox` and `--btw-suspend`/`--disable-btw-suspend` |
 | `mcp` | `timeoutSecs` | `MCP_TIMEOUT_SEC` in `tools/mcp.rs` |
 | `ask` | `maxOptions` | the `ask` tool's option cap |
+| `agents` | `autoRoute`, `maxParallel` | the `agent` tool's routing and fan-out bounds |
+| `worktree` | `sparsePaths`, `symlinkDirectories`, `isolateAgents` | full-checkout worktrees, and per-sub-agent isolation being off |
 
 Editing: `/config` opens an interactive modal (`configform.rs`) in the TUI, or
 `/config <section>.<key> <value>` sets one from the prompt (e.g. `/config

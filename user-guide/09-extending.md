@@ -79,6 +79,20 @@ The model can delegate on its own with the `agent` tool. Delegation is bounded a
 
 When the subagent reports back, plank runs a turn on that report: delegated work comes back into the conversation and gets acted on, rather than sitting in the transcript until you type again.
 
+### Giving a subagent its own worktree
+
+Add `isolation: worktree` to a definition's frontmatter and each run of that subagent gets its own throwaway checkout, so several agents working at once cannot overwrite each other's edits:
+
+```markdown
+---
+name: refactorer
+description: Restructures code without touching the main checkout
+isolation: worktree
+---
+```
+
+The subagent is told where it is and to translate inherited paths accordingly. When it finishes, a worktree it left clean is removed; one holding changes is **kept**, and its path is reported back so you can review and merge it. Setting `worktree.isolateAgents` to `true` in `settings.json` turns this on for every subagent instead of one at a time. It is off by default: a checkout per agent is not free, and the work then has to be merged back.
+
 ### Running a subagent on a different engine
 
 A definition can name its own engine, and then its sidechain runs there instead of on whatever the main agent uses:
@@ -124,6 +138,7 @@ Hooks run your shell commands (or inject static prompts) at lifecycle points. Co
 | `SessionStart` | session begins (`startup`/`resume`/`clear`/`compact`) | may inject context |
 | `SessionEnd` | session ends (with a reason) | — |
 | `PreCompact` / `PostCompact` | around a compaction pass | may inject context; both carry `trigger` (`manual` for `/compact`, `auto` for a threshold pass) and `PostCompact` carries the summary. `PostCompact` does not fire for a pass that was interrupted or produced no summary, since no compaction happened |
+| `WorktreeCreate` / `WorktreeRemove` | plank needs a worktree made or destroyed | (see below) |
 
 ### The protocol
 
@@ -139,6 +154,8 @@ Hook input is a JSON object piped to the command's stdin. Beyond exit codes, a c
 Any other nonzero exit shows stderr to **you** only, not the model.
 
 Matchers alternate on tool name and can match arguments: `bash|edit`, `bash(git *)`, `write(*.md)`. An empty or missing matcher matches every tool. Unknown event names load with a warning rather than failing.
+
+The worktree events are different in kind from the rest: configuring `WorktreeCreate` **replaces** git as plank's worktree backend rather than adding to it, which is how a non-git VCS can be driven. The hook is given the requested name and must print the resulting directory on stdout; `WorktreeRemove` is given a path to destroy. If you configure the first without the second, plank will refuse to remove what it cannot remove rather than guessing.
 
 A hook can also be `{"type": "prompt", "prompt": "…"}` — static text injected to the model instead of a command to run.
 

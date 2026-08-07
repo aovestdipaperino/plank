@@ -76,6 +76,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // `--worktree` runs before anything reads the working directory, because
+    // the whole session — its hooks, agent definitions, and every tool's cwd —
+    // is meant to live inside the worktree rather than the original checkout.
+    if let Err(e) = enter_startup_worktree(&cfg, &settings) {
+        eprintln!("plank: {e}");
+        return ExitCode::FAILURE;
+    }
+
     // First launch after an upgrade: the KV caches self-validate and survive,
     // but a major version change drops the image cache (see upgrade.rs).
     if let Some(home) = std::env::var_os("HOME").filter(|h| !h.is_empty()) {
@@ -108,6 +116,53 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Honors `--worktree` / `--worktree-pr`: creates (or resumes) the named
+/// worktree and moves the process into it, parking the session for the agent.
+///
+/// Also sweeps worktrees abandoned by an earlier plank that was killed before
+/// it could clean up — done here, once, rather than on a timer, because the
+/// sweep shells out to git for every candidate and nothing about it is urgent.
+///
+/// # Errors
+/// Returns a message when the worktree cannot be created or entered. A failure
+/// here is fatal: silently continuing in the original checkout would be exactly
+/// the collision `--worktree` was asked to prevent.
+fn enter_startup_worktree(
+    cfg: &AgentConfig,
+    settings: &plank::settings::Settings,
+) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
+    if let Some(root) = plank::worktree::canonical_git_root(&cwd) {
+        let removed =
+            plank::worktree::cleanup_stale_worktrees(&root, plank::worktree::STALE_AFTER, None);
+        if removed > 0 {
+            eprintln!("plank: removed {removed} abandoned sub-agent worktree(s)");
+        }
+    }
+    // `--worktree-pr` on its own is meaningful: name the worktree after the PR.
+    let name = match (&cfg.worktree, cfg.worktree_pr) {
+        (Some(name), _) => name.clone(),
+        (None, Some(pr)) => format!("pr-{pr}"),
+        (None, None) => return Ok(()),
+    };
+    let opts = plank::worktree::CreateOptions {
+        pr_number: cfg.worktree_pr,
+        sparse_paths: settings.worktree.sparse_paths.clone(),
+        symlink_dirs: settings.worktree.symlink_directories.clone(),
+    };
+    let hooks = plank::hooks::load_default(&cwd);
+    let session = plank::worktree::create_for_session(&cwd, &name, &hooks, &opts)
+        .map_err(|e| format!("worktree '{name}': {e}"))?;
+    std::env::set_current_dir(&session.path)
+        .map_err(|e| format!("chdir {}: {e}", session.path.display()))?;
+    eprintln!(
+        "plank: working in worktree '{name}' at {}",
+        session.path.display()
+    );
+    plank::worktree::set_startup_session(session);
+    Ok(())
 }
 
 /// Minimum physical RAM plank requires to run the model, in bytes (96 GiB).

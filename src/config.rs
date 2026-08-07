@@ -40,6 +40,12 @@ pub struct AgentConfig {
     pub trace_path: Option<PathBuf>,
     /// Working directory supplied with `--chdir`.
     pub chdir_path: Option<PathBuf>,
+    /// Worktree name supplied with `--worktree NAME`: the session starts inside
+    /// an isolated checkout of the repository instead of the current one.
+    pub worktree: Option<String>,
+    /// Pull request supplied with `--worktree-pr N`: the worktree is based on
+    /// that PR's head rather than the default branch. Implies `--worktree`.
+    pub worktree_pr: Option<u32>,
     /// MCP server config supplied with `--mcp-config`; `None` = `./.mcp.json`.
     pub mcp_config_path: Option<PathBuf>,
     /// True when `--non-interactive` was given.
@@ -260,6 +266,8 @@ impl Default for AgentConfig {
             system: DEFAULT_SYSTEM_PROMPT.to_owned(),
             trace_path: None,
             chdir_path: None,
+            worktree: None,
+            worktree_pr: None,
             mcp_config_path: None,
             non_interactive: false,
             ui_remote: None,
@@ -418,6 +426,8 @@ Options:
       --think-max          maximum reasoning effort; needs --ctx 393216 or more
       --nothink            disable thinking
       --chdir PATH         change working directory before starting
+      --worktree NAME      start inside an isolated git worktree of this repo
+      --worktree-pr N      base that worktree on pull request N (implies --worktree)
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
       --sandbox            run model bash commands under sandbox-exec
@@ -795,6 +805,13 @@ pub fn parse_options_with(
             "--think-max" => c.generation.think_mode = ThinkMode::Max,
             "--nothink" => c.generation.think_mode = ThinkMode::Off,
             "--chdir" => c.chdir_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--worktree" => c.worktree = Some(need_arg(&mut i)?.to_string()),
+            "--worktree-pr" => {
+                let n: i32 = parse_int(need_arg(&mut i)?, arg)?;
+                let n = u32::try_from(n)
+                    .map_err(|_| format!("{arg} must be a positive pull request number"))?;
+                c.worktree_pr = Some(n);
+            }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),

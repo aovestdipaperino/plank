@@ -350,5 +350,34 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "EnterWorktree",
+    "description": "Move into an isolated git worktree: a separate checkout of this repository, on its own branch, where your edits cannot affect the main working copy. Every tool's working directory switches into it until you call ExitWorktree. Use this ONLY when the user explicitly asks for a worktree or for isolation from their current checkout. Do NOT use it for ordinary branch or feature work — run git through bash for that. 'name' is the worktree name; letters, digits, '.', '_', '-' and '/' only.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "description": "name for the worktree, e.g. 'refactor-parser'"}
+      },
+      "required": ["name"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "ExitWorktree",
+    "description": "Leave the worktree entered with EnterWorktree and return to the original working directory. action 'keep' leaves the worktree and its branch on disk so the user can review, merge, or resume the work; action 'remove' deletes both. A remove is refused when the worktree holds uncommitted files or commits that are not on the base branch, unless you also pass discard_changes true — so prefer 'keep' whenever there is work worth saving.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "action": {"type": "string", "description": "'keep' to leave the worktree in place, 'remove' to delete it"},
+        "discard_changes": {"type": "string", "description": "true to remove the worktree even though it holds work that would be lost"}
+      },
+      "required": ["action"]
+    }
+  }
+}
 [End system prompt reminder.]
 

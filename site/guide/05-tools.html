@@ -282,6 +282,10 @@ a different one, find it online" — and it will go look.</p>
 <td>enter and leave read-only plan mode</td>
 </tr>
 <tr>
+<td><code>EnterWorktree</code> / <code>ExitWorktree</code></td>
+<td>work in an isolated checkout of the repository</td>
+</tr>
+<tr>
 <td><code>mcp_describe</code></td>
 <td>fetch the full schema of a non-primary MCP tool</td>
 </tr>
@@ -329,6 +333,45 @@ which you approve or reject. On approval the gate lifts and it may edit;
 on rejection plan mode stays on and it refines the plan.</p>
 <p>You can also just ask for it: "plan this out before you touch
 anything."</p>
+<h2 id="worktrees">Worktrees</h2>
+<p>A worktree is a second checkout of the same repository, on its own
+branch, in its own directory. Ask for one and the model moves into it:
+every tool's working directory switches, so whatever it edits cannot
+touch the files you have open.</p>
+<pre><code>in a worktree called refactor-parser, try splitting the parser into two modules</code></pre>
+<p>Worktrees live under <code>.plank/worktrees/&lt;name&gt;</code> in
+the repository root, on a branch called
+<code>worktree-&lt;name&gt;</code>. The model only reaches for one when
+you say so — for ordinary branch work it runs git through
+<code>bash</code>, which is what you want.</p>
+<p>When the work is done it leaves, either <strong>keeping</strong> the
+worktree (it stays on disk with its branch, for you to review, merge, or
+come back to) or <strong>removing</strong> it. A removal that would
+destroy uncommitted files or commits that exist nowhere else is refused,
+and the refusal says what would be lost:</p>
+<pre><code>Tool error: worktree &#39;refactor-parser&#39; has unsaved work, so it was not removed.
+  2 commits not present on the base branch
+  1 uncommitted file(s): src/parse.rs</code></pre>
+<p>The model can override that, but it has to do so explicitly. If plank
+cannot verify the state at all — git fails, say — it refuses too, on the
+principle that not knowing is not the same as knowing there is nothing
+there.</p>
+<p>To start a whole session in a worktree instead, pass
+<code>--worktree</code>:</p>
+<pre class="sh"><code>plank --worktree refactor-parser
+plank --worktree-pr 412          # based on pull request #412</code></pre>
+<p>That form goes further than the tool: the worktree becomes the
+session's project, so the hooks, subagent definitions, and project
+settings that apply are the ones found <em>there</em>.</p>
+<p>Two settings tune it, both under <code>worktree</code> in
+<code>settings.json</code>: <code>sparsePaths</code> narrows a new
+worktree to a few directories of a large repository, and
+<code>symlinkDirectories</code> links heavy build directories
+(<code>target</code>, <code>node_modules</code>) from the main checkout
+instead of duplicating them. A <code>.worktreeinclude</code> file in the
+repository root lists gitignored files — a <code>.env</code>, a local
+build config — to copy into each new worktree; only files that are
+<em>both</em> listed there and actually gitignored are copied.</p>
 <h2 id="questions">Questions</h2>
 <p>When a turn is genuinely ambiguous, the model can call
 <code>ask</code> instead of guessing: a multiple-choice question with a

@@ -8,6 +8,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Git worktrees.** `EnterWorktree` / `ExitWorktree` move the session into an
+  isolated second checkout of the repository — `.plank/worktrees/<name>`, on
+  branch `worktree-<name>` — so a large or speculative change never lands in the
+  tree you have open. Entering switches every tool's working directory; leaving
+  takes `keep` (worktree and branch stay, for review or merge) or `remove`.
+  Everything destructive is fail-closed. A `remove` that would take uncommitted
+  files or commits reachable from no other ref is refused, and the refusal names
+  what would be lost; so is a `remove` whose state git could not be asked about,
+  because not knowing is not the same as knowing there is nothing there.
+  `--worktree NAME` and `--worktree-pr N` start a whole session in one, and go
+  further than the tool does: the worktree becomes the session's project, so the
+  hooks, sub-agent definitions, and settings that apply are the ones found there.
+  `isolation: worktree` on a sub-agent definition — or `worktree.isolateAgents`
+  for all of them — gives each run its own throwaway worktree, which is what
+  makes fanning several agents over the same files safe rather than a race; a
+  clean one is removed when the run ends, one holding work is kept and its path
+  reported back so it can be merged. Throwaway worktrees leaked by a killed
+  process are swept at startup, and only ever ones whose names have the exact
+  shape plank itself generates, so a worktree you named is never a candidate.
+  `WorktreeCreate` / `WorktreeRemove` hooks replace the git backend outright, for
+  a VCS that is not git. Tuned by `worktree.sparsePaths` and
+  `worktree.symlinkDirectories`, plus a `.worktreeinclude` file naming gitignored
+  files (a `.env`, a local build config) to carry into each new worktree — copied
+  only when they are both listed there and genuinely ignored.
+
 - **The status bar's brain blinks while the local engine works.** The 🧠 already
   in the think segment pulses for the whole span of a local prefill or
   generation, and sits still otherwise — so which engine is actually running is

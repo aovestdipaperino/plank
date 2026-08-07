@@ -241,6 +241,12 @@ detour eating the context. Hand those to a subagent:</p>
 <strong>final report</strong> enters your transcript. Twenty file reads
 become one paragraph. The model does the same thing on its own with the
 <code>agent</code> tool when it recognises a bounded chore.</p>
+<p>If you fan several subagents out over work that touches the same
+files, give them worktrees — <code>isolation: worktree</code> in the
+definition, or <code>worktree.isolateAgents</code> for all of them.
+Otherwise two agents editing one file is a race, and the loser's work is
+simply gone. A subagent that leaves changes in its worktree keeps it,
+and reports the path back so you can merge.</p>
 <h3 id="ask-sideways-with-btw">Ask sideways with <code>/btw</code></h3>
 <pre><code>/btw what&#39;s the difference between Arc&lt;Mutex&lt;T&gt;&gt; and RwLock again?</code></pre>
 <p>The running generation genuinely suspends, answers in a split panel,
@@ -283,6 +289,35 @@ pay for twice.</p>
 refused until it proposes a plan and you approve it. Rejecting the plan
 keeps the gate on, so you can iterate on the approach with no risk of an
 edit landing mid-discussion.</p>
+<h3 id="isolate-the-edit-instead-of-holding-it-back">Isolate the edit
+instead of holding it back</h3>
+<p>Plan mode stops the model from editing. A worktree lets it edit
+<em>somewhere else</em>. When the change is large or speculative and you
+would rather see it finished than approve it up front, ask for a
+worktree:</p>
+<blockquote>
+<p>in a worktree called big-refactor, split this module in two and make
+the tests pass</p>
+</blockquote>
+<p>The model works in a second checkout on its own branch, under
+<code>.plank/worktrees/big-refactor</code>. Your files never move, so
+you can keep reading, editing, and running things in the main tree while
+it goes. When it finishes it leaves the worktree in place and tells you
+where: review the branch, merge it, or delete it, the same as any other
+branch.</p>
+<p>The safety property worth knowing is what happens on the way out. If
+the model tries to delete a worktree that still holds uncommitted files
+or commits that exist nowhere else, plank refuses and names what would
+be lost. It refuses too when it cannot check — a git failure is not
+evidence that there was nothing there. Work has to be discarded on
+purpose, never by accident.</p>
+<p>For a whole session rather than one task, start in the worktree:</p>
+<pre class="sh"><code>plank --worktree big-refactor
+plank --worktree-pr 412</code></pre>
+<p>This is the form to reach for when you want two plank sessions on the
+same repository at once. Give each its own worktree and they cannot
+overwrite each other, which the same checkout shared between them
+absolutely can.</p>
 <h3 id="phrasings-that-hold-the-model-back">Phrasings that hold the
 model back</h3>
 <p>You do not have to name plan mode to get its effect. These work, and

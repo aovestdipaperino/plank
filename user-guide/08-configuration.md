@@ -27,7 +27,10 @@ Hierarchical like the MCP config: `~/.plank/settings.json` applies everywhere, `
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
-  "update": { "check": true }
+  "update": { "check": true },
+  "agents": { "autoRoute": true, "maxParallel": 4 },
+  "worktree": { "sparsePaths": ["src", "docs"],
+                "symlinkDirectories": ["target"], "isolateAgents": false }
 }
 ```
 
@@ -78,18 +81,28 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `sandbox` | on (macOS) | default for the bash write sandbox. Same as `--sandbox` / `--no-sandbox`. |
 | `btwSuspend` | `true` | default for `/btw` mid-generation suspend |
 
-### `mcp`, `ask`, `update`
+### `mcp`, `ask`, `update`, `agents`
 
 | Key | Default | What |
 |---|---|---|
 | `mcp.timeoutSecs` | 30 | how long an MCP server has to answer before it is considered dead. Raise it for a slow-starting server — one that misses the deadline is dropped along with all its tools. |
 | `ask.maxOptions` | 7 | most options the `ask` tool may offer in one question (minimum is fixed at 2) |
 | `update.check` | `true` | check GitHub Releases at startup for a newer version |
+| `agents.autoRoute` | `true` | let the model pick a subagent definition on its own |
+| `agents.maxParallel` | 4 | how many subagents may run at once (capped at 16) |
+
+### `worktree`
+
+| Key | Default | What |
+|---|---|---|
+| `sparsePaths` | `[]` (everything) | cone-mode sparse-checkout paths for a new worktree. Worth setting for a repository large enough that a second full checkout is painful. |
+| `symlinkDirectories` | `[]` | directories linked from the main checkout instead of duplicated, e.g. `target` or `node_modules`. A name that could climb out of the worktree is ignored. |
+| `isolateAgents` | `false` | give every subagent its own throwaway worktree. Off because a checkout per agent costs disk and time, and the work then has to be merged back; turn it on per-definition with `isolation: worktree` instead if only some need it. |
 
 ### Two things the file deliberately will not do
 
 - **No secrets.** `./.plank/settings.json` sits inside your working tree and is easy to commit by accident, so there is no API-key setting. Keep keys on `--api-key` or the provider's environment variable.
-- **No per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
+- **No per-run choices.** `--prompt`, `--non-interactive`, `--ui-remote`, `--trace`, `--chdir`, `--seed`, `--worktree`, and the serve/control options describe one invocation, not a preference, so they have no settings key.
 
 ### When it goes wrong
 
@@ -135,6 +148,8 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--non-interactive` | disable the interactive UI |
 | `-sys, --system TEXT` | override the system prompt |
 | `--chdir PATH` | change working directory before starting |
+| `--worktree NAME` | start inside an isolated git worktree of this repository |
+| `--worktree-pr N` | base that worktree on pull request N (implies `--worktree`) |
 | `--trace PATH` | append a trace log |
 | `-h, --help [topic]` | help, optionally on one topic |
 

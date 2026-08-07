@@ -17,6 +17,9 @@
 //!   clear|compact) / ends (exit reason); the former may inject context.
 //! - **`PreCompact`** / **`PostCompact`** — around a compaction pass; may inject
 //!   context (the latter carries the resulting summary).
+//! - **`WorktreeCreate`** / **`WorktreeRemove`** — replace git as the worktree
+//!   backend (see [`crate::worktree`]); the former prints the new worktree's
+//!   path on stdout, the latter is handed a path to destroy.
 //!
 //! A hook is a `command` (shell) or a `prompt` (static text injected to the
 //! model). Beyond exit codes, a command hook may print a JSON response envelope
@@ -161,6 +164,8 @@ pub const KNOWN_EVENTS: &[&str] = &[
     "SessionEnd",
     "PreCompact",
     "PostCompact",
+    "WorktreeCreate",
+    "WorktreeRemove",
 ];
 
 /// All configured hooks, by event.
@@ -187,6 +192,11 @@ pub struct Hooks {
     /// Hooks run after a compaction pass (carries the resulting summary); may
     /// inject context.
     pub post_compact: Vec<HookMatcher>,
+    /// Hooks that create a worktree in place of git, printing its path on
+    /// stdout. Configuring any of these replaces the git backend entirely.
+    pub worktree_create: Vec<HookMatcher>,
+    /// Hooks that remove a worktree in place of git, given its path.
+    pub worktree_remove: Vec<HookMatcher>,
     /// Warnings gathered while loading (e.g. unknown event names), surfaced to
     /// the user at startup rather than aborting the load.
     pub warnings: Vec<String>,
@@ -205,6 +215,67 @@ impl Hooks {
             && self.session_end.is_empty()
             && self.pre_compact.is_empty()
             && self.post_compact.is_empty()
+            && self.worktree_create.is_empty()
+            && self.worktree_remove.is_empty()
+    }
+}
+
+/// True when a `WorktreeCreate` hook is configured, meaning the git backend is
+/// replaced rather than supplemented.
+#[must_use]
+pub fn has_worktree_create_hook(hooks: &Hooks) -> bool {
+    !hooks.worktree_create.is_empty()
+}
+
+/// True when a `WorktreeRemove` hook is configured.
+#[must_use]
+pub fn has_worktree_remove_hook(hooks: &Hooks) -> bool {
+    !hooks.worktree_remove.is_empty()
+}
+
+/// Runs the `WorktreeCreate` hooks for `slug` and returns the worktree path the
+/// first successful one printed.
+///
+/// The hook owns the VCS entirely here, so its stdout is the only source of
+/// truth for where the worktree landed; an empty stdout is a failure, not an
+/// empty answer.
+///
+/// # Errors
+/// Returns a message when no hook produced a usable path.
+pub fn run_worktree_create_hook(hooks: &Hooks, slug: &str, cwd: &Path) -> Result<PathBuf, String> {
+    let input = lifecycle_event_input("WorktreeCreate", &[("worktree_name", slug)], cwd);
+    let out = run_event_ctx(&hooks.worktree_create, slug, &input, cwd);
+    if let Some(msg) = out.block {
+        return Err(msg);
+    }
+    let path = out
+        .context
+        .as_deref()
+        .and_then(|c| c.lines().map(str::trim).find(|l| !l.is_empty()))
+        .ok_or_else(|| "WorktreeCreate hook printed no worktree path".to_string())?;
+    Ok(PathBuf::from(path))
+}
+
+/// Runs the `WorktreeRemove` hooks for a worktree path.
+///
+/// # Errors
+/// Returns a message when a hook blocked the removal, or when none are
+/// configured (the caller reached here only because creation was hook-based, so
+/// there is no git fallback to hand the worktree back to).
+pub fn run_worktree_remove_hook(hooks: &Hooks, worktree: &Path, cwd: &Path) -> Result<(), String> {
+    if hooks.worktree_remove.is_empty() {
+        return Err(
+            "this worktree was created by a WorktreeCreate hook, but no WorktreeRemove hook is \
+             configured to remove it"
+                .to_string(),
+        );
+    }
+    let path = worktree.to_string_lossy();
+    let input = lifecycle_event_input("WorktreeRemove", &[("worktree_path", &path)], cwd);
+    let out = run_event(&hooks.worktree_remove, &path, &input, cwd);
+    match out.block {
+        Some(msg) => Err(msg),
+        None => Ok(()),
     }
 }
 
@@ -326,6 +397,8 @@ pub fn parse_config(text: &str) -> Hooks {
         session_end: parse_event(&root, "SessionEnd"),
         pre_compact: parse_event(&root, "PreCompact"),
         post_compact: parse_event(&root, "PostCompact"),
+        worktree_create: parse_event(&root, "WorktreeCreate"),
+        worktree_remove: parse_event(&root, "WorktreeRemove"),
         warnings,
     }
 }
@@ -350,6 +423,8 @@ pub fn load_from(paths: &[PathBuf]) -> Hooks {
         merged.session_end.extend(h.session_end);
         merged.pre_compact.extend(h.pre_compact);
         merged.post_compact.extend(h.post_compact);
+        merged.worktree_create.extend(h.worktree_create);
+        merged.worktree_remove.extend(h.worktree_remove);
         merged.warnings.extend(h.warnings);
     }
     merged
@@ -654,6 +729,8 @@ pub fn render_list(hooks: &Hooks) -> String {
         ("SessionEnd", &hooks.session_end),
         ("PreCompact", &hooks.pre_compact),
         ("PostCompact", &hooks.post_compact),
+        ("WorktreeCreate", &hooks.worktree_create),
+        ("WorktreeRemove", &hooks.worktree_remove),
     ] {
         for g in groups {
             for h in &g.hooks {

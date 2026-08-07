@@ -597,6 +597,7 @@ mod tests {
             path: std::path::PathBuf::from(format!("/tmp/{name}.md")),
             engine: None,
             auto: true,
+            isolate: false,
         };
         crate::settings::install_for_test(crate::settings::Settings::default());
 
@@ -644,6 +645,7 @@ mod tests {
             path: std::path::PathBuf::from("/tmp/m.md"),
             engine: None,
             auto: false,
+            isolate: false,
         };
         crate::settings::install_for_test(crate::settings::Settings::default());
         assert!(

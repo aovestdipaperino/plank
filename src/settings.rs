@@ -261,6 +261,23 @@ pub struct Settings {
     pub update: UpdateSettings,
     /// `agent` tool bounds: model routing and fan-out width.
     pub agents: AgentSettings,
+    /// Git-worktree isolation tuning.
+    pub worktree: WorktreeSettings,
+}
+
+/// `worktree` block: how [`crate::worktree`] builds a new working copy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeSettings {
+    /// Cone-mode sparse-checkout paths. Empty (the default) checks out
+    /// everything; setting it keeps a worktree of a large repo small.
+    pub sparse_paths: Vec<String>,
+    /// Directories symlinked from the main checkout rather than duplicated,
+    /// e.g. `target` or `node_modules`.
+    pub symlink_directories: Vec<String>,
+    /// Give each sub-agent its own throwaway worktree, so parallel agents
+    /// cannot overwrite each other's edits. Off by default: it costs a checkout
+    /// per agent, and the agent's work then has to be merged back.
+    pub isolate_agents: bool,
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -287,6 +304,23 @@ fn boolean(obj: Option<&Json>, key: &str) -> Option<bool> {
         Some(Json::Bool(b)) => Some(*b),
         _ => None,
     }
+}
+
+/// Reads an array-of-strings member, dropping non-string and empty entries so
+/// one malformed element cannot discard the whole list.
+fn strings(obj: Option<&Json>, key: &str) -> Option<Vec<String>> {
+    let Some(Json::Arr(items)) = obj?.get(key) else {
+        return None;
+    };
+    Some(
+        items
+            .iter()
+            .filter_map(|v| match v {
+                Json::Str(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            })
+            .collect(),
+    )
 }
 
 fn string(obj: Option<&Json>, key: &str) -> Option<String> {
@@ -403,12 +437,29 @@ impl Settings {
             self.update.check = v;
         }
 
+        self.overlay_agents_and_worktree(&root);
+    }
+
+    /// The `agents` and `worktree` half of [`overlay`](Self::overlay), split out
+    /// only to keep each function under the length lint.
+    fn overlay_agents_and_worktree(&mut self, root: &Json) {
         let agents = root.get("agents");
         if let Some(v) = boolean(agents, "autoRoute") {
             self.agents.auto_route = v;
         }
         if let Some(v) = num::<usize>(agents, "maxParallel") {
             self.agents.max_parallel = v.clamp(1, AGENT_MAX_PARALLEL);
+        }
+
+        let worktree = root.get("worktree");
+        if let Some(v) = strings(worktree, "sparsePaths") {
+            self.worktree.sparse_paths = v;
+        }
+        if let Some(v) = strings(worktree, "symlinkDirectories") {
+            self.worktree.symlink_directories = v;
+        }
+        if let Some(v) = boolean(worktree, "isolateAgents") {
+            self.worktree.isolate_agents = v;
         }
     }
 

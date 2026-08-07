@@ -39,6 +39,11 @@ pub struct AgentDef {
     /// Whether the model may select this definition on its own initiative.
     /// Defaults true; `auto: false` makes it `/subagent`-only.
     pub auto: bool,
+    /// Run this sub-agent in its own throwaway git worktree
+    /// (`isolation: worktree`), so its edits cannot collide with the parent's.
+    /// Defaults false, and to the `worktree.isolateAgents` setting when the
+    /// frontmatter is silent — a checkout per agent is not free.
+    pub isolate: bool,
 }
 
 /// Engine override for a named definition: what its sidechain runs on instead
@@ -166,7 +171,34 @@ fn load_def(path: &Path) -> Option<AgentDef> {
         path: path.to_path_buf(),
         engine,
         auto: get("auto") != "false",
+        isolate: match get("isolation").as_str() {
+            "worktree" => true,
+            "" => crate::settings::active().worktree.isolate_agents,
+            _ => false,
+        },
     })
+}
+
+/// Prefixes a definition's instructions with a notice that this sub-agent is
+/// running in an isolated worktree.
+///
+/// Without it the sub-agent would keep using absolute paths inherited from the
+/// parent's message — which point at the *main* checkout — and its edits would
+/// land exactly where the isolation was supposed to keep them out of.
+#[must_use]
+pub fn worktree_notice(instructions: Option<&str>, worktree: &std::path::Path) -> String {
+    let notice = format!(
+        "You are running in an isolated git worktree at {}. It is a complete checkout of the \
+         repository on its own branch. Treat it as the project root: any absolute path you were \
+         given refers to the main checkout, so translate it to the matching path under this \
+         worktree before reading or editing. Your changes stay here and do not affect the main \
+         working copy.",
+        worktree.display()
+    );
+    match instructions {
+        Some(text) if !text.trim().is_empty() => format!("{notice}\n\n{text}"),
+        _ => notice,
+    }
 }
 
 /// Loads `<root>/*.md`, sorted by name for stable listings.
@@ -581,6 +613,7 @@ mod tests {
                 api_key_env: key_env.to_string(),
             })),
             auto,
+            isolate: false,
         }
     }
 
@@ -592,6 +625,7 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}.md")),
             engine: None,
             auto,
+            isolate: false,
         }
     }
 
@@ -711,6 +745,7 @@ mod tests {
             path: PathBuf::new(),
             engine: None,
             auto: true,
+            isolate: false,
         }];
         // First token names a definition: rest is the task.
         let (def, task) = resolve(&defs, "reviewer check the diff");
