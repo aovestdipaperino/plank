@@ -619,7 +619,11 @@ pub const TIP_VISIBLE_MS: u64 = 10_000;
 ///
 /// Takes a rotation slot rather than a banner or a startup notice, so it costs
 /// exactly what any other tip costs and can be ignored the same way.
-pub const PROMO_TIP: &str = "10,000,000 free tokens, already claimed — plank-agent.dev/free-tokens";
+///
+/// Spelled with the scheme because terminals that linkify URLs mostly want one:
+/// a bare host reads as prose, `https://` reads as something to click.
+pub const PROMO_TIP: &str =
+    "10,000,000 free tokens, already claimed — https://plank-agent.dev/free-tokens";
 
 /// How often [`PROMO_TIP`] displaces an ordinary tip, counted in rotations.
 ///
