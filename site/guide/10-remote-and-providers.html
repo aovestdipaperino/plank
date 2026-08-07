@@ -196,6 +196,19 @@ Studio.</p>
 a provider gets plank's own prompt with native tool definitions, never
 the byte-parity DeepSeek prompt, which is meant only for the local model
 it was trained on.</p>
+<p><strong>Two hosted models on one key</strong> — a subagent definition
+can point at a different model on the <em>same</em> endpoint with the
+<em>same</em> credential. Only the model line differs from the
+parent:</p>
+<pre class="yaml"><code>provider: openai
+model: qwen3-coder-next                 # the only difference from the parent
+base-url: https://api.regolo.ai/v1
+api-key-env: REGOLO_API_KEY             # the same variable the parent uses</code></pre>
+<p>Since only the variable's name is in the file, the definition is safe
+to commit. To confirm the sidechain really reached the second model,
+check <code>/usage</code>: two model rows against one key rather than a
+single total. Asking the model to name itself is weaker evidence —
+models are unreliable about their own identity, and billing is not.</p>
 <p><strong>Notes</strong> — <code>--provider</code> cannot be combined
 with <code>--remote</code> or the local backend selectors; it
 <em>is</em> the engine for that run. <code>/usage</code> reports billed

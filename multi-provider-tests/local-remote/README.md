@@ -29,17 +29,17 @@ the key from the environment when the sidechain starts.
    shows no engine, because it runs on the parent. Run once with the key unset
    (`env -u REGOLO_API_KEY ./run.sh` will refuse, so unset it *after* starting):
    the line gains `(no REGOLO_API_KEY)` and the model stops being offered that
-   definition, while `/subagent remote-reviewer …` still works and fails clearly.
-2. **`/subagent remote-reviewer what does this directory contain?`** — a
+   definition, while `/subagent:remote-reviewer …` still works and fails clearly.
+2. **`/subagent:remote-reviewer what does this directory contain?`** — a
    `[sub-agent: remote-reviewer — ctrl+o to follow]` line, and Ctrl+O shows text
    that reads like glm5.2 rather than the local model. Only the framed report
    enters the main transcript.
 3. **Tools inside the sidechain** —
-   `/subagent remote-reviewer count the files here by listing the directory`.
+   `/subagent:remote-reviewer count the files here by listing the directory`.
    It must actually call a tool and cite a real number. "I cannot access files"
    means the structured prompt and tool registry are not reaching the provider,
    which is the failure most likely to pass unnoticed.
-4. **`/subagent inherits-parent same question`** — runs on the **local** model,
+4. **`/subagent:inherits-parent same question`** — runs on the **local** model,
    since it has no `provider:`. The contrast with (2) is the point.
 5. **The swap is restored** — after each dispatch the footer's engine-origin
    segment must still show the local engine. A leaked swap would leave the whole

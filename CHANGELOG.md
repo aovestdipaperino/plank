@@ -43,6 +43,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   changes width, and it is driven by a guard held across the pass, so an early
   return or a panic cannot leave it pulsing forever.
 
+- **A third cross-engine sub-agent test: remote main, remote sub-agent, one key.**
+  `multi-provider-tests/remote-remote/` runs the main agent on one hosted model
+  and its sub-agent on another at the *same* endpoint with the *same* credential
+  — the definitions differ only in the model name. That is the case the existing
+  two directions cannot reach: when wire format, base URL, and key are all
+  identical, a bug that collapses the two engines into one (a client cached on
+  the base URL, a key lookup that memoises its first hit, a restore that compares
+  the wrong field) shows up only as the sub-agent quietly answering as the
+  parent's model. It loads no local model, so unlike the other two it starts
+  instantly and runs anywhere. `/usage` reporting one row per model is the check
+  that does not rely on a model's own account of which model it is.
+
 ### Changed
 
 - **Named subagents are dispatched as `/subagent:<name>`, not `/subagent <name>`.**

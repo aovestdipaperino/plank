@@ -37,6 +37,17 @@ plank --provider openai --model llama3.3 \
 
 **What stays the same** — every tool, MCP tools, `@` completion, sessions and `/resume`, `/btw`, compaction. The one difference is the system prompt: a provider gets plank's own prompt with native tool definitions, never the byte-parity DeepSeek prompt, which is meant only for the local model it was trained on.
 
+**Two hosted models on one key** — a subagent definition can point at a different model on the *same* endpoint with the *same* credential. Only the model line differs from the parent:
+
+```yaml
+provider: openai
+model: qwen3-coder-next                 # the only difference from the parent
+base-url: https://api.regolo.ai/v1
+api-key-env: REGOLO_API_KEY             # the same variable the parent uses
+```
+
+Since only the variable's name is in the file, the definition is safe to commit. To confirm the sidechain really reached the second model, check `/usage`: two model rows against one key rather than a single total. Asking the model to name itself is weaker evidence — models are unreliable about their own identity, and billing is not.
+
 **Notes** — `--provider` cannot be combined with `--remote` or the local backend selectors; it *is* the engine for that run. `/usage` reports billed tokens including cache reads, writes, and hit rate. The key is never written to `settings.json`.
 
 ## Serve and connect

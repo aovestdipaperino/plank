@@ -39,17 +39,17 @@ two-key separation case separately.
 
 1. **`/agent`** — `remote-coder` shows `[openai qwen3-coder-next]`, not the
    parent's `glm5.2`; `inherits-parent` shows no engine at all.
-2. **`/subagent remote-coder which function in sample/ can overflow, and on what
+2. **`/subagent:remote-coder which function in sample/ can overflow, and on what
    input?`** — a `[sub-agent: remote-coder — ctrl+o to follow]` line, and Ctrl+O
    showing a sidechain that read the file. `is_prime` in
    `sample/src/main.rs` is the answer, via the `d <= n / d` guard and the
    `large_prime_no_overflow` test that documents the old `d * d <= n`.
 3. **It is really the other model** — ask both definitions the same question and
-   compare. `/subagent remote-coder name your model` and `/subagent
-   inherits-parent name your model` should not agree. Self-reported identity is
+   compare. `/subagent:remote-coder name your model` and
+   `/subagent:inherits-parent name your model` should not agree. Self-reported identity is
    weak evidence on its own, so also check `/usage`: two model rows against one
    key, not one row with the whole total.
-4. **Tools inside the sidechain** — `/subagent remote-coder count the files under
+4. **Tools inside the sidechain** — `/subagent:remote-coder count the files under
    sample/ by listing the directory`. It must call a tool and cite a real number.
    "I cannot access files" means the structured prompt and tool registry are not
    reaching the second provider.

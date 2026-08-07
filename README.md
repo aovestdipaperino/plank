@@ -277,6 +277,17 @@ plank --provider openai --model llama3.3 \
 
 **What stays the same** — every plank tool (`read`/`edit`/`bash`/`glob`/`search`/…), the MCP tools, `@` completion, sessions and `/resume`, `/btw`, and compaction all work unchanged against a provider. The one difference is the system prompt: a provider gets plank's own prompt with native tool definitions, never the byte-parity DeepSeek prompt (which is meant only for the local model it was trained on).
 
+**Two hosted models on one key** — a sub-agent definition can name a *different* model at the same endpoint, authenticated with the same variable:
+
+```yaml
+provider: openai                        # any OpenAI-compatible endpoint
+model: qwen3-coder-next                 # the only difference from the parent
+base-url: https://api.regolo.ai/v1
+api-key-env: REGOLO_API_KEY             # the same variable the parent uses
+```
+
+Only the variable's *name* lives in the file, never the key, so definitions stay committable. `/usage` then reports one row per model rather than one total, which is how you confirm the sidechain really reached the second model — self-reported identity is weak evidence, billing is not. `multi-provider-tests/remote-remote/` is a runnable session that exercises exactly this, and needs no local model, so it starts instantly on any machine.
+
 **Notes** — `--provider` cannot be combined with `--remote` or the local backend selectors (`--metal`/`--cuda`/`--cpu`); it *is* the engine for that run. `/usage` reports billed token counts for the session, including Anthropic cache read/write and hit rate. The key is never written to `settings.json` — it stays on the environment or `--api-key` by design.
 
 ## The arcade

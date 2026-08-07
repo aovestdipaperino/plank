@@ -130,7 +130,7 @@ a recognisable voice, and a local run is far slower to first token on a cold KV)
 This is the one most likely to break silently, because a provider engine given a
 flat prompt receives an empty tool list.
 
-**Run:** `/subagent remote-reviewer count the test functions in src/agents.rs by reading the file`
+**Run:** `/subagent:remote-reviewer count the test functions in src/agents.rs by reading the file`
 
 **Expect:** the sub-agent actually calls `read` (or `search`), and its report
 cites a real number. If it instead says it cannot access files, the structured
@@ -148,7 +148,7 @@ accord.
 
 **Then** run `/config agents.autoRoute false` and repeat. Expect the model to
 stop selecting definitions and either do the work itself or delegate to a
-general-purpose sub-agent — while `/subagent remote-reviewer ...` still works.
+general-purpose sub-agent — while `/subagent:remote-reviewer ...` still works.
 Restore with `/config agents.autoRoute true`.
 
 **Also try** a plausible-but-wrong name by asking for "the code-reviewer agent".
@@ -164,7 +164,7 @@ name: alt-reviewer
 api-key-env: ANTHROPIC_API_KEY_ALT
 ```
 
-**Run:** `/subagent remote-reviewer …` then `/subagent alt-reviewer …` in one
+**Run:** `/subagent:remote-reviewer …` then `/subagent:alt-reviewer …` in one
 session.
 
 **Expect:** both succeed. They differ only in key variable, so they must get
@@ -208,8 +208,8 @@ fan-out — a mixed block stays serial so side effects keep their order.
 
 **Expect:**
 - `/agent` lists every definition as before.
-- `/subagent remote-reviewer …` works (remote main → remote sub-agent).
-- `/subagent local-helper …` **also works, but runs on the remote provider** — it
+- `/subagent:remote-reviewer …` works (remote main → remote sub-agent).
+- `/subagent:local-helper …` **also works, but runs on the remote provider** — it
   has no `provider:`, so it inherits the parent engine. Confirm it is not
   silently doing nothing, and confirm the billing lands on the main key.
 
@@ -232,7 +232,7 @@ Answer from the files you read. Finish with a short report.
 - A startup line saying a sub-agent definition asked for the local engine, then
   the usual model load — the provider session now pays the local load too.
 - `/agent` shows `cheap-local — … [local]`, with no key marker.
-- `/subagent cheap-local summarise src/agents.rs` runs on the **local** model:
+- `/subagent:cheap-local summarise src/agents.rs` runs on the **local** model:
   recognisably the local voice, and slow to first token on a cold KV.
 - The footer's engine-origin indicator still shows the provider afterwards — the
   swap was restored.
@@ -251,7 +251,7 @@ cost is paid only when something asks for it.
 | `ctrl+c` during a fan-out | Same; partial reports for whatever finished |
 | Revoke the key mid-session, then dispatch again | `engine unavailable: <VAR> is not set`, with no sidechain started |
 
-After every one of these, `/subagent remote-reviewer ok` must still work. A
+After every one of these, `/subagent:remote-reviewer ok` must still work. A
 leaked engine swap would leave the whole session pointed at the wrong engine,
 which is the worst failure this design can produce and the thing most worth
 re-checking by hand.

@@ -41,10 +41,10 @@ No model, no URL, no key — it is this process's own engine.
    engine, then the model load, then `provider engine ready`.
 2. **`/agent`** — `cheap-local` shows `[local]` with **no** key marker (it has no
    credential to be missing); `inherits-parent` shows no engine at all.
-3. **`/subagent cheap-local summarise the files in this directory`** — runs on the
+3. **`/subagent:cheap-local summarise the files in this directory`** — runs on the
    local model: recognisably the local voice, and slow to first token on a cold
    KV. `/usage` should attribute nothing to regolo.ai for it.
-4. **`/subagent inherits-parent same question`** — runs on **regolo.ai**, because
+4. **`/subagent:inherits-parent same question`** — runs on **regolo.ai**, because
    "inherits the parent" means the remote engine here, and it is billed to your
    key. The contrast with (3) is exactly the distinction the two definitions exist
    to make visible.
