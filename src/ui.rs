@@ -630,7 +630,6 @@ impl CompactSink for TuiCompactSink<'_> {
                 f,
                 log,
                 None,
-                0,
                 "compacting (Esc to stop)",
                 view,
                 None,
@@ -4901,6 +4900,13 @@ struct TuiInput {
     stash: String,
     /// Open `@` suggestion popup, when one is showing.
     popup: Option<crate::complete::Popup>,
+    /// Open `/` command menu, when one is showing. Mutually exclusive with
+    /// `popup`: `@` needs whitespace before it and `/` only opens at byte 0.
+    slash: Option<crate::slashmenu::SlashMenu>,
+    /// Every command the `/` menu can offer — built-ins plus the skills and
+    /// templates loaded at startup. Snapshotted once because neither set
+    /// changes during a session.
+    slash_catalog: Vec<crate::slashmenu::Entry>,
     /// Index worker, started lazily on the first `@`.
     worker: Option<crate::complete::IndexWorker>,
     /// MCP resource candidates, refreshed by `tui_loop` and handed to the
@@ -4922,9 +4928,39 @@ impl TuiInput {
             hist_bang: false,
             stash: String::new(),
             popup: None,
+            slash: None,
+            slash_catalog: crate::slashmenu::catalog(&[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
         }
+    }
+
+    /// Replaces the `/` menu's candidate list, folding this session's skills
+    /// and templates in beside the built-ins.
+    fn set_slash_catalog(
+        &mut self,
+        skills: &[crate::skills::Skill],
+        templates: &[crate::templates::Template],
+    ) {
+        self.slash_catalog = crate::slashmenu::catalog(skills, templates);
+    }
+
+    /// The prompt as the renderer needs it: text, cursor, and selection, all
+    /// in char indices.
+    fn state(&self) -> tui::InputState<'_> {
+        tui::InputState {
+            text: self.buf.text(),
+            cursor: self.cursor_char(),
+            sel: self.selection_chars(),
+        }
+    }
+
+    /// The selected range as char indices, which is what the renderer wants;
+    /// [`crate::editor::LineBuffer`] tracks bytes.
+    fn selection_chars(&self) -> Option<(usize, usize)> {
+        let (a, b) = self.buf.selection()?;
+        let text = self.buf.text();
+        Some((text[..a].chars().count(), text[..b].chars().count()))
     }
 
     /// Text of the current buffer left of the cursor, used for `@` detection.
@@ -4948,11 +4984,13 @@ impl TuiInput {
             .is_none_or(char::is_whitespace)
     }
 
-    /// Opens, retargets, or closes the popup to match the current input text.
+    /// Opens, retargets, or closes both typeahead menus to match the current
+    /// input text.
     ///
     /// Called after every key. Starts the index worker lazily on the first `@`
     /// so a session that never completes never shells out to git.
     fn sync_popup(&mut self) {
+        self.sync_slash();
         let token = crate::complete::detect_at_token(self.left_of_cursor())
             .filter(|_| self.cursor_at_token_end());
         let Some(token) = token else {
@@ -4974,6 +5012,37 @@ impl TuiInput {
         let generation = popup.bump_generation(token);
         if let Some(w) = &self.worker {
             w.query(generation, &query);
+        }
+    }
+
+    /// Opens, refilters, or closes the `/` command menu for the current input.
+    ///
+    /// A query that matches nothing closes it outright rather than showing an
+    /// empty box: an unknown `/command` is a legitimate thing to type (it goes
+    /// to the model as an ordinary prompt), and a menu hovering over it with no
+    /// rows would just be in the way.
+    fn sync_slash(&mut self) {
+        let token = crate::slashmenu::detect_slash_token(self.left_of_cursor())
+            .filter(|_| self.cursor_at_token_end());
+        let Some(token) = token else {
+            self.slash = None;
+            return;
+        };
+        match &mut self.slash {
+            Some(menu) => menu.retarget(&token.query),
+            None => {
+                self.slash = Some(crate::slashmenu::SlashMenu::new(
+                    self.slash_catalog.clone(),
+                    &token.query,
+                ));
+            }
+        }
+        if self
+            .slash
+            .as_ref()
+            .is_some_and(crate::slashmenu::SlashMenu::is_empty)
+        {
+            self.slash = None;
         }
     }
 
@@ -5016,13 +5085,16 @@ impl TuiInput {
         }
     }
 
-    /// Offers `key` to an open popup, the single entry point both TUI key
-    /// loops share so they cannot drift.
+    /// Offers `key` to an open menu (`/` first, then `@`), the single entry
+    /// point both TUI key loops share so they cannot drift.
     ///
-    /// Returns true when the popup consumed the key and the caller must skip
-    /// its own binding for it.
+    /// Returns true when a menu consumed the key and the caller must skip its
+    /// own binding for it.
     fn popup_key(&mut self, key: KeyEvent) -> bool {
         use crate::complete::PopupAction;
+        if self.slash_key(key) {
+            return true;
+        }
         if self.popup.is_none() {
             return false;
         }
@@ -5046,6 +5118,177 @@ impl TuiInput {
                 if self.buf.text() != before {
                     self.sync_popup();
                 }
+                true
+            }
+        }
+    }
+
+    /// Selection and clipboard keys, the second thing both TUI key loops share
+    /// (after [`TuiInput::popup_key`]) so the two cannot drift.
+    ///
+    /// Shift turns every cursor motion into a selecting motion by pinning the
+    /// anchor before the caller's own binding runs; an unshifted motion drops
+    /// the selection. Ctrl-C copies a selection (falling through to the
+    /// caller's "clear the line" meaning when there is none), Ctrl-X cuts,
+    /// Ctrl-V pastes, and Ctrl-Shift-A selects everything.
+    ///
+    /// Shift+Up/Down are the exception that must be *consumed* here: unshifted
+    /// they walk the history, so the caller's binding is the wrong one and
+    /// cannot be reached by falling through.
+    ///
+    /// A consumed key re-syncs the menus itself. Both loops reach their
+    /// end-of-iteration `sync_popup` by *falling through* the key match, so a
+    /// consumed key that skipped ahead would otherwise leave a menu open over
+    /// text that no longer justifies it.
+    fn selection_key(&mut self, key: KeyEvent) -> bool {
+        let consumed = self.selection_key_inner(key);
+        if consumed {
+            self.sync_popup();
+        }
+        consumed
+    }
+
+    /// The body of [`TuiInput::selection_key`], split out so the re-sync above
+    /// covers every consuming arm without each having to remember it.
+    fn selection_key_inner(&mut self, key: KeyEvent) -> bool {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            // Ctrl-C / Ctrl-Shift-C: copy. With nothing selected this falls
+            // through so Ctrl-C keeps meaning "clear the line" / "interrupt".
+            KeyCode::Char('c' | 'C') if ctrl => self.copy_selection(false),
+            KeyCode::Char('x' | 'X') if ctrl => self.copy_selection(true),
+            KeyCode::Char('v' | 'V') if ctrl => {
+                match crate::tui::paste_from_clipboard() {
+                    Some(text) => {
+                        self.hist_idx = None;
+                        // The prompt is multi-line but a pasted newline would
+                        // submit on the next Enter; fold to spaces, matching
+                        // the bracketed-paste path.
+                        self.buf
+                            .insert(text.replace("\r\n", "\n").replace(['\n', '\r'], " "));
+                    }
+                    None => crate::status::set_flash_tip("clipboard has no text".to_owned()),
+                }
+                true
+            }
+            KeyCode::Char('a' | 'A') if ctrl && shift => {
+                self.buf.select_all();
+                true
+            }
+            // Shift+Up/Down move by logical line instead of walking history.
+            KeyCode::Up if shift => {
+                self.buf.anchor_here();
+                self.buf.move_line_up();
+                true
+            }
+            KeyCode::Down if shift => {
+                self.buf.anchor_here();
+                self.buf.move_line_down();
+                true
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                if shift {
+                    self.buf.anchor_here();
+                } else {
+                    self.buf.clear_selection();
+                }
+                false
+            }
+            // Unshiftable motions (the readline aliases): they always collapse
+            // the selection.
+            KeyCode::Up | KeyCode::Down => {
+                self.buf.clear_selection();
+                false
+            }
+            KeyCode::Char('a' | 'e') if ctrl => {
+                self.buf.clear_selection();
+                false
+            }
+            KeyCode::Char('b' | 'f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.buf.clear_selection();
+                false
+            }
+            _ => false,
+        }
+    }
+
+    /// Copies the selection to the clipboard, deleting it too when `cut`.
+    /// Returns whether there was anything to copy.
+    ///
+    /// A plain copy leaves the selection standing, so the copied text stays
+    /// visible and can still be cut, replaced by typing, or extended.
+    fn copy_selection(&mut self, cut: bool) -> bool {
+        let Some(text) = self.buf.selected_text().map(str::to_owned) else {
+            return false;
+        };
+        crate::tui::copy_to_clipboard(&text);
+        let chars = text.chars().count();
+        let verb = if cut { "Cut" } else { "Copied" };
+        crate::status::set_flash_tip(format!("📋 {verb} {chars} chars"));
+        if cut {
+            self.hist_idx = None;
+            self.buf.delete_selection();
+        }
+        true
+    }
+
+    /// Points the cursor at the screen cell `(col, row)` when it lands in the
+    /// prompt text rect `rect`, starting (`drag == false`) or extending
+    /// (`drag == true`) a selection there. Returns whether the cell was in the
+    /// prompt at all.
+    ///
+    /// Callers pass `rect` from [`crate::tui::last_input_rect`] — the rect the
+    /// last frame actually drew, rather than a recomputed one, because the
+    /// prompt's position depends on the task strip's height.
+    fn mouse_to_cursor(
+        &mut self,
+        rect: ratatui::layout::Rect,
+        col: u16,
+        row: u16,
+        drag: bool,
+    ) -> bool {
+        let Some(idx) = crate::tui::input_hit(rect, self.buf.text(), col, row) else {
+            return false;
+        };
+        let byte = self
+            .buf
+            .text()
+            .char_indices()
+            .nth(idx)
+            .map_or(self.buf.text().len(), |(b, _)| b);
+        if !drag {
+            self.buf.clear_selection();
+        }
+        self.buf.set_cursor(byte);
+        // Pin the anchor where the press landed, so the drag that may follow
+        // has an origin. On the press itself anchor == cursor, which
+        // `LineBuffer::selection` reports as no selection — a plain click
+        // therefore just moves the caret. On a drag the anchor is already set
+        // and this leaves it alone.
+        self.buf.anchor_here();
+        // The caret moved, so a menu anchored to where it was may no longer
+        // apply: clicking into the middle of `@src/foo` closes its popup, the
+        // same as arrowing there would.
+        self.sync_popup();
+        true
+    }
+
+    /// Offers `key` to the open `/` menu. Returns true when it consumed it.
+    ///
+    /// Accepting an entry rewrites the buffer, so the menus are re-synced
+    /// afterwards: the new text ends in a space, which closes this menu and
+    /// leaves the prompt ready for arguments.
+    fn slash_key(&mut self, key: KeyEvent) -> bool {
+        use crate::slashmenu::MenuAction;
+        let Some(menu) = self.slash.as_mut() else {
+            return false;
+        };
+        match menu.handle_key(key, &mut self.buf) {
+            MenuAction::Passthrough => false,
+            MenuAction::Consumed => true,
+            MenuAction::Dismissed => {
+                self.slash = None;
                 true
             }
         }
@@ -5268,6 +5511,7 @@ impl Agent<'_> {
         let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
         input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
+        input.set_slash_catalog(&self.skills, &self.templates);
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
 
@@ -5331,6 +5575,10 @@ impl Agent<'_> {
         // (not the screen) lets the selection survive scrolling. Copied to the
         // clipboard on button release.
         let mut selection: Option<tui::ContentSelection> = None;
+        // True between press and release of a drag that started inside the
+        // prompt: that drag selects input text (tracked on the `LineBuffer`)
+        // rather than transcript text, so the two never fight over one gesture.
+        let mut input_drag = false;
         // The interactive `/config` modal, when open; it intercepts all keys
         // and renders over the frame until Esc (save) or q/Ctrl-C (cancel).
         let mut config_form: Option<crate::configform::ConfigForm> = None;
@@ -5399,8 +5647,7 @@ impl Agent<'_> {
                             draw_log,
                             btw_log,
                             btw_view,
-                            Some(input.buf.text()),
-                            input.cursor_char(),
+                            Some(input.state()),
                             &idle_status,
                             draw_view,
                             &task_view,
@@ -5409,14 +5656,16 @@ impl Agent<'_> {
                         tui::draw(
                             f,
                             draw_log,
-                            Some(input.buf.text()),
-                            input.cursor_char(),
+                            Some(input.state()),
                             &idle_status,
                             draw_view,
                             selection,
                             &task_view,
                             sub_title.as_deref(),
                         );
+                    }
+                    if let Some(m) = &input.slash {
+                        tui::draw_slash_menu(f, input.buf.text(), m);
                     }
                     if let Some(p) = &input.popup {
                         tui::draw_popup(f, input.buf.text(), p);
@@ -5560,6 +5809,10 @@ impl Agent<'_> {
                         v.top = v.top.saturating_add(3);
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
+                        // Every press decides afresh which surface the gesture
+                        // belongs to, so a release lost off-window cannot leave
+                        // the next drag stuck on the prompt.
+                        input_drag = false;
                         // A click on the jump-to-bottom hint resumes follow mode
                         // (same as End) instead of starting a text selection.
                         let v = sub_pane.active_view(&mut view);
@@ -5568,9 +5821,22 @@ impl Agent<'_> {
                         }) {
                             v.follow = true;
                             selection = None;
+                        } else if tui::last_input_rect()
+                            .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false))
+                        {
+                            // A press inside the prompt places the caret and
+                            // arms an input-text drag, leaving the output
+                            // pane's own selection alone.
+                            input_drag = true;
+                            selection = None;
                         } else {
                             let row = v.top.saturating_add(usize::from(m.row));
                             selection = Some(((m.column, row), (m.column, row)));
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) if input_drag => {
+                        if let Some(r) = tui::last_input_rect() {
+                            input.mouse_to_cursor(r, m.column, m.row, true);
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
@@ -5578,6 +5844,12 @@ impl Agent<'_> {
                         if let Some((_, end)) = &mut selection {
                             *end = (m.column, top.saturating_add(usize::from(m.row)));
                         }
+                    }
+                    MouseEventKind::Up(MouseButton::Left) if input_drag => {
+                        // Releasing an input drag copies what it selected, the
+                        // same bargain the output pane makes.
+                        input_drag = false;
+                        input.copy_selection(false);
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
@@ -5709,6 +5981,12 @@ impl Agent<'_> {
             if input.popup_key(key) {
                 continue;
             }
+            // Then the shared selection keymap: it consumes the clipboard keys
+            // and pins the anchor for Shift+motions before the motion bindings
+            // below run.
+            if input.selection_key(key) {
+                continue;
+            }
             let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
             // Alt (Option on macOS) or Ctrl turns arrows and Backspace/Delete
             // into word-wise operations.
@@ -5825,6 +6103,7 @@ impl Agent<'_> {
                     let line = input.buf.text().trim().to_owned();
                     input.buf.clear();
                     input.popup = None;
+                    input.slash = None;
                     input.hist_idx = None;
                     view.follow = true;
                     sub_pane.view.follow = true;
@@ -5984,7 +6263,6 @@ impl Agent<'_> {
                         f,
                         log,
                         None,
-                        0,
                         &status,
                         view,
                         None,
@@ -7471,7 +7749,7 @@ impl Agent<'_> {
                     ))));
                     let (l, v) = (&*log, &mut *view);
                     let _ = terminal.draw(|f| {
-                        tui::draw(f, l, None, 0, "", v, None, &tui::TaskView::default(), None);
+                        tui::draw(f, l, None, "", v, None, &tui::TaskView::default(), None);
                     });
                 });
                 log.set_progress(None);
@@ -7754,7 +8032,6 @@ impl Agent<'_> {
                                     f,
                                     *l,
                                     None,
-                                    0,
                                     "",
                                     *v,
                                     None,
@@ -8185,6 +8462,9 @@ fn busy_ui_loop(
     // Guards against `run_ask_panel` returning while still pending, which
     // would otherwise re-notify for the same question on the next iteration.
     let mut ask_notified = false;
+    // True between press and release of a drag that started inside the prompt;
+    // the twin of `tui_loop`'s flag, for the mid-turn prompt.
+    let mut input_drag = false;
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
@@ -8337,8 +8617,7 @@ fn busy_ui_loop(
                         draw_log,
                         btw_log,
                         btw_view,
-                        Some(input.buf.text()),
-                        input.cursor_char(),
+                        Some(input.state()),
                         &status_line,
                         draw_view,
                         &task_view,
@@ -8347,14 +8626,16 @@ fn busy_ui_loop(
                     tui::draw(
                         f,
                         draw_log,
-                        Some(input.buf.text()),
-                        input.cursor_char(),
+                        Some(input.state()),
                         &status_line,
                         draw_view,
                         None,
                         &task_view,
                         sub_title.as_deref(),
                     );
+                }
+                if let Some(m) = &input.slash {
+                    tui::draw_slash_menu(f, input.buf.text(), m);
                 }
                 if let Some(p) = &input.popup {
                     tui::draw_popup(f, input.buf.text(), p);
@@ -8440,8 +8721,9 @@ fn busy_ui_loop(
         match ev {
             Event::Key(key) if key.kind == KeyEventKind::Press => {
                 // Same precedence as `tui_loop`: the popup sees keys first, so
-                // Esc closes it before it can interrupt the worker.
-                if input.popup_key(key) {
+                // Esc closes it before it can interrupt the worker, then the
+                // shared selection keymap.
+                if input.popup_key(key) || input.selection_key(key) {
                     continue;
                 }
                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -8641,6 +8923,23 @@ fn busy_ui_loop(
                     }) =>
                 {
                     sub.active_view(view).follow = true;
+                }
+                // The prompt stays live mid-turn (queued lines, `/btw`), so
+                // click-and-drag has to place and select in it here too.
+                // Every press decides afresh which surface the gesture belongs
+                // to, so a release lost off-window cannot strand the next drag.
+                MouseEventKind::Down(MouseButton::Left) => {
+                    input_drag = tui::last_input_rect()
+                        .is_some_and(|r| input.mouse_to_cursor(r, m.column, m.row, false));
+                }
+                MouseEventKind::Drag(MouseButton::Left) if input_drag => {
+                    if let Some(r) = tui::last_input_rect() {
+                        input.mouse_to_cursor(r, m.column, m.row, true);
+                    }
+                }
+                MouseEventKind::Up(MouseButton::Left) if input_drag => {
+                    input_drag = false;
+                    input.copy_selection(false);
                 }
                 _ => {}
             },
@@ -9508,6 +9807,260 @@ mod tests {
         assert_eq!(input.buf.text(), "legacy two");
         input.history_move(-1);
         assert_eq!(input.buf.text(), "legacy one");
+    }
+
+    /// Types `text` into a fresh `TuiInput` one character at a time, re-syncing
+    /// the menus after each one exactly as the key loops do.
+    fn typed(text: &str) -> TuiInput {
+        let mut input = TuiInput::new();
+        for c in text.chars() {
+            input.buf.insert(c.to_string());
+            input.sync_popup();
+        }
+        input
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn typing_a_slash_opens_the_command_menu_and_a_space_closes_it() {
+        let input = typed("/");
+        let menu = input.slash.as_ref().expect("menu opens on a bare slash");
+        assert!(!menu.is_empty());
+        assert!(
+            menu.rows().iter().any(|e| e.name == "/help"),
+            "the bare menu lists everything"
+        );
+        assert!(typed("/compact ").slash.is_none(), "arguments close it");
+    }
+
+    #[test]
+    fn the_command_menu_narrows_as_the_name_is_typed() {
+        let input = typed("/comp");
+        let menu = input.slash.as_ref().expect("menu");
+        assert_eq!(menu.selected_entry().expect("row").name, "/compact");
+    }
+
+    #[test]
+    fn an_unknown_command_shows_no_menu_rather_than_an_empty_box() {
+        assert!(typed("/zzzznotacommand").slash.is_none());
+    }
+
+    #[test]
+    fn a_slash_mid_sentence_does_not_open_the_menu() {
+        assert!(typed("look at /help").slash.is_none());
+    }
+
+    #[test]
+    fn accepting_a_command_from_the_menu_rewrites_the_line_and_closes_it() {
+        let mut input = typed("/comp");
+        assert!(input.popup_key(key(KeyCode::Enter)), "menu takes the Enter");
+        assert_eq!(input.buf.text(), "/compact ");
+        assert!(input.slash.is_none());
+    }
+
+    /// A fully typed command must run on the first Enter: the menu hands the
+    /// key back rather than "completing" what is already complete.
+    #[test]
+    fn enter_on_a_fully_typed_command_submits_instead_of_completing() {
+        let mut input = typed("/help");
+        assert!(input.slash.is_some(), "the menu is still up");
+        assert!(
+            !input.popup_key(key(KeyCode::Enter)),
+            "Enter passes through"
+        );
+        assert_eq!(input.buf.text(), "/help", "the line is untouched");
+    }
+
+    /// A fuzzy highlight must never displace a command the user finished
+    /// typing. `mat` is a subsequence of `compact`, so a menu that completed
+    /// on Enter regardless would turn `/matrix` into `/compact` — swapping an
+    /// easter egg for a context-destroying summarization on one keystroke.
+    #[test]
+    fn a_hidden_command_is_never_swapped_for_a_fuzzy_match() {
+        let mut input = typed("/matrix");
+        assert!(
+            !input.popup_key(key(KeyCode::Enter)),
+            "Enter passes through"
+        );
+        assert_eq!(input.buf.text(), "/matrix");
+        // Mid-word the menu may well be showing something else; what matters is
+        // that finishing the name takes the line back.
+        let mut half = typed("/mat");
+        assert!(half.slash.is_some(), "a fuzzy menu is up mid-word");
+        for c in "rix".chars() {
+            half.buf.insert(c.to_string());
+            half.sync_popup();
+        }
+        assert!(!half.popup_key(key(KeyCode::Enter)));
+        assert_eq!(half.buf.text(), "/matrix");
+    }
+
+    #[test]
+    fn tab_on_a_fully_typed_command_still_completes_it() {
+        let mut input = typed("/help");
+        assert!(input.popup_key(key(KeyCode::Tab)));
+        assert_eq!(input.buf.text(), "/help ");
+    }
+
+    #[test]
+    fn esc_closes_the_command_menu_without_touching_the_line() {
+        let mut input = typed("/comp");
+        assert!(input.popup_key(key(KeyCode::Esc)));
+        assert!(input.slash.is_none());
+        assert_eq!(input.buf.text(), "/comp");
+    }
+
+    #[test]
+    fn the_command_menu_and_the_at_popup_are_never_open_at_once() {
+        let at = typed("@src");
+        assert!(at.slash.is_none());
+        let slash = typed("/co");
+        assert!(slash.popup.is_none());
+    }
+
+    #[test]
+    fn shift_arrows_select_and_plain_arrows_drop_the_selection() {
+        let mut input = typed("hello world");
+        // Three Shift+Lefts: the loop runs `selection_key` (anchoring) then its
+        // own motion binding.
+        for _ in 0..3 {
+            assert!(!input.selection_key(shift(KeyCode::Left)));
+            input.buf.move_left();
+        }
+        assert_eq!(input.buf.selected_text(), Some("rld"));
+        assert_eq!(input.selection_chars(), Some((8, 11)));
+        // A plain Left collapses it.
+        assert!(!input.selection_key(key(KeyCode::Left)));
+        input.buf.move_left();
+        assert_eq!(input.buf.selection(), None);
+    }
+
+    #[test]
+    fn shift_home_selects_back_to_the_start() {
+        let mut input = typed("hello");
+        assert!(!input.selection_key(shift(KeyCode::Home)));
+        input.buf.move_home();
+        assert_eq!(input.buf.selected_text(), Some("hello"));
+    }
+
+    /// Unshifted Up/Down keep walking history, so the selection keymap must
+    /// only claim them when Shift is held.
+    #[test]
+    fn shift_up_moves_by_line_while_plain_up_is_left_for_history() {
+        let mut input = TuiInput::new();
+        input.buf.set_text("one\ntwo");
+        assert!(input.selection_key(shift(KeyCode::Up)), "consumed");
+        assert_eq!(input.buf.selected_text(), Some("\ntwo"));
+        let mut plain = TuiInput::new();
+        plain.buf.set_text("one\ntwo");
+        assert!(!plain.selection_key(key(KeyCode::Up)), "passed through");
+        assert_eq!(plain.buf.cursor(), plain.buf.text().len());
+    }
+
+    /// A consumed selection key skips the loop's end-of-iteration re-sync, so
+    /// it has to do the re-sync itself or a menu is left standing over text
+    /// that no longer justifies it.
+    #[test]
+    fn a_consumed_selection_key_re_syncs_the_menus() {
+        let mut input = typed("/comp");
+        assert!(input.slash.is_some());
+        // Shift+Up walks to the start of the line: the caret is no longer at
+        // the end of the command token, so the menu must have closed.
+        assert!(input.selection_key(shift(KeyCode::Up)));
+        assert_eq!(input.buf.cursor(), 0);
+        assert!(input.slash.is_none(), "the menu must not outlive the caret");
+    }
+
+    #[test]
+    fn ctrl_shift_a_selects_the_whole_line() {
+        let mut input = typed("select me");
+        let ctrl_shift_a = KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert!(input.selection_key(ctrl_shift_a));
+        assert_eq!(input.buf.selected_text(), Some("select me"));
+    }
+
+    /// Ctrl-C only claims the key when there is something to copy; with an
+    /// empty selection it must still mean "clear the line" / "interrupt".
+    #[test]
+    fn ctrl_c_copies_a_selection_and_otherwise_passes_through() {
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        let mut empty = typed("nothing selected");
+        assert!(!empty.selection_key(ctrl_c));
+        let mut input = typed("copy me");
+        input.buf.select_all();
+        assert!(input.selection_key(ctrl_c));
+        assert_eq!(
+            input.buf.selected_text(),
+            Some("copy me"),
+            "a copy leaves the selection standing"
+        );
+    }
+
+    #[test]
+    fn ctrl_x_cuts_the_selection_out_of_the_line() {
+        let ctrl_x = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL);
+        let mut input = typed("keep cut");
+        input.buf.set_cursor(4);
+        input.buf.anchor_here();
+        input.buf.set_cursor(8);
+        assert!(input.selection_key(ctrl_x));
+        assert_eq!(input.buf.text(), "keep");
+        assert_eq!(input.buf.selection(), None);
+    }
+
+    #[test]
+    fn a_readline_motion_collapses_the_selection() {
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let mut input = typed("hello");
+        input.buf.select_all();
+        assert!(!input.selection_key(ctrl_a), "Ctrl-A is still Home");
+        assert_eq!(input.buf.selection(), None);
+    }
+
+    /// A press places the caret and arms a drag without selecting anything;
+    /// the drag that follows selects from the press point.
+    #[test]
+    fn a_press_places_the_caret_and_the_drag_after_it_selects() {
+        let rect = ratatui::layout::Rect::new(4, 10, 20, 1);
+        let mut input = typed("hello world");
+        // Press on column 4+6 → char 6 ('w').
+        assert!(input.mouse_to_cursor(rect, 10, 10, false));
+        assert_eq!(input.buf.cursor(), 6);
+        assert_eq!(input.buf.selection(), None, "a plain click selects nothing");
+        // Drag to the end of the text.
+        assert!(input.mouse_to_cursor(rect, 15, 10, true));
+        assert_eq!(input.buf.selected_text(), Some("world"));
+    }
+
+    #[test]
+    fn a_click_outside_the_prompt_is_left_to_the_output_pane() {
+        let rect = ratatui::layout::Rect::new(4, 10, 20, 1);
+        let mut input = typed("hello");
+        assert!(
+            !input.mouse_to_cursor(rect, 10, 3, false),
+            "a different row"
+        );
+        assert_eq!(input.buf.cursor(), 5, "the caret did not move");
+    }
+
+    /// The selection is reported to the renderer in char indices, not bytes.
+    #[test]
+    fn the_selection_handed_to_the_renderer_is_measured_in_chars() {
+        let mut input = typed("aé漢b");
+        input.buf.select_all();
+        assert_eq!(input.selection_chars(), Some((0, 4)));
+        assert_eq!(input.state().sel, Some((0, 4)));
+        assert_eq!(input.state().cursor, 4);
     }
 
     /// Builds a `TuiInput` whose popup is open with one canned row.

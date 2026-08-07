@@ -995,3 +995,23 @@ test` and review the diff before committing.
   no kana draws boxes, and nothing in the program can tell. Hence `c`, which
   cycles the rain to binary and then to ASCII — an escape hatch in the UI
   rather than a probe that cannot work.
+
+- **The real TUI *can* be driven headlessly — with a pty, not `script`.**
+  `tests/ui_remote.rs` notes that `tui_loop` is hardwired to
+  `Terminal<CrosstermBackend<Stdout>>` and so cannot take a `TestBackend`, but
+  the loop runs fine against a pty, and `--ui-remote=PORT` then drives it
+  end-to-end. Two traps make the obvious attempts fail:
+
+  - `script -q /dev/null plank --ui-remote=…` dies with `tcgetattr/ioctl:
+    Operation not supported on socket` the moment its own stdin is not a tty —
+    which it never is when launched from a tool runner. Use `pty.openpty()`
+    from Python (or any direct pty spawn) instead.
+  - stdin must stay *open*, not merely exist. Pointing it at `/dev/null` EOFs
+    immediately, which the key loop reads as Ctrl-D and exits cleanly — the CRT
+    power-off frames in the captured output are the tell.
+
+  Also drain the pty master, or a chatty frame stream eventually blocks the
+  child. With those three in place, `{"cmd":"keypress"}` → `{"cmd":"snapshot"}`
+  is a genuine end-to-end check of key handling, layout and highlighting; strip
+  the SGR escapes and diff the last ~20 rows, since the banner logo dominates
+  the rest.

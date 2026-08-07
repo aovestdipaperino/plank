@@ -89,11 +89,22 @@ fn is_word_modifier(params: &str) -> bool {
 }
 
 /// An editable UTF-8 line with a cursor, mirroring linenoise's edit ops.
+///
+/// It also carries an optional *selection anchor* (issue: Shift+arrow
+/// selection). The anchor is the fixed end of a selection whose moving end is
+/// the cursor, so every existing motion doubles as a selection-extending motion
+/// once [`LineBuffer::anchor_here`] has pinned it. Nothing sets the anchor on
+/// its own: a buffer whose caller never asks for selection behaves exactly as
+/// it did before.
 #[derive(Debug, Default, Clone)]
 pub struct LineBuffer {
     text: String,
     /// Byte offset of the cursor; always on a char boundary.
     cursor: usize,
+    /// Fixed end of an active selection, as a byte offset; `None` when nothing
+    /// is selected. May sit either side of the cursor — [`LineBuffer::selection`]
+    /// normalizes.
+    anchor: Option<usize>,
 }
 
 impl LineBuffer {
@@ -115,20 +126,90 @@ impl LineBuffer {
         self.cursor
     }
 
+    /// Pins the selection anchor at the cursor, unless one is already set.
+    ///
+    /// Called before a motion while Shift is held: the first Shift+motion drops
+    /// the anchor where the cursor was, and every later one leaves it alone so
+    /// the selection grows from the same origin.
+    pub fn anchor_here(&mut self) {
+        self.anchor.get_or_insert(self.cursor);
+    }
+
+    /// Drops any selection, leaving the text and cursor alone.
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// The selected byte range, ordered, or `None` when nothing is selected.
+    ///
+    /// An anchor that has collapsed onto the cursor counts as no selection, so
+    /// a Shift+Left followed by Shift+Right does not leave an invisible
+    /// zero-width selection behind to swallow the next keystroke.
+    #[must_use]
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let a = self.anchor?;
+        let (lo, hi) = if a <= self.cursor {
+            (a, self.cursor)
+        } else {
+            (self.cursor, a)
+        };
+        (lo < hi).then_some((lo, hi))
+    }
+
+    /// The selected text, or `None` when nothing is selected.
+    #[must_use]
+    pub fn selected_text(&self) -> Option<&str> {
+        self.selection().map(|(a, b)| &self.text[a..b])
+    }
+
+    /// Selects the whole buffer, leaving the cursor at the end.
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.text.len();
+    }
+
+    /// Deletes the selection, leaving the cursor where it started. Returns
+    /// whether anything was removed.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((start, end)) = self.selection() else {
+            self.anchor = None;
+            return false;
+        };
+        self.text.replace_range(start..end, "");
+        self.cursor = start;
+        self.anchor = None;
+        true
+    }
+
+    /// Moves the cursor to `byte`, snapped down to a char boundary and clamped
+    /// to the text. Used by mouse clicks, which land on a screen cell rather
+    /// than a known offset.
+    pub fn set_cursor(&mut self, byte: usize) {
+        let mut b = byte.min(self.text.len());
+        while !self.text.is_char_boundary(b) {
+            b -= 1;
+        }
+        self.cursor = b;
+    }
+
     /// Replaces the whole line and puts the cursor at the end.
     pub fn set_text(&mut self, text: impl AsRef<str>) {
         text.as_ref().clone_into(&mut self.text);
         self.cursor = self.text.len();
+        self.anchor = None;
     }
 
     /// Clears the line.
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.anchor = None;
     }
 
-    /// Inserts a string at the cursor and advances past it.
+    /// Inserts a string at the cursor and advances past it. An active selection
+    /// is replaced, the way typing over a selection works everywhere else.
     pub fn insert(&mut self, s: impl AsRef<str>) {
+        self.delete_selection();
         let s = s.as_ref();
         self.text.insert_str(self.cursor, s);
         self.cursor += s.len();
@@ -166,8 +247,12 @@ impl LineBuffer {
         self.cursor = self.text.len();
     }
 
-    /// Deletes the character before the cursor (Backspace).
+    /// Deletes the character before the cursor (Backspace), or the whole
+    /// selection when one is active.
     pub fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         match self.prev_boundary() {
             Some(b) => {
                 self.text.replace_range(b..self.cursor, "");
@@ -178,8 +263,12 @@ impl LineBuffer {
         }
     }
 
-    /// Deletes the character under the cursor (Delete / Ctrl-D on non-empty).
+    /// Deletes the character under the cursor (Delete / Ctrl-D on non-empty),
+    /// or the whole selection when one is active.
     pub fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         match self.next_boundary() {
             Some(b) => {
                 self.text.replace_range(self.cursor..b, "");
@@ -191,17 +280,20 @@ impl LineBuffer {
 
     /// Deletes from the cursor to the end of the line (Ctrl-K).
     pub fn kill_to_end(&mut self) {
+        self.anchor = None;
         self.text.truncate(self.cursor);
     }
 
     /// Deletes from the start of the line to the cursor (Ctrl-U).
     pub fn kill_to_start(&mut self) {
+        self.anchor = None;
         self.text.replace_range(..self.cursor, "");
         self.cursor = 0;
     }
 
     /// Deletes the word before the cursor (Ctrl-W / Alt-Backspace).
     pub fn delete_prev_word(&mut self) {
+        self.anchor = None;
         let start = prev_word_boundary(&self.text, self.cursor);
         self.text.replace_range(start..self.cursor, "");
         self.cursor = start;
@@ -209,6 +301,7 @@ impl LineBuffer {
 
     /// Deletes the word after the cursor (Alt-D / Alt-Delete).
     pub fn delete_next_word(&mut self) {
+        self.anchor = None;
         let end = next_word_boundary(&self.text, self.cursor);
         self.text.replace_range(self.cursor..end, "");
     }
@@ -247,9 +340,70 @@ impl LineBuffer {
 
     /// Replaces the byte range `start..end` with `s`, cursor after `s`.
     pub fn replace_range(&mut self, start: usize, end: usize, s: impl AsRef<str>) {
+        self.anchor = None;
         let s = s.as_ref();
         self.text.replace_range(start..end, s);
         self.cursor = start + s.len();
+    }
+
+    /// Byte range of the *logical* line (newline-delimited) holding the cursor,
+    /// plus the cursor's char offset within it.
+    fn logical_line(&self) -> (usize, usize, usize) {
+        let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
+        let end = self.text[self.cursor..]
+            .find('\n')
+            .map_or(self.text.len(), |i| self.cursor + i);
+        (start, end, self.text[start..self.cursor].chars().count())
+    }
+
+    /// Byte offset `col` chars into the line spanning `start..end`, clamped to
+    /// its end when the line is shorter than `col`.
+    fn offset_in_line(&self, start: usize, end: usize, col: usize) -> usize {
+        self.text[start..end]
+            .char_indices()
+            .nth(col)
+            .map_or(end, |(i, _)| start + i)
+    }
+
+    /// Moves the cursor to the same column on the previous logical line
+    /// (Shift+Up / Up in a multi-line prompt). A cursor already on the first
+    /// line goes to the start of the buffer, which is what a single-line prompt
+    /// wants too. Returns whether it moved.
+    ///
+    /// Logical, not visual: a long wrapped line counts as one line here, so this
+    /// stays independent of the terminal width.
+    ///
+    /// The column is not sticky — crossing a short line and continuing keeps the
+    /// column the short line clamped to, rather than restoring the original. A
+    /// goal column would need state that every other motion has to remember to
+    /// reset, which is not worth it for a prompt that is usually one line.
+    pub fn move_line_up(&mut self) -> bool {
+        let (start, _, col) = self.logical_line();
+        let before = self.cursor;
+        if start == 0 {
+            self.cursor = 0;
+        } else {
+            let prev_start = self.text[..start - 1].rfind('\n').map_or(0, |i| i + 1);
+            self.cursor = self.offset_in_line(prev_start, start - 1, col);
+        }
+        self.cursor != before
+    }
+
+    /// Mirror of [`LineBuffer::move_line_up`]: the same column on the next
+    /// logical line, or the end of the buffer when already on the last.
+    pub fn move_line_down(&mut self) -> bool {
+        let (_, end, col) = self.logical_line();
+        let before = self.cursor;
+        if end == self.text.len() {
+            self.cursor = self.text.len();
+        } else {
+            let next_start = end + 1;
+            let next_end = self.text[next_start..]
+                .find('\n')
+                .map_or(self.text.len(), |i| next_start + i);
+            self.cursor = self.offset_in_line(next_start, next_end, col);
+        }
+        self.cursor != before
     }
 
     fn prev_boundary(&self) -> Option<usize> {
@@ -1340,6 +1494,155 @@ mod tests {
         assert!(!b.move_left());
         b.move_end();
         assert!(!b.move_right());
+    }
+
+    /// A buffer nobody asks to select behaves exactly as it did before the
+    /// anchor existed.
+    #[test]
+    fn nothing_is_selected_until_the_anchor_is_pinned() {
+        let mut b = LineBuffer::new();
+        b.insert("hello");
+        b.move_left();
+        b.move_left();
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.selected_text(), None);
+        b.backspace();
+        assert_eq!(b.text(), "helo");
+    }
+
+    #[test]
+    fn shift_motions_grow_a_selection_from_one_anchor() {
+        let mut b = LineBuffer::new();
+        b.insert("hello world");
+        // Shift+Left three times: the anchor stays where the first one dropped.
+        for _ in 0..3 {
+            b.anchor_here();
+            b.move_left();
+        }
+        assert_eq!(b.selected_text(), Some("rld"));
+        // Shifting back the other way shrinks the same selection.
+        b.anchor_here();
+        b.move_right();
+        assert_eq!(b.selected_text(), Some("ld"));
+    }
+
+    #[test]
+    fn a_selection_collapsed_back_onto_its_anchor_is_no_selection() {
+        let mut b = LineBuffer::new();
+        b.insert("hi");
+        b.anchor_here();
+        b.move_left();
+        b.anchor_here();
+        b.move_right();
+        assert_eq!(b.selection(), None, "zero-width selection must not linger");
+    }
+
+    #[test]
+    fn a_plain_motion_drops_the_selection() {
+        let mut b = LineBuffer::new();
+        b.insert("hello");
+        b.anchor_here();
+        b.move_left();
+        assert!(b.selection().is_some());
+        b.clear_selection();
+        b.move_left();
+        assert_eq!(b.selection(), None);
+    }
+
+    #[test]
+    fn typing_over_a_selection_replaces_it() {
+        let mut b = LineBuffer::new();
+        b.insert("hello world");
+        b.anchor_here();
+        for _ in 0..5 {
+            b.move_left();
+        }
+        assert_eq!(b.selected_text(), Some("world"));
+        b.insert("there");
+        assert_eq!(b.text(), "hello there");
+        assert_eq!(b.selection(), None);
+        assert_eq!(b.cursor(), b.text().len());
+    }
+
+    #[test]
+    fn backspace_and_delete_take_the_whole_selection() {
+        for delete in [false, true] {
+            let mut b = LineBuffer::new();
+            b.insert("abcdef");
+            b.set_cursor(2);
+            b.anchor_here();
+            b.set_cursor(5);
+            if delete {
+                assert!(b.delete());
+            } else {
+                assert!(b.backspace());
+            }
+            assert_eq!(b.text(), "abf");
+            assert_eq!(b.cursor(), 2);
+            assert_eq!(b.selection(), None);
+        }
+    }
+
+    #[test]
+    fn select_all_then_type_replaces_the_line() {
+        let mut b = LineBuffer::new();
+        b.insert("throw this away");
+        b.select_all();
+        assert_eq!(b.selected_text(), Some("throw this away"));
+        b.insert("new");
+        assert_eq!(b.text(), "new");
+    }
+
+    #[test]
+    fn selection_survives_utf8_and_never_splits_a_char() {
+        let mut b = LineBuffer::new();
+        b.insert("aé漢b");
+        b.anchor_here();
+        b.move_left(); // over 'b'
+        b.move_left(); // over 漢
+        assert_eq!(b.selected_text(), Some("漢b"));
+        // A byte offset landing mid-char snaps down to the boundary.
+        b.set_cursor(2); // inside 'é' (a=0, é=1..3)
+        assert_eq!(b.cursor(), 1);
+    }
+
+    #[test]
+    fn set_text_and_clear_drop_the_selection() {
+        let mut b = LineBuffer::new();
+        b.insert("hello");
+        b.select_all();
+        b.set_text("from history");
+        assert_eq!(b.selection(), None);
+        b.select_all();
+        b.clear();
+        assert_eq!(b.selection(), None);
+    }
+
+    #[test]
+    fn line_motions_hold_the_column_across_logical_lines() {
+        let mut b = LineBuffer::new();
+        b.insert("alpha\nbe\ngamma");
+        b.set_cursor(b.text().len()); // end of "gamma", column 5
+        assert!(b.move_line_up());
+        // "be" is shorter than column 5, so the cursor clamps to its end.
+        assert_eq!(b.text()[..b.cursor()].to_owned(), "alpha\nbe");
+        // The column is not sticky: continuing up carries column 2, not 5.
+        assert!(b.move_line_up());
+        assert_eq!(b.text()[..b.cursor()].to_owned(), "al");
+        assert!(b.move_line_down());
+        assert_eq!(b.text()[..b.cursor()].to_owned(), "alpha\nbe");
+    }
+
+    #[test]
+    fn line_motions_run_to_the_ends_on_a_single_line() {
+        let mut b = LineBuffer::new();
+        b.insert("one line");
+        assert!(b.move_line_up());
+        assert_eq!(b.cursor(), 0, "up on the first line goes to the start");
+        assert!(!b.move_line_up(), "already there");
+        assert!(b.move_line_down());
+        assert_eq!(b.cursor(), b.text().len());
+        assert!(!b.move_line_down());
     }
 
     #[test]

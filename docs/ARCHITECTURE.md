@@ -236,6 +236,25 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   by the plain REPL.
 - `statusbar.rs` — the single-line `\r`-updated bar for the stdout path.
 - `editor.rs` — `LineBuffer`/`History` primitives reused by the TUI input.
+  `LineBuffer` also carries an optional *selection anchor*: the fixed end of a
+  selection whose moving end is the cursor, so every existing motion doubles as
+  a selecting motion once the anchor is pinned. Nothing pins it on its own, so
+  callers that never select are unaffected. `insert`/`backspace`/`delete`
+  consume an active selection; the other mutators clear it.
+- `slashmenu.rs` — the `/` command menu, sibling to `complete.rs`'s `@` popup
+  and mutually exclusive with it (`@` needs whitespace before it, `/` only opens
+  at byte 0). Synchronous: the candidates are `config::SLASH_COMMANDS` plus the
+  skills and templates already loaded, so there is no index and no worker. A
+  test in `config.rs` asserts every advertised command is one dispatch knows.
+- **Prompt selection** — `TuiInput::selection_key` is the one keymap both TUI
+  key loops call for Shift+motion, `Ctrl-C`/`Ctrl-X`/`Ctrl-V` and
+  `Ctrl-Shift-A`, the twin of `popup_key` and for the same reason: the idle and
+  mid-turn loops must not drift. Shift pins the anchor and falls through to the
+  caller's own motion binding; only Shift+Up/Down are consumed outright, since
+  unshifted they walk the history. Mouse selection in the prompt hit-tests
+  against the input rect `render_input` records each frame (`tui::input_hit`),
+  which is why it is recorded rather than recomputed — the prompt's position
+  depends on the task strip's height.
 - **Screensaver** (`arcade.rs` + the TUI input loop): after `ui.screensaver`
   of idleness (`1m` by default; `2m`, `5m`, `never`) one of the two ambient
   screens — the perspective starfield or the matrix rain (`arcade/matrix.rs`),
