@@ -74,7 +74,7 @@ pub fn fmt_turn_duration(d: std::time::Duration) -> String {
 /// The turn's closing line: a marker, and how long the turn took.
 #[must_use]
 pub fn turn_footer(d: std::time::Duration) -> String {
-    format!("\u{271b} Planked for {}", fmt_turn_duration(d))
+    format!("\u{273b} Planked for {}", fmt_turn_duration(d))
 }
 
 fn think_style() -> Style {
@@ -3245,7 +3245,7 @@ mod tests {
         assert_eq!(fmt_turn_duration(Duration::from_hours(24)), "24h 00m 00s");
         assert_eq!(
             turn_footer(Duration::from_secs(3729)),
-            "\u{271b} Planked for 1h 02m 09s"
+            "\u{273b} Planked for 1h 02m 09s"
         );
         // Bold grey: findable at a turn boundary without competing with output.
         let st = turn_footer_style();

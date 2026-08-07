@@ -6370,6 +6370,10 @@ impl Agent<'_> {
                 // any leftover-queued follow-ups this loop absorbed — not the
                 // last pass, which is what the status bar's elapsed shows while
                 // the turn runs.
+                //
+                // Blank line first: the footer is a boundary marker, and butted
+                // against the reply's last line it reads as part of it.
+                log.push_plain("");
                 log.push_spans(vec![ratatui::text::Span::styled(
                     tui::turn_footer(turn_started.elapsed()),
                     tui::turn_footer_style(),
