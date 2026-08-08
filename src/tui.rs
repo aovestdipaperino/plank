@@ -2687,7 +2687,10 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
             theme
         };
         spans.push(Span::styled(" | ".to_string(), base));
-        spans.push(Span::styled(format!("✓ {done}/{total}"), counter_style));
+        spans.push(Span::styled(
+            format!("✓ Tasks: {done}/{total}"),
+            counter_style,
+        ));
     }
     // Tail notification slot. A running tool owns it for the whole run (no
     // timed window), shimmering off the animation clock, so nothing else shows
@@ -3657,7 +3660,8 @@ mod tests {
     fn status_bar_counter_is_themed_in_flight_and_dim_when_done() {
         use crate::tasks::TaskStatus::{Completed, InProgress};
         let base = Style::default();
-        // An empty list adds no task counter to the status bar (the "✓ n/n"
+        // An empty list adds no task counter to the status bar (the
+        // "✓ Tasks: n/n"
         // segment); rotating tips may still contribute other spans.
         let empty = status_spans("idle", 0, base, &TaskView::default());
         assert!(!empty.iter().any(|s| s.content.contains('✓')));
