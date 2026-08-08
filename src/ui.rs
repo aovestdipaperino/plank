@@ -8395,6 +8395,28 @@ fn run_worker_ui<T: Send>(
     })
 }
 
+/// How long an unacknowledged interrupt waits before a second Ctrl-C is taken
+/// as a force quit.
+///
+/// Long enough that the two presses of an ordinary double-tap cannot trigger
+/// it, short enough that a genuinely wedged turn is escapable without the user
+/// reaching for `kill`.
+const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
+
+/// Last resort when the worker will not stop: restore the terminal and leave.
+///
+/// This exits the *process*, not the turn. The worker runs on a scoped thread
+/// borrowing the agent, so it cannot be abandoned and the scope cannot be left
+/// while it lives — meaning no destructor here can run and the in-flight turn
+/// is lost. That is the deal a force quit makes; it beats a wedged terminal,
+/// and with the stream idle timeout in [`crate::remote`] it should never be
+/// reached in the network-drop case that motivated it.
+fn force_quit() -> ! {
+    ratatui::restore();
+    eprintln!("plank: force quit — the turn was abandoned and not saved.");
+    std::process::exit(130);
+}
+
 /// Handles Esc / Ctrl-C during a worker job, with meaning that depends on the
 /// `/btw` panel state:
 /// - a side answer is **streaming** (`btw_active`): cancel it (interrupt) and
@@ -8468,6 +8490,10 @@ fn busy_ui_loop(
     // True while the progress line is showing the compaction bar, so it is
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
+    // When the main-task interrupt was raised, so an interrupt the worker never
+    // acknowledges can escalate to a force quit. `None` whenever no interrupt
+    // is outstanding.
+    let mut interrupt_at: Option<Instant> = None;
     // Wall-clock pacing for an easter egg opened mid-turn, same as the idle
     // loop: render events arrive irregularly, so the frame delta has to be
     // measured rather than inferred from the poll timeout.
@@ -8599,6 +8625,17 @@ fn busy_ui_loop(
             }
             None => {}
         }
+        // An interrupt the worker has not acknowledged within the grace period
+        // means it is wedged somewhere that cannot poll the flag. Say so, and
+        // name the way out — otherwise the UI looks identical to a hang.
+        let stuck = interrupt_at.is_some_and(|t: Instant| t.elapsed() >= FORCE_QUIT_GRACE);
+        let status_line: std::borrow::Cow<'_, str> = if stuck {
+            std::borrow::Cow::Owned(format!(
+                "{status_line}  [interrupt pending — Ctrl-C again to force quit]"
+            ))
+        } else {
+            std::borrow::Cow::Borrowed(status_line.as_str())
+        };
         let sub_active = sub.active;
         // Owned for the same reason: `sub.view` is borrowed mutably below.
         let sub_title: Option<String> = if sub_active { sub.label.clone() } else { None };
@@ -8740,13 +8777,34 @@ fn busy_ui_loop(
                     }
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
+                        // Arms the escalation the same way Ctrl-C does, so an
+                        // interrupt raised with Esc can still be escaped from.
+                        if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
+                            interrupt_at = Some(Instant::now());
+                        }
                     }
                     KeyCode::Char('c') if ctrl => {
                         // Ctrl-C clears a partly-typed line first; on an empty
                         // line it acts like Esc (cancel answer / close panel /
                         // interrupt the model).
                         if input.buf.text().is_empty() {
+                            // Escalation: a second Ctrl-C, once the first has
+                            // gone unacknowledged past the grace period, is the
+                            // only way out of a worker wedged somewhere it
+                            // cannot poll the interrupt flag. It cannot be a
+                            // graceful shutdown — the worker is a *scoped*
+                            // thread holding `&mut Agent`, so the scope cannot
+                            // be left while it runs and there is no safe way to
+                            // abandon it.
+                            if interrupt_at
+                                .is_some_and(|t: Instant| t.elapsed() >= FORCE_QUIT_GRACE)
+                            {
+                                force_quit();
+                            }
                             close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
+                            if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
+                                interrupt_at = Some(Instant::now());
+                            }
                         } else {
                             input.buf.clear();
                         }

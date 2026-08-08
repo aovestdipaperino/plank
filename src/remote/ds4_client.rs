@@ -31,7 +31,6 @@ use crate::remote::proto::{
     GenerateRequest, InfoResponse, PROTOCOL_VERSION, TokenizeRequest, TokenizeResponse, WireEvent,
     WireOptions,
 };
-use crate::remote::read_sse;
 
 /// Monotonic per-turn id source, so a `DELETE` cancel targets the right stream.
 static TURN_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -96,26 +95,35 @@ impl RemoteDs4Engine {
         let payload = serde_json::to_string(body)
             .map_err(|e| EngineError::new(format!("serialize request: {e}")))?;
         let url = format!("{}{path}", self.base);
-        let mut req = ureq::post(&url).header("Content-Type", "application/json");
+        // Connect and header timeouts, for the same reason as the provider
+        // engine: `ureq` defaults every timeout to `None`, so a network drop
+        // before the stream starts would park this thread indefinitely. Neither
+        // bounds the body — a long generation is the idle timeout's business.
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(std::time::Duration::from_secs(30)))
+            .timeout_recv_response(Some(std::time::Duration::from_mins(2)))
+            .build()
+            .into();
+        let mut req = agent.post(&url).header("Content-Type", "application/json");
         if let Some(t) = &self.token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
-        let mut resp = req
+        let resp = req
             .send(payload.as_str())
             .map_err(|e| EngineError::new(format!("remote {path}: {e}")))?;
 
         let mut stats: Option<GenerationStats> = None;
         let mut stream_err: Option<String> = None;
-        let reader = resp.body_mut().as_reader();
-        // Interrupt is checked before dispatching each frame; on interrupt we
-        // stop reading (dropping `resp` closes the connection) and fire DELETE.
-        let mut interrupted = false;
-        read_sse(reader, |data| {
-            if interrupt() {
-                interrupted = true;
-                return false;
-            }
-            match serde_json::from_str::<WireEvent>(data) {
+        // Read on its own thread and consumed through a channel so `interrupt`
+        // is polled on a clock, not per frame: a dropped network delivers no
+        // frames at all, and the old per-frame check could never fire.
+        let rx = crate::remote::spawn_sse_reader(resp.into_body().into_reader());
+        let end = crate::remote::pump_sse(
+            &rx,
+            crate::remote::STREAM_IDLE_TIMEOUT,
+            crate::remote::STREAM_POLL_INTERVAL,
+            interrupt,
+            |data| match serde_json::from_str::<WireEvent>(data) {
                 Ok(WireEvent::Done { stats: s }) => {
                     stats = Some(s.into());
                     false
@@ -134,12 +142,13 @@ impl RemoteDs4Engine {
                     stream_err = Some(format!("malformed server frame: {e}"));
                     false
                 }
-            }
-        })
-        .map_err(|e| EngineError::new(format!("remote stream read: {e}")))?;
+            },
+        )
+        .map_err(EngineError::new)?;
 
-        if interrupted {
-            drop(resp);
+        if end == crate::remote::SseEnd::Interrupted {
+            // The DELETE is what actually cancels; the reader thread ends when
+            // the server closes the stream in response.
             self.cancel(&body.session_id);
             return Ok(GenerationStats {
                 interrupted: true,

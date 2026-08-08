@@ -25,7 +25,6 @@ use crate::engine::{
     ChatMessage, ChatRole, Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats,
     PrefillProgress, Prompt, ToolSpec,
 };
-use crate::remote::read_sse;
 use std::time::Duration;
 
 /// Which provider API family a [`ProviderEngine`] speaks.
@@ -1173,8 +1172,18 @@ impl Engine for ProviderEngine {
         // default `StatusCode` error, so we can read the provider's error body
         // (a useful message, not just "http status: 500") and any `Retry-After`
         // header before deciding whether to retry.
+        //
+        // The two timeouts bound the phases that happen *before* any SSE byte
+        // arrives, where the streaming pump cannot help: a network drop during
+        // connect or while waiting on the response headers would otherwise park
+        // this thread forever (every `ureq` timeout defaults to `None`, and a
+        // silently dropped connection produces no RST for the kernel to
+        // report). Neither bounds the body, so a long generation is unaffected
+        // — that job belongs to `STREAM_IDLE_TIMEOUT` below.
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
+            .timeout_connect(Some(Duration::from_secs(30)))
+            .timeout_recv_response(Some(Duration::from_mins(2)))
             .build()
             .into();
 
@@ -1220,26 +1229,33 @@ impl Engine for ProviderEngine {
                 Err(e) => return Err(EngineError::new(format!("provider request: {e}"))),
             }
         }
-        let Some(mut resp) = resp else {
+        let Some(resp) = resp else {
             return Err(EngineError::new(last_err.unwrap_or_else(|| {
                 "provider request: connection failed".to_string()
             })));
         };
 
         let mut translator = self.translator();
-        let mut interrupted = false;
-        let reader = resp.body_mut().as_reader();
-        read_sse(reader, |data| {
-            if interrupt() {
-                interrupted = true;
-                return false;
-            }
-            translator.feed(data, on_event)
-        })
-        .map_err(|e| EngineError::new(format!("provider stream read: {e}")))?;
+        // The body is read on its own thread and consumed through a channel, so
+        // `interrupt` is polled on a clock rather than per arriving event. The
+        // old shape checked it inside the SSE callback, which meant a stream
+        // delivering nothing — exactly what a dropped network produces — could
+        // never be cancelled: the turn froze and Ctrl-C had nothing to reach.
+        // `into_reader` (rather than `as_reader`) because the borrowed form
+        // cannot cross a thread boundary; this hands the reader thread an owned
+        // `'static` body, and drops the response here.
+        let rx = crate::remote::spawn_sse_reader(resp.into_body().into_reader());
+        let end = crate::remote::pump_sse(
+            &rx,
+            crate::remote::STREAM_IDLE_TIMEOUT,
+            crate::remote::STREAM_POLL_INTERVAL,
+            interrupt,
+            |data| translator.feed(data, on_event),
+        )
+        .map_err(EngineError::new)?;
+        let interrupted = end == crate::remote::SseEnd::Interrupted;
 
         if interrupted {
-            drop(resp);
             return Ok(GenerationStats {
                 interrupted: true,
                 ..GenerationStats::default()
