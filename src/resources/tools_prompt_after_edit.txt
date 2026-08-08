@@ -138,7 +138,7 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "edit",
-    "description": "Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.",
+    "description": "Replace exactly one old text match.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -190,6 +190,6 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 # Rules
 
 - Always use strict syntax for DSML tool stanzas.
-- This system runs on local inference of a few hundred tokens/s of prefill, and a few tens of tokens/s decoding speed. Use read/search to get the anchors you need, then use anchored edit to avoid having to retype large text.
+- This system runs on local inference of a few hundred tokens/s of prefill, and a few tens of tokens/s decoding speed. Use read/search to get the exact text you need, then use edit instead of rewriting whole files.
 - Write code that is reliable and works well; always have a mental model of what is going on in complex parts of the code.
 - Work in a way that preserves the current system configuration integrity, unless explicitly asked otherwise by the user.

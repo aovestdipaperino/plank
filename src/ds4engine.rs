@@ -31,6 +31,11 @@ use crate::ffi;
 use crate::host::{HostSession, ModelHandle};
 use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 
+/// Tokens a single speculative step may commit: the sampled token plus the
+/// longest draft block the engine proposes. Matches the C CLI's buffer, which
+/// is the ceiling the entry point itself is written against.
+const SPEC_ACCEPT_CAP: usize = 17;
+
 /// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
 /// Metal command queue. Cheap to share read-only, expensive to build, so it
 /// lives behind an `Arc` (design §3, §4). Frees the engine on drop; the last
@@ -133,9 +138,13 @@ impl Ds4Model {
             mtp_path: as_ptr(&c_mtp),
             backend,
             n_threads,
+            context_size: ctx_size,
             prefill_chunk: tuning.prefill_chunk,
             mtp_draft_tokens: tuning.mtp_draft_tokens,
             mtp_margin: tuning.mtp_margin,
+            dspark_confidence_threshold: tuning
+                .dspark_confidence
+                .unwrap_or(crate::config::DSPARK_CONFIDENCE_DEFAULT),
             directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
             directional_steering_attn: tuning.dir_steering_attn,
@@ -143,33 +152,32 @@ impl Ds4Model {
             power_percent,
             ssd_streaming_cache_experts: tuning.ssd_streaming_cache_experts,
             ssd_streaming_cache_bytes: tuning.ssd_streaming_cache_bytes,
+            ssd_streaming_full_layers: 0,
             ssd_streaming_preload_experts: tuning.ssd_streaming_preload_experts,
             simulate_used_memory_bytes: tuning.simulate_used_memory_bytes,
             warm_weights: tuning.warm_weights,
             quality: tuning.quality,
+            glm_mtp: false,
+            glm_mtp_timing: false,
+            dspark: tuning.dspark,
+            dspark_strict: tuning.dspark_strict,
+            dspark_confidence_threshold_set: tuning.dspark_confidence.is_some(),
+            cuda_tensor_parallel: false,
             ssd_streaming: tuning.ssd_streaming,
             ssd_streaming_cold: tuning.ssd_streaming_cold,
+            ssd_streaming_full_layers_set: false,
             inspect_only: false,
+            placement_ctx_hint: ctx_size,
+            placement_session_count_hint: 0,
+            share_session_prefill_workspace: false,
+            first_token_test: false,
+            metal_graph_test: false,
             load_slice: false,
             load_layer_start: 0,
             load_layer_end: 0,
             load_output: false,
-            distributed: ffi::Ds4DistributedOptions {
-                role: 0,
-                layers_start: 0,
-                layers_end: 0,
-                layers_has_output: false,
-                layers_set: false,
-                listen_host: std::ptr::null(),
-                listen_port: 0,
-                coordinator_host: std::ptr::null(),
-                coordinator_port: 0,
-                prefill_chunk: 0,
-                prefill_window: 0,
-                activation_bits: 0,
-                replay_check: false,
-                debug: false,
-            },
+            distributed: ffi::Ds4DistributedOptions::default(),
+            tp: ffi::Ds4TpOptions::default(),
         };
         let mut engine: *mut ffi::Ds4Engine = std::ptr::null_mut();
         // SAFETY: opts and its CStrings outlive the call; engine is a valid out-ptr.
@@ -990,6 +998,20 @@ impl Engine for Ds4Session {
         });
         let start = std::time::Instant::now();
 
+        // Speculative decode verifies drafts by argmax, so it reproduces the
+        // sampled stream only when the whole generation is greedy anyway.
+        // Same gate the C CLI uses: temperature at or below zero, and a
+        // support model that proposes blocks rather than single tokens.
+        // `greedy()` flipping per token inside a DSML stanza is irrelevant
+        // here — at this temperature both branches sample argmax.
+        let draft_block = if opts.temperature <= 0.0 {
+            // SAFETY: engine valid for the life of the model.
+            unsafe { ffi::ds4_engine_mtp_draft_tokens(self.model.engine) }
+        } else {
+            0
+        };
+        let speculative = draft_block > 1;
+
         while generated < max_tokens {
             if interrupt() {
                 INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
@@ -1012,23 +1034,79 @@ impl Engine for Ds4Session {
             if token == eos {
                 break;
             }
-            // SAFETY: session valid; err buffer valid.
-            let eval_rc =
-                unsafe { ffi::ds4_session_eval(session, token, err.as_mut_ptr(), err.len()) };
-            if eval_rc != 0 {
-                return Err(EngineError::new(cstr_message(&err, "decode failed")));
+            if speculative {
+                let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
+                let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
+                // SAFETY: session valid; `accepted` is a valid out-buffer of
+                // `cap` ints; err buffer valid.
+                let n = unsafe {
+                    ffi::ds4_session_eval_speculative_argmax(
+                        session,
+                        token,
+                        max_tokens - generated,
+                        eos,
+                        accepted.as_mut_ptr(),
+                        cap,
+                        err.as_mut_ptr(),
+                        err.len(),
+                    )
+                };
+                if n < 0 {
+                    return Err(EngineError::new(cstr_message(&err, "decode failed")));
+                }
+                // Nothing committed — not even the sampled token — so there is
+                // no progress to make and looping again would spin forever.
+                if n == 0 {
+                    break;
+                }
+                // `n` is positive here: negative returned above, zero broke.
+                let run = &accepted[..usize::try_from(n).unwrap_or(0).min(accepted.len())];
+                let mut hit_eos = false;
+                for &t in run {
+                    if t == eos {
+                        hit_eos = true;
+                        break;
+                    }
+                    let text = utf8.push(self.model.token_bytes(t));
+                    reply_tokens.push(t);
+                    if !text.is_empty() {
+                        reply_text.push_str(&text);
+                        on_event(EngineEvent::Text(text));
+                    }
+                    generated += 1;
+                    if generated >= max_tokens {
+                        break;
+                    }
+                }
+                if hit_eos {
+                    break;
+                }
+            } else {
+                // SAFETY: session valid; err buffer valid.
+                let eval_rc =
+                    unsafe { ffi::ds4_session_eval(session, token, err.as_mut_ptr(), err.len()) };
+                if eval_rc != 0 {
+                    return Err(EngineError::new(cstr_message(&err, "decode failed")));
+                }
+                let text = utf8.push(self.model.token_bytes(token));
+                reply_tokens.push(token);
+                if !text.is_empty() {
+                    reply_text.push_str(&text);
+                    on_event(EngineEvent::Text(text));
+                }
+                generated += 1;
             }
-            let text = utf8.push(self.model.token_bytes(token));
-            reply_tokens.push(token);
-            if !text.is_empty() {
-                reply_text.push_str(&text);
-                on_event(EngineEvent::Text(text));
-            }
-            generated += 1;
 
             // Live recovery for a tool call opened inside an unclosed
             // `<think>`: force-feed the close and let the model restart the
             // call on the executable side of it.
+            //
+            // Under speculation this runs once per accepted block rather than
+            // once per token, so it can notice the open a few tokens later
+            // than the serial path would. It cannot be checked mid-block: the
+            // whole run is already committed to the KV cache by the time it
+            // returns, so there is nothing to rewind and the injection has to
+            // follow the last accepted token either way.
             if let Some(rec) = recovery.as_mut()
                 && rec.should_recover(&reply_text)
             {
