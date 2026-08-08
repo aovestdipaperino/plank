@@ -6,6 +6,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A dropped network no longer freezes the turn with no way out.** Losing the
+  link mid-generation — Wi-Fi off, sleep, a NAT rebind — used to hang plank
+  indefinitely, with Ctrl-C and Esc doing nothing. Two faults compounded. The
+  streaming HTTP agent set no timeouts at all (every `ureq` timeout defaults to
+  `None`, and it was the one agent in the tree that did not override them), and
+  a silent drop produces no RST or FIN: with the request already sent there is
+  no unacked data for TCP to retransmit, so no kernel timeout ever fires and
+  the socket sits established but black-holed forever. Meanwhile cancellation
+  was polled *inside* the SSE callback, which runs per arriving event — so zero
+  bytes meant zero interrupt checks, and the one situation that needed
+  cancelling was the one where it could not work.
+
+  The response body now reads on its own thread feeding a channel, and the turn
+  polls it with a timeout, so the interrupt flag is checked on a **clock rather
+  than on data arrival** — Ctrl-C lands within a quarter second even against a
+  dead socket. Ninety seconds of silence is reported as a stalled stream
+  instead of a hang, which is sound because both providers keepalive their
+  streams. Connect and header timeouts cover a drop *before* the stream starts.
+  Both remote engines are fixed. As a last resort, a second Ctrl-C on an
+  interrupt the worker has not acknowledged within two seconds force-quits,
+  with the status bar saying so.
+
+### Changed
+
+- **The status bar task counter reads `✓ Tasks: 2/5`.** The bare `✓ 2/5` did
+  not say what it was counting.
+
+- **The window title shows `❓ waiting for you...` while the `ask` tool has the
+  turn open**, so a backgrounded window says the turn is waiting on *you*
+  rather than on the model. The title it displaced — normally the `🚀` of a
+  running turn — comes back however the question ends, including a declined or
+  interrupted one.
+
 ### Added
 
 - **A third screensaver face: two minions.** `ui.screensaverFace` gains

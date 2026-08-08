@@ -1060,3 +1060,32 @@ test` and review the diff before committing.
   ripples drew as `~~~~~`. Running the key through the splitmix64 finalizer
   first fixed it. The lesson is narrow but recurring: multiply-and-add is a
   *sequence*, not a scatter, and modulo does not rescue it.
+
+- **`ureq` defaults *every* timeout to `None`, and a dropped network gives the
+  kernel nothing to time out.** A sudden link loss (Wi-Fi off, sleep, NAT
+  rebind) produces no RST and no FIN, and once the request is fully sent plank
+  is purely *receiving* — so there is no unacked data for TCP to retransmit and
+  therefore no kernel timeout can ever fire. The socket sits established and
+  black-holed, and a blocking read on it parks forever. Every agent needs
+  explicit `timeout_connect` / `timeout_recv_response`; the streaming ones need
+  more than that, because `timeout_recv_body` bounds the *total* body duration
+  and so cannot tell a dead socket from a long healthy generation. The body
+  therefore gets an **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`),
+  which is only sound because both providers keepalive their SSE streams
+  (Anthropic `event: ping`, OpenAI comment frames).
+
+- **Never poll a cancellation flag from a data-driven callback.** The provider
+  and ds4 clients used to check `interrupt()` inside the `read_sse` callback,
+  which runs per arriving event. Zero bytes means zero polls, so cancellation
+  died in exactly the situation it was needed. The fix is structural, not a
+  timeout: the read runs on its own thread feeding a channel and the turn does
+  `recv_timeout`, so the flag is polled on a *clock* (`remote::pump_sse`).
+  Anything gated on "the peer is still talking to us" has this bug latent.
+
+- **A `std::thread::scope` worker cannot be abandoned, so force-quit means
+  `process::exit`.** `run_worker_ui` spawns the turn on a scoped thread holding
+  `&mut Agent`; the scope cannot be left while it runs and the borrow checker
+  enforces it. There is no "abandon the thread and keep going" — the UI's only
+  escape from a wedged worker is restoring the terminal and exiting the
+  process, which skips every destructor and loses the in-flight turn. Worth
+  knowing before designing any UI affordance that promises to cancel a turn.
