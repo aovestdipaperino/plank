@@ -177,6 +177,10 @@ pub const DEFAULT_CONTROL_QUEUE_MAX: usize = 1 << 20; // 1 MiB
 /// large enough that the extra command-buffer overhead stays negligible.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 256;
 
+/// `DSpark` confidence-pruning threshold the C engine uses when `--dspark` is
+/// given without `--dspark-confidence`.
+pub const DSPARK_CONFIDENCE_DEFAULT: f32 = 0.7;
+
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
 /// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
 /// keep the engine defaults; the whole struct is ignored by `EchoEngine`.
@@ -190,6 +194,20 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
+    /// Use the `--mtp` support GGUF as a `DSpark` draft model, from `--dspark`.
+    ///
+    /// `DSpark` is `DeepSeek`'s auxiliary draft checkpoint for V4 Flash; it
+    /// replaces the legacy one-stage MTP path. `--dspark-confidence` and
+    /// `--dspark-strict` also imply it, mirroring the C CLI.
+    pub dspark: bool,
+    /// Load `DSpark` support but keep target-only decode, from `--dspark-strict`.
+    pub dspark_strict: bool,
+    /// Confidence-pruning threshold from `--dspark-confidence F`, `0..=1`.
+    ///
+    /// `None` leaves the C default ([`DSPARK_CONFIDENCE_DEFAULT`]) in force;
+    /// the engine is told explicitly whether it was set, because `0` means
+    /// "fixed draft length", not "unset".
+    pub dspark_confidence: Option<f32>,
     /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
     /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
     /// prompt is prefilled. Not user-configurable (no CLI flag).
@@ -225,6 +243,9 @@ impl Default for EngineTuning {
             mtp_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
+            dspark: false,
+            dspark_strict: false,
+            dspark_confidence: None,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
             quality: false,
             warm_weights: false,
@@ -364,6 +385,9 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
+      --dspark             DSpark speculative decoding using the --mtp support GGUF
+      --dspark-confidence F  DSpark confidence pruning threshold 0..1 (default 0.7)
+      --dspark-strict      load DSpark support but keep target-only decode
       --quality            enable quality mode
       --warm-weights       touch all weights at load
       --ssd-streaming      stream experts from SSD instead of loading resident
@@ -881,6 +905,12 @@ fn parse_engine_option(
         "--mtp" => e.mtp_path = Some(PathBuf::from(v)),
         "--mtp-draft" => e.mtp_draft_tokens = parse_int(v, arg)?,
         "--mtp-margin" => e.mtp_margin = parse_float_range(v, arg, 0.0, 1000.0)?,
+        // The C turns DSpark on for any of its three flags, so the threshold
+        // flag alone is enough to select the DSpark runtime.
+        "--dspark-confidence" => {
+            e.dspark = true;
+            e.dspark_confidence = Some(parse_float_range(v, arg, 0.0, 1.0)?);
+        }
         "--ssd-streaming-cache-experts" => {
             let (experts, bytes) = parse_streaming_cache_experts_arg(v)
                 .ok_or_else(|| format!("{arg} must be a positive count or <number>GB: {v}"))?;
@@ -1073,9 +1103,15 @@ pub fn parse_options_with(
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
+            "--dspark" => c.engine.dspark = true,
+            "--dspark-strict" => {
+                c.engine.dspark = true;
+                c.engine.dspark_strict = true;
+            }
             "--mtp"
             | "--mtp-draft"
             | "--mtp-margin"
+            | "--dspark-confidence"
             | "--ssd-streaming-cache-experts"
             | "--ssd-streaming-preload-experts"
             | "--simulate-used-memory"
@@ -1539,6 +1575,46 @@ mod tests {
         assert!(err.contains("invalid value for --seed"));
         let err = parse_options(&args(&["--temp", "nan"])).unwrap_err();
         assert!(err.contains("invalid value for --temp"));
+    }
+
+    #[test]
+    fn dspark_flags_select_the_runtime() {
+        let c = parse_options(&args(&["--dspark"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!(!c.engine.dspark_strict);
+        // Left unset, so the engine keeps its own default rather than 0.
+        assert_eq!(c.engine.dspark_confidence, None);
+
+        // Either of the other two flags implies --dspark, like the C CLI.
+        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!(c.engine.dspark_strict);
+
+        let c = parse_options(&args(&["--dspark-confidence", "0.35"])).unwrap();
+        assert!(c.engine.dspark);
+        assert!((c.engine.dspark_confidence.unwrap() - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dspark_confidence_zero_is_set_not_absent() {
+        // 0 means "fixed draft length", which is why the C carries a separate
+        // `_set` bool; it must not be confused with the flag being omitted.
+        let c = parse_options(&args(&["--dspark-confidence", "0"])).unwrap();
+        assert_eq!(c.engine.dspark_confidence, Some(0.0));
+    }
+
+    #[test]
+    fn dspark_confidence_is_bounded_to_a_probability() {
+        let err = parse_options(&args(&["--dspark-confidence", "1.5"])).unwrap_err();
+        assert!(err.contains("--dspark-confidence"));
+    }
+
+    #[test]
+    fn dspark_is_off_by_default() {
+        let c = parse_options(&args(&[])).unwrap();
+        assert!(!c.engine.dspark);
+        assert!(!c.engine.dspark_strict);
+        assert_eq!(c.engine.dspark_confidence, None);
     }
 
     #[test]

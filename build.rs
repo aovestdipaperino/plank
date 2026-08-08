@@ -30,11 +30,15 @@ fn main() {
         println!("cargo:warning=refs/ds4 submodule missing; building without the ds4 engine");
         return;
     }
+    // Mirrors the Metal-branch `CORE_OBJS` in the ds4 Makefile, plus ds4_web.o
+    // which plank links for the web tool.
     let objs = [
         "ds4.o",
         "ds4_distributed.o",
+        "ds4_tp.o",
         "ds4_ssd.o",
         "ds4_metal.o",
+        "ds4_layer_pack.o",
         "ds4_web.o",
     ];
     let status = Command::new("make")
@@ -70,6 +74,8 @@ fn main() {
         "ds4_metal.m",
         "ds4_ssd.c",
         "ds4_distributed.c",
+        "ds4_tp.c",
+        "ds4_layer_pack.c",
         "ds4_web.c",
         "ds4_web.h",
     ] {

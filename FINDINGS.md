@@ -637,6 +637,68 @@ test` and review the diff before committing.
 
 ## Part 2 — Environment & tooling
 
+- **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
+  is mirrored field-for-field by `ffi::Ds4EngineOptions`, and the mirror is
+  positional: a field added mid-struct in the C shifts everything after it and
+  the mismatch is silent — no compile error, just an engine configured from the
+  wrong bytes. Re-read the C struct top to bottom on every bump. `build.rs`
+  carries its own copy of the Makefile's `CORE_OBJS` list, so a new translation
+  unit there (`ds4_tp.o`, `ds4_layer_pack.o` arrived together) surfaces only as
+  undefined symbols at link time. And the prompt constants drift: `cargo test
+  --test c_parity` is the check, `PLANK_REGEN_FIXTURES=1` the fix, but only
+  after confirming the C's new text is text plank should actually be sending.
+- **Speculation needs its own entry point; the option struct is not enough.**
+  Everything `--dspark` touches in `ds4_engine_open_internal` and
+  `ds4_session_create` is allocation and setup: the support GGUF loads,
+  target-hidden capture turns on for layers 40-42, drafts get prepared. The
+  accept/rollback loop that *consumes* drafts lives in exactly one exported
+  function, `ds4_session_eval_speculative_argmax`, which takes a sampled
+  `first_token` and returns the committed run with that token at index 0.
+  `ds4_session_eval` advances one token and can never accept a block, so a
+  loop built on it gets zero benefit no matter how the engine is configured.
+  Diagnostic: `DS4_DSPARK_STATS=1` printing *nothing* means the speculative
+  path never ran — it is not the same as poor acceptance, which prints
+  counters. The C gates the call on `temperature <= 0` (verification is
+  argmax) and `ds4_engine_mtp_draft_tokens(e) > 1`; `ds4engine.rs` mirrors
+  both. The committed run is already in the KV cache when the call returns,
+  so nothing downstream can reject part of it — which is why think-recovery
+  now runs once per block instead of once per token.
+- **`DSpark` is a net loss on M5 Max at IQ2XXS, and so is the C reference.**
+  The reported speedups are an M3 Ultra result; M5 is not supported yet, so
+  treat a slowdown here as expected rather than as a porting bug. Measured
+  through plank: a ~600-word generation ran 94-98s target-only against
+  117-129s under `--dspark`, and 17KB of Rust ran 415s against 521s — code is
+  supposed to be `DSpark`'s best case and was its worst. `DS4_DSPARK_STATS=1`
+  explains it without guesswork: on the code run `accept_rate=74.13%` looks
+  healthy, but `no_draft=1824` of `cycles=2537` and `scheduler_skips=1444`
+  mean most cycles never draft, and the totals are the verdict —
+  `saved=148784ms` against `spec_total=244276ms`, i.e. `net_saved=-125652ms`,
+  with `replay=134555ms` the single largest cost. Accept rate is the wrong
+  headline number; `net_saved` is the one to read.
+  **Confirm against `./ds4` before suspecting plank.** Building the reference
+  CLI out of the submodule (`make ds4`) and running the same prompt and model
+  gives `generation: 11.52 t/s` target-only against `7.88 t/s` with
+  `--dspark` — 0.68x, the same direction and rough magnitude plank shows. Two
+  binaries agreeing rules the port out in one step, and it is much cheaper
+  than reasoning about the FFI.
+- **plank's greedy output is not bit-reproducible, and it is not `DSpark`.**
+  Across twelve `--temp 0` runs of one prompt, ten produced the same output
+  and two diverged from the first token — one under `--dspark`, one under
+  target-only decode, so the earlier reading that blamed speculation was an
+  artifact of small samples. Both outliers were the first run after something
+  invalidated a cache (a rebuild, a prompt change), which points at prefill
+  chunking changing float accumulation order and flipping a near-tie token,
+  not at the accept path. Divergent outputs are coherent prose, never
+  corruption. Before blaming the port for any of this,
+  `ffi::tests::engine_options_*_match_the_c_layout` pins all 42 field offsets
+  and the struct size against `offsetof` on the C header.
+- **The C's prompt constants can hide behind `#define`s.** `ds4_agent.c` split
+  the editing section into `agent_tools_prompt_edit_exact` (its default) and
+  `agent_tools_prompt_edit_upto`, sharing a sentence through
+  `AGENT_EDIT_TARGET_RULE`. plank ships the `[upto]` variant, because its edit
+  tool implements the anchor. `tests/c_parity.rs` expands object-like string
+  macros before decoding literals; a literal decoder alone chokes on the bare
+  macro name.
 - **The Metal backend needs the macOS 15 SDK** (`MTLResidencySet`), so
   release builds run on `macos-15` runners and bottle as `arm64_sequoia`.
   The ds4 Makefile's `-mcpu=native` default is invalid for x86_64 clang and

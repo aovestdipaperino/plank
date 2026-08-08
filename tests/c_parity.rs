@@ -200,6 +200,50 @@ fn c_file(name: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Inlines object-like `#define NAME "..."` macros into the rest of `src`.
+///
+/// The C spells shared prompt sentences as string macros so two variants of a
+/// section can share them. [`extract_c_string_constant`] only understands
+/// literals, so the macro name has to become its literal before it runs.
+/// Continuation backslashes let a macro body sit on the following line.
+fn expand_string_macros(src: &str) -> String {
+    let mut macros: Vec<(String, String)> = Vec::new();
+    // Join continuation lines so a macro body always follows its name.
+    let joined = src.replace("\\\n", " ");
+    for line in joined.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("#define ") else {
+            continue;
+        };
+        let Some((name, body)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let body = body.trim();
+        // Object-like macros only, and only those whose body is a literal.
+        if name.contains('(') || !body.starts_with('"') || !body.ends_with('"') {
+            continue;
+        }
+        macros.push((name.to_string(), body.to_string()));
+    }
+    // Longest name first, so one macro's name cannot be a prefix of another's.
+    macros.sort_by_key(|(name, _)| std::cmp::Reverse(name.len()));
+    let mut out = joined;
+    for (name, body) in macros {
+        // Skip the defining line itself: it is not inside any constant we read.
+        out = out
+            .lines()
+            .map(|line| {
+                if line.trim_start().starts_with("#define ") {
+                    line.to_string()
+                } else {
+                    line.replace(&name, &body)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    }
+    out
+}
+
 /// Decodes the concatenated C string literals initializing
 /// `static const char <name>[] = ...;` in `src`.
 fn extract_c_string_constant(src: &str, name: &str) -> String {
@@ -265,10 +309,17 @@ fn tools_prompt_matches_c_source() {
         eprintln!("refs/ds4 submodule absent; skipping source-layer parity check");
         return;
     };
+    // The edit section is spelled with a `#define`d string macro, which the
+    // literal decoder below cannot see through; expand it first.
+    let src = expand_string_macros(&src);
     let mut expected = extract_c_string_constant(&src, "agent_tools_prompt_intro");
+    // plank ships the `[upto]` variant: its edit tool implements the anchor,
+    // so it takes the prompt that teaches it. The C's `_edit_exact` sibling
+    // (its default since `--edit-upto` became opt-in) is deliberately not the
+    // one plank mirrors — see `sysprompt::TOOLS_PROMPT_EDIT_LINE`.
     expected.push_str(&extract_c_string_constant(
         &src,
-        "agent_tools_prompt_edit_line",
+        "agent_tools_prompt_edit_upto",
     ));
     expected.push_str(&extract_c_string_constant(
         &src,

@@ -32,17 +32,22 @@ You have access to native DSML tools. Invoke tools by writing exactly this shape
 </｜DSML｜tool_calls>\n\n\
 Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.\n\n\
 String parameters use raw text and string=\"true\". Numbers and booleans use JSON text and string=\"false\".\n\n\
-Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. \
-If read says more lines are available, call more with count=<lines> to read the next chunk; \
-more defaults to the next 500 lines. \
+Read defaults to a context-sized bounded chunk, not the whole file. \
+For first looks at large files, prefer read with explicit max_lines around 80-160; \
+if read says more lines are available, call more with count=<lines> to read the next chunk. \
 The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. \
 If the user explicitly asks you to read a complete file into context, call read with whole=true. \
 A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.\n\n";
 
 /// Editing-instructions section of the tools prompt (verbatim from C).
+///
+/// This is the C's `agent_tools_prompt_edit_upto` variant: plank's edit tool
+/// implements `[upto]` anchoring, so it takes the prompt that teaches it. The
+/// C also carries an `agent_tools_prompt_edit_exact` variant it now selects by
+/// default (`--edit-upto` opts back in); plank has not adopted that split.
 const TOOLS_PROMPT_EDIT_LINE: &str = "## Editing files\n\n\
+When editing files, state the target filename before the edit; for the edit tool, put path first.\n\
 Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. \
-For edit, always put the edited file path as the first parameter. \
 The old text must match exactly once in the current file; otherwise edit fails for safety.\n\
 For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. \
 The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.\n\

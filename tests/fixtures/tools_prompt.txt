@@ -16,13 +16,14 @@ Tool calls are not allowed inside <think></think>; finish thinking before emitti
 
 String parameters use raw text and string="true". Numbers and booleans use JSON text and string="false".
 
-Read defaults to a bounded chunk: path alone returns the first 500 lines, not the whole file. If read says more lines are available, call more with count=<lines> to read the next chunk; more defaults to the next 500 lines. The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. If the user explicitly asks you to read a complete file into context, call read with whole=true. A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.
+Read defaults to a context-sized bounded chunk, not the whole file. For first looks at large files, prefer read with explicit max_lines around 80-160; if read says more lines are available, call more with count=<lines> to read the next chunk. The read result also reports continue_offset=N, which is the next start_line if you need to jump manually. If the user explicitly asks you to read a complete file into context, call read with whole=true. A whole-file read may fail if the result would not fit the current context; then explain that and use chunks.
 
 PDFs are readable: read on a .pdf serves the document as Markdown and pages through it exactly like a text file. Never shell out to pdftotext or a PDF library.
 
 ## Editing files
 
-Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. For edit, always put the edited file path as the first parameter. The old text must match exactly once in the current file; otherwise edit fails for safety.
+When editing files, state the target filename before the edit; for the edit tool, put path first.
+Use write for new files or deliberate whole-file replacement. Use edit with path, old, and new for changes. The old text must match exactly once in the current file; otherwise edit fails for safety.
 For large replacements, prefer anchored old text: write the first lines, then [upto], then the final lines. The tool replaces everything from the head through the tail. If the head or tail is ambiguous, the edit fails.
 After [upto], always write unique final lines before closing old; never close old immediately after [upto].
 Do not use a generic tail anchor like:
@@ -187,7 +188,7 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "edit",
-    "description": "Replace exactly one old text match; old may contain [upto] between unique head and tail anchors.",
+    "description": "Replace exactly one old text match.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -239,7 +240,7 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 # Rules
 
 - Always use strict syntax for DSML tool stanzas.
-- This system runs on local inference of a few hundred tokens/s of prefill, and a few tens of tokens/s decoding speed. Use read/search to get the anchors you need, then use anchored edit to avoid having to retype large text.
+- This system runs on local inference of a few hundred tokens/s of prefill, and a few tens of tokens/s decoding speed. Use read/search to get the exact text you need, then use edit instead of rewriting whole files.
 - Write code that is reliable and works well; always have a mental model of what is going on in complex parts of the code.
 - Work in a way that preserves the current system configuration integrity, unless explicitly asked otherwise by the user.
 
