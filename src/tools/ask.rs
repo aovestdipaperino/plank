@@ -114,7 +114,15 @@ pub fn tool_ask(asker: Option<&mut Box<dyn Asker>>, call: &ToolCall) -> String {
                 proceed using your best judgment.\n"
             .to_string();
     };
-    format_result(&asker.ask(req))
+    // The window title says the turn is waiting on the user rather than on the
+    // model, and hands back whatever it displaced (normally the `Busy` rocket)
+    // when the guard drops — so a declined or interrupted question restores it
+    // just as an answered one does.
+    let outcome = {
+        let _title = crate::title::Scoped::set(crate::title::State::Asking);
+        asker.ask(req)
+    };
+    format_result(&outcome)
 }
 
 /// Parses and validates the `options` argument into [`MIN_OPTIONS`]..=[`max_options`] [`AskOption`]s.

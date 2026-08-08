@@ -3,9 +3,11 @@
 
 //! Terminal window title, kept in sync with what plank is doing.
 //!
-//! Four states, so the window (and tab) names plank's phase at a glance:
-//! `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.` while
-//! idle at the prompt, `🚀 <prompt>` while a turn runs, and
+//! A handful of states, so the window (and tab) names plank's phase at a
+//! glance: `🚀 Plank loading...` before a front end is up, `🪵 Plank - READY.`
+//! while idle at the prompt, `🚀 <prompt>` while a turn runs,
+//! `❓ waiting for you...` while the `ask` tool holds the turn open for an
+//! answer, and
 //! `👀 introspecting...` while `/insights` reads back the user's own history. Set via the OSC 0
 //! escape (`ESC ] 0 ; title BEL`), written to **stderr** in a single write:
 //! stderr reaches the same tty as stdout but bypasses the Ratatui frame
@@ -29,6 +31,13 @@ pub enum State<'a> {
     /// being answered — and it runs long enough that the window should say
     /// what it is doing.
     Introspecting,
+    /// Blocked on the user inside the `ask` tool. Its own state for the same
+    /// reason as [`State::Compacting`]: it interrupts a running turn, and it is
+    /// the one phase where a backgrounded window should say the turn is not
+    /// stalled but waiting on *you*. Always set through [`Scoped`], so whatever
+    /// the turn was showing — normally the [`State::Busy`] rocket — comes back
+    /// however the question ends, including a declined or interrupted one.
+    Asking,
     /// Summarizing the transcript to reclaim context. Like
     /// [`State::Introspecting`], its own state: it interrupts whatever the user
     /// asked for, takes long enough to be worth naming, and is the one phase
@@ -50,6 +59,9 @@ const INTROSPECTING: &str = "👀 introspecting...";
 /// Title shown while a compaction pass is summarizing the transcript.
 const COMPACTING: &str = "🗑️ compacting...";
 
+/// Title shown while the `ask` tool is waiting on the user's choice.
+const ASKING: &str = "❓ waiting for you...";
+
 /// Formats the window title for `state`. A [`State::Busy`] prompt is collapsed
 /// to one line and truncated past [`TITLE_PROMPT_MAX`] characters; a
 /// whitespace-only prompt degrades to the plain loading form.
@@ -60,6 +72,7 @@ pub fn window_title(state: State<'_>) -> String {
         State::Idle => return "🪵 Plank - READY.".to_string(),
         State::Introspecting => return INTROSPECTING.to_string(),
         State::Compacting => return COMPACTING.to_string(),
+        State::Asking => return ASKING.to_string(),
         State::Busy(p) => p.split_whitespace().collect::<Vec<_>>().join(" "),
     };
     if prompt.is_empty() {
@@ -139,6 +152,31 @@ mod tests {
         assert_eq!(window_title(State::Idle), "🪵 Plank - READY.");
         assert_eq!(window_title(State::Introspecting), "👀 introspecting...");
         assert_eq!(window_title(State::Compacting), "🗑️ compacting...");
+        assert_eq!(window_title(State::Asking), "❓ waiting for you...");
+    }
+
+    /// The `ask` tool's contract with the window title: the question mark is up
+    /// only while the user is being asked, and the rocket the turn was flying
+    /// comes back afterwards — whichever way the question ended.
+    #[test]
+    fn asking_displaces_the_busy_rocket_and_gives_it_back() {
+        let _serial = TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let busy = window_title(State::Busy("port the arcade"));
+        set_text(&busy);
+        let guard = Scoped::set(State::Asking);
+        let during = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(during.as_deref(), Some("❓ waiting for you..."));
+        drop(guard);
+        let after = LAST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(after.as_deref(), Some(busy.as_str()));
     }
 
     /// Serialized against itself, and the only test that reads `LAST`'s exact
