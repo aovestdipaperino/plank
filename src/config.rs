@@ -435,6 +435,8 @@ Options:
   /export [md|html] [path] write the current transcript to a shareable file
                            (default: markdown, auto-named in the working
                            directory); HTML output is standalone
+  /open [path]             edit a file in the built-in editor; with no path,
+                           reopens the last file a tool call edited
   /insights [fast]         report on how you have been using plank, from every
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
@@ -761,6 +763,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "write the transcript to a shareable file",
     },
     SlashCommand {
+        name: "/open",
+        args: "[path]",
+        desc: "edit a file in the built-in editor (default: last edited)",
+    },
+    SlashCommand {
         name: "/insights",
         args: "[fast]",
         desc: "report on how you have been using plank",
@@ -880,6 +887,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
         || slash_command_with_args(cmd, "/export")
+        || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
@@ -1849,6 +1857,9 @@ mod tests {
         assert!(slash_command_known("/insights"));
         assert!(slash_command_known("/insights fast"));
         assert!(!slash_command_known("/insightsx"));
+        assert!(slash_command_known("/open"));
+        assert!(slash_command_known("/open src/ui.rs"));
+        assert!(!slash_command_known("/opened"));
         assert!(!slash_command_known("/exports"));
         assert!(!slash_command_known("/powerful"));
         assert!(!slash_command_known("/unknown"));
