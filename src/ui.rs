@@ -1194,6 +1194,13 @@ struct Agent<'a> {
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
+    /// Absolute path of the last file an `edit` or `write` tool call changed
+    /// this session, and the default target of a bare `/open`.
+    ///
+    /// In-memory only, like [`crate::tools::ToolContext::worktree`]: a resumed
+    /// session starts with no pointer rather than one aimed at a file the
+    /// previous run happened to edit.
+    last_edited: Option<std::path::PathBuf>,
     /// Live remote-control bridge (issue #25): the shared [`BroadcastBus`] that
     /// this agent's turn output mirrors into, plus the shared [`TurnShared`] that
     /// remote `prompt`/`btw`/`interrupt` frames drive. `None` until `/rc` (or
@@ -2237,7 +2244,9 @@ impl Agent<'_> {
                 self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
-                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
+                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                for preview in previews {
                     print!("{}", preview.to_ansi(self.color));
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
@@ -7103,7 +7112,9 @@ impl Agent<'_> {
             if !out.calls.is_empty() {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
-                for preview in std::mem::take(&mut self.tool_ctx.edit_previews) {
+                let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
+                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                for preview in previews {
                     let _ = tx.send(UiEvent::EditCard(preview));
                 }
                 for line in std::mem::take(&mut self.tool_ctx.task_completions) {
@@ -9198,6 +9209,7 @@ fn new_agent(
         agents,
         isolation_seq: 0,
         checkpoints: crate::checkpoint::CheckpointStore::new(),
+        last_edited: None,
         remote: None,
         remote_server: None,
         ui_remote: None,
@@ -10535,6 +10547,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -12716,6 +12729,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -12776,6 +12790,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13213,6 +13228,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13392,6 +13408,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13476,6 +13493,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13547,6 +13565,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -13641,6 +13660,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -14804,6 +14824,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -14892,6 +14913,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -15039,6 +15061,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
@@ -15108,6 +15131,7 @@ mod tests {
             templates: Vec::new(),
             agents: Vec::new(),
             checkpoints: crate::checkpoint::CheckpointStore::new(),
+            last_edited: None,
             remote: None,
             remote_server: None,
             ui_remote: None,
