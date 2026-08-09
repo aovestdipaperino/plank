@@ -62,6 +62,16 @@ pub enum Dialog {
     ConfirmDiscard,
 }
 
+/// What the session is editing, which decides the buffer's text conventions
+/// and how the footer labels its exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A half-typed plank prompt: prose, wrapped, submitted verbatim.
+    Prompt,
+    /// A file on disk: no wrapping, and a trailing newline on save.
+    File,
+}
+
 /// One editing session.
 pub struct State {
     /// The text being edited. Shared with the textarea widget, which needs an
@@ -95,6 +105,11 @@ pub struct State {
     /// `TextBuffer::set_margin_enabled`, which has no getter, so the View menu
     /// needs its own copy to render the checkbox.
     pub line_numbers: bool,
+    /// What this session is editing. Set once at construction.
+    pub mode: Mode,
+    /// Display name shown in the status bar — the file's path in
+    /// [`Mode::File`], `None` for a prompt (there is nothing to name).
+    pub title: Option<String>,
 }
 
 impl fmt::Debug for State {
@@ -119,14 +134,39 @@ impl State {
     /// # Errors
     /// Returns the OS error when the text buffer cannot allocate.
     pub fn new(initial: &str, width: CoordType) -> io::Result<Self> {
+        Self::build(initial, width, Mode::Prompt, None)
+    }
+
+    /// Creates a file-editing session for `title`'s contents.
+    ///
+    /// Unlike [`new`](Self::new) this wraps nothing and ends the text with a
+    /// newline; `title` is shown in the status bar.
+    ///
+    /// # Errors
+    /// Returns the OS error when the text buffer cannot allocate.
+    pub fn new_for_file(initial: &str, width: CoordType, title: &str) -> io::Result<Self> {
+        Self::build(initial, width, Mode::File, Some(title.to_string()))
+    }
+
+    /// Shared constructor. The two modes differ only in word wrap and the
+    /// final-newline convention; everything else is identical.
+    fn build(
+        initial: &str,
+        width: CoordType,
+        mode: Mode,
+        title: Option<String>,
+    ) -> io::Result<Self> {
         let buffer = TextBuffer::new_rc(true)?;
+        let original;
         {
             let mut tb = buffer.borrow_mut();
             // plank prompts are prose, not source: wrap rather than scroll
             // sideways, and never invent a trailing newline the user did not
-            // type — the prompt is submitted verbatim.
-            tb.set_insert_final_newline(false);
-            tb.set_word_wrap(true);
+            // type — the prompt is submitted verbatim. A file is the other way
+            // round on both counts.
+            let file = matches!(mode, Mode::File);
+            tb.set_insert_final_newline(file);
+            tb.set_word_wrap(!file);
             tb.set_margin_enabled(true);
             tb.set_width(width);
             // Use write_canon instead of copy_from_str: copy_from_str assumes
@@ -135,6 +175,14 @@ impl State {
             tb.write_canon(initial.as_bytes());
             tb.cursor_move_to_offset(initial.len());
             tb.mark_as_clean();
+            // Read the text back rather than keeping `initial`: in file mode
+            // the buffer may have appended the final newline, and that is the
+            // buffer's own normalization, not an edit the user made. Comparing
+            // against the raw input would show a fresh file as modified and
+            // raise "discard your edits?" on an untouched Esc.
+            let mut canon = String::new();
+            tb.save_as_string(&mut canon);
+            original = canon;
         }
         Ok(Self {
             buffer,
@@ -149,10 +197,12 @@ impl State {
             // the very first frame.
             focus: FocusRequest::Editor,
             dialog: Dialog::None,
-            original: initial.to_string(),
+            original,
             match_case: false,
             whole_word: false,
             line_numbers: true,
+            mode,
+            title,
         })
     }
 
@@ -367,5 +417,50 @@ mod tests {
         s.search = Search::Hidden;
         s.search = Search::Find;
         assert_eq!(s.needle, "beta");
+    }
+
+    /// Prompt mode is unchanged: no trailing newline is invented, because the
+    /// prompt is submitted verbatim.
+    #[test]
+    fn prompt_mode_does_not_add_a_final_newline() {
+        crate::miniedit::init().unwrap();
+        let state = State::new("hello", 80).unwrap();
+        assert_eq!(state.mode, Mode::Prompt);
+        assert_eq!(state.title, None);
+        assert_eq!(state.text(), "hello");
+        assert!(!state.is_modified());
+    }
+
+    /// File mode ends the file with a newline, the POSIX convention every tool
+    /// downstream of the editor expects.
+    #[test]
+    fn file_mode_adds_a_final_newline() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("hello", 80, "a.txt").unwrap();
+        assert_eq!(state.mode, Mode::File);
+        assert_eq!(state.title.as_deref(), Some("a.txt"));
+        assert_eq!(state.text(), "hello\n");
+    }
+
+    /// The newline file mode adds must not read as a user edit: otherwise
+    /// opening a file with no trailing newline and pressing Esc would raise
+    /// "discard your edits?" over an edit the user never made.
+    #[test]
+    fn the_added_final_newline_is_not_a_modification() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("hello", 80, "a.txt").unwrap();
+        assert!(
+            !state.is_modified(),
+            "a freshly opened file must start clean"
+        );
+    }
+
+    /// A file that already ends in a newline round-trips byte-for-byte.
+    #[test]
+    fn file_mode_round_trips_an_already_newline_terminated_file() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("a\nb\n", 80, "a.txt").unwrap();
+        assert_eq!(state.text(), "a\nb\n");
+        assert!(!state.is_modified());
     }
 }

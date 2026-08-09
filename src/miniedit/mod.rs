@@ -37,7 +37,7 @@ pub fn init() -> io::Result<()> {
 pub mod draw;
 pub mod state;
 
-pub use state::{Outcome, Search, State};
+pub use state::{Mode, Outcome, Search, State};
 
 use edit::input;
 use edit::sys;
@@ -58,6 +58,28 @@ use stdext::arena::scratch_arena;
 /// Returns an error when the scratch arena or the text buffer cannot be
 /// allocated, or when the terminal cannot be switched to raw mode.
 pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
+    run(initial, Mode::Prompt, None)
+}
+
+/// Opens the built-in editor on a file's contents.
+///
+/// `title` is the display path shown in the status bar; `initial` is the file's
+/// text. Returns the edited text on accept and `None` on cancel — this function
+/// does no file I/O of its own, so miniedit stays a string-in/string-out
+/// editor and `crate::openfile` owns reading and writing.
+///
+/// The same terminal-ownership and thread rules as [`edit_text`] apply.
+///
+/// # Errors
+/// Returns an error when the scratch arena or the text buffer cannot be
+/// allocated, or when the terminal cannot be switched to raw mode.
+pub fn edit_file(title: &str, initial: &str) -> io::Result<Option<String>> {
+    run(initial, Mode::File, Some(title))
+}
+
+/// The editor session: takes the terminal, pumps input until the user accepts
+/// or cancels, and puts the terminal back.
+fn run(initial: &str, mode: Mode, title: Option<&str>) -> io::Result<Option<String>> {
     debug_log("--- session start");
     init()?;
 
@@ -74,7 +96,10 @@ pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
     let mut tui = Tui::new()?;
     sys::inject_window_size_into_stdin();
 
-    let mut state = State::new(initial, tui.size().width)?;
+    let mut state = match (mode, title) {
+        (Mode::File, Some(title)) => State::new_for_file(initial, tui.size().width, title)?,
+        _ => State::new(initial, tui.size().width)?,
+    };
 
     loop {
         {
@@ -93,10 +118,10 @@ pub fn edit_text(initial: &str) -> io::Result<Option<String>> {
             let mut input_iter = input_parser.parse(vt_iter);
             while {
                 let input = input_iter.next();
-                let more = input.is_some();
+                let has_more_input = input.is_some();
                 let mut ctx = tui.create_context(input);
                 draw::draw(&mut ctx, &mut state);
-                more
+                has_more_input
             } {}
         }
 

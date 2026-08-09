@@ -282,13 +282,25 @@ fn status_bar(ctx: &mut Context, state: &mut State) {
             &format!("{marker} Ln {}, Col {}", pos.y + 1, pos.x + 1),
         );
 
+        // A prompt has no name worth showing; a file does, and it is the only
+        // thing on screen that says which file is being written.
+        if let Some(title) = state.title.clone() {
+            ctx.label("title", &title);
+        }
+
         if let Some(err) = state.error.clone() {
             ctx.label("error", &err);
         }
 
         ctx.label("menu-hint", "F10 menu");
 
-        if ctx.button("accept", "Use text (Ctrl+S)", ButtonStyle::default()) {
+        // "Use text" is prompt language: it hands the text back to the prompt.
+        // In file mode the button writes to disk, so it says so.
+        let accept = match state.mode {
+            crate::miniedit::Mode::Prompt => "Use text (Ctrl+S)",
+            crate::miniedit::Mode::File => "Save (Ctrl+S)",
+        };
+        if ctx.button("accept", accept, ButtonStyle::default()) {
             state.outcome = Outcome::Accept;
         }
         if ctx.button("cancel", "Discard (Esc)", ButtonStyle::default()) {
