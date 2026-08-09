@@ -385,6 +385,11 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model)?;
+        // `--dspark` without `--mtp` resolves to the default support model,
+        // fetched on demand. Kept local rather than written back into `cfg`:
+        // only the engine open needs it.
+        let mut tuning = cfg.engine.clone();
+        plank::download::ensure_dspark_support(&mut tuning)?;
 
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
@@ -401,7 +406,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             cfg.generation.ctx_size,
             cfg.n_threads,
             cfg.power_percent,
-            &cfg.engine,
+            &tuning,
         )
         .map_err(|e| e.to_string())?;
         drop(replacer);
@@ -574,6 +579,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model_path)?;
+        // See the local-engine path: resolved into a local copy, not `cfg`.
+        let mut tuning = cfg.engine.clone();
+        plank::download::ensure_dspark_support(&mut tuning)?;
         let backend = match cfg.backend {
             Some(Backend::Cuda) => Ds4Backend::Cuda,
             Some(Backend::Cpu) => Ds4Backend::Cpu,
@@ -587,7 +595,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             cfg.generation.ctx_size,
             cfg.n_threads,
             cfg.power_percent,
-            &cfg.engine,
+            &tuning,
             &cfg.system,
         )
         .map_err(|e| e.to_string())?;

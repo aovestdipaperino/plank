@@ -40,6 +40,14 @@ const REPO: &str = "antirez/deepseek-v4-gguf";
 /// post-training — so the tensor layout the engine expects is the same.
 const FILE: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
 
+/// The `DSpark` speculative-decoding support GGUF (~5.6 GB) for Flash `-0731`.
+///
+/// Not a standalone model: it is the auxiliary drafter, and it is
+/// checkpoint-specific — pairing it with an older Flash is a load error, not a
+/// quality question, which is why it carries the same `-0731` suffix as
+/// [`FILE`] and is fetched from the same repository.
+const DSPARK_FILE: &str = "DeepSeek-V4-Flash-DSpark-support-0731.gguf";
+
 /// Records which `FILE` produced the local model, alongside it.
 ///
 /// Without this a bumped [`FILE`] would be invisible to anyone who already has
@@ -438,10 +446,99 @@ fn file_url(file: &str) -> String {
     format!("https://huggingface.co/{REPO}/resolve/main/{file}")
 }
 
+/// Default `DSpark` support-model location, used when `--dspark` is given
+/// without an explicit `--mtp`.
+///
+/// Sits beside the main model and mirrors its name so the pairing is legible
+/// on disk: `ds4flash.gguf` and `ds4flash.dspark.gguf`.
+#[must_use]
+pub fn default_dspark_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds4flash.dspark.gguf")
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
     file_url(FILE)
+}
+
+/// Hugging Face download URL for the `DSpark` support GGUF.
+#[must_use]
+pub fn dspark_url() -> String {
+    file_url(DSPARK_FILE)
+}
+
+/// Ensures the `DSpark` support model exists at `path`, offering to download it
+/// when it is missing.
+///
+/// Deliberately simpler than [`ensure_model`]: no upgrade check. The support
+/// file is pinned to the target checkpoint rather than tracking a quant
+/// family, so "is there a newer build" is not a question worth asking on every
+/// launch — a mismatched drafter is refused by the engine at load.
+///
+/// # Errors
+/// Returns an error string when the user declines, when stdin is not a
+/// terminal (so no prompt is possible), or when the download fails.
+pub fn ensure_dspark(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "no DSpark support model at {}; pass --mtp <path> or download it first",
+            path.display()
+        ));
+    }
+    let resuming = partial_bytes(path) > 0;
+    eprintln!("No DSpark support model found at {}.", path.display());
+    if resuming {
+        eprintln!(
+            "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
+            gb(partial_bytes(path))
+        );
+    } else {
+        eprintln!("plank can download the DSpark support model (~5.6 GB) from Hugging Face:");
+    }
+    eprintln!("  {}", dspark_url());
+    eprint!(
+        "{} it now? [Y/n] ",
+        if resuming { "Resume" } else { "Download" }
+    );
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    // Default to yes: Enter (empty) accepts, like the main model prompt.
+    if matches!(answer.trim(), "n" | "N" | "no") {
+        return Err(
+            "no DSpark support model available; re-run without --dspark or pass --mtp <path>"
+                .to_string(),
+        );
+    }
+    download(&dspark_url(), path)
+}
+
+/// Resolves the `DSpark` support model for a run that asked for `--dspark`
+/// without naming one, fetching it if needed.
+///
+/// An explicit `--mtp` always wins and is left untouched — it is also how a
+/// legacy one-stage MTP drafter is supplied, which is a different file
+/// entirely. Does nothing unless `DSpark` was actually requested, so a normal
+/// run never pays for this.
+///
+/// # Errors
+/// Propagates [`ensure_dspark`] failures: declined prompt, no terminal to
+/// prompt on, or a failed download.
+pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result<(), String> {
+    if !engine.dspark || engine.mtp_path.is_some() {
+        return Ok(());
+    }
+    let path = default_dspark_path();
+    ensure_dspark(&path)?;
+    engine.mtp_path = Some(path);
+    Ok(())
 }
 
 /// Ensures a model file exists at `path`, offering to download it if missing.
@@ -1499,6 +1596,47 @@ mod tests {
     #[test]
     fn default_path_is_under_plank() {
         assert!(default_model_path().ends_with(".plank/ds4flash.gguf"));
+    }
+
+    #[test]
+    fn dspark_path_sits_beside_the_main_model() {
+        let main = default_model_path();
+        let spark = default_dspark_path();
+        assert_eq!(main.parent(), spark.parent());
+        assert!(spark.ends_with(".plank/ds4flash.dspark.gguf"));
+    }
+
+    #[test]
+    fn dspark_url_points_at_the_support_gguf() {
+        let url = dspark_url();
+        assert!(url.contains(DSPARK_FILE));
+        assert!(url.contains("0731"), "must be checkpoint-specific: {url}");
+    }
+
+    #[test]
+    fn support_resolution_is_skipped_unless_dspark_was_asked_for() {
+        // No --dspark: the resolver must not touch mtp_path, and so must never
+        // reach the filesystem or a prompt.
+        let mut e = crate::config::EngineTuning::default();
+        assert!(ensure_dspark_support(&mut e).is_ok());
+        assert_eq!(e.mtp_path, None);
+    }
+
+    #[test]
+    fn an_explicit_mtp_path_wins_over_the_default() {
+        // --mtp is also how a legacy one-stage MTP drafter is supplied, so it
+        // must survive --dspark untouched rather than being replaced by the
+        // DSpark default.
+        let mut e = crate::config::EngineTuning {
+            dspark: true,
+            mtp_path: Some(PathBuf::from("/somewhere/custom-drafter.gguf")),
+            ..crate::config::EngineTuning::default()
+        };
+        assert!(ensure_dspark_support(&mut e).is_ok());
+        assert_eq!(
+            e.mtp_path,
+            Some(PathBuf::from("/somewhere/custom-drafter.gguf"))
+        );
     }
 
     #[test]
