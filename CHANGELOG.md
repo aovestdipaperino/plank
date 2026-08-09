@@ -43,6 +43,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **DSpark speculative decoding, behind `--dspark`.** DeepSeek's auxiliary
+  draft checkpoint for V4 Flash reads hidden states from the main model and
+  proposes up to five tokens ahead; the target model verifies them and commits
+  only the prefix it agrees with, so one verification pass can advance the
+  stream by several tokens. Off by default. `--dspark-confidence F` sets the
+  pruning threshold, `--dspark-strict` loads the drafter but keeps target-only
+  decode, and sampled decoding never uses proposals — verification is argmax,
+  so speculation only applies at `--temp 0`.
+
+  The support model does not need `--mtp`: it resolves to
+  `~/.plank/ds4flash.dspark.gguf` and is offered for download (~5.6 GB) through
+  the same prompt, resume and progress path as the main model. An explicit
+  `--mtp` still wins, since that is also how a legacy one-stage MTP drafter is
+  supplied.
+
+  Worth knowing before turning it on: the payoff moved a long way during
+  development. Through the M5 decode-fusion work it was a consistent *loss* on
+  an M5 Max — 0.71× on generation, because verification and replay cost more
+  than the target passes they saved. Upstream then pipelined the Metal verifier
+  (`42033ee`), and the same measurement flipped to **1.19×**, with wall clock
+  agreeing at 0.81×. Both figures are one machine, one quant, one engine
+  commit; treat any DSpark number as attached to a specific engine SHA.
+
+- **The exit message reports the session's peak prefill and generation rates**
+  per model, alongside the token totals:
+
+  ```
+  peak DeepSeek V4 Flash  prefill 167.1 tok/s  ·  generation 16.8 tok/s
+  ```
+
+  Session-scoped on purpose — nothing is written to disk. A peak from last week
+  was measured on a different engine build, a different context length and a
+  cooler machine, so comparing against it silently is worse than not comparing.
+  Both rates exclude the first two seconds of their phase, which is where the
+  bias lives: the first decode token pays one-time GPU costs, and a short pass
+  divides by an elapsed dominated by fixed setup. A KV-cache restore is not
+  counted as prefill, however fast it looks.
+
 - **A third screensaver face: two minions.** `ui.screensaverFace` gains
   `minions` alongside `matrix` and `starfield`, and `random` now draws from all
   three: a pair of minions on the shore of a night lake, who walk, blink, elbow

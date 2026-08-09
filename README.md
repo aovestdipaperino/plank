@@ -76,6 +76,21 @@ Details worth knowing:
 
 Without a model (or on non-macOS platforms) plank still runs against a built-in echo stub — useful for developing the UI and tools, not for real inference.
 
+### Speculative decoding (DSpark)
+
+`--dspark` turns on DeepSeek's auxiliary draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with — so one verification pass can advance the stream by several tokens. It is off by default.
+
+The support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. Passing `--mtp <path>` overrides it, which is also how a legacy one-stage MTP drafter is supplied.
+
+```sh
+plank --dspark --temp 0
+```
+
+- `--dspark-confidence F` — pruning threshold, `0..1`. `0` forces fixed five-token blocks (diagnostics). The default is the engine's own and depends on the backend.
+- `--dspark-strict` — load the drafter but keep target-only decode, for comparisons and correctness checks.
+
+Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it actually pays depends on the engine build, the quant, and the machine — on an M5 Max it was a 0.71× *slowdown* until upstream pipelined the Metal verifier, after which the same measurement read 1.19×. Plank's exit message reports the session's peak prefill and generation rates, which is the quickest way to check on your own hardware.
+
 ### Plank-only features
 
 plank tracks `ds4_agent` for the core agent loop but moves faster on the user-facing side. A few of the things that exist only in plank:

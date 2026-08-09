@@ -109,13 +109,23 @@ loop — with piped stdin there is no live input to multiplex.
   non-ds4 engines opt in only to what they support.
 - `ffi.rs` — raw declarations for the subset of the ds4 C API plank uses
   (engine open/close, chat-template tokenization, session sync/sample/eval,
-  KV snapshots). Present only under the `ds4_engine` cfg.
+  speculative decode, KV snapshots). Present only under the `ds4_engine` cfg.
+  `Ds4EngineOptions` mirrors the C `ds4_engine_options` **positionally**, so a
+  field inserted mid-struct upstream shifts everything after it with no compile
+  error; `ffi::tests` pins every offset and the struct size against `offsetof`
+  on the checked-out header.
+- `speeds.rs` — per-model peak prefill and generation rates for the current
+  session, printed in the exit message. Session-scoped and never persisted;
+  both rates exclude the first `STEADY_WARMUP_SECS` of their phase.
 - `ds4engine.rs` — the safe wrapper, split (issue #28) into `Ds4Model` (immutable
   `Arc`-shareable weights / tokenizer / Metal queue) and `Ds4Session` (one live
   FFI session, its KV suffix + cursor, implements `Engine`). The single-owner
   path is a `Ds4Session` over a solely-owned `Ds4Model`; it keeps one live session
   across turns so `ds4_session_sync` reuses the cached KV prefix and only prefills
-  the new suffix.
+  the new suffix. With DSpark enabled and greedy sampling, the decode loop drives
+  `ds4_session_eval_speculative_argmax` instead of one `ds4_session_eval` per
+  token — the only entry point that consumes drafts, and the reason configuring
+  the engine for DSpark is not on its own enough to get any benefit from it.
 - `snapshot.rs` — the safe KV snapshot primitive: `SessionSnapshot`
   (`capture`/`restore`/`as_bytes`/`restore_bytes`) over the FFI, plus an
   unconditional-restore `RestoreOnDrop` guard. Shared by `generate_aside`,
