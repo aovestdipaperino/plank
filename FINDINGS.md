@@ -677,10 +677,25 @@ test` and review the diff before committing.
   headline number; `net_saved` is the one to read.
   **Confirm against `./ds4` before suspecting plank.** Building the reference
   CLI out of the submodule (`make ds4`) and running the same prompt and model
-  gives `generation: 11.52 t/s` target-only against `7.88 t/s` with
-  `--dspark` — 0.68x, the same direction and rough magnitude plank shows. Two
-  binaries agreeing rules the port out in one step, and it is much cheaper
-  than reasoning about the FFI.
+  reproduces the loss: paired replicas give `21.92 / 21.78 t/s` target-only
+  against `15.79 / 15.44 t/s` with `--dspark`, roughly 0.71x. Two binaries
+  agreeing rules the port out in one step, and it is much cheaper than
+  reasoning about the FFI. This survived the M5 decode-fusion import, which
+  lifted ordinary decode without making speculation pay: the fusions optimize
+  the target path, so a faster target leaves speculation *less* to save.
+- **Do not time this with one-shot `./ds4 -p`; use `ds4-bench`.** Ad-hoc CLI
+  timings of a long generation swing wildly on a laptop — the same
+  target-only command measured 34.01, 21.92 and 21.78 t/s across three runs,
+  and an early cold-cache run read 11.52. Any before/after conclusion drawn
+  from single runs like that is noise. The fork's contract is three
+  independent `ds4-bench` processes with the *Promessi sposi* fixture at a
+  fixed 2048-token context (the exact command is in
+  `speed-bench/ds4_m5_fusion_port_results.md`), reporting median and min-max.
+  On that instrument this machine reads decode `42.03 t/s` median
+  (42.86/41.86/42.03) and steady `42.31`, against the fork's documented
+  `39.39` median baseline at `caf64d1` — so the M5 fusions are engaged and
+  worth about +7%. Paired A/B on one instrument beats absolute numbers across
+  two.
 - **plank's greedy output is not bit-reproducible, and it is not `DSpark`.**
   Across twelve `--temp 0` runs of one prompt, ten produced the same output
   and two diverged from the first token — one under `--dspark`, one under
