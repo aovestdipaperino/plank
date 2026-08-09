@@ -3380,6 +3380,10 @@ impl Agent<'_> {
                 Ok(path) => println!("exported session to {}", path.display()),
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
             },
+            // miniedit needs the raw terminal and only the TUI can suspend
+            // itself to hand it over; there is deliberately no $EDITOR
+            // fallback here.
+            "/open" => println!("/open requires the interactive TUI"),
             "/insights" => {
                 let color = self.color;
                 let mut note = |line: String| println!("{}", status::system_line(&line, color));
@@ -8072,6 +8076,7 @@ impl Agent<'_> {
                     log.push_dim("usage: /export [md|html] [path]".to_owned());
                 }
             },
+            "/open" => self.tui_open(arg, log, terminal),
             "/insights" => {
                 // The scan and the model calls both take long enough to look
                 // like a hang, so each progress note is pinned in the prompt's
@@ -8240,6 +8245,85 @@ impl Agent<'_> {
             },
         }
         true
+    }
+
+    /// Handles `/open [path]`: edits a file in the built-in editor and writes
+    /// it back on accept.
+    ///
+    /// Every refusal is a log line and no editor launch, so a typo cannot
+    /// create a file and a binary file cannot be mangled by the `String`
+    /// buffer. Unlike the Ctrl-G prompt path this ignores
+    /// `settings.ui.builtin_editor`: `/open` *is* the built-in editor command,
+    /// and there is no `$EDITOR` fallback to fall back to.
+    #[cfg(feature = "builtin_editor")]
+    fn tui_open(
+        &mut self,
+        arg: &str,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) {
+        let path = match crate::openfile::resolve_open_target(
+            arg,
+            self.last_edited.as_deref(),
+            &self.tool_ctx.cwd,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                log.push_plain(e);
+                return;
+            }
+        };
+        let initial = match crate::openfile::load(&path) {
+            Ok(text) => text,
+            Err(e) => {
+                log.push_plain(e);
+                return;
+            }
+        };
+        let display = path.display().to_string();
+        // miniedit takes the raw terminal, exactly like a child process, so the
+        // TUI has to be fully torn down and put back around it.
+        let edited =
+            with_tui_suspended(terminal, || crate::miniedit::edit_file(&display, &initial));
+        // The accept/cancel/no-op decision lives in `openfile` so it can be
+        // unit-tested; this arm only performs it.
+        let edited = match edited {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                log.push_plain(format!("/open failed: {e}"));
+                return;
+            }
+        };
+        match crate::openfile::after_edit(edited, &initial) {
+            crate::openfile::AfterEdit::Save(text) => {
+                match crate::openfile::save(&path, &text) {
+                    Ok(()) => log.push_plain(crate::openfile::wrote_message(&display, &text)),
+                    // The pointer is still set below: a failed save leaves the
+                    // file as the obvious thing to reopen and retry.
+                    Err(e) => log.push_plain(format!("save failed: {e}")),
+                }
+            }
+            crate::openfile::AfterEdit::Unchanged => {
+                log.push_dim(crate::openfile::unchanged_message(&display));
+            }
+        }
+        // Even a cancel points the pointer here: this is the file the user was
+        // last looking at, so the next bare `/open` should reopen it.
+        self.last_edited = Some(path);
+    }
+
+    /// Without the built-in editor compiled in there is nothing for `/open` to
+    /// open: the command deliberately has no `$EDITOR` fallback.
+    #[cfg(not(feature = "builtin_editor"))]
+    fn tui_open(
+        &mut self,
+        _arg: &str,
+        log: &mut OutputLog,
+        _terminal: &mut ratatui::DefaultTerminal,
+    ) {
+        log.push_plain(
+            "/open needs the built-in editor (build with --features builtin_editor)".to_owned(),
+        );
     }
 }
 
