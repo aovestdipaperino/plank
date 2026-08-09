@@ -142,9 +142,10 @@ impl Ds4Model {
             prefill_chunk: tuning.prefill_chunk,
             mtp_draft_tokens: tuning.mtp_draft_tokens,
             mtp_margin: tuning.mtp_margin,
-            dspark_confidence_threshold: tuning
-                .dspark_confidence
-                .unwrap_or(crate::config::DSPARK_CONFIDENCE_DEFAULT),
+            // Ignored by the engine unless `_set` below is true, in which case
+            // it picks its own backend-dependent default. Passing a placeholder
+            // beats mirroring a number that upstream retunes.
+            dspark_confidence_threshold: tuning.dspark_confidence.unwrap_or(0.0),
             directional_steering_file: as_ptr(&c_steering),
             expert_profile_path: std::ptr::null(),
             directional_steering_attn: tuning.dir_steering_attn,

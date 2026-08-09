@@ -177,10 +177,6 @@ pub const DEFAULT_CONTROL_QUEUE_MAX: usize = 1 << 20; // 1 MiB
 /// large enough that the extra command-buffer overhead stays negligible.
 pub const DEFAULT_PREFILL_CHUNK: u32 = 256;
 
-/// `DSpark` confidence-pruning threshold the C engine uses when `--dspark` is
-/// given without `--dspark-confidence`.
-pub const DSPARK_CONFIDENCE_DEFAULT: f32 = 0.7;
-
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
 /// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
 /// keep the engine defaults; the whole struct is ignored by `EchoEngine`.
@@ -194,7 +190,11 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Use the `--mtp` support GGUF as a `DSpark` draft model, from `--dspark`.
+    /// Use a `DSpark` draft model, from `--dspark`.
+    ///
+    /// The support GGUF comes from `--mtp` when given; otherwise it is
+    /// resolved to `~/.plank/ds4flash.dspark.gguf` at startup and downloaded
+    /// if absent (`download::ensure_dspark_support`).
     ///
     /// `DSpark` is `DeepSeek`'s auxiliary draft checkpoint for V4 Flash; it
     /// replaces the legacy one-stage MTP path. `--dspark-confidence` and
@@ -204,9 +204,11 @@ pub struct EngineTuning {
     pub dspark_strict: bool,
     /// Confidence-pruning threshold from `--dspark-confidence F`, `0..=1`.
     ///
-    /// `None` leaves the C default ([`DSPARK_CONFIDENCE_DEFAULT`]) in force;
-    /// the engine is told explicitly whether it was set, because `0` means
-    /// "fixed draft length", not "unset".
+    /// `None` leaves the engine's own default in force, which is
+    /// backend-dependent (Metal 0.6, CUDA/ROCm 0.7) and has changed with
+    /// tuning — so plank does not keep a copy of the number to go stale.
+    /// The engine is told explicitly whether the flag was set, because `0`
+    /// means "fixed five-token blocks", not "unset".
     pub dspark_confidence: Option<f32>,
     /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
     /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
@@ -385,8 +387,10 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --dspark             DSpark speculative decoding using the --mtp support GGUF
-      --dspark-confidence F  DSpark confidence pruning threshold 0..1 (default 0.7)
+      --dspark             DSpark speculative decoding; downloads the support model
+                           to ~/.plank/ds4flash.dspark.gguf unless --mtp names one
+      --dspark-confidence F  DSpark confidence pruning threshold 0..1
+                           (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
       --dspark-strict      load DSpark support but keep target-only decode
       --quality            enable quality mode
       --warm-weights       touch all weights at load

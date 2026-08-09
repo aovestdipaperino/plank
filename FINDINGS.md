@@ -663,26 +663,33 @@ test` and review the diff before committing.
   both. The committed run is already in the KV cache when the call returns,
   so nothing downstream can reject part of it — which is why think-recovery
   now runs once per block instead of once per token.
-- **`DSpark` is a net loss on M5 Max at IQ2XXS, and so is the C reference.**
-  The reported speedups are an M3 Ultra result; M5 is not supported yet, so
-  treat a slowdown here as expected rather than as a porting bug. Measured
-  through plank: a ~600-word generation ran 94-98s target-only against
-  117-129s under `--dspark`, and 17KB of Rust ran 415s against 521s — code is
-  supposed to be `DSpark`'s best case and was its worst. `DS4_DSPARK_STATS=1`
-  explains it without guesswork: on the code run `accept_rate=74.13%` looks
-  healthy, but `no_draft=1824` of `cycles=2537` and `scheduler_skips=1444`
-  mean most cycles never draft, and the totals are the verdict —
-  `saved=148784ms` against `spec_total=244276ms`, i.e. `net_saved=-125652ms`,
-  with `replay=134555ms` the single largest cost. Accept rate is the wrong
-  headline number; `net_saved` is the one to read.
+- **`DSpark` on Metal went from 0.71x to 1.19x on one upstream commit — pin the
+  engine before quoting any number.** Through the whole M5 fusion work it was a
+  clear loss on M5 Max at IQ2XXS: paired plank replicas read `19.84 t/s`
+  target-only against `13.99 t/s` with `--dspark`, and `DS4_DSPARK_STATS=1`
+  said why — `accept_rate=74.13%` looked healthy, but `verify=107s` and
+  `replay=134555ms` against `saved=148784ms` left `net_saved=-125652ms`.
+  Then `42033ee metal: pipeline `DFlash` verification` (submit tiny
+  target-verifier batches incrementally, and retune the Metal confidence
+  default to 0.6) flipped it: `19.84` against `23.63 t/s`, 1.19x, with wall
+  clock agreeing at 0.81x and `--dspark` winning every pair. Nothing in plank
+  changed between those two measurements — the same binary, prompt, and model.
+  Two lessons. `net_saved` is the number to read, not `accept_rate`, which
+  looked fine in both regimes. And a `DSpark` verdict is only ever true of one
+  engine commit, so record the SHA next to the figure.
   **Confirm against `./ds4` before suspecting plank.** Building the reference
   CLI out of the submodule (`make ds4`) and running the same prompt and model
-  reproduces the loss: paired replicas give `21.92 / 21.78 t/s` target-only
-  against `15.79 / 15.44 t/s` with `--dspark`, roughly 0.71x. Two binaries
+  reproduced the loss era exactly — `21.92 / 21.78 t/s` target-only against
+  `15.79 / 15.44` with `--dspark`, the same 0.71x plank showed. Two binaries
   agreeing rules the port out in one step, and it is much cheaper than
-  reasoning about the FFI. This survived the M5 decode-fusion import, which
-  lifted ordinary decode without making speculation pay: the fusions optimize
-  the target path, so a faster target leaves speculation *less* to save.
+  reasoning about the FFI.
+- **`--dspark-confidence` has no fixed default, so plank does not name one.**
+  The engine picks `METAL ? 0.6 : 0.7` and *ignores the value plank passes*
+  unless `dspark_confidence_threshold_set` is true — which is why the field is
+  `Option<f32>` (`0` means "fixed five-token blocks", not "unset"). A mirrored
+  constant went stale the moment upstream retuned Metal from 0.7 to 0.6, so
+  there is deliberately no `DSPARK_CONFIDENCE_DEFAULT` in `config.rs`: the
+  unset case passes a placeholder the engine discards.
 - **Do not time this with one-shot `./ds4 -p`; use `ds4-bench`.** Ad-hoc CLI
   timings of a long generation swing wildly on a laptop — the same
   target-only command measured 34.01, 21.92 and 21.78 t/s across three runs,
