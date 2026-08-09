@@ -418,7 +418,19 @@ pub fn warm(
             continue;
         }
         on_stage(t.kind);
-        prefilled |= engine.warm_sync(on_event)?;
+        // Warming is where a cold session does its heaviest prefill — the
+        // system prompt and project context — so the peak prefill rate is
+        // mostly earned here rather than in a turn's own short suffix.
+        // Recorded at the one chokepoint every front-end shares.
+        let model = engine.model_name();
+        prefilled |= engine.warm_sync(&mut |ev| {
+            if let EngineEvent::Prefill(p) = &ev
+                && p.is_complete()
+            {
+                crate::speeds::note_prefill(&model, p.tps, p.done);
+            }
+            on_event(ev);
+        })?;
         if let Some(key) = &t.key
             && let Some(store) = store
             && let Some(cache) = engine.get_kv()

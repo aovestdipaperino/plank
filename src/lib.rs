@@ -68,6 +68,7 @@ pub mod slashmenu;
 /// hostless counterpart to `EngineHost`'s scheduler, for fanning out forks.
 pub mod slice;
 pub mod snapshot;
+pub mod speeds;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;

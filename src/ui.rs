@@ -1573,6 +1573,9 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let think = self.think;
+        // Bound here rather than inside the event closure, which cannot borrow
+        // `self` while `self.engine` is generating.
+        let model_name = self.engine.model_name();
         let prompt_tokens = self.engine.count_tokens(prompt_text);
         let mut bar = crate::statusbar::StatusBar::new(self.show_footer && self.color, self.color);
         let verb = status::random_verb_index();
@@ -1621,6 +1624,12 @@ impl Agent<'_> {
                         }
                     }
                     EngineEvent::Prefill(p) => {
+                        // Only a finished pass has a meaningful rate: mid-pass
+                        // events divide by an elapsed time that has barely
+                        // started, so their tok/s runs high.
+                        if p.is_complete() {
+                            crate::speeds::note_prefill(&model_name, p.tps, p.done);
+                        }
                         bar.show(&Status {
                             // A finished prefill means the engine is sampling,
                             // not prefilling. Saying "prefilling" through the
@@ -2709,6 +2718,10 @@ impl Agent<'_> {
     /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
     /// unless an online provider is driving the turns.
     fn record_usage(&mut self, stats: &crate::engine::GenerationStats) {
+        // Peak decode rate for this model, reported at exit. Attributed to the
+        // engine that actually ran the pass, which during a sidechain is the
+        // alt engine — same rule as the token tally below.
+        crate::speeds::note_generation(&self.engine.model_name(), stats.tps, stats.generated);
         // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
         // updated for this pass, so the local input estimate below sees the
         // previous context size.
@@ -4171,6 +4184,7 @@ the original is frozen and listed in /tree"
             fmt_u64(s.input_tokens),
             fmt_u64(s.output_tokens),
         );
+        self.report_peak_speeds(bold, dim, reset);
         // Only when more than one engine served: with a single one the rows
         // would just repeat the totals a line lower.
         if s.by_engine.len() < 2 {
@@ -4185,6 +4199,43 @@ the original is frozen and listed in /tree"
                 w = width.unwrap_or(0),
             );
         }
+    }
+
+    /// Prints the model's best-ever prefill and generation rates, folding this
+    /// session's peaks into the stored record on the way out.
+    ///
+    /// Silent for engines that never reported a rate — the echo stub, and
+    /// online providers, whose throughput is someone else's network — so a
+    /// provider-only session's exit message is unchanged.
+    fn report_peak_speeds(&self, bold: &str, dim: &str, reset: &str) {
+        let model = self.engine.model_name();
+        let Some(c) = crate::speeds::commit(&model) else {
+            return;
+        };
+        let mut parts: Vec<String> = Vec::new();
+        if c.best.prefill_tps > 0.0 {
+            parts.push(format!(
+                "prefill {}{:.1}{reset} tok/s{}",
+                bold,
+                c.best.prefill_tps,
+                if c.new_prefill { " (new best)" } else { "" },
+            ));
+        }
+        if c.best.gen_tps > 0.0 {
+            parts.push(format!(
+                "generation {}{:.1}{reset} tok/s{}",
+                bold,
+                c.best.gen_tps,
+                if c.new_gen { " (new best)" } else { "" },
+            ));
+        }
+        if parts.is_empty() {
+            return;
+        }
+        println!(
+            "{dim}peak{reset} {model}  {}",
+            parts.join(&format!("  {dim}·{reset}  ")),
+        );
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -7289,6 +7340,9 @@ impl Agent<'_> {
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let think = self.think;
+        // Bound before the event closure, which cannot borrow `self` while
+        // `self.engine` is generating.
+        let model_name = self.engine.model_name();
         // Prompt tokens already in context; generated tokens add onto this so
         // the ctx gauge moves while the model streams.
         let prompt_tokens = self.engine.count_tokens(prompt);
@@ -7335,8 +7389,11 @@ impl Agent<'_> {
                 }
                 EngineEvent::Prefill(p) => Status {
                     // See the plain-REPL path: a completed prefill is the
-                    // sampling wait, not prefilling (#64 follow-up).
+                    // sampling wait, not prefilling (#64 follow-up). A finished
+                    // pass is also the only one whose tok/s means anything, so
+                    // that is where the peak is sampled.
                     state: if p.is_complete() {
+                        crate::speeds::note_prefill(&model_name, p.tps, p.done);
                         WorkerState::Generating
                     } else {
                         WorkerState::Prefill
