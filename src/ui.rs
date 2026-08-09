@@ -1624,12 +1624,9 @@ impl Agent<'_> {
                         }
                     }
                     EngineEvent::Prefill(p) => {
-                        // Only a finished pass has a meaningful rate: mid-pass
-                        // events divide by an elapsed time that has barely
-                        // started, so their tok/s runs high.
-                        if p.is_complete() {
-                            crate::speeds::note_prefill(&model_name, p.tps, p.done);
-                        }
+                        // Every sample, not just the last: the peak is measured
+                        // from the warmup mark onward, which needs the series.
+                        crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
                         bar.show(&Status {
                             // A finished prefill means the engine is sampling,
                             // not prefilling. Saying "prefilling" through the
@@ -2721,7 +2718,7 @@ impl Agent<'_> {
         // Peak decode rate for this model, reported at exit. Attributed to the
         // engine that actually ran the pass, which during a sidechain is the
         // alt engine — same rule as the token tally below.
-        crate::speeds::note_generation(&self.engine.model_name(), stats.tps, stats.generated);
+        crate::speeds::note_generation(&self.engine.model_name(), stats.steady_tps);
         // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
         // updated for this pass, so the local input estimate below sees the
         // previous context size.
@@ -4201,33 +4198,30 @@ the original is frozen and listed in /tree"
         }
     }
 
-    /// Prints the model's best-ever prefill and generation rates, folding this
-    /// session's peaks into the stored record on the way out.
+    /// Prints the peak prefill and generation rates this session reached.
+    ///
+    /// Session-scoped: nothing is stored, so there is no cross-run "best" to
+    /// compare against — a peak from another day was a different engine build
+    /// on a cooler machine.
     ///
     /// Silent for engines that never reported a rate — the echo stub, and
     /// online providers, whose throughput is someone else's network — so a
     /// provider-only session's exit message is unchanged.
     fn report_peak_speeds(&self, bold: &str, dim: &str, reset: &str) {
         let model = self.engine.model_name();
-        let Some(c) = crate::speeds::commit(&model) else {
+        let best = crate::speeds::session_best(&model);
+        if best.is_empty() {
             return;
-        };
+        }
         let mut parts: Vec<String> = Vec::new();
-        if c.best.prefill_tps > 0.0 {
+        if best.prefill_tps > 0.0 {
             parts.push(format!(
-                "prefill {}{:.1}{reset} tok/s{}",
-                bold,
-                c.best.prefill_tps,
-                if c.new_prefill { " (new best)" } else { "" },
+                "prefill {bold}{:.1}{reset} tok/s",
+                best.prefill_tps
             ));
         }
-        if c.best.gen_tps > 0.0 {
-            parts.push(format!(
-                "generation {}{:.1}{reset} tok/s{}",
-                bold,
-                c.best.gen_tps,
-                if c.new_gen { " (new best)" } else { "" },
-            ));
+        if best.gen_tps > 0.0 {
+            parts.push(format!("generation {bold}{:.1}{reset} tok/s", best.gen_tps));
         }
         if parts.is_empty() {
             return;
@@ -7387,28 +7381,29 @@ impl Agent<'_> {
                         ..Status::default()
                     }
                 }
-                EngineEvent::Prefill(p) => Status {
-                    // See the plain-REPL path: a completed prefill is the
-                    // sampling wait, not prefilling (#64 follow-up). A finished
-                    // pass is also the only one whose tok/s means anything, so
-                    // that is where the peak is sampled.
-                    state: if p.is_complete() {
-                        crate::speeds::note_prefill(&model_name, p.tps, p.done);
-                        WorkerState::Generating
-                    } else {
-                        WorkerState::Prefill
-                    },
-                    prefill_done: p.done,
-                    prefill_total: p.total,
-                    prefill_label: verb,
-                    prefill_tps: p.tps,
-                    elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                    ctx_used: prompt_tokens,
-                    ctx_size,
-                    power_percent: power,
-                    think,
-                    ..Status::default()
-                },
+                EngineEvent::Prefill(p) => {
+                    // Every sample feeds the peak; see the plain path.
+                    crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
+                    Status {
+                        // See the plain-REPL path: a completed prefill is the
+                        // sampling wait, not prefilling (#64 follow-up).
+                        state: if p.is_complete() {
+                            WorkerState::Generating
+                        } else {
+                            WorkerState::Prefill
+                        },
+                        prefill_done: p.done,
+                        prefill_total: p.total,
+                        prefill_label: verb,
+                        prefill_tps: p.tps,
+                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
+                        ctx_used: prompt_tokens,
+                        ctx_size,
+                        power_percent: power,
+                        think,
+                        ..Status::default()
+                    }
+                }
                 // Warm-up-only signal; never emitted mid-turn.
                 EngineEvent::Notice(_) => return,
             };

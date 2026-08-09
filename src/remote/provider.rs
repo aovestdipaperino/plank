@@ -1278,6 +1278,8 @@ impl Engine for ProviderEngine {
             .saturating_add(usage.cache_creation_input_tokens)
             .saturating_add(usage.cache_read_input_tokens);
         Ok(GenerationStats {
+            // Not a locally measured decode, so no steady rate.
+            steady_tps: 0.0,
             generated: usage.output_tokens,
             tps: 0.0,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),

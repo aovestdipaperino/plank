@@ -471,6 +471,12 @@ impl TokenUsage {
     }
 }
 
+/// Seconds a phase must run before its rate is treated as representative.
+///
+/// Shared by generation (measured in the engine loop) and prefill (measured
+/// from the progress event stream) so both mean the same thing by "steady".
+pub const STEADY_WARMUP_SECS: f64 = 2.0;
+
 /// Outcome of a generation pass.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationStats {
@@ -478,6 +484,14 @@ pub struct GenerationStats {
     pub generated: i32,
     /// Generation throughput in tokens per second.
     pub tps: f64,
+    /// Generation throughput measured only after the pass has been running for
+    /// [`STEADY_WARMUP_SECS`], or 0 when it never got that far.
+    ///
+    /// The opening of a pass is not representative — the first token pays
+    /// one-time GPU costs — so [`tps`](Self::tps) understates a long run. This
+    /// is the rate to quote as "how fast does this model decode"; `tps` remains
+    /// the honest wall-clock rate for the pass as a whole.
+    pub steady_tps: f64,
     /// Context tokens in use after the pass.
     pub ctx_used: i32,
     /// True when generation stopped because of an interrupt.
@@ -1024,6 +1038,8 @@ impl Engine for EchoEngine {
             on_event(EngineEvent::Text(tail));
         }
         Ok(GenerationStats {
+            // Not a locally measured decode, so no steady rate.
+            steady_tps: 0.0,
             generated: self.count_tokens(&reply),
             tps: 0.0,
             ctx_used: self.count_tokens(transcript),

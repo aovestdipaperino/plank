@@ -259,6 +259,9 @@ impl From<WireStats> for GenerationStats {
         Self {
             generated: s.generated,
             tps: s.tps,
+            // The wire carries the pass rate only; a remote decode is not
+            // this machine's throughput to report as a peak.
+            steady_tps: 0.0,
             ctx_used: s.ctx_used,
             interrupted: s.interrupted,
             usage: None,

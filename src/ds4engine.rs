@@ -105,6 +105,27 @@ unsafe extern "C" fn progress_cb(
     (ctx.on_event)(EngineEvent::Prefill(progress));
 }
 
+/// Decode rate measured from the warmup mark to now, or 0 when the pass never
+/// reached the mark or produced too little after it to mean anything.
+///
+/// `mark` is the instant and token count at which the pass crossed
+/// [`crate::engine::STEADY_WARMUP_SECS`]; `generated` is the count now.
+fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
+    let Some((at, tokens_at)) = mark else {
+        return 0.0;
+    };
+    let secs = at.elapsed().as_secs_f64();
+    let tokens = generated - tokens_at;
+    if secs <= 0.0 || tokens < STEADY_MIN_TOKENS {
+        return 0.0;
+    }
+    f64::from(tokens) / secs
+}
+
+/// Tokens a pass must produce *after* the warmup before its steady rate is
+/// reported. A couple of tokens divided by a sliver of a second is noise.
+const STEADY_MIN_TOKENS: i32 = 8;
+
 impl Ds4Model {
     /// Opens a model file with the given backend, context size, and tuning
     /// knobs (`--mtp`, `--ssd-streaming`, steering, ...).
@@ -998,6 +1019,9 @@ impl Engine for Ds4Session {
             ))
         });
         let start = std::time::Instant::now();
+        // Token count and instant at which this pass crossed the warmup, used
+        // to report a decode rate that excludes the unrepresentative opening.
+        let mut steady_mark: Option<(std::time::Instant, i32)> = None;
 
         // Speculative decode verifies drafts by argmax, so it reproduces the
         // sampled stream only when the whole generation is greedy anyway.
@@ -1014,6 +1038,11 @@ impl Engine for Ds4Session {
         let speculative = draft_block > 1;
 
         while generated < max_tokens {
+            if steady_mark.is_none()
+                && start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
+            {
+                steady_mark = Some((std::time::Instant::now(), generated));
+            }
             if interrupt() {
                 INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
                 break;
@@ -1167,6 +1196,7 @@ impl Engine for Ds4Session {
             } else {
                 0.0
             },
+            steady_tps: steady_rate(steady_mark, generated),
             ctx_used,
             interrupted,
             usage: None,
@@ -1491,6 +1521,9 @@ struct GenState {
     /// Cross-token UTF-8 carry — see [`Ds4Model::token_bytes`].
     utf8: crate::engine::Utf8Stream,
     start: std::time::Instant,
+    /// Token count and instant at which this pass crossed the warmup, for the
+    /// steady decode rate. `None` until it does.
+    steady_mark: Option<(std::time::Instant, i32)>,
 }
 
 /// A [`HostSession`] wrapping a [`Ds4Session`] for the shared engine: it runs
@@ -1609,6 +1642,7 @@ impl Ds4HostSession {
             reply_text: String::new(),
             utf8: crate::engine::Utf8Stream::default(),
             start: std::time::Instant::now(),
+            steady_mark: None,
         }))
     }
 
@@ -1635,6 +1669,7 @@ impl Ds4HostSession {
             } else {
                 0.0
             },
+            steady_tps: steady_rate(st.steady_mark, st.generated),
             ctx_used,
             interrupted,
             usage: None,
@@ -1680,6 +1715,11 @@ impl HostSession for Ds4HostSession {
             }
             if produced >= k {
                 return Ok(None);
+            }
+            if st.steady_mark.is_none()
+                && st.start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
+            {
+                st.steady_mark = Some((std::time::Instant::now(), st.generated));
             }
             let session = self.inner.session;
             // SAFETY: session valid; rng is a valid out-ptr. Greedy is off in

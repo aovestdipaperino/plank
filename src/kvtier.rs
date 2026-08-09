@@ -423,14 +423,24 @@ pub fn warm(
         // mostly earned here rather than in a turn's own short suffix.
         // Recorded at the one chokepoint every front-end shares.
         let model = engine.model_name();
-        prefilled |= engine.warm_sync(&mut |ev| {
-            if let EngineEvent::Prefill(p) = &ev
-                && p.is_complete()
-            {
-                crate::speeds::note_prefill(&model, p.tps, p.done);
+        // Buffered rather than recorded live: a tier served from a KV
+        // checkpoint still reports its token count against an elapsed of
+        // almost nothing, which reads as thousands of tok/s — a number no
+        // model produces, and one a peak would never let go of. `warm_sync`
+        // only says whether it really prefilled once it returns.
+        let mut samples: Vec<(i32, f64)> = Vec::new();
+        let did_prefill = engine.warm_sync(&mut |ev| {
+            if let EngineEvent::Prefill(p) = &ev {
+                samples.push((p.done, p.tps));
             }
             on_event(ev);
         })?;
+        if did_prefill {
+            for (done, tps) in samples {
+                crate::speeds::note_prefill_progress(&model, done, tps);
+            }
+        }
+        prefilled |= did_prefill;
         if let Some(key) = &t.key
             && let Some(store) = store
             && let Some(cache) = engine.get_kv()
