@@ -169,10 +169,23 @@ impl State {
             tb.set_word_wrap(!file);
             tb.set_margin_enabled(true);
             tb.set_width(width);
-            // Use write_canon instead of copy_from_str: copy_from_str assumes
-            // the line count doesn't change and truncates multi-line content
-            // to the first line when the buffer starts empty.
-            tb.write_canon(initial.as_bytes());
+            // Use write_canon/write_raw instead of copy_from_str: copy_from_str
+            // assumes the line count doesn't change and truncates multi-line
+            // content to the first line when the buffer starts empty.
+            //
+            // File mode must use the raw path: write_canon is the
+            // human-typing insert path, and after every newline it re-derives
+            // indentation from the *previous* line and stamps it onto the
+            // next one — which compounds indentation down a file loaded
+            // verbatim from disk (and expands tabs, and normalizes CRLF).
+            // write_raw only normalizes the newline convention, which is set
+            // from the input first so it round-trips exactly.
+            if file {
+                tb.set_crlf(initial.contains("\r\n"));
+                tb.write_raw(initial.as_bytes());
+            } else {
+                tb.write_canon(initial.as_bytes());
+            }
             tb.cursor_move_to_offset(initial.len());
             tb.mark_as_clean();
             // Read the text back rather than keeping `initial`: in file mode
@@ -461,6 +474,42 @@ mod tests {
         crate::miniedit::init().unwrap();
         let state = State::new_for_file("a\nb\n", 80, "a.txt").unwrap();
         assert_eq!(state.text(), "a\nb\n");
+        assert!(!state.is_modified());
+    }
+
+    /// Regression: `write_canon` re-derives each line's indentation from the
+    /// *previous* line and compounds it going down the file — fine for a
+    /// human typing in the prompt editor, corruption for a file loaded
+    /// verbatim from disk. File mode must use the raw insert path so
+    /// indentation is preserved exactly as written.
+    #[test]
+    fn file_mode_preserves_brace_and_space_indentation() {
+        crate::miniedit::init().unwrap();
+        let src = "fn a() {\n    let x = 1;\n    let y = 2;\n}\n";
+        let state = State::new_for_file(src, 80, "a.rs").unwrap();
+        assert_eq!(state.text(), src);
+        assert!(!state.is_modified());
+    }
+
+    /// Regression: a tab-indented Makefile line must not be expanded to
+    /// spaces or have indentation compounded onto it.
+    #[test]
+    fn file_mode_preserves_tab_indentation() {
+        crate::miniedit::init().unwrap();
+        let src = "all:\n\tgcc x.c\n";
+        let state = State::new_for_file(src, 80, "Makefile").unwrap();
+        assert_eq!(state.text(), src);
+        assert!(!state.is_modified());
+    }
+
+    /// Regression: CRLF-terminated files must round-trip with their line
+    /// endings intact, not silently normalized to LF.
+    #[test]
+    fn file_mode_preserves_crlf_line_endings() {
+        crate::miniedit::init().unwrap();
+        let src = "a\r\nb\r\n";
+        let state = State::new_for_file(src, 80, "a.txt").unwrap();
+        assert_eq!(state.text(), src);
         assert!(!state.is_modified());
     }
 }
