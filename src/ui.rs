@@ -6260,8 +6260,12 @@ impl Agent<'_> {
                     crate::kvpane::Outcome::Stay => {}
                     crate::kvpane::Outcome::Close => kv_pane = None,
                     // Pin and unpin only rewrite a sidecar's `pinned` flag, and
-                    // the pane already flipped its own copy for the display, so
-                    // rebuilding here would only cost a rescan.
+                    // the pane already flipped its own copy for the display.
+                    // Rebuilding here would throw away the user's folds and
+                    // cursor; the expired markers and the footer's reclaimable
+                    // figure used to go stale as a result, so the pane now
+                    // re-derives both from its effective pin state on every
+                    // draw instead.
                     crate::kvpane::Outcome::Pin(fp) => {
                         log.push_dim(self.kvcache_apply("pin", &fp));
                     }

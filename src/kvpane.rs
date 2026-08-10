@@ -79,8 +79,13 @@ pub struct KvPane {
     flat: Vec<Flat>,
     /// Metadata parallel to `Flat::meta`, in the same order.
     metas: Vec<KvMeta>,
-    /// Metadata indices a sweep would condemn right now.
+    /// Metadata indices a sweep would condemn given the *on-disk* pin flags.
+    /// Only a starting point: [`KvPane::sweep_now`] re-derives the verdicts
+    /// whenever the pane holds unsaved pin flips.
     condemned: HashSet<usize>,
+    /// The policy the verdicts are derived under, kept so a pin flip can be
+    /// re-costed without rebuilding the pane and losing the fold state.
+    policy: SweepPolicy,
     /// Collapse keys whose subtrees are hidden.
     collapsed: HashSet<String>,
     /// Fingerprints whose pin state the pane has flipped locally, so a second
@@ -138,6 +143,7 @@ impl KvPane {
         Self {
             flat,
             condemned: plan.doomed.iter().copied().collect(),
+            policy,
             metas,
             collapsed: HashSet::new(),
             pin_flips: HashSet::new(),
@@ -171,11 +177,39 @@ impl KvPane {
         meta.pinned ^ self.pin_flips.contains(&meta.fingerprint)
     }
 
+    /// The sweep verdicts and reclaimable total under the pane's *effective*
+    /// pin state, i.e. the on-disk flags with the local `p` flips applied.
+    ///
+    /// The construction-time snapshot cannot answer this: `plan_sweep` spares a
+    /// pinned node, so pinning an expired row would leave its bytes counted as
+    /// reclaimable, and unpinning a pinned-but-idle row would hide both its
+    /// bytes and its `⏳` marker. Re-planning is pure and in-memory, so it is
+    /// cheap enough to do per draw rather than rebuilding the pane — which would
+    /// throw away the user's folds and cursor.
+    fn sweep_now(&self) -> (HashSet<usize>, u64) {
+        if self.pin_flips.is_empty() {
+            return (self.condemned.clone(), self.reclaimable);
+        }
+        let metas: Vec<KvMeta> = self
+            .metas
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                m.pinned = self.pinned(&m);
+                m
+            })
+            .collect();
+        let plan = plan_sweep(&metas, &[], &self.policy, self.now);
+        (plan.doomed.into_iter().collect(), plan.bytes)
+    }
+
     /// The render rows, top to bottom, with collapsed subtrees omitted.
     #[must_use]
     pub fn rows(&self) -> Vec<Row> {
         let visible = self.visible();
         let cursor = self.cursor.min(visible.len().saturating_sub(1));
+        // One re-plan for the whole draw, not one per row.
+        let (condemned, _) = self.sweep_now();
         visible
             .iter()
             .enumerate()
@@ -200,7 +234,7 @@ impl KvPane {
                     depth: f.depth,
                     label: format!("{}  {}", m.role.as_str(), short_name(m)),
                     detail: detail_of(m),
-                    right: self.right_of(mi),
+                    right: self.right_of(mi, &condemned),
                     selected,
                     expanded,
                     has_children: f.has_children,
@@ -210,8 +244,9 @@ impl KvPane {
             .collect()
     }
 
-    /// The right-hand column for one metadata index.
-    fn right_of(&self, mi: usize) -> String {
+    /// The right-hand column for one metadata index, against the verdicts
+    /// [`KvPane::sweep_now`] produced for this draw.
+    fn right_of(&self, mi: usize, condemned: &HashSet<usize>) -> String {
         let m = &self.metas[mi];
         let mut s = format!(
             "{}  hits {}  {}",
@@ -221,7 +256,7 @@ impl KvPane {
         );
         if self.pinned(m) {
             s.push_str(" 📌 pinned");
-        } else if self.condemned.contains(&mi) {
+        } else if condemned.contains(&mi) {
             s.push_str(" ⏳ expired");
         }
         s
@@ -231,10 +266,11 @@ impl KvPane {
     #[must_use]
     pub fn footer(&self) -> String {
         use std::fmt::Write as _;
+        let (_, reclaimable) = self.sweep_now();
         let mut s = format!(
             "total {} · {} reclaimable",
             human_bytes(self.total),
-            human_bytes(self.reclaimable)
+            human_bytes(reclaimable)
         );
         if self.max_bytes > 0 && self.total > self.max_bytes {
             let _ = write!(s, " · over the {} budget", human_bytes(self.max_bytes));
@@ -638,6 +674,54 @@ mod tests {
         );
         assert!(p.rows()[0].right.contains("expired"));
         assert!(p.footer().contains("2.0 KB reclaimable"));
+    }
+
+    /// A pane over one long-idle blob, optionally already pinned on disk.
+    fn expired_pane(pinned: bool) -> KvPane {
+        let mut m = meta(KvRole::Session, "old", None, 2048);
+        m.last_used = NOW - 99 * DAY;
+        m.pinned = pinned;
+        KvPane::new(
+            crate::kvtree::build(vec![m]),
+            crate::kvgc::SweepPolicy {
+                ttl_session_secs: 14 * DAY,
+                ttl_tier_secs: 30 * DAY,
+                max_bytes: 0,
+            },
+            0,
+            NOW,
+        )
+    }
+
+    #[test]
+    fn pinning_an_expired_row_takes_its_bytes_out_of_the_reclaimable_total() {
+        let mut p = expired_pane(false);
+        assert!(p.footer().contains("2.0 KB reclaimable"));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(fp) if fp == "old"));
+        assert!(
+            p.footer().contains("0 B reclaimable"),
+            "a pinned row is not reclaimable: {}",
+            p.footer()
+        );
+        let right = &p.rows()[0].right;
+        assert!(right.contains("pinned"), "{right}");
+        assert!(!right.contains("expired"), "{right}");
+    }
+
+    #[test]
+    fn unpinning_a_pinned_but_idle_row_puts_its_bytes_back() {
+        let mut p = expired_pane(true);
+        assert!(p.footer().contains("0 B reclaimable"), "{}", p.footer());
+        assert!(!p.rows()[0].right.contains("expired"));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(fp) if fp == "old"));
+        assert!(
+            p.footer().contains("2.0 KB reclaimable"),
+            "only the pin was sparing it: {}",
+            p.footer()
+        );
+        let right = &p.rows()[0].right;
+        assert!(right.contains("expired"), "{right}");
+        assert!(!right.contains("pinned"), "{right}");
     }
 
     #[test]

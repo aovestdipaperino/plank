@@ -2391,6 +2391,38 @@ pub fn draw_warm(
     }
 }
 
+/// The rectangle a centered modal paints into: `lines` rows plus a border, at
+/// most `max_width` wide, clamped so it can never spill outside `area`.
+///
+/// The clamps run in this order deliberately: the `max(20)`/`max(3)` floors
+/// keep the box usable on an ordinary terminal, but the trailing `min` against
+/// the frame has the last word — ratatui's `render_widget` does not intersect
+/// with the viewport, so a rect wider than the frame panics on the first write.
+#[must_use]
+fn modal_rect(area: Rect, lines: usize, max_width: u16) -> Rect {
+    let width = max_width
+        .min(area.width.saturating_sub(4))
+        .max(20)
+        .min(area.width);
+    let height = u16::try_from(lines + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2))
+        .max(3)
+        .min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// The modal rectangle [`draw_config`] paints into.
+#[must_use]
+fn config_rect(area: Rect, lines: usize) -> Rect {
+    modal_rect(area, lines, 66)
+}
+
 /// Draws the interactive `/config` editor as a centered modal overlay.
 ///
 /// Rows come from [`crate::configform::ConfigForm::rows`]: section headers are
@@ -2440,20 +2472,7 @@ pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
     };
     lines.push(Line::from(footer));
 
-    let area = frame.area();
-    let width = 66.min(area.width.saturating_sub(4)).max(20);
-    let height = u16::try_from(lines.len() + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    let x = area.x + (area.width.saturating_sub(width)) / 2;
-    let y = area.y + (area.height.saturating_sub(height)) / 2;
-    let rect = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
+    let rect = config_rect(frame.area(), lines.len());
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" config → ./.plank/settings.json ")
@@ -2468,17 +2487,7 @@ pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
 /// Pulled out of the draw call so the clamping is testable on its own.
 #[must_use]
 fn kvcache_rect(area: Rect, lines: usize) -> Rect {
-    let width = 84.min(area.width.saturating_sub(4)).max(20);
-    let height = u16::try_from(lines + 2)
-        .unwrap_or(u16::MAX)
-        .min(area.height.saturating_sub(2))
-        .max(3);
-    Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    }
+    modal_rect(area, lines, 84)
 }
 
 /// Draws the `/kvcache` lineage tree as a centered modal overlay.
@@ -2489,7 +2498,14 @@ fn kvcache_rect(area: Rect, lines: usize) -> Rect {
 pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
     let rows = pane.rows();
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 3);
+    // Where the selected row's own label landed among the rendered lines. A row
+    // can contribute two lines, so the window below has to be measured in lines
+    // rather than row indices or it drifts by one per expanded detail.
+    let mut selected_line = 0usize;
     for row in &rows {
+        if row.selected {
+            selected_line = lines.len();
+        }
         let indent = "  ".repeat(row.depth);
         let marker = match (row.has_children, row.expanded) {
             (true, true) => "▾ ",
@@ -2514,8 +2530,11 @@ pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
             )));
         }
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
+    // The blank line, the footer and the hints always show; only the tree
+    // scrolls, so they are built separately and appended after the window.
+    let mut tail: Vec<Line<'static>> = Vec::with_capacity(3);
+    tail.push(Line::from(""));
+    tail.push(Line::from(Span::styled(
         format!("  {}", pane.footer()),
         Style::default().fg(Color::Cyan),
     )));
@@ -2526,18 +2545,36 @@ pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
     } else {
         "  ↑↓ move · ←→ fold · p pin · d delete · g sweep · Esc close"
     };
-    lines.push(Line::from(Span::styled(
+    tail.push(Line::from(Span::styled(
         hints,
         Style::default().fg(Color::DarkGray),
     )));
 
-    let rect = kvcache_rect(frame.area(), lines.len());
+    let rect = kvcache_rect(frame.area(), lines.len() + tail.len());
+    // `Paragraph` clips rather than scrolls, so without a window the cursor
+    // could sit on an invisible row — and `d`/`y` would then delete a blob the
+    // user cannot see. Slide the tree so the selected row is always drawn.
+    let inner = usize::from(rect.height.saturating_sub(2));
+    let room = inner.saturating_sub(tail.len());
+    let mut shown = if room == 0 {
+        // No room for the tree at all: keep the footer and hints, which are the
+        // only lines that still say something useful at this size.
+        Vec::new()
+    } else if lines.len() <= room {
+        lines
+    } else {
+        let start = (selected_line + 1)
+            .saturating_sub(room)
+            .min(lines.len() - room);
+        lines.split_off(start).into_iter().take(room).collect()
+    };
+    shown.append(&mut tail);
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" kv cache ")
         .title_style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(Clear, rect);
-    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
+    frame.render_widget(Paragraph::new(Text::from(shown)).block(block), rect);
 }
 
 /// How far a veiled cell's color is pulled toward black.
@@ -5817,27 +5854,37 @@ mod tests {
         );
     }
 
+    /// A day in seconds, for the `/kvcache` modal tests.
+    const KV_DAY: u64 = 86_400;
+
+    /// One freshly-used node for the `/kvcache` modal tests.
+    fn kv_meta(
+        role: crate::kvmeta::KvRole,
+        fp: &str,
+        parent: Option<&str>,
+    ) -> crate::kvmeta::KvMeta {
+        crate::kvmeta::KvMeta {
+            version: crate::kvmeta::META_VERSION,
+            role,
+            fingerprint: fp.to_owned(),
+            parent: parent.map(ToOwned::to_owned),
+            model: "m".into(),
+            created: 0,
+            last_used: 1_000 * KV_DAY,
+            hits: 1,
+            bytes: 4096,
+            pinned: false,
+            label: crate::kvmeta::KvLabel::Unknown,
+        }
+    }
+
     /// A pane over a two-node lineage, for the `/kvcache` modal tests.
     fn kv_test_pane() -> crate::kvpane::KvPane {
-        const DAY: u64 = 86_400;
-        let meta =
-            |role: crate::kvmeta::KvRole, fp: &str, parent: Option<&str>| crate::kvmeta::KvMeta {
-                version: crate::kvmeta::META_VERSION,
-                role,
-                fingerprint: fp.to_owned(),
-                parent: parent.map(ToOwned::to_owned),
-                model: "m".into(),
-                created: 0,
-                last_used: 1_000 * DAY,
-                hits: 1,
-                bytes: 4096,
-                pinned: false,
-                label: crate::kvmeta::KvLabel::Unknown,
-            };
+        const DAY: u64 = KV_DAY;
         crate::kvpane::KvPane::new(
             crate::kvtree::build(vec![
-                meta(crate::kvmeta::KvRole::System, "a19f", None),
-                meta(crate::kvmeta::KvRole::Session, "7c02", Some("a19f")),
+                kv_meta(crate::kvmeta::KvRole::System, "a19f", None),
+                kv_meta(crate::kvmeta::KvRole::Session, "7c02", Some("a19f")),
             ]),
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
@@ -5861,14 +5908,95 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
         term.draw(|f| draw_kvcache(f, &pane)).unwrap();
 
-        // And the geometry itself: never wider or taller than the frame, and
-        // never zero-sized however few lines there are.
-        let area = Rect::new(0, 0, 24, 8);
-        let rect = kvcache_rect(area, 40);
-        assert!(rect.right() <= area.right(), "{rect:?}");
-        assert!(rect.bottom() <= area.bottom(), "{rect:?}");
-        let tiny = kvcache_rect(Rect::new(0, 0, 4, 1), 1);
-        assert!(tiny.width >= 20 && tiny.height >= 3, "{tiny:?}");
+        // A terminal narrower than the modal's floor used to produce a rect
+        // *larger* than the frame — ratatui does not intersect with the
+        // viewport, so `Clear` then indexed out of bounds and aborted the TUI.
+        let mut tiny = Terminal::new(TestBackend::new(10, 5)).unwrap();
+        tiny.draw(|f| draw_kvcache(f, &pane)).unwrap();
+
+        // And the geometry itself: whatever the frame size, the rect fits
+        // inside it. The 24x8 + 40-lines case also pins the height clamp.
+        for (w, h) in [(4u16, 1u16), (10, 5), (24, 8), (120, 40)] {
+            let area = Rect::new(0, 0, w, h);
+            for lines in [1usize, 40] {
+                for rect in [kvcache_rect(area, lines), config_rect(area, lines)] {
+                    assert!(rect.width <= area.width, "{w}x{h} lines {lines}: {rect:?}");
+                    assert!(
+                        rect.height <= area.height,
+                        "{w}x{h} lines {lines}: {rect:?}"
+                    );
+                    assert!(rect.right() <= area.right(), "{w}x{h}: {rect:?}");
+                    assert!(rect.bottom() <= area.bottom(), "{w}x{h}: {rect:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_kvcache_modal_scrolls_the_selected_row_into_view() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // A chain far taller than the terminal: without windowing the cursor
+        // would rest on a clipped row, and `d`/`y` would delete an unseen blob.
+        let mut metas = vec![kv_meta(crate::kvmeta::KvRole::System, "root", None)];
+        for i in 0..30u32 {
+            let fp = format!("blob{i:02}");
+            let parent = if i == 0 {
+                "root".to_owned()
+            } else {
+                format!("blob{:02}", i - 1)
+            };
+            metas.push(kv_meta(crate::kvmeta::KvRole::Session, &fp, Some(&parent)));
+        }
+        let mut pane = crate::kvpane::KvPane::new(
+            crate::kvtree::build(metas),
+            crate::kvgc::SweepPolicy {
+                ttl_session_secs: 14 * KV_DAY,
+                ttl_tier_secs: 30 * KV_DAY,
+                max_bytes: 0,
+            },
+            0,
+            1_000 * KV_DAY,
+        );
+        for _ in 0..25 {
+            pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        let rows = pane.rows();
+        let label = rows
+            .iter()
+            .find(|r| r.selected)
+            .map(|r| r.label.clone())
+            .unwrap();
+        let selected = rows.iter().position(|r| r.selected).unwrap();
+        assert!(
+            selected > 12 && rows.len() > 25,
+            "the cursor must be past the bottom of a 14-row terminal: row {selected} of {}",
+            rows.len()
+        );
+
+        let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        term.draw(|f| draw_kvcache(f, &pane)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let name = label.rsplit("  ").next().unwrap();
+        assert!(text.contains(name), "selected row must be drawn: {text}");
+        // ...and the window really did scroll: the first row is off the top.
+        assert!(
+            !text.contains(" root"),
+            "the top of the tree should have scrolled away: {text}"
+        );
+        // The footer and hints survive the window.
+        assert!(text.contains("reclaimable"), "{text}");
+        assert!(text.contains("Esc close"), "{text}");
     }
 
     #[test]
