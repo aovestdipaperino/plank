@@ -1328,11 +1328,47 @@ fn date_str(ts: u64, offset: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// A `YYYY-MM-DD HH:MM` local wall-clock stamp for a unix second.
+fn datetime_str(ts: u64, offset: i64) -> String {
+    let secs = (ts.cast_signed() + offset).rem_euclid(86_400);
+    format!(
+        "{} {:02}:{:02}",
+        date_str(ts, offset),
+        secs / 3600,
+        (secs % 3600) / 60
+    )
+}
+
+/// The same instant as a filename-safe `YYYYMMDD-HHMM`.
+fn file_stamp(ts: u64, offset: i64) -> String {
+    datetime_str(ts, offset)
+        .chars()
+        .filter(|c| c.is_ascii_digit() || *c == ' ')
+        .collect::<String>()
+        .replace(' ', "-")
+}
+
+/// The wall-clock second a report is being generated at.
+#[must_use]
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
 /// Condensed report for the terminal: the numbers that fit on a screen, plus
 /// whichever narrative made it back.
 #[must_use]
-pub fn render_summary(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> Vec<String> {
-    let mut out = Vec::new();
+pub fn render_summary(
+    agg: &Aggregated,
+    narrative: &Narrative,
+    tz_offset: i64,
+    generated_at: u64,
+) -> Vec<String> {
+    let mut out = vec![format!(
+        "generated {}",
+        datetime_str(generated_at, tz_offset)
+    )];
     if agg.sessions_counted == 0 {
         out.push("No sessions substantial enough to report on yet.".to_owned());
         return out;
@@ -1556,8 +1592,13 @@ footer{color:var(--dim);font-size:.8rem;border-top:1px solid var(--line);padding
 /// Renders the full HTML report.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn render_html(agg: &Aggregated, narrative: &Narrative, tz_offset: i64) -> String {
-    render_html_cancellable(agg, narrative, tz_offset, &|| false).unwrap_or_default()
+pub fn render_html(
+    agg: &Aggregated,
+    narrative: &Narrative,
+    tz_offset: i64,
+    generated_at: u64,
+) -> String {
+    render_html_cancellable(agg, narrative, tz_offset, generated_at, &|| false).unwrap_or_default()
 }
 
 /// [`render_html`], abandoning the document if `cancel` goes true.
@@ -1574,6 +1615,7 @@ pub fn render_html_cancellable(
     agg: &Aggregated,
     narrative: &Narrative,
     tz_offset: i64,
+    generated_at: u64,
     cancel: &dyn Fn() -> bool,
 ) -> Option<String> {
     let mut out = String::with_capacity(16 * 1024);
@@ -1585,7 +1627,8 @@ pub fn render_html_cancellable(
 
     let _ = write!(
         out,
-        "<h1>Your plank insights</h1><p class=\"sub\">{} sessions ({} scanned) · {} → {} · {} days active</p>",
+        "<h1>Your plank insights</h1><p class=\"sub\">generated {} · {} sessions ({} scanned) · {} → {} · {} days active</p>",
+        datetime_str(generated_at, tz_offset),
         commas(agg.sessions_counted as u64),
         commas(agg.sessions_scanned as u64),
         date_str(agg.first_session, tz_offset),
@@ -1791,27 +1834,39 @@ prompts.</p><ul>",
     }
     out.push_str(&narrative_html(narrative));
 
-    out.push_str("<footer>Generated locally by plank. Nothing here left this machine.</footer>");
+    let _ = write!(
+        out,
+        "<footer>Generated locally by plank on {}. Nothing here left this machine.</footer>",
+        datetime_str(generated_at, tz_offset)
+    );
     out.push_str("\n</main>\n</body>\n</html>\n");
     Some(out)
 }
 
 /// Writes the report and returns its path.
 ///
-/// Written to `report.html.tmp` and renamed into place, so the previous
-/// report survives intact until the new one is complete. A run that fails or
-/// is interrupted partway therefore costs the user nothing: the report they
-/// already had is still there, whole, rather than replaced by a truncated
-/// file. The rename is atomic on the same filesystem, so a reader never sees
+/// The name carries the generation time (`report-YYYYMMDD-HHMM.html`), so
+/// successive runs sit side by side rather than overwriting each other.
+/// Written to a matching `.tmp` and renamed into place, so a report already
+/// under that name survives intact until the new one is complete. A run that
+/// fails or is interrupted partway therefore costs the user nothing: the
+/// report they already had is still there, whole, rather than replaced by a
+/// truncated file. The rename is atomic on the same filesystem, so a reader never sees
 /// a half-written report either.
 ///
 /// # Errors
 ///
 /// Returns the underlying I/O error's message if the file cannot be written
 /// or the rename fails; the temporary file is cleaned up in both cases.
-pub fn write_report(root: &Path, html: &str) -> Result<PathBuf, String> {
-    let path = root.join("report.html");
-    let tmp = root.join("report.html.tmp");
+pub fn write_report(
+    root: &Path,
+    html: &str,
+    tz_offset: i64,
+    generated_at: u64,
+) -> Result<PathBuf, String> {
+    let stem = format!("report-{}", file_stamp(generated_at, tz_offset));
+    let path = root.join(format!("{stem}.html"));
+    let tmp = root.join(format!("{stem}.html.tmp"));
     write_private(&tmp, html).map_err(|e| format!("{}: {e}", tmp.display()))?;
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
@@ -2092,9 +2147,9 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "an unrepresentative total must not be sent:\n{ctx}"
         );
         // And it is not shown to the user as a number either.
-        assert!(render_html(&agg, &Narrative::new(), 0).contains("—"));
+        assert!(render_html(&agg, &Narrative::new(), 0, 0).contains("—"));
         assert!(
-            !render_summary(&agg, &Narrative::new(), 0)
+            !render_summary(&agg, &Narrative::new(), 0, 0)
                 .iter()
                 .any(|l| l.contains("in session"))
         );
@@ -2195,7 +2250,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
             "at_a_glance".to_owned(),
             serde_json::json!({"working": "<script>alert(1)</script>"}),
         );
-        let html = render_html(&agg, &narrative, 0);
+        let html = render_html(&agg, &narrative, 0, 0);
         assert!(!html.contains("<script>"), "narrative must be escaped");
         assert!(html.contains("&lt;script&gt;"));
         // Self-contained: no network references of any kind.
@@ -2216,12 +2271,12 @@ Tool result 3 (read):\nfine\n</tool_result>",
             0,
         );
         // Cancelled from the very first check.
-        assert!(render_html_cancellable(&agg, &Narrative::new(), 0, &|| true).is_none());
+        assert!(render_html_cancellable(&agg, &Narrative::new(), 0, 0, &|| true).is_none());
 
         // Cancelled partway: still nothing, never a half-built document that
         // could be written over a good report.
         let seen = std::cell::Cell::new(0);
-        let out = render_html_cancellable(&agg, &Narrative::new(), 0, &|| {
+        let out = render_html_cancellable(&agg, &Narrative::new(), 0, 0, &|| {
             seen.set(seen.get() + 1);
             seen.get() > 2
         });
@@ -2229,7 +2284,7 @@ Tool result 3 (read):\nfine\n</tool_result>",
         assert!(seen.get() > 2, "cancellation is checked more than once");
 
         // Uncancelled, the document is whole.
-        let whole = render_html_cancellable(&agg, &Narrative::new(), 0, &|| false)
+        let whole = render_html_cancellable(&agg, &Narrative::new(), 0, 0, &|| false)
             .expect("an uncancelled render");
         assert!(whole.starts_with("<!DOCTYPE html>") && whole.ends_with("</html>\n"));
     }
@@ -2240,14 +2295,19 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
 
-        let first = write_report(&root, "<html>one</html>").unwrap();
-        assert_eq!(first.file_name().unwrap(), "report.html");
+        let first = write_report(&root, "<html>one</html>", 0, 1_754_800_000).unwrap();
+        assert_eq!(first.file_name().unwrap(), "report-20250810-0426.html");
         assert_eq!(std::fs::read_to_string(&first).unwrap(), "<html>one</html>");
         // The scratch file does not survive a successful write.
-        assert!(!root.join("report.html.tmp").exists());
+        assert!(!root.join("report-20250810-0426.html.tmp").exists());
 
-        let second = write_report(&root, "<html>two</html>").unwrap();
-        assert_eq!(second, first, "same path, replaced in place");
+        // A later run is a new file; the earlier report is untouched.
+        let later = write_report(&root, "<html>later</html>", 0, 1_754_803_600).unwrap();
+        assert_eq!(later.file_name().unwrap(), "report-20250810-0526.html");
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "<html>one</html>");
+
+        let second = write_report(&root, "<html>two</html>", 0, 1_754_800_000).unwrap();
+        assert_eq!(second, first, "same stamp, replaced in place");
         assert_eq!(
             std::fs::read_to_string(&second).unwrap(),
             "<html>two</html>"
@@ -2266,9 +2326,10 @@ Tool result 3 (read):\nfine\n</tool_result>",
     #[test]
     fn summary_reports_an_empty_history_plainly() {
         let agg = aggregate(&[], 0);
-        let lines = render_summary(&agg, &Narrative::new(), 0);
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0].contains("No sessions"));
+        let lines = render_summary(&agg, &Narrative::new(), 0, 1_754_800_000);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "generated 2025-08-10 04:26");
+        assert!(lines[1].contains("No sessions"));
     }
 
     #[test]

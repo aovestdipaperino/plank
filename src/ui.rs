@@ -4398,18 +4398,19 @@ the original is frozen and listed in /tree"
         // read as "abandon the render too".
         crate::interrupt::clear();
         tick("writing the report…".to_owned());
-        let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, &|| {
-            crate::interrupt::pending()
-        }) else {
+        let at = insights::now_secs();
+        let cancel = crate::interrupt::pending;
+        let Some(html) = insights::render_html_cancellable(&agg, &narrative, tz, at, &cancel)
+        else {
             // Stopped mid-render: nothing is written, so the report the user
             // already had is still on disk, whole.
             crate::interrupt::clear();
             return Ok(Insights::Cancelled);
         };
-        let path = insights::write_report(&root, &html)?;
+        let path = insights::write_report(&root, &html, tz, at)?;
         Ok(Insights::Done {
             path,
-            summary: insights::render_summary(&agg, &narrative, tz),
+            summary: insights::render_summary(&agg, &narrative, tz, at),
         })
     }
 
