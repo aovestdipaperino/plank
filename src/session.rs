@@ -85,16 +85,21 @@ const HISTORY_TOOL_MAX_BYTES: usize = 3000;
 
 const MAGIC: &str = "plank-session 1";
 const FILE_EXT: &str = ".kv";
-/// Extension of the engine KV payload sidecar written next to a transcript.
+/// Extension of the engine KV payload written beside a transcript.
 ///
 /// The C agent stores the engine payload inside the same `.kv` file as the
 /// rendered text; plank's v1 transcript format predates payloads and must
-/// keep loading, so the payload lives in a sidecar (`<sha>.payload`) instead.
-/// The sidecar is a rebuildable cache: its signature is a fingerprint tying
-/// it to the exact model, system prompt, and rendered transcript, and a
-/// mismatch means the payload is ignored and rebuilt by prefill — never
-/// trusted (see [`payload_fingerprint`] and [`SessionStore::kv_load`]).
-const PAYLOAD_EXT: &str = ".payload";
+/// keep loading, so the payload lives in a sidecar instead. The sidecar is a
+/// rebuildable cache: its signature is a fingerprint tying it to the exact
+/// model, system prompt, and rendered transcript, and a mismatch means the
+/// payload is ignored and rebuilt by prefill — never trusted (see
+/// [`payload_fingerprint`] and [`SessionStore::kv_load`]).
+///
+/// It shares one extension with the Tier 1 and Tier 2 checkpoints, distinct
+/// from the transcripts' [`FILE_EXT`]: every KV body in the cache is a
+/// `.kv_raw`, so one scan finds them all and no glob confuses a checkpoint for
+/// a transcript.
+const PAYLOAD_EXT: &str = crate::kvmeta::BLOB_EXT;
 
 /// Error raised by session store operations.
 ///
@@ -470,7 +475,8 @@ impl SessionStore {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(PROJECT_STEM) || !name.ends_with(FILE_EXT) || name == keep_name {
+            if !name.starts_with(PROJECT_STEM) || !name.ends_with(PAYLOAD_EXT) || name == keep_name
+            {
                 continue;
             }
             if fs::remove_file(entry.path()).is_ok() {
@@ -505,6 +511,9 @@ impl SessionStore {
             .iter()
             .map(|fp| sysprompt_checkpoint_name(fp))
             .collect();
+        // Deliberately `FILE_EXT`, not `PAYLOAD_EXT`: this names the legacy
+        // bare `sysprompt.kv` written before checkpoints were content-keyed.
+        // Nothing writes it any more; it only needs collecting.
         let legacy_name = format!("{SYSPROMPT_STEM}{FILE_EXT}");
         let Ok(entries) = fs::read_dir(&self.dir) else {
             return 0;
@@ -518,7 +527,7 @@ impl SessionStore {
             // and `<name>.kv.tmp.<pid>` writes still in flight.
             let collect = name == legacy_name
                 || (name.starts_with(SYSPROMPT_PREFIX)
-                    && name.ends_with(FILE_EXT)
+                    && name.ends_with(PAYLOAD_EXT)
                     && !keep_names.iter().any(|k| k == name));
             if !collect || !entry.file_type().is_ok_and(|t| t.is_file()) {
                 continue;
@@ -925,14 +934,14 @@ pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
 /// revision); shared by every session of the project (issue #60).
 #[must_use]
 pub fn project_checkpoint_name(fp2: &str) -> String {
-    format!("{PROJECT_STEM}-{fp2}{FILE_EXT}")
+    format!("{PROJECT_STEM}-{fp2}{PAYLOAD_EXT}")
 }
 
 /// File name of the Tier 1 system-prompt checkpoint keyed by its fingerprint
 /// `fp1`: `sysprompt-<fp1>.kv`. Model-global, at the cache root.
 #[must_use]
 pub fn sysprompt_checkpoint_name(fp1: &str) -> String {
-    format!("{SYSPROMPT_PREFIX}{fp1}{FILE_EXT}")
+    format!("{SYSPROMPT_PREFIX}{fp1}{PAYLOAD_EXT}")
 }
 
 /// Whether `s` is a valid session id (or lookup prefix): non-empty, at most 80
@@ -1763,6 +1772,34 @@ mod tests {
         dir
     }
 
+    #[test]
+    fn blob_names_use_kv_raw_and_never_collide_with_transcripts() {
+        assert_eq!(sysprompt_checkpoint_name("a19f"), "sysprompt-a19f.kv_raw");
+        assert_eq!(project_checkpoint_name("7c02"), "project-7c02.kv_raw");
+        // The whole point of the split: no blob name ends in the transcript
+        // extension, so a `*.kv` glob can never sweep up a checkpoint.
+        for n in [
+            sysprompt_checkpoint_name("a19f"),
+            project_checkpoint_name("7c02"),
+        ] {
+            assert!(
+                !n.ends_with(FILE_EXT),
+                "{n} must not look like a transcript"
+            );
+        }
+        let store = SessionStore::open(
+            std::env::temp_dir().join(format!("plank-blobname-{}", std::process::id())),
+        )
+        .unwrap();
+        assert!(
+            store
+                .payload_path("cheeky-bell")
+                .to_string_lossy()
+                .ends_with("cheeky-bell.kv_raw")
+        );
+        let _ = std::fs::remove_dir_all(store.dir());
+    }
+
     /// A session file exactly as plank wrote them before branching existed
     /// (issue #65): magic, header, `msg` records, `meta` trailer — and no
     /// `node` records at all.
@@ -1968,7 +2005,7 @@ hello\n";
         assert!(cp.starts_with(&pdir));
         assert_eq!(
             cp.file_name().unwrap().to_string_lossy(),
-            format!("project-{fp2}{FILE_EXT}")
+            format!("project-{fp2}{PAYLOAD_EXT}")
         );
         let _ = fs::remove_dir_all(&dir);
     }
