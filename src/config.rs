@@ -722,6 +722,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "list the skills loaded from SKILL.md files",
     },
     SlashCommand {
+        name: "/plugins",
+        args: "",
+        desc: "list loaded plugins and their contributions",
+    },
+    SlashCommand {
         name: "/templates",
         args: "",
         desc: "list the prompt templates available as commands",
@@ -862,6 +867,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/usage"
             | "/init"
             | "/skills"
+            | "/plugins"
             | "/templates"
             | "/tasks"
             | "/agent"
@@ -1840,6 +1846,11 @@ mod tests {
             assert!(c.name.starts_with('/'), "{}", c.name);
             assert!(!c.desc.is_empty(), "{} has no description", c.name);
         }
+    }
+
+    #[test]
+    fn plugins_is_a_known_slash_command() {
+        assert!(slash_command_known("/plugins"));
     }
 
     #[test]

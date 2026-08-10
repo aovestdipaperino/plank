@@ -3411,6 +3411,7 @@ impl Agent<'_> {
                 self.compact("user request", arg)?;
             }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/plugins" => print!("{}", crate::plugins::render_list(&self.tool_ctx.plugins)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
@@ -8525,6 +8526,11 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/plugins" => {
+                for line in crate::plugins::render_list(&self.tool_ctx.plugins).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/templates" => {
                 for line in crate::templates::render_list(&self.templates).lines() {
                     log.push_plain(line.to_owned());
@@ -9799,6 +9805,7 @@ fn print_footer(st: &Status, color: bool) {
     }
 }
 
+#[allow(clippy::too_many_lines)] // sequential startup wiring; splitting hurts readability.
 fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
@@ -9824,16 +9831,20 @@ fn new_agent(
     // `save_for_exit`.)
     session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
+    // Resolved before anything that consumes plugin contributions (MCP
+    // startup, hooks) so both see the real set rather than a placeholder.
+    tool_ctx.plugins = crate::plugins::load_default(&tool_ctx.cwd, &cfg.plugin_dirs);
+    for w in tool_ctx.plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
     // `--worktree` already created the worktree and moved the process into it,
     // so `cwd` above is the worktree; adopting the session it left behind is
     // what lets `ExitWorktree` find its way back out.
     tool_ctx.worktree = crate::worktree::take_startup_session();
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
-    tool_ctx.mcp = crate::tools::mcp::load_and_start(
-        cfg.mcp_config_path.as_deref(),
-        &crate::plugins::PluginSet::default(),
-    );
+    tool_ctx.mcp =
+        crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref(), &tool_ctx.plugins);
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");

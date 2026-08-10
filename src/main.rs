@@ -48,10 +48,27 @@ fn main() -> ExitCode {
         return run_remote_client(&args[1..]);
     }
 
-    // Settings seed the config; every CLI flag then overrides them. Read from
-    // the launch directory: `--chdir` is parsed here and so cannot yet be
-    // known, which is a documented limitation of project-scoped settings.
-    let settings = plank::settings::Settings::load();
+    // The plugin set has to be built before settings are read, so that a
+    // plugin's `settings.json` can be layered in below the user file — but
+    // building it needs `--plugin-dir`, which only the parsed config carries.
+    // A throwaway provisional parse (base settings, no plugin layer) breaks
+    // that cycle: only its `plugin_dirs` is used, the real parse below
+    // re-derives everything else with the enriched settings. Like project
+    // settings, the scan reads the launch directory: `--chdir` is parsed only
+    // by the real config below, so it cannot move the scan, a documented
+    // limitation shared with project-scoped settings.
+    let provisional =
+        plank::config::parse_options_with(&plank::settings::Settings::default(), &args)
+            .unwrap_or_else(|_| {
+                plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
+            });
+    let launch_cwd = std::env::current_dir().unwrap_or_default();
+    let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    for w in plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
+    let settings =
+        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &args) {
         Ok(cfg) => cfg,
@@ -102,7 +119,7 @@ fn main() -> ExitCode {
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
     // is meant to live inside the worktree rather than the original checkout.
-    if let Err(e) = enter_startup_worktree(&cfg, &settings) {
+    if let Err(e) = enter_startup_worktree(&cfg, &settings, &plugins) {
         eprintln!("plank: {e}");
         return ExitCode::FAILURE;
     }
@@ -125,7 +142,7 @@ fn main() -> ExitCode {
     }
 
     plank::interrupt::install();
-    let engine = match make_engine(&cfg) {
+    let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("plank: {e}");
@@ -155,6 +172,7 @@ fn main() -> ExitCode {
 fn enter_startup_worktree(
     cfg: &AgentConfig,
     settings: &plank::settings::Settings,
+    plugins: &plank::plugins::PluginSet,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().map_err(|e| format!("cwd: {e}"))?;
     if let Some(root) = plank::worktree::canonical_git_root(&cwd) {
@@ -175,7 +193,7 @@ fn enter_startup_worktree(
         sparse_paths: settings.worktree.sparse_paths.clone(),
         symlink_dirs: settings.worktree.symlink_directories.clone(),
     };
-    let hooks = plank::plugins::hooks_with_plugins(&cwd, &plank::plugins::PluginSet::default());
+    let hooks = plank::plugins::hooks_with_plugins(&cwd, plugins);
     let session = plank::worktree::create_for_session(&cwd, &name, &hooks, &opts)
         .map_err(|e| format!("worktree '{name}': {e}"))?;
     std::env::set_current_dir(&session.path)
@@ -279,17 +297,17 @@ struct Engines {
 /// Whether any sub-agent definition visible from `cwd` asks for the local
 /// engine explicitly (`provider: local`). Omitting `provider:` does *not* count:
 /// that means "the parent's engine", whatever it happens to be.
-fn wants_local_subagent() -> bool {
+fn wants_local_subagent(plugins: &plank::plugins::PluginSet) -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
-    plank::plugins::agents_with_plugins(&cwd, &plank::plugins::PluginSet::default())
+    plank::plugins::agents_with_plugins(&cwd, plugins)
         .0
         .iter()
         .any(|d| matches!(d.engine, Some(plank::agents::AgentEngine::Local)))
 }
 
-fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
+fn make_engine(cfg: &AgentConfig, plugins: &plank::plugins::PluginSet) -> Result<Engines, String> {
     // Remote engine (flavor a, issue #26) is available on every platform and
     // takes precedence over the local selectors when `--remote` is given.
     if let Some(url) = &cfg.remote_url {
@@ -356,7 +374,7 @@ fn make_engine(cfg: &AgentConfig) -> Result<Engines, String> {
         // load it alongside the provider — otherwise such a sidechain would have
         // nothing to run on. Costly and deliberate: only an explicit definition
         // triggers it, and it fails here rather than mid-turn.
-        let local = if wants_local_subagent() {
+        let local = if wants_local_subagent(plugins) {
             eprintln!(
                 "plank: a sub-agent definition asks for the local engine; loading it alongside the provider..."
             );
@@ -525,7 +543,22 @@ fn run_serve(args: &[String]) -> ExitCode {
             }
         }
     }
-    let settings = plank::settings::Settings::load();
+    // See the `main` provisional-parse comment: the plugin set must be built
+    // from `--plugin-dir` before settings are read, but `--plugin-dir` is
+    // only known once parsed, so a throwaway base-settings parse breaks the
+    // cycle.
+    let provisional =
+        plank::config::parse_options_with(&plank::settings::Settings::default(), &passthrough)
+            .unwrap_or_else(|_| {
+                plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
+            });
+    let launch_cwd = std::env::current_dir().unwrap_or_default();
+    let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    for w in plugins.all_warnings() {
+        eprintln!("plugin warning: {w}");
+    }
+    let settings =
+        plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
         Ok(cfg) => cfg,
@@ -556,7 +589,7 @@ fn run_serve(args: &[String]) -> ExitCode {
         };
     }
 
-    let engine = match make_engine(&cfg) {
+    let engine = match make_engine(&cfg, &plugins) {
         Ok(engine) => engine,
         Err(e) => {
             eprintln!("plank serve: {e}");

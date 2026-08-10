@@ -330,6 +330,58 @@ pub fn settings_paths(set: &PluginSet) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Which components a plugin actually contributes, for the listing.
+fn contributions(plugin: &Plugin) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for (label, (plank, cc)) in ["skills", "agents", "templates", "hooks", "mcp", "settings"]
+        .into_iter()
+        .zip(COMPONENT_PATHS)
+    {
+        if component_root(plugin, plank, cc).is_some() {
+            out.push(label);
+        }
+    }
+    out
+}
+
+/// Renders the `/plugins` listing: one block per plugin, then every warning.
+#[must_use]
+pub fn render_list(set: &PluginSet) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if set.plugins.is_empty() {
+        out.push_str(
+            "no plugins loaded (checked ~/.plank/plugins/dev, ./.plank/plugins, and --plugin-dir)\n",
+        );
+    }
+    for plugin in &set.plugins {
+        let _ = write!(out, "{} ({})", plugin.name, plugin.origin.label());
+        if !plugin.version.is_empty() {
+            let _ = write!(out, " v{}", plugin.version);
+        }
+        out.push('\n');
+        if !plugin.description.is_empty() {
+            let _ = writeln!(out, "  {}", plugin.description);
+        }
+        let _ = writeln!(out, "  {}", plugin.root.display());
+        let parts = contributions(plugin);
+        if parts.is_empty() {
+            out.push_str("  contributes nothing\n");
+        } else {
+            let _ = writeln!(out, "  contributes: {}", parts.join(", "));
+        }
+    }
+    let warnings = set.all_warnings();
+    if !warnings.is_empty() {
+        out.push_str("\nwarnings:\n");
+        for w in warnings {
+            let _ = writeln!(out, "  {w}");
+        }
+    }
+    out
+}
+
 /// Merges plugin-contributed entries into the user+project entries.
 ///
 /// Every plugin entry is registered as `<plugin>:<name>`. It is registered a
@@ -1134,5 +1186,37 @@ mod tests {
         let (servers, warnings) = mcp_servers(&set);
         assert!(servers.is_empty());
         assert!(warnings.iter().any(|w| w.contains("we__ather")));
+    }
+
+    #[test]
+    fn the_listing_names_each_plugin_its_origin_and_its_warnings() {
+        let base = scratch("render-list");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(
+            &plugin,
+            ".plank-plugin/plugin.json",
+            r#"{"name":"demo","description":"A demo","version":"1.0"}"#,
+        );
+        write(&plugin, "skills/greet/SKILL.md", "hi\n");
+        let set = load_in(Some(&base.join("home")), &cwd, &[plugin]);
+        let out = render_list(&set);
+        assert!(out.contains("demo"));
+        assert!(out.contains("A demo"));
+        assert!(out.contains("1.0"));
+        assert!(out.contains("--plugin-dir"));
+        assert!(out.contains("skills"));
+    }
+
+    #[test]
+    fn the_listing_says_so_when_no_plugins_are_loaded() {
+        let base = scratch("render-empty");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let set = load_in(Some(&base.join("home")), &cwd, &[]);
+        let out = render_list(&set);
+        assert!(out.contains("no plugins"));
+        assert!(out.contains("--plugin-dir"));
     }
 }
