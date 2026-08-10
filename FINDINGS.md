@@ -1173,3 +1173,37 @@ test` and review the diff before committing.
   escape from a wedged worker is restoring the terminal and exiting the
   process, which skips every destructor and loses the in-flight turn. Worth
   knowing before designing any UI affordance that promises to cancel a turn.
+
+- **`TextBuffer::write_canon` auto-indents, so it must never seed a file you
+  intend to write back.** The canonicalizing insert path expands tabs to spaces
+  (gated on `indent_with_tabs`, default off) and, after every newline,
+  re-emits the *previous* line's indentation on top of the incoming line's own
+  leading whitespace — so indentation compounds down the file. It also rewrites
+  every interior line break to the one convention `set_crlf` selected. `/open`
+  inherited that seeding from the Ctrl-G prompt path, where it is harmless
+  because nothing is written to disk; against a real file it turned
+  `fn a() {\n    let x;\n}\n` into cascading indentation plus a junk trailing
+  line, silently converted Makefile tabs to spaces, and normalized CRLF — and
+  because `State::original` is read back *out of the buffer*, `is_modified()`
+  reported the mangled buffer as clean, so nothing warned. File mode now uses
+  `write_raw` plus `set_crlf` detection (`src/miniedit/state.rs`), with
+  byte-exact round-trip tests for brace-indented, tab-indented, CRLF, empty and
+  newline-less inputs. Flat unindented fixtures cannot catch this class of bug;
+  any test guarding a file round-trip needs indentation and CRLF in it.
+- **Never decide "did this change?" by re-deriving what an editor buffer would
+  have done.** `/open` first compared the edited text against a seed computed
+  outside the buffer. Each fix modelled one more of the buffer's
+  normalizations (the missing trailing newline) and still missed the next
+  (interior line breaks), so mixed and lone-CR files were silently rewritten on
+  a Ctrl+S the user never edited into. Any independently-derived baseline drifts
+  the moment the buffer normalizes something new. The fix is structural: ask the
+  buffer itself, via `State::is_modified()` against the `original` it read back
+  at construction (`State::accepted_text`). For a file, "accepted unchanged" and
+  "cancelled" are the same outcome, so both collapse to `None`.
+- **Bare `cargo fmt` reformats the vendored `refs/obscura` submodule.** obscura
+  is a path dependency (`Cargo.toml`), so rustfmt walks into it and rewrites 59
+  files / ~4000 lines to plank's style — churn inside a submodule we do not own,
+  showing up only as ` M refs/obscura` in the parent's status. Use `cargo fmt -p
+  plank`. Note the pre-commit hook still runs the bare form, so a commit made
+  through it can carry the drift; recover with `git -C refs/obscura checkout --
+  .`.
