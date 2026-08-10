@@ -17,6 +17,7 @@ Every command below works identically in the TUI and the plain REPL.
 | `/resume [prefix]` | resume a saved session; no argument picks the most recent, or shows a list |
 | `/del <id>` | delete a saved session |
 | `/tag <text>` | label the current session so it is recognizable in `/list` |
+| `/rename <name>` | change the name later saves use; what is already on disk keeps its old name |
 | `/strip <id>` | drop a saved session's KV payload to reclaim disk; the transcript survives and a later resume re-prefills it |
 | `/history` | reprint recent turns |
 | `/quit`, `/exit` | leave (the session is saved) |

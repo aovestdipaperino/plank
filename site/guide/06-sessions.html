@@ -137,16 +137,27 @@ state so returning to it does not mean re-reading it from scratch.</p>
 <code>&lt;name&gt;.kv</code>, with a fingerprinted
 <code>&lt;name&gt;.kv_raw</code> sidecar holding the engine state and a
 small <code>&lt;name&gt;.json</code> describing it. A session id is a
-memorable <code>adjective-celebrity</code> name minted on first save
+memorable <code>adjective-celebrity</code> name
 (<code>deadly-einstein</code>), and titles derive from your first
-prompt, so <code>/list</code> is readable rather than a wall of
-hashes.</p>
+prompt, so <code>/list</code> is readable rather than a wall of hashes.
+The name is minted when the session <strong>starts</strong>, not when it
+is first saved, and the TUI floats it at the right end of the rule above
+the prompt — so the name a transcript will be saved under is visible
+from the first frame.</p>
 <h2 id="saving-listing-switching">Saving, listing, switching</h2>
 <p>Sessions save automatically; <code>/save</code> forces it.</p>
 <pre><code>/list               # most recent first
 /switch &lt;id&gt;        # load another session
 /tag reindex bug    # label this one
+/rename apollo      # name this one something you will recognize
 /del &lt;id&gt;           # delete</code></pre>
+<p><code>/rename &lt;name&gt;</code> changes the name later saves use
+and leaves what is already on disk alone, so a session saved before the
+rename stays resumable under its old name and the next save is a copy
+rather than a move. Names are validated rather than quietly rewritten —
+letters, digits, <code>-</code>, <code>_</code> and <code>.</code> — and
+a name already taken on disk is confirmed with you before it is
+reused.</p>
 <p><code>/strip &lt;id&gt;</code> drops a session's KV payload to
 reclaim disk. The transcript survives untouched, so the session still
 loads; it just re-prefills the conversation the next time you open it,

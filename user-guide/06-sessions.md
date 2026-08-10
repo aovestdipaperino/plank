@@ -4,7 +4,7 @@
 
 A session is the whole conversation: every message, the tasks, and — where the engine supports it — a snapshot of the model's internal KV state so returning to it does not mean re-reading it from scratch.
 
-Sessions live under `~/.plank/kvcache/` as `<name>.kv`, with a fingerprinted `<name>.kv_raw` sidecar holding the engine state and a small `<name>.json` describing it. A session id is a memorable `adjective-celebrity` name minted on first save (`deadly-einstein`), and titles derive from your first prompt, so `/list` is readable rather than a wall of hashes.
+Sessions live under `~/.plank/kvcache/` as `<name>.kv`, with a fingerprinted `<name>.kv_raw` sidecar holding the engine state and a small `<name>.json` describing it. A session id is a memorable `adjective-celebrity` name (`deadly-einstein`), and titles derive from your first prompt, so `/list` is readable rather than a wall of hashes. The name is minted when the session **starts**, not when it is first saved, and the TUI floats it at the right end of the rule above the prompt — so the name a transcript will be saved under is visible from the first frame.
 
 ## Saving, listing, switching
 
@@ -14,8 +14,11 @@ Sessions save automatically; `/save` forces it.
 /list               # most recent first
 /switch <id>        # load another session
 /tag reindex bug    # label this one
+/rename apollo      # name this one something you will recognize
 /del <id>           # delete
 ```
+
+`/rename <name>` changes the name later saves use and leaves what is already on disk alone, so a session saved before the rename stays resumable under its old name and the next save is a copy rather than a move. Names are validated rather than quietly rewritten — letters, digits, `-`, `_` and `.` — and a name already taken on disk is confirmed with you before it is reused.
 
 `/strip <id>` drops a session's KV payload to reclaim disk. The transcript survives untouched, so the session still loads; it just re-prefills the conversation the next time you open it, and `/list` shows it as `stripped`.
 

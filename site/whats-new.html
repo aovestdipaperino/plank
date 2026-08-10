@@ -137,6 +137,21 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>v3.0.0 is out</strong>, and the beta channel has opened on
+3.0.1. The patch number is still the channel: <code>.0</code> is stable,
+anything above it is beta.</p>
+<p><strong>Your session has a name from the first frame.</strong> The
+memorable <code>adjective-celebrity</code> name used to be minted when a
+session was first saved, so until you quit there was nothing to call the
+conversation you were in. It is minted at the start now, and floats at
+the right end of the rule above the prompt.
+<code>/rename &lt;name&gt;</code> changes what later saves use without
+touching what is already on disk, so the earlier file stays resumable
+under its old name. Resuming a session no longer replays plank's own
+scaffolding at you either — the agent instructions, memory, git status
+and date that open a session are sent to the model, not typed by you,
+and they stay out of the transcript you read. See <a
+href="/guide/06-sessions.html">Sessions</a>.</p>
 <p><strong><code>/kvcache</code> shows the cache as the tree it really
 is.</strong> Every KV snapshot on disk now carries a small metadata file
 recording what it is, which snapshot it was built on, the model and
@@ -176,11 +191,15 @@ the repo without touching yours. Subagents can each get their own with
 <code>--dspark</code>.</strong> DeepSeek's auxiliary draft checkpoint
 (~5.6 GB on top of the model) proposes tokens the main model verifies in
 batches. It downloads and resumes the same way the model does.</p>
-<p><strong>A live agent roster on <code>Ctrl-O</code>.</strong> Instead
-of one sub-agent's output, the pane is now a roster of every run in the
-session with what each is doing, how long it has been at it, and what it
-has spent. The status bar became two rows to make room for it, and the
-working directory and git branch moved up to the first.</p>
+<p><strong>A live agent roster under the status bar.</strong> Instead of
+one sub-agent's output in a hidden pane, every run gets a row: what it
+is doing, how long it has been at it, and what it has spent.
+<code>←</code> on an empty prompt steps into it, <code>Enter</code>
+opens an agent's output in full, <code>Esc</code> comes back. A fan-out
+shows every agent at once, each with its own buffer, and what comes back
+into your transcript is the agent's answer with its thinking stripped
+out. See <a href="/guide/03-the-interface.html#the-agent-roster">The
+agent roster</a>.</p>
 <h2 id="drive-it-from-somewhere-else">Drive it from somewhere else</h2>
 <p><strong><code>/remote-control</code>, or <code>/rc</code>,</strong>
 starts and stops a remote-control server from inside a running session,

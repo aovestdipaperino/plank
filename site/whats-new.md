@@ -7,6 +7,20 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v3.0.0 is out**, and the beta channel has opened on 3.0.1. The patch number is
+still the channel: `.0` is stable, anything above it is beta.
+
+**Your session has a name from the first frame.** The memorable
+`adjective-celebrity` name used to be minted when a session was first saved, so
+until you quit there was nothing to call the conversation you were in. It is minted
+at the start now, and floats at the right end of the rule above the prompt.
+`/rename <name>` changes what later saves use without touching what is already on
+disk, so the earlier file stays resumable under its old name. Resuming a session no
+longer replays plank's own scaffolding at you either — the agent instructions,
+memory, git status and date that open a session are sent to the model, not typed by
+you, and they stay out of the transcript you read. See
+[Sessions](/guide/06-sessions.html).
+
 **`/kvcache` shows the cache as the tree it really is.** Every KV snapshot on disk
 now carries a small metadata file recording what it is, which snapshot it was built
 on, the model and reasoning level behind it, its size, how many times it has been
@@ -43,10 +57,12 @@ can each get their own with `isolation: worktree`.
 checkpoint (~5.6 GB on top of the model) proposes tokens the main model verifies in
 batches. It downloads and resumes the same way the model does.
 
-**A live agent roster on `Ctrl-O`.** Instead of one sub-agent's output, the pane is
-now a roster of every run in the session with what each is doing, how long it has
-been at it, and what it has spent. The status bar became two rows to make room for
-it, and the working directory and git branch moved up to the first.
+**A live agent roster under the status bar.** Instead of one sub-agent's output in a
+hidden pane, every run gets a row: what it is doing, how long it has been at it, and
+what it has spent. `←` on an empty prompt steps into it, `Enter` opens an agent's
+output in full, `Esc` comes back. A fan-out shows every agent at once, each with its
+own buffer, and what comes back into your transcript is the agent's answer with its
+thinking stripped out. See [The agent roster](/guide/03-the-interface.html#the-agent-roster).
 
 ## Drive it from somewhere else
 
