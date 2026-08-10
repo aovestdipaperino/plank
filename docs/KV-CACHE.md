@@ -324,7 +324,8 @@ policy, now).
 **Phase 1, per node, first match wins:**
 
 1. `pinned`: keep.
-2. In the tier chain this launch is using: keep, and touch `last_used`.
+2. In the tier chain this launch is using: keep. Recency for these nodes is
+   refreshed by the load itself (`SessionStore::kv_load`), not by the sweep.
 3. Has a surviving child: keep. An expired system prompt with a live session
    below it stays.
 4. `now - last_used >= ttl(role)`: delete the `.kv_raw` and its `.json`.

@@ -8,10 +8,10 @@
 //!
 //! | Tier | Content | Key | Storage |
 //! |------|---------|-----|---------|
-//! | 1 | system prompt (+ global MCP tool defs, incl. cached ones) | `fp1 = sha(model ‖ system)` | `sysprompt-*.kv` (model-global) |
-//! | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md` set, memory, **local** MCP tool defs | `fp2 = tier(fp1, stable-hash ‖ local tool defs)` | `<project-key>/project-<fp2>.kv` |
+//! | 1 | system prompt (+ global MCP tool defs, incl. cached ones) | `fp1 = sha(model ‖ system)` | `sysprompt-<fp1>.kv_raw` (model-global) |
+//! | 2 | project-stable context: `AGENTS.md`/`CLAUDE.md` set, memory, **local** MCP tool defs | `fp2 = tier(fp1, stable-hash ‖ local tool defs)` | `<project-key>/project-<fp2>.kv_raw` |
 //! | 3 | session-volatile context: git status, date, hook output | — | never cached |
-//! | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.payload` |
+//! | 4 | conversation turns | `tier(fp2, transcript)` | `<session>.kv_raw` |
 //!
 //! Tier 1's text depends on the set of global MCP servers **present in
 //! `~/.plank/.mcp.json`**, not the set that successfully handshook: a global
@@ -105,7 +105,7 @@ impl TierSpec {
 /// Tier 1's fingerprint: `sha1(model ‖ NUL ‖ think ‖ NUL ‖ trusted_len ‖ NUL ‖ system)`.
 ///
 /// The single definition of the system-prompt checkpoint key, shared by the
-/// engine (which writes `sysprompt-*.kv` with it) and by the tier planner
+/// engine (which writes `sysprompt-*.kv_raw` with it) and by the tier planner
 /// (which chains `fp2` off it). Keeping one implementation is what guarantees
 /// the two never disagree and silently invalidate the whole chain.
 ///

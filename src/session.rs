@@ -372,9 +372,9 @@ pub struct SessionEntry {
 /// not share a file, and GC sweeps per project directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KvKey {
-    /// Tier 1: model + system prompt. `sysprompt-<fp>.kv`, shared across projects.
+    /// Tier 1: model + system prompt. `sysprompt-<fp>.kv_raw`, shared across projects.
     System { fp: String },
-    /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv`.
+    /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv_raw`.
     Project { dir: PathBuf, fp: String },
     /// A saved conversation's KV payload. `<id>.kv_raw`.
     ///
@@ -525,14 +525,14 @@ impl SessionStore {
     }
 
     /// Project-scope subdirectory for Tier 2+ checkpoints: `<dir>/<project-key>/`
-    /// (issue #60). Callers create it lazily before writing a `project.kv`.
+    /// (issue #60). Callers create it lazily before writing a project checkpoint.
     #[must_use]
     pub fn project_dir(&self, project: &Path) -> PathBuf {
         self.dir.join(project_key(project))
     }
 
     /// Path of the Tier 2 project-stable KV checkpoint for `project` at the
-    /// chained fingerprint `fp2`: `<dir>/<project-key>/project-<fp2>.kv`. Shared
+    /// chained fingerprint `fp2`: `<dir>/<project-key>/project-<fp2>.kv_raw`. Shared
     /// by all sessions of the project and read by every new session (issue #60).
     #[must_use]
     pub fn project_checkpoint_path(&self, project: &Path, fp2: &str) -> PathBuf {
@@ -1067,12 +1067,12 @@ const SYSPROMPT_PREFIX: &str = "sysprompt-";
 const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
-/// `project-<fp2>.kv`, living under the per-project subdirectory.
+/// `project-<fp2>.kv_raw`, living under the per-project subdirectory.
 const PROJECT_STEM: &str = "project";
 
 /// Project-scope subdirectory name under `kvcache/`: 12 hex of `sha1(project
 /// path)`. Tier 2+ checkpoints live under here so they are *project-scoped*,
-/// while Tier 1 (`sysprompt-*.kv`) stays model-global at the cache root and is
+/// while Tier 1 (`sysprompt-*.kv_raw`) stays model-global at the cache root and is
 /// shared across every project (issue #60).
 #[must_use]
 pub fn project_key(project_dir: &Path) -> String {
@@ -1102,7 +1102,7 @@ pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
 }
 
 /// File name of a Tier 2 project-stable checkpoint keyed by its chained
-/// fingerprint `fp2`: `project-<fp2>.kv`. One file per (project, AGENTS.md
+/// fingerprint `fp2`: `project-<fp2>.kv_raw`. One file per (project, AGENTS.md
 /// revision); shared by every session of the project (issue #60).
 #[must_use]
 pub fn project_checkpoint_name(fp2: &str) -> String {
@@ -1120,7 +1120,7 @@ pub fn kv_role(key: &KvKey) -> crate::kvmeta::KvRole {
 }
 
 /// File name of the Tier 1 system-prompt checkpoint keyed by its fingerprint
-/// `fp1`: `sysprompt-<fp1>.kv`. Model-global, at the cache root.
+/// `fp1`: `sysprompt-<fp1>.kv_raw`. Model-global, at the cache root.
 #[must_use]
 pub fn sysprompt_checkpoint_name(fp1: &str) -> String {
     format!("{SYSPROMPT_PREFIX}{fp1}{PAYLOAD_EXT}")
