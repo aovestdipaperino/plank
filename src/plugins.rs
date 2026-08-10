@@ -168,6 +168,98 @@ pub fn load_plugin(dir: &Path, origin: Origin) -> Option<Plugin> {
     Some(plugin)
 }
 
+/// Every plugin activated for a session, plus set-level load complaints.
+#[derive(Debug, Clone, Default)]
+pub struct PluginSet {
+    /// Loaded plugins, in increasing precedence.
+    pub plugins: Vec<Plugin>,
+    /// Non-fatal complaints not attributable to a single loaded plugin.
+    pub warnings: Vec<String>,
+}
+
+impl PluginSet {
+    /// Every warning worth showing: set-level first, then per-plugin.
+    #[must_use]
+    pub fn all_warnings(&self) -> Vec<String> {
+        let mut out = self.warnings.clone();
+        for p in &self.plugins {
+            out.extend(p.warnings.iter().cloned());
+        }
+        out
+    }
+}
+
+/// Immediate subdirectories of `root`, sorted by name for a stable load order.
+fn subdirs(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Loads every activated plugin: `~/.plank/plugins/dev/*`, then
+/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given.
+/// A later source replaces an earlier plugin of the same name.
+#[must_use]
+pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
+    let mut candidates: Vec<(PathBuf, Origin)> = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let root = PathBuf::from(home)
+            .join(".plank")
+            .join("plugins")
+            .join("dev");
+        candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
+    }
+    let project = cwd.join(".plank").join("plugins");
+    candidates.extend(
+        subdirs(&project)
+            .into_iter()
+            .map(|d| (d, Origin::ProjectScan)),
+    );
+    candidates.extend(cli_dirs.iter().map(|d| (d.clone(), Origin::CliDir)));
+
+    let mut set = PluginSet::default();
+    let mut seen_roots: Vec<PathBuf> = Vec::new();
+    for (dir, origin) in candidates {
+        if origin == Origin::CliDir && !dir.is_dir() {
+            set.warnings
+                .push(format!("--plugin-dir {}: not a directory", dir.display()));
+            continue;
+        }
+        let Some(plugin) = load_plugin(&dir, origin) else {
+            if origin == Origin::CliDir {
+                set.warnings.push(format!(
+                    "--plugin-dir {}: no plugin.json and no components",
+                    dir.display()
+                ));
+            }
+            continue;
+        };
+        if seen_roots.contains(&plugin.root) {
+            continue;
+        }
+        seen_roots.push(plugin.root.clone());
+        if let Some(slot) = set.plugins.iter_mut().find(|p| p.name == plugin.name) {
+            set.warnings.push(format!(
+                "plugin '{}' from {} shadows the one from {}",
+                plugin.name,
+                plugin.origin.label(),
+                slot.origin.label()
+            ));
+            *slot = plugin;
+        } else {
+            set.plugins.push(plugin);
+        }
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +347,61 @@ mod tests {
         let p = load_plugin(&dir, Origin::UserScan).expect("loads");
         assert_eq!(p.name, "safe");
         assert!(p.warnings.iter().any(|w| w.contains("invalid name")));
+    }
+
+    #[test]
+    fn project_plugins_load_and_carry_their_origin() {
+        let base = scratch("project-scan");
+        let cwd = base.join("proj");
+        write(
+            &cwd,
+            ".plank/plugins/alpha/.plank-plugin/plugin.json",
+            r#"{"name":"alpha"}"#,
+        );
+        let set = load_default(&cwd, &[]);
+        assert_eq!(set.plugins.len(), 1);
+        assert_eq!(set.plugins[0].name, "alpha");
+        assert_eq!(set.plugins[0].origin, Origin::ProjectScan);
+    }
+
+    #[test]
+    fn a_cli_dir_shadows_an_auto_scanned_plugin_of_the_same_name() {
+        let base = scratch("cli-shadow");
+        let cwd = base.join("proj");
+        write(
+            &cwd,
+            ".plank/plugins/alpha/.plank-plugin/plugin.json",
+            r#"{"name":"alpha","version":"scanned"}"#,
+        );
+        let cli = base.join("elsewhere").join("alpha");
+        write(
+            &cli,
+            ".plank-plugin/plugin.json",
+            r#"{"name":"alpha","version":"cli"}"#,
+        );
+        let set = load_default(&cwd, &[cli]);
+        assert_eq!(set.plugins.len(), 1);
+        assert_eq!(set.plugins[0].version, "cli");
+        assert_eq!(set.plugins[0].origin, Origin::CliDir);
+        assert!(set.warnings.iter().any(|w| w.contains("shadow")));
+    }
+
+    #[test]
+    fn the_same_directory_named_twice_loads_once() {
+        let base = scratch("dedup");
+        let cwd = base.join("proj");
+        let cli = base.join("alpha");
+        write(&cli, ".plank-plugin/plugin.json", r#"{"name":"alpha"}"#);
+        let set = load_default(&cwd, &[cli.clone(), cli]);
+        assert_eq!(set.plugins.len(), 1);
+    }
+
+    #[test]
+    fn a_missing_cli_dir_warns_without_failing_the_set() {
+        let base = scratch("missing-cli");
+        let cwd = base.join("proj");
+        let set = load_default(&cwd, &[base.join("nope")]);
+        assert!(set.plugins.is_empty());
+        assert!(set.warnings.iter().any(|w| w.contains("nope")));
     }
 }

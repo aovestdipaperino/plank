@@ -48,6 +48,8 @@ pub struct AgentConfig {
     pub worktree_pr: Option<u32>,
     /// MCP server config supplied with `--mcp-config`; `None` = `./.mcp.json`.
     pub mcp_config_path: Option<PathBuf>,
+    /// Directories named by `--plugin-dir`, loaded as session-only plugins.
+    pub plugin_dirs: Vec<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
     /// Loopback port for `--ui-remote` TUI remote control; `Some(0)` asks for
@@ -292,6 +294,7 @@ impl Default for AgentConfig {
             worktree: None,
             worktree_pr: None,
             mcp_config_path: None,
+            plugin_dirs: Vec::new(),
             non_interactive: false,
             ui_remote: None,
             show_help: false,
@@ -460,6 +463,7 @@ Options:
       --worktree-pr N      base that worktree on pull request N (implies --worktree)
       --mcp-config FILE    local MCP server config (default: ./.mcp.json);
                            overlays the global ~/.plank/.mcp.json by name
+      --plugin-dir PATH    load a plugin directory for this session (repeatable)
       --sandbox            run model bash commands under sandbox-exec
                            (writes limited to cwd/temp; see sandbox.json).
                            On by default on macOS
@@ -1119,6 +1123,7 @@ pub fn parse_options_with(
                 c.worktree_pr = Some(n);
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
+            "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
             "--sandbox" => c.sandbox_override = Some(true),
             "--no-sandbox" => c.sandbox_override = Some(false),
             "--btw-suspend" => c.btw.suspend = true,
@@ -1300,6 +1305,16 @@ mod tests {
         };
         assert_eq!(parse_options_with(&s, &[]).unwrap().backend, None);
         assert!(parse_options(&args(&["--backend", "quantum"])).is_err());
+    }
+
+    #[test]
+    fn plugin_dir_is_repeatable() {
+        let c =
+            parse_options(&args(&["--plugin-dir", "/a", "--plugin-dir", "/b"])).expect("parses");
+        assert_eq!(
+            c.plugin_dirs,
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 
     #[test]
