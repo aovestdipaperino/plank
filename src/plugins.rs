@@ -119,10 +119,52 @@ fn valid_name(name: &str) -> bool {
         && !name.contains("__")
 }
 
+/// Warnings for every `safety.*` key a plugin's `settings.json` sets.
+///
+/// Plugin settings are applied strictly below `~/.plank/settings.json`, so a
+/// plugin can never override a key the user set. But `safety.sandbox` is an
+/// `Option<bool>` that defaults to `None`, and almost nobody sets it
+/// explicitly — so a plugin writing `{"safety":{"sandbox":false}}` wins by
+/// default and turns the bash sandbox off silently. That is no more power than
+/// `./.plank/settings.json` already has over the same key, so the setting is
+/// honored rather than blocked; it is only made visible.
+fn settings_safety_warnings(name: &str, root: &Path) -> Vec<String> {
+    let path = root.join("settings.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Some(crate::tools::mcp::Json::Obj(top)) = crate::tools::mcp::json_parse(&text) else {
+        return Vec::new();
+    };
+    let Some((_, crate::tools::mcp::Json::Obj(safety))) = top.iter().find(|(k, _)| k == "safety")
+    else {
+        return Vec::new();
+    };
+    safety
+        .iter()
+        .map(|(key, _)| {
+            format!(
+                "plugin '{name}': settings.json sets safety.{key}; it applies unless you set it yourself in ~/.plank/settings.json or ./.plank/settings.json"
+            )
+        })
+        .collect()
+}
+
 /// Loads one plugin directory. `None` when `dir` is not a plugin at all —
 /// neither a manifest nor any recognizable component.
 #[must_use]
 pub fn load_plugin(dir: &Path, origin: Origin) -> Option<Plugin> {
+    let mut plugin = load_plugin_fields(dir, origin)?;
+    // Appended after the manifest is read, so the warning uses the plugin's
+    // final name rather than the directory it happened to sit in.
+    let safety = settings_safety_warnings(&plugin.name, &plugin.root);
+    plugin.warnings.extend(safety);
+    Some(plugin)
+}
+
+/// The manifest-reading half of [`load_plugin`], split out so the safety-key
+/// audit runs once on every exit path.
+fn load_plugin_fields(dir: &Path, origin: Origin) -> Option<Plugin> {
     let manifest = manifest_path(dir);
     if manifest.is_none() && !has_components(dir) {
         return None;
@@ -1347,6 +1389,46 @@ mod tests {
         assert!(
             out.contains("we__ather"),
             "rejected MCP server warning missing: {out}"
+        );
+    }
+
+    /// `safety.sandbox` defaults to `None`, so a plugin setting it wins unless
+    /// the user set it explicitly — which almost nobody does. The setting is
+    /// still honored; it just cannot be silent.
+    #[test]
+    fn a_plugin_settings_file_touching_a_safety_key_warns() {
+        let base = scratch("plugin-safety");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(&plugin, "settings.json", r#"{"safety":{"sandbox":false}}"#);
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(set.plugins.len(), 1, "the plugin still loads");
+        let out = render_list(&set);
+        assert!(
+            out.contains("safety.sandbox") && out.contains("demo"),
+            "expected a warning naming the plugin and the key, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_settings_file_without_safety_keys_is_quiet() {
+        let base = scratch("plugin-safety-quiet");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(&plugin, "settings.json", r#"{"kvcache":{"maxBytes":7}}"#);
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert!(
+            !set.all_warnings().iter().any(|w| w.contains("safety")),
+            "{:?}",
+            set.all_warnings()
         );
     }
 
