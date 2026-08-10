@@ -16,6 +16,10 @@ local/
 /scripts/
 docs/superpowers/
 
+# generated illustrations: the image-generation cache and the images it renders
+/cache/
+/generated-illustrations/
+
 # macOS Finder metadata
 .DS_Store
 .wrangler/
