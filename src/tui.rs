@@ -2462,6 +2462,84 @@ pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
     frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
 }
 
+/// The modal rectangle `draw_kvcache` paints into: `lines` rows plus a border,
+/// centered in `area` and clamped so it never spills outside a small terminal.
+///
+/// Pulled out of the draw call so the clamping is testable on its own.
+#[must_use]
+fn kvcache_rect(area: Rect, lines: usize) -> Rect {
+    let width = 84.min(area.width.saturating_sub(4)).max(20);
+    let height = u16::try_from(lines + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    }
+}
+
+/// Draws the `/kvcache` lineage tree as a centered modal overlay.
+///
+/// Rows come from [`crate::kvpane::KvPane::rows`]: indentation encodes depth,
+/// the selected row is reversed, and pinned and expired markers ride on the
+/// right. A footer carries the totals and the key hints.
+pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
+    let rows = pane.rows();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() + 3);
+    for row in &rows {
+        let indent = "  ".repeat(row.depth);
+        let marker = match (row.has_children, row.expanded) {
+            (true, true) => "▾ ",
+            (true, false) => "▸ ",
+            (false, _) => "  ",
+        };
+        let left = format!("{indent}{marker}{}", row.label);
+        let style = if row.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(left, style),
+            Span::raw("  "),
+            Span::styled(row.right.clone(), Style::default().fg(Color::DarkGray)),
+        ]));
+        if !row.detail.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!("{indent}    {}", row.detail),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!("  {}", pane.footer()),
+        Style::default().fg(Color::Cyan),
+    )));
+    // A pending delete replaces the hints with the question it is waiting on,
+    // so `d` never leaves the user guessing what the pane wants next.
+    let hints = if pane.pending_delete() {
+        "  delete this entry? y to confirm, any other key cancels"
+    } else {
+        "  ↑↓ move · ←→ fold · p pin · d delete · g sweep · Esc close"
+    };
+    lines.push(Line::from(Span::styled(
+        hints,
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let rect = kvcache_rect(frame.area(), lines.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" kv cache ")
+        .title_style(Style::default().add_modifier(Modifier::BOLD));
+    frame.render_widget(Clear, rect);
+    frame.render_widget(Paragraph::new(Text::from(lines)).block(block), rect);
+}
+
 /// How far a veiled cell's color is pulled toward black.
 const VEIL_KEEP: f32 = 0.32;
 
@@ -5737,5 +5815,83 @@ mod tests {
                 .any(|r| r.contains("pace") || r.contains("quit")),
             "the screensaver must not offer the controls: {rows:?}"
         );
+    }
+
+    /// A pane over a two-node lineage, for the `/kvcache` modal tests.
+    fn kv_test_pane() -> crate::kvpane::KvPane {
+        const DAY: u64 = 86_400;
+        let meta =
+            |role: crate::kvmeta::KvRole, fp: &str, parent: Option<&str>| crate::kvmeta::KvMeta {
+                version: crate::kvmeta::META_VERSION,
+                role,
+                fingerprint: fp.to_owned(),
+                parent: parent.map(ToOwned::to_owned),
+                model: "m".into(),
+                created: 0,
+                last_used: 1_000 * DAY,
+                hits: 1,
+                bytes: 4096,
+                pinned: false,
+                label: crate::kvmeta::KvLabel::Unknown,
+            };
+        crate::kvpane::KvPane::new(
+            crate::kvtree::build(vec![
+                meta(crate::kvmeta::KvRole::System, "a19f", None),
+                meta(crate::kvmeta::KvRole::Session, "7c02", Some("a19f")),
+            ]),
+            crate::kvgc::SweepPolicy {
+                ttl_session_secs: 14 * DAY,
+                ttl_tier_secs: 30 * DAY,
+                max_bytes: 0,
+            },
+            0,
+            1_000 * DAY,
+        )
+    }
+
+    #[test]
+    fn the_kvcache_modal_fits_inside_a_small_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // The same clamping `draw_config` relies on: on a 24x8 terminal the
+        // modal must stay inside the frame rather than panicking in ratatui's
+        // Rect math.
+        let pane = kv_test_pane();
+        let mut term = Terminal::new(TestBackend::new(24, 8)).unwrap();
+        term.draw(|f| draw_kvcache(f, &pane)).unwrap();
+
+        // And the geometry itself: never wider or taller than the frame, and
+        // never zero-sized however few lines there are.
+        let area = Rect::new(0, 0, 24, 8);
+        let rect = kvcache_rect(area, 40);
+        assert!(rect.right() <= area.right(), "{rect:?}");
+        assert!(rect.bottom() <= area.bottom(), "{rect:?}");
+        let tiny = kvcache_rect(Rect::new(0, 0, 4, 1), 1);
+        assert!(tiny.width >= 20 && tiny.height >= 3, "{tiny:?}");
+    }
+
+    #[test]
+    fn the_kvcache_modal_draws_the_tree_and_its_footer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let pane = kv_test_pane();
+        let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
+        term.draw(|f| draw_kvcache(f, &pane)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("kv cache"), "{text}");
+        assert!(text.contains("system"), "{text}");
+        assert!(text.contains("session"), "{text}");
+        assert!(text.contains("reclaimable"), "{text}");
+        assert!(text.contains("Esc close"), "{text}");
     }
 }

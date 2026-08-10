@@ -3935,31 +3935,48 @@ the original is frozen and listed in /tree"
         let verb = words.next().unwrap_or("");
         let fp = words.next().unwrap_or("");
         match verb {
-            "" => {
-                let settings = crate::settings::active();
-                let policy = crate::kvgc::SweepPolicy::from_settings(&settings.kvcache);
-                let pane = crate::kvpane::KvPane::new(
-                    crate::kvtree::build(self.store.kv_nodes()),
-                    policy,
-                    settings.kvcache.max_bytes,
-                    crate::kvmeta::now_secs(),
-                );
-                crate::kvpane::render_text(&pane)
-            }
-            "gc" => {
-                let policy =
-                    crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
-                let freed = self.store.sweep(&[], &policy, crate::kvmeta::now_secs());
-                format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
-            }
-            "pin" | "unpin" | "rm" => match self.kvcache_mutate(verb, fp) {
-                Ok(msg) => msg,
-                Err(e) => format!("kvcache: {e}"),
-            },
+            "" => crate::kvpane::render_text(&self.kvcache_pane()),
+            "gc" => self.kvcache_sweep(),
+            "pin" | "unpin" | "rm" => self.kvcache_apply(verb, fp),
             other => {
                 format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
             }
         }
+    }
+
+    /// Builds a `/kvcache` pane over the current on-disk state.
+    ///
+    /// Both front ends construct the view this way, so the TUI modal and the
+    /// stdout tree are always the same rows.
+    #[must_use]
+    fn kvcache_pane(&self) -> crate::kvpane::KvPane {
+        let settings = crate::settings::active();
+        crate::kvpane::KvPane::new(
+            crate::kvtree::build(self.store.kv_nodes()),
+            crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
+            settings.kvcache.max_bytes,
+            crate::kvmeta::now_secs(),
+        )
+    }
+
+    /// Sweeps the cache under the configured policy and reports what it freed.
+    ///
+    /// No session is passed as active: `/kvcache gc` is a deliberate manual
+    /// sweep, and the live session's own blobs are protected by their recency
+    /// rather than by an exemption list.
+    #[must_use]
+    fn kvcache_sweep(&self) -> String {
+        let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
+        let freed = self.store.sweep(&[], &policy, crate::kvmeta::now_secs());
+        format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
+    }
+
+    /// [`kvcache_mutate`](Self::kvcache_mutate) flattened to one printable
+    /// line, so both front ends report a failure the same way.
+    #[must_use]
+    fn kvcache_apply(&self, verb: &str, fp: &str) -> String {
+        self.kvcache_mutate(verb, fp)
+            .unwrap_or_else(|e| format!("kvcache: {e}"))
     }
 
     /// Applies one `/kvcache` mutation by fingerprint prefix, returning the
@@ -5833,6 +5850,9 @@ impl Agent<'_> {
         // The interactive `/config` modal, when open; it intercepts all keys
         // and renders over the frame until Esc (save) or q/Ctrl-C (cancel).
         let mut config_form: Option<crate::configform::ConfigForm> = None;
+        // The `/kvcache` lineage pane, when open; like `/config` it intercepts
+        // all keys and renders over the frame until Esc/q/Ctrl-C closes it.
+        let mut kv_pane: Option<crate::kvpane::KvPane> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
         // attached to the message as file references the model's tools can
         // read. Always empty while IMAGES_ENABLED is off.
@@ -5929,6 +5949,9 @@ impl Agent<'_> {
                     if let Some(form) = &config_form {
                         tui::draw_config(f, form);
                     }
+                    if let Some(pane) = &kv_pane {
+                        tui::draw_kvcache(f, pane);
+                    }
                     // Drawn last: the arcade covers the whole frame.
                     if arcade.is_open() {
                         tui::draw_arcade(f, &arcade);
@@ -5951,6 +5974,7 @@ impl Agent<'_> {
             // question the user still has to answer.
             if !arcade.is_open()
                 && config_form.is_none()
+                && kv_pane.is_none()
                 && let Some(after) = crate::settings::active().ui.screensaver.duration()
                 && last_activity.elapsed() >= after
             {
@@ -5987,6 +6011,7 @@ impl Agent<'_> {
                                 &mut input,
                                 &mut btw_panel,
                                 &mut config_form,
+                                &mut kv_pane,
                                 &mut arcade,
                                 &mut sub_pane,
                             ) {
@@ -6229,6 +6254,33 @@ impl Agent<'_> {
                 }
                 continue;
             }
+            // The `/kvcache` pane, when open, owns every key until it closes.
+            if let Some(pane) = kv_pane.as_mut() {
+                match pane.handle_key(key) {
+                    crate::kvpane::Outcome::Stay => {}
+                    crate::kvpane::Outcome::Close => kv_pane = None,
+                    // Pin and unpin only rewrite a sidecar's `pinned` flag, and
+                    // the pane already flipped its own copy for the display, so
+                    // rebuilding here would only cost a rescan.
+                    crate::kvpane::Outcome::Pin(fp) => {
+                        log.push_dim(self.kvcache_apply("pin", &fp));
+                    }
+                    crate::kvpane::Outcome::Unpin(fp) => {
+                        log.push_dim(self.kvcache_apply("unpin", &fp));
+                    }
+                    // These two change what is on disk, so the pane has to be
+                    // rebuilt or it would keep offering rows that are gone.
+                    crate::kvpane::Outcome::Delete(fp) => {
+                        log.push_dim(self.kvcache_apply("rm", &fp));
+                        kv_pane = Some(self.kvcache_pane());
+                    }
+                    crate::kvpane::Outcome::Sweep => {
+                        log.push_dim(self.kvcache_sweep());
+                        kv_pane = Some(self.kvcache_pane());
+                    }
+                }
+                continue;
+            }
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
             selection = None;
@@ -6432,6 +6484,7 @@ impl Agent<'_> {
                             &mut input,
                             &mut btw_panel,
                             &mut config_form,
+                            &mut kv_pane,
                             &mut arcade,
                             &mut sub_pane,
                         ) {
@@ -8007,6 +8060,7 @@ impl Agent<'_> {
         input: &mut TuiInput,
         btw: &mut BtwPanel,
         config_form: &mut Option<crate::configform::ConfigForm>,
+        kv_pane: &mut Option<crate::kvpane::KvPane>,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> bool {
@@ -8287,6 +8341,16 @@ impl Agent<'_> {
                             ));
                         }
                         Err(e) => log.push_plain(format!("strip failed: {e}")),
+                    }
+                }
+            }
+            "/kvcache" => {
+                if arg.is_empty() {
+                    *kv_pane = Some(self.kvcache_pane());
+                } else {
+                    // Subcommands work in the TUI too, for scripted use.
+                    for line in self.kvcache_text_command(arg).lines() {
+                        log.push_plain(line.to_owned());
                     }
                 }
             }
