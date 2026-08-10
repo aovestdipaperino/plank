@@ -447,6 +447,56 @@ impl SessionStore {
         fs::metadata(self.payload_path(id)).map_or(0, |m| m.len())
     }
 
+    /// Every KV blob in the cache, with its metadata.
+    ///
+    /// Scans the cache root and one level of per-project subdirectories for
+    /// `*.kv_raw` bodies. A body with no readable sidecar yields
+    /// [`crate::kvmeta::KvMeta::synthesized`] from its size and mtime, so an
+    /// externally dropped or partially migrated file still shows in `/kvcache`
+    /// and can still be deleted from there.
+    #[must_use]
+    pub fn kv_nodes(&self) -> Vec<crate::kvmeta::KvMeta> {
+        fn scan(dir: &Path, out: &mut Vec<crate::kvmeta::KvMeta>, recurse: bool) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    if recurse {
+                        scan(&path, out, false);
+                    }
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                let Some(stem) = name.strip_suffix(PAYLOAD_EXT) else {
+                    continue;
+                };
+                let meta = crate::kvmeta::load(&path).unwrap_or_else(|| {
+                    let md = entry.metadata().ok();
+                    let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
+                    let mtime = md
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    let (role, fp) = if let Some(fp) = stem.strip_prefix(SYSPROMPT_PREFIX) {
+                        (crate::kvmeta::KvRole::System, fp)
+                    } else if let Some(fp) = stem.strip_prefix(&format!("{PROJECT_STEM}-")) {
+                        (crate::kvmeta::KvRole::Project, fp)
+                    } else {
+                        (crate::kvmeta::KvRole::Session, stem)
+                    };
+                    crate::kvmeta::KvMeta::synthesized(role, fp, bytes, mtime)
+                });
+                out.push(meta);
+            }
+        }
+        let mut out = Vec::new();
+        scan(&self.dir, &mut out, true);
+        out
+    }
+
     /// Project-scope subdirectory for Tier 2+ checkpoints: `<dir>/<project-key>/`
     /// (issue #60). Callers create it lazily before writing a `project.kv`.
     #[must_use]
@@ -1918,6 +1968,38 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn kv_nodes_finds_blobs_in_the_root_and_in_project_dirs() {
+        let dir = std::env::temp_dir().join(format!("plank-kvnodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let proj = dir.join("abc123def456");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 100]).unwrap();
+        std::fs::write(proj.join("project-7c02.kv_raw"), vec![0u8; 50]).unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv_raw"), vec![0u8; 200]).unwrap();
+        // Neither a transcript nor an in-flight temp file is a node.
+        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv_raw.tmp.99"), b"x").unwrap();
+
+        let mut nodes = store.kv_nodes();
+        nodes.sort_by(|a, b| a.fingerprint.cmp(&b.fingerprint));
+        let got: Vec<(&str, &str, u64)> = nodes
+            .iter()
+            .map(|m| (m.role.as_str(), m.fingerprint.as_str(), m.bytes))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("project", "7c02", 50),
+                ("system", "a19f", 100),
+                ("session", "cheeky-bell", 200),
+            ],
+            "one node per .kv_raw body, role and fingerprint inferred from the name"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
