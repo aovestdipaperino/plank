@@ -155,31 +155,6 @@ pub fn note_edited(last: &mut Option<PathBuf>, previews: &[EditPreview], cwd: &P
     }
 }
 
-/// What `/open` should do once the editor hands the terminal back.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AfterEdit {
-    /// Write nothing: the user cancelled, or accepted without changing a byte.
-    Unchanged,
-    /// Write this text back to the file.
-    Save(String),
-}
-
-/// Decides whether an editor session's result needs writing.
-///
-/// `edited` is what the editor returned — `None` on cancel. Accepting a
-/// byte-identical buffer is deliberately *not* a write: rewriting the file
-/// would bump its mtime and make every watcher downstream rebuild for nothing.
-///
-/// Separated from the UI arm so the decision is unit-testable; the arm itself
-/// needs a live terminal and cannot be.
-#[must_use]
-pub fn after_edit(edited: Option<String>, initial: &str) -> AfterEdit {
-    match edited {
-        Some(text) if text != initial => AfterEdit::Save(text),
-        _ => AfterEdit::Unchanged,
-    }
-}
-
 /// The log line for a successful write.
 #[must_use]
 pub fn wrote_message(display: &str, text: &str) -> String {
@@ -391,45 +366,6 @@ mod tests {
         let mut last = Some(PathBuf::from("/work/a.rs"));
         note_edited(&mut last, &[], Path::new("/work"));
         assert_eq!(last, Some(PathBuf::from("/work/a.rs")));
-    }
-
-    #[test]
-    fn cancelling_writes_nothing() {
-        assert_eq!(after_edit(None, "hello\n"), AfterEdit::Unchanged);
-    }
-
-    #[test]
-    fn accepting_without_editing_writes_nothing() {
-        // Rewriting a byte-identical file would bump its mtime and make every
-        // watcher downstream rebuild for nothing.
-        assert_eq!(
-            after_edit(Some("hello\n".to_string()), "hello\n"),
-            AfterEdit::Unchanged
-        );
-    }
-
-    /// Regression: file mode inserts a trailing newline the raw file text on
-    /// disk may not have, so comparing an accept against the raw `initial`
-    /// text made a true no-op accept look like an edit and rewrite the file.
-    /// `after_edit` must be compared against the same seeded text the editor
-    /// started from, not the raw bytes.
-    #[test]
-    fn accepting_an_untouched_file_without_a_trailing_newline_writes_nothing() {
-        let initial = "hello"; // no trailing newline, as read from disk
-        let seed = crate::miniedit::file_seed_text(initial);
-        assert_eq!(seed, "hello\n");
-        // The editor returns exactly what it was seeded with: the user typed
-        // nothing and just pressed Ctrl+S. `tui_open` must compare against
-        // the seeded text, not the raw `initial` it read from disk.
-        assert_eq!(after_edit(Some(seed.clone()), &seed), AfterEdit::Unchanged);
-    }
-
-    #[test]
-    fn accepting_an_edit_asks_for_a_save() {
-        assert_eq!(
-            after_edit(Some("bye\n".to_string()), "hello\n"),
-            AfterEdit::Save("bye\n".to_string())
-        );
     }
 
     #[test]

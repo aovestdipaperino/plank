@@ -8294,21 +8294,22 @@ impl Agent<'_> {
                 return;
             }
         };
-        // Compare against the same seeded text the editor was started from,
-        // not the raw file bytes: file mode appends a trailing newline the
-        // disk copy may lack, so comparing against `initial` would treat an
-        // untouched Ctrl+S as an edit and rewrite the file for no reason.
-        let seed = crate::miniedit::file_seed_text(&initial);
-        match crate::openfile::after_edit(edited, &seed) {
-            crate::openfile::AfterEdit::Save(text) => {
-                match crate::openfile::save(&path, &text) {
-                    Ok(()) => log.push_plain(crate::openfile::wrote_message(&display, &text)),
-                    // The pointer is still set below: a failed save leaves the
-                    // file as the obvious thing to reopen and retry.
-                    Err(e) => log.push_plain(format!("save failed: {e}")),
-                }
-            }
-            crate::openfile::AfterEdit::Unchanged => {
+        // `edited` is already the accept/cancel/no-op decision: miniedit's
+        // `State::accepted_text` returns `None` for a file accepted without
+        // any change, using its own `is_modified` (which compares against
+        // the buffer's own read-back-at-construction `original`) rather than
+        // a seed computed independently here. That is the only way this
+        // comparison can't drift from what the buffer's write path actually
+        // does — including line-ending normalization the old seed-based
+        // comparison did not model.
+        match edited {
+            Some(text) => match crate::openfile::save(&path, &text) {
+                Ok(()) => log.push_plain(crate::openfile::wrote_message(&display, &text)),
+                // The pointer is still set below: a failed save leaves the
+                // file as the obvious thing to reopen and retry.
+                Err(e) => log.push_plain(format!("save failed: {e}")),
+            },
+            None => {
                 log.push_dim(crate::openfile::unchanged_message(&display));
             }
         }

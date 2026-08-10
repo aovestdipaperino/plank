@@ -245,6 +245,30 @@ impl State {
         self.text() != self.original
     }
 
+    /// What accepting this session should hand back to the caller.
+    ///
+    /// For [`Mode::File`], accepting without changing anything and cancelling
+    /// are the same outcome — write nothing — so an unmodified accept
+    /// collapses onto `None` here rather than leaving the caller to
+    /// re-derive "did anything change" from a separately computed seed. This
+    /// is the only place that decision is made, and it is made from
+    /// [`State::is_modified`], which already accounts for every
+    /// normalization the buffer applies (trailing newline, line-ending
+    /// convention, ...) because it compares against [`State::original`],
+    /// read back out of the buffer itself at construction.
+    ///
+    /// [`Mode::Prompt`] always returns its text on accept, even when
+    /// unmodified: an unedited Ctrl-G prompt must still submit verbatim, so
+    /// the caller can tell "accept" from "cancel".
+    #[must_use]
+    pub fn accepted_text(&self) -> Option<String> {
+        if matches!(self.mode, Mode::File) && !self.is_modified() {
+            None
+        } else {
+            Some(self.text())
+        }
+    }
+
     /// Asks to leave without keeping the text.
     ///
     /// Discarding an untouched buffer loses nothing, so that leaves straight
@@ -516,5 +540,51 @@ mod tests {
         let state = State::new_for_file(src, 80, "a.txt").unwrap();
         assert_eq!(state.text(), src);
         assert!(!state.is_modified());
+    }
+
+    /// Regression: the buffer's write path rewrites every interior line
+    /// break to a single configured convention, so a mixed-ending file's
+    /// buffer text differs from a seed computed independently of the
+    /// buffer (as the old `miniedit::file_seed_text`-based comparison in
+    /// `ui.rs` did) even though `is_modified` correctly reports no edit.
+    /// `accepted_text` must key off `is_modified`, not a separately derived
+    /// seed, or an untouched Ctrl+S on this file rewrites it anyway.
+    #[test]
+    fn accepted_text_is_none_for_an_unmodified_mixed_line_ending_file() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("a\nb\r\nc\n", 80, "a.txt").unwrap();
+        assert!(!state.is_modified());
+        assert_eq!(state.accepted_text(), None);
+    }
+
+    /// Same bug class, lone-CR line endings.
+    #[test]
+    fn accepted_text_is_none_for_an_unmodified_lone_cr_file() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("a\rb\n", 80, "a.txt").unwrap();
+        assert!(!state.is_modified());
+        assert_eq!(state.accepted_text(), None);
+    }
+
+    /// A genuinely edited file must still come back `Some` so it gets
+    /// written.
+    #[test]
+    fn accepted_text_returns_the_edit_when_the_file_was_actually_changed() {
+        crate::miniedit::init().unwrap();
+        let state = State::new_for_file("hello", 80, "a.txt").unwrap();
+        state.buffer.borrow_mut().write_canon(b"!");
+        assert!(state.is_modified());
+        assert_eq!(state.accepted_text().as_deref(), Some("hello!\n"));
+    }
+
+    /// `Mode::Prompt` behavior must not change: accept always returns the
+    /// text, even when nothing was typed, so the caller can distinguish
+    /// accept from cancel.
+    #[test]
+    fn accepted_text_always_returns_text_for_prompt_mode_even_unmodified() {
+        crate::miniedit::init().unwrap();
+        let state = State::new("hello", 80).unwrap();
+        assert!(!state.is_modified());
+        assert_eq!(state.accepted_text().as_deref(), Some("hello"));
     }
 }

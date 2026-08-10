@@ -42,16 +42,18 @@ pub use state::{Mode, Outcome, Search, State};
 /// Applies the one normalization file mode performs on the text it is seeded
 /// with: appending a trailing newline when the text lacks one.
 ///
-/// File mode sets `insert_final_newline(true)`, so `State::new_for_file`'s
-/// buffer text can differ from the raw bytes on disk even before the user
-/// types anything. Both `State::build`'s file path and `crate::ui`'s
-/// `tui_open` (which decides whether Ctrl+S needs to write anything) must
-/// compare against this same normalized text, or an untouched accept on a
-/// file with no trailing newline looks like an edit and gets rewritten.
+/// File mode sets `insert_final_newline(true)`, but `write_raw` (the raw
+/// insert path `State::build` uses for a file, to avoid `write_canon`'s
+/// per-line indentation re-derivation) does not apply that setting itself —
+/// so `State::build` pre-computes the seed here before handing it to
+/// `write_raw`. Whether the *result* looks like an edit is no longer decided
+/// by comparing against this seed anywhere: `State::is_modified` reads the
+/// buffer's own post-write text back into `original` at construction, so it
+/// already reflects this and every other normalization the buffer applies.
 ///
 /// An empty file must not gain a newline: there is no line to terminate.
 #[must_use]
-pub fn file_seed_text(initial: &str) -> String {
+pub(crate) fn file_seed_text(initial: &str) -> String {
     if initial.is_empty() || initial.ends_with('\n') {
         initial.to_string()
     } else {
@@ -163,7 +165,7 @@ fn run(initial: &str, mode: Mode, title: Option<&str>) -> io::Result<Option<Stri
         match state.outcome {
             Outcome::Accept => {
                 debug_log("session end: accept");
-                return Ok(Some(state.text()));
+                return Ok(state.accepted_text());
             }
             Outcome::Cancel => {
                 debug_log("session end: cancel");
