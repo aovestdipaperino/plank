@@ -184,6 +184,24 @@ done."
     )
 }
 
+/// Finds `tag` on `line` and returns the text after it, but only if what
+/// precedes the tag on that line is empty/whitespace or ends with `>`.
+///
+/// The `>` allowance exists for one observed shape: a thinking model closes
+/// its `</think>` tag on the same line as the marker (`</think>GOAL_VERDICT:
+/// ATTAINED`), with no whitespace in between. Matching only at the trimmed
+/// start of a line (the original rule) misses that case entirely, which is
+/// the defect this function fixes.
+fn marker_suffix<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
+    let idx = line.find(tag)?;
+    let prefix = line[..idx].trim();
+    if prefix.is_empty() || prefix.ends_with('>') {
+        Some(line[idx + tag.len()..].trim())
+    } else {
+        None
+    }
+}
+
 /// Parses an adjudication reply.
 ///
 /// The **last** `GOAL_VERDICT:` line wins, so a reply that quotes the marker
@@ -191,13 +209,24 @@ done."
 /// unrecognized degrades to [`Verdict::Continue`]: turning a parse miss into a
 /// premature `ATTAINED` would be the worse failure, and the cap bounds the
 /// alternative.
+///
+/// The marker no longer has to open the line: it may follow a closing tag
+/// like `</think>` with no separating whitespace (see [`marker_suffix`]).
+/// This is deliberately narrower than "match the tag anywhere in the line" —
+/// that laxer rule would let a reply that merely *quotes* the marker in
+/// prose (e.g. "the format is `GOAL_VERDICT: ATTAINED`") be read as a real
+/// verdict whenever it happened to be the last such line, with no preamble
+/// after it to override it. Requiring the preceding text to be blank or end
+/// in `>` rules out ordinary prose while still admitting the tag-adjacent
+/// case that motivated this change. The residual risk — prose that ends a
+/// sentence with `>` right before quoting the marker — is vanishingly
+/// unlikely and accepted.
 #[must_use]
 pub fn parse_verdict(text: &str) -> Adjudication {
     let last = |tag: &str| {
         text.lines()
-            .filter_map(|l| l.trim().strip_prefix(tag))
+            .filter_map(|l| marker_suffix(l, tag))
             .next_back()
-            .map(str::trim)
     };
     let verdict = match last("GOAL_VERDICT:")
         .map(str::to_ascii_uppercase)
@@ -290,6 +319,20 @@ mod tests {
         let adj = parse_verdict(text);
         assert_eq!(adj.verdict, Verdict::Continue);
         assert_eq!(adj.reason, "two tests still fail");
+    }
+
+    #[test]
+    fn parse_verdict_reads_the_marker_sharing_a_line_with_a_closing_think_tag() {
+        let text = "</think>GOAL_VERDICT: ATTAINED\nGOAL_REASON: the tests pass\n";
+        let adj = parse_verdict(text);
+        assert_eq!(adj.verdict, Verdict::Attained);
+        assert_eq!(adj.reason, "the tests pass");
+    }
+
+    #[test]
+    fn parse_verdict_ignores_a_marker_quoted_mid_prose() {
+        let text = "The format is `x GOAL_VERDICT: ATTAINED` as documented.\n";
+        assert_eq!(parse_verdict(text).verdict, Verdict::Continue);
     }
 
     #[test]
