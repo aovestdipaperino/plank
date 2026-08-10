@@ -398,6 +398,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A brand-new install must classify as a fresh install, and that depends on
+    /// nothing having created `~/.plank` before this runs.
+    ///
+    /// The one-shot `.kv_raw` migration in `main` opens a `SessionStore`, whose
+    /// `create_dir_all` created `~/.plank` as a side effect. This function then
+    /// found a directory with no version marker, which `classify(None, _)` reads
+    /// as [`Transition::Major`] — so a first launch announced "major version
+    /// change detected; cleared the image cache". The migration is now gated on
+    /// `~/.plank/kvcache` already being a directory. This test holds both halves
+    /// of that coupling in place: the absent-directory case is `None`, and the
+    /// present-but-unmarked case really is `Major`, which is why the gate is
+    /// load-bearing rather than merely tidy.
+    #[test]
+    fn a_fresh_install_is_not_a_major_transition() {
+        let dir = tmp("fresh-no-kvcache");
+        assert!(!dir.exists(), "nothing has created ~/.plank yet");
+        assert!(!dir.join("kvcache").is_dir(), "and no cache dir to migrate");
+        assert_eq!(
+            run_startup_maintenance(&dir, "2.9.3"),
+            Transition::None,
+            "a fresh install is not a version change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join(MARKER_FILE)).unwrap(),
+            "2.9.3"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // The regression this guards against, made explicit: had anything created
+        // the directory first, the very same launch would have been Major.
+        let dir = tmp("fresh-precreated");
+        std::fs::create_dir_all(dir.join("kvcache")).unwrap();
+        assert_eq!(
+            run_startup_maintenance(&dir, "2.9.3"),
+            Transition::Major,
+            "an unmarked ~/.plank is indistinguishable from a downgrade"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn minor_keeps_all_kv_caches_and_images() {
         // The KV caches self-validate (fingerprint + snapshot format-version),

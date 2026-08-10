@@ -4007,40 +4007,41 @@ the original is frozen and listed in /tree"
     #[must_use]
     fn kvcache_apply(&self, verb: &str, fp_prefix: &str) -> String {
         self.resolve_kv_prefix(fp_prefix)
-            .and_then(|idx| self.kvcache_mutate(verb, idx))
+            .and_then(|(idx, fp)| self.kvcache_mutate(verb, idx, &fp))
             .unwrap_or_else(|e| format!("kvcache: {e}"))
     }
 
     /// [`kvcache_mutate`](Self::kvcache_mutate) on an already-resolved index,
     /// flattened to one printable line. The pane's own path: its rows carry the
-    /// index, so no prefix matching is involved.
+    /// index and the fingerprint, so no prefix matching is involved.
     #[must_use]
-    fn kvcache_apply_idx(&self, verb: &str, idx: usize) -> String {
-        self.kvcache_mutate(verb, idx)
+    fn kvcache_apply_idx(&self, verb: &str, idx: usize, fp: &str) -> String {
+        self.kvcache_mutate(verb, idx, fp)
             .unwrap_or_else(|e| format!("kvcache: {e}"))
     }
 
     /// Resolves a `/kvcache <verb> <fp-prefix>` argument to a scan index into
-    /// [`crate::session::SessionStore::kv_blob_nodes`].
+    /// [`crate::session::SessionStore::kv_blob_nodes`], paired with the full
+    /// fingerprint found there so the mutation can re-check the identity.
     ///
     /// The REPL subcommands keep their fingerprint-prefix interface; only the
     /// resolution changes, so both front ends act through one index-keyed code
     /// path. Never guesses: a prefix matching nothing, or more than one blob, is
     /// refused, because the caller may be about to unlink a file.
-    fn resolve_kv_prefix(&self, fp_prefix: &str) -> Result<usize, String> {
+    fn resolve_kv_prefix(&self, fp_prefix: &str) -> Result<(usize, String), String> {
         if fp_prefix.is_empty() {
             return Err("usage: /kvcache <pin|unpin|rm> <fingerprint>".to_owned());
         }
-        let hits: Vec<usize> = self
+        let hits: Vec<(usize, String)> = self
             .store
             .kv_blob_nodes()
             .iter()
             .enumerate()
             .filter(|(_, (_, m))| m.fingerprint.starts_with(fp_prefix))
-            .map(|(i, _)| i)
+            .map(|(i, (_, m))| (i, m.fingerprint.clone()))
             .collect();
         match hits.as_slice() {
-            [one] => Ok(*one),
+            [one] => Ok(one.clone()),
             [] => Err(format!("no cache entry matching {fp_prefix:?}")),
             _ => Err(format!(
                 "{fp_prefix:?} is ambiguous ({} matches)",
@@ -4060,16 +4061,47 @@ the original is frozen and listed in /tree"
     /// fingerprint happened to equal another body's stem, acted on that other
     /// file.
     ///
+    /// `expect_fp` is the fingerprint the caller saw at `idx`, and the index is
+    /// only honoured if the blob there still carries it. An index is a position
+    /// in a scan, and `/kvcache` retakes the scan on every mutation: a blob
+    /// unlinked by a sibling plank, a sub-agent's `persist` or a startup sweep
+    /// between the pane being built and a `d` press shifts every later position
+    /// down one, so the same index would name a *different* body. Refusing is
+    /// the honest answer — the cache changed under the user, and the fix is to
+    /// reopen the pane, not to guess which row was meant.
+    ///
     /// # Errors
-    /// Returns a message when the index names no blob, or the unlink or sidecar
-    /// write fails.
-    fn kvcache_mutate(&self, verb: &str, idx: usize) -> Result<String, String> {
+    /// Returns a message when the index names no blob, when the blob there is
+    /// not the one the caller saw, or when the unlink or sidecar write fails.
+    fn kvcache_mutate(&self, verb: &str, idx: usize, expect_fp: &str) -> Result<String, String> {
         let scan = self.store.kv_blob_nodes();
         let Some((path, meta)) = scan.get(idx) else {
             return Err(format!("cache entry {idx} vanished from disk"));
         };
+        if meta.fingerprint != expect_fp {
+            return Err(format!(
+                "the cache changed under you (entry {idx} is now {}, not {expect_fp}); reopen /kvcache",
+                meta.fingerprint
+            ));
+        }
         match verb {
             "rm" => {
+                // Last check before an irreversible unlink: the body must still
+                // be there, and a readable sidecar must still name the same
+                // blob. A sidecar-less body is fine — the scan's fingerprint is
+                // then synthesized from the file stem, which the check above
+                // already matched.
+                if !path.exists() {
+                    return Err(format!("{expect_fp} is already gone from disk"));
+                }
+                if let Some(fresh) = crate::kvmeta::load(path)
+                    && fresh.fingerprint != expect_fp
+                {
+                    return Err(format!(
+                        "{} was replaced by {} under you; reopen /kvcache",
+                        expect_fp, fresh.fingerprint
+                    ));
+                }
                 std::fs::remove_file(path).map_err(|e| e.to_string())?;
                 // The sidecar must go too: one left behind is a phantom node in
                 // every later scan.
@@ -6324,16 +6356,16 @@ impl Agent<'_> {
                     // figure used to go stale as a result, so the pane now
                     // re-derives both from its effective pin state on every
                     // draw instead.
-                    crate::kvpane::Outcome::Pin(idx) => {
-                        log.push_dim(self.kvcache_apply_idx("pin", idx));
+                    crate::kvpane::Outcome::Pin(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("pin", idx, &fp));
                     }
-                    crate::kvpane::Outcome::Unpin(idx) => {
-                        log.push_dim(self.kvcache_apply_idx("unpin", idx));
+                    crate::kvpane::Outcome::Unpin(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("unpin", idx, &fp));
                     }
                     // These two change what is on disk, so the pane has to be
                     // rebuilt or it would keep offering rows that are gone.
-                    crate::kvpane::Outcome::Delete(idx) => {
-                        log.push_dim(self.kvcache_apply_idx("rm", idx));
+                    crate::kvpane::Outcome::Delete(idx, fp) => {
+                        log.push_dim(self.kvcache_apply_idx("rm", idx, &fp));
                         kv_pane = Some(self.kvcache_pane());
                     }
                     crate::kvpane::Outcome::Sweep => {
@@ -13587,25 +13619,40 @@ mod tests {
         let rows = agent.kvcache_pane().rows();
         assert_eq!(rows.len(), 1, "{rows:?}");
         let idx = rows[0].idx.expect("the row names a blob");
+        let row_fp = rows[0]
+            .fingerprint
+            .clone()
+            .expect("the row carries the blob's identity");
+        assert_eq!(row_fp, fp, "the row's identity is the sidecar fingerprint");
+        // FIX C: the handle `/kvcache rm` wants is now on screen.
+        assert!(
+            rows[0].detail.starts_with(&fp[..8]),
+            "the session row shows a typeable fingerprint prefix: {:?}",
+            rows[0].detail
+        );
 
         // A load bumps `hits`, and pinning must not revert that snapshot.
         assert!(agent.store.kv_load(&key).is_some());
         let hits = crate::kvmeta::load(&path).expect("a sidecar").hits;
         assert_eq!(hits, 1);
 
-        let line = agent.kvcache_apply_idx("pin", idx);
+        let line = agent.kvcache_apply_idx("pin", idx, &row_fp);
         assert!(line.contains("pinned"), "{line}");
         let meta = crate::kvmeta::load(&path).expect("a sidecar");
         assert!(meta.pinned, "pin took effect on disk");
         assert_eq!(meta.hits, hits, "pin must not revert a concurrent hit bump");
 
-        let line = agent.kvcache_apply_idx("unpin", idx);
+        let line = agent.kvcache_apply_idx("unpin", idx, &row_fp);
         assert!(line.contains("unpinned"), "{line}");
         assert!(!crate::kvmeta::load(&path).expect("a sidecar").pinned);
 
         // The REPL's prefix interface resolves to the same index, and still
         // refuses what it cannot pin down.
-        assert_eq!(agent.resolve_kv_prefix(&fp[..8]), Ok(idx));
+        assert_eq!(agent.resolve_kv_prefix(&fp[..8]), Ok((idx, fp.clone())));
+        // An index whose identity no longer matches is refused, never guessed.
+        let line = agent.kvcache_apply_idx("rm", idx, "0000000000000000000000000000000000000000");
+        assert!(line.contains("changed under you"), "{line}");
+        assert!(path.exists(), "a refused mutation touches nothing");
         assert!(agent.resolve_kv_prefix("zzzzzzzz").is_err(), "no match");
         assert!(agent.resolve_kv_prefix("").is_err(), "no argument");
 
@@ -13616,6 +13663,109 @@ mod tests {
             !crate::kvmeta::sidecar_path(&path).exists(),
             "and its sidecar"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A scan index is not stable across scans, so a mutation must re-check the
+    /// identity the pane showed rather than trusting the position.
+    ///
+    /// The pane is built over several blobs; an earlier one then disappears —
+    /// exactly what a second plank's startup sweep, or a sub-agent's `persist`,
+    /// does between the pane being drawn and the user pressing `d`/`y`. Every
+    /// later index now names its neighbour, so an unchecked delete unlinks a body
+    /// the user never selected. The mutation must refuse and say the cache moved.
+    #[test]
+    fn a_mutation_is_refused_when_the_scan_shifted_under_the_pane() {
+        let dir = scratch_dir("kvcache-index-shift");
+        let cfg = test_cfg();
+        let agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        // Five system blobs, named so the sorted scan order is a19f0..a19f4.
+        let keys: Vec<crate::session::KvKey> = (0..5)
+            .map(|i| crate::session::KvKey::System {
+                fp: format!("a19f{i}"),
+            })
+            .collect();
+        for key in &keys {
+            agent
+                .store
+                .kv_store_labeled(
+                    key,
+                    &crate::kvcache::KVCache::new(
+                        vec![7u8; 64],
+                        crate::ds4tokens::TokenTranscript::new(),
+                    ),
+                    None,
+                    "m",
+                    &crate::kvmeta::KvLabel::Unknown,
+                )
+                .unwrap();
+        }
+        // The pane's view of the world: index and identity per row.
+        let seen: Vec<(usize, String)> = agent
+            .kvcache_pane()
+            .rows()
+            .into_iter()
+            .filter_map(|r| Some((r.idx?, r.fingerprint?)))
+            .collect();
+        assert_eq!(seen.len(), 5, "{seen:?}");
+        // Sorting `kv_blob_paths` is what makes this positional claim a claim at
+        // all: under `read_dir` order the indices were filesystem-hash order.
+        let mut by_idx = seen.clone();
+        by_idx.sort_by_key(|(i, _)| *i);
+        assert_eq!(
+            by_idx
+                .iter()
+                .map(|(_, fp)| fp.as_str())
+                .collect::<Vec<&str>>(),
+            vec!["a19f0", "a19f1", "a19f2", "a19f3", "a19f4"],
+            "the scan is sorted by path, so index order is reproducible"
+        );
+
+        // A sibling process removes the blob the pane called index 1. Nothing
+        // tells the open pane, and every later index now names its neighbour.
+        let gone = agent.store.kv_path(&keys[1]);
+        std::fs::remove_file(&gone).unwrap();
+        std::fs::remove_file(crate::kvmeta::sidecar_path(&gone)).unwrap();
+
+        // The user presses `d` then `y` on the row the pane built for index 3.
+        let (idx, fp) = seen
+            .iter()
+            .find(|(i, _)| *i == 3)
+            .cloned()
+            .expect("a row at index 3");
+        assert_eq!(fp, "a19f3");
+        let line = agent.kvcache_apply_idx("rm", idx, &fp);
+        // Either guard may speak first — the index check, or the pre-unlink
+        // sidecar re-check behind it. Both refuse and both say to reopen.
+        assert!(
+            line.contains("reopen /kvcache"),
+            "the mutation must refuse, not guess: {line}"
+        );
+        // The body index 3 now names — a19f4 — is untouched, and so is the one
+        // the user actually selected.
+        for key in [&keys[3], &keys[4]] {
+            assert!(
+                agent.store.kv_path(key).exists(),
+                "{} was unlinked by a shifted index",
+                agent.store.kv_path(key).display()
+            );
+        }
+        // Pin takes the same check.
+        let line = agent.kvcache_apply_idx("pin", idx, &fp);
+        assert!(line.contains("reopen /kvcache"), "{line}");
+        assert!(
+            !crate::kvmeta::load(&agent.store.kv_path(&keys[4]))
+                .expect("a sidecar")
+                .pinned,
+            "a refused pin wrote nothing"
+        );
+        // Re-resolving against the current scan works, which is what reopening
+        // the pane does.
+        let (idx, fp) = agent.resolve_kv_prefix("a19f3").expect("still present");
+        let line = agent.kvcache_apply_idx("rm", idx, &fp);
+        assert!(line.contains("removed"), "{line}");
+        assert!(!agent.store.kv_path(&keys[3]).exists());
+        assert!(agent.store.kv_path(&keys[4]).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

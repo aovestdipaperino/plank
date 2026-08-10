@@ -514,6 +514,13 @@ impl SessionStore {
     /// sweep needs the path it must unlink alongside the fingerprint the plan
     /// names. Covers the cache root and one level of per-project
     /// subdirectories — never deeper.
+    ///
+    /// **Sorted by path.** `read_dir` yields filesystem-hash order, which made
+    /// `/kvcache`'s row order and the phase-2 budget tie-break reproducible only
+    /// by accident; sorting makes both deterministic. Callers still must not
+    /// treat an index as a durable handle across two scans — a concurrent unlink
+    /// shifts every later position, which is why a mutation carries the expected
+    /// fingerprint and re-checks it.
     #[must_use]
     pub fn kv_blob_paths(&self) -> Vec<(PathBuf, String)> {
         fn scan(dir: &Path, out: &mut Vec<(PathBuf, String)>, recurse: bool) {
@@ -542,6 +549,7 @@ impl SessionStore {
         }
         let mut out = Vec::new();
         scan(&self.dir, &mut out, true);
+        out.sort_by(|a, b| a.0.cmp(&b.0));
         out
     }
 
@@ -2621,11 +2629,24 @@ hello\n";
     fn a_concurrent_store_and_sweep_never_pair_a_body_with_a_foreign_sidecar() {
         let dir = temp_dir("kv-interleave");
         let store = SessionStore::open(&dir).unwrap();
-        let fps: Vec<String> = (0..40u32).map(|i| format!("{i:040x}")).collect();
+        // `KvKey::Session`, deliberately: a session body's signature is the
+        // payload fingerprint, which never equals the `<id>` its file is named
+        // after. With `KvKey::System` the two coincide, so a body left with *no*
+        // sidecar still satisfied `from_file(path, synthesized_fp)` — the sweep
+        // unlinking the sidecar of a body the other thread had just rewritten
+        // passed silently, which is the only interesting outcome here.
+        let ids: Vec<String> = (0..40u32).map(|i| format!("session-{i:02}")).collect();
+        let fps: Vec<String> = (0..40u32).map(|i| format!("{:040x}", i + 1_000)).collect();
+        for (id, fp) in ids.iter().zip(&fps) {
+            assert_ne!(id, fp, "the signature must differ from the file stem");
+        }
         std::thread::scope(|sc| {
             sc.spawn(|| {
-                for fp in &fps {
-                    let key = KvKey::System { fp: fp.clone() };
+                for (id, fp) in ids.iter().zip(&fps) {
+                    let key = KvKey::Session {
+                        id: id.clone(),
+                        fp: fp.clone(),
+                    };
                     let cache = crate::kvcache::KVCache::new(
                         vec![7u8; 512],
                         crate::ds4tokens::TokenTranscript::new(),
@@ -2654,13 +2675,45 @@ hello\n";
                 }
             });
         });
-        for (path, meta) in store.kv_blob_nodes() {
+        let survivors = store.kv_blob_nodes();
+        for (path, meta) in &survivors {
+            // A surviving body must still have its own sidecar. Each id is stored
+            // exactly once, so a body the sweep unlinked never comes back — a
+            // body present with its sidecar gone therefore means the sweep took
+            // the sidecar of a body that outlived it.
             assert!(
-                crate::kvcache::KVCache::from_file(&path, &meta.fingerprint).is_some(),
+                crate::kvmeta::sidecar_path(path).exists(),
+                "{} outlived its sidecar",
+                path.display()
+            );
+            assert_eq!(
+                meta.fingerprint,
+                crate::kvmeta::load(path).expect("a sidecar").fingerprint,
+                "{} is nodes-scanned under a synthesized fingerprint",
+                path.display()
+            );
+            assert!(
+                crate::kvcache::KVCache::from_file(path, &meta.fingerprint).is_some(),
                 "{} does not match the sidecar beside it",
                 path.display()
             );
         }
+        // How many bodies survive the race is timing-dependent, so nothing is
+        // asserted about the count. That these bodies were genuinely sweepable —
+        // i.e. the assertions above were not vacuously ranging over blobs no
+        // sweep would ever have touched — is checked deterministically, single
+        // threaded, after the joins.
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 0,
+            ttl_tier_secs: 0,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        let _ = store.sweep(&[], &policy, future);
+        assert!(
+            store.kv_blob_nodes().is_empty(),
+            "every body in this fixture is collectable"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

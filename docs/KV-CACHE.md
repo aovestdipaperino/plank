@@ -411,7 +411,19 @@ may share one, and a session sidecar records the *payload* fingerprint, which
 never equals the `<id>` its body is named after. So the two same-fingerprint
 bodies described above fold, pin and delete independently. The REPL subcommands
 keep their `<fp-prefix>` argument, resolving it to an index first and still
-refusing a prefix that matches nothing or more than one blob.
+refusing a prefix that matches nothing or more than one blob. Because a session
+row is labelled by its *name*, its detail line also carries the first 8 characters
+of its fingerprint, so the handle `/kvcache rm` wants is one you were shown.
+
+An index is a position in a scan, not a durable handle, so `kv_blob_paths` sorts
+by path (making both the row order and the phase-2 budget tie-break reproducible)
+and every row carries its fingerprint alongside its index. A mutation retakes the
+scan and refuses unless the blob at that index still carries the expected
+fingerprint, with a second check that the body is present under a matching sidecar
+immediately before an unlink. Without that, a blob unlinked by a second plank or a
+sub-agent between the pane being drawn and a `d` press would shift every later
+index down one and the delete would hit the neighbouring body. A refusal is the
+right answer there: the cache moved, so the pane has to be reopened.
 
 ## Diagnosing a miss
 

@@ -48,6 +48,17 @@ pub struct Row {
     /// resolving a row back to a path through its fingerprint used to fail on
     /// every session blob and, on a collision, act on the wrong file.
     pub idx: Option<usize>,
+    /// The identity of the blob at [`Row::idx`]: its sidecar fingerprint (or the
+    /// one synthesized from the file stem). `None` for the synthetic orphan
+    /// header, mirroring `idx`.
+    ///
+    /// An index alone is not a durable handle: the scan it indexes is retaken on
+    /// every mutation, so a blob unlinked by a sibling process or a sub-agent
+    /// between the pane being built and a `p`/`d` press shifts every later
+    /// position down one, and the index would then name a *different* body. The
+    /// fingerprint travels with the row so the mutation can refuse instead of
+    /// acting on the wrong file.
+    pub fingerprint: Option<String>,
 }
 
 /// What a key press asks the caller to do with the pane.
@@ -57,12 +68,13 @@ pub enum Outcome {
     Stay,
     /// Close the pane.
     Close,
-    /// Pin the blob at this scan index.
-    Pin(usize),
-    /// Unpin the blob at this scan index.
-    Unpin(usize),
-    /// Delete the blob at this scan index (already confirmed).
-    Delete(usize),
+    /// Pin the blob at this scan index, whose fingerprint is the second field.
+    Pin(usize, String),
+    /// Unpin the blob at this scan index, whose fingerprint is the second field.
+    Unpin(usize, String),
+    /// Delete the blob at this scan index (already confirmed), whose fingerprint
+    /// is the second field.
+    Delete(usize, String),
     /// Run a sweep now.
     Sweep,
 }
@@ -254,6 +266,7 @@ impl KvPane {
                         expanded,
                         has_children: true,
                         idx: None,
+                        fingerprint: None,
                     };
                 };
                 let m = &self.metas[mi];
@@ -266,6 +279,7 @@ impl KvPane {
                     expanded,
                     has_children: f.has_children,
                     idx: f.src,
+                    fingerprint: Some(m.fingerprint.clone()),
                 }
             })
             .collect()
@@ -309,13 +323,17 @@ impl KvPane {
         s
     }
 
-    /// The node the cursor is on as `(metadata index, scan index)`, if it names
-    /// a real blob rather than the orphan header.
-    fn selected_node(&self) -> Option<(usize, usize)> {
+    /// The node the cursor is on as `(metadata index, scan index, fingerprint)`,
+    /// if it names a real blob rather than the orphan header.
+    ///
+    /// The fingerprint rides along because the scan index is only valid against
+    /// the scan the pane was built from; the mutation re-checks it.
+    fn selected_node(&self) -> Option<(usize, usize, String)> {
         let visible = self.visible();
         let &i = visible.get(self.cursor.min(visible.len().saturating_sub(1)))?;
         let f = &self.flat[i];
-        Some((f.meta?, f.src?))
+        let mi = f.meta?;
+        Some((mi, f.src?, self.metas.get(mi)?.fingerprint.clone()))
     }
 
     /// The collapse key of the row the cursor is on.
@@ -332,9 +350,9 @@ impl KvPane {
         if self.pending_delete {
             self.pending_delete = false;
             if matches!(key.code, KeyCode::Char('y' | 'Y'))
-                && let Some((_, src)) = self.selected_node()
+                && let Some((_, src, fp)) = self.selected_node()
             {
-                return Outcome::Delete(src);
+                return Outcome::Delete(src, fp);
             }
             return Outcome::Stay;
         }
@@ -357,16 +375,16 @@ impl KvPane {
                 }
             }
             KeyCode::Char('p' | 'P') => {
-                if let Some((mi, src)) = self.selected_node() {
+                if let Some((mi, src, fp)) = self.selected_node() {
                     if self.pin_flips.contains(&mi) {
                         self.pin_flips.remove(&mi);
                     } else {
                         self.pin_flips.insert(mi);
                     }
                     return if self.pinned(mi) {
-                        Outcome::Pin(src)
+                        Outcome::Pin(src, fp)
                     } else {
-                        Outcome::Unpin(src)
+                        Outcome::Unpin(src, fp)
                     };
                 }
             }
@@ -444,6 +462,12 @@ fn short_name(m: &KvMeta) -> String {
 }
 
 /// The second line under a row: whatever the role-specific label can say.
+///
+/// A session row's label is its *name* (`cheeky-bell`), but `/kvcache rm` takes a
+/// fingerprint prefix, and a session's fingerprint is the payload signature —
+/// never the name. So the detail also carries the first 8 characters of that
+/// fingerprint: the handle the user has to type is now one they were shown. The
+/// system and project rows already show it, as `short_name`.
 fn detail_of(m: &KvMeta) -> String {
     match &m.label {
         KvLabel::System {
@@ -460,7 +484,14 @@ fn detail_of(m: &KvMeta) -> String {
             agents_files.join(", "),
             local_mcp.len()
         ),
-        KvLabel::Session { title, .. } => title.clone(),
+        KvLabel::Session { title, .. } => {
+            let fp8: String = m.fingerprint.chars().take(8).collect();
+            if title.is_empty() {
+                fp8
+            } else {
+                format!("{fp8} · {title}")
+            }
+        }
         KvLabel::Unknown => String::new(),
     }
 }
@@ -661,14 +692,15 @@ mod tests {
     fn action_keys_name_the_selected_node() {
         let mut p = pane();
         // The outcomes carry scan indices, matching the order `pane()` built the
-        // forest from: 0 = a19f, 1 = 7c02, 2 = cheeky-bell.
-        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0)));
+        // forest from: 0 = a19f, 1 = 7c02, 2 = cheeky-bell — plus the row's
+        // fingerprint, the identity the mutation re-checks the index against.
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0, ref fp) if fp == "a19f"));
         // The pane flips its own copy, so a second press is the inverse.
-        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0)));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0, ref fp) if fp == "a19f"));
         p.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         // Delete asks first and only fires on confirmation.
         assert!(matches!(p.handle_key(key('d')), Outcome::Stay));
-        assert!(matches!(p.handle_key(key('y')), Outcome::Delete(1)));
+        assert!(matches!(p.handle_key(key('y')), Outcome::Delete(1, ref fp) if fp == "7c02"));
         assert!(matches!(p.handle_key(key('g')), Outcome::Sweep));
         assert!(matches!(
             p.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -736,7 +768,7 @@ mod tests {
     fn pinning_an_expired_row_takes_its_bytes_out_of_the_reclaimable_total() {
         let mut p = expired_pane(false);
         assert!(p.footer().contains("2.0 KB reclaimable"));
-        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0)));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0, ref fp) if fp == "old"));
         assert!(
             p.footer().contains("0 B reclaimable"),
             "a pinned row is not reclaimable: {}",
@@ -752,7 +784,7 @@ mod tests {
         let mut p = expired_pane(true);
         assert!(p.footer().contains("0 B reclaimable"), "{}", p.footer());
         assert!(!p.rows()[0].right.contains("expired"));
-        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0)));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0, ref fp) if fp == "old"));
         assert!(
             p.footer().contains("2.0 KB reclaimable"),
             "only the pin was sparing it: {}",
@@ -883,7 +915,7 @@ mod tests {
         // Roots sort largest subtree first, and the index follows the node.
         assert_eq!(rows[0].idx, Some(1));
         assert_eq!(rows[1].idx, Some(0));
-        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(1)));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(1, ref fp) if fp == "dup"));
         let rows = p.rows();
         assert!(rows[0].right.contains("pinned"), "{}", rows[0].right);
         assert!(
