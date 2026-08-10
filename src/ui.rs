@@ -3358,6 +3358,7 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
             "/config" => {
                 if arg.is_empty() {
                     print!(
@@ -3921,6 +3922,101 @@ the original is frozen and listed in /tree"
             .count_tokens(&render_transcript(&s, &self.system))
             .max(0);
         Ok((id, tokens))
+    }
+
+    /// Runs one textual `/kvcache [gc|pin <fp>|unpin <fp>|rm <fp>]` and returns
+    /// the whole output as a single string.
+    ///
+    /// Both front ends go through this: the plain REPL prints the result, and
+    /// the TUI pushes it into the output log, so the two cannot answer the same
+    /// subcommand differently.
+    fn kvcache_text_command(&self, arg: &str) -> String {
+        let mut words = arg.split_whitespace();
+        let verb = words.next().unwrap_or("");
+        let fp = words.next().unwrap_or("");
+        match verb {
+            "" => {
+                let settings = crate::settings::active();
+                let policy = crate::kvgc::SweepPolicy::from_settings(&settings.kvcache);
+                let pane = crate::kvpane::KvPane::new(
+                    crate::kvtree::build(self.store.kv_nodes()),
+                    policy,
+                    settings.kvcache.max_bytes,
+                    crate::kvmeta::now_secs(),
+                );
+                crate::kvpane::render_text(&pane)
+            }
+            "gc" => {
+                let policy =
+                    crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
+                let freed = self.store.sweep(&[], &policy, crate::kvmeta::now_secs());
+                format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
+            }
+            "pin" | "unpin" | "rm" => match self.kvcache_mutate(verb, fp) {
+                Ok(msg) => msg,
+                Err(e) => format!("kvcache: {e}"),
+            },
+            other => {
+                format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
+            }
+        }
+    }
+
+    /// Applies one `/kvcache` mutation by fingerprint prefix, returning the
+    /// line to show. Shared by both front ends so `p`/`d` in the pane and
+    /// `/kvcache pin|rm` in the REPL cannot diverge.
+    ///
+    /// # Errors
+    /// Returns a message when the prefix matches no blob or more than one.
+    fn kvcache_mutate(&self, verb: &str, fp_prefix: &str) -> Result<String, String> {
+        if fp_prefix.is_empty() {
+            return Err(format!("usage: /kvcache {verb} <fingerprint>"));
+        }
+        let nodes = self.store.kv_nodes();
+        let hits: Vec<_> = nodes
+            .iter()
+            .filter(|m| m.fingerprint.starts_with(fp_prefix))
+            .collect();
+        // Never guess: two blobs can share a fingerprint prefix, and this
+        // branch deletes files.
+        let meta = match hits.as_slice() {
+            [one] => *one,
+            [] => return Err(format!("no cache entry matching {fp_prefix:?}")),
+            _ => {
+                return Err(format!(
+                    "{fp_prefix:?} is ambiguous ({} matches)",
+                    hits.len()
+                ));
+            }
+        };
+        let Some((path, _)) = self
+            .store
+            .kv_blob_paths()
+            .into_iter()
+            .find(|(_, fp)| *fp == meta.fingerprint)
+        else {
+            return Err(format!("{} vanished from disk", meta.fingerprint));
+        };
+        match verb {
+            "rm" => {
+                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                // The sidecar must go too: one left behind is a phantom node in
+                // every later scan.
+                let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(&path));
+                Ok(format!(
+                    "kvcache: removed {} ({})",
+                    meta.fingerprint,
+                    crate::kvpane::human_bytes(meta.bytes)
+                ))
+            }
+            verb @ ("pin" | "unpin") => {
+                let mut m = meta.clone();
+                m.pinned = verb == "pin";
+                crate::kvmeta::store(&path, &m).map_err(|e| e.to_string())?;
+                Ok(format!("kvcache: {verb}ned {}", meta.fingerprint))
+            }
+            other => Err(format!("unknown action {other:?}")),
+        }
     }
 
     /// Parses a `/notify [on|off]` argument and applies it; returns the

@@ -45,6 +45,7 @@ pub mod interrupt;
 pub mod kvcache;
 pub mod kvgc;
 pub mod kvmeta;
+pub mod kvpane;
 /// Volatility-tiered KV cache planning (issues #60, #64). FFI-free and always
 /// compiled so the tier walk is CI-tested; the gated `ds4engine` executes it.
 pub mod kvtier;
