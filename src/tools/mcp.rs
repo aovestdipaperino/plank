@@ -1113,8 +1113,15 @@ pub fn global_eligible_names(local_path: Option<&Path>) -> Vec<String> {
 /// location; the global `~/.plank/.mcp.json` always applies underneath (see
 /// [`config_load_hierarchy`]). `plugins` contributes servers that sit between
 /// the global and local configs (see [`crate::plugins::mcp_servers`]).
+///
+/// Returns the started servers alongside the plugin-contribution warnings
+/// [`crate::plugins::mcp_servers`] raised — a rejected or renamed plugin server
+/// is invisible otherwise, so the caller is expected to surface them.
 #[must_use]
-pub fn load_and_start(path: Option<&Path>, plugins: &crate::plugins::PluginSet) -> Vec<McpServer> {
+pub fn load_and_start(
+    path: Option<&Path>,
+    plugins: &crate::plugins::PluginSet,
+) -> (Vec<McpServer>, Vec<String>) {
     // Read once: the eligible-names set, the prune keep-list and the merged
     // hierarchy all derive from this single `Option`, so they cannot disagree
     // about whether the global config was readable.
@@ -1137,14 +1144,15 @@ pub fn load_and_start(path: Option<&Path>, plugins: &crate::plugins::PluginSet) 
     }
     let default = Path::new(".mcp.json");
     let local_configs = config_load(path.unwrap_or(default));
-    let plugin_servers = crate::plugins::mcp_servers(plugins).0;
+    let (plugin_servers, warnings) = crate::plugins::mcp_servers(plugins);
     let mut start = spawn_and_handshake;
-    start_servers_with(
+    let servers = start_servers_with(
         hierarchy_with_plugins(global.unwrap_or_default(), plugin_servers, local_configs),
         &eligible,
         root.as_deref(),
         &mut start,
-    )
+    );
+    (servers, warnings)
 }
 
 /// Prunes advertisement records for servers no longer in the global config.

@@ -9809,6 +9809,30 @@ fn print_footer(st: &Status, color: bool) {
     }
 }
 
+/// Loads the skills and templates the session addresses by name, then folds
+/// every plugin collision warning — `earlier` (agents and MCP, computed
+/// upstream) plus these two — onto the plugin set and prints it.
+///
+/// The set is the accumulator because it is what `/plugins` renders, and these
+/// warnings are only knowable once the contributions are merged, which is after
+/// `main()` has already printed the load-time ones.
+fn load_named_contributions(
+    tool_ctx: &mut ToolContext,
+    mut earlier: Vec<String>,
+) -> (Vec<crate::skills::Skill>, Vec<crate::templates::Template>) {
+    let (skills, skill_warnings) =
+        crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (templates, template_warnings) =
+        crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    earlier.extend(skill_warnings);
+    earlier.extend(template_warnings);
+    for w in &earlier {
+        eprintln!("plugin warning: {w}");
+    }
+    tool_ctx.plugins.add_warnings(earlier);
+    (skills, templates)
+}
+
 fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
@@ -9830,7 +9854,13 @@ fn new_agent(
     // is dispatchable by the user and invisible to the model. Still built well
     // before `build_system_prompt_parts` below, which is what the `agent`
     // tool's `name` enum — and hence the fingerprinted prompt prefix — reads.
-    let (agents, _agent_warnings) = crate::plugins::agents_with_plugins(&cwd, &plugins);
+    let (agents, agent_warnings) = crate::plugins::agents_with_plugins(&cwd, &plugins);
+    // Every collision the reconciliation reports is accumulated here and
+    // folded onto the plugin set below, so `/plugins` shows it beside the
+    // load-time warnings instead of it being computed and dropped. The set is
+    // the accumulator because it is the thing `/plugins` renders and the one
+    // object both front-ends already reach through `tool_ctx`.
+    let mut contribution_warnings = agent_warnings;
     // Collect context at session start
     let context_content = ContextContent::new_with_agents(&agents);
     // Inject context into the session transcript
@@ -9853,8 +9883,10 @@ fn new_agent(
     tool_ctx.worktree = crate::worktree::take_startup_session();
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
-    tool_ctx.mcp =
+    let (mcp, mcp_warnings) =
         crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref(), &tool_ctx.plugins);
+    tool_ctx.mcp = mcp;
+    contribution_warnings.extend(mcp_warnings);
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
@@ -9924,8 +9956,7 @@ fn new_agent(
     }
     let trusted_system_len = system.trusted_len;
     let system = system.text;
-    let (skills, _) = crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
-    let (templates, _) = crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (skills, templates) = load_named_contributions(&mut tool_ctx, contribution_warnings);
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);

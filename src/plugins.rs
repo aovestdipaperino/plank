@@ -181,10 +181,22 @@ pub struct PluginSet {
     /// Loaded plugins, in increasing precedence.
     pub plugins: Vec<Plugin>,
     /// Non-fatal complaints not attributable to a single loaded plugin.
+    ///
+    /// Holds both the load-time complaints and, once the session has merged
+    /// the contributions, the collision warnings [`reconcile`] and
+    /// [`mcp_servers`] raise — those span two contributors by construction, so
+    /// they belong to the set rather than to one plugin, and putting them here
+    /// is what makes `/plugins` show them.
     pub warnings: Vec<String>,
 }
 
 impl PluginSet {
+    /// Folds post-load contribution warnings into the set so [`render_list`]
+    /// shows them.
+    pub fn add_warnings(&mut self, warnings: impl IntoIterator<Item = String>) {
+        self.warnings.extend(warnings);
+    }
+
     /// Every warning worth showing: set-level first, then per-plugin.
     #[must_use]
     pub fn all_warnings(&self) -> Vec<String> {
@@ -1211,6 +1223,57 @@ mod tests {
         assert!(out.contains("1.0"));
         assert!(out.contains("--plugin-dir"));
         assert!(out.contains("skills"));
+    }
+
+    /// The collision warnings used to be computed and dropped on the floor —
+    /// `let (skills, _) = …` — so a plugin skill that silently lost its bare
+    /// name, or a plugin MCP server rejected for containing `__`, showed up
+    /// nowhere. Folding them onto the set is what puts them in `/plugins`.
+    #[test]
+    fn contribution_collision_warnings_reach_the_listing() {
+        let base = scratch("warnings-surface");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        write(
+            &cwd,
+            ".plank/skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: project version\n---\nProject\n",
+        );
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: plugin version\n---\nPlugin\n",
+        );
+        write(
+            &plugin,
+            ".mcp.json",
+            r#"{"mcpServers":{"we__ather":{"command":"true"}}}"#,
+        );
+        let mut set = load_in(Some(&home), &cwd, &[plugin]);
+        assert!(
+            !render_list(&set).contains("demo:greet"),
+            "precondition: the collision is not in the load-time warnings"
+        );
+
+        let (_, skill_warnings) = skills_in(Some(&home), &cwd, &set);
+        let (_, mcp_warnings) = mcp_servers(&set);
+        assert!(!skill_warnings.is_empty(), "the collision was reported");
+        assert!(!mcp_warnings.is_empty(), "the `__` server was rejected");
+        set.add_warnings(skill_warnings);
+        set.add_warnings(mcp_warnings);
+
+        let out = render_list(&set);
+        assert!(
+            out.contains("demo:greet"),
+            "shadowed skill warning missing: {out}"
+        );
+        assert!(
+            out.contains("we__ather"),
+            "rejected MCP server warning missing: {out}"
+        );
     }
 
     #[test]
