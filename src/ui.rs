@@ -1208,6 +1208,10 @@ struct Agent<'a> {
     /// Whether the most recent turn ended by user interrupt, so the turn-end
     /// notification says "interrupted" instead of "finished".
     last_turn_interrupted: bool,
+    /// Live `/goal` run, or `None`. Transient by construction: both front ends
+    /// clear it before returning to the prompt, so a resumed or cleared session
+    /// never inherits a goal (`docs/superpowers/specs/2026-08-10-goal-command-design.md`).
+    goal: Option<crate::goal::GoalLoop>,
     /// A framed `/btw` prompt waiting to be answered *alongside* the next main
     /// pass rather than in place of it (`docs/SESSION-CLONE-DESIGN.md` §6.2).
     ///
@@ -2341,6 +2345,71 @@ impl Agent<'_> {
         }
     }
 
+    /// Asks the model for a goal verdict on the plain-stdout path: one
+    /// generation, no tool dispatch.
+    ///
+    /// The prompt and the reply both stay in the transcript. Popping them would
+    /// truncate the session behind the engine's live KV and force a warm reset
+    /// every iteration; keeping them is append-only, and the model's own
+    /// `GOAL_REASON` becomes the context the next iteration works from.
+    fn adjudicate_plain(&mut self) -> Result<crate::goal::Adjudication, String> {
+        self.session
+            .push(Message::user(crate::goal::ADJUDICATION_PROMPT));
+        let prompt_text = render_transcript(&self.session, &self.system);
+        let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
+        let finished = stream.finished();
+        self.session.push(Message::assistant(text.clone()));
+        // Work instead of a verdict, or a cut-off pass: neither settles a goal.
+        if stats.interrupted || !finished.calls.is_empty() {
+            return Ok(crate::goal::Adjudication::keep_going());
+        }
+        Ok(crate::goal::parse_verdict(&text))
+    }
+
+    /// Drives turns until the goal is settled (plain-stdout path).
+    ///
+    /// The mirror of the TUI's continuation hook in `tui_turn`; a change here
+    /// almost always needs the matching change there (CLAUDE.md).
+    fn run_goal_loop(&mut self, goal: &str, max_iters: usize) -> Result<(), String> {
+        self.goal = Some(crate::goal::GoalLoop::new(goal, max_iters));
+        self.session
+            .push(Message::user(crate::goal::kickoff_message(goal)));
+        let mut iters;
+        let (outcome, reason) = loop {
+            let (iter, max) = {
+                let g = self
+                    .goal
+                    .as_mut()
+                    .expect("goal is live inside its own loop");
+                (g.next_iteration(), g.max_iters())
+            };
+            iters = iter;
+            println!("{}", self.debug_line(&crate::goal::banner(iter, max)));
+            self.run_turn()?;
+            if self.last_turn_interrupted || crate::interrupt::pending() {
+                break (crate::goal::Outcome::Interrupted, String::new());
+            }
+            let adj = self.adjudicate_plain()?;
+            if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
+                break (o, adj.reason);
+            }
+            if self
+                .goal
+                .as_ref()
+                .expect("goal is live inside its own loop")
+                .at_cap()
+            {
+                break (crate::goal::Outcome::Cap, adj.reason);
+            }
+        };
+        self.goal = None;
+        println!(
+            "{}",
+            self.debug_line(&crate::goal::closing(outcome, iters, &reason))
+        );
+        Ok(())
+    }
+
     /// Runs the Stop hooks; returns the model-visible feedback of the first
     /// exit-2 hook, `None` when the turn may conclude. `warn` receives
     /// user-only lines from other nonzero exits.
@@ -3405,6 +3474,13 @@ impl Agent<'_> {
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
+            "/goal" => {
+                match crate::goal::parse_command(arg) {
+                    Ok((goal, max)) => self.run_goal_loop(&goal, max)?,
+                    Err(usage) => println!("{usage}"),
+                }
+                return Ok(true);
+            }
             "/compact" => {
                 // Any argument is extra summarization instructions for this one
                 // pass. The interrupted case already printed its own notice.
@@ -9924,6 +10000,7 @@ fn new_agent(
         editor_owns_footer: false,
         last_ctx_used: 0,
         last_turn_interrupted: false,
+        goal: None,
         context_content,
         skills,
         templates,
@@ -11336,6 +11413,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -13524,6 +13602,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -13585,6 +13664,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -14284,6 +14364,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -14464,6 +14545,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -14549,6 +14631,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -14621,6 +14704,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -14716,6 +14800,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -15576,6 +15661,105 @@ mod tests {
         unsafe { std::env::remove_var(KEY) };
     }
 
+    /// The verdict reply the adjudication pass is scripted to return.
+    fn verdict_reply(token: &str, reason: &str) -> String {
+        format!("GOAL_VERDICT: {token}\nGOAL_REASON: {reason}\n")
+    }
+
+    #[test]
+    fn goal_stops_on_the_first_attained_verdict() {
+        let dir = scratch_dir("goal-attained");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![
+                    "did the work\n".to_string(),
+                    verdict_reply("ATTAINED", "all tests pass"),
+                ],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent
+            .slash("/goal make the tests pass")
+            .expect("/goal runs");
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        // Two generations: one turn, one adjudication.
+        assert_eq!(prompts.lock().expect("lock").len(), 2);
+        // The adjudication exchange stays in the transcript (KV prefix stability).
+        let transcript = agent
+            .session
+            .transcript
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            transcript.contains("GOAL_VERDICT: ATTAINED"),
+            "verdict reply was popped: {transcript}"
+        );
+        assert!(
+            transcript.contains("make the tests pass"),
+            "kickoff missing: {transcript}"
+        );
+    }
+
+    #[test]
+    fn goal_stops_at_the_iteration_cap() {
+        let dir = scratch_dir("goal-cap");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                // Alternating turn/adjudication replies for two iterations.
+                replies: vec![
+                    "step one\n".to_string(),
+                    verdict_reply("CONTINUE", "more to do"),
+                    "step two\n".to_string(),
+                    verdict_reply("CONTINUE", "still more"),
+                ],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent
+            .slash("/goal --max 2 keep going forever")
+            .expect("/goal runs");
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        assert_eq!(
+            prompts.lock().expect("lock").len(),
+            4,
+            "two turns and two adjudications"
+        );
+    }
+
+    #[test]
+    fn goal_without_an_objective_prints_usage_and_runs_nothing() {
+        let dir = scratch_dir("goal-usage");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec!["should never run\n".to_string()],
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        agent.slash("/goal").expect("/goal handles a bare call");
+        assert!(agent.goal.is_none());
+        assert!(
+            prompts.lock().expect("lock").is_empty(),
+            "no generation should have run"
+        );
+    }
+
     /// The main loop acts on the report: `/subagent` runs a parent turn as soon
     /// as the report lands, so delegated work comes back into the conversation
     /// instead of parking in the transcript until the user types again. This is
@@ -15966,6 +16150,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16055,6 +16240,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16203,6 +16389,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16273,6 +16460,7 @@ mod tests {
             editor_owns_footer: false,
             last_ctx_used: 0,
             last_turn_interrupted: false,
+            goal: None,
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
