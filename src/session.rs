@@ -225,6 +225,14 @@ impl Message {
         t.starts_with("<tool_result>") || t.starts_with("Tool:") || t.starts_with("Tool result")
     }
 
+    /// True for the session-start context blocks plank injects itself (agent
+    /// instructions, persistent memory, the sub-agent roster, git status, the
+    /// date). They are user turns as far as the model is concerned, but nobody
+    /// typed them, so replaying a session must not show them back.
+    pub(crate) fn is_session_context(&self) -> bool {
+        self.role == Role::User && crate::context::is_session_context(&self.text)
+    }
+
     /// Strips a `<tool_result>` wrapper, returning the inner payload.
     pub(crate) fn tool_result_payload(&self) -> &str {
         let t = self.text.trim();
@@ -242,8 +250,10 @@ impl Message {
 /// resaving keeps the same file name while the transcript evolves.
 #[derive(Debug, Clone)]
 pub struct Session {
-    /// Memorable `adjective-celebrity` id (or a legacy 40-hex id); empty
-    /// until the first save.
+    /// Memorable `adjective-celebrity` id (or a legacy 40-hex id). Minted when
+    /// the session starts (see [`SessionStore::mint_id`]) so the name can be
+    /// shown while the conversation is still in flight; empty only for a
+    /// session built without a store.
     pub id: String,
     /// Title derived from the first user prompt (or set explicitly).
     pub title: String,
@@ -286,6 +296,15 @@ impl Session {
             tasks: crate::tasks::TaskList::new(),
             dirty: false,
         }
+    }
+
+    /// True once the session exists on disk — either saved at least once or
+    /// loaded from a file. `created_at` is the marker: [`SessionStore::save`]
+    /// stamps it and a load carries it in, while the id alone says nothing
+    /// (it is minted at session start, before anything is written).
+    #[must_use]
+    pub fn is_persisted(&self) -> bool {
+        self.created_at != 0
     }
 
     /// Appends a message and marks the session dirty.
@@ -431,7 +450,10 @@ impl SessionStore {
         &self.dir
     }
 
-    fn path_for_id(&self, id: &str) -> PathBuf {
+    /// Path a session with this id is (or would be) written to. Callers use it
+    /// to ask whether a name is taken — `/rename` before it reassigns one.
+    #[must_use]
+    pub fn path_for_id(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}{FILE_EXT}"))
     }
 
@@ -841,6 +863,22 @@ impl SessionStore {
         Ok((id, had_payload))
     }
 
+    /// Mints a fresh memorable `adjective-celebrity` session name (e.g.
+    /// `deadly-einstein`), unused by any file in the store. On the rare
+    /// collision a short guid is appended.
+    ///
+    /// Called when a session starts, so its name can be shown in the UI long
+    /// before the transcript is written.
+    #[must_use]
+    pub fn mint_id(&self) -> String {
+        let base = crate::names::session_slug();
+        let mut id = base.clone();
+        while self.path_for_id(&id).exists() {
+            id = format!("{base}-{}", crate::names::guid8());
+        }
+        id
+    }
+
     /// Saves the session, assigning title, creation time, and id if missing.
     ///
     /// The file is written atomically (temp file + rename). On success the
@@ -864,16 +902,11 @@ impl SessionStore {
         if session.created_at == 0 {
             session.created_at = now;
         }
-        // First save: mint a memorable `adjective-celebrity` name (e.g.
-        // `deadly-einstein`). On the rare filename collision, append a short
-        // guid. Re-saving an already-named session keeps its name (overwrite).
+        // Normally the name was already minted at session start; a session
+        // built without a store still gets one here, on its first save.
+        // Re-saving an already-named session keeps its name (overwrite).
         if session.id.is_empty() {
-            let base = crate::names::session_slug();
-            let mut id = base.clone();
-            while self.path_for_id(&id).exists() {
-                id = format!("{base}-{}", crate::names::guid8());
-            }
-            session.id = id;
+            session.id = self.mint_id();
         }
         let id = session.id.clone();
 
@@ -1214,6 +1247,46 @@ pub fn display_id(id: &str) -> &str {
     }
 }
 
+/// Longest session name accepted from a user. Names are filenames (plus the
+/// `.kv`/`.kv_raw`/`.json` suffixes), and a name this long is already far past
+/// being readable in a listing.
+pub const NAME_MAX: usize = 64;
+
+/// Validates a user-supplied session name, returning it trimmed.
+///
+/// A name becomes a filename in the store, so it is held to what is safe there:
+/// ASCII letters, digits, `-`, `_` and `.`, not starting with a `.` (which would
+/// hide the file and could spell `..`), within [`NAME_MAX`] bytes. Everything
+/// else — path separators above all — is rejected rather than sanitized, so the
+/// name the user sees is exactly the name they typed.
+///
+/// # Errors
+///
+/// Returns a message suitable for showing the user.
+pub fn validate_name(name: &str) -> std::result::Result<&str, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("a session name cannot be empty".to_owned());
+    }
+    if name.len() > NAME_MAX {
+        return Err(format!(
+            "a session name cannot exceed {NAME_MAX} characters"
+        ));
+    }
+    if name.starts_with('.') {
+        return Err("a session name cannot start with '.'".to_owned());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+    {
+        return Err(format!(
+            "'{bad}' is not allowed in a session name (use letters, digits, '-', '_' or '.')"
+        ));
+    }
+    Ok(name)
+}
+
 /// Renders the session list the way the C agent prints `/sessions`.
 ///
 /// Each entry shows the 8-char id, title, then an indented age/size line;
@@ -1419,16 +1492,19 @@ pub fn history_window(transcript: &[Message], user_turns: usize) -> Option<(usiz
     }
     let user_turns = user_turns.min(HISTORY_MAX_TURNS);
 
+    // Session-start context is not a turn anybody took, so it neither counts
+    // as a human turn nor anchors the window — otherwise a short session's
+    // whole replay is the git status and the agent instructions.
     let human_idx: Vec<usize> = transcript
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User && !m.is_tool_user())
+        .filter(|(_, m)| m.role == Role::User && !m.is_tool_user() && !m.is_session_context())
         .map(|(i, _)| i)
         .collect();
     let all_user_idx: Vec<usize> = transcript
         .iter()
         .enumerate()
-        .filter(|(_, m)| m.role == Role::User)
+        .filter(|(_, m)| m.role == Role::User && !m.is_session_context())
         .map(|(i, _)| i)
         .collect();
 
@@ -1497,6 +1573,10 @@ pub fn render_history(transcript: &[Message], user_turns: usize, color: bool) ->
     }
 
     for m in &transcript[start..] {
+        // Never replayed: see `history_window`.
+        if m.is_session_context() {
+            continue;
+        }
         let text = m.text.trim();
         match m.role {
             Role::User if m.is_tool_user() => {
@@ -1900,16 +1980,21 @@ fn parse_meta_at(buf: &[u8], at: usize) -> Option<(String, String)> {
     Some((tag, last))
 }
 
-/// Renders the `/resume` picker: the most recent sessions, numbered, with
-/// tag and last prompt. `entries` must already be sorted most recent first
-/// (as [`SessionStore::list`] returns them).
+/// Renders the `/resume` picker: the most recent sessions, numbered, each led by
+/// its name, then its title, tag, age and last prompt. `entries` must already be
+/// sorted most recent first (as [`SessionStore::list`] returns them).
+///
+/// The name leads because it is what the user types to pick the session (and,
+/// since it is minted at session start, what they were watching on the prompt
+/// rule all along); the number is a shorthand for the rows on screen right now.
 #[must_use]
 pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit: usize) -> String {
     if entries.is_empty() {
         return "no saved sessions to resume\n".to_owned();
     }
-    let (num_on, title_on, help_on, dim, reset) = if color {
+    let (num_on, name_on, title_on, help_on, dim, reset) = if color {
         (
+            "\x1b[1;96m",
             "\x1b[1;96m",
             "\x1b[1;97m",
             "\x1b[97m",
@@ -1917,7 +2002,7 @@ pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit
             "\x1b[0m",
         )
     } else {
-        ("", "", "", "", "")
+        ("", "", "", "", "", "")
     };
     let mut out = String::new();
     for (i, e) in entries.iter().take(limit).enumerate() {
@@ -1933,19 +2018,19 @@ pub fn render_resume_list(entries: &[SessionEntry], now: u64, color: bool, limit
         };
         let _ = writeln!(
             out,
-            "{num_on}{:>2}.{reset} {title_on}{}{reset}{tag} {dim}({}, {}){reset}",
+            "{num_on}{:>2}.{reset} {name_on}{}{reset}{tag} {dim}({}){reset}",
             i + 1,
-            e.title,
-            format_age(when, now),
-            display_id(&e.id)
+            display_id(&e.id),
+            format_age(when, now)
         );
+        let _ = writeln!(out, "     {title_on}{}{reset}", e.title);
         if !e.last_prompt.is_empty() {
             let _ = writeln!(out, "     {dim}last: {}{reset}", e.last_prompt);
         }
     }
     let _ = writeln!(
         out,
-        "{help_on}Use /resume <number> (or a sha prefix) to continue a session.{reset}"
+        "{help_on}Use /resume <name> (or a number from this list) to continue a session.{reset}"
     );
     out
 }
@@ -2896,10 +2981,41 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Session-start scaffolding is context for the model, never conversation to
+    /// replay: it neither anchors the history window nor renders.
     #[test]
-    fn resume_list_renders_numbers_tags_and_last_prompt() {
+    fn replayed_history_skips_session_start_context() {
+        let git = "This is the git status at the start of the conversation.\n\nbranch: main";
+        let transcript = vec![
+            Message::user("Agent instructions:\n\n# CLAUDE.md\nbe careful"),
+            Message::user(format!("{git}\n\nToday's date is 2026-08-10.")),
+            Message::user("fix the resume replay"),
+            Message::assistant("done"),
+        ];
+        // Two human turns requested, one real one available: the window starts
+        // at the real turn rather than sliding back over the scaffolding.
+        assert_eq!(history_window(&transcript, 2), Some((2, false)));
+        let out = render_history(&transcript, 6, false);
+        assert!(out.contains("fix the resume replay"), "got: {out}");
+        assert!(
+            !out.contains("CLAUDE.md"),
+            "agent instructions leaked: {out}"
+        );
+        assert!(!out.contains("git status"), "git status leaked: {out}");
+        assert!(!out.contains("Today's date"), "date leaked: {out}");
+
+        // Scaffolding only: nothing to replay at all.
+        assert_eq!(history_window(&transcript[..2], 6), None);
+        assert_eq!(
+            render_history(&transcript[..2], 6, false),
+            "\n(no user history)\n"
+        );
+    }
+
+    #[test]
+    fn resume_list_leads_with_the_name_then_the_title() {
         let entries = vec![SessionEntry {
-            id: "a".repeat(40),
+            id: "deadly-einstein".to_string(),
             title: "Fix CI".to_string(),
             created_at: 100,
             last_used: 100,
@@ -2910,9 +3026,15 @@ hello\n";
             path: PathBuf::new(),
         }];
         let out = render_resume_list(&entries, 100, false, 10);
-        assert!(out.contains(" 1. Fix CI [wip]"), "got: {out}");
+        assert!(out.contains(" 1. deadly-einstein [wip]"), "got: {out}");
+        assert!(out.contains("     Fix CI"), "got: {out}");
         assert!(out.contains("last: rerun the tests"), "got: {out}");
-        assert!(out.contains("Use /resume <number>"), "got: {out}");
+        assert!(out.contains("Use /resume <name>"), "got: {out}");
+        // A legacy 40-hex id still shows the way it always did.
+        let mut legacy = entries.clone();
+        legacy[0].id = "a".repeat(40);
+        let out = render_resume_list(&legacy, 100, false, 10);
+        assert!(out.contains(" 1. aaaaaaaa [wip]"), "got: {out}");
         assert_eq!(
             render_resume_list(&[], 0, false, 10),
             "no saved sessions to resume\n"
@@ -3138,6 +3260,50 @@ hello\n";
         store.delete(&id[..8]).unwrap();
         assert!(!store.payload_path(&id).exists());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_preminted_name_survives_the_first_save() {
+        let dir = temp_dir("premint");
+        let store = SessionStore::open(&dir).unwrap();
+
+        // What `new_agent` does at launch: name the session before a word of it
+        // exists, then save it later under exactly that name.
+        let id = store.mint_id();
+        assert!(id.contains('-'), "memorable slug, got {id:?}");
+        assert!(!store.path_for_id(&id).exists());
+
+        let mut s = Session::new();
+        s.id = id.clone();
+        assert!(!s.is_persisted(), "unsaved despite having a name");
+        s.push(Message::user("hi"));
+        assert_eq!(store.save(&mut s).unwrap(), id);
+        assert!(s.is_persisted());
+        assert_eq!(store.load(&id).unwrap().id, id);
+
+        // And a minted name never collides with one already on disk.
+        assert_ne!(store.mint_id(), id);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_names_are_validated_not_sanitized() {
+        assert_eq!(validate_name("  parser-hunt  ").unwrap(), "parser-hunt");
+        assert_eq!(validate_name("v2.9_final").unwrap(), "v2.9_final");
+        for bad in [
+            "",
+            "   ",
+            ".hidden",
+            "..",
+            "a/b",
+            "a\\b",
+            "why not",
+            "caf\u{e9}",
+        ] {
+            assert!(validate_name(bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(validate_name(&"a".repeat(NAME_MAX)).is_ok());
+        assert!(validate_name(&"a".repeat(NAME_MAX + 1)).is_err());
     }
 
     #[test]

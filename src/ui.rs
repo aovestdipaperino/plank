@@ -3156,6 +3156,9 @@ impl Agent<'_> {
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
                 self.session = Session::new();
+                // A new session, a new name — minted here for the same reason
+                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
+                self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
@@ -3230,12 +3233,16 @@ impl Agent<'_> {
             },
             "/save" => match self.save_session() {
                 Ok(id) => {
-                    println!("saved session {}", &id[..8]);
+                    println!("saved session {}", crate::session::display_id(&id));
                     if let Some(note) = self.save_session_payload() {
                         println!("{}", self.debug_line(&note));
                     }
                 }
                 Err(e) => println!("save failed: {e}"),
+            },
+            "/rename" => match self.rename_session(arg, &mut confirm_on_stdin) {
+                Ok(msg) => println!("{msg}"),
+                Err(e) => println!("rename failed: {e}"),
             },
             "/list" => match self.store.list() {
                 Ok(entries) => print!(
@@ -3622,7 +3629,7 @@ impl Agent<'_> {
     /// front-end to display at startup.
     fn resumed_history(&self) -> Option<String> {
         use std::fmt::Write as _;
-        if self.session.id.is_empty() {
+        if !self.session.is_persisted() {
             return None;
         }
         let mut out = crate::session::render_history(&self.session.transcript, 6, self.color);
@@ -3643,7 +3650,7 @@ impl Agent<'_> {
     /// spans, not an ANSI string.
     fn replay_history_into_log(&self, log: &mut OutputLog) {
         use crate::session::Role;
-        if self.session.id.is_empty() {
+        if !self.session.is_persisted() {
             return;
         }
         let transcript = &self.session.transcript;
@@ -3662,6 +3669,11 @@ impl Agent<'_> {
             !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured();
 
         for m in &transcript[start..] {
+            // Session-start scaffolding (agent instructions, git status, the
+            // date) is context for the model, not conversation: never replayed.
+            if m.is_session_context() {
+                continue;
+            }
             match m.role {
                 Role::User if m.is_tool_user() => {
                     log.push_dim("Tool result:");
@@ -4218,7 +4230,7 @@ the original is frozen and listed in /tree"
         } else {
             format!("tag set: {tag}")
         };
-        if !self.session.id.is_empty() {
+        if self.session.is_persisted() {
             self.save_session().map_err(|e| e.to_string())?;
             msg.push_str(" (saved)");
         }
@@ -4410,6 +4422,50 @@ the original is frozen and listed in /tree"
     fn save_session(&mut self) -> crate::session::Result<String> {
         self.session.cwd = self.tool_ctx.cwd.to_string_lossy().into_owned();
         self.store.save(&mut self.session)
+    }
+
+    /// Renames the live session: the name every later save writes under, on
+    /// disk and in the UI.
+    ///
+    /// Nothing already written is touched. A session saved before the rename
+    /// stays on disk under its old name, so the next save is a logical copy
+    /// rather than a move — which is the point: the old name remains resumable.
+    /// The session is marked dirty so the copy actually gets written, even if
+    /// the rename is the only thing that happened this run.
+    ///
+    /// A name already on disk is not refused: the next save would replace that
+    /// transcript, so `confirm` is asked first and a "no" leaves the session as
+    /// it was. A front end with nothing to ask with (headless) passes a
+    /// confirmer that declines.
+    fn rename_session(
+        &mut self,
+        arg: &str,
+        confirm: &mut dyn FnMut(&str) -> bool,
+    ) -> Result<String, String> {
+        use std::fmt::Write as _;
+        let name = crate::session::validate_name(arg)?;
+        let old = self.session.id.clone();
+        if name == old {
+            return Ok(format!("already named {name}"));
+        }
+        if self.store.path_for_id(name).exists()
+            && !confirm(&format!(
+                "a session named {name} is already saved — the next save will overwrite it"
+            ))
+        {
+            return Err("rename cancelled".to_owned());
+        }
+        name.clone_into(&mut self.session.id);
+        self.session.dirty = true;
+        let mut msg = format!("renamed to {name}");
+        if self.store.path_for_id(&old).exists() {
+            let _ = write!(
+                msg,
+                " (the saved {} is left as it was)",
+                crate::session::display_id(&old)
+            );
+        }
+        Ok(msg)
     }
 
     /// Saves the session at exit and returns `(id, path)` so the caller can
@@ -5981,6 +6037,9 @@ impl Agent<'_> {
             }
             input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
+            // Republished per tick, like the status text: `/new`, `/switch` and
+            // `/resume` all change the name under the loop's feet.
+            tui::set_session_name(&self.session.id);
             let mut status = self.idle_status_text();
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
@@ -8185,6 +8244,9 @@ impl Agent<'_> {
             }
             "/new" | "/clear" => {
                 self.session = Session::new();
+                // A new session, a new name — minted here for the same reason
+                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
+                self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 self.context_content = ContextContent::new();
@@ -8303,13 +8365,24 @@ impl Agent<'_> {
             }
             "/save" => match self.save_session() {
                 Ok(id) => {
-                    log.push_plain(format!("saved session {}", &id[..8]));
+                    log.push_plain(format!("saved session {}", crate::session::display_id(&id)));
                     if let Some(note) = self.save_session_payload() {
                         log.push_dim(note);
                     }
                 }
                 Err(e) => log.push_plain(format!("save failed: {e}")),
             },
+            "/rename" => {
+                // The panel borrows the log and view the arm otherwise only
+                // writes to, so the confirmer is built here and the result
+                // reported after it is done.
+                let mut confirm = |q: &str| run_confirm_panel(terminal, &*log, view, q);
+                let outcome = self.rename_session(arg, &mut confirm);
+                match outcome {
+                    Ok(msg) => log.push_plain(msg),
+                    Err(e) => log.push_plain(format!("rename failed: {e}")),
+                }
+            }
             "/list" => match self.store.list() {
                 Ok(entries) => {
                     for line in
@@ -8754,6 +8827,79 @@ impl Agent<'_> {
         log.push_plain(
             "/open needs the built-in editor (build with --features builtin_editor)".to_owned(),
         );
+    }
+}
+
+/// Asks a yes/no question at the plain-stdout prompt and returns the answer.
+/// Only an explicit yes counts; a closed or unreadable stdin declines, which is
+/// what keeps a piped run from silently agreeing to overwrite something.
+fn confirm_on_stdin(question: &str) -> bool {
+    // A piped stdin is somebody else's protocol stream (the headless front end
+    // reads prompts off it): asking there would both go unanswered and eat a
+    // line. Declining is the safe answer.
+    if !std::io::stdin().is_terminal() {
+        println!("{question} — declined (stdin is not a terminal)");
+        return false;
+    }
+    print!("{question}\noverwrite it? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// Asks a yes/no question in the TUI, reusing the `ask` tool's option panel
+/// ([`tui::draw_ask`]) so a slash command's confirmation looks like every other
+/// question plank asks. Blocks the loop until answered; Escape and Ctrl-C both
+/// decline, since declining is the safe answer for every caller.
+fn run_confirm_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    question: &str,
+) -> bool {
+    use crate::tools::ask::{AskOption, AskRequest, AskState};
+    let req = AskRequest {
+        question: question.to_owned(),
+        header: "Overwrite".to_owned(),
+        options: vec![
+            AskOption {
+                label: "Keep it".to_owned(),
+                description: "cancel the rename and leave both sessions alone".to_owned(),
+            },
+            AskOption {
+                label: "Overwrite".to_owned(),
+                description: "adopt the name; the next save replaces the saved session".to_owned(),
+            },
+        ],
+        multi: false,
+    };
+    // Cursor starts on the first option, so the safe answer is the one a stray
+    // Enter picks.
+    let mut state = AskState::new(req.options.len(), false);
+    loop {
+        if terminal
+            .draw(|f| tui::draw_ask(f, log, &req, &state, "", view, &tui::TaskView::default()))
+            .is_err()
+        {
+            return false;
+        }
+        let Ok(Some(Event::Key(key))) = next_event(None, Duration::from_millis(100)) else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        match key.code {
+            KeyCode::Up => state.move_up(),
+            KeyCode::Down => state.move_down(),
+            KeyCode::Enter => return state.cursor == 1,
+            KeyCode::Esc => return false,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return false,
+            _ => {}
+        }
     }
 }
 
@@ -9662,6 +9808,10 @@ fn new_agent(
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
     let mut trace = Trace::open(cfg.trace_path.as_deref()).map_err(|e| e.to_string())?;
     let mut session = Session::new();
+    // Name the session up front rather than at save time: the TUI shows it on
+    // the rule above the prompt from the first frame, and the name it shows has
+    // to be the one the file ends up under.
+    session.id = store.mint_id();
     // Collect context at session start
     let context_content = ContextContent::new();
     // Inject context into the session transcript
@@ -10304,6 +10454,79 @@ mod tests {
             agent.sub_sink
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/rename` retargets later saves without disturbing what is already on
+    /// disk: the old file stays resumable and the new name becomes a copy.
+    #[test]
+    fn rename_session_leaves_the_saved_copy_alone() {
+        let dir = scratch_dir("rename-session");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = agent.store.mint_id();
+        let minted = agent.session.id.clone();
+        agent.session.push(Message::user("first turn"));
+        assert_eq!(agent.save_session().unwrap(), minted);
+
+        // Nothing to overwrite, so the confirmer must not be consulted.
+        let mut never = |_q: &str| -> bool { panic!("no confirmation expected here") };
+        let msg = agent.rename_session("  parser-hunt  ", &mut never).unwrap();
+        assert_eq!(agent.session.id, "parser-hunt", "trimmed and adopted");
+        assert!(msg.contains(&minted), "the old name is reported: {msg}");
+        assert!(agent.session.dirty, "the copy still has to be written");
+        assert!(
+            agent.store.path_for_id(&minted).exists(),
+            "the already-saved session is untouched"
+        );
+        assert!(
+            !agent.store.path_for_id("parser-hunt").exists(),
+            "and nothing is written until the next save"
+        );
+
+        // The copy is a real second session, with the transcript so far.
+        assert_eq!(agent.save_session().unwrap(), "parser-hunt");
+        assert_eq!(agent.store.load(&minted).unwrap().transcript.len(), 1);
+        assert_eq!(agent.store.load("parser-hunt").unwrap().transcript.len(), 1);
+
+        // A name already on disk asks before taking it, and a "no" changes
+        // nothing at all.
+        let mut asked = String::new();
+        let mut decline = |q: &str| {
+            asked = q.to_owned();
+            false
+        };
+        let err = agent.rename_session(&minted, &mut decline).unwrap_err();
+        assert_eq!(err, "rename cancelled");
+        assert!(
+            asked.contains("overwrite"),
+            "the question explains: {asked}"
+        );
+        assert_eq!(agent.session.id, "parser-hunt", "the rename is a no-op");
+
+        // A "yes" takes the name; the file is still only replaced by a save.
+        let mut accept = |_: &str| true;
+        assert!(agent.rename_session(&minted, &mut accept).is_ok());
+        assert_eq!(agent.session.id, minted);
+        agent.session.push(Message::user("second turn"));
+        assert_eq!(agent.save_session().unwrap(), minted);
+        assert_eq!(
+            agent.store.load(&minted).unwrap().transcript.len(),
+            2,
+            "the overwritten file now holds the live transcript"
+        );
+
+        // Renaming to the current name says so instead of asking anything.
+        assert!(
+            agent
+                .rename_session(&minted, &mut never)
+                .unwrap()
+                .contains("already named")
+        );
+
+        // A path separator never reaches the filesystem.
+        assert!(agent.rename_session("../escape", &mut never).is_err());
+        assert!(agent.rename_session("", &mut never).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -12338,6 +12561,9 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.id = "deadbeef".repeat(5);
+        // `replay_history_into_log` replays only a persisted session, and
+        // `created_at` is what marks one (see `Session::is_persisted`).
+        agent.session.created_at = 1;
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant(
             "<think>pondering</think>Here is **bold** text.\n",
@@ -12406,6 +12632,9 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.id = "deadbeef".repeat(5);
+        // `replay_history_into_log` replays only a persisted session, and
+        // `created_at` is what marks one (see `Session::is_persisted`).
+        agent.session.created_at = 1;
         agent.session.push(Message::user("hi"));
         agent.session.push(Message::assistant(concat!(
             "<think>I should list the directory",

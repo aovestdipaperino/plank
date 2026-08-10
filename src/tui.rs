@@ -1378,7 +1378,71 @@ fn frame_rows(
             rule,
         );
     }
+    // Drawn over the top rule, so it needs the rule painted first.
+    if let Some(rule) = rule_top {
+        render_session_name(frame, rule);
+    }
     (output, input, status)
+}
+
+/// Columns of bare rule kept to the right of the session name, so the label
+/// reads as sitting on the line rather than running off its end.
+const SESSION_NAME_GAP: u16 = 2;
+
+/// Shortest run of rule left of the session name; below this the label is
+/// dropped rather than swallowing the whole line on a narrow terminal.
+const SESSION_NAME_MIN_RULE: u16 = 8;
+
+/// Floats the session name at the right end of the rule above the prompt, so the
+/// name the transcript will be saved under is visible from the first frame
+/// instead of only being announced on exit.
+fn render_session_name(frame: &mut Frame, rule: Rect) {
+    let name = session_name();
+    if name.is_empty() {
+        return;
+    }
+    // Spaces on both sides: the label sits in a gap in the rule, not on top of it.
+    let label = format!(" {name} ");
+    let w = u16::try_from(label.chars().count()).unwrap_or(u16::MAX);
+    if rule.width < w.saturating_add(SESSION_NAME_GAP + SESSION_NAME_MIN_RULE) {
+        return;
+    }
+    let area = Rect::new(rule.right() - SESSION_NAME_GAP - w, rule.y, w, 1);
+    crate::uiremote::region(
+        "session_name",
+        area,
+        &[("name", crate::tools::mcp::Json::Str(name.clone()))],
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            label,
+            Style::default().fg(Color::Indexed(245)),
+        )),
+        area,
+    );
+}
+
+/// The session name the next frame will float on the rule above the prompt.
+///
+/// A process global rather than a `draw` parameter: every one of `draw`'s call
+/// sites would otherwise have to thread it through, including the ones that
+/// repaint from inside a slow command with no session in reach.
+static SESSION_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+/// Publishes the current session's name for later frames to draw.
+pub fn set_session_name(name: &str) {
+    if let Ok(mut slot) = SESSION_NAME.lock()
+        && *slot != name
+    {
+        slot.clear();
+        slot.push_str(name);
+    }
+}
+
+/// The published session name, empty when none has been set.
+#[must_use]
+pub fn session_name() -> String {
+    SESSION_NAME.lock().map(|s| s.clone()).unwrap_or_default()
 }
 
 /// Draws the contextual task strip: the active task in the theme green the rule
@@ -5444,6 +5508,57 @@ mod tests {
         crate::uiremote::set_recording(true);
         assert_eq!(with_remote_marker("idle"), "idle | remote");
         crate::uiremote::set_recording(false);
+    }
+
+    #[test]
+    fn session_name_floats_right_on_the_rule_above_the_prompt() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let row_at = |buf: &ratatui::buffer::Buffer, y: u16| -> String {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let render = |w: u16, view: &mut OutputView| {
+            let mut term = Terminal::new(TestBackend::new(w, 8)).unwrap();
+            term.draw(|f| {
+                draw(
+                    f,
+                    &log,
+                    Some(InputState::new("hi", 2)),
+                    "idle",
+                    view,
+                    None,
+                    &TaskView::default(),
+                    None,
+                    &RosterView::default(),
+                );
+            })
+            .unwrap();
+            let buf = term.backend().buffer();
+            let y = input_row(buf).expect("prompt row present") - 1;
+            row_at(buf, y)
+        };
+
+        set_session_name("deadly-einstein");
+        let rule = render(40, &mut view);
+        assert!(
+            rule.ends_with("─ deadly-einstein ──"),
+            "name floats right with a two-column tail of rule: {rule:?}"
+        );
+        assert!(rule.starts_with("──────"), "rule still leads: {rule:?}");
+
+        // Too narrow to keep a readable run of rule: the label is dropped
+        // rather than eating the whole line.
+        let narrow = render(20, &mut view);
+        assert_eq!(narrow, "─".repeat(20), "no room for the name");
+
+        set_session_name("");
+        let bare = render(40, &mut view);
+        assert_eq!(bare, "─".repeat(40), "no name published, plain rule");
     }
 
     #[test]

@@ -633,6 +633,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "save the current session to ~/.plank",
     },
     SlashCommand {
+        name: "/rename",
+        args: "<name>",
+        desc: "rename this session (the saved copy keeps its old name)",
+    },
+    SlashCommand {
         name: "/list",
         args: "",
         desc: "list saved sessions",
@@ -640,12 +645,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/resume",
         args: "[prefix]",
-        desc: "resume a saved session (sha prefix or list number)",
+        desc: "resume a saved session (name or list number)",
     },
     SlashCommand {
         name: "/switch",
-        args: "<prefix>",
-        desc: "switch to another saved session by id",
+        args: "<name>",
+        desc: "switch to another saved session by name",
     },
     SlashCommand {
         name: "/del",
@@ -896,6 +901,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/insights")
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
+        || slash_command_with_args(cmd, "/rename")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
         || slash_command_with_args(cmd, "/switch")

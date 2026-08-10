@@ -8,6 +8,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A session is named the moment it starts, and the name is on screen the whole
+  time.** The memorable `adjective-celebrity` name used to be minted at save
+  time, so until you quit there was nothing to call the conversation you were
+  having. It is now minted at session start (and again on `/new`), and the TUI
+  floats it at the right end of the rule above the prompt — so the name a
+  transcript will be saved under is visible from the first frame.
+
+- **`/rename <name>`** changes the name later saves use. Nothing already on disk
+  is touched: a session saved before the rename stays resumable under its old
+  name, so the next save is a logical copy rather than a move. Names are
+  validated rather than sanitized (letters, digits, `-`, `_`, `.`), so the name
+  you see is the name you typed, and a name already on disk asks before taking
+  it — the `ask` panel in the TUI, a `[y/N]` prompt on the plain path, declining
+  wherever there is nobody to ask. `/save` already wrote the session without
+  quitting; it now reports the name rather than eight characters of it.
+
 - **`/kvcache`** shows the KV cache as the tree it actually is. Every persisted
   snapshot now carries a JSON metadata sidecar recording what it is, the
   fingerprint of the snapshot it extends, the model and reasoning level behind
@@ -25,6 +41,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   edited this session. TUI-only, and it never creates a file.
 
 ### Changed
+
+- **The `/resume` picker leads with the session name.** Each row is the name and
+  age, then the title, then the last prompt, and the help line says to type the
+  name (a number from the list still works). The name is what you type to pick a
+  session and, now that it exists from session start, what you were looking at
+  on the prompt rule the whole time it ran.
+
+- **Replayed history leaves out the session-start context.** Resuming a session
+  used to replay the scaffolding plank injects for the model — agent
+  instructions, persistent memory, the sub-agent roster, git status, the date —
+  which on a short session was most of what you saw. Those blocks are user turns
+  as far as the model is concerned but nobody typed them, so they no longer
+  count as turns for the history window and are never rendered. A session that
+  holds nothing else replays nothing at all.
 
 - **The KV cache expires on age and is capped on size**, instead of keeping
   only the current fingerprints. The old garbage collector kept exactly the
