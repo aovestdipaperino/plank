@@ -1035,9 +1035,17 @@ impl SessionStore {
     /// names a different saved session (renaming would destroy it), or if the
     /// move fails.
     pub fn rename(&self, prefix: &str, new_name: &str) -> Result<String> {
+        // Ids are canonically lowercase: `session_files` lowercases every file
+        // stem when deriving an id, so `find`/`list`/`load` only ever report
+        // lowercase ids. Canonicalizing here means the same-name check, the
+        // destination path, and the returned value all agree with what the
+        // store will report on the very next lookup — otherwise a mixed-case
+        // `new_name` would hand the caller an id the store never produces
+        // again, and a case-only rename would false-collide with itself on
+        // case-insensitive filesystems (e.g. macOS APFS).
         let name = validate_name(new_name)
             .map_err(SessionError::new)?
-            .to_owned();
+            .to_ascii_lowercase();
         let (old, path) = self.find(prefix)?;
         if name == old {
             return Ok(old);
@@ -3203,6 +3211,47 @@ hello\n";
         assert!(store.rename("one", "has spaces").is_err());
         // Renaming to its own name is a no-op success, not an "already taken" error.
         assert_eq!(store.rename("one", "one").unwrap(), "one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_to_a_case_variant_of_the_same_name_is_a_no_op_success() {
+        let dir = temp_dir("store-rename-case-noop");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "one".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+
+        // On a case-insensitive filesystem, "One" and "one" are the same
+        // underlying file: `dest.exists()` must not fire against the very
+        // session being renamed. Reverting the lowercase canonicalization
+        // makes this return the "already saved" error instead.
+        let id = store.rename("one", "One").unwrap();
+        assert_eq!(id, "one");
+        assert_eq!(store.load("one").unwrap().id, "one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_to_a_mixed_case_name_returns_the_lowercase_id() {
+        let dir = temp_dir("store-rename-mixed-case");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "one".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+
+        // The returned id must be exactly what `find`/`list` report next,
+        // since `session_files` lowercases every stem. Reverting the
+        // canonicalization makes this return "New-Case" while `find` and
+        // `list` report "new-case", failing the equality checks below.
+        let id = store.rename("one", "New-Case").unwrap();
+        assert_eq!(id, "new-case");
+        let (found_id, _) = store.find("new").unwrap();
+        assert_eq!(found_id, id);
+        let listed_ids: Vec<String> = store.list().unwrap().into_iter().map(|e| e.id).collect();
+        assert!(listed_ids.contains(&id));
         let _ = fs::remove_dir_all(&dir);
     }
 
