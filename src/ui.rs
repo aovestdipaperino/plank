@@ -6572,10 +6572,16 @@ impl Agent<'_> {
         }
     }
 
-    /// Drops superseded Tier 2 checkpoints for this project once the current
-    /// one is known good; they can never be read again and are large.
+    /// Runs the TTL + pin sweep over the whole KV cache once this launch's
+    /// tiers are known good.
     ///
-    /// Every *live* Tier 1 fingerprint is kept, not just the main engine's. A
+    /// Nothing is deleted for being superseded any more: a blob dies only when
+    /// it has gone unused past its role's TTL, is unpinned, is not in this
+    /// launch's chain, and has no surviving child. That is what lets several
+    /// system prompts — a model or reasoning-level switch each fork one —
+    /// coexist instead of costing a full re-prefill each way.
+    ///
+    /// Every *live* Tier 1 fingerprint is passed, not just the main engine's. A
     /// `provider: local` sub-agent has its own — keyed on the local model, not
     /// on the provider's — and collecting against the main engine's alone
     /// deleted it on every launch, which is why the sub-agent re-prefilled its
@@ -6584,31 +6590,22 @@ impl Agent<'_> {
     /// keep and the whole directory of system checkpoints went, including ones
     /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        let mut keep: Vec<String> = tiers
-            .iter()
-            .filter(|t| t.kind == crate::kvtier::TierKind::System)
-            .map(|t| t.fingerprint.clone())
-            .collect();
+        // Every tier of this launch's chain, not just Tier 1: one sweep now
+        // protects them all, where the two old GCs were per-tier.
+        let mut keep: Vec<String> = tiers.iter().map(|t| t.fingerprint.clone()).collect();
         if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
             keep.extend(
                 self.kv_tiers_for(&alt.model_name())
                     .into_iter()
-                    .filter(|t| t.kind == crate::kvtier::TierKind::System)
                     .map(|t| t.fingerprint),
             );
         }
-        if !keep.is_empty() {
-            let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
-            let _removed = self.store.gc_system_checkpoints(&keep);
-        }
-        if let Some(t) = tiers
-            .iter()
-            .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
-        {
-            let _removed = self
-                .store
-                .gc_project_checkpoints(&self.tool_ctx.cwd, &t.fingerprint);
-        }
+        // The session in front of the user is live by definition, however long
+        // it has been since its payload was last loaded.
+        keep.push(self.session.id.clone());
+        let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
+        let _freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
     }
 
     /// Re-establishes the warm KV prefix after the transcript is reset by
@@ -13363,11 +13360,17 @@ mod tests {
         let (main_fp, alt_fp) = (fp(&main_tiers), fp(&alt_tiers));
         assert_ne!(main_fp, alt_fp, "different models, different Tier 1");
 
-        // Both engines' checkpoints on disk, plus a stale third.
+        // Both engines' checkpoints on disk, plus a long-idle third. Being
+        // superseded is no longer fatal, so the third one is aged past the
+        // tier TTL with a sidecar to make it collectable.
         let key = |fp: &str| crate::session::KvKey::System { fp: fp.to_owned() };
         for f in [&main_fp, &alt_fp, &"stale".to_string()] {
             std::fs::write(agent.store.kv_path(&key(f)), b"x").unwrap();
         }
+        let stale_path = agent.store.kv_path(&key("stale"));
+        let stale_meta =
+            crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "stale", 1, 0);
+        crate::kvmeta::store(&stale_path, &stale_meta).unwrap();
 
         agent.gc_kv_tiers(&main_tiers);
 

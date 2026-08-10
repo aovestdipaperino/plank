@@ -456,7 +456,42 @@ impl SessionStore {
     /// and can still be deleted from there.
     #[must_use]
     pub fn kv_nodes(&self) -> Vec<crate::kvmeta::KvMeta> {
-        fn scan(dir: &Path, out: &mut Vec<crate::kvmeta::KvMeta>, recurse: bool) {
+        self.kv_blob_paths()
+            .into_iter()
+            .map(|(path, fp)| {
+                crate::kvmeta::load(&path).unwrap_or_else(|| {
+                    let md = fs::metadata(&path).ok();
+                    let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
+                    let mtime = md
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map_or(0, |d| d.as_secs());
+                    let name = path
+                        .file_name()
+                        .and_then(std::ffi::OsStr::to_str)
+                        .unwrap_or_default();
+                    let role = if name.starts_with(SYSPROMPT_PREFIX) {
+                        crate::kvmeta::KvRole::System
+                    } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
+                        crate::kvmeta::KvRole::Project
+                    } else {
+                        crate::kvmeta::KvRole::Session
+                    };
+                    crate::kvmeta::KvMeta::synthesized(role, &fp, bytes, mtime)
+                })
+            })
+            .collect()
+    }
+
+    /// Every KV blob body in the cache, as `(path, fingerprint)`.
+    ///
+    /// The scan behind [`kv_nodes`](Self::kv_nodes), kept separate because a
+    /// sweep needs the path it must unlink alongside the fingerprint the plan
+    /// names. Covers the cache root and one level of per-project
+    /// subdirectories — never deeper.
+    #[must_use]
+    pub fn kv_blob_paths(&self) -> Vec<(PathBuf, String)> {
+        fn scan(dir: &Path, out: &mut Vec<(PathBuf, String)>, recurse: bool) {
             let Ok(entries) = fs::read_dir(dir) else {
                 return;
             };
@@ -473,23 +508,11 @@ impl SessionStore {
                 let Some(stem) = name.strip_suffix(PAYLOAD_EXT) else {
                     continue;
                 };
-                let meta = crate::kvmeta::load(&path).unwrap_or_else(|| {
-                    let md = entry.metadata().ok();
-                    let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
-                    let mtime = md
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs());
-                    let (role, fp) = if let Some(fp) = stem.strip_prefix(SYSPROMPT_PREFIX) {
-                        (crate::kvmeta::KvRole::System, fp)
-                    } else if let Some(fp) = stem.strip_prefix(&format!("{PROJECT_STEM}-")) {
-                        (crate::kvmeta::KvRole::Project, fp)
-                    } else {
-                        (crate::kvmeta::KvRole::Session, stem)
-                    };
-                    crate::kvmeta::KvMeta::synthesized(role, fp, bytes, mtime)
-                });
-                out.push(meta);
+                let fp = stem
+                    .strip_prefix(SYSPROMPT_PREFIX)
+                    .or_else(|| stem.strip_prefix(&format!("{PROJECT_STEM}-")))
+                    .unwrap_or(stem);
+                out.push((path, fp.to_owned()));
             }
         }
         let mut out = Vec::new();
@@ -512,89 +535,38 @@ impl SessionStore {
         self.project_dir(project).join(project_checkpoint_name(fp2))
     }
 
-    /// Deletes every Tier 2 checkpoint of `project` except the one keyed `keep`,
-    /// returning how many files were removed (issue #64).
+    /// Deletes every blob [`crate::kvgc::plan_sweep`] condemns, returning the
+    /// bytes reclaimed.
     ///
-    /// A `project-<fp2>.kv` is only ever readable at one `AGENTS.md`/local-MCP
-    /// revision, so the moment a new `fp2` is written the old ones are dead
-    /// weight — and these snapshots are large. GC is by fingerprint, not by
-    /// mtime: the file is shared by every session of the project, so it must
-    /// survive session deletion, and the current revision is the only one any
-    /// future launch can hit. Best-effort; a failed unlink is ignored (the next
-    /// launch retries).
-    #[must_use]
-    pub fn gc_project_checkpoints(&self, project: &Path, keep: &str) -> usize {
-        let dir = self.project_dir(project);
-        let keep_name = project_checkpoint_name(keep);
-        let Ok(entries) = fs::read_dir(&dir) else {
+    /// Best-effort: a failed unlink is skipped and its bytes are not counted,
+    /// and the next launch retries. Both the body and its sidecar go.
+    ///
+    /// `active` is the set of fingerprints this launch is using, across *every*
+    /// engine it holds: a provider main agent beside a `provider: local`
+    /// sub-agent has two Tier 1 fingerprints, and passing only one of them is
+    /// what used to delete the other's checkpoint on every launch.
+    pub fn sweep(&self, active: &[&str], policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
+        let nodes = self.kv_nodes();
+        let plan = crate::kvgc::plan_sweep(&nodes, active, policy, now);
+        if plan.doomed.is_empty() {
             return 0;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(PROJECT_STEM) || !name.ends_with(PAYLOAD_EXT) || name == keep_name
-            {
+        }
+        let doomed: std::collections::HashSet<&str> =
+            plan.doomed.iter().map(String::as_str).collect();
+        let mut freed = 0u64;
+        for (path, fp) in self.kv_blob_paths() {
+            if !doomed.contains(fp.as_str()) {
                 continue;
             }
-            if fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
+            let size = fs::metadata(&path).map_or(0, |m| m.len());
+            if fs::remove_file(&path).is_ok() {
+                freed = freed.saturating_add(size);
+                // The sidecar must go with the body, or the next scan reports a
+                // phantom node.
+                let _ = fs::remove_file(crate::kvmeta::sidecar_path(&path));
             }
         }
-        removed
-    }
-
-    /// Deletes every Tier 1 system-prompt checkpoint except the one keyed
-    /// `keep_fp`, returning how many files were removed (issue #64).
-    ///
-    /// A `sysprompt-<fp1>.kv` is only ever readable at one (model, system
-    /// prompt) revision, so a plank upgrade, a global MCP server added or
-    /// removed, or a model switch orphans the previous one permanently — and
-    /// these snapshots run to hundreds of megabytes. GC is by fingerprint, not
-    /// by mtime: the current revision is the only one any future launch can
-    /// hit. The legacy bare `sysprompt.kv` (overwritten in place before the
-    /// checkpoint became content-keyed) goes too — nothing writes that name
-    /// any more, so it can never be read again. Best-effort; a failed unlink
-    /// is ignored (the next launch retries).
-    ///
-    /// `keep` is a *set* because a session can hold more than one engine, and
-    /// each has its own Tier 1 fingerprint — a provider main agent beside a
-    /// `provider: local` sub-agent has two. Passing only the main engine's
-    /// deletes the other's checkpoint on every launch, and under a provider it
-    /// deletes every checkpoint in the directory: the provider's own
-    /// fingerprint never has a file, so nothing at all matches `keep`.
-    #[must_use]
-    pub fn gc_system_checkpoints(&self, keep: &[&str]) -> usize {
-        let keep_names: Vec<String> = keep
-            .iter()
-            .map(|fp| sysprompt_checkpoint_name(fp))
-            .collect();
-        // Deliberately `FILE_EXT`, not `PAYLOAD_EXT`: this names the legacy
-        // bare `sysprompt.kv` written before checkpoints were content-keyed.
-        // Nothing writes it any more; it only needs collecting.
-        let legacy_name = format!("{SYSPROMPT_STEM}{FILE_EXT}");
-        let Ok(entries) = fs::read_dir(&self.dir) else {
-            return 0;
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            // `sysprompt-*.kv` only: the same directory holds `<id>.payload`
-            // sidecars, `<id>.kv` session files, per-project subdirectories,
-            // and `<name>.kv.tmp.<pid>` writes still in flight.
-            let collect = name == legacy_name
-                || (name.starts_with(SYSPROMPT_PREFIX)
-                    && name.ends_with(PAYLOAD_EXT)
-                    && !keep_names.iter().any(|k| k == name));
-            if !collect || !entry.file_type().is_ok_and(|t| t.is_file()) {
-                continue;
-            }
-            if fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
-            }
-        }
-        removed
+        freed
     }
 
     /// The system-prompt text the last Tier 1 checkpoint was built from, or
@@ -1079,7 +1051,7 @@ const SYSPROMPT_PREFIX: &str = "sysprompt-";
 /// checkpoint was built from. Deliberately *not* keyed by `fp1` — a changed
 /// prompt yields a different key, so the point of this file is to be findable
 /// after the fingerprint has already moved. Its name ends in `.prompt`, not
-/// `.kv`, so [`SessionStore::gc_system_checkpoints`] leaves it alone.
+/// `.kv_raw`, so [`SessionStore::sweep`] never sees it as a blob.
 const SYSPROMPT_NOTE_NAME: &str = "sysprompt-last.prompt";
 
 /// File-stem prefix of the Tier 2 project-stable KV checkpoints (issue #60):
@@ -2326,18 +2298,21 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Ported from `gc_keeps_only_the_current_system_checkpoint`: the sweep
+    /// still collects a superseded Tier 1 checkpoint and still spares the live
+    /// one. What changed is *why* a checkpoint dies — expiry rather than
+    /// fingerprint inequality — so the clock is wound past the tier TTL to make
+    /// the superseded ones collectable.
     #[test]
-    fn gc_keeps_only_the_current_system_checkpoint() {
+    fn sweep_collects_superseded_system_checkpoints_and_spares_the_live_ones() {
         let dir = temp_dir("sys-gc");
         let store = SessionStore::open(&dir).unwrap();
 
         for fp in ["aaa", "bbb", "ccc"] {
             fs::write(dir.join(sysprompt_checkpoint_name(fp)), b"fp\nkv").unwrap();
         }
-        // The pre-content-keyed checkpoint: unreadable now, so it goes too.
-        fs::write(dir.join("sysprompt.kv"), b"legacy").unwrap();
-        // Neighbours in the same root that must survive: a payload sidecar, a
-        // session file, an in-flight temp write, and a project subdirectory.
+        // Neighbours in the same root that must survive: a session transcript,
+        // an in-flight temp write, and a non-blob file in a project subdir.
         let mut s = Session::new();
         s.push(Message::user("hi"));
         store.save(&mut s).unwrap();
@@ -2348,34 +2323,57 @@ hello\n";
         let project = Path::new("/proj/sys");
         fs::create_dir_all(store.project_dir(project)).unwrap();
         fs::write(store.project_checkpoint_path(project, "aaa"), b"fp\nkv").unwrap();
+        let stray = store.project_dir(project).join("notes.txt");
+        fs::write(&stray, b"keep me").unwrap();
 
-        // Two fingerprints kept: a session can hold two engines, each with its
-        // own Tier 1 — a provider main agent beside a `provider: local`
-        // sub-agent. Keeping only one deletes the other's every launch.
-        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 2);
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+        };
+        // Two Tier 1 fingerprints are live, not one: a session can hold two
+        // engines — a provider main agent beside a `provider: local` sub-agent —
+        // and each has its own. Keeping only one deleted the other's every
+        // launch. The current session's own payload is live too.
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        let active = ["bbb", "ccc", s.id.as_str()];
+        assert!(store.sweep(&active, &policy, future) > 0);
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
-        assert!(!dir.join("sysprompt.kv").exists());
-        assert!(payload.exists());
-        assert!(store.path_for_id(&s.id).exists());
-        assert!(tmp.exists());
-        assert!(store.project_checkpoint_path(project, "aaa").exists());
+        assert!(payload.exists(), "the live session's payload is active");
+        assert!(
+            store.path_for_id(&s.id).exists(),
+            "transcripts are not blobs"
+        );
+        assert!(tmp.exists(), "an in-flight temp write is not a blob");
+        assert!(
+            stray.exists(),
+            "a non-blob file in a project dir is untouched"
+        );
 
         // Idempotent, and harmless when there is nothing to collect.
-        assert_eq!(store.gc_system_checkpoints(&["bbb", "ccc"]), 0);
+        assert_eq!(store.sweep(&active, &policy, future), 0);
         let empty = temp_dir("sys-gc-empty");
         let empty_store = SessionStore::open(&empty).unwrap();
-        assert_eq!(empty_store.gc_system_checkpoints(&["bbb"]), 0);
-        // An empty keep set is a full sweep, not a no-op: the caller decides
-        // what is live, and "nothing" would only ever be a bug upstream.
-        assert_eq!(store.gc_system_checkpoints(&[]), 2);
+        assert_eq!(empty_store.sweep(&["bbb"], &policy, future), 0);
+        // An empty active set is a full sweep of everything expired, not a
+        // no-op: the caller decides what is live.
+        assert!(store.sweep(&[], &policy, future) > 0);
+        assert!(!dir.join(sysprompt_checkpoint_name("bbb")).exists());
+        assert!(!dir.join(sysprompt_checkpoint_name("ccc")).exists());
+        assert!(!payload.exists());
+        assert!(store.path_for_id(&s.id).exists());
         let _ = fs::remove_dir_all(&empty);
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Ported from `gc_keeps_only_the_current_project_checkpoint`: superseded
+    /// Tier 2 checkpoints are collected, the live one survives, and a
+    /// neighbouring project's files are unaffected. The sweep is no longer
+    /// scoped to one project directory, so the neighbour survives by being
+    /// listed as active rather than by being out of scope.
     #[test]
-    fn gc_keeps_only_the_current_project_checkpoint() {
+    fn sweep_collects_superseded_project_checkpoints() {
         let dir = temp_dir("proj-gc");
         let store = SessionStore::open(&dir).unwrap();
         let project = Path::new("/proj/gc");
@@ -2386,22 +2384,49 @@ hello\n";
         for fp in ["aaa", "bbb", "ccc"] {
             fs::write(store.project_checkpoint_path(project, fp), b"fp\nkv").unwrap();
         }
-        // A neighbouring project's checkpoint and a non-checkpoint file must
-        // both survive: GC is scoped to one project's Tier 2 files.
-        fs::write(store.project_checkpoint_path(other, "aaa"), b"fp\nkv").unwrap();
+        fs::write(store.project_checkpoint_path(other, "ddd"), b"fp\nkv").unwrap();
         let stray = store.project_dir(project).join("notes.txt");
         fs::write(&stray, b"keep me").unwrap();
 
-        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 2);
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(
+            store.sweep(&["bbb", "ddd"], &policy, future),
+            10,
+            "aaa + ccc"
+        );
         assert!(store.project_checkpoint_path(project, "bbb").exists());
         assert!(!store.project_checkpoint_path(project, "aaa").exists());
         assert!(!store.project_checkpoint_path(project, "ccc").exists());
-        assert!(store.project_checkpoint_path(other, "aaa").exists());
+        assert!(store.project_checkpoint_path(other, "ddd").exists());
         assert!(stray.exists());
 
-        // Idempotent, and harmless for a project with no checkpoint dir yet.
-        assert_eq!(store.gc_project_checkpoints(project, "bbb"), 0);
-        assert_eq!(store.gc_project_checkpoints(Path::new("/nope"), "bbb"), 0);
+        // Idempotent, and harmless for a cache with nothing collectable.
+        assert_eq!(store.sweep(&["bbb", "ddd"], &policy, future), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A blob's sidecar goes with it; a phantom node otherwise survives every
+    /// later scan, since `kv_nodes` reads sidecars as well as bodies.
+    #[test]
+    fn sweep_takes_the_sidecar_with_the_body() {
+        let dir = temp_dir("sweep-sidecar");
+        let store = SessionStore::open(&dir).unwrap();
+        let blob = dir.join(sysprompt_checkpoint_name("aaa"));
+        fs::write(&blob, b"fp\nkv").unwrap();
+        let meta = crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "aaa", 5, 0);
+        crate::kvmeta::store(&blob, &meta).unwrap();
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 0,
+            ttl_tier_secs: 0,
+        };
+        assert_eq!(store.sweep(&[], &policy, crate::kvmeta::now_secs()), 5);
+        assert!(!blob.exists());
+        assert!(!crate::kvmeta::sidecar_path(&blob).exists());
+        assert!(store.kv_nodes().is_empty(), "no phantom node remains");
         let _ = fs::remove_dir_all(&dir);
     }
 
