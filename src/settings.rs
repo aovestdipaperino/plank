@@ -514,16 +514,31 @@ impl Settings {
         }
     }
 
-    /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
+    /// Overlays `low` files then `high` files, in that order, on the
+    /// built-in defaults. Exists so plugin settings can sit strictly below
+    /// the user and project files.
     #[must_use]
-    pub fn load() -> Self {
+    pub fn load_from_paths(low: &[PathBuf], high: &[PathBuf]) -> Self {
         let mut s = Self::default();
-        for p in Self::paths() {
-            if let Ok(text) = std::fs::read_to_string(&p) {
+        for p in low.iter().chain(high.iter()) {
+            if let Ok(text) = std::fs::read_to_string(p) {
                 s.overlay(&text);
             }
         }
         s
+    }
+
+    /// [`load`](Self::load) with plugin-contributed settings applied first, so
+    /// `defaults < plugins < ~/.plank < ./.plank`.
+    #[must_use]
+    pub fn load_with_plugins(plugin_paths: &[PathBuf]) -> Self {
+        Self::load_from_paths(plugin_paths, &Self::paths())
+    }
+
+    /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
+    #[must_use]
+    pub fn load() -> Self {
+        Self::load_from_paths(&[], &Self::paths())
     }
 
     /// The files [`load`](Self::load) consults, in increasing precedence.
@@ -1457,5 +1472,26 @@ mod tests {
         let mut s2 = Settings::default();
         s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
         assert!(!s2.engine.thinking_tool_calls);
+    }
+
+    #[test]
+    fn plugin_settings_lose_to_the_user_file() {
+        let dir = std::env::temp_dir().join(format!("plank-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write");
+
+        // The plugin value applies when nothing above it speaks.
+        let s = Settings::load_from_paths(std::slice::from_ref(&plugin), &[]);
+        assert_eq!(s.kvcache.max_bytes, 111);
+
+        // A user file wins over it.
+        let user = dir.join("user-settings.json");
+        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write");
+        let s = Settings::load_from_paths(&[plugin], &[user]);
+        assert_eq!(s.kvcache.max_bytes, 222);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -320,6 +320,16 @@ pub fn component_root(plugin: &Plugin, plank: &str, cc: &str) -> Option<PathBuf>
     None
 }
 
+/// Settings files contributed by plugins, in load order. They are applied
+/// below `~/.plank/settings.json`, so a plugin can never override the user.
+#[must_use]
+pub fn settings_paths(set: &PluginSet) -> Vec<PathBuf> {
+    set.plugins
+        .iter()
+        .filter_map(|p| component_root(p, "settings.json", "settings.json"))
+        .collect()
+}
+
 /// Merges plugin-contributed entries into the user+project entries.
 ///
 /// Every plugin entry is registered as `<plugin>:<name>`. It is registered a
@@ -1090,6 +1100,20 @@ mod tests {
                 .any(|w| w.contains("alpha-weather") && w.contains("gamma") && w.contains("alpha")),
             "expected a warning naming the colliding servers and plugins, got: {warnings:?}"
         );
+    }
+
+    #[test]
+    fn a_plugin_settings_file_is_discovered() {
+        let base = scratch("plugin-settings");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(&plugin, "settings.json", r#"{"kvcache":{"maxBytes":7}}"#);
+        let set = load_in(Some(&base.join("home")), &cwd, &[plugin]);
+        let paths = settings_paths(&set);
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("settings.json"));
     }
 
     #[test]
