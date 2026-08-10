@@ -519,6 +519,82 @@ pub fn hooks_with_plugins(cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
     hooks_in(home.as_deref(), cwd, set)
 }
 
+/// Names in `path`'s `mcpServers` object that contain `__`.
+///
+/// [`crate::tools::mcp::config_load_checked`] already drops these servers
+/// (they could never be routed back through `mcp__<server>__<tool>`
+/// dispatch), but only logs to stderr; this re-reads the raw JSON so
+/// [`mcp_servers`] can surface the same rejection as a returned warning.
+fn raw_server_names_with_double_underscore(path: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Some(root) = crate::tools::mcp::json_parse(&text) else {
+        return Vec::new();
+    };
+    let Some(crate::tools::mcp::Json::Obj(servers)) = root.get("mcpServers") else {
+        return Vec::new();
+    };
+    servers
+        .iter()
+        .filter(|(name, _)| name.contains("__"))
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// MCP servers contributed by plugins, with names disambiguated.
+///
+/// Uncontested names stay bare. When two plugins offer the same server name,
+/// both are renamed `<plugin>-<server>`. The separator is `-` rather than `:`
+/// because a server name is embedded in `mcp__<server>__<tool>` and split at
+/// the first `__`, so a plugin server name containing `__` is rejected.
+#[must_use]
+pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut gathered: Vec<(String, crate::tools::mcp::McpServerConfig)> = Vec::new();
+    for plugin in &set.plugins {
+        let Some(path) = component_root(plugin, ".mcp.json", ".mcp.json") else {
+            continue;
+        };
+        for name in raw_server_names_with_double_underscore(&path) {
+            warnings.push(format!(
+                "plugin '{}': server name '{name}' contains '__' and was rejected",
+                plugin.name
+            ));
+        }
+        let Some(configs) = crate::tools::mcp::config_load_checked(&path) else {
+            warnings.push(format!(
+                "plugin '{}': unreadable {}",
+                plugin.name,
+                path.display()
+            ));
+            continue;
+        };
+        for config in configs {
+            gathered.push((plugin.name.clone(), config));
+        }
+    }
+
+    let mut out = Vec::new();
+    for (plugin, config) in &gathered {
+        let contested = gathered
+            .iter()
+            .filter(|(_, other)| other.name == config.name)
+            .count()
+            > 1;
+        let mut config = config.clone();
+        if contested {
+            warnings.push(format!(
+                "MCP server '{}' is contributed by more than one plugin; renamed '{}-{}'",
+                config.name, plugin, config.name
+            ));
+            config.name = format!("{plugin}-{}", config.name);
+        }
+        out.push(config);
+    }
+    (out, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -913,5 +989,73 @@ mod tests {
             plugin_at < project_at,
             "plugin hooks run before project hooks"
         );
+    }
+
+    #[test]
+    fn a_plugin_mcp_server_keeps_its_bare_name_when_uncontested() {
+        let base = scratch("plugin-mcp");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            ".mcp.json",
+            r#"{"mcpServers":{"weather":{"command":"weather-server"}}}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (servers, warnings) = mcp_servers(&set);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "weather");
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn two_plugins_offering_the_same_server_name_are_both_prefixed() {
+        let base = scratch("mcp-collision");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        for name in ["alpha", "beta"] {
+            let plugin = base.join(name);
+            write(
+                &plugin,
+                ".plank-plugin/plugin.json",
+                &format!(r#"{{"name":"{name}"}}"#),
+            );
+            write(
+                &plugin,
+                ".mcp.json",
+                r#"{"mcpServers":{"weather":{"command":"weather-server"}}}"#,
+            );
+        }
+        let set = load_in(Some(&home), &cwd, &[base.join("alpha"), base.join("beta")]);
+        let (servers, warnings) = mcp_servers(&set);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha-weather", "beta-weather"]);
+        assert!(warnings.iter().any(|w| w.contains("weather")));
+    }
+
+    #[test]
+    fn a_plugin_server_name_containing_a_double_underscore_is_rejected() {
+        let base = scratch("mcp-bad-name");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            ".mcp.json",
+            r#"{"mcpServers":{"we__ather":{"command":"x"}}}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (servers, warnings) = mcp_servers(&set);
+        assert!(servers.is_empty());
+        assert!(warnings.iter().any(|w| w.contains("we__ather")));
     }
 }

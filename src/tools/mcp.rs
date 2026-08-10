@@ -987,6 +987,32 @@ fn hierarchy_from_global(
     merge_configs(global, local)
 }
 
+/// Overlays plugin-contributed servers onto the global config, then the local
+/// config onto that, so precedence runs global < plugins < local.
+fn hierarchy_with_plugins(
+    global: Vec<McpServerConfig>,
+    plugin: Vec<McpServerConfig>,
+    local: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
+    merge_configs(merge_configs(global, plugin), local)
+}
+
+/// [`config_load_hierarchy`] with plugin-contributed servers inserted between
+/// the global and local configs.
+#[must_use]
+pub fn config_load_hierarchy_with_plugins(
+    local_path: Option<&Path>,
+    plugin_servers: Vec<McpServerConfig>,
+) -> Vec<McpServerConfig> {
+    let global = match global_config_path() {
+        Some(path) => config_load(&path),
+        None => Vec::new(),
+    };
+    let default = Path::new(".mcp.json");
+    let local = config_load(local_path.unwrap_or(default));
+    hierarchy_with_plugins(global, plugin_servers, local)
+}
+
 /// Overlays `local` server configs onto `global`, matching by server name.
 fn merge_configs(
     global: Vec<McpServerConfig>,
@@ -1066,9 +1092,10 @@ pub fn global_eligible_names(local_path: Option<&Path>) -> Vec<String> {
 /// advertisement, so the system prompt — and hence the Tier 1 KV snapshot —
 /// stays byte-identical across a flap. `path` overrides the local config
 /// location; the global `~/.plank/.mcp.json` always applies underneath (see
-/// [`config_load_hierarchy`]).
+/// [`config_load_hierarchy`]). `plugins` contributes servers that sit between
+/// the global and local configs (see [`crate::plugins::mcp_servers`]).
 #[must_use]
-pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
+pub fn load_and_start(path: Option<&Path>, plugins: &crate::plugins::PluginSet) -> Vec<McpServer> {
     // Read once: the eligible-names set, the prune keep-list and the merged
     // hierarchy all derive from this single `Option`, so they cannot disagree
     // about whether the global config was readable.
@@ -1089,9 +1116,12 @@ pub fn load_and_start(path: Option<&Path>) -> Vec<McpServer> {
     if let Some(root) = root.as_deref() {
         prune_records(root, global_names.as_deref());
     }
+    let default = Path::new(".mcp.json");
+    let local_configs = config_load(path.unwrap_or(default));
+    let plugin_servers = crate::plugins::mcp_servers(plugins).0;
     let mut start = spawn_and_handshake;
     start_servers_with(
-        hierarchy_from_global(global.unwrap_or_default(), path),
+        hierarchy_with_plugins(global.unwrap_or_default(), plugin_servers, local_configs),
         &eligible,
         root.as_deref(),
         &mut start,
@@ -2800,5 +2830,30 @@ done
             "binary flagged: {out}"
         );
         assert!(!out.contains("AAAA"), "blob bytes must not inline: {out}");
+    }
+
+    #[test]
+    fn plugin_servers_sit_between_the_global_and_local_configs() {
+        let global = vec![McpServerConfig {
+            name: "shared".to_string(),
+            command: "global".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }];
+        let plugin = vec![McpServerConfig {
+            name: "shared".to_string(),
+            command: "plugin".to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        }];
+        let merged = hierarchy_with_plugins(global, plugin, Vec::new());
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].command, "plugin");
     }
 }
