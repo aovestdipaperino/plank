@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::session::SessionEntry;
 
@@ -98,6 +98,18 @@ impl ResumePane {
     #[must_use]
     pub fn query(&self) -> &str {
         &self.query
+    }
+
+    /// The rename text being edited, or `None` when the box is the search box.
+    #[must_use]
+    pub fn rename_buffer(&self) -> Option<&str> {
+        self.rename.as_deref()
+    }
+
+    /// A delete press is armed and awaiting its confirmation.
+    #[must_use]
+    pub fn pending_delete(&self) -> bool {
+        self.pending_delete
     }
 
     /// No session matches the query.
@@ -212,8 +224,38 @@ impl ResumePane {
     }
 
     /// Handles one key press.
+    ///
+    /// Control keys first: `Ctrl+R`/`Ctrl+X` must not be mistaken for the
+    /// characters `r` and `x` going into the search box.
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
+            KeyCode::Char('r') if ctrl => {
+                // Nothing selected means nothing to rename.
+                if let Some(e) = self.selected() {
+                    self.rename = Some(e.id.clone());
+                    self.preview_open = false;
+                    self.pending_delete = false;
+                }
+                Outcome::Stay
+            }
+            // Delete is unreachable behind a rename box: the two would fight
+            // over Enter, and confirming a delete you cannot see is worse.
+            KeyCode::Char('x') if ctrl && self.rename.is_none() => {
+                if !self.pending_delete {
+                    self.pending_delete = self.selected().is_some();
+                    return Outcome::Stay;
+                }
+                self.pending_delete = false;
+                match self.selected() {
+                    Some(e) => Outcome::Delete(e.id.clone()),
+                    None => Outcome::Stay,
+                }
+            }
+            // Every other control chord is swallowed rather than falling through
+            // to the text arms below. Without this, `Ctrl+X` behind a rename box
+            // types a literal `x` into the name.
+            KeyCode::Char(_) if ctrl => Outcome::Stay,
             KeyCode::Up => {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.preview_open = false;
@@ -228,24 +270,42 @@ impl ResumePane {
                 self.pending_delete = false;
                 Outcome::Stay
             }
-            KeyCode::Enter => match self.selected() {
-                Some(e) => Outcome::Resume(e.id.clone()),
-                None => Outcome::Stay,
-            },
-            KeyCode::Esc => Outcome::Close,
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.refilter();
+            KeyCode::Enter => {
+                self.pending_delete = false;
+                let Some(id) = self.selected().map(|e| e.id.clone()) else {
+                    return Outcome::Stay;
+                };
+                match self.rename.clone() {
+                    // An empty name is refused here rather than round-tripping
+                    // through the store just to be rejected; the box stays open.
+                    Some(new) if new.trim().is_empty() => Outcome::Stay,
+                    Some(new) => {
+                        self.rename = None;
+                        Outcome::Rename(id, new)
+                    }
+                    None => Outcome::Resume(id),
+                }
+            }
+            // Esc backs out one level: rename box first, then the picker.
+            KeyCode::Esc if self.rename.is_some() => {
+                self.rename = None;
                 Outcome::Stay
             }
-            // Space is the preview toggle only while the search box is empty.
-            // Once there is a query it has to be an ordinary character, or
-            // multi-word searches are impossible.
+            KeyCode::Esc => Outcome::Close,
+            KeyCode::Backspace => {
+                self.pending_delete = false;
+                if let Some(buf) = self.rename.as_mut() {
+                    buf.pop();
+                } else {
+                    self.query.pop();
+                    self.refilter();
+                }
+                Outcome::Stay
+            }
             KeyCode::Char(' ') if self.query.is_empty() && self.rename.is_none() => {
                 self.pending_delete = false;
                 self.preview_open = !self.preview_open;
                 match self.selected().map(|e| e.id.clone()) {
-                    // Only ask when the text is not already in hand.
                     Some(id) if self.preview_open && !self.previews.contains_key(&id) => {
                         Outcome::LoadPreview(id)
                     }
@@ -253,8 +313,13 @@ impl ResumePane {
                 }
             }
             KeyCode::Char(c) => {
-                self.query.push(c);
-                self.refilter();
+                self.pending_delete = false;
+                if let Some(buf) = self.rename.as_mut() {
+                    buf.push(c);
+                } else {
+                    self.query.push(c);
+                    self.refilter();
+                }
                 Outcome::Stay
             }
             _ => Outcome::Stay,
@@ -265,7 +330,7 @@ impl ResumePane {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     fn entry(
         id: &str,
@@ -319,6 +384,10 @@ mod tests {
         for c in text.chars() {
             pane.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     fn ids(pane: &ResumePane) -> Vec<String> {
@@ -492,5 +561,94 @@ mod tests {
         p.set_preview("kv-cache-design", "cached".to_owned());
         p.handle_key(key(KeyCode::Down));
         assert!(p.rows()[0].extra.iter().all(|l| l != "cached"));
+    }
+
+    #[test]
+    fn ctrl_r_opens_a_rename_prefilled_with_the_current_name() {
+        let mut p = pane();
+        p.handle_key(key(KeyCode::Down));
+        assert!(matches!(p.handle_key(ctrl('r')), Outcome::Stay));
+        assert_eq!(p.rename_buffer(), Some("guide-update"));
+        // Editing goes to the rename buffer, not the search box.
+        for _ in 0..6 {
+            p.handle_key(key(KeyCode::Backspace));
+        }
+        typed(&mut p, "docs");
+        assert_eq!(p.rename_buffer(), Some("guide-docs"));
+        assert_eq!(p.query(), "", "the filter is untouched while renaming");
+        assert!(matches!(p.handle_key(key(KeyCode::Enter)),
+                         Outcome::Rename(id, new) if id == "guide-update" && new == "guide-docs"));
+    }
+
+    #[test]
+    fn esc_leaves_rename_mode_without_closing_the_picker() {
+        let mut p = pane();
+        p.handle_key(ctrl('r'));
+        typed(&mut p, "-x");
+        assert!(matches!(p.handle_key(key(KeyCode::Esc)), Outcome::Stay));
+        assert_eq!(p.rename_buffer(), None, "back to search");
+        // A second Esc, now in search mode, closes the picker.
+        assert!(matches!(p.handle_key(key(KeyCode::Esc)), Outcome::Close));
+    }
+
+    #[test]
+    fn renaming_to_the_empty_string_is_refused_by_the_pane() {
+        let mut p = pane();
+        p.handle_key(ctrl('r'));
+        for _ in 0..40 {
+            p.handle_key(key(KeyCode::Backspace));
+        }
+        assert_eq!(p.rename_buffer(), Some(""));
+        assert!(
+            matches!(p.handle_key(key(KeyCode::Enter)), Outcome::Stay),
+            "an empty name never reaches the store"
+        );
+        assert_eq!(p.rename_buffer(), Some(""), "still renaming");
+    }
+
+    #[test]
+    fn ctrl_r_with_nothing_selected_does_nothing() {
+        let mut p = pane();
+        typed(&mut p, "no-such-session");
+        assert!(matches!(p.handle_key(ctrl('r')), Outcome::Stay));
+        assert_eq!(p.rename_buffer(), None);
+    }
+
+    #[test]
+    fn ctrl_x_twice_deletes_the_selected_session() {
+        let mut p = pane();
+        p.handle_key(key(KeyCode::Down));
+        assert!(
+            matches!(p.handle_key(ctrl('x')), Outcome::Stay),
+            "armed, not fired"
+        );
+        assert!(p.pending_delete());
+        assert!(p.footer().contains("again"), "{}", p.footer());
+        assert!(matches!(p.handle_key(ctrl('x')),
+                         Outcome::Delete(id) if id == "guide-update"));
+    }
+
+    #[test]
+    fn any_other_key_disarms_a_pending_delete() {
+        let mut p = pane();
+        p.handle_key(ctrl('x'));
+        assert!(p.pending_delete());
+        p.handle_key(key(KeyCode::Down));
+        assert!(!p.pending_delete(), "moving away cancels");
+        // And a second Ctrl+X after the disarm only re-arms, it does not delete.
+        assert!(matches!(p.handle_key(ctrl('x')), Outcome::Stay));
+    }
+
+    #[test]
+    fn ctrl_x_does_nothing_while_renaming() {
+        let mut p = pane();
+        p.handle_key(ctrl('r'));
+        assert!(matches!(p.handle_key(ctrl('x')), Outcome::Stay));
+        assert!(!p.pending_delete(), "no delete armed behind a rename box");
+        assert_eq!(
+            p.rename_buffer(),
+            Some("kv-cache-design"),
+            "and the chord did not type a literal x into the name"
+        );
     }
 }
