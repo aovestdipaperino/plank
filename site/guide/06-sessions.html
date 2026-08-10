@@ -134,19 +134,55 @@ where the engine supports it — a snapshot of the model's internal KV
 state so returning to it does not mean re-reading it from scratch.</p>
 <p>Sessions live under <code>~/.plank/kvcache/</code> as
 <code>&lt;name&gt;.kv</code>, with a fingerprinted
-<code>&lt;name&gt;.payload</code> sidecar holding the engine state. A
-session id is a memorable <code>adjective-celebrity</code> name minted
-on first save (<code>deadly-einstein</code>), and titles derive from
-your first prompt, so <code>/list</code> is readable rather than a wall
-of hashes.</p>
+<code>&lt;name&gt;.kv_raw</code> sidecar holding the engine state and a
+small <code>&lt;name&gt;.json</code> describing it. A session id is a
+memorable <code>adjective-celebrity</code> name minted on first save
+(<code>deadly-einstein</code>), and titles derive from your first
+prompt, so <code>/list</code> is readable rather than a wall of
+hashes.</p>
 <h2 id="saving-listing-switching">Saving, listing, switching</h2>
 <p>Sessions save automatically; <code>/save</code> forces it.</p>
 <pre><code>/list               # most recent first
 /switch &lt;id&gt;        # load another session
 /tag reindex bug    # label this one
 /del &lt;id&gt;           # delete</code></pre>
-<p><code>/strip &lt;id&gt;</code> trims a saved session's oldest turns
-when one has grown unwieldy but you want to keep the recent part.</p>
+<p><code>/strip &lt;id&gt;</code> drops a session's KV payload to
+reclaim disk. The transcript survives untouched, so the session still
+loads; it just re-prefills the conversation the next time you open it,
+and <code>/list</code> shows it as <code>stripped</code>.</p>
+<h2 id="the-kv-cache">The KV cache</h2>
+<p><code>/kvcache</code> shows what is actually on disk, as the tree it
+really is. A system-prompt snapshot sits at the root, the
+project-context snapshots that extend it hang below, and each session's
+payload hangs below the project it belongs to. Every row carries its
+size, how many times it has been reused, when it was last touched, and
+whether it is about to expire.</p>
+<pre><code>system  a19f4c21  412 MB  📌 pinned
+│  max · 12 global MCP tools
+├─ project  7c02be90  88 MB  hits 41  2h ago
+│  │  ~/Code/plank · AGENTS.md · 2 local MCP
+│  ├─ session cheeky-bell   1.2 GB  hits 3   2h ago
+│  └─ session bouncy-dali   0.9 GB  hits 1   6d ago  ⏳ ttl 8d
+└─ project  4d81a7f3  61 MB  hits 2   9d ago
+   └─ (no sessions)
+
+total 2.6 GB · 0 B reclaimable</code></pre>
+<p>Move with <code>↑↓</code>, fold a subtree with <code>←→</code>, and
+act on the selected row: <code>p</code> pins it so no sweep will ever
+take it, <code>d</code> deletes it after a confirmation, <code>g</code>
+runs the sweep immediately. <code>Esc</code> closes. Piped into a
+non-interactive shell the same tree prints as plain text, and
+<code>/kvcache pin|unpin|rm|gc</code> do the same jobs by fingerprint
+prefix.</p>
+<p>Pinning is the thing worth knowing about. Snapshots expire on age
+(see <a href="08-configuration.html#kvcache">Configuration</a>), and the
+largest ones are the most expensive to rebuild, so if you have a setup
+you return to every few weeks it is cheaper to pin it than to let it
+lapse and pay the re-prefill. A pinned entry is also exempt from the
+size ceiling.</p>
+<p>Nothing here can lose a conversation. Deleting a cache entry deletes
+a snapshot, never a transcript; the worst case is that plank re-reads
+the conversation once.</p>
 <h2 id="resuming">Resuming</h2>
 <pre><code>/resume             # inside plank: the most recent, or a picker
 /resume dead        # by name prefix or list number</code></pre>

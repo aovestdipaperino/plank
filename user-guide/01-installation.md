@@ -80,7 +80,7 @@ Without a model file plank runs against a built-in echo engine. Every command, t
 |---|---|
 | `~/.plank/ds4flash.gguf` | default model location |
 | `~/.plank/ds4flash.dspark.gguf` | DSpark draft model, when `--dspark` is used |
-| `~/.plank/kvcache/` | saved sessions (`<name>.kv`) and their KV sidecars |
+| `~/.plank/kvcache/` | saved sessions (`<name>.kv`) plus the KV snapshots (`*.kv_raw`) and their metadata (`*.json`). Browse it with `/kvcache`. |
 | `~/.plank/settings.json` | global preferences |
 | `~/.plank/.mcp.json` | global MCP server config |
 | `~/.plank/hooks.json` | global hooks |

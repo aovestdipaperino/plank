@@ -17,7 +17,7 @@ Every command below works identically in the TUI and the plain REPL.
 | `/resume [prefix]` | resume a saved session; no argument picks the most recent, or shows a list |
 | `/del <id>` | delete a saved session |
 | `/tag <text>` | label the current session so it is recognizable in `/list` |
-| `/strip <id>` | trim a saved session's oldest turns to reclaim space |
+| `/strip <id>` | drop a saved session's KV payload to reclaim disk; the transcript survives and a later resume re-prefills it |
 | `/history` | reprint recent turns |
 | `/quit`, `/exit` | leave (the session is saved) |
 
@@ -86,6 +86,8 @@ See [Extending plank](09-extending.md).
 | Command | What it does |
 |---|---|
 | `/export [md\|html] [path]` | write the transcript to a shareable file (markdown by default, auto-named; HTML is standalone) |
+| `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
+| `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
 | `/insights [fast]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose) |
 | `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report |
 

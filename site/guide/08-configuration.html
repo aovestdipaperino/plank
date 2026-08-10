@@ -363,6 +363,48 @@ dropped along with all its tools.</td>
 </tr>
 </tbody>
 </table>
+<h3 id="kvcache"><code>kvcache</code></h3>
+<p>How long plank keeps the KV snapshots under
+<code>~/.plank/kvcache/</code>, and how much disk they may occupy in
+total. Ages are measured from a blob's last use, so a checkpoint you
+keep hitting never expires.</p>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>ttlSessionDays</code></td>
+<td>14</td>
+<td>days a session's KV payload survives after its last use. Expiring
+one costs a re-prefill of that conversation the next time you resume it,
+nothing more.</td>
+</tr>
+<tr>
+<td><code>ttlTierDays</code></td>
+<td>30</td>
+<td>days a system-prompt or project-context checkpoint survives after
+its last use. These are the expensive ones to rebuild, so they get the
+longer window.</td>
+</tr>
+<tr>
+<td><code>maxBytes</code></td>
+<td>21474836480 (20 GB)</td>
+<td>hard ceiling on the whole cache. Once the age-based pass is done,
+anything still over budget is evicted least-recently-used first.
+<code>0</code> means no ceiling.</td>
+</tr>
+</tbody>
+</table>
+<p>Three things always survive both passes: anything you have pinned in
+<code>/kvcache</code>, the chain the current launch is actually using,
+and any checkpoint that something newer still builds on. A budget is a
+target rather than a licence, so if everything left is protected plank
+stays over budget instead of deleting something it should not.</p>
 <h3 id="worktree"><code>worktree</code></h3>
 <table>
 <thead>

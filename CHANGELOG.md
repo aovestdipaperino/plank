@@ -8,9 +8,54 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/kvcache`** shows the KV cache as the tree it actually is. Every persisted
+  snapshot now carries a JSON metadata sidecar recording what it is, the
+  fingerprint of the snapshot it extends, the model and reasoning level behind
+  it, its size, its hit count, when it was last used, and whether it is pinned.
+  The pane draws that tree with `↑↓` to move, `←→` to fold, `p` to pin, `d` to
+  delete and `g` to sweep; the plain REPL prints the same tree and takes
+  `/kvcache pin|unpin|rm|gc` by fingerprint prefix.
+
+  The metadata is strictly advisory. The signature inside a snapshot's own body
+  remains the only thing that decides whether its bytes may be restored, so a
+  missing or corrupt sidecar costs display quality and never correctness.
+
 - **`/open [path]`** edits an existing file in the built-in editor: `Ctrl-S`
   saves, `Esc` discards. Bare `/open` reopens the last file a tool call
   edited this session. TUI-only, and it never creates a file.
+
+### Changed
+
+- **The KV cache expires on age and is capped on size**, instead of keeping
+  only the current fingerprints. The old garbage collector kept exactly the
+  live system-prompt and project checkpoints and deleted every sibling, so
+  switching model or reasoning level and back paid a full system-prompt
+  re-prefill each way. Snapshots now expire on time since last use
+  (`kvcache.ttlSessionDays`, default 14; `kvcache.ttlTierDays`, default 30),
+  and if the survivors still exceed `kvcache.maxBytes` (default 20 GB) the
+  least-recently-used are evicted until they fit. Pinned entries, the chain the
+  current launch is using, and any snapshot something newer still builds on are
+  exempt, and when everything remaining is protected plank stays over budget
+  rather than deleting something it should not. Several system prompts now
+  coexist for as long as they are all in use.
+
+- **Every KV body is now a `.kv_raw` file**, so `.kv` means "session
+  transcript" and nothing else. The two used to share an extension, which
+  forced the collector to filter by filename prefix to avoid eating a
+  transcript.
+
+- **`/strip`'s description was wrong** in the guide and is now correct: it drops
+  a session's KV payload to reclaim disk and leaves the transcript untouched.
+  It never trimmed turns.
+
+### Migration
+
+On the first launch after upgrading, plank deletes the old-format KV snapshots
+once and reports how much it reclaimed. **Session transcripts are not touched**,
+so every saved conversation still loads; each pays one re-prefill the next time
+you open it, and the shared system-prompt and project snapshots rebuild on
+demand. If your cache had grown large, expect that first launch to hand back
+most of it. The 20 GB ceiling then applies to what you rebuild afterwards.
 
 ### Fixed
 

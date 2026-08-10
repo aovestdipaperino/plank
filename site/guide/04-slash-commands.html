@@ -177,7 +177,8 @@ a list</td>
 </tr>
 <tr>
 <td><code>/strip &lt;id&gt;</code></td>
-<td>trim a saved session's oldest turns to reclaim space</td>
+<td>drop a saved session's KV payload to reclaim disk; the transcript
+survives and a later resume re-prefills it</td>
 </tr>
 <tr>
 <td><code>/history</code></td>
@@ -380,6 +381,16 @@ href="08-configuration.html">Configuration</a>.</p>
 <td><code>/export [md|html] [path]</code></td>
 <td>write the transcript to a shareable file (markdown by default,
 auto-named; HTML is standalone)</td>
+</tr>
+<tr>
+<td><code>/kvcache</code></td>
+<td>browse the KV cache as a tree: what each snapshot is, what it was
+built on, its size, how often it has been used, and when it expires</td>
+</tr>
+<tr>
+<td><code>/kvcache gc|pin|unpin|rm</code></td>
+<td>sweep expired entries now, or pin, unpin or delete one by
+fingerprint prefix</td>
 </tr>
 <tr>
 <td><code>/insights [fast]</code></td>

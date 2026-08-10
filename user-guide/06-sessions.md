@@ -4,7 +4,7 @@
 
 A session is the whole conversation: every message, the tasks, and — where the engine supports it — a snapshot of the model's internal KV state so returning to it does not mean re-reading it from scratch.
 
-Sessions live under `~/.plank/kvcache/` as `<name>.kv`, with a fingerprinted `<name>.payload` sidecar holding the engine state. A session id is a memorable `adjective-celebrity` name minted on first save (`deadly-einstein`), and titles derive from your first prompt, so `/list` is readable rather than a wall of hashes.
+Sessions live under `~/.plank/kvcache/` as `<name>.kv`, with a fingerprinted `<name>.kv_raw` sidecar holding the engine state and a small `<name>.json` describing it. A session id is a memorable `adjective-celebrity` name minted on first save (`deadly-einstein`), and titles derive from your first prompt, so `/list` is readable rather than a wall of hashes.
 
 ## Saving, listing, switching
 
@@ -17,7 +17,30 @@ Sessions save automatically; `/save` forces it.
 /del <id>           # delete
 ```
 
-`/strip <id>` trims a saved session's oldest turns when one has grown unwieldy but you want to keep the recent part.
+`/strip <id>` drops a session's KV payload to reclaim disk. The transcript survives untouched, so the session still loads; it just re-prefills the conversation the next time you open it, and `/list` shows it as `stripped`.
+
+## The KV cache
+
+`/kvcache` shows what is actually on disk, as the tree it really is. A system-prompt snapshot sits at the root, the project-context snapshots that extend it hang below, and each session's payload hangs below the project it belongs to. Every row carries its size, how many times it has been reused, when it was last touched, and whether it is about to expire.
+
+```
+system  a19f4c21  412 MB  📌 pinned
+│  max · 12 global MCP tools
+├─ project  7c02be90  88 MB  hits 41  2h ago
+│  │  ~/Code/plank · AGENTS.md · 2 local MCP
+│  ├─ session cheeky-bell   1.2 GB  hits 3   2h ago
+│  └─ session bouncy-dali   0.9 GB  hits 1   6d ago  ⏳ ttl 8d
+└─ project  4d81a7f3  61 MB  hits 2   9d ago
+   └─ (no sessions)
+
+total 2.6 GB · 0 B reclaimable
+```
+
+Move with `↑↓`, fold a subtree with `←→`, and act on the selected row: `p` pins it so no sweep will ever take it, `d` deletes it after a confirmation, `g` runs the sweep immediately. `Esc` closes. Piped into a non-interactive shell the same tree prints as plain text, and `/kvcache pin|unpin|rm|gc` do the same jobs by fingerprint prefix.
+
+Pinning is the thing worth knowing about. Snapshots expire on age (see [Configuration](08-configuration.md#kvcache)), and the largest ones are the most expensive to rebuild, so if you have a setup you return to every few weeks it is cheaper to pin it than to let it lapse and pay the re-prefill. A pinned entry is also exempt from the size ceiling.
+
+Nothing here can lose a conversation. Deleting a cache entry deletes a snapshot, never a transcript; the worst case is that plank re-reads the conversation once.
 
 ## Resuming
 

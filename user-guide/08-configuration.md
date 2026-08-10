@@ -92,6 +92,18 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `agents.autoRoute` | `true` | let the model pick a subagent definition on its own |
 | `agents.maxParallel` | 4 | how many subagents may run at once (capped at 16) |
 
+### `kvcache`
+
+How long plank keeps the KV snapshots under `~/.plank/kvcache/`, and how much disk they may occupy in total. Ages are measured from a blob's last use, so a checkpoint you keep hitting never expires.
+
+| Key | Default | What |
+|---|---|---|
+| `ttlSessionDays` | 14 | days a session's KV payload survives after its last use. Expiring one costs a re-prefill of that conversation the next time you resume it, nothing more. |
+| `ttlTierDays` | 30 | days a system-prompt or project-context checkpoint survives after its last use. These are the expensive ones to rebuild, so they get the longer window. |
+| `maxBytes` | 21474836480 (20 GB) | hard ceiling on the whole cache. Once the age-based pass is done, anything still over budget is evicted least-recently-used first. `0` means no ceiling. |
+
+Three things always survive both passes: anything you have pinned in `/kvcache`, the chain the current launch is actually using, and any checkpoint that something newer still builds on. A budget is a target rather than a licence, so if everything left is protected plank stays over budget instead of deleting something it should not.
+
 ### `worktree`
 
 | Key | Default | What |
