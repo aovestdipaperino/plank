@@ -490,6 +490,61 @@ impl BashJobs {
     }
 }
 
+/// How far a user's answer to the `~/.plank` write prompt reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlankHomeGrant {
+    /// "Allow": this command only; the session flag stays clear.
+    Once,
+    /// "Always allow": every sandboxed command for the rest of the session.
+    Session,
+    /// "Deny", declined, interrupted, or no interactive user at all.
+    Denied,
+}
+
+/// Asks whether a sandboxed command may write under `~/.plank`.
+///
+/// Routed through the [`Asker`](crate::tools::ask::Asker) each front end
+/// installs, so the TUI renders it in the input region and the plain REPL reads
+/// stdin — the same path the `ask` tool and the web approval gate use. In
+/// `--non-interactive` mode there is no asker and hence no one to grant: the
+/// answer is [`PlankHomeGrant::Denied`], leaving `~/.plank` read-only as it is
+/// by default.
+fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
+    let Some(asker) = ctx.asker.as_mut() else {
+        return PlankHomeGrant::Denied;
+    };
+    let req = crate::tools::ask::AskRequest {
+        question: "This command names ~/.plank. Allow it to write there?".to_string(),
+        header: "Sandbox".to_string(),
+        options: vec![
+            crate::tools::ask::AskOption {
+                label: "Allow".to_string(),
+                description: "Allow writes under ~/.plank for this command only".to_string(),
+            },
+            crate::tools::ask::AskOption {
+                label: "Always allow".to_string(),
+                description: "Allow writes under ~/.plank for the rest of this session".to_string(),
+            },
+            crate::tools::ask::AskOption {
+                label: "Deny".to_string(),
+                description: "Run the command with ~/.plank read-only".to_string(),
+            },
+        ],
+        multi: false,
+    };
+    match asker.ask(req) {
+        crate::tools::ask::AskOutcome::Answered(labels)
+            if labels.iter().any(|l| l == "Always allow") =>
+        {
+            PlankHomeGrant::Session
+        }
+        crate::tools::ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Allow") => {
+            PlankHomeGrant::Once
+        }
+        _ => PlankHomeGrant::Denied,
+    }
+}
+
 /// Implements the `bash` tool: start a job and wait up to `refresh_sec`.
 pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let cmd = call.arg_value("command").unwrap_or("");
@@ -504,7 +559,32 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         3600,
     ))
     .unwrap_or(60);
-    let sandbox = ctx.sandbox.should_sandbox(cmd).then_some(&ctx.sandbox);
+    // `~/.plank` is read-only under the sandbox unless the user says otherwise.
+    // Ask only when the command actually names it, so ordinary commands never
+    // see a prompt, and only while the session grant is still unset.
+    let mut grant_once = false;
+    if ctx.sandbox.should_sandbox(cmd)
+        && !ctx.sandbox.plank_home_writable
+        && crate::sandbox::mentions_plank_home(cmd)
+    {
+        match plank_home_grant(ctx) {
+            PlankHomeGrant::Session => ctx.sandbox.plank_home_writable = true,
+            PlankHomeGrant::Once => grant_once = true,
+            PlankHomeGrant::Denied => {
+                ctx.publish_status("~/.plank stays read-only for this command");
+            }
+        }
+    }
+    // A one-command grant rides on a throwaway copy of the policy, leaving the
+    // session's own `plank_home_writable` clear.
+    let once_policy = grant_once.then(|| crate::sandbox::Sandbox {
+        plank_home_writable: true,
+        ..ctx.sandbox.clone()
+    });
+    let sandbox = ctx
+        .sandbox
+        .should_sandbox(cmd)
+        .then(|| once_policy.as_ref().unwrap_or(&ctx.sandbox));
     if let Err(err) = ctx.bash.start(&ctx.cwd.clone(), cmd, timeout, sandbox) {
         return format!("Tool error: bash failed to start: {err}\n");
     }
