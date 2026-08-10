@@ -532,7 +532,17 @@ impl Settings {
     /// `defaults < plugins < ~/.plank < ./.plank`.
     #[must_use]
     pub fn load_with_plugins(plugin_paths: &[PathBuf]) -> Self {
-        Self::load_from_paths(plugin_paths, &Self::paths())
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let cwd = std::env::current_dir().unwrap_or_default();
+        Self::load_with_plugins_in(home.as_deref(), &cwd, plugin_paths)
+    }
+
+    /// Hermetic seam for [`load_with_plugins`](Self::load_with_plugins): takes
+    /// `home`/`cwd` explicitly instead of reading the environment, so tests can
+    /// exercise the real precedence composition without touching `HOME`.
+    #[must_use]
+    pub fn load_with_plugins_in(home: Option<&Path>, cwd: &Path, plugin_paths: &[PathBuf]) -> Self {
+        Self::load_from_paths(plugin_paths, &Self::paths_in(home, cwd))
     }
 
     /// Loads `~/.plank/settings.json` then `<cwd>/.plank/settings.json`.
@@ -544,13 +554,25 @@ impl Settings {
     /// The files [`load`](Self::load) consults, in increasing precedence.
     #[must_use]
     pub fn paths() -> Vec<PathBuf> {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        match std::env::current_dir() {
+            Ok(cwd) => Self::paths_in(home.as_deref(), &cwd),
+            Err(_) => home
+                .map(|home| home.join(".plank").join("settings.json"))
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    /// Hermetic seam for [`paths`](Self::paths): takes `home`/`cwd` explicitly
+    /// instead of reading the environment.
+    #[must_use]
+    pub fn paths_in(home: Option<&Path>, cwd: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        if let Some(home) = std::env::var_os("HOME") {
-            paths.push(PathBuf::from(home).join(".plank").join("settings.json"));
+        if let Some(home) = home {
+            paths.push(home.join(".plank").join("settings.json"));
         }
-        if let Ok(cwd) = std::env::current_dir() {
-            paths.push(cwd.join(".plank").join("settings.json"));
-        }
+        paths.push(cwd.join(".plank").join("settings.json"));
         paths
     }
 
@@ -1475,22 +1497,83 @@ mod tests {
     }
 
     #[test]
-    fn plugin_settings_lose_to_the_user_file() {
-        let dir = std::env::temp_dir().join(format!("plank-settings-{}", std::process::id()));
+    fn load_from_paths_lets_high_win_over_low() {
+        // This covers the primitive only: later slice wins. It does not by
+        // itself prove real-world plugin/user precedence — that guarantee
+        // lives in `load_with_plugins_in_never_lets_a_plugin_beat_the_user`.
+        let dir = std::env::temp_dir().join(format!("plank-settings-prim-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
-        let plugin = dir.join("plugin-settings.json");
-        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write");
+        let low = dir.join("low.json");
+        std::fs::write(&low, r#"{"kvcache":{"maxBytes":111}}"#).expect("write");
 
-        // The plugin value applies when nothing above it speaks.
-        let s = Settings::load_from_paths(std::slice::from_ref(&plugin), &[]);
+        let s = Settings::load_from_paths(std::slice::from_ref(&low), &[]);
         assert_eq!(s.kvcache.max_bytes, 111);
 
-        // A user file wins over it.
-        let user = dir.join("user-settings.json");
-        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write");
-        let s = Settings::load_from_paths(&[plugin], &[user]);
+        let high = dir.join("high.json");
+        std::fs::write(&high, r#"{"kvcache":{"maxBytes":222}}"#).expect("write");
+        let s = Settings::load_from_paths(&[low], &[high]);
         assert_eq!(s.kvcache.max_bytes, 222);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_with_plugins_in_never_lets_a_plugin_beat_the_user() {
+        // Exercises the composed loader `load_with_plugins_in`, not the raw
+        // `load_from_paths` primitive. A real user settings file lives under
+        // `home/.plank/settings.json`; a plugin settings file sets the same
+        // key to a different value. If the two arguments to `load_from_paths`
+        // inside `load_with_plugins_in` were ever swapped (i.e. it called
+        // `load_from_paths(&Self::paths_in(...), plugin_paths)` instead of
+        // `load_from_paths(plugin_paths, &Self::paths_in(...))`), the plugin
+        // path would land in the `high` slot and this assertion would flip to
+        // seeing the plugin's value (111) instead of the user's (222) — so
+        // this test fails under that swap.
+        let dir = std::env::temp_dir().join(format!("plank-settings-comp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        let user = home.join(".plank").join("settings.json");
+        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write user");
+
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write plugin");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(
+            s.kvcache.max_bytes, 222,
+            "the user's ~/.plank/settings.json must win over a plugin's setting"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_with_plugins_in_lets_the_later_plugin_win() {
+        // "plugin settings, in plugin load order, later winning" — two
+        // plugin-contributed files disagreeing on the same key, no user file
+        // in play at all.
+        let dir = std::env::temp_dir().join(format!("plank-settings-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+
+        let plugin_a = dir.join("plugin-a-settings.json");
+        std::fs::write(&plugin_a, r#"{"kvcache":{"maxBytes":111}}"#).expect("write a");
+        let plugin_b = dir.join("plugin-b-settings.json");
+        std::fs::write(&plugin_b, r#"{"kvcache":{"maxBytes":333}}"#).expect("write b");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin_a, plugin_b]);
+        assert_eq!(
+            s.kvcache.max_bytes, 333,
+            "the later plugin in load order must win over an earlier one"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
