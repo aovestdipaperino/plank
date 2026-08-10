@@ -283,7 +283,8 @@ fn wants_local_subagent() -> bool {
     let Ok(cwd) = std::env::current_dir() else {
         return false;
     };
-    plank::agents::load_default(&cwd)
+    plank::plugins::agents_with_plugins(&cwd, &plank::plugins::PluginSet::default())
+        .0
         .iter()
         .any(|d| matches!(d.engine, Some(plank::agents::AgentEngine::Local)))
 }

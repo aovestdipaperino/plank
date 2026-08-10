@@ -377,6 +377,62 @@ pub fn reconcile<T: Named + Clone>(
     (merged, warnings)
 }
 
+/// Loads one component out of every plugin in the set, tagging each entry
+/// with the plugin that supplied it.
+fn gather<T>(
+    set: &PluginSet,
+    plank: &str,
+    cc: &str,
+    load: impl Fn(&[PathBuf]) -> Vec<T>,
+) -> Vec<(String, T)> {
+    let mut out = Vec::new();
+    for plugin in &set.plugins {
+        let Some(root) = component_root(plugin, plank, cc) else {
+            continue;
+        };
+        for entry in load(&[root]) {
+            out.push((plugin.name.clone(), entry));
+        }
+    }
+    out
+}
+
+/// Skills from `~/.plank` and `./.plank`, plus every plugin's, namespaced per
+/// the collision rule. Returns the merged list and the collision warnings.
+#[must_use]
+pub fn skills_with_plugins(
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::skills::Skill>, Vec<String>) {
+    let local = crate::skills::load_default(cwd);
+    let plugin = gather(set, "skills", "skills", crate::skills::load_from);
+    reconcile(local, plugin)
+}
+
+/// Agent definitions from `~/.plank` and `./.plank`, plus every plugin's.
+#[must_use]
+pub fn agents_with_plugins(
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::agents::AgentDef>, Vec<String>) {
+    let local = crate::agents::load_default(cwd);
+    let plugin = gather(set, "agents", "agents", crate::agents::load_from);
+    reconcile(local, plugin)
+}
+
+/// Prompt templates from `~/.plank` and `./.plank`, plus every plugin's.
+/// A plugin may spell the directory `templates/` (plank) or `commands/`
+/// (Claude Code).
+#[must_use]
+pub fn templates_with_plugins(
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::templates::Template>, Vec<String>) {
+    let local = crate::templates::load_default(cwd);
+    let plugin = gather(set, "templates", "commands", crate::templates::load_from);
+    reconcile(local, plugin)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +696,94 @@ mod tests {
         write(&dir, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
         let p = load_plugin(&dir, Origin::UserScan).expect("loads");
         assert!(component_root(&p, "skills", "skills").is_none());
+    }
+
+    #[test]
+    fn a_plugin_skill_is_reachable_bare_and_namespaced() {
+        let base = scratch("plugin-skills");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: says hi\n---\nHello\n",
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (skills, warnings) = skills_with_plugins(&cwd, &set);
+        assert!(skills.iter().any(|s| s.name == "greet"));
+        assert!(skills.iter().any(|s| s.name == "demo:greet"));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a_project_skill_beats_a_plugin_skill_of_the_same_name() {
+        let base = scratch("skill-collision");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        write(
+            &cwd,
+            ".plank/skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: project version\n---\nProject\n",
+        );
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: plugin version\n---\nPlugin\n",
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (skills, warnings) = skills_with_plugins(&cwd, &set);
+        let unqualified = skills
+            .iter()
+            .find(|s| s.name == "greet")
+            .expect("bare exists");
+        assert_eq!(unqualified.description, "project version");
+        assert!(skills.iter().any(|s| s.name == "demo:greet"));
+        assert!(warnings.iter().any(|w| w.contains("demo:greet")));
+    }
+
+    #[test]
+    fn a_plugin_template_under_the_claude_code_commands_dir_loads() {
+        let base = scratch("plugin-commands");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".claude-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "commands/note.md",
+            "---\ndescription: a note\n---\nBody\n",
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (templates, _) = templates_with_plugins(&cwd, &set);
+        assert!(templates.iter().any(|t| t.name == "note"));
+        assert!(templates.iter().any(|t| t.name == "demo:note"));
+    }
+
+    #[test]
+    fn a_plugin_agent_is_reachable_namespaced() {
+        let base = scratch("plugin-agents");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "agents/scout.md",
+            "---\ndescription: scouts\n---\nBe a scout.\n",
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (agents, _) = agents_with_plugins(&cwd, &set);
+        assert!(agents.iter().any(|a| a.name == "demo:scout"));
     }
 }

@@ -100,6 +100,9 @@ pub struct ToolContext {
     pub recent_reads: Vec<PathBuf>,
     /// Command hooks (PreToolUse/PostToolUse/Stop) from hooks.json configs.
     pub hooks: crate::hooks::Hooks,
+    /// Plugins activated for this session, contributing skills, agents and
+    /// templates alongside the local ones.
+    pub plugins: crate::plugins::PluginSet,
     /// Seatbelt sandbox policy for model-initiated bash commands.
     pub sandbox: crate::sandbox::Sandbox,
     /// User-only warnings from non-blocking hook failures, drained by the UI
@@ -200,6 +203,7 @@ impl ToolContext {
             mcp: Vec::new(),
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
+            plugins: crate::plugins::PluginSet::default(),
             sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
             skills: Vec::new(),

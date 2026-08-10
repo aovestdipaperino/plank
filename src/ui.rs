@@ -9863,7 +9863,7 @@ fn new_agent(
     // select. Definitions are on-disk files, stable across a session, so they
     // belong inside the fingerprinted prefix — editing one correctly
     // invalidates `sysprompt.kv` rather than being silently ignored.
-    let agents = crate::agents::load_default(&tool_ctx.cwd);
+    let (agents, _) = crate::plugins::agents_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     // Publishes the names so the input line can colour `/subagent:<name>` by
     // whether the name resolves, three call layers below anything that holds
     // the definitions themselves.
@@ -9900,8 +9900,8 @@ fn new_agent(
     }
     let trusted_system_len = system.trusted_len;
     let system = system.text;
-    let skills = crate::skills::load_default(&tool_ctx.cwd);
-    let templates = crate::templates::load_default(&tool_ctx.cwd);
+    let (skills, _) = crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    let (templates, _) = crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     // The `skill` tool resolves names against the same set the slash command
     // uses; hand the dispatch context its own copy.
     tool_ctx.skills.clone_from(&skills);
