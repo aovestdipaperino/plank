@@ -93,6 +93,16 @@ See [Extending plank](09-extending.md).
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 
+## Editing a file
+
+| Command | What it does |
+|---|---|
+| `/open [path]` | edit an existing file in the built-in editor; with no path, reopens the last file a tool call edited this session |
+
+`/open` hands the terminal to the same editor `Ctrl-G` uses, with the file loaded: `Ctrl-S` saves, `Esc` discards. It is the fast way to fix up an edit the model just made — bare `/open` needs no path at all — or to look at a file without spending a turn on it.
+
+It edits, and only edits. A path that does not exist is refused rather than created, so a typo cannot leave an empty file behind, and so are directories, binary files, and anything over 32 MB. An untouched `Ctrl-S` writes nothing. Saving follows a symlink to the file it points at instead of replacing the link. TUI only; in the plain REPL the command is not available.
+
 ## Remote control
 
 | Command | Status |

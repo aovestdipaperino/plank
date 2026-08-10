@@ -83,6 +83,10 @@ Each supplies extra instructions that frame the subagent's turn. Dispatch one by
 
 The model can delegate on its own with the `agent` tool. Delegation is bounded at one level — a subagent cannot itself delegate — which keeps a runaway from spawning a tree.
 
+What comes back is the answer, not the deliberation: the report is stripped of the subagent's thinking before it enters your transcript, and the subagent is asked to state its conclusion once with the reason attached. Its reasoning is still there to read in the roster while it works.
+
+While agents are running, the TUI lists them in a roster below the status bar — one row each, with the task, the clock and the token spend, and `←` then `Enter` to read any agent's output in full. See [The agent roster](03-the-interface.md#the-agent-roster).
+
 When the subagent reports back, plank runs a turn on that report: delegated work comes back into the conversation and gets acted on, rather than sitting in the transcript until you type again.
 
 ### Giving a subagent its own worktree

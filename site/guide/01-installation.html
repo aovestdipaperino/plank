@@ -199,6 +199,11 @@ counters, plus a rotation of two hundred status messages.</li>
 there is nobody to answer the prompt, so plank exits with instructions
 rather than hanging your script.</li>
 </ul>
+<p>The DSpark draft checkpoint (~5.6 GB) follows the same path when
+<code>--dspark</code> asks for it: it resolves to
+<code>~/.plank/ds4flash.dspark.gguf</code> and is offered for download
+with the same prompt, resume and progress. See <a
+href="08-configuration.html#speculative-decoding">Configuration</a>.</p>
 <p>To use a model you already have somewhere else:</p>
 <pre class="sh"><code>plank -m ~/models/ds4flash.gguf</code></pre>
 <p>or set it permanently with <code>engine.model</code> in
@@ -220,6 +225,10 @@ it is what you will see if you launch on an unsupported platform.</p>
 <tr>
 <td><code>~/.plank/ds4flash.gguf</code></td>
 <td>default model location</td>
+</tr>
+<tr>
+<td><code>~/.plank/ds4flash.dspark.gguf</code></td>
+<td>DSpark draft model, when <code>--dspark</code> is used</td>
 </tr>
 <tr>
 <td><code>~/.plank/kvcache/</code></td>

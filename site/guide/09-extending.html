@@ -235,6 +235,16 @@ does not, so a typo shows up before you press Enter.</p>
 <p>The model can delegate on its own with the <code>agent</code> tool.
 Delegation is bounded at one level — a subagent cannot itself delegate —
 which keeps a runaway from spawning a tree.</p>
+<p>What comes back is the answer, not the deliberation: the report is
+stripped of the subagent's thinking before it enters your transcript,
+and the subagent is asked to state its conclusion once with the reason
+attached. Its reasoning is still there to read in the roster while it
+works.</p>
+<p>While agents are running, the TUI lists them in a roster below the
+status bar — one row each, with the task, the clock and the token spend,
+and <code>←</code> then <code>Enter</code> to read any agent's output in
+full. See <a href="03-the-interface.html#the-agent-roster">The agent
+roster</a>.</p>
 <p>When the subagent reports back, plank runs a turn on that report:
 delegated work comes back into the conversation and gets acted on,
 rather than sitting in the transcript until you type again.</p>

@@ -138,6 +138,10 @@ Also: `--provider` cannot be combined with `--remote` or the local backend selec
 - A remote client that needs to *drive* (not just mirror) currently needs the server started with `--control-allow`, because the local `/grant` approval is not wired into the UI yet.
 - A client whose unsent output exceeds `--control-queue-max` is evicted. A very slow link disconnecting mid-turn is that.
 
+## A hosted turn froze after the network dropped
+
+Wi-Fi off, a sleep, a NAT rebind: a silently dropped connection sends no reset, so the socket sits established and black-holed. plank no longer waits on it forever. Ninety seconds of silence is reported as a stalled stream rather than a hang, and the interrupt flag is polled on a clock rather than on arriving bytes, so `Ctrl-C` lands within a quarter second even against a dead socket. If an interrupt is not acknowledged within two seconds, a second `Ctrl-C` force-quits and the status bar says so.
+
 ## Ctrl-C is not stopping anything
 
 - During a turn, `Ctrl-C` and `Esc` both interrupt the generation.

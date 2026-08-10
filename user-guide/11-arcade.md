@@ -43,6 +43,7 @@ Leave the prompt idle and plank puts an ambient screen up. `ui.screensaverFace` 
 |---|---|
 | `matrix` | the falling glyphs — the default |
 | `starfield` | a perspective starfield rushing past the edges |
+| `minions` | two minions on a shore, waiting it out with you |
 | `random` | a fresh coin flip each time it opens |
 
 `ui.screensaver` says when: `1m` (the default), `2m`, `5m`, or `never`. Both cycle in `/config` rather than needing to be typed.

@@ -280,7 +280,8 @@ for untracked files</td>
 <td><code>screensaverFace</code></td>
 <td><code>matrix</code></td>
 <td>which screen it shows: <code>matrix</code>, <code>starfield</code>,
-or <code>random</code> for a coin flip each time</td>
+<code>minions</code>, or <code>random</code> for a coin flip each
+time</td>
 </tr>
 <tr>
 <td><code>easterEggs</code></td>
@@ -572,6 +573,44 @@ suspending</td>
 </tr>
 </tbody>
 </table>
+<h3 id="speculative-decoding">Speculative decoding</h3>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--dspark</code></td>
+<td>DSpark speculative decoding, off by default</td>
+</tr>
+<tr>
+<td><code>--dspark-confidence F</code></td>
+<td>pruning threshold, <code>0..1</code> (<code>0</code> forces fixed
+five-token blocks)</td>
+</tr>
+<tr>
+<td><code>--dspark-strict</code></td>
+<td>load the drafter but keep target-only decode, for comparisons</td>
+</tr>
+</tbody>
+</table>
+<p><code>--dspark</code> turns on DeepSeek's auxiliary draft checkpoint
+for V4 Flash: it proposes up to five tokens ahead and the main model
+verifies them, committing only the prefix it agrees with, so one
+verification pass can advance the stream by several tokens. The support
+model (~5.6 GB) needs no flag of its own — it resolves to
+<code>~/.plank/ds4flash.dspark.gguf</code> and is offered for download
+through the same resumable path as the main model, unless
+<code>--mtp</code> names one.</p>
+<p>Verification is argmax, so proposals are only used at
+<code>--temp 0</code>; sampled decoding ignores them. Whether it pays
+depends on the engine build, the quant and the machine: on an M5 Max it
+was a 0.71× <em>slowdown</em> until the Metal verifier was pipelined
+upstream, after which the same measurement read 1.19×. The peak rates in
+the exit message are the way to check on your own hardware.</p>
 <h3 id="advanced-engine-tuning">Advanced engine tuning</h3>
 <p><code>--mtp PATH</code>, <code>--mtp-draft N</code>,
 <code>--mtp-margin F</code> configure multi-token prediction with a

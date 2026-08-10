@@ -402,6 +402,33 @@ single self-contained file. It never touches the live session.</p>
 and uses the model only for prose it cannot replace — a failed or
 skipped model call costs the report its narrative, never its
 statistics.</p>
+<h2 id="editing-a-file">Editing a file</h2>
+<table>
+<thead>
+<tr>
+<th>Command</th>
+<th>What it does</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>/open [path]</code></td>
+<td>edit an existing file in the built-in editor; with no path, reopens
+the last file a tool call edited this session</td>
+</tr>
+</tbody>
+</table>
+<p><code>/open</code> hands the terminal to the same editor
+<code>Ctrl-G</code> uses, with the file loaded: <code>Ctrl-S</code>
+saves, <code>Esc</code> discards. It is the fast way to fix up an edit
+the model just made — bare <code>/open</code> needs no path at all — or
+to look at a file without spending a turn on it.</p>
+<p>It edits, and only edits. A path that does not exist is refused
+rather than created, so a typo cannot leave an empty file behind, and so
+are directories, binary files, and anything over 32 MB. An untouched
+<code>Ctrl-S</code> writes nothing. Saving follows a symlink to the file
+it points at instead of replacing the link. TUI only; in the plain REPL
+the command is not available.</p>
 <h2 id="remote-control">Remote control</h2>
 <table>
 <thead>

@@ -253,6 +253,11 @@ fork of Microsoft Edit, running in-process, no external dependency). Set
 <code>ui.builtinEditor</code> to <code>false</code> to shell out to
 <code>$EDITOR</code> instead. Either way, what you save comes back into
 the prompt; cancelling keeps what you typed.</p>
+<p>The same editor also edits files on disk:
+<strong><code>/open [path]</code></strong> takes over the terminal with
+the file loaded, <code>Ctrl-S</code> saves and <code>Esc</code>
+discards. See <a href="04-slash-commands.html#editing-a-file">Slash
+commands</a>.</p>
 <h3 id="during-a-turn">During a turn</h3>
 <table>
 <thead>
@@ -270,6 +275,10 @@ line)</td>
 <tr>
 <td><code>Esc</code></td>
 <td>interrupt the generation</td>
+</tr>
+<tr>
+<td><code>←</code> on an empty prompt</td>
+<td>step into the agent roster, when there is one</td>
 </tr>
 <tr>
 <td>mouse wheel / trackpad</td>
@@ -293,6 +302,32 @@ closes.</p>
 an option when the question is multi-select, <code>Enter</code> to
 answer, <code>Esc</code> to decline, and <code>Ctrl-C</code> to
 interrupt.</p>
+<h2 id="the-agent-roster">The agent roster</h2>
+<p>The moment anything is delegated — by you with
+<code>/subagent</code>, or by the model with the <code>agent</code> tool
+— a roster appears below the status bar: <code>main</code> first, then
+one row per run with a state bullet (<code>●</code> working,
+<code>○</code> finished), the agent's name, the task it was given on one
+line, and, flush right, how long it has been going and what it has spent
+in tokens.</p>
+<pre><code>● main
+● reviewer   check the diff on this branch          1m 12s  · 4.1k
+○ researcher find every caller of load_config()        48s  · 9.7k</code></pre>
+<p>A fan-out gets a row each, with its own output buffer, so concurrent
+agents never overwrite one another. <code>←</code> on an empty prompt
+steps into the roster, <code>←</code>/<code>→</code> walk the rows,
+<code>Enter</code> expands the selected agent's output over the
+transcript with its own scroll position, and <code>Esc</code> comes
+back.</p>
+<p>It is a live readout: it appears with the first agent and goes away
+with the last, staying put only while you are reading it, and
+<code>←</code> brings a finished roster back so a report you delegated
+is still reachable. The last eight runs are kept. The transcript itself
+gets only a one-line signpost, which is the point of delegating in the
+first place — see <a href="09-extending.html">Extending plank</a>.</p>
+<p>The plain REPL has no roster and prints subagent output inline
+instead; <code>--non-interactive</code> stays silent so its stdout
+protocol is not corrupted.</p>
 <h2 id="-file-completion"><code>@</code> file completion</h2>
 <p>Type <code>@</code> in the prompt and a fuzzy-completion popup offers
 file paths from the working tree; pick one and the path is spliced into
@@ -402,13 +437,21 @@ ignore it.</li>
 <li><code>ui.reducedMotion</code> collapses every animation — throbber,
 shimmer, pulse, flash, stall-fade — to a static fallback.</li>
 <li><code>ui.screensaver</code> sets how long the TUI must sit idle
-before a starfield screensaver takes the screen: <code>1m</code>,
-<code>2m</code>, <code>5m</code>, or <code>never</code>. Any key or
-mouse event dismisses it, and it never appears mid-turn or over a
-dialog.</li>
+before a screensaver takes the screen: <code>1m</code>, <code>2m</code>,
+<code>5m</code>, or <code>never</code>. Any key or mouse event dismisses
+it, and it never appears mid-turn or over a dialog.
+<code>ui.screensaverFace</code> picks which one — see <a
+href="11-arcade.html#the-screensaver">The arcade</a>.</li>
 <li><code>ui.crtOff</code> plays a CRT power-off animation of the final
 frame when you exit cleanly.</li>
 </ul>
+<p>Leaving prints the session's token totals and, per model, the fastest
+sustained rates it reached:</p>
+<pre><code>peak DeepSeek V4 Flash  prefill 167.1 tok/s  ·  generation 16.8 tok/s</code></pre>
+<p>Both figures are scoped to this session and never persisted — a peak
+from last week was a different engine build on a differently loaded
+machine. They are the quickest way to see what a flag like
+<code>--dspark</code> actually did on your hardware.</p>
 <h2 id="quieting-the-display">Quieting the display</h2>
 <p>Three settings control how much of the machinery you see. None of
 them change what the <em>model</em> receives:</p>

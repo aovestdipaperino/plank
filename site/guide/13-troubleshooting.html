@@ -331,6 +331,16 @@ yet.</li>
 <code>--control-queue-max</code> is evicted. A very slow link
 disconnecting mid-turn is that.</li>
 </ul>
+<h2 id="a-hosted-turn-froze-after-the-network-dropped">A hosted turn
+froze after the network dropped</h2>
+<p>Wi-Fi off, a sleep, a NAT rebind: a silently dropped connection sends
+no reset, so the socket sits established and black-holed. plank no
+longer waits on it forever. Ninety seconds of silence is reported as a
+stalled stream rather than a hang, and the interrupt flag is polled on a
+clock rather than on arriving bytes, so <code>Ctrl-C</code> lands within
+a quarter second even against a dead socket. If an interrupt is not
+acknowledged within two seconds, a second <code>Ctrl-C</code>
+force-quits and the status bar says so.</p>
 <h2 id="ctrl-c-is-not-stopping-anything">Ctrl-C is not stopping
 anything</h2>
 <ul>

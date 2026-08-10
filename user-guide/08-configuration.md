@@ -69,7 +69,7 @@ Changes write `./.plank/settings.json` and apply immediately.
 | `crtOff` | `true` | CRT power-off animation on clean TUI exit |
 | `reducedMotion` | `false` | collapse every animation to a static fallback |
 | `screensaver` | `1m` | idle delay before the screensaver: `1m`, `2m`, `5m`, `never` |
-| `screensaverFace` | `matrix` | which screen it shows: `matrix`, `starfield`, or `random` for a coin flip each time |
+| `screensaverFace` | `matrix` | which screen it shows: `matrix`, `starfield`, `minions`, or `random` for a coin flip each time |
 | `easterEggs` | `true` | whether the arcade commands exist at all |
 | `builtinEditor` | `true` | `Ctrl-G` uses the built-in editor; `false` shells out to `$EDITOR` |
 
@@ -161,6 +161,18 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--sandbox` / `--no-sandbox` | bash write sandbox (on by default on macOS) |
 | `--disable-btw-suspend` | queue an in-pass `/btw` at the next boundary instead of suspending |
 | `--mcp-config FILE` | local MCP config (default `./.mcp.json`) |
+
+### Speculative decoding
+
+| Flag | What |
+|---|---|
+| `--dspark` | DSpark speculative decoding, off by default |
+| `--dspark-confidence F` | pruning threshold, `0..1` (`0` forces fixed five-token blocks) |
+| `--dspark-strict` | load the drafter but keep target-only decode, for comparisons |
+
+`--dspark` turns on DeepSeek's auxiliary draft checkpoint for V4 Flash: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. The support model (~5.6 GB) needs no flag of its own — it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp` names one.
+
+Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it pays depends on the engine build, the quant and the machine: on an M5 Max it was a 0.71× *slowdown* until the Metal verifier was pipelined upstream, after which the same measurement read 1.19×. The peak rates in the exit message are the way to check on your own hardware.
 
 ### Advanced engine tuning
 
