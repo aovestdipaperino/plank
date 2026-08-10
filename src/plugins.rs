@@ -268,6 +268,115 @@ pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
     load_in(home.as_deref(), cwd, cli_dirs)
 }
 
+/// A contribution addressed by name — skills, agents and templates all are.
+/// Implemented here rather than in each module so the namespacing rule lives
+/// in exactly one place.
+pub trait Named {
+    /// The name the entry is currently addressed by.
+    fn name(&self) -> &str;
+    /// Renames the entry, used to apply the `<plugin>:<name>` alias.
+    fn set_name(&mut self, name: String);
+}
+
+impl Named for crate::skills::Skill {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+}
+
+impl Named for crate::agents::AgentDef {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+}
+
+impl Named for crate::templates::Template {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn set_name(&mut self, name: String) {
+        self.name = name;
+    }
+}
+
+/// The directory (or file) a plugin contributes for one component, preferring
+/// the plank spelling over the Claude Code one. `None` when neither exists.
+#[must_use]
+pub fn component_root(plugin: &Plugin, plank: &str, cc: &str) -> Option<PathBuf> {
+    let preferred = plugin.root.join(plank);
+    if preferred.exists() {
+        return Some(preferred);
+    }
+    let fallback = plugin.root.join(cc);
+    if fallback.exists() {
+        return Some(fallback);
+    }
+    None
+}
+
+/// Merges plugin-contributed entries into the user+project entries.
+///
+/// Every plugin entry is registered as `<plugin>:<name>`. It is registered a
+/// second time under the bare `<name>` only when no non-plugin entry and no
+/// other plugin claims that name. Returns the merged list and the collision
+/// warnings.
+#[must_use]
+pub fn reconcile<T: Named + Clone>(
+    local: Vec<T>,
+    plugin_entries: Vec<(String, T)>,
+) -> (Vec<T>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut merged = local;
+
+    // A bare name is contested when a non-plugin entry holds it, or when two
+    // plugins both offer it.
+    let mut claims: Vec<(String, Vec<String>)> = Vec::new();
+    for (plugin, entry) in &plugin_entries {
+        let key = entry.name().to_string();
+        match claims.iter_mut().find(|(n, _)| *n == key) {
+            Some((_, owners)) => owners.push(plugin.clone()),
+            None => claims.push((key, vec![plugin.clone()])),
+        }
+    }
+
+    for (plugin, entry) in plugin_entries {
+        let bare = entry.name().to_string();
+        let alias = format!("{plugin}:{bare}");
+        let owners = claims
+            .iter()
+            .find(|(n, _)| *n == bare)
+            .map(|(_, o)| o.clone())
+            .unwrap_or_default();
+        let taken_by_local = merged.iter().any(|e| e.name() == bare);
+
+        let mut aliased = entry.clone();
+        aliased.set_name(alias.clone());
+        merged.push(aliased);
+
+        if taken_by_local {
+            warnings.push(format!(
+                "'{bare}' is already defined outside plugins; plugin '{plugin}' contributes it as '{alias}'"
+            ));
+            continue;
+        }
+        if owners.len() > 1 {
+            warnings.push(format!(
+                "'{bare}' is contributed by plugins {}; use the namespaced names",
+                owners.join(", ")
+            ));
+            continue;
+        }
+        merged.push(entry);
+    }
+    (merged, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,5 +545,100 @@ mod tests {
         let set = load_in(Some(&home), &cwd, &[base.join("nope")]);
         assert!(set.plugins.is_empty());
         assert!(set.warnings.iter().any(|w| w.contains("nope")));
+    }
+
+    /// A minimal `Named` stand-in so reconciliation is tested without building
+    /// real skills or agents.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Item {
+        name: String,
+        from: &'static str,
+    }
+
+    impl Named for Item {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn set_name(&mut self, name: String) {
+            self.name = name;
+        }
+    }
+
+    fn item(name: &str, from: &'static str) -> Item {
+        Item {
+            name: name.to_string(),
+            from,
+        }
+    }
+
+    fn names(items: &[Item]) -> Vec<&str> {
+        items.iter().map(|i| i.name.as_str()).collect()
+    }
+
+    #[test]
+    fn an_uncontested_plugin_entry_gets_both_the_bare_name_and_the_alias() {
+        let (merged, warnings) =
+            reconcile(vec![], vec![("demo".to_string(), item("greet", "plugin"))]);
+        assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn a_user_entry_keeps_the_bare_name_and_the_plugin_keeps_only_the_alias() {
+        let (merged, warnings) = reconcile(
+            vec![item("greet", "user")],
+            vec![("demo".to_string(), item("greet", "plugin"))],
+        );
+        assert_eq!(names(&merged), vec!["greet", "demo:greet"]);
+        assert_eq!(
+            merged
+                .iter()
+                .find(|i| i.name == "greet")
+                .expect("present")
+                .from,
+            "user"
+        );
+        assert!(warnings.iter().any(|w| w.contains("demo:greet")));
+    }
+
+    #[test]
+    fn two_colliding_plugins_both_lose_the_bare_name() {
+        let (merged, warnings) = reconcile(
+            vec![],
+            vec![
+                ("alpha".to_string(), item("greet", "alpha")),
+                ("beta".to_string(), item("greet", "beta")),
+            ],
+        );
+        assert_eq!(names(&merged), vec!["alpha:greet", "beta:greet"]);
+        assert!(!merged.iter().any(|i| i.name == "greet"));
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("alpha") && w.contains("beta"))
+        );
+    }
+
+    #[test]
+    fn component_roots_prefer_the_plank_spelling() {
+        let dir = scratch("component-root").join("demo");
+        write(&dir, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(&dir, "commands/a.md", "x\n");
+        write(&dir, "templates/a.md", "x\n");
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        let root = component_root(&p, "templates", "commands").expect("some");
+        assert!(root.ends_with("templates"));
+        assert!(
+            p.warnings.is_empty(),
+            "shadowing is warned by the caller, not here"
+        );
+    }
+
+    #[test]
+    fn a_component_root_absent_in_both_spellings_is_none() {
+        let dir = scratch("no-component").join("demo");
+        write(&dir, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        assert!(component_root(&p, "skills", "skills").is_none());
     }
 }
