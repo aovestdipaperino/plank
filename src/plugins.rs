@@ -397,6 +397,26 @@ fn gather<T>(
     out
 }
 
+/// Skills from `<home>/.plank` and `<cwd>/.plank`, plus every plugin's,
+/// namespaced per the collision rule, given an explicit home directory.
+/// `home` is `None` when there is no home directory to overlay. Returns the
+/// merged list and the collision warnings.
+#[must_use]
+pub fn skills_in(
+    home: Option<&Path>,
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::skills::Skill>, Vec<String>) {
+    let mut roots = Vec::new();
+    if let Some(home) = home {
+        roots.push(home.join(".plank").join("skills"));
+    }
+    roots.push(cwd.join(".plank").join("skills"));
+    let local = crate::skills::load_from(&roots);
+    let plugin = gather(set, "skills", "skills", crate::skills::load_from);
+    reconcile(local, plugin)
+}
+
 /// Skills from `~/.plank` and `./.plank`, plus every plugin's, namespaced per
 /// the collision rule. Returns the merged list and the collision warnings.
 #[must_use]
@@ -404,8 +424,26 @@ pub fn skills_with_plugins(
     cwd: &Path,
     set: &PluginSet,
 ) -> (Vec<crate::skills::Skill>, Vec<String>) {
-    let local = crate::skills::load_default(cwd);
-    let plugin = gather(set, "skills", "skills", crate::skills::load_from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    skills_in(home.as_deref(), cwd, set)
+}
+
+/// Agent definitions from `<home>/.plank` and `<cwd>/.plank`, plus every
+/// plugin's, given an explicit home directory. `home` is `None` when there is
+/// no home directory to overlay.
+#[must_use]
+pub fn agents_in(
+    home: Option<&Path>,
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::agents::AgentDef>, Vec<String>) {
+    let mut roots = Vec::new();
+    if let Some(home) = home {
+        roots.push(home.join(".plank").join("agents"));
+    }
+    roots.push(cwd.join(".plank").join("agents"));
+    let local = crate::agents::load_from(&roots);
+    let plugin = gather(set, "agents", "agents", crate::agents::load_from);
     reconcile(local, plugin)
 }
 
@@ -415,8 +453,28 @@ pub fn agents_with_plugins(
     cwd: &Path,
     set: &PluginSet,
 ) -> (Vec<crate::agents::AgentDef>, Vec<String>) {
-    let local = crate::agents::load_default(cwd);
-    let plugin = gather(set, "agents", "agents", crate::agents::load_from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    agents_in(home.as_deref(), cwd, set)
+}
+
+/// Prompt templates from `<home>/.plank` and `<cwd>/.plank`, plus every
+/// plugin's, given an explicit home directory. `home` is `None` when there is
+/// no home directory to overlay. A plugin may spell the directory
+/// `templates/` (plank) or `commands/` (Claude Code); the local half is
+/// always `templates/`.
+#[must_use]
+pub fn templates_in(
+    home: Option<&Path>,
+    cwd: &Path,
+    set: &PluginSet,
+) -> (Vec<crate::templates::Template>, Vec<String>) {
+    let mut roots = Vec::new();
+    if let Some(home) = home {
+        roots.push(home.join(".plank").join("templates"));
+    }
+    roots.push(cwd.join(".plank").join("templates"));
+    let local = crate::templates::load_from(&roots);
+    let plugin = gather(set, "templates", "commands", crate::templates::load_from);
     reconcile(local, plugin)
 }
 
@@ -428,9 +486,8 @@ pub fn templates_with_plugins(
     cwd: &Path,
     set: &PluginSet,
 ) -> (Vec<crate::templates::Template>, Vec<String>) {
-    let local = crate::templates::load_default(cwd);
-    let plugin = gather(set, "templates", "commands", crate::templates::load_from);
-    reconcile(local, plugin)
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    templates_in(home.as_deref(), cwd, set)
 }
 
 #[cfg(test)]
@@ -713,7 +770,7 @@ mod tests {
             "---\nname: greet\ndescription: says hi\n---\nHello\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (skills, warnings) = skills_with_plugins(&cwd, &set);
+        let (skills, warnings) = skills_in(Some(&home), &cwd, &set);
         assert!(skills.iter().any(|s| s.name == "greet"));
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
         assert!(warnings.is_empty());
@@ -738,7 +795,7 @@ mod tests {
             "---\nname: greet\ndescription: plugin version\n---\nPlugin\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (skills, warnings) = skills_with_plugins(&cwd, &set);
+        let (skills, warnings) = skills_in(Some(&home), &cwd, &set);
         let unqualified = skills
             .iter()
             .find(|s| s.name == "greet")
@@ -763,7 +820,7 @@ mod tests {
             "---\ndescription: a note\n---\nBody\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (templates, _) = templates_with_plugins(&cwd, &set);
+        let (templates, _) = templates_in(Some(&home), &cwd, &set);
         assert!(templates.iter().any(|t| t.name == "note"));
         assert!(templates.iter().any(|t| t.name == "demo:note"));
     }
@@ -783,7 +840,7 @@ mod tests {
             "---\ndescription: scouts\n---\nBe a scout.\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (agents, _) = agents_with_plugins(&cwd, &set);
+        let (agents, _) = agents_in(Some(&home), &cwd, &set);
         assert!(agents.iter().any(|a| a.name == "demo:scout"));
     }
 }
