@@ -203,17 +203,16 @@ fn subdirs(root: &Path) -> Vec<PathBuf> {
     dirs
 }
 
-/// Loads every activated plugin: `~/.plank/plugins/dev/*`, then
-/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given.
-/// A later source replaces an earlier plugin of the same name.
+/// Loads every activated plugin given an explicit home directory: scans
+/// `<home>/.plank/plugins/dev/*`, then `<cwd>/.plank/plugins/*`, then each
+/// `--plugin-dir` in the order given. A later source replaces an earlier
+/// plugin of the same name. `home` is `None` when there is no home directory
+/// to scan, in which case the user-scan source contributes nothing.
 #[must_use]
-pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
+pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
     let mut candidates: Vec<(PathBuf, Origin)> = Vec::new();
-    if let Some(home) = std::env::var_os("HOME") {
-        let root = PathBuf::from(home)
-            .join(".plank")
-            .join("plugins")
-            .join("dev");
+    if let Some(home) = home {
+        let root = home.join(".plank").join("plugins").join("dev");
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
     }
     let project = cwd.join(".plank").join("plugins");
@@ -258,6 +257,15 @@ pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
         }
     }
     set
+}
+
+/// Loads every activated plugin: `~/.plank/plugins/dev/*`, then
+/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given.
+/// A later source replaces an earlier plugin of the same name.
+#[must_use]
+pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    load_in(home.as_deref(), cwd, cli_dirs)
 }
 
 #[cfg(test)]
@@ -352,13 +360,15 @@ mod tests {
     #[test]
     fn project_plugins_load_and_carry_their_origin() {
         let base = scratch("project-scan");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
         let cwd = base.join("proj");
         write(
             &cwd,
             ".plank/plugins/alpha/.plank-plugin/plugin.json",
             r#"{"name":"alpha"}"#,
         );
-        let set = load_default(&cwd, &[]);
+        let set = load_in(Some(&home), &cwd, &[]);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].name, "alpha");
         assert_eq!(set.plugins[0].origin, Origin::ProjectScan);
@@ -367,6 +377,8 @@ mod tests {
     #[test]
     fn a_cli_dir_shadows_an_auto_scanned_plugin_of_the_same_name() {
         let base = scratch("cli-shadow");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
         let cwd = base.join("proj");
         write(
             &cwd,
@@ -379,7 +391,7 @@ mod tests {
             ".plank-plugin/plugin.json",
             r#"{"name":"alpha","version":"cli"}"#,
         );
-        let set = load_default(&cwd, &[cli]);
+        let set = load_in(Some(&home), &cwd, &[cli]);
         assert_eq!(set.plugins.len(), 1);
         assert_eq!(set.plugins[0].version, "cli");
         assert_eq!(set.plugins[0].origin, Origin::CliDir);
@@ -389,18 +401,39 @@ mod tests {
     #[test]
     fn the_same_directory_named_twice_loads_once() {
         let base = scratch("dedup");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
         let cwd = base.join("proj");
         let cli = base.join("alpha");
         write(&cli, ".plank-plugin/plugin.json", r#"{"name":"alpha"}"#);
-        let set = load_default(&cwd, &[cli.clone(), cli]);
+        let set = load_in(Some(&home), &cwd, &[cli.clone(), cli]);
         assert_eq!(set.plugins.len(), 1);
+    }
+
+    #[test]
+    fn user_scanned_plugins_load_first_with_the_right_origin() {
+        let base = scratch("user-scan");
+        let home = base.join("home");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        write(
+            &home,
+            ".plank/plugins/dev/alpha/.plank-plugin/plugin.json",
+            r#"{"name":"alpha"}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[]);
+        assert_eq!(set.plugins.len(), 1);
+        assert_eq!(set.plugins[0].name, "alpha");
+        assert_eq!(set.plugins[0].origin, Origin::UserScan);
     }
 
     #[test]
     fn a_missing_cli_dir_warns_without_failing_the_set() {
         let base = scratch("missing-cli");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
         let cwd = base.join("proj");
-        let set = load_default(&cwd, &[base.join("nope")]);
+        let set = load_in(Some(&home), &cwd, &[base.join("nope")]);
         assert!(set.plugins.is_empty());
         assert!(set.warnings.iter().any(|w| w.contains("nope")));
     }
