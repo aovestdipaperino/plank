@@ -3841,7 +3841,29 @@ the original is frozen and listed in /tree"
             id: self.session.id.clone(),
             fp: self.payload_fingerprint_for(&self.session),
         };
-        match self.store.kv_store(&key, &cache) {
+        // Tier 4 hangs off the deepest *cacheable* tier of this launch — Tier 2
+        // when the project has stable context, Tier 1 otherwise — so a session
+        // is never an orphan in the `/kvcache` tree. Tier 3 is deliberately not
+        // a candidate: it is never checkpointed, so naming it would point at a
+        // node that has no blob.
+        let tiers = self.kv_tiers();
+        let parent = tiers
+            .iter()
+            .find(|t| t.kind == crate::kvtier::TierKind::ProjectStable)
+            .or_else(|| {
+                tiers
+                    .iter()
+                    .find(|t| t.kind == crate::kvtier::TierKind::System)
+            })
+            .map(|t| t.fingerprint.as_str());
+        let label = crate::kvmeta::KvLabel::Session {
+            name: self.session.id.clone(),
+            title: self.session.title.clone(),
+        };
+        match self
+            .store
+            .kv_store_labeled(&key, &cache, parent, &self.engine.model_name(), &label)
+        {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
                 crate::session::to_mb(self.store.payload_bytes(&self.session.id))
@@ -6519,6 +6541,37 @@ impl Agent<'_> {
         )
     }
 
+    /// Display material for the KV metadata sidecars. Cosmetic only — nothing
+    /// here is key material, so a wrong value can never invalidate a cache.
+    ///
+    /// The MCP names mirror the tier split [`kv_tiers_for`](Self::kv_tiers_for)
+    /// keys on: global servers belong to Tier 1, project-local ones to Tier 2.
+    /// The `AGENTS.md`/`CLAUDE.md` paths are recovered from the `# From:`
+    /// markers `context::ContextContent` writes into the discovered text —
+    /// discovery keeps only the concatenated content, and adding a path list to
+    /// it would touch the value that hashes into Tier 2.
+    fn tier_labels(&self) -> crate::kvtier::TierLabels {
+        let agents_files = self
+            .context_content
+            .agents_md_content
+            .as_deref()
+            .map(|text| {
+                text.lines()
+                    .filter_map(|l| l.strip_prefix("# From: "))
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        crate::kvtier::TierLabels {
+            think_mode: self.think.name().to_owned(),
+            trusted_len: self.trusted_system_len,
+            global_mcp: crate::tools::mcp::global_eligible_names(None),
+            project_path: self.tool_ctx.cwd.display().to_string(),
+            agents_files,
+            local_mcp: crate::tools::mcp::local_server_names(None),
+        }
+    }
+
     /// Drops superseded Tier 2 checkpoints for this project once the current
     /// one is known good; they can never be read again and are large.
     ///
@@ -6583,12 +6636,14 @@ impl Agent<'_> {
         // that emits no events, so without this the indicator would never
         // appear in the common (checkpoint present) case.
         on_progress();
+        let labels = self.tier_labels();
         let _ = crate::kvtier::warm(
             &mut *self.engine,
             Some(&self.store),
             &tiers,
             &mut |_| on_progress(),
             &mut |_| {},
+            &labels,
         );
     }
 
@@ -6621,6 +6676,7 @@ impl Agent<'_> {
             return;
         };
         let tiers = self.kv_tiers_for(&engine.model_name());
+        let labels = self.tier_labels();
         if let Some(system) = tiers
             .first()
             .filter(|t| t.kind == crate::kvtier::TierKind::System)
@@ -6631,6 +6687,7 @@ impl Agent<'_> {
                 std::slice::from_ref(system),
                 on_event,
                 on_stage,
+                &labels,
             );
             // Set even on failure: the on-demand restore would fail the same
             // way, and retrying it per dispatch buys nothing.
@@ -6651,6 +6708,7 @@ impl Agent<'_> {
         // and event callbacks both need it and only one of them may hold the
         // terminal mutably; the stage callback only records the label, and the
         // prefill events that follow immediately paint it.
+        let labels = self.tier_labels();
         let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         crate::kvtier::warm(
             &mut *self.engine,
@@ -6670,6 +6728,7 @@ impl Agent<'_> {
                 EngineEvent::Text(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
+            &labels,
         )
         .map_err(|e| e.to_string())?;
         // The sub-agent's local engine gets the same treatment on the same
@@ -6716,6 +6775,7 @@ impl Agent<'_> {
         // Which tier is prefilling, and the label last printed for it: each
         // stage announces itself once, so the note names the work actually
         // running rather than always the system prompt.
+        let labels = self.tier_labels();
         let stage = std::cell::Cell::new(crate::kvtier::TierKind::System.warm_label());
         let mut shown: Option<&'static str> = None;
         let mut announced = 0usize;
@@ -6756,6 +6816,7 @@ impl Agent<'_> {
                 EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
+            &labels,
         )
         .map_err(|e| e.to_string())?;
         // Erase the transient "Updating…" note. Only when a single stage
