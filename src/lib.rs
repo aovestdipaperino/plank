@@ -59,6 +59,7 @@ pub mod notify;
 #[cfg(feature = "use_obscura")]
 pub mod obscura_web;
 pub mod openfile;
+pub mod plugins;
 pub mod remote;
 pub mod render;
 pub mod repro;
