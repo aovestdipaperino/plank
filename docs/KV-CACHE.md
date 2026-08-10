@@ -20,7 +20,7 @@ Do not confuse them; almost every bug in this area came from doing so.
 
 | | **Live KV** | **Checkpoint** |
 |---|---|---|
-| Where | in the engine (C session, GPU/unified memory) | a file under `~/.plank/kvcache/` |
+| Where | in the engine (C session, GPU/unified memory) | a `.kv_raw` file under `~/.plank/kvcache/`, with a `.json` sidecar beside it |
 | Lifetime | one process | across launches and across sessions |
 | Written by | every `generate` | `warm`, and session save |
 | Trusted because | it was built by this process | its signature matches what the caller expects |
@@ -71,10 +71,10 @@ extension checkpoint of the one above it. `kvtier::plan` builds the list;
 
 | Tier | Content | Key | Storage |
 |---|---|---|---|
-| 1 | system prompt, global MCP tool defs, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv`, model-global |
-| 2 | project-stable context: `AGENTS.md`/`CLAUDE.md`, memory, local MCP tool defs | `fp2 = tier(fp1, stable ‖ local defs)` | `<project-key>/project-<fp2>.kv` |
+| 1 | system prompt, global MCP tool defs, sub-agent roster | `fp1 = sha1(model ‖ think ‖ trusted_len ‖ system)` | `sysprompt-<fp1>.kv_raw`, model-global |
+| 2 | project-stable context: `AGENTS.md`/`CLAUDE.md`, memory, local MCP tool defs | `fp2 = tier(fp1, stable ‖ local defs)` | `<project-key>/project-<fp2>.kv_raw` |
 | 3 | session-volatile: git status, date, hook output | — | never cached |
-| 4 | conversation turns | `tier(fp2, transcript)` | `<session>.payload` |
+| 4 | conversation turns | `tier(fp2, transcript)` | `<session>.kv_raw` |
 
 Each fingerprint **chains its parent's**, which is what makes the walk sound:
 a deep tier matching proves every ancestor matches, so the walk can restore the
@@ -147,6 +147,29 @@ matters for any consumer that needs Tier 1 *alone* — see the sub-agent section
 
 ## Layer 4: on-disk format
 
+Every blob body is a `.kv_raw` file, and every body has a sibling `.json`
+sidecar holding its metadata. The `.kv` extension means **session transcript**
+and nothing else:
+
+```
+~/.plank/kvcache/
+  sysprompt-a19f….kv_raw
+  sysprompt-a19f….json
+  <projkey>/
+    project-7c02….kv_raw
+    project-7c02….json
+  cheeky-bell.kv          # transcript
+  cheeky-bell.kv_raw      # KV payload
+  cheeky-bell.json        # metadata
+```
+
+Paths keep their tier-derived names, so this is a sidecar addition rather than a
+content-addressed re-layout. Both files of a pair are created together and swept
+together; a body without its sidecar is legal and simply displays with
+synthesized defaults.
+
+### The body
+
 One writer, one reader: `KVCache::persist` and `KVCache::from_file`.
 
 ```
@@ -169,9 +192,63 @@ instead". No other code in plank makes a trust decision about cached bytes.
 Writes go through a temp file and rename, so an interrupted write cannot leave a
 half-checkpoint that reads as valid.
 
+### The metadata sidecar
+
+`kvmeta.rs` owns the sidecar: one `KvMeta` per body, serialized as JSON.
+
+```json
+{
+  "version": 1,
+  "role": "system" | "project" | "session",
+  "fingerprint": "a19f…",
+  "parent": "7c02…",
+  "model": "…",
+  "created": 1770000000,
+  "last_used": 1770000000,
+  "hits": 41,
+  "bytes": 92274688,
+  "pinned": false,
+  "label": { }
+}
+```
+
+`parent` is `null` for a system blob and a fingerprint string otherwise, which is
+what lets `kvtree.rs` reassemble the tier chain that the warm walk builds in
+memory and then forgets. `created` and `last_used` are Unix seconds, `hits`
+counts successful loads, and `bytes` caches the body's size so rendering the tree
+does not stat every blob. `version` is this schema's own counter, deliberately
+independent of `kvcache::FORMAT_VERSION`: a schema change must not invalidate
+blobs, so a sidecar whose version does not match `META_VERSION` is ignored rather
+than migrated.
+
+`label` is role-specific and exists purely to make the tree readable:
+
+- `system`: `think_mode`, `trusted_len`, `global_mcp` (server names)
+- `project`: `project_path`, `agents_files`, `local_mcp` (server names)
+- `session`: `name`, `title`
+- `unknown`: nothing recorded, the shape a synthesized sidecar takes
+
+That split is also the audit surface for MCP segregation. Global tool defs are
+Tier 1 material and local ones Tier 2, so a global server name may appear only on
+a `system` label and a local one only on a `project` label. Before the split the
+property was a claim in a document; now a test can read it off the labels
+(`a_local_mcp_name_never_reaches_a_system_label`).
+
+**The trust invariant: metadata is advisory.** The signature inside the body is
+the only trust input for restoring cached bytes, and `KVCache::decode` is the
+only place that decides. A missing, corrupt, or disagreeing sidecar degrades the
+display and resets some counters; it can never invalidate a good blob and never
+validate a bad one. Sidecar parse failure is swallowed into a synthesized
+default, and sidecar writes are best-effort because a lost counter update is not
+worth failing a persist over. This is the property a future change is most likely
+to break: the moment anything reads a sidecar field to decide whether a body may
+be loaded, a hand-edited or stale JSON file becomes able to feed the model a KV
+built from a different prompt. `a_corrupt_sidecar_never_blocks_a_good_blob` pins
+it.
+
 ## Layer 5: session payloads
 
-A saved session carries its KV as a `<id>.payload` sidecar, keyed differently
+A saved session carries its KV as a `<id>.kv_raw` blob, keyed differently
 from the tiers: the file is named after the session id, which is stable across
 resaves, but it is only trusted when its stored signature equals
 `payload_fingerprint(model, think, trusted_len, system, transcript_render)`.
@@ -216,7 +293,7 @@ Restoring Tier 2 would seed its KV with tokens its prompt does not contain.
 
 So the alt engine is warmed at startup with a tier list of **one**. With nothing
 deeper to short-circuit it, Tier 1 is prefilled and written — which is also what
-makes `sysprompt-*.kv` exist at all on a machine whose Tier 2 has been valid for
+makes `sysprompt-*.kv_raw` exist at all on a machine whose Tier 2 has been valid for
 months.
 
 Two configuration requirements, both silent when missed:
@@ -234,19 +311,96 @@ Two configuration requirements, both silent when missed:
 ## Garbage collection
 
 Checkpoints run to hundreds of megabytes, and a plank upgrade, an MCP server
-added or removed, or a model switch orphans one permanently. GC is **by
-fingerprint, not by mtime** — the current revision is the only one any future
-launch can hit.
+added or removed, or a model switch forks a new one while the old one keeps its
+file. Retention used to be "keep the current fingerprint, delete every sibling",
+which meant switching model or reasoning level back and forth paid a full Tier 1
+re-prefill each way. It is now **value-based**: a blob lives while it is pinned,
+in use, holding something up, or simply young enough. `kvgc.rs` owns the policy,
+`SessionStore::sweep` executes it, and a best-effort sweep runs at startup.
 
-`gc_system_checkpoints` takes a **set** of fingerprints to keep, because a
-session can hold more than one engine and each has its own Tier 1. Passing only
-the main engine's deletes the other's on every launch; under a provider main
-agent it deletes *every* checkpoint in the directory, since the provider's own
-fingerprint never has a file and so nothing matches the keep.
+The sweep is two phases, both pure functions of (nodes, active fingerprints,
+policy, now).
+
+**Phase 1, per node, first match wins:**
+
+1. `pinned`: keep.
+2. In the tier chain this launch is using: keep, and touch `last_used`.
+3. Has a surviving child: keep. An expired system prompt with a live session
+   below it stays.
+4. `now - last_used >= ttl(role)`: delete the `.kv_raw` and its `.json`.
+
+Otherwise keep. The comparison is `>=` rather than `>` so that a TTL of zero
+means "collect on sight" instead of being a silent no-op.
+
+Rule 3 reads the node set as it stood **before** the sweep began, not one
+mutating as files are unlinked, which is what makes the outcome independent of
+directory scan order. The cost is that a parent whose last child died this run
+needs one more run to go, so a dead chain collects one level per launch. That
+bottom-up cascade is the intended behaviour, not a defect.
+
+**Phase 2, the budget pass**, runs only once phase 1's verdicts are fully
+determined. If the survivors still total more than `kvcache.maxBytes`, they are
+evicted in a globally sorted order (ascending `last_used`, ties broken by
+fingerprint), skipping pinned nodes, nodes in the active chain, and nodes with a
+child that survived phase 1, stopping as soon as the total is under budget.
+Sorting before evicting is what keeps this order-independent. Note that phase 2
+re-derives "has a surviving child" against the *post*-phase-1 survivors, the
+opposite of phase 1: a parent whose only child just expired must become evictable
+rather than immortal under any budget.
+
+Settings, read from `settings.json`:
+
+| key | default | meaning |
+|---|---|---|
+| `kvcache.ttlSessionDays` | 14 | idle days a session payload survives |
+| `kvcache.ttlTierDays` | 30 | idle days a system or project checkpoint survives |
+| `kvcache.maxBytes` | 21474836480 (20 GB) | ceiling for the budget pass; `0` disables it |
+
+`maxBytes = 0` means **unbounded**, never "evict everything". The inverse
+reading would wipe the cache on every launch for anyone who never set the key.
+The ceiling is also a target rather than a licence: a cache of nothing but pinned
+and active blobs stays over budget, and the footer says so.
+
+A verdict maps to a **path**, not to a fingerprint. Two bodies can legitimately
+carry the same fingerprint (a root `sysprompt-X.kv_raw` beside a
+`<projkey>/project-X.kv_raw`, or the same `project-X` under two project
+directories), so a fingerprint-keyed delete could unlink a file the sweep had
+decided to keep.
 
 Version transitions (`upgrade.rs`) deliberately do **not** drop KV caches: they
-self-validate by fingerprint and format version. Only the image cache, which has
-no such guard, is dropped on a major bump.
+self-validate by signature and format version. Only the image cache, which has no
+such guard, is dropped on a major bump.
+
+### One-shot migration to the sidecar layout
+
+The pre-sidecar layout is wiped rather than adopted, once, by
+`SessionStore::migrate_legacy_blobs`, which `main.rs` calls before any terminal
+setup and which is guarded by a `.kvformat-2` marker in the cache directory.
+Synthesized metadata would carry no lineage and unreliable counters, and every
+tier rebuilds on demand, so adopting the old files would buy nothing. Deleted:
+`sysprompt-*.kv`, `<projkey>/project-*.kv`, `*.payload`, the legacy bare
+`sysprompt.kv`, and `sysprompt-last.prompt`. **Every `<id>.kv` transcript is
+preserved**, so resuming a session across the migration works exactly as before
+and pays one re-prefill. The reclaimed byte count is reported once, on that first
+launch.
+
+### Browsing the cache: `/kvcache`
+
+`kvtree.rs` groups the sidecars into a forest by `parent`, and `kvpane.rs` turns
+that forest into rows, selection and key handling. A node naming a parent with no
+file on disk renders under an `(orphaned)` heading rather than disappearing: a
+blob you cannot see is a blob you cannot delete, and those are exactly the ones
+worth deleting.
+
+In the TUI, `/kvcache` opens a centered modal: `↑↓` move, `←→` fold, `p` pin, `d`
+delete (with a `y` confirmation), `g` sweep now, `Esc` close. The plain-stdout
+REPL has no pane, so it prints the same tree statically and takes
+`/kvcache pin|unpin|rm|gc` subcommands. Both front ends read the same rows, per
+the two-parallel-paths rule in `CLAUDE.md`.
+
+Collapse and pin act on fingerprints, so the two same-fingerprint bodies
+described above fold and pin as one. That is fail-safe by design: a delete
+targeting such a node is refused as ambiguous rather than guessing a path.
 
 ## Diagnosing a miss
 

@@ -1243,3 +1243,66 @@ test` and review the diff before committing.
   available width too (`TASK_MAX_COLS`): sized only by "whatever room is left",
   prose runs to the edge on a wide terminal and buries the name and the tally
   the row exists to show.
+- **`.kv` used to mean two different things, and the GC paid for it.** The
+  extension named both a session transcript and a Tier 1 checkpoint, so
+  `gc_system_checkpoints` had to hand-filter file names by the `sysprompt-`
+  prefix to avoid eating user data. Any new species of cache file inherited the
+  same obligation, and one forgotten prefix check would delete transcripts.
+  Bodies are now `<stem>.kv_raw` with a `<stem>.json` sidecar, transcripts alone
+  keep `.kv`, and the sweep can walk by extension with nothing to hand-filter.
+  The rename is also why the migration wipes rather than adopts the old layout:
+  synthesized metadata would carry no lineage and unreliable counters, and every
+  tier rebuilds on demand.
+- **Metadata beside a KV blob has to stay advisory, or the cache stops being
+  safe.** The signature inside the body (`KVCache::decode`) is the only trust
+  input for restoring cached bytes; the sidecar exists for display, counters and
+  retention. A missing or corrupt sidecar therefore costs a nicer `/kvcache` row
+  and some counters, never correctness, and sidecar writes are best-effort for
+  the same reason. The moment anything consults a sidecar field to decide whether
+  a body may be loaded, a stale or hand-edited JSON file becomes able to feed the
+  model a KV built from a different prompt, which is exactly the failure every
+  fingerprint in this subsystem exists to prevent. `META_VERSION` is likewise
+  independent of `kvcache::FORMAT_VERSION`, and a sidecar at an unrecognized
+  version is ignored rather than migrated: resetting counters is cheap, and
+  guessing at a schema you do not know is not.
+- **The GC's "has a surviving child" rule reads the pre-sweep node set.** Judged
+  against a set mutating as files are unlinked, a sweep's outcome would depend on
+  directory scan order, so the same cache could collect different files on two
+  runs. Reading the set as it stood before the sweep began costs one extra run to
+  collect a parent whose last child died this run, which is the intended
+  bottom-up cascade: a dead chain collects one level per launch.
+- **Phase 2 must read the *post*-phase-1 survivor set, the opposite of phase 1.**
+  The budget pass re-derives "has a surviving child" against what phase 1 left
+  alive. Reusing phase 1's pre-sweep view there would make a parent whose only
+  child just expired immortal under any budget, because it would keep looking
+  like it was holding a live descendant up. The two phases read different sets on
+  purpose, and the reason differs on each side: phase 1 wants order independence,
+  phase 2 wants an upper bound that actually binds.
+- **`kvcache.maxBytes = 0` means unbounded, not "evict everything".** The
+  opposite reading is the natural one for a ceiling, and it would wipe the entire
+  cache on every launch for everyone who never set the key. A budget of zero is
+  also the shape an absent or unparsable settings value degrades to, which is the
+  worst possible moment to start deleting. Note the neighbouring TTLs go the
+  other way, where `>=` makes a TTL of zero mean "collect on sight" rather than a
+  silent no-op; a zero is only self-evident once you decide what it disables.
+- **A sweep verdict must map to a path, not to a fingerprint.** Two bodies can
+  legitimately share one fingerprint: a root `sysprompt-X.kv_raw` beside a
+  `<projkey>/project-X.kv_raw`, or the same `project-X` under two project
+  directories. A fingerprint-keyed delete then unlinks a file the sweep decided
+  to keep, and it looks like a policy bug rather than a lookup bug. `sweep` walks
+  paths and metadata as one paired list so verdict `i` names file `i`. The
+  `/kvcache` mutation path cannot do that (its input is a fingerprint prefix
+  typed by a user), so it refuses an ambiguous match outright instead of guessing.
+- **Re-persisting an existing fingerprint must preserve `created` and `pinned`.**
+  A refresh is the same blob being written again, not a new blob, and treating it
+  as new silently unpins whatever the user pinned and resets the age the TTL is
+  measured from. Both fields are read back off the prior sidecar before the new
+  one is written, so a pin survives every subsequent store.
+- **A test whose fixtures are always written fresh silently stops testing
+  anything once retention becomes age-based.**
+  `gc_keeps_the_alt_local_engines_system_checkpoint` was in exactly that state:
+  its blobs were young, freshness alone kept them, and the keep-set it existed to
+  exercise had no effect on the outcome. Deleting the entire code path it
+  guarded left it green. Any test of an age-sensitive policy has to write
+  explicit `last_used` values into its sidecars rather than let the filesystem
+  supply "now".
