@@ -2359,12 +2359,16 @@ impl Agent<'_> {
         let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let finished = stream.finished();
         self.session.push(Message::assistant(text.clone()));
-        // A cut-off adjudication is handled exactly as `run_turn` handles a
-        // cut-off turn: record it on `last_turn_interrupted` and clear the
+        // The flag handling here is exactly `run_turn`'s for a cut-off turn:
+        // record it on `last_turn_interrupted` and clear the
         // process-wide SIGINT flag here. Leaving that flag raised would return
         // to the REPL prompt with an interrupt still pending, and the
         // generation loop polls it — so the user's *next* message would abort
         // instantly with `[interrupted]` before producing a token.
+        //
+        // Only the flag handling is shared: unlike `run_turn`, this prints
+        // nothing. The goal's single closing notice is the whole story of how
+        // it ended, and a second `[interrupted]` here would double-report it.
         if stats.interrupted {
             crate::interrupt::clear();
             self.last_turn_interrupted = true;
@@ -2395,6 +2399,14 @@ impl Agent<'_> {
         let result = self.drive_goal_loop();
         self.goal = None;
         let (outcome, iters, reason) = result?;
+        // Closes the class, not just the instance: `adjudicate_plain` clears
+        // the SIGINT flag for a generation it saw cut off, but a Ctrl+C landing
+        // between a generation returning and `drive_goal_loop`'s `pending()`
+        // check is seen by the check alone, which consumes nothing. Either way
+        // the goal ends here, so this is the one place that always runs.
+        if outcome == crate::goal::Outcome::Interrupted {
+            crate::interrupt::clear();
+        }
         println!(
             "{}",
             self.debug_line(&crate::goal::closing(outcome, iters, &reason))
@@ -15980,10 +15992,14 @@ mod tests {
             .slash("/goal --max 2 keep going forever")
             .expect("/goal runs");
         assert!(agent.goal.is_none(), "the loop clears its own state");
+        // Documents intent rather than guarding it: `interrupt_at` is a
+        // per-engine knob and raises no process-wide flag, so this cannot
+        // fail. The real regression guard is the prompt count below — the
+        // second iteration only runs if the interrupt went unnoticed.
         assert!(
             !crate::interrupt::pending(),
-            "the adjudication must clear the process-wide flag, or the user's \
-next message aborts before its first token"
+            "a goal must not return to the prompt with an interrupt pending, \
+or the user's next message aborts before its first token"
         );
         assert_eq!(
             prompts.lock().expect("lock").len(),
