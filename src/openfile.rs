@@ -344,6 +344,22 @@ mod tests {
         );
     }
 
+    /// Regression: file mode inserts a trailing newline the raw file text on
+    /// disk may not have, so comparing an accept against the raw `initial`
+    /// text made a true no-op accept look like an edit and rewrite the file.
+    /// `after_edit` must be compared against the same seeded text the editor
+    /// started from, not the raw bytes.
+    #[test]
+    fn accepting_an_untouched_file_without_a_trailing_newline_writes_nothing() {
+        let initial = "hello"; // no trailing newline, as read from disk
+        let seed = crate::miniedit::file_seed_text(initial);
+        assert_eq!(seed, "hello\n");
+        // The editor returns exactly what it was seeded with: the user typed
+        // nothing and just pressed Ctrl+S. `tui_open` must compare against
+        // the seeded text, not the raw `initial` it read from disk.
+        assert_eq!(after_edit(Some(seed.clone()), &seed), AfterEdit::Unchanged);
+    }
+
     #[test]
     fn accepting_an_edit_asks_for_a_save() {
         assert_eq!(

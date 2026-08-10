@@ -182,7 +182,12 @@ impl State {
             // from the input first so it round-trips exactly.
             if file {
                 tb.set_crlf(initial.contains("\r\n"));
-                tb.write_raw(initial.as_bytes());
+                // Seed with the same text `crate::miniedit::file_seed_text`
+                // computes, so the buffer's insert_final_newline has nothing
+                // left to add and `original` below needs no extra read-back
+                // trick to stay in sync with what `tui_open` compares against.
+                let seeded = crate::miniedit::file_seed_text(initial);
+                tb.write_raw(seeded.as_bytes());
             } else {
                 tb.write_canon(initial.as_bytes());
             }

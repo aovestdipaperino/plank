@@ -39,6 +39,34 @@ pub mod state;
 
 pub use state::{Mode, Outcome, Search, State};
 
+/// Applies the one normalization file mode performs on the text it is seeded
+/// with: appending a trailing newline when the text lacks one.
+///
+/// File mode sets `insert_final_newline(true)`, so `State::new_for_file`'s
+/// buffer text can differ from the raw bytes on disk even before the user
+/// types anything. Both `State::build`'s file path and `crate::ui`'s
+/// `tui_open` (which decides whether Ctrl+S needs to write anything) must
+/// compare against this same normalized text, or an untouched accept on a
+/// file with no trailing newline looks like an edit and gets rewritten.
+///
+/// An empty file must not gain a newline: there is no line to terminate.
+#[must_use]
+pub fn file_seed_text(initial: &str) -> String {
+    if initial.is_empty() || initial.ends_with('\n') {
+        initial.to_string()
+    } else {
+        // Match the newline convention `State::build` sets via `set_crlf`:
+        // a CRLF file gets a CRLF appended, not a bare LF that would make
+        // an untouched accept look edited.
+        let newline = if initial.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        format!("{initial}{newline}")
+    }
+}
+
 use edit::input;
 use edit::sys;
 use edit::tui::Tui;
@@ -196,6 +224,26 @@ impl Drop for RestoreModes {
 mod tests {
     use super::*;
     use edit::buffer::TextBuffer;
+
+    #[test]
+    fn file_seed_text_appends_a_missing_trailing_newline() {
+        assert_eq!(file_seed_text("hello"), "hello\n");
+    }
+
+    #[test]
+    fn file_seed_text_leaves_an_already_newline_terminated_file_alone() {
+        assert_eq!(file_seed_text("hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn file_seed_text_does_not_invent_a_newline_for_an_empty_file() {
+        assert_eq!(file_seed_text(""), "");
+    }
+
+    #[test]
+    fn file_seed_text_matches_the_crlf_convention() {
+        assert_eq!(file_seed_text("a\r\nb"), "a\r\nb\r\n");
+    }
 
     /// The dependency is wired up and usable headlessly: text in, text out,
     /// through the same round-trip the editor session will use.

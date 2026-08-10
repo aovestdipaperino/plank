@@ -8294,7 +8294,12 @@ impl Agent<'_> {
                 return;
             }
         };
-        match crate::openfile::after_edit(edited, &initial) {
+        // Compare against the same seeded text the editor was started from,
+        // not the raw file bytes: file mode appends a trailing newline the
+        // disk copy may lack, so comparing against `initial` would treat an
+        // untouched Ctrl+S as an edit and rewrite the file for no reason.
+        let seed = crate::miniedit::file_seed_text(&initial);
+        match crate::openfile::after_edit(edited, &seed) {
             crate::openfile::AfterEdit::Save(text) => {
                 match crate::openfile::save(&path, &text) {
                     Ok(()) => log.push_plain(crate::openfile::wrote_message(&display, &text)),
