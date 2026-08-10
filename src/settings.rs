@@ -267,6 +267,8 @@ pub struct Settings {
     pub agents: AgentSettings,
     /// Git-worktree isolation tuning.
     pub worktree: WorktreeSettings,
+    /// KV-cache retention.
+    pub kvcache: KvCacheSettings,
 }
 
 /// `worktree` block: how [`crate::worktree`] builds a new working copy.
@@ -282,6 +284,33 @@ pub struct WorktreeSettings {
     /// cannot overwrite each other's edits. Off by default: it costs a checkout
     /// per agent, and the agent's work then has to be merged back.
     pub isolate_agents: bool,
+}
+
+/// `kvcache` block: retention for persisted KV blobs.
+///
+/// Ages are in days and measured from a blob's `last_used`. A pinned blob and a
+/// blob with a surviving child both outlive their TTL — see [`crate::kvgc`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvCacheSettings {
+    /// Days a session KV payload survives after its last use.
+    pub ttl_session_days: u64,
+    /// Days a system-prompt or project-stable checkpoint survives after its
+    /// last use.
+    pub ttl_tier_days: u64,
+    /// Advisory size ceiling in bytes, surfaced as a warning in `/kvcache`.
+    /// `0` means unset. It never evicts anything: eviction decisions stay
+    /// per-node so a sweep does not depend on directory scan order.
+    pub max_bytes: u64,
+}
+
+impl Default for KvCacheSettings {
+    fn default() -> Self {
+        Self {
+            ttl_session_days: 14,
+            ttl_tier_days: 30,
+            max_bytes: 0,
+        }
+    }
 }
 
 /// Reads a positive integer member, ignoring absent, non-numeric, and
@@ -469,6 +498,17 @@ impl Settings {
         }
         if let Some(v) = boolean(worktree, "isolateAgents") {
             self.worktree.isolate_agents = v;
+        }
+
+        let kvcache = root.get("kvcache");
+        if let Some(v) = num::<u64>(kvcache, "ttlSessionDays") {
+            self.kvcache.ttl_session_days = v;
+        }
+        if let Some(v) = num::<u64>(kvcache, "ttlTierDays") {
+            self.kvcache.ttl_tier_days = v;
+        }
+        if let Some(v) = num::<u64>(kvcache, "maxBytes") {
+            self.kvcache.max_bytes = v;
         }
     }
 
@@ -930,6 +970,30 @@ mod tests {
         assert_eq!(s.mcp.timeout_secs, 30);
         assert_eq!(s.engine.model, None);
         assert_eq!(s.safety.sandbox, None);
+    }
+
+    #[test]
+    fn kvcache_block_overlays_and_defaults() {
+        let mut s = Settings::default();
+        assert_eq!(s.kvcache.ttl_session_days, 14);
+        assert_eq!(s.kvcache.ttl_tier_days, 30);
+        assert_eq!(s.kvcache.max_bytes, 0, "unset by default");
+
+        s.overlay(r#"{"kvcache":{"ttlSessionDays":7,"ttlTierDays":60,"maxBytes":21474836480}}"#);
+        assert_eq!(s.kvcache.ttl_session_days, 7);
+        assert_eq!(s.kvcache.ttl_tier_days, 60);
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
+    }
+
+    #[test]
+    fn a_bad_kvcache_value_does_not_discard_its_siblings() {
+        let mut s = Settings::default();
+        s.overlay(r#"{"kvcache":{"ttlSessionDays":"soon","ttlTierDays":60}}"#);
+        assert_eq!(
+            s.kvcache.ttl_session_days, 14,
+            "bad value keeps the default"
+        );
+        assert_eq!(s.kvcache.ttl_tier_days, 60, "sibling still applies");
     }
 
     #[test]
