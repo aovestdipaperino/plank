@@ -519,35 +519,20 @@ pub fn hooks_with_plugins(cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
     hooks_in(home.as_deref(), cwd, set)
 }
 
-/// Names in `path`'s `mcpServers` object that contain `__`.
-///
-/// [`crate::tools::mcp::config_load_checked`] already drops these servers
-/// (they could never be routed back through `mcp__<server>__<tool>`
-/// dispatch), but only logs to stderr; this re-reads the raw JSON so
-/// [`mcp_servers`] can surface the same rejection as a returned warning.
-fn raw_server_names_with_double_underscore(path: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let Some(root) = crate::tools::mcp::json_parse(&text) else {
-        return Vec::new();
-    };
-    let Some(crate::tools::mcp::Json::Obj(servers)) = root.get("mcpServers") else {
-        return Vec::new();
-    };
-    servers
-        .iter()
-        .filter(|(name, _)| name.contains("__"))
-        .map(|(name, _)| name.clone())
-        .collect()
-}
-
 /// MCP servers contributed by plugins, with names disambiguated.
 ///
 /// Uncontested names stay bare. When two plugins offer the same server name,
 /// both are renamed `<plugin>-<server>`. The separator is `-` rather than `:`
 /// because a server name is embedded in `mcp__<server>__<tool>` and split at
 /// the first `__`, so a plugin server name containing `__` is rejected.
+///
+/// The rename pass can itself introduce a collision — e.g. plugins `alpha`
+/// and `beta` both offering `weather` become `alpha-weather` and
+/// `beta-weather`, but a third plugin offering a server literally named
+/// `alpha-weather` then collides with the renamed one. That collision is not
+/// undone (the caller's `merge_configs` keeps its existing last-write-wins
+/// precedence), but it is reported as a warning naming the colliding servers
+/// and the plugins that contributed them.
 #[must_use]
 pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>, Vec<String>) {
     let mut warnings = Vec::new();
@@ -556,13 +541,7 @@ pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>,
         let Some(path) = component_root(plugin, ".mcp.json", ".mcp.json") else {
             continue;
         };
-        for name in raw_server_names_with_double_underscore(&path) {
-            warnings.push(format!(
-                "plugin '{}': server name '{name}' contains '__' and was rejected",
-                plugin.name
-            ));
-        }
-        let Some(configs) = crate::tools::mcp::config_load_checked(&path) else {
+        let Some((configs, rejected)) = crate::tools::mcp::config_load_reporting(&path) else {
             warnings.push(format!(
                 "plugin '{}': unreadable {}",
                 plugin.name,
@@ -570,12 +549,15 @@ pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>,
             ));
             continue;
         };
+        for reason in rejected {
+            warnings.push(format!("plugin '{}': {reason}", plugin.name));
+        }
         for config in configs {
             gathered.push((plugin.name.clone(), config));
         }
     }
 
-    let mut out = Vec::new();
+    let mut out: Vec<(String, crate::tools::mcp::McpServerConfig)> = Vec::new();
     for (plugin, config) in &gathered {
         let contested = gathered
             .iter()
@@ -590,9 +572,34 @@ pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>,
             ));
             config.name = format!("{plugin}-{}", config.name);
         }
-        out.push(config);
+        out.push((plugin.clone(), config));
     }
-    (out, warnings)
+
+    for (name, plugin_contributors) in duplicate_names_after_rename(&out) {
+        warnings.push(format!(
+            "MCP server name '{name}' collides across plugins {} after disambiguation; the last one wins",
+            plugin_contributors.join(", ")
+        ));
+    }
+
+    (out.into_iter().map(|(_, c)| c).collect(), warnings)
+}
+
+/// Groups `(plugin, config)` pairs by final server name, returning only the
+/// names contributed more than once, alongside the contributing plugin names
+/// in encounter order.
+fn duplicate_names_after_rename(
+    entries: &[(String, crate::tools::mcp::McpServerConfig)],
+) -> Vec<(String, Vec<String>)> {
+    let mut by_name: Vec<(String, Vec<String>)> = Vec::new();
+    for (plugin, config) in entries {
+        match by_name.iter_mut().find(|(name, _)| *name == config.name) {
+            Some((_, plugins)) => plugins.push(plugin.clone()),
+            None => by_name.push((config.name.clone(), vec![plugin.clone()])),
+        }
+    }
+    by_name.retain(|(_, plugins)| plugins.len() > 1);
+    by_name
 }
 
 #[cfg(test)]
@@ -1037,6 +1044,52 @@ mod tests {
         let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["alpha-weather", "beta-weather"]);
         assert!(warnings.iter().any(|w| w.contains("weather")));
+    }
+
+    #[test]
+    fn a_rename_collision_with_a_third_plugins_bare_name_is_warned_about() {
+        let base = scratch("mcp-rename-collision");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        for name in ["alpha", "beta"] {
+            let plugin = base.join(name);
+            write(
+                &plugin,
+                ".plank-plugin/plugin.json",
+                &format!(r#"{{"name":"{name}"}}"#),
+            );
+            write(
+                &plugin,
+                ".mcp.json",
+                r#"{"mcpServers":{"weather":{"command":"weather-server"}}}"#,
+            );
+        }
+        let third = base.join("gamma");
+        write(&third, ".plank-plugin/plugin.json", r#"{"name":"gamma"}"#);
+        write(
+            &third,
+            ".mcp.json",
+            r#"{"mcpServers":{"alpha-weather":{"command":"x"}}}"#,
+        );
+        let set = load_in(
+            Some(&home),
+            &cwd,
+            &[base.join("alpha"), base.join("beta"), third],
+        );
+        let (servers, warnings) = mcp_servers(&set);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["alpha-weather", "beta-weather", "alpha-weather"]
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("alpha-weather") && w.contains("gamma") && w.contains("alpha")),
+            "expected a warning naming the colliding servers and plugins, got: {warnings:?}"
+        );
     }
 
     #[test]

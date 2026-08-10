@@ -852,6 +852,20 @@ impl HttpTransport {
 /// name could never be routed back.
 #[must_use]
 pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
+    config_load_reporting(path).map(|(configs, _)| configs)
+}
+
+/// Parses `.mcp.json`, reporting *why* each dropped entry was dropped.
+///
+/// Same parse and same acceptance rules as [`config_load_checked`], but
+/// instead of only printing a rejection to stderr it also returns one
+/// human-readable rejection string per dropped entry (server name plus the
+/// real reason it was rejected), so a second caller can turn those into its
+/// own warnings without re-parsing the file. `None` has the same meaning as
+/// in `config_load_checked`: the file could not be read or did not parse as
+/// JSON.
+#[must_use]
+pub fn config_load_reporting(path: &Path) -> Option<(Vec<McpServerConfig>, Vec<String>)> {
     let text = std::fs::read_to_string(path).ok()?;
     let Some(root) = json_parse(&text) else {
         eprintln!(
@@ -861,18 +875,23 @@ pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
         return None;
     };
     let mut out = Vec::new();
+    let mut rejected = Vec::new();
     let Some(Json::Obj(servers)) = root.get("mcpServers") else {
-        return Some(out);
+        return Some((out, rejected));
     };
     for (name, sv) in servers {
         let command = sv.str_or("command", "");
         let url = sv.str_or("url", "");
         if command.is_empty() && url.is_empty() {
             eprintln!("plank: MCP server \"{name}\" has no command or url, skipping");
+            rejected.push(format!(
+                "server '{name}' has no command or url and was rejected"
+            ));
             continue;
         }
         if name.contains("__") {
             eprintln!("plank: MCP server name \"{name}\" must not contain \"__\", skipping");
+            rejected.push(format!("server '{name}' contains '__' and was rejected"));
             continue;
         }
         let mut cfg = McpServerConfig {
@@ -922,7 +941,7 @@ pub fn config_load_checked(path: &Path) -> Option<Vec<McpServerConfig>> {
         }
         out.push(cfg);
     }
-    Some(out)
+    Some((out, rejected))
 }
 
 /// Parses `.mcp.json`, treating an absent or invalid file as "no servers".
