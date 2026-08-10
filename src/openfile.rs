@@ -16,6 +16,17 @@ use crate::tools::diff::EditPreview;
 /// What bare `/open` says when nothing has been edited yet.
 pub const NO_LAST_EDITED: &str = "no file edited yet this session — usage: /open <path>";
 
+/// The largest file `/open` will load, in bytes.
+///
+/// `load` runs after the TUI has already been torn down for miniedit to take
+/// the terminal, so a file large enough to make the read-into-`String` (and
+/// the buffer it seeds) take a visible while looks like a hang with no way to
+/// interrupt it — there is no running UI left to show a progress bar or take
+/// Esc. 32 MiB comfortably covers any real source file or log a terminal text
+/// editor is used on, while refusing the "accidentally opened a database
+/// dump" case outright.
+pub const MAX_OPEN_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Picks the file `/open` should edit and checks it is editable.
 ///
 /// `arg` is the slash command's argument, empty for a bare `/open`; `last` is
@@ -64,10 +75,22 @@ fn resolve(path: &str, cwd: &Path) -> PathBuf {
 /// Reads `path` as text.
 ///
 /// # Errors
-/// Returns a user-facing message when the file cannot be read or is not valid
-/// UTF-8. miniedit's buffer is a `String`, so a binary file is refused rather
-/// than silently mangled.
+/// Returns a user-facing message when the file cannot be read, is larger than
+/// [`MAX_OPEN_FILE_BYTES`], or is not valid UTF-8. miniedit's buffer is a
+/// `String`, so a binary file is refused rather than silently mangled, and a
+/// huge one is refused rather than freezing the (already torn-down) TUI.
 pub fn load(path: &Path) -> Result<String, String> {
+    // Check the size before reading the bytes: a metadata call is cheap even
+    // when the file itself is huge.
+    let len = std::fs::metadata(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .len();
+    if len > MAX_OPEN_FILE_BYTES {
+        return Err(format!(
+            "{} is too large to open ({len} bytes, limit {MAX_OPEN_FILE_BYTES})",
+            path.display()
+        ));
+    }
     let bytes = std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     String::from_utf8(bytes)
         .map_err(|_| format!("{} is not text (not valid UTF-8)", path.display()))
@@ -81,12 +104,20 @@ pub fn load(path: &Path) -> Result<String, String> {
 /// permissions are carried over, which matters for the executable scripts a
 /// user is likely to `/open`.
 ///
+/// `path` is canonicalized first so a symlink (a real pattern for dotfiles,
+/// e.g. `~/.vimrc` pointing into a dotfiles checkout) has its *target*
+/// rewritten in place rather than being replaced by a plain file: renaming a
+/// temp file over the link itself would sever it. When canonicalization fails
+/// (e.g. a dangling symlink) the path is used as given rather than losing the
+/// user's edit.
+///
 /// # Errors
 /// Returns a user-facing message when the temp file cannot be written or the
 /// rename fails.
 pub fn save(path: &Path, text: &str) -> Result<(), String> {
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().map_or_else(
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let dir = target.parent().unwrap_or(Path::new("."));
+    let name = target.file_name().map_or_else(
         || std::ffi::OsString::from("open"),
         std::ffi::OsStr::to_os_string,
     );
@@ -97,14 +128,14 @@ pub fn save(path: &Path, text: &str) -> Result<(), String> {
 
     std::fs::write(&tmp, text.as_bytes())
         .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
-    if let Ok(meta) = std::fs::metadata(path) {
+    if let Ok(meta) = std::fs::metadata(&target) {
         // Best-effort: a permission we cannot copy is not a reason to lose the
         // user's edit.
         let _ = std::fs::set_permissions(&tmp, meta.permissions());
     }
-    if let Err(e) = std::fs::rename(&tmp, path) {
+    if let Err(e) = std::fs::rename(&tmp, &target) {
         let _ = std::fs::remove_file(&tmp);
-        return Err(format!("cannot replace {}: {e}", path.display()));
+        return Err(format!("cannot replace {}: {e}", target.display()));
     }
     Ok(())
 }
@@ -242,6 +273,18 @@ mod tests {
     }
 
     #[test]
+    fn load_refuses_a_file_above_the_size_limit() {
+        let dir = scratch("huge");
+        let path = dir.join("huge.txt");
+        let f = std::fs::File::create(&path).unwrap();
+        f.set_len(MAX_OPEN_FILE_BYTES + 1).unwrap();
+        drop(f);
+        let err = load(&path).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn load_refuses_non_utf8() {
         let dir = scratch("binary");
         let path = dir.join("b.bin");
@@ -265,6 +308,27 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["a.txt".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_through_a_symlink_updates_the_target_and_keeps_the_link() {
+        let dir = scratch("symlink");
+        let target = dir.join("real.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        save(&link, "new\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(
+            link_meta.file_type().is_symlink(),
+            "save must not replace the symlink with a regular file"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

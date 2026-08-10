@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/open [path]`** edits an existing file in the built-in editor: `Ctrl-S`
+  saves, `Esc` discards. Bare `/open` reopens the last file a tool call
+  edited this session. TUI-only, and it never creates a file.
+
 ### Fixed
 
 - **A dropped network no longer freezes the turn with no way out.** Losing the
