@@ -4091,6 +4091,16 @@ the original is frozen and listed in /tree"
                 // blob. A sidecar-less body is fine — the scan's fingerprint is
                 // then synthesized from the file stem, which the check above
                 // already matched.
+                //
+                // This is defence in depth against a concurrent writer, layered
+                // on top of the index/fingerprint check above. It is NOT
+                // exercised by this module's unit test, and it cannot be: the
+                // scan above and this re-check both read the same sidecar in
+                // the same single-threaded call, so nothing can change between
+                // them without a real interleave from another process or
+                // thread. The unit test covers only the index/fingerprint
+                // guard; this one guards a race no single-threaded test can
+                // reach.
                 if !path.exists() {
                     return Err(format!("{expect_fp} is already gone from disk"));
                 }

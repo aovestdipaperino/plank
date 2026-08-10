@@ -85,9 +85,7 @@ fn main() -> ExitCode {
     // is the fix rather than a reorder. Nothing to migrate exists before the
     // directory does, so skipping is exact rather than merely cheap.
     let kv_dir = plank::session::SessionStore::default_dir();
-    if kv_dir.is_dir()
-        && let Ok(store) = plank::session::SessionStore::open(&kv_dir)
-        && let Some(bytes) = store.migrate_legacy_blobs()
+    if let Some(bytes) = plank::session::SessionStore::migrate_kvcache_if_present(&kv_dir)
         && bytes > 0
     {
         #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision

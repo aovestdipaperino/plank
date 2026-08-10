@@ -601,12 +601,17 @@ impl SessionStore {
             // the whole window between the scan above and this unlink, so the
             // file under an expired sidecar may already have been replaced by a
             // fresh one. Re-read the node and skip anything that moved: the
-            // verdict was computed about bytes that are no longer there.
+            // verdict was computed about bytes that are no longer there. The
+            // fingerprint is part of that identity check too — a replacement
+            // blob at the same path with an identical size, `last_used` and
+            // `pinned` flag but a different fingerprint is a different body,
+            // not the one the verdict was about.
             let fp = seen.fingerprint.as_str();
             let fresh = Self::kv_node_at(path, fp);
             if fresh.last_used != seen.last_used
                 || fresh.bytes != seen.bytes
                 || fresh.pinned != seen.pinned
+                || fresh.fingerprint != seen.fingerprint
             {
                 continue;
             }
@@ -795,6 +800,25 @@ impl SessionStore {
         }
         let _ = fs::write(&marker, b"2\n");
         Some(reclaimed)
+    }
+
+    /// Runs [`Self::migrate_legacy_blobs`] only when `dir` already exists,
+    /// returning the bytes reclaimed (`Some(0)` or more) or `None`.
+    ///
+    /// `SessionStore::open` does a `create_dir_all`, which would create the
+    /// cache directory as a side effect on a brand-new install — and a
+    /// freshly created directory with no version marker is exactly what
+    /// `upgrade::classify` reads as a major version change, so a first-ever
+    /// launch would wrongly announce "cleared the image cache". Gating on
+    /// the directory already existing keeps a fresh install a true no-op:
+    /// nothing is created, nothing is opened, nothing is migrated.
+    #[must_use]
+    pub fn migrate_kvcache_if_present(dir: &Path) -> Option<u64> {
+        if !dir.is_dir() {
+            return None;
+        }
+        let store = Self::open(dir).ok()?;
+        store.migrate_legacy_blobs()
     }
 
     /// Strips the engine KV payload from the session matching the hex
@@ -2091,6 +2115,18 @@ mod tests {
             "marker is written even when nothing was deleted"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_kvcache_if_present_is_a_true_no_op_on_a_fresh_install() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!dir.exists());
+        assert_eq!(SessionStore::migrate_kvcache_if_present(&dir), None);
+        assert!(
+            !dir.exists(),
+            "a fresh install must not have its cache directory created by the migration gate"
+        );
     }
 
     #[test]
