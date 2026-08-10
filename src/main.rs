@@ -52,18 +52,30 @@ fn main() -> ExitCode {
     // plugin's `settings.json` can be layered in below the user file — but
     // building it needs `--plugin-dir`, which only the parsed config carries.
     // A throwaway provisional parse (base settings, no plugin layer) breaks
-    // that cycle: only its `plugin_dirs` is used, the real parse below
-    // re-derives everything else with the enriched settings. Like project
-    // settings, the scan reads the launch directory: `--chdir` is parsed only
-    // by the real config below, so it cannot move the scan, a documented
-    // limitation shared with project-scoped settings.
+    // that cycle: only its `plugin_dirs` and `chdir_path` are used (both pure
+    // CLI flags, unaffected by settings layering, so they agree with the real
+    // parse below), and the real parse re-derives everything else with the
+    // enriched settings.
     let provisional =
         plank::config::parse_options_with(&plank::settings::Settings::default(), &args)
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
-    let launch_cwd = std::env::current_dir().unwrap_or_default();
-    let plugins = plank::plugins::load_default(&launch_cwd, &provisional.plugin_dirs);
+    // `--chdir` has to happen before the plugin scan (and therefore before
+    // project settings, which are also cwd-scoped) rather than after, or the
+    // plugin set built here would reflect the launch directory instead of the
+    // directory the session actually runs in — the eager local-engine preload
+    // in `wants_local_subagent` and the worktree's `hooks.json` discovery both
+    // consult this same set, so a mismatch here means a plugin declared under
+    // `<chdir>/.plank/plugins` silently never loads.
+    if let Some(dir) = &provisional.chdir_path
+        && let Err(e) = std::env::set_current_dir(dir)
+    {
+        eprintln!("plank: chdir {}: {e}", dir.display());
+        return ExitCode::FAILURE;
+    }
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
     }
@@ -109,13 +121,6 @@ fn main() -> ExitCode {
         let gb = bytes as f64 / 1_073_741_824.0;
         eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
     }
-    if let Some(dir) = &cfg.chdir_path
-        && let Err(e) = std::env::set_current_dir(dir)
-    {
-        eprintln!("plank: chdir {}: {e}", dir.display());
-        return ExitCode::FAILURE;
-    }
-
     // `--worktree` runs before anything reads the working directory, because
     // the whole session — its hooks, agent definitions, and every tool's cwd —
     // is meant to live inside the worktree rather than the original checkout.
@@ -149,7 +154,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match run(engine.main, engine.local, &cfg) {
+    match run(engine.main, engine.local, &cfg, plugins) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("plank: {e}");
@@ -678,10 +683,11 @@ fn run(
     engine: Box<dyn Engine>,
     local_engine: Option<Box<dyn Engine>>,
     cfg: &AgentConfig,
+    plugins: plank::plugins::PluginSet,
 ) -> Result<(), String> {
     let color = std::io::stdout().is_terminal();
     if cfg.non_interactive {
-        return plank::ui::run_non_interactive(engine, cfg, local_engine);
+        return plank::ui::run_non_interactive(engine, cfg, local_engine, plugins);
     }
     plank::title::set(plank::title::State::Loading);
     // The full-screen TUI (a real terminal on both ends) draws its own header,
@@ -704,5 +710,5 @@ fn run(
         }
         std::io::stdout().flush().map_err(|e| e.to_string())?;
     }
-    plank::ui::run_interactive(engine, cfg, local_engine)
+    plank::ui::run_interactive(engine, cfg, local_engine, plugins)
 }

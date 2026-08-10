@@ -9805,12 +9805,12 @@ fn print_footer(st: &Status, color: bool) {
     }
 }
 
-#[allow(clippy::too_many_lines)] // sequential startup wiring; splitting hurts readability.
 fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     show_footer: bool,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<Agent<'_>, String> {
     let store = SessionStore::open(SessionStore::default_dir()).map_err(|e| e.to_string())?;
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
@@ -9831,12 +9831,11 @@ fn new_agent(
     // `save_for_exit`.)
     session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
-    // Resolved before anything that consumes plugin contributions (MCP
-    // startup, hooks) so both see the real set rather than a placeholder.
-    tool_ctx.plugins = crate::plugins::load_default(&tool_ctx.cwd, &cfg.plugin_dirs);
-    for w in tool_ctx.plugins.all_warnings() {
-        eprintln!("plugin warning: {w}");
-    }
+    // Built once in `main()` against the session's real working directory
+    // (post-`--chdir`/`--worktree` resolution happens below) and threaded in
+    // here rather than rebuilt, so this set and `main()`'s agree and its
+    // warnings are printed exactly once.
+    tool_ctx.plugins = plugins;
     // `--worktree` already created the worktree and moved the process into it,
     // so `cwd` above is the worktree; adopting the session it left behind is
     // what lets `ExitWorktree` find its way back out.
@@ -9975,8 +9974,9 @@ pub fn run_interactive(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, true, local_engine)?;
+    let mut agent = new_agent(engine, cfg, true, local_engine, plugins)?;
 
     // Seed the notification enable flag once, before either front-end loop
     // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
@@ -10266,8 +10266,9 @@ pub fn run_non_interactive(
     engine: Box<dyn Engine>,
     cfg: &AgentConfig,
     local_engine: Option<Box<dyn Engine>>,
+    plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
-    let mut agent = new_agent(engine, cfg, false, local_engine)?;
+    let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
     // Seed the notification enable flag once, mirroring `run_interactive`, so
     // headless/non-interactive runs also honor `ui.notifications`.
     crate::notify::set_mode(crate::settings::active().ui.notifications);
@@ -12357,6 +12358,7 @@ mod tests {
             &cfg,
             false,
             Some(Box::new(local)),
+            crate::plugins::PluginSet::default(),
         )
         .expect("an agent");
 

@@ -60,6 +60,13 @@ const COMPONENT_PATHS: [(&str, &str); 6] = [
     ("settings.json", "settings.json"),
 ];
 
+/// Human-readable labels for the listing, in the same order as
+/// [`COMPONENT_PATHS`]. Kept beside it and length-checked below so adding or
+/// reordering a component can't silently truncate or mislabel `contributions`.
+const COMPONENT_LABELS: [&str; 6] = ["skills", "agents", "templates", "hooks", "mcp", "settings"];
+
+const _: () = assert!(COMPONENT_LABELS.len() == COMPONENT_PATHS.len());
+
 /// The manifest plank will read for `dir`, preferring the plank flavor.
 /// `None` when the directory has neither manifest.
 #[must_use]
@@ -333,10 +340,7 @@ pub fn settings_paths(set: &PluginSet) -> Vec<PathBuf> {
 /// Which components a plugin actually contributes, for the listing.
 fn contributions(plugin: &Plugin) -> Vec<&'static str> {
     let mut out = Vec::new();
-    for (label, (plank, cc)) in ["skills", "agents", "templates", "hooks", "mcp", "settings"]
-        .into_iter()
-        .zip(COMPONENT_PATHS)
-    {
+    for (label, (plank, cc)) in COMPONENT_LABELS.into_iter().zip(COMPONENT_PATHS) {
         if component_root(plugin, plank, cc).is_some() {
             out.push(label);
         }
