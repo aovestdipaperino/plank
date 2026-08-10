@@ -3,7 +3,9 @@
 
 //! Retention policy for persisted KV blobs.
 //!
-//! The rule, applied to each node in order and stopping at the first match:
+//! A sweep runs in two phases.
+//!
+//! **Phase 1 — TTL and pins.** Per node, stopping at the first match:
 //!
 //! 1. pinned → keep
 //! 2. in the tier chain this launch is using → keep
@@ -19,9 +21,28 @@
 //! system and project checkpoints and deleted every sibling, which made
 //! switching model or reasoning level cost a full re-prefill each way.
 //!
-//! `kvcache.maxBytes` is not consulted here. It is an advisory figure shown in
-//! `/kvcache`; making it evict would make a node's fate depend on the other
-//! nodes' sizes and on visit order, which is exactly what this module avoids.
+//! **Phase 2 — the `kvcache.maxBytes` ceiling.** Phase 1 alone puts no upper
+//! bound on the cache: Tier 1 forks on every model, reasoning level, plank
+//! version and global MCP set, Tier 2 on every `AGENTS.md` edit, and session
+//! payloads run to ~1 GB each, so a steady state of tens of GB is ordinary.
+//! Phase 2 therefore evicts survivors, least recently used first, until the
+//! total is at or under the budget.
+//!
+//! `maxBytes` used to be advisory for one reason: a node's fate had to be
+//! independent of directory scan order, and a size-driven rule seemed to make
+//! it depend on which node was visited first. Sorting resolves that. Phase 2
+//! runs only once phase 1's verdicts are fully determined, and it evicts in a
+//! *globally sorted* order — ascending `last_used`, ties broken by fingerprint
+//! — so the outcome is a pure function of the inputs, scan order included.
+//!
+//! Two asymmetries are deliberate. Phase 2 re-derives "has a surviving child"
+//! against the **post-phase-1** set, where phase 1 reads the pre-sweep set:
+//! otherwise a parent whose only child just expired would outlive every budget
+//! forever. And `maxBytes == 0` means *unbounded*, never "evict everything" —
+//! the inverse reading would wipe the whole cache for anyone who never sets the
+//! key. A budget is also a target, not a licence: when every remaining node is
+//! pinned, active, or a parent of a survivor, the sweep leaves the total over
+//! budget rather than deleting something protected.
 
 use crate::kvmeta::{KvMeta, KvRole};
 
@@ -36,6 +57,10 @@ pub struct SweepPolicy {
     /// TTL for [`KvRole::System`] and [`KvRole::Project`] checkpoints, in
     /// seconds.
     pub ttl_tier_secs: u64,
+    /// Hard ceiling on total cache bytes, enforced after the TTL pass. `0`
+    /// disables the budget pass entirely — it means "unbounded", never
+    /// "evict everything".
+    pub max_bytes: u64,
 }
 
 impl SweepPolicy {
@@ -45,6 +70,7 @@ impl SweepPolicy {
         Self {
             ttl_session_secs: s.ttl_session_days.saturating_mul(SECS_PER_DAY),
             ttl_tier_secs: s.ttl_tier_days.saturating_mul(SECS_PER_DAY),
+            max_bytes: s.max_bytes,
         }
     }
 
@@ -80,6 +106,17 @@ pub struct SweepPlan {
 /// including those of any secondary engine — a `provider: local` sub-agent has
 /// its own system fingerprint, and omitting it is what used to delete that
 /// sub-agent's checkpoint on every single run.
+///
+/// Two phases. Phase 1 applies the per-node TTL and pin rules (see the module
+/// docs). Phase 2 then enforces `policy.max_bytes` over what phase 1 left,
+/// evicting least-recently-used survivors — ties broken by fingerprint — until
+/// the total fits. `max_bytes == 0` skips phase 2 entirely: it means
+/// "unbounded".
+///
+/// The budget is a target, not a licence. Phase 2 never touches a node that is
+/// pinned, active, or the parent of a phase-1 survivor, so when everything left
+/// is protected the plan leaves the total over budget rather than deleting
+/// something it must keep.
 #[must_use]
 pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: u64) -> SweepPlan {
     use std::collections::HashSet;
@@ -98,6 +135,59 @@ pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: 
             plan.bytes = plan.bytes.saturating_add(m.bytes);
             plan.doomed.push(i);
         }
+    }
+
+    // Phase 2: a hard ceiling. Runs only after phase 1's verdicts are fully
+    // determined, so the survivor set below is a pure function of the inputs and
+    // the eviction order does not depend on how the directory was scanned.
+    if policy.max_bytes == 0 {
+        return plan;
+    }
+    let doomed: HashSet<usize> = plan.doomed.iter().copied().collect();
+    let mut total: u64 = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !doomed.contains(i))
+        .fold(0u64, |acc, (_, m)| acc.saturating_add(m.bytes));
+    if total <= policy.max_bytes {
+        return plan;
+    }
+    // "Has a surviving child" is re-derived against the POST-phase-1 set:
+    // unlike phase 1, where reading the pre-sweep set is what makes the result
+    // order-independent, here a parent whose only child just expired must become
+    // evictable or it would outlive every budget forever.
+    let survivor_parents: HashSet<&str> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !doomed.contains(i))
+        .filter_map(|(_, m)| m.parent.as_deref())
+        .collect();
+    let mut candidates: Vec<usize> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !doomed.contains(i))
+        .filter(|(_, m)| {
+            !m.pinned
+                && !active.contains(&m.fingerprint.as_str())
+                && !survivor_parents.contains(m.fingerprint.as_str())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    // Least-recently-used first, ties broken by fingerprint so the order is
+    // total and reproducible.
+    candidates.sort_by(|&a, &b| {
+        nodes[a]
+            .last_used
+            .cmp(&nodes[b].last_used)
+            .then_with(|| nodes[a].fingerprint.cmp(&nodes[b].fingerprint))
+    });
+    for i in candidates {
+        if total <= policy.max_bytes {
+            break;
+        }
+        total = total.saturating_sub(nodes[i].bytes);
+        plan.bytes = plan.bytes.saturating_add(nodes[i].bytes);
+        plan.doomed.push(i);
     }
     plan
 }
@@ -130,6 +220,17 @@ mod tests {
         SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            max_bytes: 0,
+        }
+    }
+
+    /// A policy with the given budget and TTLs long enough that phase 1 never
+    /// fires, so a test isolates the budget pass.
+    fn budget_only(max_bytes: u64) -> SweepPolicy {
+        SweepPolicy {
+            ttl_session_secs: 9_999 * DAY,
+            ttl_tier_secs: 9_999 * DAY,
+            max_bytes,
         }
     }
 
@@ -248,6 +349,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            max_bytes: 0,
         };
         let mut pinned = node(KvRole::Session, "pin", None, 0);
         pinned.pinned = true;
@@ -258,5 +360,145 @@ mod tests {
         ];
         let plan = plan_sweep(&nodes, &["live"], &p, NOW);
         assert_eq!(doomed_fps(&plan, &nodes), vec!["gone".to_owned()]);
+    }
+
+    #[test]
+    fn a_zero_budget_disables_the_budget_pass() {
+        // 0 means unbounded, not "evict everything" — the inverse mistake would
+        // wipe the whole cache on every launch for anyone who never sets it.
+        let nodes = vec![
+            node(KvRole::Session, "a", None, 1),
+            node(KvRole::Session, "b", None, 2),
+        ];
+        assert!(
+            plan_sweep(&nodes, &[], &budget_only(0), NOW)
+                .doomed
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_total_under_budget_evicts_nothing() {
+        let nodes = vec![node(KvRole::Session, "a", None, 1)];
+        // `node` builds 100-byte blobs.
+        assert!(
+            plan_sweep(&nodes, &[], &budget_only(1_000), NOW)
+                .doomed
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn the_budget_pass_evicts_least_recently_used_first_until_under_budget() {
+        // Four 100-byte nodes, budget 250: evict until <= 250, so two must go,
+        // and they must be the two idlest.
+        let nodes = vec![
+            node(KvRole::Session, "newest", None, 1),
+            node(KvRole::Session, "oldest", None, 40),
+            node(KvRole::Session, "middle", None, 20),
+            node(KvRole::Session, "second-newest", None, 5),
+        ];
+        let plan = plan_sweep(&nodes, &[], &budget_only(250), NOW);
+        let mut gone: Vec<&str> = plan
+            .doomed
+            .iter()
+            .map(|&i| nodes[i].fingerprint.as_str())
+            .collect();
+        gone.sort_unstable();
+        assert_eq!(gone, vec!["middle", "oldest"]);
+        assert_eq!(plan.bytes, 200);
+    }
+
+    #[test]
+    fn the_budget_pass_spares_pinned_active_and_parents() {
+        // Every protection from phase 1 still holds in phase 2, so a tiny
+        // budget cannot evict a pinned node, the live chain, or an ancestor of
+        // a survivor — it just fails to reach the target.
+        let mut pinned = node(KvRole::Session, "pinned", None, 99);
+        pinned.pinned = true;
+        let nodes = vec![
+            pinned,
+            node(KvRole::System, "live", None, 99),
+            node(KvRole::System, "parent", None, 99),
+            node(KvRole::Session, "child", Some("parent"), 1),
+            node(KvRole::Session, "evictable", None, 99),
+        ];
+        let plan = plan_sweep(&nodes, &["live"], &budget_only(1), NOW);
+        let mut gone: Vec<&str> = plan
+            .doomed
+            .iter()
+            .map(|&i| nodes[i].fingerprint.as_str())
+            .collect();
+        gone.sort_unstable();
+        assert_eq!(
+            gone,
+            vec!["child", "evictable"],
+            "a budget is a target, not a licence to delete protected nodes"
+        );
+    }
+
+    #[test]
+    fn the_budget_pass_counts_only_what_phase_1_left() {
+        // Phase 1 kills 200 bytes of expired sessions; the remaining 100 is
+        // already under a 150 budget, so phase 2 must evict nothing more.
+        let p = SweepPolicy {
+            ttl_session_secs: 14 * DAY,
+            ttl_tier_secs: 30 * DAY,
+            max_bytes: 150,
+        };
+        let nodes = vec![
+            node(KvRole::Session, "expired-1", None, 99),
+            node(KvRole::Session, "expired-2", None, 99),
+            node(KvRole::Session, "fresh", None, 1),
+        ];
+        let plan = plan_sweep(&nodes, &[], &p, NOW);
+        let mut gone: Vec<&str> = plan
+            .doomed
+            .iter()
+            .map(|&i| nodes[i].fingerprint.as_str())
+            .collect();
+        gone.sort_unstable();
+        assert_eq!(gone, vec!["expired-1", "expired-2"]);
+    }
+
+    #[test]
+    fn a_parent_orphaned_by_phase_1_becomes_evictable_in_phase_2() {
+        // Phase 2's "has a surviving child" test reads the POST-phase-1 set,
+        // unlike phase 1's, which reads the pre-sweep set. Otherwise a parent
+        // whose only child just expired would be immortal under any budget.
+        let p = SweepPolicy {
+            ttl_session_secs: 14 * DAY,
+            ttl_tier_secs: 9_999 * DAY,
+            max_bytes: 1,
+        };
+        let nodes = vec![
+            node(KvRole::System, "parent", None, 99),
+            node(KvRole::Session, "dead-child", Some("parent"), 99),
+        ];
+        let plan = plan_sweep(&nodes, &[], &p, NOW);
+        let mut gone: Vec<&str> = plan
+            .doomed
+            .iter()
+            .map(|&i| nodes[i].fingerprint.as_str())
+            .collect();
+        gone.sort_unstable();
+        assert_eq!(gone, vec!["dead-child", "parent"]);
+    }
+
+    #[test]
+    fn the_budget_pass_is_deterministic_regardless_of_input_order() {
+        // The whole reason phase 2 sorts before evicting. Two nodes with the
+        // same last_used tie-break on fingerprint, so reversing the input must
+        // not change the outcome.
+        let a = node(KvRole::Session, "aaa", None, 50);
+        let b = node(KvRole::Session, "bbb", None, 50);
+        let fwd = plan_sweep(&[a.clone(), b.clone()], &[], &budget_only(100), NOW);
+        let rev = plan_sweep(&[b, a], &[], &budget_only(100), NOW);
+        assert_eq!(fwd.doomed.len(), 1);
+        assert_eq!(rev.doomed.len(), 1);
+        assert_eq!(fwd.bytes, rev.bytes);
+        // Forward: index 0 is "aaa"; reversed: index 1 is "aaa". Same node.
+        assert_eq!(fwd.doomed[0], 0);
+        assert_eq!(rev.doomed[0], 1);
     }
 }

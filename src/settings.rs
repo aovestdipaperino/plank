@@ -297,9 +297,11 @@ pub struct KvCacheSettings {
     /// Days a system-prompt or project-stable checkpoint survives after its
     /// last use.
     pub ttl_tier_days: u64,
-    /// Advisory size ceiling in bytes, surfaced as a warning in `/kvcache`.
-    /// `0` means unset. It never evicts anything: eviction decisions stay
-    /// per-node so a sweep does not depend on directory scan order.
+    /// Hard size ceiling in bytes, enforced after the TTL sweep: survivors are
+    /// evicted least-recently-used first until the total fits. `0` disables the
+    /// ceiling — it means unbounded, never "evict everything". Pinned, active
+    /// and parent-of-a-survivor nodes are spared even when that leaves the
+    /// total over budget.
     pub max_bytes: u64,
 }
 
@@ -308,7 +310,7 @@ impl Default for KvCacheSettings {
         Self {
             ttl_session_days: 14,
             ttl_tier_days: 30,
-            max_bytes: 0,
+            max_bytes: 21_474_836_480,
         }
     }
 }
@@ -973,11 +975,18 @@ mod tests {
     }
 
     #[test]
+    fn the_kvcache_budget_defaults_to_twenty_gigabytes() {
+        // A real ceiling, not a warning: the TTL sweep alone puts no upper
+        // bound on the cache.
+        assert_eq!(Settings::default().kvcache.max_bytes, 21_474_836_480);
+    }
+
+    #[test]
     fn kvcache_block_overlays_and_defaults() {
         let mut s = Settings::default();
         assert_eq!(s.kvcache.ttl_session_days, 14);
         assert_eq!(s.kvcache.ttl_tier_days, 30);
-        assert_eq!(s.kvcache.max_bytes, 0, "unset by default");
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480, "20 GB by default");
 
         s.overlay(r#"{"kvcache":{"ttlSessionDays":7,"ttlTierDays":60,"maxBytes":21474836480}}"#);
         assert_eq!(s.kvcache.ttl_session_days, 7);

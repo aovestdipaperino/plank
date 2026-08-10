@@ -2341,6 +2341,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
         };
         // Two Tier 1 fingerprints are live, not one: a session can hold two
         // engines — a provider main agent beside a `provider: local` sub-agent —
@@ -2411,6 +2412,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
         assert_eq!(
@@ -2460,6 +2462,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
         assert_eq!(
@@ -2486,6 +2489,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            max_bytes: 0,
         };
         assert_eq!(store.sweep(&[], &policy, crate::kvmeta::now_secs()), 5);
         assert!(!blob.exists());
