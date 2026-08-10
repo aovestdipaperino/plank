@@ -6268,6 +6268,14 @@ impl Agent<'_> {
                                 remote_abandon(rem);
                                 return Ok(crt_frame);
                             }
+                            // `/goal` arms a loop instead of running one: it
+                            // cannot start a turn from inside `tui_slash`, which
+                            // has no terminal handles of its own. `self.goal` is
+                            // `None` at every prompt, so this means exactly
+                            // "`/goal` just started one".
+                            if self.goal.is_some() {
+                                run = true;
+                            }
                         } else {
                             r.bus.broadcast(UiEvent::UserEcho(line.clone()));
                             log.push_spans(tui::user_echo_spans(&line));
@@ -6742,6 +6750,22 @@ impl Agent<'_> {
                             &mut sub_pane,
                         ) {
                             break;
+                        }
+                        // `/goal` arms a loop instead of running one: it cannot
+                        // start a turn from inside `tui_slash`, which has no
+                        // terminal handles of its own. `self.goal` is `None` at
+                        // every prompt (both loops clear it before returning),
+                        // so this means exactly "`/goal` just started one".
+                        if self.goal.is_some() {
+                            self.tui_turn(
+                                terminal,
+                                &mut log,
+                                &mut view,
+                                &mut input,
+                                &mut btw_panel,
+                                &mut arcade,
+                                &mut sub_pane,
+                            )?;
                         }
                     } else {
                         // The engine is text-only: attach pasted images as
@@ -7265,6 +7289,9 @@ impl Agent<'_> {
     /// the UI thread keeps the terminal live (typing, scrolling, interrupts),
     /// then feeds user lines queued during the turn into follow-up turns.
     #[allow(clippy::too_many_arguments)]
+    // Flat turn/leftover/goal loop; splitting it would only scatter the shared
+    // per-iteration bindings across helpers.
+    #[allow(clippy::too_many_lines)]
     fn tui_turn(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
@@ -7351,6 +7378,90 @@ impl Agent<'_> {
             let leftover = shared.take_queued();
             carry_btw = shared.take_btw();
             if leftover.is_empty() && carry_btw.is_empty() {
+                // A live goal is another kind of "leftover": adjudicate, and on
+                // CONTINUE re-enter the loop as if a queued line had arrived.
+                // The mirror of `run_goal_loop`/`drive_goal_loop` on the plain
+                // path (CLAUDE.md) — including its invariant that `self.goal`
+                // is `None` on *every* exit, error returns included, so each
+                // fallible step here clears it before propagating.
+                if self.goal.is_some() {
+                    let iters = self
+                        .goal
+                        .as_ref()
+                        .expect("goal is live in this branch")
+                        .iter();
+                    // Esc reaches the TUI through the turn's shared flag as well
+                    // as the process-wide one, and aborts the whole goal rather
+                    // than only the turn that saw it. Checked before the
+                    // adjudication, as on the plain path: a user who pressed Esc
+                    // should not then wait out another generation.
+                    let interrupted = shared.interrupt.load(Ordering::Relaxed)
+                        || crate::interrupt::pending()
+                        || self.last_turn_interrupted;
+                    let settled = if interrupted {
+                        Some((crate::goal::Outcome::Interrupted, String::new()))
+                    } else {
+                        // `live` was captured for this loop iteration and is
+                        // passed by reference, so the turn's own `run_worker_ui`
+                        // call left it usable; no need to re-capture.
+                        let adj = run_worker_ui(
+                            terminal,
+                            log,
+                            view,
+                            input,
+                            btw,
+                            arcade,
+                            sub,
+                            shared,
+                            bus_ref,
+                            rem,
+                            None,
+                            &live,
+                            |tx| self.adjudicate_worker(&tx, shared),
+                        )
+                        .and_then(|inner| inner);
+                        // Both the UI-side and worker-side errors land here; the
+                        // goal must be cleared before either propagates.
+                        let adj = match adj {
+                            Ok(adj) => adj,
+                            Err(e) => {
+                                self.goal = None;
+                                return Err(e);
+                            }
+                        };
+                        // Re-checked: an Esc pressed *during* the adjudication
+                        // only makes it `keep_going`, which on the last
+                        // iteration would otherwise read as a cap rather than
+                        // as the abort the user asked for.
+                        if shared.interrupt.load(Ordering::Relaxed)
+                            || crate::interrupt::pending()
+                            || self.last_turn_interrupted
+                        {
+                            Some((crate::goal::Outcome::Interrupted, String::new()))
+                        } else {
+                            let at_cap = self
+                                .goal
+                                .as_ref()
+                                .expect("goal is live in this branch")
+                                .at_cap();
+                            crate::goal::Outcome::from_verdict(adj.verdict)
+                                .or(at_cap.then_some(crate::goal::Outcome::Cap))
+                                .map(|o| (o, adj.reason))
+                        }
+                    };
+                    if let Some((outcome, reason)) = settled {
+                        self.goal = None;
+                        log.push_dim(crate::goal::closing(outcome, iters, &reason));
+                    } else {
+                        let (iter, max) = {
+                            let g = self.goal.as_mut().expect("goal is live in this branch");
+                            (g.next_iteration(), g.max_iters())
+                        };
+                        log.push_dim(crate::goal::banner(iter, max));
+                        run_main = true;
+                        continue;
+                    }
+                }
                 // Closing line, before anything switches to idle: `turn_started`
                 // covers the whole user turn — every generate/tools round, plus
                 // any leftover-queued follow-ups this loop absorbed — not the
@@ -7714,6 +7825,34 @@ impl Agent<'_> {
             }
             return Ok(());
         }
+    }
+
+    /// Worker-thread mirror of [`Self::adjudicate_plain`]: one generation, no
+    /// tool dispatch, output routed through the turn's UI channel.
+    ///
+    /// Like the plain path, the prompt and the reply both stay in the
+    /// transcript: popping them would truncate the session behind the engine's
+    /// live KV and force a warm reset every iteration.
+    ///
+    /// `is_main: false` keeps this out of the main-pass machinery — an
+    /// adjudication is never preempted by a `/btw` and never resumes a frozen
+    /// reply.
+    fn adjudicate_worker(
+        &mut self,
+        tx: &Sender<UiEvent>,
+        shared: &TurnShared,
+    ) -> Result<crate::goal::Adjudication, String> {
+        self.session
+            .push(Message::user(crate::goal::ADJUDICATION_PROMPT));
+        let prompt = render_transcript(&self.session, &self.system);
+        let out = self.worker_generate(tx, shared, &prompt, Instant::now(), false)?;
+        self.session
+            .push(Message::assistant(out.assistant_text.clone()));
+        // Work instead of a verdict, or a cut-off pass: neither settles a goal.
+        if out.interrupted || !out.calls.is_empty() {
+            return Ok(crate::goal::Adjudication::keep_going());
+        }
+        Ok(crate::goal::parse_verdict(&out.assistant_text))
     }
 
     /// Answers queued `/btw` side questions FIFO at a generation boundary
@@ -8325,6 +8464,22 @@ impl Agent<'_> {
                     log.push_dim(format!("{cmd}: resumed where you left off"));
                 }
             }
+            // `tui_slash` returns `bool` and has no terminal handles of its own,
+            // so it can only *arm* the loop; the call sites in `tui_loop` see
+            // `self.goal` set and start the first turn.
+            "/goal" => match crate::goal::parse_command(arg) {
+                Ok((goal, max)) => {
+                    self.goal = Some(crate::goal::GoalLoop::new(&goal, max));
+                    self.session
+                        .push(Message::user(crate::goal::kickoff_message(&goal)));
+                    let (iter, m) = {
+                        let g = self.goal.as_mut().expect("just set");
+                        (g.next_iteration(), g.max_iters())
+                    };
+                    log.push_dim(crate::goal::banner(iter, m));
+                }
+                Err(usage) => log.push_dim(usage),
+            },
             "/config" => {
                 // Open the interactive modal; the run loop drives it and
                 // persists on close. `arg` is ignored (the form edits everything).
@@ -15793,6 +15948,36 @@ mod tests {
         assert!(
             agent.goal.is_none(),
             "goal state must clear even on an error return"
+        );
+    }
+
+    /// The TUI's `tui_turn` hook needs a live terminal, but its worker-side
+    /// adjudication does not: this covers the piece that decides the loop, and
+    /// pins the no-pop rule that keeps the KV prefix stable.
+    #[test]
+    fn worker_adjudication_parses_the_verdict_and_keeps_the_exchange() {
+        let dir = scratch_dir("goal-worker-adjudicate");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![verdict_reply("NEEDS_USER", "which database?")],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        // `_rx` must outlive the call: dropping it makes every `tx.send` fail.
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        let adj = agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("adjudication runs");
+        assert_eq!(adj.verdict, crate::goal::Verdict::NeedsUser);
+        assert_eq!(adj.reason, "which database?");
+        let transcript = render_transcript(&agent.session, &agent.system);
+        assert!(
+            transcript.contains("GOAL_VERDICT: NEEDS_USER"),
+            "verdict reply was popped: {transcript}"
         );
     }
 
