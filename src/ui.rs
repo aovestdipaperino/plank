@@ -989,9 +989,42 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
     messages
         .iter()
         .rev()
-        .find(|m| matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty())
-        .map(|m| m.text.trim().to_owned())
+        .filter(|m| matches!(m.role, crate::session::Role::Assistant))
+        .map(|m| strip_thinking(&m.text))
+        .find(|text| !text.is_empty())
 }
+
+/// Removes `<think>…</think>` blocks from an assistant message, leaving the
+/// prose it actually said.
+///
+/// Every caller of [`last_assistant_text`] is extracting a sub-agent's *report*,
+/// which becomes a tool observation in the parent's transcript. A transcript
+/// keeps thinking verbatim (the KV prefix depends on it), so the raw text
+/// carries the sub-agent's reasoning — and handing that to the parent as the
+/// report makes it read as a muddle of half-conclusions the parent then feels
+/// obliged to re-verify. The reasoning was already on screen in the sub-agent's
+/// own pane; the report is the answer.
+///
+/// An unterminated block (an interrupted run) is dropped to the end, since
+/// everything after an unclosed `<think>` is thinking by definition.
+fn strip_thinking(text: &str) -> String {
+    const OPEN: &str = "<think>";
+    const CLOSE: &str = "</think>";
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find(OPEN) {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + OPEN.len()..];
+        let Some(end) = after.find(CLOSE) else {
+            // Unterminated: everything after an unclosed `<think>` is thinking.
+            return out.trim().to_owned();
+        };
+        rest = &after[end + CLOSE.len()..];
+    }
+    out.push_str(rest);
+    out.trim().to_owned()
+}
+
 /// Concatenates tool outputs into the model-facing result block, given
 /// `(tool name, output)` pairs in the model's call order.
 ///
@@ -14368,6 +14401,60 @@ mod tests {
             "the cached engine served every dispatch"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    #[test]
+    fn a_subagents_report_carries_its_answer_and_not_its_thinking() {
+        use crate::session::Message;
+
+        // The report becomes a tool observation in the parent's transcript. A
+        // transcript keeps thinking verbatim, so the raw text carries the
+        // sub-agent's reasoning — handing that over makes the report read as a
+        // muddle the parent then re-verifies by hand.
+        let msgs = vec![
+            Message::user("count the characters"),
+            Message::assistant(
+                "<think>the script says XXXVIII, but let me reconsider — \
+                 maybe XXXIIX? no, that is not how it works</think>\
+                 38 = XXXVIII, 7 characters.",
+            ),
+        ];
+        let report = last_assistant_text(&msgs).expect("a report");
+        assert_eq!(report, "38 = XXXVIII, 7 characters.");
+        assert!(!report.contains("script says"), "{report}");
+        assert!(!report.contains("<think>"), "{report}");
+    }
+
+    #[test]
+    fn a_report_that_is_only_thinking_falls_back_to_an_earlier_answer() {
+        use crate::session::Message;
+
+        // A pass that produced nothing but reasoning must not blank the report:
+        // the emptiness test runs *after* the strip, so the scan keeps walking
+        // back to the last thing the sub-agent actually said.
+        let msgs = vec![
+            Message::assistant("the earlier answer"),
+            Message::user("<tool_result>ok</tool_result>"),
+            Message::assistant("<think>still deciding</think>"),
+        ];
+        assert_eq!(
+            last_assistant_text(&msgs).as_deref(),
+            Some("the earlier answer")
+        );
+
+        // An interrupted run leaves the block unterminated; everything after an
+        // unclosed `<think>` is thinking by definition.
+        assert_eq!(
+            strip_thinking("said it<think>cut off mid-thought"),
+            "said it"
+        );
+        assert_eq!(strip_thinking("<think>only thinking"), "");
+        assert_eq!(strip_thinking("plain prose"), "plain prose");
+        assert_eq!(
+            strip_thinking("<think>a</think>one<think>b</think>two"),
+            "onetwo",
+            "every block goes, not just the first"
+        );
     }
 
     #[test]
