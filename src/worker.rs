@@ -86,13 +86,39 @@ pub enum UiEvent {
     /// main log back to the last [`UiEvent::MainCheckpoint`] so the re-run
     /// does not duplicate the discarded partial output.
     MainRollback,
-    /// A sub-agent run began; the payload is its display label (the configured
-    /// agent name, or a generic one for an unnamed sub-agent). The UI clears
-    /// the sub-agent buffer and starts filling it.
-    SubStart(String),
+    /// A sub-agent run began: the UI opens a roster row for it and starts
+    /// filling its buffer.
+    SubStart {
+        /// Display label — the configured agent name, or a generic one for an
+        /// unnamed sub-agent.
+        label: String,
+        /// What the agent was asked to do, as the roster row reports it beside
+        /// the name. The delegated task, not the agent's output: a row summarises
+        /// the job, and a tail of streamed text lands mid-token on whatever the
+        /// model happens to be writing (`vals =`).
+        task: String,
+    },
     /// The sub-agent run finished, successfully or not. The buffer is kept so
-    /// the user can still read it.
+    /// the user can still read it, and its roster row freezes its elapsed time.
     SubEnd,
+    /// One *completed* pass's token spend for a running sub-agent, so its roster
+    /// row can report what it is costing. Emitted per pass rather than once at
+    /// the end: a long run's row would otherwise read as free right up to the
+    /// moment it finishes. While a pass is still in flight the row tracks the
+    /// worker's [`UiEvent::Status`] snapshots instead — this arrives only once
+    /// the pass is done, so the two never double-count.
+    ///
+    /// `label` names the row when the emitter knows it — a fan-out has several
+    /// rows open at once and folds their passes in together, so "the current
+    /// run" would credit them all to whichever started last. `None` means the
+    /// current run, which is what the serial path has.
+    SubTokens {
+        label: Option<String>,
+        /// Tokens the pass ingested (prompt / prefill).
+        prefill: u64,
+        /// Tokens the pass generated.
+        generated: u64,
+    },
     /// One render payload destined for the sub-agent buffer rather than the
     /// main log. Boxed so the enum does not grow by a whole `UiEvent`.
     Sub(Box<UiEvent>),
@@ -119,7 +145,11 @@ impl UiEvent {
     pub fn is_local_pane_only(&self) -> bool {
         matches!(
             self,
-            Self::SubStart(_) | Self::SubEnd | Self::Sub(_) | Self::Btw(_)
+            Self::SubStart { .. }
+                | Self::SubEnd
+                | Self::SubTokens { .. }
+                | Self::Sub(_)
+                | Self::Btw(_)
         )
     }
 }
@@ -451,8 +481,9 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         | UiEvent::BtwEnd
         | UiEvent::MainCheckpoint
         | UiEvent::MainRollback
-        | UiEvent::SubStart(_)
+        | UiEvent::SubStart { .. }
         | UiEvent::SubEnd
+        | UiEvent::SubTokens { .. }
         | UiEvent::Sub(_)
         | UiEvent::Btw(_) => {}
     }
@@ -503,7 +534,13 @@ mod tests {
 
     #[test]
     fn sub_agent_events_are_local_pane_only_and_never_reach_the_bus() {
-        assert!(UiEvent::SubStart("agent".to_string()).is_local_pane_only());
+        assert!(
+            UiEvent::SubStart {
+                label: "agent".to_string(),
+                task: "t".to_string(),
+            }
+            .is_local_pane_only()
+        );
         assert!(UiEvent::SubEnd.is_local_pane_only());
         assert!(UiEvent::Sub(Box::new(UiEvent::Visible("x".to_string()))).is_local_pane_only());
         assert!(!UiEvent::Visible("v".to_string()).is_local_pane_only());
@@ -515,7 +552,10 @@ mod tests {
         let rx = bus.subscribe();
         let stream = [
             UiEvent::Visible("before".to_string()),
-            UiEvent::SubStart("agent".to_string()),
+            UiEvent::SubStart {
+                label: "agent".to_string(),
+                task: "t".to_string(),
+            },
             UiEvent::Sub(Box::new(UiEvent::Visible("noise".to_string()))),
             UiEvent::SubEnd,
             UiEvent::Visible("after".to_string()),
@@ -541,7 +581,13 @@ mod tests {
         // and applies the inner event to the sub-agent buffer instead.
         let mut log = OutputLog::new();
         let before = log.line_count();
-        apply(&mut log, UiEvent::SubStart("research".to_string()));
+        apply(
+            &mut log,
+            UiEvent::SubStart {
+                label: "research".to_string(),
+                task: "t".to_string(),
+            },
+        );
         apply(
             &mut log,
             UiEvent::Sub(Box::new(UiEvent::Visible("x".to_string()))),

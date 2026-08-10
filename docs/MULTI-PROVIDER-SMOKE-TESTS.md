@@ -115,9 +115,9 @@ the *model*, not from you.
 **Run:** `/subagent:remote-reviewer summarise what src/agents.rs does`
 
 **Expect:**
-- A `[sub-agent: remote-reviewer — ctrl+o to follow]` line.
-- `ctrl+o` shows the sidechain; its text reads like the remote model, not the
-  local one.
+- A `[sub-agent: remote-reviewer — ← for agents]` line.
+- A roster row for `remote-reviewer` below the status bar, ticking; `←` then
+  Enter expands it, and its text reads like the remote model, not the local one.
 - Only the framed report enters the main conversation.
 - The footer's engine-origin indicator still shows the **main** engine
   afterwards — the swap was restored.
@@ -186,8 +186,8 @@ each with a `provider:`/`model:`, then ask for work that splits cleanly:
 > sub-agent for each
 
 **Expect:**
-- A single `[sub-agents: remote-a, remote-b, remote-c — ctrl+o to follow]` line,
-  plural.
+- A single `[sub-agents: remote-a, remote-b, remote-c — ← for agents]` line,
+  plural, and three roster rows ticking together.
 - Wall-clock close to the *slowest* sub-agent, not the sum. Time it — this is the
   only check that proves concurrency rather than fast serial execution.
 - Reports appear in the order the model requested them, regardless of which

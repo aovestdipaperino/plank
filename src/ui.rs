@@ -635,6 +635,7 @@ impl CompactSink for TuiCompactSink<'_> {
                 None,
                 &tui::TaskView::default(),
                 None,
+                &tui::RosterView::default(),
             );
         });
     }
@@ -698,6 +699,10 @@ struct FanoutSlot {
     /// are always clean-room.
     session: Session,
     label: String,
+    /// The delegated task, kept for the slot's roster row. The framed task in
+    /// `session` is wrapped in the sub-agent envelope, so it is not the plain
+    /// text a row wants to show.
+    task: String,
     /// Model text accumulated for the pane, flushed as one labelled block when
     /// the whole fan-out finishes.
     output: String,
@@ -987,7 +992,6 @@ fn last_assistant_text(messages: &[Message]) -> Option<String> {
         .find(|m| matches!(m.role, crate::session::Role::Assistant) && !m.text.trim().is_empty())
         .map(|m| m.text.trim().to_owned())
 }
-
 /// Concatenates tool outputs into the model-facing result block, given
 /// `(tool name, output)` pairs in the model's call order.
 ///
@@ -1809,7 +1813,10 @@ impl Agent<'_> {
         self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagent_signpost(
             &label,
         )));
-        self.emit_sub(crate::worker::UiEvent::SubStart(label));
+        self.emit_sub(crate::worker::UiEvent::SubStart {
+            label,
+            task: task.clone(),
+        });
         self.tool_ctx.subagent_depth += 1;
         let result = match alt {
             None => self.run_subagent_loop(),
@@ -2763,6 +2770,16 @@ impl Agent<'_> {
         if let Some(u) = stats.usage {
             self.usage.total.add(u);
             self.usage.turns += 1;
+        }
+
+        // Inside a sub-agent, credit the run's roster row too. The serial path
+        // has exactly one run open, so the row needs no naming.
+        if self.tool_ctx.subagent_depth > 0 {
+            self.emit_sub(crate::worker::UiEvent::SubTokens {
+                label: None,
+                prefill: u64::try_from(input.max(0)).unwrap_or(0),
+                generated: u64::try_from(output.max(0)).unwrap_or(0),
+            });
         }
     }
 
@@ -4395,6 +4412,7 @@ the original is frozen and listed in /tree"
                         engine,
                         session,
                         label: label.clone(),
+                        task: task.clone(),
                         output: String::new(),
                         pending_calls: Vec::new(),
                         done: false,
@@ -4427,6 +4445,15 @@ the original is frozen and listed in /tree"
         self.emit_sub(crate::worker::UiEvent::Dim(crate::tui::subagents_signpost(
             &labels,
         )));
+        // Open every roster row before the rounds start, not at flush time: the
+        // fan-out buffers its output (see `flush_fanout_panes`), so rows created
+        // only at the flush would all report having taken no time at all.
+        for slot in &slots {
+            self.emit_sub(crate::worker::UiEvent::SubStart {
+                label: slot.label.clone(),
+                task: slot.task.clone(),
+            });
+        }
         self.tool_ctx.subagent_depth += 1;
         self.run_fanout_rounds(&mut slots, width);
         self.tool_ctx.subagent_depth -= 1;
@@ -4514,29 +4541,7 @@ the original is frozen and listed in /tree"
                         slot.done = true;
                     }
                     Ok(pass) => {
-                        // A fan-out slot runs on its own engine, so its tokens
-                        // belong in that engine's row rather than the main
-                        // agent's — and they were never counted at all before
-                        // the breakdown made their absence visible. The usage
-                        // block is the only valid source here: the local
-                        // ctx-delta estimate is keyed to `self.last_ctx_used`,
-                        // which describes the main engine's context, not this
-                        // slot's. Fan-out is provider-only by construction, so
-                        // there is nothing to fall back to.
-                        if let Some(u) = pass.stats.usage {
-                            self.stats.add(
-                                &engine_stats_label(&*slot.engine),
-                                u64::try_from(
-                                    i64::from(u.input_tokens)
-                                        + i64::from(u.cache_read_tokens)
-                                        + i64::from(u.cache_write_tokens),
-                                )
-                                .unwrap_or(0),
-                                u64::try_from(u.output_tokens).unwrap_or(0),
-                            );
-                            self.usage.total.add(u);
-                            self.usage.turns += 1;
-                        }
+                        self.fold_fanout_usage(slot, pass.stats.usage);
                         slot.session.push(Message::assistant(pass.assistant_text));
                         if last_round {
                             slot.done = true;
@@ -4589,6 +4594,40 @@ the original is frozen and listed in /tree"
         }
     }
 
+    /// Folds one fan-out pass's token usage in: into the session breakdown under
+    /// the slot's own engine, into the billed total, and into the slot's roster
+    /// row.
+    ///
+    /// A fan-out slot runs on its own engine, so its tokens belong in that
+    /// engine's row rather than the main agent's — and they were never counted at
+    /// all before the breakdown made their absence visible. The usage block is
+    /// the only valid source here: the local ctx-delta estimate is keyed to
+    /// `self.last_ctx_used`, which describes the main engine's context, not this
+    /// slot's. Fan-out is provider-only by construction, so there is nothing to
+    /// fall back to when `usage` is absent.
+    fn fold_fanout_usage(&mut self, slot: &FanoutSlot, usage: Option<crate::engine::TokenUsage>) {
+        let Some(u) = usage else { return };
+        self.stats.add(
+            &engine_stats_label(&*slot.engine),
+            u64::try_from(
+                i64::from(u.input_tokens)
+                    + i64::from(u.cache_read_tokens)
+                    + i64::from(u.cache_write_tokens),
+            )
+            .unwrap_or(0),
+            u64::try_from(u.output_tokens).unwrap_or(0),
+        );
+        self.usage.total.add(u);
+        self.usage.turns += 1;
+        // Credit the slot's own roster row. Several are open at once here, so
+        // the row has to be named rather than left to "the current run".
+        self.emit_sub(crate::worker::UiEvent::SubTokens {
+            label: Some(slot.label.clone()),
+            prefill: u64::try_from(i64::from(u.input_tokens)).unwrap_or(0),
+            generated: u64::try_from(i64::from(u.output_tokens)).unwrap_or(0),
+        });
+    }
+
     /// Appends each slot's buffered output to the sub-agent pane as one labelled
     /// block, in call order.
     ///
@@ -4597,7 +4636,10 @@ the original is frozen and listed in /tree"
     /// and flushes; the serial path still streams live.
     fn flush_fanout_panes(&mut self, slots: &[FanoutSlot]) {
         for slot in slots {
-            self.emit_sub(crate::worker::UiEvent::SubStart(slot.label.clone()));
+            self.emit_sub(crate::worker::UiEvent::SubStart {
+                label: slot.label.clone(),
+                task: slot.task.clone(),
+            });
             if !slot.output.trim().is_empty() {
                 self.emit_sub(crate::worker::UiEvent::Sub(Box::new(
                     crate::worker::UiEvent::Visible(slot.output.clone()),
@@ -5677,22 +5719,25 @@ impl Agent<'_> {
             // closure: a Ctrl-O pressed while idle has to be visible here too.
             let sub_active = sub_pane.active;
             // Owned so the draw closure does not hold a borrow of `sub_pane`
-            // alongside the mutable borrow of its view.
+            // alongside the mutable borrow of its view. The roster is snapshotted
+            // for the same reason.
             let sub_title: Option<String> = if sub_active {
-                sub_pane.label.clone()
+                sub_pane.label().map(str::to_owned)
             } else {
                 None
             };
-            let idle_status = if let (true, Some(label)) = (sub_active, sub_pane.label.as_deref()) {
-                format!("[sub-agent: {label}] {status}")
-            } else {
-                status
+            let idle_status = match sub_title.as_deref() {
+                Some(label) => format!("[sub-agent: {label}] {status}"),
+                None => status,
             };
-            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
-                (&sub_pane.log, &mut sub_pane.view)
-            } else {
-                (&log, &mut view)
-            };
+            let roster = sub_pane.roster_view(tui::roster_clock_ms());
+            let roster_rows = roster.height();
+            let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
+            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+                match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
+                    Some(run) => (&run.log, &mut run.view),
+                    None => (&log, &mut view),
+                };
             let completed = terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
@@ -5709,6 +5754,7 @@ impl Agent<'_> {
                             &idle_status,
                             draw_view,
                             &task_view,
+                            &roster,
                         );
                     } else {
                         tui::draw(
@@ -5720,13 +5766,14 @@ impl Agent<'_> {
                             selection,
                             &task_view,
                             sub_title.as_deref(),
+                            &roster,
                         );
                     }
                     if let Some(m) = &input.slash {
-                        tui::draw_slash_menu(f, input.buf.text(), m);
+                        tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
                     }
                     if let Some(p) = &input.popup {
-                        tui::draw_popup(f, input.buf.text(), p);
+                        tui::draw_popup(f, input.buf.text(), p, roster_rows);
                     }
                     if let Some(form) = &config_form {
                         tui::draw_config(f, form);
@@ -6050,10 +6097,18 @@ impl Agent<'_> {
             // into word-wise operations.
             let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
             match key.code {
-                // Ctrl-O switches between the main transcript and the most
-                // recent sub-agent's output, while idle as well as mid-turn.
-                KeyCode::Char('o') if ctrl => {
-                    if !sub_pane.toggle() {
+                // `←` on an empty prompt reaches into the sub-agent roster below
+                // the status bar: it reveals the cursor, then walks up the rows
+                // (toward `main`). `→` walks back down, Enter expands the
+                // selected agent's output, Esc leaves. With text in the prompt
+                // the arrows stay cursor motion, so typing is never hijacked.
+                KeyCode::Left | KeyCode::Right
+                    if input.buf.text().is_empty()
+                        && !word_mod
+                        && (sub_pane.selecting || key.code == KeyCode::Left) =>
+                {
+                    let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                    if !sub_pane.move_cursor(delta) {
                         log.push_dim("[no sub-agent has run yet]");
                     }
                     // A selection belongs to the pane it was dragged over, so it
@@ -6061,6 +6116,14 @@ impl Agent<'_> {
                     // would be painted over the other pane's text. (Every key
                     // already clears it above; kept here so the invariant is
                     // stated where the switch happens.)
+                    selection = None;
+                }
+                KeyCode::Enter if sub_pane.selecting && input.buf.text().is_empty() => {
+                    // On the `main` row there is nothing to expand: leave the
+                    // roster instead, which is what the row means.
+                    if !sub_pane.expand() {
+                        sub_pane.collapse();
+                    }
                     selection = None;
                 }
                 KeyCode::Char('c') if ctrl => {
@@ -6125,6 +6188,9 @@ impl Agent<'_> {
                 KeyCode::Down => input.history_move(1),
                 // Esc while idle dismisses a `/btw` panel left open from an
                 // earlier turn (the only way it ever closes).
+                // Esc leaves the roster before it closes a `/btw` panel: the
+                // roster is the thing the user is looking at when both are up.
+                KeyCode::Esc if sub_pane.collapse() => {}
                 KeyCode::Esc if btw_panel.is_some() => btw_panel = None,
                 // Shift+Enter inserts a newline instead of submitting.
                 // Terminals without the kitty keyboard protocol cannot
@@ -6164,7 +6230,10 @@ impl Agent<'_> {
                     input.slash = None;
                     input.hist_idx = None;
                     view.follow = true;
-                    sub_pane.view.follow = true;
+                    // A submitted prompt is about the main conversation: leave
+                    // the roster and re-pin every pane to its newest output.
+                    sub_pane.collapse();
+                    sub_pane.follow_all();
                     if line.is_empty() && attachments.is_empty() {
                         continue;
                     }
@@ -6326,6 +6395,7 @@ impl Agent<'_> {
                         None,
                         &tui::TaskView::default(),
                         None,
+                        &tui::RosterView::default(),
                     );
                 });
                 self.dirty = false;
@@ -7816,7 +7886,17 @@ impl Agent<'_> {
                     ))));
                     let (l, v) = (&*log, &mut *view);
                     let _ = terminal.draw(|f| {
-                        tui::draw(f, l, None, "", v, None, &tui::TaskView::default(), None);
+                        tui::draw(
+                            f,
+                            l,
+                            None,
+                            "",
+                            v,
+                            None,
+                            &tui::TaskView::default(),
+                            None,
+                            &tui::RosterView::default(),
+                        );
                     });
                 });
                 log.set_progress(None);
@@ -8105,6 +8185,7 @@ impl Agent<'_> {
                                     None,
                                     &tui::TaskView::default(),
                                     None,
+                                    &tui::RosterView::default(),
                                 );
                             });
                         }
@@ -8201,7 +8282,7 @@ impl Agent<'_> {
                     let fork_at =
                         self.begin_subagent_fork(instructions.as_deref(), &task, alt.is_none());
                     log.push_dim(tui::subagent_signpost(&label));
-                    sub.begin(label);
+                    sub.begin(label, &task, tui::roster_clock_ms());
                     sub.adopt_turn = true;
                     let outcome = match alt {
                         None => self.tui_turn(terminal, log, view, input, btw, arcade, sub),
@@ -8210,7 +8291,7 @@ impl Agent<'_> {
                         }),
                     };
                     sub.adopt_turn = false;
-                    sub.end();
+                    sub.end(tui::roster_clock_ms());
                     if let Err(e) = outcome {
                         // Restore the transcript even when the turn errored.
                         self.finish_subagent_fork(fork_at, &task);
@@ -8696,10 +8777,17 @@ fn busy_ui_loop(
                     log.set_progress(
                         status::progress_segment(&st, false).map(|p| tui::progress_line(&p)),
                     );
+                    // The snapshot describes whichever pass the engine is
+                    // running, so while a lone sub-agent holds it, it is that
+                    // sub-agent's — and the only live token count its roster row
+                    // can have. `record_usage` only reports a pass once it is
+                    // done, which for a long local pass is minutes of a blank
+                    // column.
+                    sub.note_status(&st);
                     // While the sub-agent pane is on screen the status line
                     // must say so, or the user cannot tell which transcript
                     // they are reading.
-                    if let (true, Some(label)) = (sub.active, sub.label.as_deref()) {
+                    if let (true, Some(label)) = (sub.active, sub.label()) {
                         status_line = format!("[sub-agent: {label}] {status_line}");
                     }
                 }
@@ -8727,9 +8815,22 @@ fn busy_ui_loop(
                 // The signpost line is emitted by the worker as an ordinary
                 // `Dim`, so it reaches remote clients too; these arms only
                 // move the pane's state (and stand aside for an adopted run).
-                UiEvent::SubStart(label) => sub.on_sub_start(label),
-                UiEvent::SubEnd => sub.on_sub_end(),
-                UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                UiEvent::SubStart { label, task } => {
+                    sub.on_sub_start(label, &task, tui::roster_clock_ms());
+                }
+                UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                // Addressed to the current run. Before any run has started there
+                // is no buffer to write to, so it falls back to the transcript
+                // rather than dropping the output on the floor.
+                UiEvent::Sub(inner) => match sub.current_log_mut() {
+                    Some(sub_log) => worker::apply(sub_log, *inner),
+                    None => worker::apply(log, *inner),
+                },
+                UiEvent::SubTokens {
+                    label,
+                    prefill,
+                    generated,
+                } => sub.add_tokens(label.as_deref(), prefill, generated),
                 // Addressed to the panel per event, so it lands there even
                 // while the main task streams into the main log beside it.
                 UiEvent::Btw(inner) => {
@@ -8743,8 +8844,8 @@ fn busy_ui_loop(
                 ev => {
                     if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                         worker::apply(btw_log, ev);
-                    } else if sub.adopt_turn {
-                        worker::apply(&mut sub.log, ev);
+                    } else if let (true, Some(sub_log)) = (sub.adopt_turn, sub.current_log_mut()) {
+                        worker::apply(sub_log, ev);
                     } else {
                         worker::apply(log, ev);
                     }
@@ -8790,13 +8891,21 @@ fn busy_ui_loop(
             std::borrow::Cow::Borrowed(status_line.as_str())
         };
         let sub_active = sub.active;
-        // Owned for the same reason: `sub.view` is borrowed mutably below.
-        let sub_title: Option<String> = if sub_active { sub.label.clone() } else { None };
-        let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) = if sub_active {
-            (&sub.log, &mut sub.view)
+        // Owned for the same reason: the selected run's view is borrowed mutably
+        // below, so nothing else may hold a borrow of the pane across the draw.
+        let sub_title: Option<String> = if sub_active {
+            sub.label().map(str::to_owned)
         } else {
-            (log, view)
+            None
         };
+        let roster = sub.roster_view(tui::roster_clock_ms());
+        let roster_rows = roster.height();
+        let selected_row = sub.cursor.checked_sub(1).filter(|_| sub_active);
+        let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+            match selected_row.and_then(|i| sub.runs.get_mut(i)) {
+                Some(run) => (&run.log, &mut run.view),
+                None => (log, view),
+            };
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
@@ -8811,6 +8920,7 @@ fn busy_ui_loop(
                         &status_line,
                         draw_view,
                         &task_view,
+                        &roster,
                     );
                 } else {
                     tui::draw(
@@ -8822,13 +8932,14 @@ fn busy_ui_loop(
                         None,
                         &task_view,
                         sub_title.as_deref(),
+                        &roster,
                     );
                 }
                 if let Some(m) = &input.slash {
-                    tui::draw_slash_menu(f, input.buf.text(), m);
+                    tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
                 }
                 if let Some(p) = &input.popup {
-                    tui::draw_popup(f, input.buf.text(), p);
+                    tui::draw_popup(f, input.buf.text(), p, roster_rows);
                 }
                 // Drawn last, over the live turn. Translucent by default here,
                 // so the model's output keeps streaming legibly underneath.
@@ -8849,9 +8960,19 @@ fn busy_ui_loop(
                     UiEvent::BtwBegin => btw_active = true,
                     UiEvent::BtwEnd => btw_active = false,
                     UiEvent::MainRollback => log.truncate_to(main_checkpoint),
-                    UiEvent::SubStart(label) => sub.on_sub_start(label),
-                    UiEvent::SubEnd => sub.on_sub_end(),
-                    UiEvent::Sub(inner) => worker::apply(&mut sub.log, *inner),
+                    UiEvent::SubStart { label, task } => {
+                        sub.on_sub_start(label, &task, tui::roster_clock_ms());
+                    }
+                    UiEvent::SubEnd => sub.on_sub_end(tui::roster_clock_ms()),
+                    UiEvent::Sub(inner) => match sub.current_log_mut() {
+                        Some(sub_log) => worker::apply(sub_log, *inner),
+                        None => worker::apply(log, *inner),
+                    },
+                    UiEvent::SubTokens {
+                        label,
+                        prefill,
+                        generated,
+                    } => sub.add_tokens(label.as_deref(), prefill, generated),
                     // Addressed to the panel per event, so a multiplexed aside
                     // lands there while the main task streams into the log.
                     UiEvent::Btw(inner) => {
@@ -8862,8 +8983,10 @@ fn busy_ui_loop(
                     ev => {
                         if let (true, Some((btw_log, _))) = (btw_active, btw.as_mut()) {
                             worker::apply(btw_log, ev);
-                        } else if sub.adopt_turn {
-                            worker::apply(&mut sub.log, ev);
+                        } else if let (true, Some(sub_log)) =
+                            (sub.adopt_turn, sub.current_log_mut())
+                        {
+                            worker::apply(sub_log, ev);
                         } else {
                             worker::apply(log, ev);
                         }
@@ -8921,13 +9044,27 @@ fn busy_ui_loop(
                 // Backspace/Delete into word-wise operations.
                 let word_mod = ctrl || key.modifiers.contains(KeyModifiers::ALT);
                 match key.code {
-                    // Ctrl-O switches between the main transcript and the
-                    // sub-agent pane; mid-turn is exactly when it matters.
-                    KeyCode::Char('o') if ctrl => {
-                        if !sub.toggle() {
+                    // The roster keys, mirroring the idle loop — mid-turn is
+                    // exactly when reaching into a running agent matters.
+                    KeyCode::Left | KeyCode::Right
+                        if input.buf.text().is_empty()
+                            && !word_mod
+                            && (sub.selecting || key.code == KeyCode::Left) =>
+                    {
+                        let delta = if key.code == KeyCode::Left { -1 } else { 1 };
+                        if !sub.move_cursor(delta) {
                             log.push_dim("[no sub-agent has run yet]");
                         }
                     }
+                    KeyCode::Enter if sub.selecting && input.buf.text().is_empty() => {
+                        if !sub.expand() {
+                            sub.collapse();
+                        }
+                    }
+                    // Esc leaves the roster before it interrupts the turn: the
+                    // roster is what the user is looking at, and an accidental
+                    // interrupt here would be expensive.
+                    KeyCode::Esc if sub.collapse() => {}
                     KeyCode::Esc => {
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
                         // Arms the escalation the same way Ctrl-C does, so an
@@ -9008,7 +9145,7 @@ fn busy_ui_loop(
                                 log.push_dim("[/btw — answering now]");
                             }
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         } else if let Some(out) = line
                             .starts_with('/')
                             .then(|| line.split_whitespace().next().unwrap_or(&line))
@@ -9021,7 +9158,7 @@ fn busy_ui_loop(
                             log.push_spans(tui::user_echo_spans(&line));
                             log.push_ansi(&out);
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         } else if let Some(cmd) = arcade_command(&line) {
                             // The whole point of these is the waiting, so they
                             // are the commands that *do* run mid-turn.
@@ -9049,7 +9186,7 @@ fn busy_ui_loop(
                             log.push_dim("[queued — joins the conversation at the next step]");
                             shared.push_queued(line);
                             view.follow = true;
-                            sub.view.follow = true;
+                            sub.follow_all();
                         }
                     }
                     KeyCode::Char('u') if ctrl => input.buf.kill_to_start(),
@@ -14234,6 +14371,33 @@ mod tests {
     }
 
     #[test]
+    fn the_serial_agent_tool_credits_its_roster_row_per_pass() {
+        // The row's spend comes from `record_usage`, which fires once per pass
+        // inside the sub-agent. `ScriptedEngine` reports no tokens at all, so
+        // this pins the *addressing* — unnamed, i.e. the current run — rather
+        // than a count; the tally itself is engine-supplied.
+        let dir = scratch_dir("agent-tool-subtokens");
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let _ = agent.run_agent_tool(&agent_call("do a thing", None));
+        let events: Vec<crate::worker::UiEvent> = rx.try_iter().collect();
+        let labels: Vec<&Option<String>> = events
+            .iter()
+            .filter_map(|e| match e {
+                crate::worker::UiEvent::SubTokens { label, .. } => Some(label),
+                _ => None,
+            })
+            .collect();
+        assert!(!labels.is_empty(), "a pass credits the row: {events:?}");
+        assert!(
+            labels.iter().all(|l| l.is_none()),
+            "the serial path has one run open, so the row is not named: {labels:?}"
+        );
+    }
+
+    #[test]
     fn fanout_flushes_one_labelled_pane_block_per_slot_in_call_order() {
         let dir = scratch_dir("fanout-pane");
         let cfg = test_cfg();
@@ -14271,20 +14435,25 @@ mod tests {
         let labels: Vec<&str> = events
             .iter()
             .filter_map(|e| match e {
-                crate::worker::UiEvent::SubStart(l) => Some(l.as_str()),
+                crate::worker::UiEvent::SubStart { label, .. } => Some(label.as_str()),
                 _ => None,
             })
             .collect();
+        // Every slot's roster row is opened before the rounds run, so the rows
+        // are visible (and their clocks honest) while the fan-out works; the
+        // buffered output is then flushed under the same labels, in call order
+        // rather than completion order. `SubPane::begin` resumes a row it has
+        // already opened, so the repeat is not a second row.
         assert_eq!(
             labels,
-            vec!["a0", "a1"],
-            "one block per slot, in call order rather than completion order"
+            vec!["a0", "a1", "a0", "a1"],
+            "rows opened up front, then flushed in call order"
         );
         let ends = events
             .iter()
             .filter(|e| matches!(e, crate::worker::UiEvent::SubEnd))
             .count();
-        assert_eq!(ends, labels.len(), "every block is closed");
+        assert_eq!(ends, 2, "every flushed block is closed");
         clear_vars(&vars);
     }
 
@@ -14840,7 +15009,7 @@ mod tests {
             "first event should be the Dim signpost: {got:?}"
         );
         assert!(
-            matches!(got.get(1), Some(crate::worker::UiEvent::SubStart(_))),
+            matches!(got.get(1), Some(crate::worker::UiEvent::SubStart { .. })),
             "second event should be SubStart: {got:?}"
         );
         assert!(

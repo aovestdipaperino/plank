@@ -333,7 +333,11 @@ impl ServerMsg {
             // Sub-agent groundwork (not wired up yet): no remote frame exists
             // for the sub-agent buffer, so these don't cross the wire. A later
             // task adds dedicated frames once a remote client can view it.
-            UiEvent::SubStart(_) | UiEvent::SubEnd | UiEvent::Sub(_) | UiEvent::Btw(_) => {
+            UiEvent::SubStart { .. }
+            | UiEvent::SubEnd
+            | UiEvent::SubTokens { .. }
+            | UiEvent::Sub(_)
+            | UiEvent::Btw(_) => {
                 return None;
             }
         })
@@ -1438,7 +1442,13 @@ mod tests {
 
     #[test]
     fn from_event_none_for_sub_agent_variants() {
-        assert!(ServerMsg::from_event(&UiEvent::SubStart("agent".into())).is_none());
+        assert!(
+            ServerMsg::from_event(&UiEvent::SubStart {
+                label: "agent".into(),
+                task: "t".into(),
+            })
+            .is_none()
+        );
         assert!(ServerMsg::from_event(&UiEvent::SubEnd).is_none());
         assert!(
             ServerMsg::from_event(&UiEvent::Sub(Box::new(UiEvent::Visible("x".into())))).is_none()
