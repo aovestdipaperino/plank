@@ -61,6 +61,18 @@ fn main() -> ExitCode {
             .unwrap_or_else(|_| {
                 plank::config::AgentConfig::from_settings(&plank::settings::Settings::default())
             });
+    // `--help` is answered from the provisional parse, before `--chdir` and
+    // before the plugin scan. Both of those can fail or print warnings, and
+    // `plank --chdir /nonexistent --help` printing a chdir error instead of the
+    // usage text — or prefixing the usage with plugin warnings — is a
+    // regression against every other CLI. `show_help` is a pure flag, so the
+    // provisional parse resolves it identically to the real one; a provisional
+    // parse that failed leaves it false and falls through to the real parse,
+    // which reports the argument error.
+    if provisional.show_help {
+        print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     // `--chdir` has to happen before the plugin scan (and therefore before
     // project settings, which are also cwd-scoped) rather than after, or the
     // plugin set built here would reflect the launch directory instead of the
@@ -89,6 +101,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Backstop: the provisional parse above answers `--help` in practice, but
+    // it falls back to defaults when the argument list does not parse, and the
+    // real parse is the one that decides with the layered settings in hand.
     if cfg.show_help {
         print!("{}", usage());
         return ExitCode::SUCCESS;
