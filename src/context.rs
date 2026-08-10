@@ -38,17 +38,39 @@ pub struct ContextContent {
 }
 
 impl ContextContent {
-    /// Collects all context content at session start.
+    /// Collects all context content at session start, deriving the roster from
+    /// the plugin-free `~/.plank`+`./.plank` definitions.
+    ///
+    /// Prefer [`Self::new_with_agents`] anywhere the caller already holds the
+    /// merged (plugin-inclusive) definition list: this constructor cannot see
+    /// plugin-contributed agents, so the roster it builds would advertise less
+    /// than `/agent` and `set_roster` do. It stays for tests and for callers
+    /// with no merged list at hand.
     #[must_use]
     pub fn new() -> Self {
+        let defs = std::env::current_dir()
+            .ok()
+            .map(|cwd| crate::agents::load_default(&cwd))
+            .unwrap_or_default();
+        Self::new_with_agents(&defs)
+    }
+
+    /// Collects all context content at session start, advertising exactly the
+    /// definitions `defs` holds.
+    ///
+    /// The roster the model sees has to be the same roster `set_roster`
+    /// publishes and `/agent` lists — otherwise a plugin-contributed agent is
+    /// dispatchable by the user but invisible to the model, and a
+    /// `provider: local` one makes plank pay the local-engine load for a
+    /// definition it can never auto-route to.
+    #[must_use]
+    pub fn new_with_agents(defs: &[crate::agents::AgentDef]) -> Self {
         let git_content = fetch_git_context();
         let agents_md_content = discover_agents_md_files();
         let memory_content = std::env::current_dir()
             .ok()
             .and_then(|cwd| crate::memory::load_default(&cwd));
-        let agents_content = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| agent_roster_context(&crate::agents::load_default(&cwd)));
+        let agents_content = agent_roster_context(defs);
         let date_content = date_context_line();
 
         Self {
@@ -725,5 +747,30 @@ mod tests {
             "autoRoute off withholds everything"
         );
         crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// The roster the model sees is built from the definitions it is handed,
+    /// so a plugin-contributed agent reaches it. Before this, `new()` reloaded
+    /// the plugin-free set and the model could never auto-route to one.
+    #[test]
+    fn the_roster_advertises_the_definitions_it_is_handed() {
+        use crate::agents::AgentDef;
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let from_plugin = AgentDef {
+            name: "demo:scout".to_string(),
+            description: "scouts ahead".to_string(),
+            body: String::new(),
+            path: std::path::PathBuf::from("/tmp/demo/agents/scout.md"),
+            engine: None,
+            auto: true,
+            isolate: false,
+        };
+        let content = ContextContent::new_with_agents(std::slice::from_ref(&from_plugin));
+        let roster = content.agents_content.clone().expect("roster built");
+        assert!(
+            roster.contains("demo:scout"),
+            "plugin agent missing from the model-visible roster: {roster}"
+        );
+        assert!(content.stable_context().contains("demo:scout"));
     }
 }

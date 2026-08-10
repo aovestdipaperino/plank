@@ -3161,7 +3161,9 @@ impl Agent<'_> {
                 self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
-                self.context_content = ContextContent::new();
+                // Same merged roster the launch path advertises, so /clear
+                // cannot silently drop plugin-contributed agents from it.
+                self.context_content = ContextContent::new_with_agents(&self.agents);
                 push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
@@ -8251,7 +8253,9 @@ impl Agent<'_> {
                 self.session.id = self.store.mint_id();
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
-                self.context_content = ContextContent::new();
+                // Same merged roster the launch path advertises, so /clear
+                // cannot silently drop plugin-contributed agents from it.
+                self.context_content = ContextContent::new_with_agents(&self.agents);
                 push_session_context(&mut self.session, &self.context_content);
                 // Scaffolding only — not activity worth a resume point (see
                 // `save_for_exit`); a real turn re-dirties it.
@@ -9820,8 +9824,15 @@ fn new_agent(
     // the rule above the prompt from the first frame, and the name it shows has
     // to be the one the file ends up under.
     session.id = store.mint_id();
+    // Loaded before the session context because the model-visible roster rides
+    // in it: the roster the model sees has to be the same merged list
+    // `set_roster` publishes and `/agent` lists, or a plugin-contributed agent
+    // is dispatchable by the user and invisible to the model. Still built well
+    // before `build_system_prompt_parts` below, which is what the `agent`
+    // tool's `name` enum — and hence the fingerprinted prompt prefix — reads.
+    let (agents, _agent_warnings) = crate::plugins::agents_with_plugins(&cwd, &plugins);
     // Collect context at session start
-    let context_content = ContextContent::new();
+    let context_content = ContextContent::new_with_agents(&agents);
     // Inject context into the session transcript
     trace.text("context", &context_content.combined());
     push_session_context(&mut session, &context_content);
@@ -9871,12 +9882,12 @@ fn new_agent(
             matches!(answer.trim(), "y" | "Y" | "yes")
         }));
     }
-    // Loaded before the system prompt because the roster is part of it: the
+    // Published before the system prompt because the roster is part of it: the
     // `agent` tool's `name` enum advertises which definitions the model may
     // select. Definitions are on-disk files, stable across a session, so they
     // belong inside the fingerprinted prefix — editing one correctly
     // invalidates `sysprompt.kv` rather than being silently ignored.
-    let (agents, _) = crate::plugins::agents_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
+    //
     // Publishes the names so the input line can colour `/subagent:<name>` by
     // whether the name resolves, three call layers below anything that holds
     // the definitions themselves.
