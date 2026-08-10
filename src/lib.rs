@@ -62,6 +62,7 @@ pub mod openfile;
 pub mod remote;
 pub mod render;
 pub mod repro;
+pub mod resumepane;
 pub mod sandbox;
 pub mod serve;
 pub mod session;
