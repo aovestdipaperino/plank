@@ -2359,6 +2359,16 @@ impl Agent<'_> {
         let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let finished = stream.finished();
         self.session.push(Message::assistant(text.clone()));
+        // A cut-off adjudication is handled exactly as `run_turn` handles a
+        // cut-off turn: record it on `last_turn_interrupted` and clear the
+        // process-wide SIGINT flag here. Leaving that flag raised would return
+        // to the REPL prompt with an interrupt still pending, and the
+        // generation loop polls it — so the user's *next* message would abort
+        // instantly with `[interrupted]` before producing a token.
+        if stats.interrupted {
+            crate::interrupt::clear();
+            self.last_turn_interrupted = true;
+        }
         // Work instead of a verdict, or a cut-off pass: neither settles a goal.
         if stats.interrupted || !finished.calls.is_empty() {
             return Ok(crate::goal::Adjudication::keep_going());
@@ -7321,6 +7331,8 @@ impl Agent<'_> {
         r
     }
 
+    /// The body of [`Self::tui_turn`]; callers must go through `tui_turn`,
+    /// which owns clearing `self.goal` on an error out of here.
     #[allow(clippy::too_many_arguments)]
     // Flat turn/leftover/goal loop; splitting it would only scatter the shared
     // per-iteration bindings across helpers.
@@ -7417,12 +7429,18 @@ impl Agent<'_> {
                 // path (CLAUDE.md) — including its invariant that `self.goal`
                 // is `None` on *every* exit, error returns included (the
                 // `tui_turn` wrapper enforces that for the whole body).
+                //
+                // Reached only when `leftover` is empty: a line the user typed
+                // during a goal turn runs its follow-up turn ahead of this hook,
+                // without a banner and without `next_iteration()`. The goal
+                // resumes on the round after, so nothing is lost — but it does
+                // mean `--max N` bounds adjudications, not turns.
                 if self.goal.is_some() {
                     let iters = self
                         .goal
                         .as_ref()
                         .expect("goal is live in this branch")
-                        .iter();
+                        .iters_done();
                     // Esc reaches the TUI through the turn's shared flag as well
                     // as the process-wide one, and aborts the whole goal rather
                     // than only the turn that saw it. Checked before the
@@ -11397,10 +11415,6 @@ mod tests {
         next: usize,
         prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         interrupt_at: Option<usize>,
-        /// Raises the *process-wide* interrupt flag while the pass at this
-        /// index runs — a Ctrl-C that lands mid-generation, as opposed to
-        /// `interrupt_at`, which only reports the pass as cut short.
-        request_interrupt_at: Option<usize>,
         /// When true, `generate_aside` is implemented (mirrors a real engine's
         /// snapshot/restore support) so the in-pass `/btw` suspend path runs
         /// instead of falling back to the boundary queue.
@@ -11469,9 +11483,6 @@ mod tests {
                 events.lock().unwrap().push("generate".to_string());
             }
             let interrupted = self.interrupt_at == Some(self.next);
-            if self.request_interrupt_at == Some(self.next) {
-                crate::interrupt::request();
-            }
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
             // Stream in small chunks to exercise partial-marker handling.
@@ -15959,19 +15970,21 @@ mod tests {
                     verdict_reply("CONTINUE", "still more"),
                 ],
                 // Pass 1 is the first adjudication.
-                request_interrupt_at: Some(1),
+                interrupt_at: Some(1),
                 prompts: std::sync::Arc::clone(&prompts),
                 ..ScriptedEngine::default()
             },
             &cfg,
         );
-        crate::interrupt::clear();
         agent
             .slash("/goal --max 2 keep going forever")
             .expect("/goal runs");
-        // Leave no pending flag behind for the rest of the suite.
-        crate::interrupt::clear();
         assert!(agent.goal.is_none(), "the loop clears its own state");
+        assert!(
+            !crate::interrupt::pending(),
+            "the adjudication must clear the process-wide flag, or the user's \
+next message aborts before its first token"
+        );
         assert_eq!(
             prompts.lock().expect("lock").len(),
             2,
@@ -16052,6 +16065,39 @@ mod tests {
             transcript.contains("GOAL_VERDICT: NEEDS_USER"),
             "verdict reply was popped: {transcript}"
         );
+    }
+
+    /// An adjudication that answers with *work* instead of a verdict settles
+    /// nothing: a reply carrying a DSML tool call degrades to `Continue`, even
+    /// when it also spells a terminal token out.
+    #[test]
+    fn worker_adjudication_with_tool_calls_keeps_going() {
+        let dir = scratch_dir("goal-worker-adjudicate-tools");
+        let cfg = test_cfg();
+        let reply = concat!(
+            "GOAL_VERDICT: ATTAINED\n",
+            "GOAL_REASON: let me just check\n",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\" string=\"true\">echo hi</｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        );
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![reply.to_string()],
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        let adj = agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("adjudication runs");
+        assert_eq!(adj.verdict, crate::goal::Verdict::Continue);
+        assert_eq!(adj.reason, "");
     }
 
     /// The main loop acts on the report: `/subagent` runs a parent turn as soon

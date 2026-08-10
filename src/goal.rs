@@ -7,6 +7,12 @@
 //! Nothing here touches the system prompt or the DSML tool syntax: the goal and
 //! adjudication texts are ordinary *user* messages, which is what keeps
 //! `tests/c_parity.rs` unaffected.
+//!
+//! Context cost: every iteration appends two messages to the transcript (the
+//! adjudication prompt and its reply), so the default cap of 20 adds up to 40
+//! beyond the goal's own work. An adjudication pass never calls `maybe_compact`
+//! itself; the growth is bounded only in that `run_turn`/`worker_turn` compact
+//! at the next turn boundary.
 
 /// Iterations a goal runs before settling as [`Outcome::Cap`], absent `--max`.
 pub const DEFAULT_MAX_ITERS: usize = 20;
@@ -124,8 +130,7 @@ impl GoalLoop {
 
     /// Iterations started so far; 0 before the first one.
     #[must_use]
-    #[allow(clippy::iter_not_returning_iterator)]
-    pub fn iter(&self) -> usize {
+    pub fn iters_done(&self) -> usize {
         self.iter
     }
 
@@ -223,6 +228,12 @@ fn marker_suffix<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
 /// in `</think>` rules out ordinary prose — and Markdown blockquotes, which
 /// a laxer "ends with `>`" rule would have admitted — while still allowing
 /// the tag-adjacent case that motivated this change.
+///
+/// The scan is per line and takes the *first* occurrence of the marker on it
+/// ([`str::find`]), so a line whose first occurrence is prose-quoted and whose
+/// second is genuine is rejected as prose and degrades to [`Verdict::Continue`].
+/// That is the safe direction — a missed verdict costs an iteration, which the
+/// cap bounds; a false `ATTAINED` ends the goal wrongly.
 #[must_use]
 pub fn parse_verdict(text: &str) -> Adjudication {
     let last = |tag: &str| {
@@ -366,7 +377,7 @@ mod tests {
     #[test]
     fn goal_loop_caps_after_max_iterations() {
         let mut g = GoalLoop::new("do it", 2);
-        assert_eq!(g.iter(), 0);
+        assert_eq!(g.iters_done(), 0);
         assert!(!g.at_cap());
         assert_eq!(g.next_iteration(), 1);
         assert!(!g.at_cap());
