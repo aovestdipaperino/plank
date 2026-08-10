@@ -2409,6 +2409,13 @@ impl Agent<'_> {
                 return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
             }
             let adj = self.adjudicate_plain()?;
+            // Re-checked, mirroring the TUI hook: a Ctrl+C landing *during* the
+            // adjudication only makes it `keep_going`, which would otherwise
+            // cost the user another whole iteration — and read as `Cap` rather
+            // than `Interrupted` if that was the last one.
+            if self.last_turn_interrupted || crate::interrupt::pending() {
+                return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
+            }
             if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
                 return Ok((o, iter, adj.reason));
             }
@@ -7288,11 +7295,37 @@ impl Agent<'_> {
     /// One TUI turn: runs the generate → tools loop on a worker thread while
     /// the UI thread keeps the terminal live (typing, scrolling, interrupts),
     /// then feeds user lines queued during the turn into follow-up turns.
+    ///
+    /// Wraps [`Self::tui_turn_inner`] purely to enforce the `self.goal`
+    /// invariant: whenever this returns, the front end is back at the prompt,
+    /// so a live goal must not survive — including on an `Err` propagated out
+    /// of any fallible step in the body. Doing it here rather than at each
+    /// `?` (or at the call sites that swallow the error) makes the invariant
+    /// hold by construction: a future error path added inside the body cannot
+    /// forget it.
+    #[allow(clippy::too_many_arguments)]
+    fn tui_turn(
+        &mut self,
+        terminal: &mut ratatui::DefaultTerminal,
+        log: &mut OutputLog,
+        view: &mut tui::OutputView,
+        input: &mut TuiInput,
+        btw: &mut BtwPanel,
+        arcade: &mut crate::arcade::Arcade,
+        sub: &mut tui::SubPane,
+    ) -> Result<(), String> {
+        let r = self.tui_turn_inner(terminal, log, view, input, btw, arcade, sub);
+        if r.is_err() {
+            self.goal = None;
+        }
+        r
+    }
+
     #[allow(clippy::too_many_arguments)]
     // Flat turn/leftover/goal loop; splitting it would only scatter the shared
     // per-iteration bindings across helpers.
     #[allow(clippy::too_many_lines)]
-    fn tui_turn(
+    fn tui_turn_inner(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
         log: &mut OutputLog,
@@ -7382,8 +7415,8 @@ impl Agent<'_> {
                 // CONTINUE re-enter the loop as if a queued line had arrived.
                 // The mirror of `run_goal_loop`/`drive_goal_loop` on the plain
                 // path (CLAUDE.md) — including its invariant that `self.goal`
-                // is `None` on *every* exit, error returns included, so each
-                // fallible step here clears it before propagating.
+                // is `None` on *every* exit, error returns included (the
+                // `tui_turn` wrapper enforces that for the whole body).
                 if self.goal.is_some() {
                     let iters = self
                         .goal
@@ -7420,15 +7453,10 @@ impl Agent<'_> {
                             |tx| self.adjudicate_worker(&tx, shared),
                         )
                         .and_then(|inner| inner);
-                        // Both the UI-side and worker-side errors land here; the
-                        // goal must be cleared before either propagates.
-                        let adj = match adj {
-                            Ok(adj) => adj,
-                            Err(e) => {
-                                self.goal = None;
-                                return Err(e);
-                            }
-                        };
+                        // Both the UI-side and worker-side errors land here;
+                        // `tui_turn`'s wrapper clears the goal on any `Err` out
+                        // of this body, so `?` is safe.
+                        let adj = adj?;
                         // Re-checked: an Esc pressed *during* the adjudication
                         // only makes it `keep_going`, which on the last
                         // iteration would otherwise read as a cap rather than
@@ -11369,6 +11397,10 @@ mod tests {
         next: usize,
         prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         interrupt_at: Option<usize>,
+        /// Raises the *process-wide* interrupt flag while the pass at this
+        /// index runs — a Ctrl-C that lands mid-generation, as opposed to
+        /// `interrupt_at`, which only reports the pass as cut short.
+        request_interrupt_at: Option<usize>,
         /// When true, `generate_aside` is implemented (mirrors a real engine's
         /// snapshot/restore support) so the in-pass `/btw` suspend path runs
         /// instead of falling back to the boundary queue.
@@ -11437,6 +11469,9 @@ mod tests {
                 events.lock().unwrap().push("generate".to_string());
             }
             let interrupted = self.interrupt_at == Some(self.next);
+            if self.request_interrupt_at == Some(self.next) {
+                crate::interrupt::request();
+            }
             let reply = self.replies.get(self.next).cloned().unwrap_or_default();
             self.next += 1;
             // Stream in small chunks to exercise partial-marker handling.
@@ -15903,6 +15938,44 @@ mod tests {
             prompts.lock().expect("lock").len(),
             4,
             "two turns and two adjudications"
+        );
+    }
+
+    /// Mirror of the TUI hook's second interrupt check: a Ctrl-C landing
+    /// *during* the adjudication must end the goal there, not buy the user
+    /// another full iteration (and not be reported as a cap).
+    #[test]
+    fn goal_stops_on_an_interrupt_during_the_adjudication() {
+        let dir = scratch_dir("goal-interrupt-adjudication");
+        let cfg = test_cfg();
+        let prompts = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: vec![
+                    "step one\n".to_string(),
+                    verdict_reply("CONTINUE", "more to do"),
+                    "step two\n".to_string(),
+                    verdict_reply("CONTINUE", "still more"),
+                ],
+                // Pass 1 is the first adjudication.
+                request_interrupt_at: Some(1),
+                prompts: std::sync::Arc::clone(&prompts),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        crate::interrupt::clear();
+        agent
+            .slash("/goal --max 2 keep going forever")
+            .expect("/goal runs");
+        // Leave no pending flag behind for the rest of the suite.
+        crate::interrupt::clear();
+        assert!(agent.goal.is_none(), "the loop clears its own state");
+        assert_eq!(
+            prompts.lock().expect("lock").len(),
+            2,
+            "the second iteration must not run after a mid-adjudication Ctrl-C"
         );
     }
 

@@ -185,17 +185,20 @@ done."
 }
 
 /// Finds `tag` on `line` and returns the text after it, but only if what
-/// precedes the tag on that line is empty/whitespace or ends with `>`.
+/// precedes the tag on that line is empty/whitespace or ends with
+/// `</think>`.
 ///
-/// The `>` allowance exists for one observed shape: a thinking model closes
-/// its `</think>` tag on the same line as the marker (`</think>GOAL_VERDICT:
+/// The allowance exists for one observed shape: a thinking model closes its
+/// `</think>` tag on the same line as the marker (`</think>GOAL_VERDICT:
 /// ATTAINED`), with no whitespace in between. Matching only at the trimmed
 /// start of a line (the original rule) misses that case entirely, which is
-/// the defect this function fixes.
+/// the defect this function fixes. The allowance is the literal closing tag
+/// rather than any `>`, so a Markdown blockquote (`> GOAL_VERDICT: …`) — a
+/// model quoting the protocol back at us — is not read as a real verdict.
 fn marker_suffix<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
     let idx = line.find(tag)?;
     let prefix = line[..idx].trim();
-    if prefix.is_empty() || prefix.ends_with('>') {
+    if prefix.is_empty() || prefix.ends_with("</think>") {
         Some(line[idx + tag.len()..].trim())
     } else {
         None
@@ -217,10 +220,9 @@ fn marker_suffix<'a>(line: &'a str, tag: &str) -> Option<&'a str> {
 /// prose (e.g. "the format is `GOAL_VERDICT: ATTAINED`") be read as a real
 /// verdict whenever it happened to be the last such line, with no preamble
 /// after it to override it. Requiring the preceding text to be blank or end
-/// in `>` rules out ordinary prose while still admitting the tag-adjacent
-/// case that motivated this change. The residual risk — prose that ends a
-/// sentence with `>` right before quoting the marker — is vanishingly
-/// unlikely and accepted.
+/// in `</think>` rules out ordinary prose — and Markdown blockquotes, which
+/// a laxer "ends with `>`" rule would have admitted — while still allowing
+/// the tag-adjacent case that motivated this change.
 #[must_use]
 pub fn parse_verdict(text: &str) -> Adjudication {
     let last = |tag: &str| {
@@ -327,6 +329,15 @@ mod tests {
         let adj = parse_verdict(text);
         assert_eq!(adj.verdict, Verdict::Attained);
         assert_eq!(adj.reason, "the tests pass");
+    }
+
+    #[test]
+    fn parse_verdict_ignores_a_marker_inside_a_blockquote() {
+        // A model quoting the protocol back at us in Markdown is not a verdict.
+        let text = "> GOAL_VERDICT: ATTAINED\n> GOAL_REASON: quoted spec\n";
+        let adj = parse_verdict(text);
+        assert_eq!(adj.verdict, Verdict::Continue);
+        assert_eq!(adj.reason, "");
     }
 
     #[test]
