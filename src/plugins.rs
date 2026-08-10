@@ -490,6 +490,35 @@ pub fn templates_with_plugins(
     templates_in(home.as_deref(), cwd, set)
 }
 
+/// Hook definitions from `<home>/.plank/hooks.json`, then every plugin's hook
+/// file in load order, then `<cwd>/.plank/hooks.json`, given an explicit home
+/// directory. `home` is `None` when there is no home directory to overlay.
+/// Hooks are additive, so all of them run and there is no name to
+/// disambiguate.
+#[must_use]
+pub fn hooks_in(home: Option<&Path>, cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
+    let mut paths = Vec::new();
+    if let Some(home) = home {
+        paths.push(home.join(".plank").join("hooks.json"));
+    }
+    for plugin in &set.plugins {
+        if let Some(path) = component_root(plugin, "hooks.json", "hooks/hooks.json") {
+            paths.push(path);
+        }
+    }
+    paths.push(cwd.join(".plank").join("hooks.json"));
+    crate::hooks::load_from(&paths)
+}
+
+/// Hook definitions from `~/.plank/hooks.json`, then every plugin's hook file
+/// in load order, then `<cwd>/.plank/hooks.json`. Hooks are additive, so all
+/// of them run and there is no name to disambiguate.
+#[must_use]
+pub fn hooks_with_plugins(cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    hooks_in(home.as_deref(), cwd, set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,5 +871,47 @@ mod tests {
         let set = load_in(Some(&home), &cwd, &[plugin]);
         let (agents, _) = agents_in(Some(&home), &cwd, &set);
         assert!(agents.iter().any(|a| a.name == "demo:scout"));
+    }
+
+    #[test]
+    fn plugin_hooks_are_added_between_the_user_and_project_files() {
+        let base = scratch("plugin-hooks");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        write(
+            &cwd,
+            ".plank/hooks.json",
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"project-hook"}]}]}}"#,
+        );
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "hooks/hooks.json",
+            r#"{"hooks":{"PreToolUse":[{"hooks":[{"type":"command","command":"plugin-hook"}]}]}}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let hooks = hooks_in(Some(&home), &cwd, &set);
+        let commands: Vec<&str> = hooks
+            .pre_tool_use
+            .iter()
+            .flat_map(|m| m.hooks.iter())
+            .map(|h| h.command.as_str())
+            .collect();
+        assert!(commands.contains(&"plugin-hook"));
+        assert!(commands.contains(&"project-hook"));
+        let plugin_at = commands
+            .iter()
+            .position(|c| *c == "plugin-hook")
+            .expect("present");
+        let project_at = commands
+            .iter()
+            .position(|c| *c == "project-hook")
+            .expect("present");
+        assert!(
+            plugin_at < project_at,
+            "plugin hooks run before project hooks"
+        );
     }
 }

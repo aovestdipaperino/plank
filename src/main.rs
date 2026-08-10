@@ -175,7 +175,7 @@ fn enter_startup_worktree(
         sparse_paths: settings.worktree.sparse_paths.clone(),
         symlink_dirs: settings.worktree.symlink_directories.clone(),
     };
-    let hooks = plank::hooks::load_default(&cwd);
+    let hooks = plank::plugins::hooks_with_plugins(&cwd, &plank::plugins::PluginSet::default());
     let session = plank::worktree::create_for_session(&cwd, &name, &hooks, &opts)
         .map_err(|e| format!("worktree '{name}': {e}"))?;
     std::env::set_current_dir(&session.path)

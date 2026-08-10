@@ -9831,7 +9831,7 @@ fn new_agent(
     // Start MCP servers before composing the system prompt so their tool
     // schemas land in it, like agent_worker_init.
     tool_ctx.mcp = crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref());
-    tool_ctx.hooks = crate::hooks::load_default(&tool_ctx.cwd);
+    tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
     }
