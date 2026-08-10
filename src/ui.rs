@@ -13360,17 +13360,19 @@ mod tests {
         let (main_fp, alt_fp) = (fp(&main_tiers), fp(&alt_tiers));
         assert_ne!(main_fp, alt_fp, "different models, different Tier 1");
 
-        // Both engines' checkpoints on disk, plus a long-idle third. Being
-        // superseded is no longer fatal, so the third one is aged past the
-        // tier TTL with a sidecar to make it collectable.
+        // Both engines' checkpoints on disk, plus a long-idle third. Every one
+        // of the three gets a `last_used = 0` sidecar, so all three are past the
+        // tier TTL and *only* membership in the keep-set can save one. Written
+        // fresh, they would be spared by TTL freshness alone and the test would
+        // pass even with the keep-set gutted — which is exactly the regression
+        // it exists to catch.
         let key = |fp: &str| crate::session::KvKey::System { fp: fp.to_owned() };
-        for f in [&main_fp, &alt_fp, &"stale".to_string()] {
-            std::fs::write(agent.store.kv_path(&key(f)), b"x").unwrap();
+        for f in [main_fp.as_str(), alt_fp.as_str(), "stale"] {
+            let path = agent.store.kv_path(&key(f));
+            std::fs::write(&path, b"x").unwrap();
+            let meta = crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, f, 1, 0);
+            crate::kvmeta::store(&path, &meta).unwrap();
         }
-        let stale_path = agent.store.kv_path(&key("stale"));
-        let stale_meta =
-            crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "stale", 1, 0);
-        crate::kvmeta::store(&stale_path, &stale_meta).unwrap();
 
         agent.gc_kv_tiers(&main_tiers);
 

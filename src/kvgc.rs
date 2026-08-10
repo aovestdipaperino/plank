@@ -60,8 +60,16 @@ impl SweepPolicy {
 /// What a sweep would remove.
 #[derive(Debug, Clone, Default)]
 pub struct SweepPlan {
-    /// Fingerprints of the blobs to delete.
-    pub doomed: Vec<String>,
+    /// Indices into the `nodes` slice `plan_sweep` was given, one per blob to
+    /// delete.
+    ///
+    /// Indices, not fingerprints: two distinct bodies can carry the same
+    /// fingerprint — a root `sysprompt-X.kv_raw` beside a
+    /// `<proj>/project-X.kv_raw`, or the same `project-X` under two project
+    /// directories — and a fingerprint-keyed verdict deletes the kept namesake
+    /// along with the doomed one. The caller keeps a path list parallel to
+    /// `nodes`, so index *i* names exactly one file.
+    pub doomed: Vec<usize>,
     /// Bytes those blobs occupy.
     pub bytes: u64,
 }
@@ -78,7 +86,7 @@ pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: 
     // Rule 3's input: the parent set as it stood before this sweep.
     let parents: HashSet<&str> = nodes.iter().filter_map(|m| m.parent.as_deref()).collect();
     let mut plan = SweepPlan::default();
-    for m in nodes {
+    for (i, m) in nodes.iter().enumerate() {
         let fp = m.fingerprint.as_str();
         let keep = m.pinned
             || active.contains(&fp)
@@ -88,7 +96,7 @@ pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: 
             || now.saturating_sub(m.last_used) < policy.ttl(m.role);
         if !keep {
             plan.bytes = plan.bytes.saturating_add(m.bytes);
-            plan.doomed.push(m.fingerprint.clone());
+            plan.doomed.push(i);
         }
     }
     plan
@@ -125,10 +133,20 @@ mod tests {
         }
     }
 
-    fn doomed(nodes: &[KvMeta], active: &[&str]) -> Vec<String> {
-        let mut d = plan_sweep(nodes, active, &policy(), NOW).doomed;
+    /// The plan's doomed *indices* resolved back to fingerprints, so the
+    /// assertions read as the policy statements they are.
+    fn doomed_fps(plan: &SweepPlan, nodes: &[KvMeta]) -> Vec<String> {
+        let mut d: Vec<String> = plan
+            .doomed
+            .iter()
+            .map(|&i| nodes[i].fingerprint.clone())
+            .collect();
         d.sort();
         d
+    }
+
+    fn doomed(nodes: &[KvMeta], active: &[&str]) -> Vec<String> {
+        doomed_fps(&plan_sweep(nodes, active, &policy(), NOW), nodes)
     }
 
     #[test]
@@ -212,6 +230,20 @@ mod tests {
     }
 
     #[test]
+    fn two_bodies_sharing_a_fingerprint_get_separate_verdicts() {
+        // A root `sysprompt-dup` and a `<proj>/project-dup` collide on the
+        // fingerprint. The verdict is per node, so the fresh one is not dragged
+        // down by its expired namesake.
+        let nodes = vec![
+            node(KvRole::System, "dup", None, 1),
+            node(KvRole::Project, "dup", None, 999),
+        ];
+        let plan = plan_sweep(&nodes, &[], &policy(), NOW);
+        assert_eq!(plan.doomed, vec![1], "only the expired body");
+        assert_eq!(plan.bytes, 100);
+    }
+
+    #[test]
     fn a_zero_ttl_still_spares_pinned_and_active_nodes() {
         let p = SweepPolicy {
             ttl_session_secs: 0,
@@ -224,8 +256,7 @@ mod tests {
             node(KvRole::Session, "live", None, 0),
             node(KvRole::Session, "gone", None, 0),
         ];
-        let mut d = plan_sweep(&nodes, &["live"], &p, NOW).doomed;
-        d.sort();
-        assert_eq!(d, vec!["gone".to_owned()]);
+        let plan = plan_sweep(&nodes, &["live"], &p, NOW);
+        assert_eq!(doomed_fps(&plan, &nodes), vec!["gone".to_owned()]);
     }
 }

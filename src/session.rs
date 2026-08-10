@@ -457,30 +457,34 @@ impl SessionStore {
     #[must_use]
     pub fn kv_nodes(&self) -> Vec<crate::kvmeta::KvMeta> {
         self.kv_blob_paths()
-            .into_iter()
-            .map(|(path, fp)| {
-                crate::kvmeta::load(&path).unwrap_or_else(|| {
-                    let md = fs::metadata(&path).ok();
-                    let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
-                    let mtime = md
-                        .and_then(|m| m.modified().ok())
-                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map_or(0, |d| d.as_secs());
-                    let name = path
-                        .file_name()
-                        .and_then(std::ffi::OsStr::to_str)
-                        .unwrap_or_default();
-                    let role = if name.starts_with(SYSPROMPT_PREFIX) {
-                        crate::kvmeta::KvRole::System
-                    } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
-                        crate::kvmeta::KvRole::Project
-                    } else {
-                        crate::kvmeta::KvRole::Session
-                    };
-                    crate::kvmeta::KvMeta::synthesized(role, &fp, bytes, mtime)
-                })
-            })
+            .iter()
+            .map(|(path, fp)| Self::kv_node_at(path, fp))
             .collect()
+    }
+
+    /// The node for one blob body: its sidecar when readable, else one
+    /// synthesized from the file name, size and mtime.
+    fn kv_node_at(path: &Path, fp: &str) -> crate::kvmeta::KvMeta {
+        crate::kvmeta::load(path).unwrap_or_else(|| {
+            let md = fs::metadata(path).ok();
+            let bytes = md.as_ref().map_or(0, std::fs::Metadata::len);
+            let mtime = md
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_secs());
+            let name = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default();
+            let role = if name.starts_with(SYSPROMPT_PREFIX) {
+                crate::kvmeta::KvRole::System
+            } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
+                crate::kvmeta::KvRole::Project
+            } else {
+                crate::kvmeta::KvRole::Session
+            };
+            crate::kvmeta::KvMeta::synthesized(role, fp, bytes, mtime)
+        })
     }
 
     /// Every KV blob body in the cache, as `(path, fingerprint)`.
@@ -545,25 +549,29 @@ impl SessionStore {
     /// engine it holds: a provider main agent beside a `provider: local`
     /// sub-agent has two Tier 1 fingerprints, and passing only one of them is
     /// what used to delete the other's checkpoint on every launch.
+    #[must_use]
     pub fn sweep(&self, active: &[&str], policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
-        let nodes = self.kv_nodes();
+        // One paired walk: node `i` is the metadata of path `i`, so a verdict
+        // names exactly one file. Matching on fingerprints instead would delete
+        // a kept body that merely shares a doomed one's fingerprint — a root
+        // `sysprompt-X` and a `<proj>/project-X`, say.
+        let paths = self.kv_blob_paths();
+        let nodes: Vec<crate::kvmeta::KvMeta> = paths
+            .iter()
+            .map(|(path, fp)| Self::kv_node_at(path, fp))
+            .collect();
         let plan = crate::kvgc::plan_sweep(&nodes, active, policy, now);
-        if plan.doomed.is_empty() {
-            return 0;
-        }
-        let doomed: std::collections::HashSet<&str> =
-            plan.doomed.iter().map(String::as_str).collect();
         let mut freed = 0u64;
-        for (path, fp) in self.kv_blob_paths() {
-            if !doomed.contains(fp.as_str()) {
+        for i in plan.doomed {
+            let Some((path, _)) = paths.get(i) else {
                 continue;
-            }
-            let size = fs::metadata(&path).map_or(0, |m| m.len());
-            if fs::remove_file(&path).is_ok() {
+            };
+            let size = fs::metadata(path).map_or(0, |m| m.len());
+            if fs::remove_file(path).is_ok() {
                 freed = freed.saturating_add(size);
                 // The sidecar must go with the body, or the next scan reports a
                 // phantom node.
-                let _ = fs::remove_file(crate::kvmeta::sidecar_path(&path));
+                let _ = fs::remove_file(crate::kvmeta::sidecar_path(path));
             }
         }
         freed
@@ -2322,7 +2330,11 @@ hello\n";
         fs::write(&tmp, b"in flight").unwrap();
         let project = Path::new("/proj/sys");
         fs::create_dir_all(store.project_dir(project)).unwrap();
-        fs::write(store.project_checkpoint_path(project, "aaa"), b"fp\nkv").unwrap();
+        // A Tier 2 checkpoint under its own fingerprint, deliberately *not*
+        // "aaa": sharing a Tier 1 blob's fingerprint would leave its fate
+        // ambiguous between policy and a fingerprint collision.
+        let proj_cp = store.project_checkpoint_path(project, "p1");
+        fs::write(&proj_cp, b"fp\nkv").unwrap();
         let stray = store.project_dir(project).join("notes.txt");
         fs::write(&stray, b"keep me").unwrap();
 
@@ -2340,6 +2352,14 @@ hello\n";
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
+        // New policy, stated explicitly: one sweep now covers project
+        // directories too, and this checkpoint is decided by rule 4 — not
+        // pinned, not active, no surviving child, and 400 days past the 30-day
+        // tier TTL — so it is collected.
+        assert!(
+            !proj_cp.exists(),
+            "an expired, inactive Tier 2 checkpoint is collected by rule 4"
+        );
         assert!(payload.exists(), "the live session's payload is active");
         assert!(
             store.path_for_id(&s.id).exists(),
@@ -2406,6 +2426,50 @@ hello\n";
 
         // Idempotent, and harmless for a cache with nothing collectable.
         assert_eq!(store.sweep(&["bbb", "ddd"], &policy, future), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two bodies can share one fingerprint: a root `sysprompt-<fp>.kv_raw` and
+    /// a `<proj>/project-<fp>.kv_raw`. The verdict must follow the path, not the
+    /// fingerprint — a fingerprint-keyed delete took the kept namesake with the
+    /// doomed one.
+    #[test]
+    fn sweep_does_not_delete_a_kept_body_sharing_a_doomed_ones_fingerprint() {
+        let dir = temp_dir("sweep-dup-fp");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/proj/dup");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+
+        // Same fingerprint, two bodies. The root one is expired (sidecar with
+        // `last_used = 0`); the project one is pinned, so only its own sidecar
+        // can save it.
+        let expired = dir.join(sysprompt_checkpoint_name("dup"));
+        fs::write(&expired, b"fp\nkv").unwrap();
+        crate::kvmeta::store(
+            &expired,
+            &crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::System, "dup", 5, 0),
+        )
+        .unwrap();
+        let pinned_path = store.project_checkpoint_path(project, "dup");
+        fs::write(&pinned_path, b"fp\nkv").unwrap();
+        let mut pinned =
+            crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::Project, "dup", 5, 0);
+        pinned.pinned = true;
+        crate::kvmeta::store(&pinned_path, &pinned).unwrap();
+
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(
+            store.sweep(&[], &policy, future),
+            5,
+            "only the expired body"
+        );
+        assert!(!expired.exists(), "the expired body goes");
+        assert!(pinned_path.exists(), "the pinned namesake survives");
+        assert!(crate::kvmeta::sidecar_path(&pinned_path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 
