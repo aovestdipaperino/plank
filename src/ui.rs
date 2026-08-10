@@ -6531,13 +6531,6 @@ impl Agent<'_> {
     /// keep and the whole directory of system checkpoints went, including ones
     /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        if let Some(bytes) = self.store.migrate_legacy_blobs()
-            && bytes > 0
-        {
-            #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision
-            let gb = bytes as f64 / 1_073_741_824.0;
-            eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
-        }
         let mut keep: Vec<String> = tiers
             .iter()
             .filter(|t| t.kind == crate::kvtier::TierKind::System)

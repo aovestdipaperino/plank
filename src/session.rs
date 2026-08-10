@@ -612,6 +612,10 @@ impl SessionStore {
     /// Best-effort throughout: an unlink that fails is skipped and its bytes
     /// are not counted, and the marker is still written — a second sweep would
     /// find the same undeletable file.
+    ///
+    /// The returned tally means "cache bytes reclaimed": the diagnostic
+    /// prompt note is deleted too, but its bytes are deliberately excluded
+    /// from the count.
     #[must_use]
     pub fn migrate_legacy_blobs(&self) -> Option<u64> {
         let marker = self.dir.join(MIGRATION_MARKER);
@@ -631,6 +635,9 @@ impl SessionStore {
                     continue;
                 }
                 if name == SYSPROMPT_NOTE_NAME {
+                    // Deleted but deliberately not counted: it's a tiny
+                    // diagnostic sidecar, not cache, and the tally means
+                    // cache bytes reclaimed.
                     let _ = fs::remove_file(entry.path());
                     continue;
                 }
@@ -1859,6 +1866,12 @@ mod tests {
         std::fs::write(dir.join("sysprompt-last.prompt"), b"old prompt").unwrap();
         std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
 
+        // Nested one level below the project directory: the sweep must not
+        // recurse into it, so this legacy-named file must survive untouched.
+        let nested = proj.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("project-dead.kv"), vec![0u8; 999]).unwrap();
+
         let reclaimed = store.migrate_legacy_blobs().expect("migration runs once");
         assert_eq!(reclaimed, 360, "100 + 10 + 200 + 50");
 
@@ -1870,6 +1883,10 @@ mod tests {
         assert!(
             dir.join("cheeky-bell.kv").exists(),
             "transcripts must survive: resuming pays one re-prefill, it does not lose the conversation"
+        );
+        assert!(
+            nested.join("project-dead.kv").exists(),
+            "the sweep descends exactly one directory level, never arbitrarily deep"
         );
 
         assert!(
@@ -1889,6 +1906,10 @@ mod tests {
         assert_eq!(store.migrate_legacy_blobs(), Some(0));
         assert!(dir.join("sysprompt-a19f.kv_raw").exists());
         assert!(dir.join("sysprompt-a19f.json").exists());
+        assert!(
+            store.migrate_legacy_blobs().is_none(),
+            "marker is written even when nothing was deleted"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

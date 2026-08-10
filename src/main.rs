@@ -69,6 +69,19 @@ fn main() -> ExitCode {
     if let Some(note) = plank::settings::startup_note(&settings, &cfg) {
         eprintln!("{note}");
     }
+    // One-shot wipe of pre-`.kv_raw` KV blobs, before any terminal setup so
+    // the note prints as a plain line on every front end (TUI, plain REPL,
+    // and `--non-interactive` all funnel through here). Best-effort: a store
+    // that fails to open is skipped silently, and the next launch retries.
+    if let Ok(store) =
+        plank::session::SessionStore::open(plank::session::SessionStore::default_dir())
+        && let Some(bytes) = store.migrate_legacy_blobs()
+        && bytes > 0
+    {
+        #[allow(clippy::cast_precision_loss)] // GB display only; loses no meaningful precision
+        let gb = bytes as f64 / 1_073_741_824.0;
+        eprintln!("kvcache: migrated to the .kv_raw format, reclaimed {gb:.1} GB");
+    }
     if let Some(dir) = &cfg.chdir_path
         && let Err(e) = std::env::set_current_dir(dir)
     {
