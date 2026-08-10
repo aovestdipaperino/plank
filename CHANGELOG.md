@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.0] - 2026-08-10
+
 ### Added
 
 - **A session is named the moment it starts, and the name is on screen the whole
