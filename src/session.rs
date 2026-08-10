@@ -7,7 +7,7 @@
 //! and "Session Listing, History Rendering, And Completion". The C agent
 //! persists engine KV state plus a rendered token transcript in one file;
 //! plank persists the text transcript as the session file and keeps the
-//! engine KV state in a fingerprinted `<name>.payload` sidecar (a
+//! engine KV state in a fingerprinted `<name>.kv_raw` sidecar (a
 //! [`crate::kvcache::KVCache`] keyed by [`KvKey::Session`]), while keeping the
 //! same user-visible behavior: sessions
 //! live under `~/.plank/kvcache` as `<name>.kv` files. A session id is a
@@ -376,7 +376,7 @@ pub enum KvKey {
     System { fp: String },
     /// Tier 2: project-stable context. `<project-key>/project-<fp>.kv`.
     Project { dir: PathBuf, fp: String },
-    /// A saved conversation's KV payload. `<id>.payload`.
+    /// A saved conversation's KV payload. `<id>.kv_raw`.
     ///
     /// Path and signature differ here: the file is named after the session id
     /// (stable across resaves), but it is only trusted when its stored
@@ -1026,9 +1026,8 @@ impl SessionStore {
     }
 
     /// Enumerates `<name>.kv` session files: memorable `adjective-celebrity`
-    /// names, plus legacy `<40-hex>.kv` ids. The system prompt checkpoints
-    /// (`sysprompt-*.kv`, plus the legacy shared `sysprompt.kv`) and temp
-    /// files (`*.kv.tmp.*`, which don't end in `.kv`) are skipped.
+    /// names, plus legacy `<40-hex>.kv` ids. Temp files (`*.kv.tmp.*`, which
+    /// don't end in `.kv`) are skipped.
     fn session_files(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.dir)? {
@@ -1038,6 +1037,10 @@ impl SessionStore {
             let Some(stem) = name.strip_suffix(FILE_EXT) else {
                 continue;
             };
+            // The `sysprompt` guard is belt-and-braces against a legacy file:
+            // no checkpoint ends in `.kv` any more (bodies are `.kv_raw`), and
+            // `migrate_legacy_blobs` unlinks the old ones on first launch, so
+            // this can only fire on a blob that survived the migration.
             if stem.starts_with(SYSPROMPT_STEM) || !is_valid_id_prefix(stem) {
                 continue;
             }
@@ -1048,11 +1051,12 @@ impl SessionStore {
 }
 
 /// File-stem prefix of the system-prompt KV checkpoints, which share the
-/// cache dir with session files but are not sessions.
+/// cache dir with session files but are not sessions. Names the legacy bare
+/// `sysprompt.kv` that [`SessionStore::migrate_legacy_blobs`] removes.
 const SYSPROMPT_STEM: &str = "sysprompt";
 
 /// File-name prefix of a content-keyed system-prompt checkpoint,
-/// `sysprompt-<fp1>.kv`.
+/// `sysprompt-<fp1>.kv_raw`.
 const SYSPROMPT_PREFIX: &str = "sysprompt-";
 
 /// Sidecar holding the system-prompt text that the most recent Tier 1
@@ -2349,7 +2353,10 @@ hello\n";
         // launch. The current session's own payload is live too.
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
         let active = ["bbb", "ccc", s.id.as_str()];
-        assert!(store.sweep(&active, &policy, future) > 0);
+        // Exactly the two expired, inactive bodies: `sysprompt-aaa` and the
+        // Tier 2 `project-p1`, five bytes of `"fp\nkv"` each. An exact tally
+        // also pins that nothing else was collected.
+        assert_eq!(store.sweep(&active, &policy, future), 10);
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
@@ -2379,7 +2386,9 @@ hello\n";
         assert_eq!(empty_store.sweep(&["bbb"], &policy, future), 0);
         // An empty active set is a full sweep of everything expired, not a
         // no-op: the caller decides what is live.
-        assert!(store.sweep(&[], &policy, future) > 0);
+        // Everything left: the two formerly-active Tier 1 bodies at five bytes
+        // each plus the session payload at seven.
+        assert_eq!(store.sweep(&[], &policy, future), 17);
         assert!(!dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!payload.exists());

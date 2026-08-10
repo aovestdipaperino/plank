@@ -57,8 +57,11 @@ const MAX_DEPTH: usize = 16;
 
 /// Assembles `nodes` into a forest, ordering siblings largest subtree first.
 ///
-/// Duplicate fingerprints keep the first occurrence; a node naming an absent or
-/// self-referential parent becomes an orphan.
+/// Every node appears exactly once, duplicate fingerprints included; when two
+/// nodes share a fingerprint only the first to be attached absorbs the children
+/// keyed under it, and the later one renders childless. A node naming an absent
+/// or self-referential parent becomes an orphan, as does one whose parent is
+/// present but itself unreachable.
 #[must_use]
 pub fn build(nodes: Vec<KvMeta>) -> KvForest {
     use std::cmp::Reverse;
@@ -79,7 +82,9 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
                 .map(|c| attach(c, children, depth + 1))
                 .collect()
         };
-        kids.sort_by_key(|b| Reverse(b.subtree_bytes()));
+        // Cached: `subtree_bytes` is O(subtree), and `sort_by_key` would
+        // recompute it on every comparison.
+        kids.sort_by_cached_key(|b| Reverse(b.subtree_bytes()));
         KvNode {
             meta: m,
             children: kids,
@@ -102,7 +107,7 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
         .into_iter()
         .map(|m| attach(m, &mut children, 0))
         .collect();
-    root_nodes.sort_by_key(|b| Reverse(b.subtree_bytes()));
+    root_nodes.sort_by_cached_key(|b| Reverse(b.subtree_bytes()));
     let mut orphan_nodes: Vec<KvNode> = orphans
         .into_iter()
         .map(|m| attach(m, &mut children, 0))
@@ -114,7 +119,7 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
         meta: m,
         children: Vec::new(),
     }));
-    orphan_nodes.sort_by_key(|b| Reverse(b.subtree_bytes()));
+    orphan_nodes.sort_by_cached_key(|b| Reverse(b.subtree_bytes()));
 
     KvForest {
         roots: root_nodes,
@@ -196,6 +201,60 @@ mod tests {
         let f = build(Vec::new());
         assert!(f.roots.is_empty() && f.orphans.is_empty());
         assert_eq!(f.total_bytes(), 0);
+    }
+
+    #[test]
+    fn a_mutual_cycle_surfaces_both_nodes_and_does_not_hang() {
+        // Impossible from plank's own writes, since every chained fingerprint
+        // embeds its parent's, but the input is untrusted JSON. Neither node is
+        // a root and neither parent is absent, so the only correct outcome is
+        // that both fall out as stragglers rather than vanishing.
+        let f = build(vec![
+            meta(KvRole::Project, "a", Some("b"), 10),
+            meta(KvRole::Project, "b", Some("a"), 20),
+        ]);
+        assert!(f.roots.is_empty());
+        let mut fps: Vec<&str> = f
+            .orphans
+            .iter()
+            .map(|n| n.meta.fingerprint.as_str())
+            .collect();
+        fps.sort_unstable();
+        assert_eq!(fps, vec!["a", "b"], "never silently drop a node");
+        assert_eq!(f.total_bytes(), 30);
+    }
+
+    /// Nodes in one subtree, including its own root.
+    fn count(n: &KvNode) -> usize {
+        1 + n.children.iter().map(count).sum::<usize>()
+    }
+
+    #[test]
+    fn a_chain_deeper_than_max_depth_truncates_the_display_but_loses_nothing() {
+        // Display stops descending at MAX_DEPTH; the nodes below it must still
+        // be reachable, because a blob you cannot see is a blob you cannot
+        // delete.
+        let depth = MAX_DEPTH + 5;
+        let mut nodes = vec![meta(KvRole::System, "n000", None, 1)];
+        for i in 1..=depth {
+            let fp = format!("n{i:03}");
+            let parent = format!("n{:03}", i - 1);
+            nodes.push(meta(KvRole::Session, &fp, Some(&parent), 1));
+        }
+        let f = build(nodes);
+        assert_eq!(f.roots.len(), 1);
+        // The chain under the single root is cut at MAX_DEPTH...
+        let mut n = &f.roots[0];
+        let mut reached = 1usize;
+        while let Some(child) = n.children.first() {
+            n = child;
+            reached += 1;
+        }
+        assert_eq!(reached, MAX_DEPTH + 1, "descent stops at MAX_DEPTH");
+        // ...and every node the descent did not reach is still present.
+        let total: usize = f.roots.iter().chain(&f.orphans).map(count).sum();
+        assert_eq!(total, depth + 1, "never silently drop a node");
+        assert_eq!(f.total_bytes(), (depth + 1) as u64);
     }
 
     #[test]

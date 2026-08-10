@@ -806,6 +806,105 @@ mod tests {
         expect.extend_from_slice(b"sys");
         assert_eq!(a, crate::session::sha1_hex(&expect));
     }
+
+    #[test]
+    fn each_tier_records_its_parent_fingerprint() {
+        let tiers = plan(
+            "fp1-system",
+            "system text",
+            "stable context",
+            "volatile context",
+            "local defs",
+            Some(std::path::Path::new("/tmp/plank-lineage")),
+        );
+        let sys = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::System)
+            .expect("plan always emits Tier 1 first");
+        assert!(sys.parent.is_none(), "the system tier is the root");
+        let proj = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::ProjectStable)
+            .expect("a project tier exists when there is stable text");
+        assert_eq!(proj.parent.as_deref(), Some("fp1-system"));
+        let vol = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::SessionVolatile)
+            .expect("a volatile tier exists when there is volatile text");
+        assert_eq!(
+            vol.parent.as_deref(),
+            Some(proj.fingerprint.as_str()),
+            "Tier 3 chains off Tier 2, not off Tier 1"
+        );
+    }
+
+    #[test]
+    fn the_volatile_tier_chains_off_tier_1_when_there_is_no_stable_text() {
+        // `plan` collapses fp2 to fp1 when `stable` is empty and emits no Tier 2,
+        // so Tier 3's recorded parent must follow that collapse rather than naming
+        // a tier that does not exist.
+        let tiers = plan("fp1-system", "system text", "", "volatile", "", None);
+        assert!(
+            !tiers.iter().any(|t| t.kind == TierKind::ProjectStable),
+            "no stable text means no Tier 2"
+        );
+        let vol = tiers
+            .iter()
+            .find(|t| t.kind == TierKind::SessionVolatile)
+            .expect("volatile tier present");
+        assert_eq!(vol.parent.as_deref(), Some("fp1-system"));
+    }
+
+    #[test]
+    fn a_local_mcp_name_never_reaches_a_system_label() {
+        // The audit surface for MCP segregation: global tool defs are Tier 1
+        // material, project-local ones are Tier 2. A local name on a system label
+        // would mean that split had broken.
+        let labels = TierLabels {
+            think_mode: "max".into(),
+            trusted_len: 12,
+            global_mcp: vec!["global-srv".into()],
+            project_path: "/Users/x/Code/plank".into(),
+            agents_files: vec!["AGENTS.md".into()],
+            local_mcp: vec!["local-srv".into()],
+        };
+        match tier_label(TierKind::System, &labels) {
+            crate::kvmeta::KvLabel::System {
+                think_mode,
+                trusted_len,
+                global_mcp,
+            } => {
+                assert_eq!(think_mode, "max");
+                assert_eq!(trusted_len, 12);
+                assert_eq!(global_mcp, vec!["global-srv".to_owned()]);
+                assert!(
+                    !global_mcp.iter().any(|n| n == "local-srv"),
+                    "a project-local server must never appear on a system label"
+                );
+            }
+            other => panic!("expected a System label, got {other:?}"),
+        }
+        match tier_label(TierKind::ProjectStable, &labels) {
+            crate::kvmeta::KvLabel::Project {
+                project_path,
+                agents_files,
+                local_mcp,
+            } => {
+                assert_eq!(project_path, "/Users/x/Code/plank");
+                assert_eq!(agents_files, vec!["AGENTS.md".to_owned()]);
+                assert_eq!(local_mcp, vec!["local-srv".to_owned()]);
+                assert!(
+                    !local_mcp.iter().any(|n| n == "global-srv"),
+                    "a global server must never appear on a project label"
+                );
+            }
+            other => panic!("expected a Project label, got {other:?}"),
+        }
+        assert!(matches!(
+            tier_label(TierKind::SessionVolatile, &labels),
+            crate::kvmeta::KvLabel::Unknown
+        ));
+    }
 }
 
 /// Records what a warm walk asked the engine to do, so the walk's logic can be
@@ -892,8 +991,7 @@ impl crate::engine::Engine for SpyEngine {
 #[cfg(test)]
 mod warm_tests {
     use super::{
-        Restored, TierKind, TierLabels, TierSpec, plan, restore, system_fingerprint, tier_label,
-        warm,
+        Restored, TierKind, TierLabels, TierSpec, plan, restore, system_fingerprint, warm,
     };
     use std::path::Path;
 
@@ -1546,104 +1644,5 @@ mod warm_tests {
             "each tier must be captured at its own boundary, before the next sync"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn each_tier_records_its_parent_fingerprint() {
-        let tiers = plan(
-            "fp1-system",
-            "system text",
-            "stable context",
-            "volatile context",
-            "local defs",
-            Some(std::path::Path::new("/tmp/plank-lineage")),
-        );
-        let sys = tiers
-            .iter()
-            .find(|t| t.kind == TierKind::System)
-            .expect("plan always emits Tier 1 first");
-        assert!(sys.parent.is_none(), "the system tier is the root");
-        let proj = tiers
-            .iter()
-            .find(|t| t.kind == TierKind::ProjectStable)
-            .expect("a project tier exists when there is stable text");
-        assert_eq!(proj.parent.as_deref(), Some("fp1-system"));
-        let vol = tiers
-            .iter()
-            .find(|t| t.kind == TierKind::SessionVolatile)
-            .expect("a volatile tier exists when there is volatile text");
-        assert_eq!(
-            vol.parent.as_deref(),
-            Some(proj.fingerprint.as_str()),
-            "Tier 3 chains off Tier 2, not off Tier 1"
-        );
-    }
-
-    #[test]
-    fn the_volatile_tier_chains_off_tier_1_when_there_is_no_stable_text() {
-        // `plan` collapses fp2 to fp1 when `stable` is empty and emits no Tier 2,
-        // so Tier 3's recorded parent must follow that collapse rather than naming
-        // a tier that does not exist.
-        let tiers = plan("fp1-system", "system text", "", "volatile", "", None);
-        assert!(
-            !tiers.iter().any(|t| t.kind == TierKind::ProjectStable),
-            "no stable text means no Tier 2"
-        );
-        let vol = tiers
-            .iter()
-            .find(|t| t.kind == TierKind::SessionVolatile)
-            .expect("volatile tier present");
-        assert_eq!(vol.parent.as_deref(), Some("fp1-system"));
-    }
-
-    #[test]
-    fn a_local_mcp_name_never_reaches_a_system_label() {
-        // The audit surface for MCP segregation: global tool defs are Tier 1
-        // material, project-local ones are Tier 2. A local name on a system label
-        // would mean that split had broken.
-        let labels = TierLabels {
-            think_mode: "max".into(),
-            trusted_len: 12,
-            global_mcp: vec!["global-srv".into()],
-            project_path: "/Users/x/Code/plank".into(),
-            agents_files: vec!["AGENTS.md".into()],
-            local_mcp: vec!["local-srv".into()],
-        };
-        match tier_label(TierKind::System, &labels) {
-            crate::kvmeta::KvLabel::System {
-                think_mode,
-                trusted_len,
-                global_mcp,
-            } => {
-                assert_eq!(think_mode, "max");
-                assert_eq!(trusted_len, 12);
-                assert_eq!(global_mcp, vec!["global-srv".to_owned()]);
-                assert!(
-                    !global_mcp.iter().any(|n| n == "local-srv"),
-                    "a project-local server must never appear on a system label"
-                );
-            }
-            other => panic!("expected a System label, got {other:?}"),
-        }
-        match tier_label(TierKind::ProjectStable, &labels) {
-            crate::kvmeta::KvLabel::Project {
-                project_path,
-                agents_files,
-                local_mcp,
-            } => {
-                assert_eq!(project_path, "/Users/x/Code/plank");
-                assert_eq!(agents_files, vec!["AGENTS.md".to_owned()]);
-                assert_eq!(local_mcp, vec!["local-srv".to_owned()]);
-                assert!(
-                    !local_mcp.iter().any(|n| n == "global-srv"),
-                    "a global server must never appear on a project label"
-                );
-            }
-            other => panic!("expected a Project label, got {other:?}"),
-        }
-        assert!(matches!(
-            tier_label(TierKind::SessionVolatile, &labels),
-            crate::kvmeta::KvLabel::Unknown
-        ));
     }
 }

@@ -399,13 +399,8 @@ mod tests {
             node(KvRole::Session, "second-newest", None, 5),
         ];
         let plan = plan_sweep(&nodes, &[], &budget_only(250), NOW);
-        let mut gone: Vec<&str> = plan
-            .doomed
-            .iter()
-            .map(|&i| nodes[i].fingerprint.as_str())
-            .collect();
-        gone.sort_unstable();
-        assert_eq!(gone, vec!["middle", "oldest"]);
+        let gone = doomed_fps(&plan, &nodes);
+        assert_eq!(gone, vec!["middle".to_owned(), "oldest".to_owned()]);
         assert_eq!(plan.bytes, 200);
     }
 
@@ -424,15 +419,10 @@ mod tests {
             node(KvRole::Session, "evictable", None, 99),
         ];
         let plan = plan_sweep(&nodes, &["live"], &budget_only(1), NOW);
-        let mut gone: Vec<&str> = plan
-            .doomed
-            .iter()
-            .map(|&i| nodes[i].fingerprint.as_str())
-            .collect();
-        gone.sort_unstable();
+        let gone = doomed_fps(&plan, &nodes);
         assert_eq!(
             gone,
-            vec!["child", "evictable"],
+            vec!["child".to_owned(), "evictable".to_owned()],
             "a budget is a target, not a licence to delete protected nodes"
         );
     }
@@ -452,13 +442,8 @@ mod tests {
             node(KvRole::Session, "fresh", None, 1),
         ];
         let plan = plan_sweep(&nodes, &[], &p, NOW);
-        let mut gone: Vec<&str> = plan
-            .doomed
-            .iter()
-            .map(|&i| nodes[i].fingerprint.as_str())
-            .collect();
-        gone.sort_unstable();
-        assert_eq!(gone, vec!["expired-1", "expired-2"]);
+        let gone = doomed_fps(&plan, &nodes);
+        assert_eq!(gone, vec!["expired-1".to_owned(), "expired-2".to_owned()]);
     }
 
     #[test]
@@ -476,13 +461,8 @@ mod tests {
             node(KvRole::Session, "dead-child", Some("parent"), 99),
         ];
         let plan = plan_sweep(&nodes, &[], &p, NOW);
-        let mut gone: Vec<&str> = plan
-            .doomed
-            .iter()
-            .map(|&i| nodes[i].fingerprint.as_str())
-            .collect();
-        gone.sort_unstable();
-        assert_eq!(gone, vec!["dead-child", "parent"]);
+        let gone = doomed_fps(&plan, &nodes);
+        assert_eq!(gone, vec!["dead-child".to_owned(), "parent".to_owned()]);
     }
 
     #[test]

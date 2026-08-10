@@ -2558,7 +2558,11 @@ pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
     let room = inner.saturating_sub(tail.len());
     let mut shown = if room == 0 {
         // No room for the tree at all: keep the footer and hints, which are the
-        // only lines that still say something useful at this size.
+        // only lines that still say something useful at this size. The blank
+        // separator has to go with the tree it was separating, or it spends the
+        // one or two lines that are left and `Paragraph`, which clips from the
+        // bottom, drops the hints instead.
+        tail.remove(0);
         Vec::new()
     } else if lines.len() <= room {
         lines
@@ -5914,6 +5918,24 @@ mod tests {
         let mut tiny = Terminal::new(TestBackend::new(10, 5)).unwrap();
         tiny.draw(|f| draw_kvcache(f, &pane)).unwrap();
 
+        // Too short for even one tree line: the footer and the key hints are the
+        // last things to go, so the blank separator must be dropped rather than
+        // spending one of the two remaining lines. With the separator kept, this
+        // frame drew a blank line and the footer and lost the `Esc close` hint.
+        let mut squat = Terminal::new(TestBackend::new(90, 6)).unwrap();
+        squat.draw(|f| draw_kvcache(f, &pane)).unwrap();
+        let buf = squat.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("reclaimable"), "{text}");
+        assert!(text.contains("Esc close"), "{text}");
+
         // And the geometry itself: whatever the frame size, the rect fits
         // inside it. The 24x8 + 40-lines case also pins the height clamp.
         for (w, h) in [(4u16, 1u16), (10, 5), (24, 8), (120, 40)] {
@@ -5940,6 +5962,11 @@ mod tests {
 
         // A chain far taller than the terminal: without windowing the cursor
         // would rest on a clipped row, and `d`/`y` would delete an unseen blob.
+        //
+        // Every session node carries a `Session` label, so every row emits a
+        // second detail line. That is the point: the window is measured in
+        // *lines*, not rows, so a fixture whose rows are one line each never
+        // exercises the arithmetic this test exists to protect.
         let mut metas = vec![kv_meta(crate::kvmeta::KvRole::System, "root", None)];
         for i in 0..30u32 {
             let fp = format!("blob{i:02}");
@@ -5948,34 +5975,79 @@ mod tests {
             } else {
                 format!("blob{:02}", i - 1)
             };
-            metas.push(kv_meta(crate::kvmeta::KvRole::Session, &fp, Some(&parent)));
+            let mut m = kv_meta(crate::kvmeta::KvRole::Session, &fp, Some(&parent));
+            m.label = crate::kvmeta::KvLabel::Session {
+                name: format!("sess{i:02}"),
+                title: format!("a title for row {i:02}"),
+            };
+            metas.push(m);
         }
-        let mut pane = crate::kvpane::KvPane::new(
-            crate::kvtree::build(metas),
-            crate::kvgc::SweepPolicy {
-                ttl_session_secs: 14 * KV_DAY,
-                ttl_tier_secs: 30 * KV_DAY,
-                max_bytes: 0,
-            },
-            0,
-            1_000 * KV_DAY,
-        );
+        let rows_total = metas.len();
+        let build = || {
+            crate::kvpane::KvPane::new(
+                crate::kvtree::build(metas.clone()),
+                crate::kvgc::SweepPolicy {
+                    ttl_session_secs: 14 * KV_DAY,
+                    ttl_tier_secs: 30 * KV_DAY,
+                    max_bytes: 0,
+                },
+                0,
+                1_000 * KV_DAY,
+            )
+        };
+
+        // The cursor at the top, the middle and the bottom, on a roomy frame and
+        // on one barely taller than the footer.
+        for down in [0usize, rows_total / 2, rows_total - 1] {
+            let mut pane = build();
+            for _ in 0..down {
+                pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            let rows = pane.rows();
+            let want = rows
+                .iter()
+                .find(|r| r.selected)
+                .map(|r| r.label.clone())
+                .expect("some row is always selected");
+
+            for (w, h) in [(90u16, 14u16), (90, 8)] {
+                let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+                term.draw(|f| draw_kvcache(f, &pane)).unwrap();
+                let buf = term.backend().buffer().clone();
+                let line_at = |y: u16| -> String {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                };
+                // Find the row the *terminal* is highlighting, not the row the
+                // pane thinks is selected: asserting the text is merely present
+                // would pass while the highlight sat on a different line.
+                let reversed: Vec<String> = (0..buf.area.height)
+                    .filter(|&y| {
+                        (0..buf.area.width)
+                            .any(|x| buf[(x, y)].modifier.contains(Modifier::REVERSED))
+                    })
+                    .map(line_at)
+                    .collect();
+                assert_eq!(
+                    reversed.len(),
+                    1,
+                    "exactly one drawn row is highlighted at {w}x{h}, down {down}: {reversed:?}"
+                );
+                assert!(
+                    reversed[0].contains(want.trim()),
+                    "the highlighted row must be the selected one at {w}x{h}, down {down}: want {want:?}, got {:?}",
+                    reversed[0]
+                );
+            }
+        }
+
+        // ...and the window really did scroll, plus the footer and hints survive
+        // it, on the frame with room for both.
+        let mut pane = build();
         for _ in 0..25 {
             pane.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         }
-        let rows = pane.rows();
-        let label = rows
-            .iter()
-            .find(|r| r.selected)
-            .map(|r| r.label.clone())
-            .unwrap();
-        let selected = rows.iter().position(|r| r.selected).unwrap();
-        assert!(
-            selected > 12 && rows.len() > 25,
-            "the cursor must be past the bottom of a 14-row terminal: row {selected} of {}",
-            rows.len()
-        );
-
         let mut term = Terminal::new(TestBackend::new(90, 14)).unwrap();
         term.draw(|f| draw_kvcache(f, &pane)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -5987,14 +6059,10 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let name = label.rsplit("  ").next().unwrap();
-        assert!(text.contains(name), "selected row must be drawn: {text}");
-        // ...and the window really did scroll: the first row is off the top.
         assert!(
             !text.contains(" root"),
             "the top of the tree should have scrolled away: {text}"
         );
-        // The footer and hints survive the window.
         assert!(text.contains("reclaimable"), "{text}");
         assert!(text.contains("Esc close"), "{text}");
     }

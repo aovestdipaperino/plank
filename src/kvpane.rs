@@ -65,7 +65,12 @@ struct Flat {
     depth: usize,
     /// Collapse keys of every ancestor, outermost first.
     ancestors: Vec<String>,
-    /// This row's own collapse key.
+    /// This row's own collapse key: the blob's fingerprint (or [`ORPHAN_KEY`]
+    /// for the synthetic header). Two bodies can legitimately share a
+    /// fingerprint, so they fold and pin as one row-key. That is inherent to the
+    /// fingerprint-keyed [`Row`]/[`Outcome`] API rather than a bug here, and it
+    /// is fail-safe: an [`Outcome::Delete`] naming such a fingerprint is refused
+    /// as ambiguous rather than guessing which file to unlink.
     key: String,
     has_children: bool,
     /// Index into the flattened metadata list; `None` for the orphan header.
@@ -186,9 +191,12 @@ impl KvPane {
     /// bytes and its `⏳` marker. Re-planning is pure and in-memory, so it is
     /// cheap enough to do per draw rather than rebuilding the pane — which would
     /// throw away the user's folds and cursor.
-    fn sweep_now(&self) -> (HashSet<usize>, u64) {
+    /// Borrows the construction-time verdicts on the common path, so a draw
+    /// that has flipped no pins allocates nothing.
+    fn sweep_now(&self) -> (std::borrow::Cow<'_, HashSet<usize>>, u64) {
+        use std::borrow::Cow;
         if self.pin_flips.is_empty() {
-            return (self.condemned.clone(), self.reclaimable);
+            return (Cow::Borrowed(&self.condemned), self.reclaimable);
         }
         let metas: Vec<KvMeta> = self
             .metas
@@ -200,7 +208,7 @@ impl KvPane {
             })
             .collect();
         let plan = plan_sweep(&metas, &[], &self.policy, self.now);
-        (plan.doomed.into_iter().collect(), plan.bytes)
+        (Cow::Owned(plan.doomed.into_iter().collect()), plan.bytes)
     }
 
     /// The render rows, top to bottom, with collapsed subtrees omitted.
@@ -505,13 +513,21 @@ pub fn render_text(pane: &KvPane) -> String {
         } else {
             ""
         };
-        let _ = writeln!(out, "{prefix}{marker}{}    {}", row.label, row.right);
+        // Trimmed at the end: the orphan header has an empty `right` field, so
+        // an untrimmed line would carry trailing whitespace.
+        let line = format!("{prefix}{marker}{}    {}", row.label, row.right);
+        let _ = writeln!(out, "{}", line.trim_end());
         if !row.detail.is_empty() {
             let gutter = "   ".repeat(row.depth);
-            let _ = writeln!(out, "{gutter}   {}", row.detail);
+            let _ = writeln!(out, "{gutter}   {}", row.detail.trim_end());
         }
     }
-    let _ = write!(out, "\n{}", pane.footer());
+    // The blank separator belongs between the tree and the footer, so an empty
+    // forest must not open with one.
+    if !rows.is_empty() {
+        out.push('\n');
+    }
+    let _ = write!(out, "{}", pane.footer());
     out
 }
 
@@ -735,6 +751,30 @@ mod tests {
         assert!(out.lines().count() >= 4, "rows plus a footer");
         // No trailing blank line: the REPL prints this with println!.
         assert!(!out.ends_with("\n\n"));
+        // No trailing whitespace on any line either. The orphan header has an
+        // empty right-hand column, which used to leave the padding behind.
+        for line in out.lines() {
+            assert_eq!(line, line.trim_end(), "trailing whitespace: {line:?}");
+        }
+    }
+
+    #[test]
+    fn render_text_on_an_empty_forest_is_just_the_footer() {
+        // The blank line separates the tree from the footer, so with no tree it
+        // must not appear: the output used to open with a stray empty line.
+        let pane = KvPane::new(
+            crate::kvtree::KvForest::default(),
+            crate::kvgc::SweepPolicy {
+                ttl_session_secs: 14 * DAY,
+                ttl_tier_secs: 30 * DAY,
+                max_bytes: 0,
+            },
+            0,
+            NOW,
+        );
+        let out = render_text(&pane);
+        assert!(out.starts_with("total "), "{out:?}");
+        assert_eq!(out.lines().count(), 1, "{out:?}");
     }
 
     #[test]
