@@ -134,6 +134,13 @@ impl ResumePane {
         self.pending_delete = false;
     }
 
+    /// Supplies the preview text the pane asked for with
+    /// [`Outcome::LoadPreview`]. Cached by id, so re-opening the same row
+    /// never asks again.
+    pub fn set_preview(&mut self, id: &str, text: String) {
+        self.previews.insert(id.to_owned(), text);
+    }
+
     /// Header line: cursor position within the visible set.
     #[must_use]
     pub fn header(&self) -> String {
@@ -230,6 +237,20 @@ impl ResumePane {
                 self.query.pop();
                 self.refilter();
                 Outcome::Stay
+            }
+            // Space is the preview toggle only while the search box is empty.
+            // Once there is a query it has to be an ordinary character, or
+            // multi-word searches are impossible.
+            KeyCode::Char(' ') if self.query.is_empty() && self.rename.is_none() => {
+                self.pending_delete = false;
+                self.preview_open = !self.preview_open;
+                match self.selected().map(|e| e.id.clone()) {
+                    // Only ask when the text is not already in hand.
+                    Some(id) if self.preview_open && !self.previews.contains_key(&id) => {
+                        Outcome::LoadPreview(id)
+                    }
+                    _ => Outcome::Stay,
+                }
             }
             KeyCode::Char(c) => {
                 self.query.push(c);
@@ -413,5 +434,63 @@ mod tests {
             ids(&p),
             ["kv-cache-design", "guide-update", "session-names"]
         );
+    }
+
+    #[test]
+    fn space_on_an_empty_query_asks_the_caller_for_a_preview() {
+        let mut p = pane();
+        let out = p.handle_key(key(KeyCode::Char(' ')));
+        assert!(matches!(out, Outcome::LoadPreview(id) if id == "kv-cache-design"));
+        assert_eq!(p.query(), "", "Space did not land in the search box");
+        // Until the caller answers, the row says so rather than showing stale text.
+        assert!(p.rows()[0].extra.iter().any(|l| l.contains("loading")));
+
+        p.set_preview(
+            "kv-cache-design",
+            "user: make it scroll\nplank: done".to_owned(),
+        );
+        let extra = p.rows()[0].extra.clone();
+        assert_eq!(extra, ["user: make it scroll", "plank: done"]);
+    }
+
+    #[test]
+    fn a_second_space_closes_the_preview_and_does_not_reload_it() {
+        let mut p = pane();
+        p.handle_key(key(KeyCode::Char(' ')));
+        p.set_preview("kv-cache-design", "cached".to_owned());
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char(' '))),
+            Outcome::Stay
+        ));
+        assert!(
+            p.rows()[0].extra.iter().all(|l| l != "cached"),
+            "preview closed"
+        );
+        // Reopening is free: the text is already in hand, so no reload is asked for.
+        assert!(matches!(
+            p.handle_key(key(KeyCode::Char(' '))),
+            Outcome::Stay
+        ));
+        assert!(p.rows()[0].extra.iter().any(|l| l == "cached"));
+    }
+
+    #[test]
+    fn space_types_a_space_once_the_query_is_not_empty() {
+        let mut p = pane();
+        typed(&mut p, "user");
+        let out = p.handle_key(key(KeyCode::Char(' ')));
+        assert!(matches!(out, Outcome::Stay));
+        assert_eq!(p.query(), "user ");
+        typed(&mut p, "guide");
+        assert_eq!(ids(&p), ["guide-update"]);
+    }
+
+    #[test]
+    fn moving_the_cursor_closes_the_preview() {
+        let mut p = pane();
+        p.handle_key(key(KeyCode::Char(' ')));
+        p.set_preview("kv-cache-design", "cached".to_owned());
+        p.handle_key(key(KeyCode::Down));
+        assert!(p.rows()[0].extra.iter().all(|l| l != "cached"));
     }
 }
