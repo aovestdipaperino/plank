@@ -2370,12 +2370,32 @@ impl Agent<'_> {
     ///
     /// The mirror of the TUI's continuation hook in `tui_turn`; a change here
     /// almost always needs the matching change there (CLAUDE.md).
+    ///
+    /// `self.goal` must be `None` again by the time this returns, on *every*
+    /// exit path, including an `Err` from a failed generation — the field's
+    /// own invariant is that it is transient state cleared before the front
+    /// end is back at the prompt, and a propagated `?` must not skip that.
+    /// `drive_goal_loop` does the actual work and can fail; this wrapper
+    /// clears `self.goal` unconditionally before deciding whether to print
+    /// the closing notice or propagate the error.
     fn run_goal_loop(&mut self, goal: &str, max_iters: usize) -> Result<(), String> {
         self.goal = Some(crate::goal::GoalLoop::new(goal, max_iters));
         self.session
             .push(Message::user(crate::goal::kickoff_message(goal)));
-        let mut iters;
-        let (outcome, reason) = loop {
+        let result = self.drive_goal_loop();
+        self.goal = None;
+        let (outcome, iters, reason) = result?;
+        println!(
+            "{}",
+            self.debug_line(&crate::goal::closing(outcome, iters, &reason))
+        );
+        Ok(())
+    }
+
+    /// The fallible body of the goal loop, factored out so `run_goal_loop`
+    /// can clear `self.goal` on every exit, including an early `?` return.
+    fn drive_goal_loop(&mut self) -> Result<(crate::goal::Outcome, usize, String), String> {
+        loop {
             let (iter, max) = {
                 let g = self
                     .goal
@@ -2383,15 +2403,14 @@ impl Agent<'_> {
                     .expect("goal is live inside its own loop");
                 (g.next_iteration(), g.max_iters())
             };
-            iters = iter;
             println!("{}", self.debug_line(&crate::goal::banner(iter, max)));
             self.run_turn()?;
             if self.last_turn_interrupted || crate::interrupt::pending() {
-                break (crate::goal::Outcome::Interrupted, String::new());
+                return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
             }
             let adj = self.adjudicate_plain()?;
             if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
-                break (o, adj.reason);
+                return Ok((o, iter, adj.reason));
             }
             if self
                 .goal
@@ -2399,15 +2418,9 @@ impl Agent<'_> {
                 .expect("goal is live inside its own loop")
                 .at_cap()
             {
-                break (crate::goal::Outcome::Cap, adj.reason);
+                return Ok((crate::goal::Outcome::Cap, iter, adj.reason));
             }
-        };
-        self.goal = None;
-        println!(
-            "{}",
-            self.debug_line(&crate::goal::closing(outcome, iters, &reason))
-        );
-        Ok(())
+        }
     }
 
     /// Runs the Stop hooks; returns the model-visible feedback of the first
@@ -15757,6 +15770,29 @@ mod tests {
         assert!(
             prompts.lock().expect("lock").is_empty(),
             "no generation should have run"
+        );
+    }
+
+    /// `run_turn`'s `?` must not leave `self.goal` set behind it: the field's
+    /// invariant is that it is `None` whenever the front end is back at the
+    /// prompt, error return included.
+    #[test]
+    fn goal_clears_its_state_even_when_a_turn_errors() {
+        let dir = scratch_dir("goal-error");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                fail_with: Some("provider exploded".to_string()),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let err = agent.slash("/goal make the tests pass");
+        assert!(err.is_err(), "the engine failure must propagate: {err:?}");
+        assert!(
+            agent.goal.is_none(),
+            "goal state must clear even on an error return"
         );
     }
 
