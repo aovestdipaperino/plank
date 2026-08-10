@@ -1020,6 +1020,48 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// Renames a saved session, moving its transcript and KV payload sidecar.
+    ///
+    /// A session's identity *is* its filename ([`SessionStore::load`] takes
+    /// `id` from the stem), so this is a pure file move with no in-file
+    /// rewrite. The payload travels along: its embedded signature is over
+    /// model, system prompt and rendered transcript — never the id — so it
+    /// stays trustworthy under the new name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid, ambiguous or unmatched `prefix`, for a
+    /// `new_name` that [`validate_name`] rejects, for a name that already
+    /// names a different saved session (renaming would destroy it), or if the
+    /// move fails.
+    pub fn rename(&self, prefix: &str, new_name: &str) -> Result<String> {
+        let name = validate_name(new_name)
+            .map_err(SessionError::new)?
+            .to_owned();
+        let (old, path) = self.find(prefix)?;
+        if name == old {
+            return Ok(old);
+        }
+        let dest = self.path_for_id(&name);
+        if dest.exists() {
+            return Err(SessionError::new(format!(
+                "a session named {name} is already saved"
+            )));
+        }
+        fs::rename(&path, &dest)?;
+        // Best-effort for the cache sidecars: a session with no saved payload is
+        // ordinary, and a payload left behind is only a wasted blob the GC
+        // sweeps, never a wrong answer — the signature check would reject it.
+        let old_payload = self.payload_path(&old);
+        let new_payload = self.payload_path(&name);
+        let _ = fs::rename(&old_payload, &new_payload);
+        let _ = fs::rename(
+            crate::kvmeta::sidecar_path(&old_payload),
+            crate::kvmeta::sidecar_path(&new_payload),
+        );
+        Ok(name)
+    }
+
     /// Resolves a hex prefix to exactly one saved session id and path.
     ///
     /// # Errors
@@ -3099,6 +3141,68 @@ hello\n";
         assert_eq!(store.delete(&id).unwrap(), id);
         assert!(store.list().unwrap().is_empty());
         assert!(store.load(&id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_moves_the_session_file_and_its_payload() {
+        let dir = temp_dir("store-rename");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "old-name".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+        // A payload sidecar and its metadata sit beside the transcript.
+        fs::write(store.payload_path("old-name"), b"payload").unwrap();
+        fs::write(
+            crate::kvmeta::sidecar_path(&store.payload_path("old-name")),
+            b"{}",
+        )
+        .unwrap();
+
+        let id = store.rename("old-name", "new-name").unwrap();
+        assert_eq!(id, "new-name");
+        assert!(
+            !store.path_for_id("old-name").exists(),
+            "old transcript gone"
+        );
+        assert!(
+            store.path_for_id("new-name").exists(),
+            "new transcript there"
+        );
+        assert!(store.payload_path("new-name").exists(), "payload followed");
+        assert!(
+            crate::kvmeta::sidecar_path(&store.payload_path("new-name")).exists(),
+            "sidecar followed"
+        );
+        // The identity is the filename, so the loaded session reports the new name.
+        assert_eq!(store.load("new-name").unwrap().id, "new-name");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rename_refuses_an_invalid_or_taken_name() {
+        let dir = temp_dir("store-rename-refuse");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut a = Session::new();
+        a.id = "one".to_owned();
+        a.push(Message::user("a"));
+        store.save(&mut a).unwrap();
+        let mut b = Session::new();
+        b.id = "two".to_owned();
+        b.push(Message::user("b"));
+        store.save(&mut b).unwrap();
+
+        // A name that already names a saved session is refused, and nothing moves:
+        // silently clobbering `two` would destroy a transcript.
+        assert!(store.rename("one", "two").is_err());
+        assert!(store.path_for_id("one").exists());
+        assert!(store.path_for_id("two").exists());
+        // `validate_name`'s rules still apply.
+        assert!(store.rename("one", "").is_err());
+        assert!(store.rename("one", "has spaces").is_err());
+        // Renaming to its own name is a no-op success, not an "already taken" error.
+        assert_eq!(store.rename("one", "one").unwrap(), "one");
         let _ = fs::remove_dir_all(&dir);
     }
 
