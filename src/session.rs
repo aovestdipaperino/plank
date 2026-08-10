@@ -581,19 +581,76 @@ impl SessionStore {
 
     /// Loads the cache stored under `key`, or `None` on any miss — absent,
     /// stale, corrupt, or written by an older format version.
+    ///
+    /// A hit bumps the sidecar's `hits` and `last_used`, which is what the TTL
+    /// sweep and `/kvcache` read. That refresh is best-effort and strictly
+    /// downstream of the load decision: the signature inside the body is still
+    /// the only thing that decides whether these bytes may be used.
     #[must_use]
     pub fn kv_load(&self, key: &KvKey) -> Option<crate::kvcache::KVCache> {
-        crate::kvcache::KVCache::from_file(&self.kv_path(key), key.signature())
+        let path = self.kv_path(key);
+        let cache = crate::kvcache::KVCache::from_file(&path, key.signature())?;
+        if let Some(mut meta) = crate::kvmeta::load(&path) {
+            meta.hits = meta.hits.saturating_add(1);
+            meta.last_used = crate::kvmeta::now_secs();
+            let _ = crate::kvmeta::store(&path, &meta);
+        }
+        Some(cache)
     }
 
-    /// Persists `cache` under `key`, creating parent directories as needed.
+    /// Persists `cache` under `key` with no lineage or label recorded.
+    ///
+    /// Prefer [`kv_store_labeled`](Self::kv_store_labeled): a blob stored this
+    /// way shows in `/kvcache` as an unattributed root. This form exists for
+    /// callers that genuinely have nothing to say about the blob.
     ///
     /// # Errors
     /// Returns the underlying [`io::Error`] when the write fails. Callers treat
     /// a failure as best-effort: the live session is correct either way and
     /// only the next launch pays.
     pub fn kv_store(&self, key: &KvKey, cache: &crate::kvcache::KVCache) -> io::Result<()> {
-        cache.persist(&self.kv_path(key), key.signature())
+        self.kv_store_labeled(key, cache, None, "", &crate::kvmeta::KvLabel::Unknown)
+    }
+
+    /// Persists `cache` under `key` and records its lineage and display label.
+    ///
+    /// `parent` is the fingerprint of the blob this one extends — `None` only
+    /// for a Tier 1 system checkpoint. An existing sidecar's `created` and
+    /// `pinned` survive a rewrite: re-persisting the same fingerprint is a
+    /// refresh, not a new blob, and silently unpinning one would be a nasty
+    /// surprise.
+    ///
+    /// # Errors
+    /// Returns the underlying [`io::Error`] when the body write fails. A failed
+    /// *sidecar* write is swallowed: metadata is advisory and must never turn a
+    /// good store into an error.
+    pub fn kv_store_labeled(
+        &self,
+        key: &KvKey,
+        cache: &crate::kvcache::KVCache,
+        parent: Option<&str>,
+        model: &str,
+        label: &crate::kvmeta::KvLabel,
+    ) -> io::Result<()> {
+        let path = self.kv_path(key);
+        cache.persist(&path, key.signature())?;
+        let now = crate::kvmeta::now_secs();
+        let prior = crate::kvmeta::load(&path);
+        let meta = crate::kvmeta::KvMeta {
+            version: crate::kvmeta::META_VERSION,
+            role: kv_role(key),
+            fingerprint: key.signature().to_owned(),
+            parent: parent.map(ToOwned::to_owned),
+            model: model.to_owned(),
+            created: prior.as_ref().map_or(now, |p| p.created),
+            last_used: now,
+            hits: prior.as_ref().map_or(0, |p| p.hits),
+            bytes: fs::metadata(&path).map_or(0, |m| m.len()),
+            pinned: prior.as_ref().is_some_and(|p| p.pinned),
+            label: label.clone(),
+        };
+        let _ = crate::kvmeta::store(&path, &meta);
+        Ok(())
     }
 
     /// Deletes every pre-`.kv_raw` KV body once, returning the bytes reclaimed.
@@ -681,6 +738,7 @@ impl SessionStore {
         let had_payload = payload.exists();
         if had_payload {
             fs::remove_file(&payload)?;
+            let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         }
         Ok((id, had_payload))
     }
@@ -825,7 +883,9 @@ impl SessionStore {
         let (id, path) = self.find(prefix.as_ref())?;
         fs::remove_file(&path)?;
         // The payload sidecar is a cache keyed to the transcript; it goes too.
-        let _ = fs::remove_file(self.payload_path(&id));
+        let payload = self.payload_path(&id);
+        let _ = fs::remove_file(&payload);
+        let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         Ok(id)
     }
 
@@ -1013,6 +1073,16 @@ pub fn tier_fingerprint(parent_fp: &str, material: &[u8]) -> String {
 #[must_use]
 pub fn project_checkpoint_name(fp2: &str) -> String {
     format!("{PROJECT_STEM}-{fp2}{PAYLOAD_EXT}")
+}
+
+/// The metadata role a [`KvKey`] variant corresponds to.
+#[must_use]
+pub fn kv_role(key: &KvKey) -> crate::kvmeta::KvRole {
+    match key {
+        KvKey::System { .. } => crate::kvmeta::KvRole::System,
+        KvKey::Project { .. } => crate::kvmeta::KvRole::Project,
+        KvKey::Session { .. } => crate::kvmeta::KvRole::Session,
+    }
 }
 
 /// File name of the Tier 1 system-prompt checkpoint keyed by its fingerprint
@@ -2802,5 +2872,100 @@ hello\n";
             "project checkpoints must not collide across projects"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storing_writes_a_sidecar_and_loading_counts_the_hit() {
+        use crate::kvcache::KVCache;
+        let dir = std::env::temp_dir().join(format!("plank-kvmeta-io-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a19f".into() };
+        let cache = KVCache::new(vec![1, 2, 3], crate::ds4tokens::TokenTranscript::new());
+
+        store
+            .kv_store_labeled(
+                &key,
+                &cache,
+                None,
+                "test-model",
+                &crate::kvmeta::KvLabel::System {
+                    think_mode: "max".into(),
+                    trusted_len: 12,
+                    global_mcp: vec!["tokensave".into()],
+                },
+            )
+            .unwrap();
+
+        let meta = crate::kvmeta::load(&store.kv_path(&key)).expect("sidecar written");
+        assert_eq!(meta.fingerprint, "a19f");
+        assert_eq!(meta.model, "test-model");
+        assert_eq!(
+            meta.bytes,
+            std::fs::metadata(store.kv_path(&key)).unwrap().len()
+        );
+        assert_eq!(meta.hits, 0, "storing is not a hit");
+        assert!(meta.parent.is_none());
+
+        assert!(store.kv_load(&key).is_some());
+        assert_eq!(
+            crate::kvmeta::load(&store.kv_path(&key)).unwrap().hits,
+            1,
+            "a successful load is a hit"
+        );
+
+        // A miss must not invent a sidecar or touch counters.
+        assert!(
+            store
+                .kv_load(&KvKey::System { fp: "beef".into() })
+                .is_none()
+        );
+        assert_eq!(crate::kvmeta::load(&store.kv_path(&key)).unwrap().hits, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_corrupt_sidecar_never_blocks_a_good_blob() {
+        use crate::kvcache::KVCache;
+        let dir = std::env::temp_dir().join(format!("plank-kvmeta-bad-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a19f".into() };
+        store
+            .kv_store(
+                &key,
+                &KVCache::new(vec![9], crate::ds4tokens::TokenTranscript::new()),
+            )
+            .unwrap();
+        std::fs::write(
+            crate::kvmeta::sidecar_path(&store.kv_path(&key)),
+            b"garbage",
+        )
+        .unwrap();
+        assert!(
+            store.kv_load(&key).is_some(),
+            "the signature in the body is the only trust input"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kv_role_maps_each_key_variant() {
+        use crate::kvmeta::KvRole;
+        assert_eq!(kv_role(&KvKey::System { fp: "a".into() }), KvRole::System);
+        assert_eq!(
+            kv_role(&KvKey::Project {
+                dir: PathBuf::from("/p"),
+                fp: "b".into()
+            }),
+            KvRole::Project
+        );
+        assert_eq!(
+            kv_role(&KvKey::Session {
+                id: "i".into(),
+                fp: "c".into()
+            }),
+            KvRole::Session
+        );
     }
 }
