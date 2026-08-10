@@ -1207,3 +1207,39 @@ test` and review the diff before committing.
   plank`. Note the pre-commit hook still runs the bare form, so a commit made
   through it can carry the drift; recover with `git -C refs/obscura checkout --
   .`.
+- **A sub-agent's report is its transcript text, and a transcript keeps
+  `<think>` verbatim.** The report handed back as a tool observation came from
+  `last_assistant_text`, i.e. the raw last assistant message — which still
+  carries the reasoning block, because the KV prefix depends on the transcript
+  holding thinking unaltered. The parent therefore received a report narrating
+  half-abandoned alternatives, judged it unreliable, and redid the work by hand
+  (defeating the whole point of delegating). Two fixes are needed, because they
+  address different halves: `strip_thinking` removes blocks the model *marked*
+  as thinking, and the `agents::task_message` envelope asks for the plain answer
+  stated once, which is the only lever against reasoning narrated as ordinary
+  prose in the report body — no parser can identify that. Note the emptiness
+  test has to run *after* stripping, or a pass that was pure reasoning yields a
+  blank report instead of falling back to the last real answer.
+- **`record_usage` fires at pass *completion*, so per-pass token accounting
+  shows nothing during a long pass.** A sub-agent roster row wired only to the
+  per-pass tally sat blank for the minutes a local pass takes, which reads as a
+  broken feature rather than as "not counted yet" — and it is intermittent,
+  since a short pass populates the row almost immediately. Live counts have to
+  come from the worker's `UiEvent::Status` snapshots (`prefill_done`/
+  `prefill_total`/`generated`), the same source `status::progress_segment` draws
+  the main progress line from. Fold the completed pass in and drop the live
+  figures in the same breath, or the two double-count. The snapshot describes
+  whichever pass the engine is running, so it can only be attributed when
+  exactly one sub-agent is in flight; a fan-out has several, and its rows must
+  stay on their own per-pass tallies.
+- **A live one-line summary of an agent cannot come from the tail of its
+  output.** The roster's task column was first derived from the newest non-blank
+  line of the run's `OutputLog`, on the reasoning that a derived value cannot
+  drift from what it summarises. It cannot drift, but it is worthless: a
+  streaming line is sampled mid-statement, so the column showed fragments like
+  `vals =` from whatever code the model happened to be emitting. The delegated
+  task is the stable, meaningful source — flattened to one line, since a task is
+  often a paragraph and a raw newline breaks the row. Cap it well below the
+  available width too (`TASK_MAX_COLS`): sized only by "whatever room is left",
+  prose runs to the edge on a wide terminal and buries the name and the tally
+  the row exists to show.
