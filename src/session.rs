@@ -101,6 +101,14 @@ const FILE_EXT: &str = ".kv";
 /// a transcript.
 const PAYLOAD_EXT: &str = crate::kvmeta::BLOB_EXT;
 
+/// Extension the engine KV payload used before the `.kv_raw` unification.
+/// Referenced only by [`SessionStore::migrate_legacy_blobs`].
+const LEGACY_PAYLOAD_EXT: &str = ".payload";
+
+/// Marker recording that [`SessionStore::migrate_legacy_blobs`] has run. Its
+/// presence, not its contents, is the signal.
+const MIGRATION_MARKER: &str = ".kvformat-2";
+
 /// Error raised by session store operations.
 ///
 /// Wraps both I/O failures and user-level failures (bad prefix, ambiguous
@@ -586,6 +594,69 @@ impl SessionStore {
     /// only the next launch pays.
     pub fn kv_store(&self, key: &KvKey, cache: &crate::kvcache::KVCache) -> io::Result<()> {
         cache.persist(&self.kv_path(key), key.signature())
+    }
+
+    /// Deletes every pre-`.kv_raw` KV body once, returning the bytes reclaimed.
+    ///
+    /// Returns `None` when the marker file shows migration already ran, so the
+    /// caller knows to stay silent. The old format carried no lineage and no
+    /// usage history, and synthesizing either would produce a `/kvcache` tree
+    /// that looks authoritative while being invented — so the blobs go and the
+    /// tiers rebuild on demand.
+    ///
+    /// **Transcripts are never touched.** Only `<id>.payload`,
+    /// `sysprompt-*.kv`, the legacy bare `sysprompt.kv`, `<proj>/project-*.kv`,
+    /// and the diagnostic prompt note are removed; every `<id>.kv` survives, so
+    /// resuming a session works and pays a single re-prefill.
+    ///
+    /// Best-effort throughout: an unlink that fails is skipped and its bytes
+    /// are not counted, and the marker is still written — a second sweep would
+    /// find the same undeletable file.
+    #[must_use]
+    pub fn migrate_legacy_blobs(&self) -> Option<u64> {
+        let marker = self.dir.join(MIGRATION_MARKER);
+        if marker.exists() {
+            return None;
+        }
+        let mut reclaimed = 0u64;
+        let legacy_sysprompt = format!("{SYSPROMPT_STEM}{FILE_EXT}");
+        let mut sweep = |dir: &Path, stems: &[&str]| {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                if name == SYSPROMPT_NOTE_NAME {
+                    let _ = fs::remove_file(entry.path());
+                    continue;
+                }
+                let doomed = name == legacy_sysprompt
+                    || name.ends_with(LEGACY_PAYLOAD_EXT)
+                    || (name.ends_with(FILE_EXT) && stems.iter().any(|s| name.starts_with(s)));
+                if !doomed {
+                    continue;
+                }
+                let size = entry.metadata().map_or(0, |m| m.len());
+                if fs::remove_file(entry.path()).is_ok() {
+                    reclaimed = reclaimed.saturating_add(size);
+                }
+            }
+        };
+        sweep(&self.dir, &[SYSPROMPT_PREFIX]);
+        // Project checkpoints live one level down, one directory per project.
+        if let Ok(entries) = fs::read_dir(&self.dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    sweep(&entry.path(), &[PROJECT_STEM]);
+                }
+            }
+        }
+        let _ = fs::write(&marker, b"2\n");
+        Some(reclaimed)
     }
 
     /// Strips the engine KV payload from the session matching the hex
@@ -1770,6 +1841,55 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    #[test]
+    fn migration_wipes_old_blobs_and_keeps_every_transcript() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        let proj = dir.join("abc123def456");
+        std::fs::create_dir_all(&proj).unwrap();
+
+        // The four old blob species, the note, and one transcript.
+        std::fs::write(dir.join("sysprompt-a19f.kv"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sysprompt.kv"), vec![0u8; 10]).unwrap();
+        std::fs::write(dir.join("cheeky-bell.payload"), vec![0u8; 200]).unwrap();
+        std::fs::write(proj.join("project-7c02.kv"), vec![0u8; 50]).unwrap();
+        std::fs::write(dir.join("sysprompt-last.prompt"), b"old prompt").unwrap();
+        std::fs::write(dir.join("cheeky-bell.kv"), b"plank-session 1\n").unwrap();
+
+        let reclaimed = store.migrate_legacy_blobs().expect("migration runs once");
+        assert_eq!(reclaimed, 360, "100 + 10 + 200 + 50");
+
+        assert!(!dir.join("sysprompt-a19f.kv").exists());
+        assert!(!dir.join("sysprompt.kv").exists());
+        assert!(!dir.join("cheeky-bell.payload").exists());
+        assert!(!proj.join("project-7c02.kv").exists());
+        assert!(!dir.join("sysprompt-last.prompt").exists());
+        assert!(
+            dir.join("cheeky-bell.kv").exists(),
+            "transcripts must survive: resuming pays one re-prefill, it does not lose the conversation"
+        );
+
+        assert!(
+            store.migrate_legacy_blobs().is_none(),
+            "second run is a no-op"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_does_not_touch_new_format_blobs() {
+        let dir = std::env::temp_dir().join(format!("plank-migrate-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 100]).unwrap();
+        std::fs::write(dir.join("sysprompt-a19f.json"), b"{}").unwrap();
+        assert_eq!(store.migrate_legacy_blobs(), Some(0));
+        assert!(dir.join("sysprompt-a19f.kv_raw").exists());
+        assert!(dir.join("sysprompt-a19f.json").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
