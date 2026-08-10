@@ -353,6 +353,11 @@ pub trait Named {
     fn name(&self) -> &str;
     /// Renames the entry, used to apply the `<plugin>:<name>` alias.
     fn set_name(&mut self, name: String);
+    /// The file or directory the entry was loaded from. [`reconcile`] clones
+    /// an entry to register it twice, so the two copies share this — which is
+    /// how [`listing`] tells a plugin's own bare copy apart from a local entry
+    /// that merely has the same name.
+    fn source(&self) -> &Path;
 }
 
 impl Named for crate::skills::Skill {
@@ -361,6 +366,9 @@ impl Named for crate::skills::Skill {
     }
     fn set_name(&mut self, name: String) {
         self.name = name;
+    }
+    fn source(&self) -> &Path {
+        &self.dir
     }
 }
 
@@ -371,6 +379,9 @@ impl Named for crate::agents::AgentDef {
     fn set_name(&mut self, name: String) {
         self.name = name;
     }
+    fn source(&self) -> &Path {
+        &self.path
+    }
 }
 
 impl Named for crate::templates::Template {
@@ -380,6 +391,73 @@ impl Named for crate::templates::Template {
     fn set_name(&mut self, name: String) {
         self.name = name;
     }
+    fn source(&self) -> &Path {
+        &self.path
+    }
+}
+
+/// One entry as a listing should show it: once, under the name worth typing,
+/// plus the plugin that contributed it.
+#[derive(Debug)]
+pub struct Listed<'a, T> {
+    /// The entry to render.
+    pub entry: &'a T,
+    /// The name to show. The bare name when the plugin won it, the
+    /// `<plugin>:<name>` alias when something else holds the bare one.
+    pub name: &'a str,
+    /// The contributing plugin, or `None` for a user or project entry.
+    pub plugin: Option<&'a str>,
+}
+
+/// Collapses a [`reconcile`]d list for display: an uncontested plugin entry is
+/// registered twice, bare and aliased, so every listing showed it twice and the
+/// model could read the two rows as two different skills. Both names stay
+/// resolvable; only the rendering is deduplicated.
+///
+/// A local entry whose own name happens to contain `:` is reported as though it
+/// came from a plugin. Names come from file stems and directory names, so that
+/// is pathological rather than reachable in practice, and the alternative would
+/// be to carry provenance on every entry.
+#[must_use]
+pub fn listing<T: Named>(entries: &[T]) -> Vec<Listed<'_, T>> {
+    let mut out: Vec<Listed<'_, T>> = Vec::new();
+    let mut suppressed: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        if suppressed.contains(&i) {
+            continue;
+        }
+        let Some((plugin, bare)) = entry.name().split_once(':') else {
+            out.push(Listed {
+                entry,
+                name: entry.name(),
+                plugin: None,
+            });
+            continue;
+        };
+        // `reconcile` pushes the alias first and the bare copy right after, so
+        // the twin is always later in the list; matching on the source path is
+        // what distinguishes it from a same-named local entry.
+        let twin = entries
+            .iter()
+            .enumerate()
+            .find(|(j, o)| *j != i && o.name() == bare && o.source() == entry.source());
+        match twin {
+            Some((j, o)) => {
+                suppressed.push(j);
+                out.push(Listed {
+                    entry: o,
+                    name: o.name(),
+                    plugin: Some(plugin),
+                });
+            }
+            None => out.push(Listed {
+                entry,
+                name: entry.name(),
+                plugin: Some(plugin),
+            }),
+        }
+    }
+    out
 }
 
 /// The directory (or file) a plugin contributes for one component, preferring
@@ -914,6 +992,7 @@ mod tests {
     struct Item {
         name: String,
         from: &'static str,
+        path: PathBuf,
     }
 
     impl Named for Item {
@@ -923,12 +1002,16 @@ mod tests {
         fn set_name(&mut self, name: String) {
             self.name = name;
         }
+        fn source(&self) -> &Path {
+            &self.path
+        }
     }
 
     fn item(name: &str, from: &'static str) -> Item {
         Item {
             name: name.to_string(),
             from,
+            path: PathBuf::from(from).join(name),
         }
     }
 
@@ -978,6 +1061,60 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("alpha") && w.contains("beta"))
         );
+    }
+
+    #[test]
+    fn an_uncontested_plugin_entry_is_listed_once_under_its_bare_name() {
+        let (merged, _) = reconcile(vec![], vec![("demo".to_string(), item("greet", "plugin"))]);
+        assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
+        let listed = listing(&merged);
+        assert_eq!(listed.len(), 1, "rendered once");
+        assert_eq!(listed[0].name, "greet");
+        assert_eq!(listed[0].plugin, Some("demo"));
+    }
+
+    #[test]
+    fn a_contested_plugin_entry_is_listed_under_its_alias_beside_the_local_one() {
+        let (merged, _) = reconcile(
+            vec![item("greet", "user")],
+            vec![("demo".to_string(), item("greet", "plugin"))],
+        );
+        let listed = listing(&merged);
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].name, "greet");
+        assert_eq!(listed[0].plugin, None, "the local entry has no plugin");
+        assert_eq!(listed[1].name, "demo:greet");
+        assert_eq!(listed[1].plugin, Some("demo"));
+    }
+
+    #[test]
+    fn the_skill_listings_show_a_plugin_skill_once_with_its_origin() {
+        let base = scratch("listing-skills");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "skills/greet/SKILL.md",
+            "---\nname: greet\ndescription: says hi\n---\nHello\n",
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        let (skills, _) = skills_in(Some(&home), &cwd, &set);
+        assert_eq!(skills.len(), 2, "both names stay resolvable");
+        for out in [
+            crate::skills::render_list(&skills),
+            crate::skills::render_names(&skills),
+        ] {
+            assert_eq!(
+                out.matches("greet").count(),
+                1,
+                "the skill is named once: {out}"
+            );
+            assert!(out.contains("[plugin demo]"), "origin missing: {out}");
+        }
     }
 
     #[test]

@@ -407,9 +407,12 @@ pub fn render_list(defs: &[AgentDef]) -> String {
             .to_string();
     }
     let mut out = String::from("Agents (dispatch with /subagent:<name> <task>):\n");
-    for d in defs {
+    // An uncontested plugin definition holds both its bare name and its
+    // `<plugin>:<name>` alias; `listing` shows it once and names the plugin.
+    for listed in crate::plugins::listing(defs) {
+        let d = listed.entry;
         out.push_str("  ");
-        out.push_str(&d.name);
+        out.push_str(listed.name);
         if !d.description.is_empty() {
             out.push_str(" — ");
             out.push_str(&d.description);
@@ -429,6 +432,9 @@ pub fn render_list(defs: &[AgentDef]) -> String {
                 }
             }
             None => {}
+        }
+        if let Some(plugin) = listed.plugin {
+            let _ = write!(out, " [plugin {plugin}]");
         }
         out.push('\n');
     }

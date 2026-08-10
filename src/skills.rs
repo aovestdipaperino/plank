@@ -152,9 +152,12 @@ pub fn render_list(skills: &[Skill]) -> String {
         return "no skills found (checked ~/.plank/skills and ./.plank/skills)\n".to_string();
     }
     let mut out = String::from("Skills (invoke with /<name> [arguments]):\n");
-    for s in skills {
+    // An uncontested plugin skill is registered under both its bare name and
+    // its `<plugin>:<name>` alias; `listing` shows it once and names the plugin.
+    for listed in crate::plugins::listing(skills) {
+        let s = listed.entry;
         out.push_str("  /");
-        out.push_str(&s.name);
+        out.push_str(listed.name);
         if !s.argument_hint.is_empty() {
             out.push(' ');
             out.push_str(&s.argument_hint);
@@ -162,6 +165,11 @@ pub fn render_list(skills: &[Skill]) -> String {
         if !s.description.is_empty() {
             out.push_str(" — ");
             out.push_str(&s.description);
+        }
+        if let Some(plugin) = listed.plugin {
+            out.push_str(" [plugin ");
+            out.push_str(plugin);
+            out.push(']');
         }
         out.push('\n');
     }
@@ -177,12 +185,19 @@ pub fn render_names(skills: &[Skill]) -> String {
             .to_string();
     }
     let mut out = String::from("Available skills (call skill with name set to one of):\n");
-    for s in skills {
+    // Listing an uncontested plugin skill under both its bare name and its
+    // alias would read to the model as two different skills, so show it once.
+    for listed in crate::plugins::listing(skills) {
         out.push_str("- ");
-        out.push_str(&s.name);
-        if !s.description.is_empty() {
+        out.push_str(listed.name);
+        if !listed.entry.description.is_empty() {
             out.push_str(" — ");
-            out.push_str(&s.description);
+            out.push_str(&listed.entry.description);
+        }
+        if let Some(plugin) = listed.plugin {
+            out.push_str(" [plugin ");
+            out.push_str(plugin);
+            out.push(']');
         }
         out.push('\n');
     }

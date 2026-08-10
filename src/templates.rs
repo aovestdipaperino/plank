@@ -361,9 +361,12 @@ pub fn render_list(templates: &[Template]) -> String {
             .to_string();
     }
     let mut out = String::from("Prompt templates (invoke with /<name> [values]):\n");
-    for t in templates {
+    // An uncontested plugin template holds both its bare name and its
+    // `<plugin>:<name>` alias; `listing` shows it once and names the plugin.
+    for listed in crate::plugins::listing(templates) {
+        let t = listed.entry;
         out.push_str("  /");
-        out.push_str(&t.name);
+        out.push_str(listed.name);
         let vars = variables(&t.body);
         let args = usage_args(t, &vars);
         if !args.is_empty() {
@@ -373,6 +376,11 @@ pub fn render_list(templates: &[Template]) -> String {
         if !t.description.is_empty() {
             out.push_str(" — ");
             out.push_str(&t.description);
+        }
+        if let Some(plugin) = listed.plugin {
+            out.push_str(" [plugin ");
+            out.push_str(plugin);
+            out.push(']');
         }
         out.push('\n');
     }
