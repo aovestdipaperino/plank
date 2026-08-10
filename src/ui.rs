@@ -3954,72 +3954,126 @@ the original is frozen and listed in /tree"
         crate::kvpane::KvPane::new(
             crate::kvtree::build(self.store.kv_nodes()),
             crate::kvgc::SweepPolicy::from_settings(&settings.kvcache),
-            settings.kvcache.max_bytes,
+            // The same set the startup sweep is given. Without it the pane marks
+            // this launch's own chain `⏳ expired` and counts it as reclaimable
+            // whenever its `last_used` is stale, which is exactly the state a
+            // long-lived checkpoint is in.
+            self.active_kv_fingerprints(&self.kv_tiers()),
             crate::kvmeta::now_secs(),
         )
     }
 
+    /// Every fingerprint this launch is using, across every engine it holds and
+    /// including the live session's payload.
+    ///
+    /// One definition, shared by the startup sweep and the `/kvcache` view, so
+    /// the pane cannot report a blob as expired that the sweep will keep.
+    fn active_kv_fingerprints(&self, tiers: &[crate::kvtier::TierSpec]) -> Vec<String> {
+        // Every tier of this launch's chain, not just Tier 1: one sweep now
+        // protects them all, where the two old GCs were per-tier.
+        let mut keep: Vec<String> = tiers.iter().map(|t| t.fingerprint.clone()).collect();
+        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
+            keep.extend(
+                self.kv_tiers_for(&alt.model_name())
+                    .into_iter()
+                    .map(|t| t.fingerprint),
+            );
+        }
+        // The session in front of the user is live by definition, however long
+        // it has been since its payload was last loaded. Its node's fingerprint
+        // is the *payload* fingerprint, not the session id: pushing the id here
+        // matched nothing at all, so the payload survived only on recency.
+        keep.push(self.payload_fingerprint_for(&self.session));
+        keep
+    }
+
     /// Sweeps the cache under the configured policy and reports what it freed.
     ///
-    /// No session is passed as active: `/kvcache gc` is a deliberate manual
-    /// sweep, and the live session's own blobs are protected by their recency
-    /// rather than by an exemption list.
+    /// Given the same active set as the startup sweep and as the pane's own
+    /// verdicts, so `g` in the pane cannot delete a row the pane is showing as
+    /// live. Recency alone would not protect the live chain: a checkpoint that
+    /// has not been reloaded for a month is still the one in use.
     #[must_use]
     fn kvcache_sweep(&self) -> String {
         let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
-        let freed = self.store.sweep(&[], &policy, crate::kvmeta::now_secs());
+        let keep = self.active_kv_fingerprints(&self.kv_tiers());
+        let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
         format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
     }
 
     /// [`kvcache_mutate`](Self::kvcache_mutate) flattened to one printable
     /// line, so both front ends report a failure the same way.
     #[must_use]
-    fn kvcache_apply(&self, verb: &str, fp: &str) -> String {
-        self.kvcache_mutate(verb, fp)
+    fn kvcache_apply(&self, verb: &str, fp_prefix: &str) -> String {
+        self.resolve_kv_prefix(fp_prefix)
+            .and_then(|idx| self.kvcache_mutate(verb, idx))
             .unwrap_or_else(|e| format!("kvcache: {e}"))
     }
 
-    /// Applies one `/kvcache` mutation by fingerprint prefix, returning the
-    /// line to show. Shared by both front ends so `p`/`d` in the pane and
-    /// `/kvcache pin|rm` in the REPL cannot diverge.
+    /// [`kvcache_mutate`](Self::kvcache_mutate) on an already-resolved index,
+    /// flattened to one printable line. The pane's own path: its rows carry the
+    /// index, so no prefix matching is involved.
+    #[must_use]
+    fn kvcache_apply_idx(&self, verb: &str, idx: usize) -> String {
+        self.kvcache_mutate(verb, idx)
+            .unwrap_or_else(|e| format!("kvcache: {e}"))
+    }
+
+    /// Resolves a `/kvcache <verb> <fp-prefix>` argument to a scan index into
+    /// [`crate::session::SessionStore::kv_blob_nodes`].
+    ///
+    /// The REPL subcommands keep their fingerprint-prefix interface; only the
+    /// resolution changes, so both front ends act through one index-keyed code
+    /// path. Never guesses: a prefix matching nothing, or more than one blob, is
+    /// refused, because the caller may be about to unlink a file.
+    fn resolve_kv_prefix(&self, fp_prefix: &str) -> Result<usize, String> {
+        if fp_prefix.is_empty() {
+            return Err("usage: /kvcache <pin|unpin|rm> <fingerprint>".to_owned());
+        }
+        let hits: Vec<usize> = self
+            .store
+            .kv_blob_nodes()
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, m))| m.fingerprint.starts_with(fp_prefix))
+            .map(|(i, _)| i)
+            .collect();
+        match hits.as_slice() {
+            [one] => Ok(*one),
+            [] => Err(format!("no cache entry matching {fp_prefix:?}")),
+            _ => Err(format!(
+                "{fp_prefix:?} is ambiguous ({} matches)",
+                hits.len()
+            )),
+        }
+    }
+
+    /// Applies one `/kvcache` mutation to the blob at scan index `idx`,
+    /// returning the line to show. Shared by both front ends so `p`/`d` in the
+    /// pane and `/kvcache pin|rm` in the REPL cannot diverge.
+    ///
+    /// Keyed on the index rather than the fingerprint. A fingerprint does not
+    /// identify a file: a session sidecar records the *payload* fingerprint,
+    /// which never equals the `<id>` the body is named after, so looking the path
+    /// up by fingerprint failed on every session blob and, when a sidecar
+    /// fingerprint happened to equal another body's stem, acted on that other
+    /// file.
     ///
     /// # Errors
-    /// Returns a message when the prefix matches no blob or more than one.
-    fn kvcache_mutate(&self, verb: &str, fp_prefix: &str) -> Result<String, String> {
-        if fp_prefix.is_empty() {
-            return Err(format!("usage: /kvcache {verb} <fingerprint>"));
-        }
-        let nodes = self.store.kv_nodes();
-        let hits: Vec<_> = nodes
-            .iter()
-            .filter(|m| m.fingerprint.starts_with(fp_prefix))
-            .collect();
-        // Never guess: two blobs can share a fingerprint prefix, and this
-        // branch deletes files.
-        let meta = match hits.as_slice() {
-            [one] => *one,
-            [] => return Err(format!("no cache entry matching {fp_prefix:?}")),
-            _ => {
-                return Err(format!(
-                    "{fp_prefix:?} is ambiguous ({} matches)",
-                    hits.len()
-                ));
-            }
-        };
-        let Some((path, _)) = self
-            .store
-            .kv_blob_paths()
-            .into_iter()
-            .find(|(_, fp)| *fp == meta.fingerprint)
-        else {
-            return Err(format!("{} vanished from disk", meta.fingerprint));
+    /// Returns a message when the index names no blob, or the unlink or sidecar
+    /// write fails.
+    fn kvcache_mutate(&self, verb: &str, idx: usize) -> Result<String, String> {
+        let scan = self.store.kv_blob_nodes();
+        let Some((path, meta)) = scan.get(idx) else {
+            return Err(format!("cache entry {idx} vanished from disk"));
         };
         match verb {
             "rm" => {
-                std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+                std::fs::remove_file(path).map_err(|e| e.to_string())?;
                 // The sidecar must go too: one left behind is a phantom node in
                 // every later scan.
-                let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(&path));
+                let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(path));
                 Ok(format!(
                     "kvcache: removed {} ({})",
                     meta.fingerprint,
@@ -4027,10 +4081,14 @@ the original is frozen and listed in /tree"
                 ))
             }
             verb @ ("pin" | "unpin") => {
-                let mut m = meta.clone();
+                // Read the sidecar fresh rather than rewriting the snapshot this
+                // scan produced: a concurrent `kv_load` may have bumped `hits`
+                // and `last_used` in between, and writing the stale copy back
+                // would silently revert it.
+                let mut m = crate::kvmeta::load(path).unwrap_or_else(|| meta.clone());
                 m.pinned = verb == "pin";
-                crate::kvmeta::store(&path, &m).map_err(|e| e.to_string())?;
-                Ok(format!("kvcache: {verb}ned {}", meta.fingerprint))
+                crate::kvmeta::store(path, &m).map_err(|e| e.to_string())?;
+                Ok(format!("kvcache: {verb}ned {}", m.fingerprint))
             }
             other => Err(format!("unknown action {other:?}")),
         }
@@ -6266,16 +6324,16 @@ impl Agent<'_> {
                     // figure used to go stale as a result, so the pane now
                     // re-derives both from its effective pin state on every
                     // draw instead.
-                    crate::kvpane::Outcome::Pin(fp) => {
-                        log.push_dim(self.kvcache_apply("pin", &fp));
+                    crate::kvpane::Outcome::Pin(idx) => {
+                        log.push_dim(self.kvcache_apply_idx("pin", idx));
                     }
-                    crate::kvpane::Outcome::Unpin(fp) => {
-                        log.push_dim(self.kvcache_apply("unpin", &fp));
+                    crate::kvpane::Outcome::Unpin(idx) => {
+                        log.push_dim(self.kvcache_apply_idx("unpin", idx));
                     }
                     // These two change what is on disk, so the pane has to be
                     // rebuilt or it would keep offering rows that are gone.
-                    crate::kvpane::Outcome::Delete(fp) => {
-                        log.push_dim(self.kvcache_apply("rm", &fp));
+                    crate::kvpane::Outcome::Delete(idx) => {
+                        log.push_dim(self.kvcache_apply_idx("rm", idx));
                         kv_pane = Some(self.kvcache_pane());
                     }
                     crate::kvpane::Outcome::Sweep => {
@@ -6743,19 +6801,7 @@ impl Agent<'_> {
     /// keep and the whole directory of system checkpoints went, including ones
     /// belonging to ordinary local sessions.
     fn gc_kv_tiers(&self, tiers: &[crate::kvtier::TierSpec]) {
-        // Every tier of this launch's chain, not just Tier 1: one sweep now
-        // protects them all, where the two old GCs were per-tier.
-        let mut keep: Vec<String> = tiers.iter().map(|t| t.fingerprint.clone()).collect();
-        if let Some(alt) = self.alt_engines.get(&EngineKey::Local) {
-            keep.extend(
-                self.kv_tiers_for(&alt.model_name())
-                    .into_iter()
-                    .map(|t| t.fingerprint),
-            );
-        }
-        // The session in front of the user is live by definition, however long
-        // it has been since its payload was last loaded.
-        keep.push(self.session.id.clone());
+        let keep = self.active_kv_fingerprints(tiers);
         let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
         let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
         let _freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
@@ -13489,6 +13535,141 @@ mod tests {
             vec![false, true, true],
             "cold once, then restored — not re-cached every launch"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A real session payload, stored the way a launch stores one, and mutated
+    /// through the exact path the `/kvcache` pane uses.
+    ///
+    /// Every earlier fixture built session nodes by hand with
+    /// `fingerprint == <file stem>`, which is why this was invisible for twelve
+    /// scoped reviews: a genuine [`crate::session::KvKey::Session`] sidecar
+    /// records the *payload* fingerprint, so the old code — pick a node by
+    /// sidecar fingerprint, then find its path by the stem-derived one — failed
+    /// on every session blob with "vanished from disk", and on a coincidental
+    /// match acted on a different body entirely.
+    #[test]
+    fn kvcache_mutations_act_on_a_real_session_payload() {
+        let dir = scratch_dir("kvcache-session-mutate");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        let fp = agent.payload_fingerprint_for(&agent.session);
+        assert_ne!(
+            fp, agent.session.id,
+            "the sidecar fingerprint is not the file stem — that is the whole bug"
+        );
+        let key = crate::session::KvKey::Session {
+            id: agent.session.id.clone(),
+            fp: fp.clone(),
+        };
+        agent
+            .store
+            .kv_store_labeled(
+                &key,
+                &crate::kvcache::KVCache::new(
+                    vec![1, 2, 3],
+                    crate::ds4tokens::TokenTranscript::new(),
+                ),
+                None,
+                "m",
+                &crate::kvmeta::KvLabel::Session {
+                    name: agent.session.id.clone(),
+                    title: "t".to_owned(),
+                },
+            )
+            .unwrap();
+        let path = agent.store.kv_path(&key);
+        assert!(path.exists());
+
+        // The pane names the blob by its scan index, which resolves straight
+        // back to this path.
+        let rows = agent.kvcache_pane().rows();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let idx = rows[0].idx.expect("the row names a blob");
+
+        // A load bumps `hits`, and pinning must not revert that snapshot.
+        assert!(agent.store.kv_load(&key).is_some());
+        let hits = crate::kvmeta::load(&path).expect("a sidecar").hits;
+        assert_eq!(hits, 1);
+
+        let line = agent.kvcache_apply_idx("pin", idx);
+        assert!(line.contains("pinned"), "{line}");
+        let meta = crate::kvmeta::load(&path).expect("a sidecar");
+        assert!(meta.pinned, "pin took effect on disk");
+        assert_eq!(meta.hits, hits, "pin must not revert a concurrent hit bump");
+
+        let line = agent.kvcache_apply_idx("unpin", idx);
+        assert!(line.contains("unpinned"), "{line}");
+        assert!(!crate::kvmeta::load(&path).expect("a sidecar").pinned);
+
+        // The REPL's prefix interface resolves to the same index, and still
+        // refuses what it cannot pin down.
+        assert_eq!(agent.resolve_kv_prefix(&fp[..8]), Ok(idx));
+        assert!(agent.resolve_kv_prefix("zzzzzzzz").is_err(), "no match");
+        assert!(agent.resolve_kv_prefix("").is_err(), "no argument");
+
+        let line = agent.kvcache_apply("rm", &fp[..8]);
+        assert!(line.contains("removed"), "{line}");
+        assert!(!path.exists(), "rm unlinked the body");
+        assert!(
+            !crate::kvmeta::sidecar_path(&path).exists(),
+            "and its sidecar"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live session's payload is protected by being *active*, not by
+    /// recency. Its node's fingerprint is the payload fingerprint, so pushing
+    /// the session id into the keep set — as the launch sweep used to — matched
+    /// nothing at all.
+    #[test]
+    fn the_live_sessions_payload_survives_a_sweep_from_the_far_future() {
+        let dir = scratch_dir("kvcache-live-payload");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        let fp = agent.payload_fingerprint_for(&agent.session);
+        let key = crate::session::KvKey::Session {
+            id: agent.session.id.clone(),
+            fp: fp.clone(),
+        };
+        agent
+            .store
+            .kv_store_labeled(
+                &key,
+                &crate::kvcache::KVCache::new(
+                    vec![1, 2, 3],
+                    crate::ds4tokens::TokenTranscript::new(),
+                ),
+                None,
+                "m",
+                &crate::kvmeta::KvLabel::Unknown,
+            )
+            .unwrap();
+        let path = agent.store.kv_path(&key);
+
+        // The keep set `gc_kv_tiers` sweeps with. `gc_kv_tiers` itself reads the
+        // wall clock, so the future clock goes to the sweep it delegates to.
+        let keep = agent.active_kv_fingerprints(&agent.kv_tiers());
+        assert!(
+            keep.contains(&fp),
+            "the payload fingerprint must be in the keep set, not the session id"
+        );
+        assert!(!keep.contains(&agent.session.id));
+        let refs: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 1,
+            ttl_tier_secs: 1,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(agent.store.sweep(&refs, &policy, future), 0);
+        assert!(path.exists(), "the live session's payload is active");
+        // And it is only the keep set sparing it: dropped from the active set,
+        // the same sweep collects it.
+        assert!(agent.store.sweep(&[], &policy, future) > 0);
+        assert!(!path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -5895,7 +5895,7 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             1_000 * DAY,
         )
     }
@@ -5991,7 +5991,7 @@ mod tests {
                     ttl_tier_secs: 30 * KV_DAY,
                     max_bytes: 0,
                 },
-                0,
+                Vec::new(),
                 1_000 * KV_DAY,
             )
         };

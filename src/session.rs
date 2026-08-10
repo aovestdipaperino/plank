@@ -456,9 +456,30 @@ impl SessionStore {
     /// and can still be deleted from there.
     #[must_use]
     pub fn kv_nodes(&self) -> Vec<crate::kvmeta::KvMeta> {
+        self.kv_blob_nodes()
+            .into_iter()
+            .map(|(_, meta)| meta)
+            .collect()
+    }
+
+    /// Every KV blob body in the cache paired with its metadata, in one walk.
+    ///
+    /// The single scan every caller shares, so index *i* of the returned vector
+    /// always names path *i*. That pairing is the only sound way to identify a
+    /// blob: a fingerprint does not identify a file. Two bodies may carry the
+    /// same fingerprint (a root `sysprompt-X.kv_raw` beside a
+    /// `<proj>/project-X.kv_raw`), and a [`KvKey::Session`] sidecar records the
+    /// *payload* fingerprint, which never equals the `<id>` in its file name.
+    /// Round-tripping a node through its fingerprint to find its path therefore
+    /// either fails or, worse, finds a different body.
+    #[must_use]
+    pub fn kv_blob_nodes(&self) -> Vec<(PathBuf, crate::kvmeta::KvMeta)> {
         self.kv_blob_paths()
-            .iter()
-            .map(|(path, fp)| Self::kv_node_at(path, fp))
+            .into_iter()
+            .map(|(path, fp)| {
+                let meta = Self::kv_node_at(&path, &fp);
+                (path, meta)
+            })
             .collect()
     }
 
@@ -545,6 +566,11 @@ impl SessionStore {
     /// Best-effort: a failed unlink is skipped and its bytes are not counted,
     /// and the next launch retries. Both the body and its sidecar go.
     ///
+    /// Each verdict is re-checked against the disk immediately before the
+    /// unlink, so a body a sibling process rewrote while this sweep was
+    /// planning is left alone rather than deleted under a sidecar that has
+    /// since been replaced.
+    ///
     /// `active` is the set of fingerprints this launch is using, across *every*
     /// engine it holds: a provider main agent beside a `provider: local`
     /// sub-agent has two Tier 1 fingerprints, and passing only one of them is
@@ -555,17 +581,27 @@ impl SessionStore {
         // names exactly one file. Matching on fingerprints instead would delete
         // a kept body that merely shares a doomed one's fingerprint — a root
         // `sysprompt-X` and a `<proj>/project-X`, say.
-        let paths = self.kv_blob_paths();
-        let nodes: Vec<crate::kvmeta::KvMeta> = paths
-            .iter()
-            .map(|(path, fp)| Self::kv_node_at(path, fp))
-            .collect();
+        let scan = self.kv_blob_nodes();
+        let nodes: Vec<crate::kvmeta::KvMeta> = scan.iter().map(|(_, m)| m.clone()).collect();
         let plan = crate::kvgc::plan_sweep(&nodes, active, policy, now);
         let mut freed = 0u64;
         for i in plan.doomed {
-            let Some((path, _)) = paths.get(i) else {
+            let Some((path, seen)) = scan.get(i) else {
                 continue;
             };
+            // A sibling process persisting a multi-hundred-megabyte body spans
+            // the whole window between the scan above and this unlink, so the
+            // file under an expired sidecar may already have been replaced by a
+            // fresh one. Re-read the node and skip anything that moved: the
+            // verdict was computed about bytes that are no longer there.
+            let fp = seen.fingerprint.as_str();
+            let fresh = Self::kv_node_at(path, fp);
+            if fresh.last_used != seen.last_used
+                || fresh.bytes != seen.bytes
+                || fresh.pinned != seen.pinned
+            {
+                continue;
+            }
             let size = fs::metadata(path).map_or(0, |m| m.len());
             if fs::remove_file(path).is_ok() {
                 freed = freed.saturating_add(size);
@@ -2330,6 +2366,24 @@ hello\n";
         store.save(&mut s).unwrap();
         let payload = store.payload_path(&s.id);
         fs::write(&payload, b"payload").unwrap();
+        // A *production-shaped* sidecar: a session node's fingerprint is its
+        // payload fingerprint, which never equals the `<id>` in its file name.
+        // Without this the node was synthesized from the path, its fingerprint
+        // coincided with the id, and the "payload is active" assertion below
+        // passed for the wrong reason.
+        let payload_fp = payload_fingerprint(
+            "model-a",
+            "sys",
+            "[user]\nhi\n",
+            crate::engine::ThinkMode::Medium,
+            0,
+        );
+        assert_ne!(payload_fp, s.id);
+        crate::kvmeta::store(
+            &payload,
+            &crate::kvmeta::KvMeta::synthesized(crate::kvmeta::KvRole::Session, &payload_fp, 7, 0),
+        )
+        .unwrap();
         let tmp = dir.join(format!("{}.tmp.4242", sysprompt_checkpoint_name("ddd")));
         fs::write(&tmp, b"in flight").unwrap();
         let project = Path::new("/proj/sys");
@@ -2352,7 +2406,7 @@ hello\n";
         // and each has its own. Keeping only one deleted the other's every
         // launch. The current session's own payload is live too.
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
-        let active = ["bbb", "ccc", s.id.as_str()];
+        let active = ["bbb", "ccc", payload_fp.as_str()];
         // Exactly the two expired, inactive bodies: `sysprompt-aaa` and the
         // Tier 2 `project-p1`, five bytes of `"fp\nkv"` each. An exact tally
         // also pins that nothing else was collected.
@@ -2504,6 +2558,109 @@ hello\n";
         assert!(!blob.exists());
         assert!(!crate::kvmeta::sidecar_path(&blob).exists());
         assert!(store.kv_nodes().is_empty(), "no phantom node remains");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The converse trust direction. Every other test corrupts the *sidecar* and
+    /// checks the body still loads; this one leaves a perfectly agreeing sidecar
+    /// in place and checks a bad body still does not. Metadata is advisory in
+    /// both directions: the signature inside the body is the sole trust input.
+    #[test]
+    fn a_sidecar_that_agrees_with_a_bad_body_does_not_make_it_loadable() {
+        let dir = temp_dir("sidecar-trust-converse");
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::System { fp: "a".repeat(40) };
+        let cache = crate::kvcache::KVCache::new(
+            vec![1, 2, 3, 4],
+            crate::ds4tokens::TokenTranscript::new(),
+        );
+        store
+            .kv_store_labeled(&key, &cache, None, "m", &crate::kvmeta::KvLabel::Unknown)
+            .unwrap();
+        let path = store.kv_path(&key);
+        assert!(store.kv_load(&key).is_some(), "the good body loads");
+
+        // 1. Truncated body, sidecar untouched and still describing it.
+        let good = fs::read(&path).unwrap();
+        let nl = good.iter().position(|&b| b == b'\n').unwrap();
+        fs::write(&path, &good[..=nl]).unwrap();
+        assert_eq!(
+            crate::kvmeta::load(&path).expect("a sidecar").fingerprint,
+            *key.signature(),
+            "the sidecar still agrees with the body's name"
+        );
+        assert!(
+            store.kv_load(&key).is_none(),
+            "a truncated body is not loadable however good its sidecar"
+        );
+
+        // 2. A body carrying a different signature, under a sidecar still naming
+        // the right fingerprint.
+        let other = crate::kvcache::KVCache::new(vec![9], crate::ds4tokens::TokenTranscript::new());
+        fs::write(&path, other.encode("not-the-signature")).unwrap();
+        assert_eq!(
+            crate::kvmeta::load(&path).expect("a sidecar").fingerprint,
+            *key.signature()
+        );
+        assert!(
+            store.kv_load(&key).is_none(),
+            "the body's own signature is the sole trust input"
+        );
+        // The blob still lists, because listing is advisory too: a blob you
+        // cannot see is a blob you cannot delete.
+        assert_eq!(store.kv_nodes().len(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Two processes on one cache directory, modelled as two threads: one
+    /// storing bodies while the other sweeps. Whatever the interleaving, a
+    /// surviving body must never be left beside a sidecar describing a different
+    /// blob — the sidecar's fingerprint must still be the signature the body
+    /// itself carries.
+    #[test]
+    fn a_concurrent_store_and_sweep_never_pair_a_body_with_a_foreign_sidecar() {
+        let dir = temp_dir("kv-interleave");
+        let store = SessionStore::open(&dir).unwrap();
+        let fps: Vec<String> = (0..40u32).map(|i| format!("{i:040x}")).collect();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                for fp in &fps {
+                    let key = KvKey::System { fp: fp.clone() };
+                    let cache = crate::kvcache::KVCache::new(
+                        vec![7u8; 512],
+                        crate::ds4tokens::TokenTranscript::new(),
+                    );
+                    let _ = store.kv_store_labeled(
+                        &key,
+                        &cache,
+                        None,
+                        "m",
+                        &crate::kvmeta::KvLabel::Unknown,
+                    );
+                }
+            });
+            sc.spawn(|| {
+                // A zero TTL and a clock far in the future: every body the other
+                // thread writes is immediately collectable, so the two threads
+                // race over the same paths for the whole run.
+                let policy = crate::kvgc::SweepPolicy {
+                    ttl_session_secs: 0,
+                    ttl_tier_secs: 0,
+                    max_bytes: 0,
+                };
+                let future = crate::kvmeta::now_secs() + 400 * 86_400;
+                for _ in 0..40 {
+                    let _ = store.sweep(&[], &policy, future);
+                }
+            });
+        });
+        for (path, meta) in store.kv_blob_nodes() {
+            assert!(
+                crate::kvcache::KVCache::from_file(&path, &meta.fingerprint).is_some(),
+                "{} does not match the sidecar beside it",
+                path.display()
+            );
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 

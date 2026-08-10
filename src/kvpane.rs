@@ -38,8 +38,16 @@ pub struct Row {
     pub expanded: bool,
     /// This row has children, so collapsing it is meaningful.
     pub has_children: bool,
-    /// Fingerprint this row acts on; empty for the orphan header.
-    pub fingerprint: String,
+    /// Which blob this row acts on: its index in the scan the forest was built
+    /// from, i.e. in [`crate::session::SessionStore::kv_blob_nodes`]. `None` for
+    /// the synthetic orphan header, which is not a blob.
+    ///
+    /// An index, not a fingerprint. A fingerprint does not identify a file: two
+    /// bodies can share one, and a session sidecar's fingerprint is the payload
+    /// signature, which never matches the `<id>` its file is named after — so
+    /// resolving a row back to a path through its fingerprint used to fail on
+    /// every session blob and, on a collision, act on the wrong file.
+    pub idx: Option<usize>,
 }
 
 /// What a key press asks the caller to do with the pane.
@@ -49,12 +57,12 @@ pub enum Outcome {
     Stay,
     /// Close the pane.
     Close,
-    /// Pin the named blob.
-    Pin(String),
-    /// Unpin the named blob.
-    Unpin(String),
-    /// Delete the named blob (already confirmed).
-    Delete(String),
+    /// Pin the blob at this scan index.
+    Pin(usize),
+    /// Unpin the blob at this scan index.
+    Unpin(usize),
+    /// Delete the blob at this scan index (already confirmed).
+    Delete(usize),
     /// Run a sweep now.
     Sweep,
 }
@@ -65,16 +73,17 @@ struct Flat {
     depth: usize,
     /// Collapse keys of every ancestor, outermost first.
     ancestors: Vec<String>,
-    /// This row's own collapse key: the blob's fingerprint (or [`ORPHAN_KEY`]
-    /// for the synthetic header). Two bodies can legitimately share a
-    /// fingerprint, so they fold and pin as one row-key. That is inherent to the
-    /// fingerprint-keyed [`Row`]/[`Outcome`] API rather than a bug here, and it
-    /// is fail-safe: an [`Outcome::Delete`] naming such a fingerprint is refused
-    /// as ambiguous rather than guessing which file to unlink.
+    /// This row's own collapse key: the blob's scan index rendered as text (or
+    /// [`ORPHAN_KEY`] for the synthetic header). Keyed on the index rather than
+    /// the fingerprint, so two bodies that share a fingerprint fold, pin and
+    /// delete independently.
     key: String,
     has_children: bool,
     /// Index into the flattened metadata list; `None` for the orphan header.
     meta: Option<usize>,
+    /// Index of the blob in the scan the forest was built from; `None` for the
+    /// orphan header. This is what [`Row::idx`] reports.
+    src: Option<usize>,
 }
 
 /// Interactive state over a KV cache forest.
@@ -93,9 +102,9 @@ pub struct KvPane {
     policy: SweepPolicy,
     /// Collapse keys whose subtrees are hidden.
     collapsed: HashSet<String>,
-    /// Fingerprints whose pin state the pane has flipped locally, so a second
-    /// `p` press reads as the inverse of the first.
-    pin_flips: HashSet<String>,
+    /// Metadata indices whose pin state the pane has flipped locally, so a
+    /// second `p` press reads as the inverse of the first.
+    pin_flips: HashSet<usize>,
     /// Cursor over the *visible* rows.
     cursor: usize,
     /// A `d` press is awaiting confirmation.
@@ -104,8 +113,9 @@ pub struct KvPane {
     total: u64,
     /// Bytes a sweep would reclaim.
     reclaimable: u64,
-    /// The `kvcache.maxBytes` ceiling; `0` means unbounded.
-    max_bytes: u64,
+    /// Fingerprints of the tiers this launch is using. The startup sweep spares
+    /// them, so the pane must not mark them expired or count them reclaimable.
+    active: Vec<String>,
     /// Wall clock the ages and TTLs are measured against.
     now: u64,
 }
@@ -114,10 +124,14 @@ impl KvPane {
     /// Builds the pane from a forest, flattening the tree and computing the
     /// sweep verdicts once.
     ///
-    /// `policy` and `now` are only used to mark expired rows and total what a
-    /// sweep would free; nothing here touches the filesystem.
+    /// `policy`, `active` and `now` are only used to mark expired rows and total
+    /// what a sweep would free; nothing here touches the filesystem. `active`
+    /// must be the same fingerprint set the launch's sweep is given, or the pane
+    /// would report the live chain as expired. The budget shown in the footer is
+    /// `policy.max_bytes` — the one the verdicts are computed under, so the two
+    /// cannot be desynchronised by a caller.
     #[must_use]
-    pub fn new(forest: KvForest, policy: SweepPolicy, max_bytes: u64, now: u64) -> Self {
+    pub fn new(forest: KvForest, policy: SweepPolicy, active: Vec<String>, now: u64) -> Self {
         let mut flat: Vec<Flat> = Vec::new();
         let mut metas: Vec<KvMeta> = Vec::new();
         let total = forest.total_bytes();
@@ -131,6 +145,7 @@ impl KvPane {
                 key: ORPHAN_KEY.to_owned(),
                 has_children: true,
                 meta: None,
+                src: None,
             });
             for orphan in forest.orphans {
                 push_node(
@@ -144,7 +159,8 @@ impl KvPane {
         }
         // One `plan_sweep` for the whole pane: the plan names indices into
         // `metas`, which is exactly the order `flat` refers to.
-        let plan = plan_sweep(&metas, &[], &policy, now);
+        let active_refs: Vec<&str> = active.iter().map(String::as_str).collect();
+        let plan = plan_sweep(&metas, &active_refs, &policy, now);
         Self {
             flat,
             condemned: plan.doomed.iter().copied().collect(),
@@ -156,7 +172,7 @@ impl KvPane {
             pending_delete: false,
             total,
             reclaimable: plan.bytes,
-            max_bytes,
+            active,
             now,
         }
     }
@@ -177,9 +193,10 @@ impl KvPane {
             .collect()
     }
 
-    /// The effective pin state of a node, including the pane's local flip.
-    fn pinned(&self, meta: &KvMeta) -> bool {
-        meta.pinned ^ self.pin_flips.contains(&meta.fingerprint)
+    /// The effective pin state of the node at metadata index `mi`, including the
+    /// pane's local flip.
+    fn pinned(&self, mi: usize) -> bool {
+        self.metas.get(mi).is_some_and(|m| m.pinned) ^ self.pin_flips.contains(&mi)
     }
 
     /// The sweep verdicts and reclaimable total under the pane's *effective*
@@ -201,13 +218,15 @@ impl KvPane {
         let metas: Vec<KvMeta> = self
             .metas
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(mi, m)| {
                 let mut m = m.clone();
-                m.pinned = self.pinned(&m);
+                m.pinned = self.pinned(mi);
                 m
             })
             .collect();
-        let plan = plan_sweep(&metas, &[], &self.policy, self.now);
+        let active: Vec<&str> = self.active.iter().map(String::as_str).collect();
+        let plan = plan_sweep(&metas, &active, &self.policy, self.now);
         (Cow::Owned(plan.doomed.into_iter().collect()), plan.bytes)
     }
 
@@ -234,7 +253,7 @@ impl KvPane {
                         selected,
                         expanded,
                         has_children: true,
-                        fingerprint: String::new(),
+                        idx: None,
                     };
                 };
                 let m = &self.metas[mi];
@@ -246,7 +265,7 @@ impl KvPane {
                     selected,
                     expanded,
                     has_children: f.has_children,
-                    fingerprint: m.fingerprint.clone(),
+                    idx: f.src,
                 }
             })
             .collect()
@@ -262,7 +281,7 @@ impl KvPane {
             m.hits,
             relative_age(self.now.saturating_sub(m.last_used))
         );
-        if self.pinned(m) {
+        if self.pinned(mi) {
             s.push_str(" 📌 pinned");
         } else if condemned.contains(&mi) {
             s.push_str(" ⏳ expired");
@@ -280,18 +299,23 @@ impl KvPane {
             human_bytes(self.total),
             human_bytes(reclaimable)
         );
-        if self.max_bytes > 0 && self.total > self.max_bytes {
-            let _ = write!(s, " · over the {} budget", human_bytes(self.max_bytes));
+        // The budget the verdicts were computed under, read from the same field
+        // `plan_sweep` reads: a separate `max_bytes` parameter let a caller show
+        // one ceiling while enforcing another.
+        let max_bytes = self.policy.max_bytes;
+        if max_bytes > 0 && self.total > max_bytes {
+            let _ = write!(s, " · over the {} budget", human_bytes(max_bytes));
         }
         s
     }
 
-    /// The fingerprint the cursor is on, if it names a real blob.
-    fn selected_fp(&self) -> Option<String> {
+    /// The node the cursor is on as `(metadata index, scan index)`, if it names
+    /// a real blob rather than the orphan header.
+    fn selected_node(&self) -> Option<(usize, usize)> {
         let visible = self.visible();
         let &i = visible.get(self.cursor.min(visible.len().saturating_sub(1)))?;
-        let mi = self.flat[i].meta?;
-        Some(self.metas[mi].fingerprint.clone())
+        let f = &self.flat[i];
+        Some((f.meta?, f.src?))
     }
 
     /// The collapse key of the row the cursor is on.
@@ -308,9 +332,9 @@ impl KvPane {
         if self.pending_delete {
             self.pending_delete = false;
             if matches!(key.code, KeyCode::Char('y' | 'Y'))
-                && let Some(fp) = self.selected_fp()
+                && let Some((_, src)) = self.selected_node()
             {
-                return Outcome::Delete(fp);
+                return Outcome::Delete(src);
             }
             return Outcome::Stay;
         }
@@ -333,26 +357,21 @@ impl KvPane {
                 }
             }
             KeyCode::Char('p' | 'P') => {
-                if let Some(fp) = self.selected_fp() {
-                    if self.pin_flips.contains(&fp) {
-                        self.pin_flips.remove(&fp);
+                if let Some((mi, src)) = self.selected_node() {
+                    if self.pin_flips.contains(&mi) {
+                        self.pin_flips.remove(&mi);
                     } else {
-                        self.pin_flips.insert(fp.clone());
+                        self.pin_flips.insert(mi);
                     }
-                    let now_pinned = self
-                        .metas
-                        .iter()
-                        .find(|m| m.fingerprint == fp)
-                        .is_some_and(|m| self.pinned(m));
-                    return if now_pinned {
-                        Outcome::Pin(fp)
+                    return if self.pinned(mi) {
+                        Outcome::Pin(src)
                     } else {
-                        Outcome::Unpin(fp)
+                        Outcome::Unpin(src)
                     };
                 }
             }
             KeyCode::Char('d' | 'D') => {
-                if self.selected_fp().is_some() {
+                if self.selected_node().is_some() {
                     self.pending_delete = true;
                 }
             }
@@ -395,7 +414,8 @@ fn push_node(
     flat: &mut Vec<Flat>,
     metas: &mut Vec<KvMeta>,
 ) {
-    let key = node.meta.fingerprint.clone();
+    // Keyed on the scan index, which names one file; a fingerprint can name two.
+    let key = node.idx.to_string();
     metas.push(node.meta.clone());
     flat.push(Flat {
         depth,
@@ -403,6 +423,7 @@ fn push_node(
         key: key.clone(),
         has_children: !node.children.is_empty(),
         meta: Some(metas.len() - 1),
+        src: Some(node.idx),
     });
     ancestors.push(key);
     for child in &node.children {
@@ -578,7 +599,7 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             NOW,
         )
     }
@@ -639,13 +660,15 @@ mod tests {
     #[test]
     fn action_keys_name_the_selected_node() {
         let mut p = pane();
-        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(fp) if fp == "a19f"));
+        // The outcomes carry scan indices, matching the order `pane()` built the
+        // forest from: 0 = a19f, 1 = 7c02, 2 = cheeky-bell.
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0)));
         // The pane flips its own copy, so a second press is the inverse.
-        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(fp) if fp == "a19f"));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0)));
         p.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         // Delete asks first and only fires on confirmation.
         assert!(matches!(p.handle_key(key('d')), Outcome::Stay));
-        assert!(matches!(p.handle_key(key('y')), Outcome::Delete(fp) if fp == "7c02"));
+        assert!(matches!(p.handle_key(key('y')), Outcome::Delete(1)));
         assert!(matches!(p.handle_key(key('g')), Outcome::Sweep));
         assert!(matches!(
             p.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
@@ -685,7 +708,7 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             NOW,
         );
         assert!(p.rows()[0].right.contains("expired"));
@@ -704,7 +727,7 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             NOW,
         )
     }
@@ -713,7 +736,7 @@ mod tests {
     fn pinning_an_expired_row_takes_its_bytes_out_of_the_reclaimable_total() {
         let mut p = expired_pane(false);
         assert!(p.footer().contains("2.0 KB reclaimable"));
-        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(fp) if fp == "old"));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(0)));
         assert!(
             p.footer().contains("0 B reclaimable"),
             "a pinned row is not reclaimable: {}",
@@ -729,7 +752,7 @@ mod tests {
         let mut p = expired_pane(true);
         assert!(p.footer().contains("0 B reclaimable"), "{}", p.footer());
         assert!(!p.rows()[0].right.contains("expired"));
-        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(fp) if fp == "old"));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Unpin(0)));
         assert!(
             p.footer().contains("2.0 KB reclaimable"),
             "only the pin was sparing it: {}",
@@ -769,7 +792,7 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             NOW,
         );
         let out = render_text(&pane);
@@ -789,15 +812,85 @@ mod tests {
                 ttl_tier_secs: 30 * DAY,
                 max_bytes: 0,
             },
-            0,
+            Vec::new(),
             NOW,
         );
         let rows = p.rows();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[1].label, "(orphaned)");
         assert!(rows[1].has_children);
-        assert!(rows[1].fingerprint.is_empty());
+        assert!(rows[1].idx.is_none(), "the header is not a blob");
+        assert_eq!(rows[0].idx, Some(0));
+        assert_eq!(rows[2].idx, Some(1), "the orphan keeps its scan index");
         assert_eq!(rows[2].depth, 1);
+    }
+
+    /// The TTL/tier policy the pane tests use, with the given ceiling.
+    fn pol(max_bytes: u64) -> crate::kvgc::SweepPolicy {
+        crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * DAY,
+            ttl_tier_secs: 30 * DAY,
+            max_bytes,
+        }
+    }
+
+    #[test]
+    fn a_blob_the_launch_is_using_is_not_shown_as_expired() {
+        // The pane used to pass `active = &[]` to `plan_sweep`, so a checkpoint
+        // the startup sweep keeps as in-use showed `⏳ expired` and counted
+        // toward the reclaimable figure as soon as its `last_used` went stale.
+        let mut m = meta(KvRole::System, "live", None, 2048);
+        m.last_used = NOW - 99 * DAY;
+        let live = KvPane::new(
+            crate::kvtree::build(vec![m.clone()]),
+            pol(0),
+            vec!["live".to_owned()],
+            NOW,
+        );
+        assert!(
+            !live.rows()[0].right.contains("expired"),
+            "{}",
+            live.rows()[0].right
+        );
+        assert!(
+            live.footer().contains("0 B reclaimable"),
+            "{}",
+            live.footer()
+        );
+        // And the active set is the only thing sparing it, so the assertion is
+        // discriminating rather than a restatement of the TTL.
+        let idle = KvPane::new(crate::kvtree::build(vec![m]), pol(0), Vec::new(), NOW);
+        assert!(idle.rows()[0].right.contains("expired"));
+        assert!(idle.footer().contains("2.0 KB reclaimable"));
+    }
+
+    #[test]
+    fn two_bodies_sharing_a_fingerprint_are_separate_rows_that_act_independently() {
+        // Rows are keyed on the scan index, so a root `sysprompt-dup` and a
+        // `<proj>/project-dup` fold, pin and delete as the two distinct files
+        // they are. Under the old fingerprint-keyed rows they moved as one.
+        let mut p = KvPane::new(
+            crate::kvtree::build(vec![
+                meta(KvRole::System, "dup", None, 100),
+                meta(KvRole::Project, "dup", None, 200),
+            ]),
+            pol(0),
+            Vec::new(),
+            NOW,
+        );
+        let rows = p.rows();
+        assert_eq!(rows.len(), 2);
+        // Roots sort largest subtree first, and the index follows the node.
+        assert_eq!(rows[0].idx, Some(1));
+        assert_eq!(rows[1].idx, Some(0));
+        assert!(matches!(p.handle_key(key('p')), Outcome::Pin(1)));
+        let rows = p.rows();
+        assert!(rows[0].right.contains("pinned"), "{}", rows[0].right);
+        assert!(
+            !rows[1].right.contains("pinned"),
+            "its namesake is a different file: {}",
+            rows[1].right
+        );
     }
 
     #[test]
@@ -807,9 +900,9 @@ mod tests {
             crate::kvgc::SweepPolicy {
                 ttl_session_secs: 14 * DAY,
                 ttl_tier_secs: 30 * DAY,
-                max_bytes: 0,
+                max_bytes: 1024,
             },
-            1024,
+            Vec::new(),
             NOW,
         );
         assert!(

@@ -368,6 +368,11 @@ carry the same fingerprint (a root `sysprompt-X.kv_raw` beside a
 directories), so a fingerprint-keyed delete could unlink a file the sweep had
 decided to keep.
 
+Each verdict is re-checked against the disk immediately before the unlink. A
+sibling process persisting a multi-hundred-megabyte body spans the whole window
+between the scan and the delete, so a body whose sidecar has moved since the scan
+is skipped rather than deleted under metadata that no longer describes it.
+
 Version transitions (`upgrade.rs`) deliberately do **not** drop KV caches: they
 self-validate by signature and format version. Only the image cache, which has no
 such guard, is dropped on a major bump.
@@ -399,9 +404,14 @@ REPL has no pane, so it prints the same tree statically and takes
 `/kvcache pin|unpin|rm|gc` subcommands. Both front ends read the same rows, per
 the two-parallel-paths rule in `CLAUDE.md`.
 
-Collapse and pin act on fingerprints, so the two same-fingerprint bodies
-described above fold and pin as one. That is fail-safe by design: a delete
-targeting such a node is refused as ambiguous rather than guessing a path.
+Rows, collapse keys and pin/delete actions are keyed on a **scan index** — the
+position of the blob in `SessionStore::kv_blob_nodes`, the one walk every caller
+shares — not on a fingerprint. A fingerprint cannot identify a file: two bodies
+may share one, and a session sidecar records the *payload* fingerprint, which
+never equals the `<id>` its body is named after. So the two same-fingerprint
+bodies described above fold, pin and delete independently. The REPL subcommands
+keep their `<fp-prefix>` argument, resolving it to an index first and still
+refusing a prefix that matches nothing or more than one blob.
 
 ## Diagnosing a miss
 

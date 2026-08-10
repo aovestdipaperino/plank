@@ -13,6 +13,12 @@ use crate::kvmeta::KvMeta;
 /// One blob and everything that extends it.
 #[derive(Debug, Clone)]
 pub struct KvNode {
+    /// Position of this blob in the slice [`build`] was given, which is also
+    /// its position in [`crate::session::SessionStore::kv_blob_nodes`] — so the
+    /// index identifies the *file*, where a fingerprint does not: two bodies can
+    /// legitimately carry one fingerprint, and a session body's sidecar
+    /// fingerprint is its payload signature rather than anything in its name.
+    pub idx: usize,
     /// This blob's metadata.
     pub meta: KvMeta,
     /// Blobs whose `parent` names this one, largest subtree first.
@@ -57,6 +63,9 @@ const MAX_DEPTH: usize = 16;
 
 /// Assembles `nodes` into a forest, ordering siblings largest subtree first.
 ///
+/// Each [`KvNode`] records the index it came from, so a caller that walks the
+/// forest can still name the exact file the node was read from.
+///
 /// Every node appears exactly once, duplicate fingerprints included; when two
 /// nodes share a fingerprint only the first to be attached absorbs the children
 /// keyed under it, and the later one renders childless. A node naming an absent
@@ -71,7 +80,9 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
     // build must terminate even on input a chained fingerprint could not
     // actually produce. `MAX_DEPTH` is the actual safeguard; recursion depth
     // is bounded by it regardless of how `children` is shaped.
-    fn attach(m: KvMeta, children: &mut HashMap<String, Vec<KvMeta>>, depth: usize) -> KvNode {
+    type Item = (usize, KvMeta);
+    fn attach(item: Item, children: &mut HashMap<String, Vec<Item>>, depth: usize) -> KvNode {
+        let (idx, m) = item;
         let mut kids: Vec<KvNode> = if depth >= MAX_DEPTH {
             Vec::new()
         } else {
@@ -86,20 +97,21 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
         // recompute it on every comparison.
         kids.sort_by_cached_key(|b| Reverse(b.subtree_bytes()));
         KvNode {
+            idx,
             meta: m,
             children: kids,
         }
     }
 
     let present: HashSet<String> = nodes.iter().map(|m| m.fingerprint.clone()).collect();
-    let mut children: HashMap<String, Vec<KvMeta>> = HashMap::new();
-    let mut roots: Vec<KvMeta> = Vec::new();
-    let mut orphans: Vec<KvMeta> = Vec::new();
-    for m in nodes {
+    let mut children: HashMap<String, Vec<Item>> = HashMap::new();
+    let mut roots: Vec<Item> = Vec::new();
+    let mut orphans: Vec<Item> = Vec::new();
+    for (idx, m) in nodes.into_iter().enumerate() {
         match m.parent.clone() {
-            None => roots.push(m),
-            Some(p) if p == m.fingerprint || !present.contains(&p) => orphans.push(m),
-            Some(p) => children.entry(p).or_default().push(m),
+            None => roots.push((idx, m)),
+            Some(p) if p == m.fingerprint || !present.contains(&p) => orphans.push((idx, m)),
+            Some(p) => children.entry(p).or_default().push((idx, m)),
         }
     }
 
@@ -114,8 +126,9 @@ pub fn build(nodes: Vec<KvMeta>) -> KvForest {
         .collect();
     // Anything still unattached had a present parent that was itself
     // unreachable; surface it rather than dropping it.
-    let stragglers: Vec<KvMeta> = children.into_values().flatten().collect();
-    orphan_nodes.extend(stragglers.into_iter().map(|m| KvNode {
+    let stragglers: Vec<Item> = children.into_values().flatten().collect();
+    orphan_nodes.extend(stragglers.into_iter().map(|(idx, m)| KvNode {
+        idx,
         meta: m,
         children: Vec::new(),
     }));
@@ -255,6 +268,40 @@ mod tests {
         let total: usize = f.roots.iter().chain(&f.orphans).map(count).sum();
         assert_eq!(total, depth + 1, "never silently drop a node");
         assert_eq!(f.total_bytes(), (depth + 1) as u64);
+    }
+
+    #[test]
+    fn every_node_remembers_the_slice_position_it_came_from() {
+        // The index is how a caller names the *file* a node was read from, so it
+        // must survive the sibling sort, the root sort and the orphan path. A
+        // fingerprint cannot do that job: two bodies may share one, and a
+        // session body's sidecar fingerprint is its payload signature rather
+        // than its file stem.
+        fn walk(n: &KvNode, out: &mut Vec<usize>) {
+            out.push(n.idx);
+            for c in &n.children {
+                walk(c, out);
+            }
+        }
+        let nodes = vec![
+            meta(KvRole::System, "y1", None, 1),
+            meta(KvRole::Project, "small", Some("y1"), 10),
+            meta(KvRole::Project, "big", Some("y1"), 900),
+            meta(KvRole::Session, "lost", Some("gone"), 5),
+        ];
+        let f = build(nodes.clone());
+        assert_eq!(f.roots[0].idx, 0);
+        assert_eq!(f.roots[0].children[0].meta.fingerprint, "big");
+        assert_eq!(f.roots[0].children[0].idx, 2, "the sort must not renumber");
+        assert_eq!(f.roots[0].children[1].idx, 1);
+        assert_eq!(f.orphans[0].idx, 3);
+        // Every position appears exactly once across the whole forest.
+        let mut all = Vec::new();
+        for n in f.roots.iter().chain(&f.orphans) {
+            walk(n, &mut all);
+        }
+        all.sort_unstable();
+        assert_eq!(all, (0..nodes.len()).collect::<Vec<_>>());
     }
 
     #[test]
