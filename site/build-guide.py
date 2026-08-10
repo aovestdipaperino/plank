@@ -140,6 +140,7 @@ HEAD = """<!doctype html>
     <div class="bar">
       <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
       <div class="navlinks">
+        <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
         <a class="ghost" href="{repo}" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
@@ -202,6 +203,31 @@ def page(title: str, desc: str, body: str) -> str:
     )
 
 
+def build_whats_new() -> bool:
+    """Render `site/whats-new.md` into `site/whats-new.html`.
+
+    Kept out of `user-guide/` on purpose: the guide is numbered chapters with a
+    prev/next pager and a contents list, and a release-notes page is none of
+    those. It still goes through [`page`] so it shares the landing page's
+    palette and chrome instead of carrying a second copy of them.
+    """
+    src = ROOT / "site" / "whats-new.md"
+    if not src.is_file():
+        return False
+    md = src.read_text()
+    title = re.search(r"^#\s+(.+)$", md, re.M).group(1).strip()
+    body = (
+        f'  <p class="crumb"><a href="/">plank</a> › {html.escape(title)}</p>\n'
+        f"  <article>\n{fix_links(pandoc(md))}\n  </article>\n"
+    )
+    (ROOT / "site" / "whats-new.html").write_text(page(
+        f"{title} — plank",
+        "The features worth knowing about since plank-agent.dev went up: the KV cache "
+        "browser, cross-engine sub-agents, remote control, reasoning levels, and more.",
+        body))
+    return True
+
+
 def main() -> int:
     if not GUIDE.is_dir():
         print("no user-guide/ next to this script", file=sys.stderr)
@@ -260,6 +286,8 @@ def main() -> int:
         "Using plank: the TUI, slash commands, tools, sessions, context, configuration, and more.",
         body))
     print(f"built {len(built) + 1} pages into {OUT.relative_to(ROOT)}")
+    if build_whats_new():
+        print("built site/whats-new.html")
     return 0
 
 

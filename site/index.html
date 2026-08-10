@@ -205,6 +205,7 @@
     <div class="bar">
       <div class="brand rounded"><span class="chip">🪵</span> plank</div>
       <div style="display:flex;gap:10px;align-items:center">
+        <a class="ghost" href="/whats-new">What's new</a>
         <a class="ghost" href="/guide/">Guide</a>
         <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
@@ -312,6 +313,32 @@
       </div>
     </section>
 
+    <section id="whats-new">
+      <p class="kicker">Since you were last here</p>
+      <h2 class="rounded">The plank has been busy.</h2>
+      <p style="color:var(--bark-soft);margin:0 0 18px;max-width:640px">A few of the
+      newest arrivals. One session can now drive more than one engine, you can pin the
+      pieces of cache worth keeping, and you can walk away from the laptop entirely.</p>
+      <div class="cards">
+        <div class="card">
+          <div class="ico">🌲</div>
+          <h3 class="rounded">See inside the cache</h3>
+          <p><span class="mono">/kvcache</span> draws every KV snapshot as the tree it really is — what it was built on, how often you have reused it, when it expires. Pin the expensive ones; the rest age out on their own.</p>
+        </div>
+        <div class="card">
+          <div class="ico">🧩</div>
+          <h3 class="rounded">Several engines, one session</h3>
+          <p>A subagent can name its own model and provider, so a hosted main agent can hand work to the model on your Mac. Each one can get its own git worktree, too.</p>
+        </div>
+        <div class="card">
+          <div class="ico">📱</div>
+          <h3 class="rounded">Leave the desk</h3>
+          <p><span class="mono">/rc</span> starts the remote-control server mid-session, and the bundled web client streams the turn in plank's own theme. It buzzes you when it is your move.</p>
+        </div>
+      </div>
+      <p style="margin:16px 0 0"><a class="ghost" href="/whats-new">Everything new since v2.5 →</a></p>
+    </section>
+
     <section>
       <p class="kicker">Real screenshots, no mockups</p>
       <h2 class="rounded">Yes, it actually does this.</h2>
@@ -381,6 +408,7 @@
     <div class="footgrid">
       <div class="brand rounded"><span class="chip">🪵</span> plank</div>
       <div>
+        <a href="/whats-new">What's new</a> ·
         <a href="/guide/">User guide</a> ·
         <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
         <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a> ·
@@ -398,11 +426,11 @@
   var CHAN = {
     stable: {
       cmd: "brew install aovestdipaperino/tap/plank-agent",
-      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v2.6.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
+      note: 'Seasoned lumber — the stable channel. Currently <span class="mono">v2.9.0</span>; <span class="mono">brew upgrade</span> keeps you steady.'
     },
     beta: {
       cmd: "brew install aovestdipaperino/tap/plank-agent-beta",
-      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v2.6.1</span>.'
+      note: 'Fresh-cut and still curing — newest features first. Currently <span class="mono">v2.9.3</span>.'
     }
   };
   function setChan(c){

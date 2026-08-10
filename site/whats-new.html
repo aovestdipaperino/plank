@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>What&#x27;s new — plank</title>
+<meta name="description" content="The features worth knowing about since plank-agent.dev went up: the KV cache browser, cross-engine sub-agents, remote control, reasoning levels, and more.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%AA%B5%3C/text%3E%3C/svg%3E">
+<style>
+:root{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8;
+    --grain:#00000010;
+  }
+@media (prefers-color-scheme:dark){
+    :root{
+      --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+      --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+      --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+    }
+  }
+:root[data-theme="light"]{
+    --birch:#f7f1e6; --paper:#fffaf1; --bark:#2b2018; --bark-soft:#6b5a45;
+    --honey:#c9871f; --honey-ink:#8a5a10; --pine:#2f7d5b; --coral:#e2503a;
+    --line:#e6d9c1; --shadow:22 16 8; --grain:#00000010;
+  }
+:root[data-theme="dark"]{
+    --birch:#1e1811; --paper:#2a2118; --bark:#f3e9d8; --bark-soft:#b7a78c;
+    --honey:#e8ad4c; --honey-ink:#e8ad4c; --pine:#5cc797; --coral:#ff7259;
+    --line:#3a2f22; --shadow:0 0 0; --grain:#ffffff0d;
+  }
+@media (prefers-color-scheme:dark){
+    .plank{background:
+      repeating-linear-gradient(90deg,transparent 0 13px,var(--grain) 13px 14px),
+      linear-gradient(160deg,#c9923f,#a9741f 55%,#8c5f16)}
+  }
+
+  *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%; scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--birch); color:var(--bark);
+    font-family:system-ui,-apple-system,"Segoe UI",sans-serif;
+    line-height:1.65; font-size:17px; -webkit-font-smoothing:antialiased;
+  }
+  .rounded{font-family:ui-rounded,"SF Pro Rounded","Hiragino Maru Gothic ProN","Segoe UI",system-ui,sans-serif}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  a{color:var(--pine);text-underline-offset:3px}
+  .wrap{max-width:880px;margin:0 auto;padding:0 22px}
+
+  header{padding:22px 0 8px}
+  .bar{display:flex;align-items:center;justify-content:space-between;gap:16px}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:800;font-size:20px;letter-spacing:-.01em;
+         color:var(--bark);text-decoration:none}
+  .brand .chip{font-size:22px;filter:saturate(1.1)}
+  .ghost{font-size:14px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:7px 14px;
+    transition:border-color .15s,color .15s,transform .1s;white-space:nowrap}
+  .ghost:hover{color:var(--bark);border-color:var(--honey);transform:translateY(-1px)}
+  .navlinks{display:flex;gap:10px;align-items:center}
+
+  .crumb{font-size:14px;color:var(--bark-soft);margin:18px 0 0}
+  .crumb a{color:var(--bark-soft)}
+
+  article{background:var(--paper);border:2px solid var(--line);border-radius:18px;
+    padding:34px 34px 26px;margin:14px 0 26px;
+    box-shadow:0 10px 30px rgb(var(--shadow) / .06)}
+  article h1{font-family:ui-rounded,"SF Pro Rounded","Segoe UI",system-ui,sans-serif;
+    font-size:34px;line-height:1.15;letter-spacing:-.02em;margin:.1em 0 .5em}
+  article h2{font-size:24px;margin:1.6em 0 .5em;letter-spacing:-.01em;
+    padding-top:.5em;border-top:2px solid var(--line)}
+  article h2:first-of-type{border-top:0;padding-top:0}
+  article h3{font-size:19px;margin:1.4em 0 .4em}
+  article p{margin:.7em 0}
+  article ul,article ol{padding-left:1.3em}
+  article li{margin:.3em 0}
+  article strong{color:var(--bark)}
+  article blockquote{margin:1em 0;padding:.6em 1em;border-left:4px solid var(--honey);
+    background:var(--birch);border-radius:0 10px 10px 0;color:var(--bark-soft)}
+  article blockquote p{margin:.2em 0}
+  code{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.9em;
+    background:var(--birch);border:1px solid var(--line);border-radius:6px;padding:.08em .35em}
+  pre{background:var(--birch);border:2px solid var(--line);border-radius:12px;
+    padding:14px 16px;overflow-x:auto;margin:1em 0}
+  pre code{background:none;border:0;padding:0;font-size:.86em;line-height:1.55}
+  table{border-collapse:collapse;width:100%;margin:1em 0;display:block;overflow-x:auto}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:var(--birch);font-weight:800}
+  hr{border:0;border-top:2px solid var(--line);margin:1.6em 0}
+  img{max-width:100%}
+
+  .toc{list-style:none;padding:0;margin:0}
+  .toc li{margin:0 0 10px}
+  .toc a{display:block;text-decoration:none;color:var(--bark);
+    border:2px solid var(--line);border-radius:14px;padding:12px 15px;background:var(--paper);
+    transition:border-color .15s,transform .1s}
+  .toc a:hover{border-color:var(--honey);transform:translateY(-1px)}
+  .toc .n{font-weight:800;color:var(--honey-ink);margin-right:.5em}
+  .toc .d{display:block;color:var(--bark-soft);font-size:15px;margin-top:2px}
+
+  .pager{display:flex;justify-content:space-between;gap:12px;margin:0 0 34px;flex-wrap:wrap}
+  .pager a{font-size:15px;font-weight:700;text-decoration:none;color:var(--bark-soft);
+    border:2px solid var(--line);border-radius:999px;padding:9px 16px;background:var(--paper)}
+  .pager a:hover{color:var(--bark);border-color:var(--honey)}
+
+  footer{border-top:2px solid var(--line);padding:20px 0 40px;color:var(--bark-soft);font-size:14px}
+  .footgrid{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;align-items:center}
+  .fine{font-size:12.5px;opacity:.75;margin-top:10px}
+
+  @media (max-width:640px){
+    article{padding:24px 20px 18px;border-radius:14px}
+    article h1{font-size:27px}
+    body{font-size:16px}
+  }
+
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="bar">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div class="navlinks">
+        <a class="ghost" href="/whats-new">What's new</a>
+        <a class="ghost" href="/guide/">Guide</a>
+        <a class="ghost" href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </div>
+  </header>
+  <p class="crumb"><a href="/">plank</a> › What&#x27;s new</p>
+  <article>
+<h1 id="whats-new">What's new</h1>
+<p>This site went up in late July 2026, around v2.5. Plank has not held
+still since. Below are the changes worth knowing about if you have been
+away, newest first. The <a
+href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
+changelog</a> has every last fix; this page has the ones you will
+actually notice.</p>
+<h2 id="just-landed">Just landed</h2>
+<p><strong><code>/kvcache</code> shows the cache as the tree it really
+is.</strong> Every KV snapshot on disk now carries a small metadata file
+recording what it is, which snapshot it was built on, the model and
+reasoning level behind it, its size, how many times it has been reused,
+and when. <code>/kvcache</code> draws that as a tree you can walk with
+the arrow keys: <code>p</code> pins an entry so nothing will ever sweep
+it, <code>d</code> deletes one, <code>g</code> sweeps now.</p>
+<p><strong>The cache expires on age and is capped on size.</strong>
+Snapshots used to be kept only for the <em>current</em> system prompt
+and project, and every sibling was deleted, so switching model or
+reasoning level and back paid a full system-prompt re-prefill each way.
+Now they expire on time since last use (14 days for a conversation, 30
+for a shared checkpoint) and a 20 GB ceiling evicts the least recently
+used beyond that. Several system prompts coexist for as long as you are
+using them. See <a
+href="/guide/06-sessions.html#the-kv-cache">Sessions</a> and <a
+href="/guide/08-configuration.html#kvcache">Configuration</a>.</p>
+<p><strong><code>/open [path]</code></strong> edits an existing file in
+plank's own editor: <code>Ctrl-S</code> saves, <code>Esc</code>
+discards. Bare <code>/open</code> reopens the last file a tool call
+touched, which is usually the one you wanted to look at.</p>
+<h2 id="one-session-several-engines">One session, several engines</h2>
+<p><strong>Cross-engine sub-agents.</strong> A subagent definition can
+name the engine it runs on, independently of the main agent: a
+<code>provider:</code> and <code>model:</code> in its frontmatter, with
+an optional base URL and the <em>name</em> of the environment variable
+holding the key, so the file stays committable.
+<code>provider: local</code> names the local engine specifically, so a
+hosted main agent can delegate to the model on your own Mac.
+<code>/agent</code> shows each definition's engine and the variable to
+set when it is missing.</p>
+<p><strong>Git worktrees.</strong> A session can move itself into an
+isolated worktree and back out again, so an agent can work on a copy of
+the repo without touching yours. Subagents can each get their own with
+<code>isolation: worktree</code>.</p>
+<p><strong>DSpark speculative decoding, behind
+<code>--dspark</code>.</strong> DeepSeek's auxiliary draft checkpoint
+(~5.6 GB on top of the model) proposes tokens the main model verifies in
+batches. It downloads and resumes the same way the model does.</p>
+<p><strong>A live agent roster on <code>Ctrl-O</code>.</strong> Instead
+of one sub-agent's output, the pane is now a roster of every run in the
+session with what each is doing, how long it has been at it, and what it
+has spent. The status bar became two rows to make room for it, and the
+working directory and git branch moved up to the first.</p>
+<h2 id="drive-it-from-somewhere-else">Drive it from somewhere else</h2>
+<p><strong><code>/remote-control</code>, or <code>/rc</code>,</strong>
+starts and stops a remote-control server from inside a running session,
+and <code>/grant</code> approves a client that asks for control. The old
+<code>--control*</code> flags are gone.</p>
+<p><strong>The bundled web client is a real front-end now.</strong> It
+wears plank's own dark theme, streams the turn as it happens, and tells
+you unmistakably when the connection drops. Attached clients get the
+end-of-turn notification too, so you can walk away from the laptop and
+still be told when it is your move.</p>
+<h2 id="reasoning-you-can-dial">Reasoning you can dial</h2>
+<p><strong><code>/think off | low | medium | max</code>,</strong> with
+<code>--think-max</code> and friends on the command line.
+<code>low</code> is experimental and cheap; <code>max</code> prepends a
+reasoning-effort preamble and is the one worth reaching for on a hard
+problem. The status footer shows which level is in force as a
+<code>🧠 med</code> segment, because it changes both cost and answers
+and used to be invisible.</p>
+<h2 id="the-terminal-got-more-useful">The terminal got more useful</h2>
+<p><strong><code>!</code> and <code>!!</code>.</strong> A bare
+<code>!command</code> runs a shell command <em>and hands the result to
+the model</em>, which is what you almost always wanted;
+<code>!!command</code> keeps the output to yourself.</p>
+<p><strong><code>/btw &lt;question&gt;</code> answers beside the running
+task</strong> instead of freezing it. The aside runs on a fork of the
+session in a split panel, so the real conversation is never touched and
+neither side waits for the other.</p>
+<p><strong>PDFs are readable.</strong> <code>read</code> on a
+<code>.pdf</code> converts the document to Markdown, with OCR for a
+scanned one.</p>
+<p><strong><code>/insights</code></strong> builds a personal usage
+report over every session you have ever saved and writes it to an HTML
+file: where the time went, which tools you lean on, how the model
+actually behaves for you.</p>
+<p><strong>A prompt editor on <code>Ctrl-G</code>,</strong> built in
+rather than shelling out to <code>$EDITOR</code>, for when the thing you
+are about to ask has outgrown one line.</p>
+<p><strong><code>/compact [instructions]</code></strong> compacts the
+conversation now rather than waiting for the automatic pass, and an
+argument steers what that one summary keeps. Compaction shows its
+progress in the status bar, and <code>Ctrl-C</code> interrupts it.</p>
+<p><strong>A screensaver, and an arcade.</strong> After a few idle
+minutes plank goes to a starfield, matrix rain, or a couple of minions,
+chosen at random and configurable. There are also games that run over a
+live turn, which is either a feature or a confession (<a
+href="/guide/11-arcade.html">chapter 11</a>).</p>
+<h2 id="sessions-became-a-tree">Sessions became a tree</h2>
+<p><strong><code>/tree</code>, <code>/fork</code>,
+<code>/clone</code>.</strong> A session is a tree of messages rather
+than a line. <code>/tree</code> draws it and numbers the fork points;
+<code>/fork &lt;n&gt;</code> rewinds to just before one of your prompts
+and keeps everything after it as a sibling branch, so you can try a
+different approach without losing the first; <code>/clone</code> freezes
+the current branch and continues on a copy. All of it is shaped so the
+cache is reused rather than rebuilt.</p>
+<p><strong><code>/export [md|html]</code></strong> renders the
+transcript to a shareable file. The HTML is standalone.</p>
+<p><strong>Prompt templates.</strong> Markdown files in
+<code>~/.plank/templates</code> become commands, with
+<code>{{variable}}</code> substitution.</p>
+<p><strong>MCP over Streamable HTTP.</strong> An <code>.mcp.json</code>
+entry with a <code>"url"</code> speaks to a remote MCP server, alongside
+the stdio servers that were already supported.</p>
+<h2 id="things-that-were-quietly-broken">Things that were quietly
+broken</h2>
+<p>A resumed session used to re-prefill its whole conversation.
+<code>/new</code> and <code>/clear</code> used to rebuild the
+system-prompt cache from scratch. A dropped network could hang a turn
+forever with <code>Ctrl-C</code> doing nothing. A compaction that
+produced no usable summary could destroy the transcript. Several shapes
+of tool call the model emits were parsed wrongly and died. All fixed,
+and each one has an entry in the changelog explaining what actually went
+wrong, if you like that sort of thing.</p>
+<hr />
+<p>New here instead? Start with the <a href="/guide/">user guide</a>, or
+<a href="/">install it</a> and get going.</p>
+
+  </article>
+
+  <footer>
+    <div class="footgrid">
+      <a class="brand rounded" href="/"><span class="chip">🪵</span> plank</a>
+      <div>
+        <a href="/guide/">User guide</a> ·
+        <a href="https://github.com/aovestdipaperino/plank" target="_blank" rel="noopener">GitHub</a> ·
+        <a href="https://github.com/aovestdipaperino/plank/releases" target="_blank" rel="noopener">Releases</a>
+      </div>
+    </div>
+    <p class="fine">macOS only — Plank is a Mac guy (it needs Metal). This guide is generated from
+    <a href="https://github.com/aovestdipaperino/plank/tree/main/user-guide">user-guide/</a> in the repo, so it cannot drift from the source.</p>
+  </footer>
+</div>
+</body>
+</html>
