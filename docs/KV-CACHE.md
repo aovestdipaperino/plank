@@ -11,8 +11,12 @@ wrongly reused KV does not error — it produces a model that has silently read 
 different prompt than the one on screen. Every fingerprint, version byte, and
 signature below is there to make that failure impossible rather than rare.
 
-Related reading: `docs/ARCHITECTURE.md` for where these pieces sit, `FINDINGS.md`
-for the traps that cost a debugging session each.
+Related reading: **`docs/KV-CACHING.md`** is the companion to this file and the
+better starting point if you are new to the subsystem. It follows the arc from
+requirement to design to implementation and explains *why* each decision was
+made; this document is the mechanics reference, organised by layer, and answers
+*what* each piece does. Also `docs/ARCHITECTURE.md` for where these pieces sit,
+and `FINDINGS.md` for the traps that cost a debugging session each.
 
 ## The two things being cached
 

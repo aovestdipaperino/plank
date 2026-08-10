@@ -428,7 +428,7 @@ is parsed from the very arguments the settings seed.
 ## Data flows worth understanding
 
 ### System-prompt KV cache
-See **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
+See **`docs/KV-CACHING.md`** for why this subsystem is shaped the way it is, and **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
 warm walk, the on-disk format, forks, and GC. In outline, on startup the agent
 warms the cache before the first turn:
 
