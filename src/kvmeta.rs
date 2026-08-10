@@ -23,9 +23,18 @@ pub const META_VERSION: u32 = 1;
 
 /// Extension of a persisted KV body. Distinct from `.kv`, which is a session
 /// transcript — before this split one glob could match both.
+///
+/// Carries a leading dot, unlike [`META_EXT`], because it is always used with
+/// `strip_suffix`/`ends_with` over a whole file name while `META_EXT` is
+/// appended as an extension. The asymmetry is deliberate: giving both the same
+/// shape would mean a dot-stripping call at every one of the two dozen
+/// `BLOB_EXT` match sites.
 pub const BLOB_EXT: &str = ".kv_raw";
 
 /// Extension of the metadata sidecar written beside a [`BLOB_EXT`] body.
+///
+/// No leading dot, unlike [`BLOB_EXT`] — see that constant for why. It is only
+/// ever appended by [`sidecar_path`].
 pub const META_EXT: &str = "json";
 
 /// Which tier a blob belongs to.
@@ -146,10 +155,21 @@ pub fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-/// The sidecar that belongs to `blob`: same stem, `.json` extension.
+/// The sidecar that belongs to `blob`: the body's name with [`BLOB_EXT`]
+/// replaced by `.json`.
+///
+/// Built from the whole file name rather than `Path::with_extension`, which
+/// strips at the *last* dot and so would map `my.notes.kv_raw` to
+/// `my.notes.json` but `my.notes` (no `BLOB_EXT`) to `my.json`. Today's stems
+/// cannot contain a dot — session ids are `[A-Za-z0-9-]` and tier keys are hex —
+/// but the sidecar naming must not silently depend on that.
 #[must_use]
 pub fn sidecar_path(blob: &Path) -> PathBuf {
-    blob.with_extension(META_EXT)
+    let Some(name) = blob.file_name().and_then(std::ffi::OsStr::to_str) else {
+        return blob.with_extension(META_EXT);
+    };
+    let stem = name.strip_suffix(BLOB_EXT).unwrap_or(name);
+    blob.with_file_name(format!("{stem}.{META_EXT}"))
 }
 
 /// Reads the sidecar beside `blob`.
@@ -230,6 +250,13 @@ mod tests {
         assert_eq!(
             sidecar_path(Path::new("/c/cheeky-bell.kv_raw")),
             PathBuf::from("/c/cheeky-bell.json")
+        );
+        // Built from the whole file name, so a stem containing a dot keeps it.
+        // `with_extension` would have produced `/c/my.json` here and collided
+        // with an unrelated blob's sidecar.
+        assert_eq!(
+            sidecar_path(Path::new("/c/my.notes.kv_raw")),
+            PathBuf::from("/c/my.notes.json")
         );
     }
 

@@ -73,8 +73,20 @@ fn main() -> ExitCode {
     // the note prints as a plain line on every front end (TUI, plain REPL,
     // and `--non-interactive` all funnel through here). Best-effort: a store
     // that fails to open is skipped silently, and the next launch retries.
-    if let Ok(store) =
-        plank::session::SessionStore::open(plank::session::SessionStore::default_dir())
+    //
+    // Gated on the cache directory already existing, and deliberately not
+    // moved below `run_startup_maintenance`: `SessionStore::open` does a
+    // `create_dir_all`, which creates `~/.plank` as a side effect, and a
+    // `~/.plank` that exists with no version marker is what
+    // `upgrade::classify` reads as a major version change — so a brand-new
+    // install announced "cleared the image cache" on its very first launch.
+    // The migration has to stay above every terminal setup (running it inside
+    // the live alternate screen garbled the warm-progress frame), so the gate
+    // is the fix rather than a reorder. Nothing to migrate exists before the
+    // directory does, so skipping is exact rather than merely cheap.
+    let kv_dir = plank::session::SessionStore::default_dir();
+    if kv_dir.is_dir()
+        && let Ok(store) = plank::session::SessionStore::open(&kv_dir)
         && let Some(bytes) = store.migrate_legacy_blobs()
         && bytes > 0
     {
