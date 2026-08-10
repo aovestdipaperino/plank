@@ -259,6 +259,22 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
             }
             continue;
         };
+        // The manifest `name` is gated by `valid_name` in `load_plugin`, but
+        // the directory-name fallback is not — and it becomes the namespace
+        // prefix just the same. A directory called `foo:bar` would mint the
+        // ambiguous alias `foo:bar:greet`, and one called `a__b` the MCP server
+        // name `a__b-weather`, unroutable because `mcp__<server>__<tool>` is
+        // split at the first `__` (and rejected by `config_load_reporting`
+        // everywhere else). Drop rather than sanitize: a sanitized name could
+        // itself collide with a real plugin's.
+        if !valid_name(&plugin.name) {
+            set.warnings.push(format!(
+                "plugin directory {}: unusable plugin name {:?}; skipped (give it a plugin.json with a valid \"name\")",
+                dir.display(),
+                plugin.name
+            ));
+            continue;
+        }
         if seen_roots.contains(&plugin.root) {
             continue;
         }
@@ -1223,6 +1239,64 @@ mod tests {
         assert!(out.contains("1.0"));
         assert!(out.contains("--plugin-dir"));
         assert!(out.contains("skills"));
+    }
+
+    /// The directory-name fallback becomes the namespace prefix, so it has to
+    /// clear the same bar the manifest `name` does. `foo:bar` would mint the
+    /// ambiguous alias `foo:bar:greet`.
+    #[test]
+    fn a_directory_named_with_a_colon_is_dropped() {
+        let base = scratch("dirname-colon");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("foo:bar");
+        write(&plugin, "skills/greet/SKILL.md", "hi\n");
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert!(set.plugins.is_empty(), "the plugin was dropped");
+        assert!(
+            set.warnings.iter().any(|w| w.contains("foo:bar")),
+            "the directory is named in a warning: {:?}",
+            set.warnings
+        );
+    }
+
+    /// `a__b` would mint the MCP server name `a__b-weather`, which
+    /// `mcp__<server>__<tool>` cannot round-trip.
+    #[test]
+    fn a_directory_named_with_a_double_underscore_is_dropped() {
+        let base = scratch("dirname-dunder");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("a__b");
+        write(&plugin, ".mcp.json", r#"{"mcpServers":{"weather":{}}}"#);
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert!(set.plugins.is_empty(), "the plugin was dropped");
+        assert!(
+            set.warnings.iter().any(|w| w.contains("a__b")),
+            "the directory is named in a warning: {:?}",
+            set.warnings
+        );
+        assert!(mcp_servers(&set).0.is_empty());
+    }
+
+    /// A manifest with a valid `name` rescues an otherwise unusable directory
+    /// name, since the fallback never applies.
+    #[test]
+    fn a_manifest_name_rescues_an_unusable_directory_name() {
+        let base = scratch("dirname-rescued");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("foo:bar");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(set.plugins.len(), 1);
+        assert_eq!(set.plugins[0].name, "demo");
     }
 
     /// The collision warnings used to be computed and dropped on the floor —
