@@ -471,6 +471,79 @@ substituted advertisement.</p>
 <p>This applies to global servers only. Project-local servers are cheap
 to rebuild, so they get no cached record — a dead project server simply
 is not advertised.</p>
+<h2 id="plugins">Plugins</h2>
+<p>A plugin is a directory that bundles several of the extension points
+above and contributes them to a session as one unit, instead of asking
+you to drop a skill here, an agent there and a hook file somewhere
+else.</p>
+<pre><code>my-plugin/
+  .plank-plugin/plugin.json     name, description, version, author
+  skills/release/SKILL.md
+  agents/reviewer.md
+  templates/review.md
+  hooks.json
+  .mcp.json
+  settings.json</code></pre>
+<p>Every part is optional; a directory with a manifest and one component
+is a plugin. Both spellings are accepted, plank's and Claude Code's: the
+manifest may be <code>.plank-plugin/plugin.json</code> or
+<code>.claude-plugin/plugin.json</code>, templates may live in
+<code>templates/</code> or <code>commands/</code>, hooks in
+<code>hooks.json</code> or <code>hooks/hooks.json</code>. Where both are
+present the plank spelling wins and the shadowing is reported. A
+directory with no manifest at all but with recognizable components still
+loads, named after the directory it sits in.</p>
+<h3 id="activating-one">Activating one</h3>
+<p>Plugins are loaded from three places, in order:
+<code>~/.plank/plugins/dev/*</code> for ones you want everywhere,
+<code>&lt;cwd&gt;/.plank/plugins/*</code> for ones that belong to a
+project, and each <code>--plugin-dir &lt;path&gt;</code> on the command
+line, which is repeatable and lasts only for that session. A later
+source shadows an earlier plugin of the same name, so a
+<code>--plugin-dir</code> copy is the natural way to try a change to a
+plugin you already have installed.</p>
+<p><code>/plugins</code> lists what loaded, where each one came from,
+what it contributes, and every warning raised along the way. Nothing
+about a bad plugin is fatal: a broken manifest or an unreadable
+component demotes that one plugin, or just that one component, and the
+session continues.</p>
+<h3 id="naming">Naming</h3>
+<p>One rule covers skills, agents and templates: a plugin contribution
+is always addressable as <code>&lt;plugin&gt;:&lt;name&gt;</code>, and
+it keeps the bare <code>&lt;name&gt;</code> only when nothing else
+claims it. Your own skills and agents always win the bare name, and when
+two plugins offer the same name neither keeps it — both stay reachable
+only in their namespaced form. <code>/skills</code>, <code>/agent</code>
+and <code>/templates</code> show the contributing plugin beside each
+entry.</p>
+<p>MCP servers are the exception: the separator is <code>-</code>, so a
+disambiguated server is <code>&lt;plugin&gt;-&lt;server&gt;</code>.
+Server names are embedded in the tool name
+<code>mcp__&lt;server&gt;__&lt;tool&gt;</code> and split at the first
+<code>__</code>, which is also why a plugin server name containing
+<code>__</code> is rejected outright.</p>
+<p>Hooks have no names to collide, so they are simply additive and all
+of them run: <code>~/.plank/hooks.json</code> first, then each plugin's
+hook file in load order, then the project's
+<code>./.plank/hooks.json</code>.</p>
+<h3 id="where-plugin-settings-sit">Where plugin settings sit</h3>
+<p>A plugin's <code>settings.json</code> becomes a new precedence level
+directly above the built-in defaults, and below everything of yours:</p>
+<pre><code>defaults &lt; plugin &lt; ~/.plank/settings.json &lt; ./.plank/settings.json &lt; env &lt; CLI</code></pre>
+<p>Several plugins merge in load order, later winning. By construction a
+plugin can never override a setting you set yourself. The sharp edge is
+the key you did <em>not</em> set: a plugin that writes a
+<code>safety.*</code> key still beats the built-in default, so a plugin
+can, for instance, turn the bash sandbox off if you have never set it
+explicitly. plank warns at startup and in <code>/plugins</code> whenever
+a plugin's settings touch a <code>safety.*</code> key — that warning is
+worth reading. See <a href="08-configuration.html">Configuration</a>.</p>
+<h3 id="what-is-not-here-yet">What is not here yet</h3>
+<p>This release makes hand-placed plugin directories work, and nothing
+more. There is no installer, no marketplace, no dependency resolution,
+no version handling and no policy controls. You place a plugin directory
+yourself, or pass it with <code>--plugin-dir</code>. Manifest fields
+that later work will need are tolerated and ignored today.</p>
 <hr />
 <p>Next: <a href="10-remote-and-providers.html">Remote and hosted engines
 →</a></p>

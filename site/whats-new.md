@@ -7,6 +7,17 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**Plugins load.** A plugin is one directory bundling skills, agents, templates, hooks,
+an `.mcp.json` and a `settings.json`, contributed to a session as a unit. plank picks
+them up from `~/.plank/plugins/dev/`, from `./.plank/plugins/`, or from a repeatable
+`--plugin-dir` for the session you are in, and reads both its own spelling and Claude
+Code's. A plugin contribution is always addressable as `<plugin>:<name>` and keeps the
+bare name only when nothing else claims it, so your own skills and agents never lose
+theirs. Plugin settings sit below your own files, and `/plugins` shows what loaded,
+what each one contributes and every warning. There is no installer and no marketplace
+yet — you place the directory yourself. See
+[Extending plank](/guide/09-extending.html).
+
 **v3.0.0 is out**, and the beta channel has opened on 3.0.1. The patch number is
 still the channel: `.0` is stable, anything above it is beta.
 

@@ -216,6 +216,51 @@ The consequence to know about: after a failed start, the model still believes th
 
 This applies to global servers only. Project-local servers are cheap to rebuild, so they get no cached record — a dead project server simply is not advertised.
 
+## Plugins
+
+A plugin is a directory that bundles several of the extension points above and contributes them to a session as one unit, instead of asking you to drop a skill here, an agent there and a hook file somewhere else.
+
+```
+my-plugin/
+  .plank-plugin/plugin.json     name, description, version, author
+  skills/release/SKILL.md
+  agents/reviewer.md
+  templates/review.md
+  hooks.json
+  .mcp.json
+  settings.json
+```
+
+Every part is optional; a directory with a manifest and one component is a plugin. Both spellings are accepted, plank's and Claude Code's: the manifest may be `.plank-plugin/plugin.json` or `.claude-plugin/plugin.json`, templates may live in `templates/` or `commands/`, hooks in `hooks.json` or `hooks/hooks.json`. Where both are present the plank spelling wins and the shadowing is reported. A directory with no manifest at all but with recognizable components still loads, named after the directory it sits in.
+
+### Activating one
+
+Plugins are loaded from three places, in order: `~/.plank/plugins/dev/*` for ones you want everywhere, `<cwd>/.plank/plugins/*` for ones that belong to a project, and each `--plugin-dir <path>` on the command line, which is repeatable and lasts only for that session. A later source shadows an earlier plugin of the same name, so a `--plugin-dir` copy is the natural way to try a change to a plugin you already have installed.
+
+`/plugins` lists what loaded, where each one came from, what it contributes, and every warning raised along the way. Nothing about a bad plugin is fatal: a broken manifest or an unreadable component demotes that one plugin, or just that one component, and the session continues.
+
+### Naming
+
+One rule covers skills, agents and templates: a plugin contribution is always addressable as `<plugin>:<name>`, and it keeps the bare `<name>` only when nothing else claims it. Your own skills and agents always win the bare name, and when two plugins offer the same name neither keeps it — both stay reachable only in their namespaced form. `/skills`, `/agent` and `/templates` show the contributing plugin beside each entry.
+
+MCP servers are the exception: the separator is `-`, so a disambiguated server is `<plugin>-<server>`. Server names are embedded in the tool name `mcp__<server>__<tool>` and split at the first `__`, which is also why a plugin server name containing `__` is rejected outright.
+
+Hooks have no names to collide, so they are simply additive and all of them run: `~/.plank/hooks.json` first, then each plugin's hook file in load order, then the project's `./.plank/hooks.json`.
+
+### Where plugin settings sit
+
+A plugin's `settings.json` becomes a new precedence level directly above the built-in defaults, and below everything of yours:
+
+```
+defaults < plugin < ~/.plank/settings.json < ./.plank/settings.json < env < CLI
+```
+
+Several plugins merge in load order, later winning. By construction a plugin can never override a setting you set yourself. The sharp edge is the key you did *not* set: a plugin that writes a `safety.*` key still beats the built-in default, so a plugin can, for instance, turn the bash sandbox off if you have never set it explicitly. plank warns at startup and in `/plugins` whenever a plugin's settings touch a `safety.*` key — that warning is worth reading. See [Configuration](08-configuration.md).
+
+### What is not here yet
+
+This release makes hand-placed plugin directories work, and nothing more. There is no installer, no marketplace, no dependency resolution, no version handling and no policy controls. You place a plugin directory yourself, or pass it with `--plugin-dir`. Manifest fields that later work will need are tolerated and ignored today.
+
 ---
 
 Next: [Remote and hosted engines →](10-remote-and-providers.md)

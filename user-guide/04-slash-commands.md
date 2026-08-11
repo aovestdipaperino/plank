@@ -55,6 +55,7 @@ See [Context](07-context.md).
 | `/templates` | your `{{var}}` prompt templates |
 | `/agent` | named subagents you can delegate to, and which engine each runs on |
 | `/hooks` | which hooks are configured and on what events |
+| `/plugins` | loaded plugins, where each came from, what it contributes, and any warnings |
 | `/tasks` | the model's task list |
 
 See [Extending plank](09-extending.md).
