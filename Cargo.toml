@@ -12,10 +12,12 @@ rust-version = "1.93"
 exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf"]
 
 [features]
-default = ["use_obscura", "builtin_editor", "docparse"]
-# Image pasting (Cmd-V clipboard images, image file paths) is disabled until
-# the model's handling of image-file references is understood; build with
-# `--features images` to re-enable.
+default = ["use_obscura", "builtin_editor", "docparse", "images"]
+# Image pasting (Cmd-V clipboard images, image file paths). This was off while
+# the model had no way to act on an image-file reference — the attachment named
+# a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
+# (`transcribe_image` reads the cached file), so the gate has outlived its
+# reason and pasting is on by default. Disable with `--no-default-features`.
 images = []
 # Key the system-prompt KV checkpoint by project directory
 # (`sysprompt-<hash>.kv`) so per-project prompt inputs (AGENTS.md, local MCP
