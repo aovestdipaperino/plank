@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.3] - 2026-08-11
+
+### Added
+
+- **plank can read your screenshots.** Image pasting is on by default now, and
+  paired with the [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp)
+  server the model can act on what you paste: it calls `transcribe_image` on the
+  cached path and gets the text back. Transcription runs on your own machine
+  against a 0.9B OCR model, so no image leaves the laptop and there is no API
+  key. Install it with `brew install llama.cpp && cargo install ocr-mcp` and
+  register it in `.mcp.json`; the guide covers fetching the weights.
+
+  The feature had been compiled out behind `--features images` because a pasted
+  image reached the model as a path nothing could open, which made the whole
+  thing a tease. There is now a tool that opens it.
+
+### Changed
+
+- **Pasted images are cached byte-for-byte.** plank used to downsample every PNG
+  to 2000px on its long edge, a rule inherited from an image-upload API limit
+  that plank does not have: the ds4 engine is text-only and never uploads pixels
+  anywhere. The resampling only discarded the pixel density and DPI metadata that
+  an OCR tool then needs. Note that `~/.plank/image-cache/` is bounded by file
+  count rather than bytes, so it now grows larger for the same number of images.
+
 ## [3.0.2] - 2026-08-11
 
 ### Added
