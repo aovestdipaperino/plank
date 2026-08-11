@@ -3,8 +3,7 @@
     "ocr": {
       "command": "ocr-mcp",
       "env": {
-        "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp",
-        "OCR_MCP_AUTO_DOWNLOAD": "1"
+        "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp"
       }
     }
   }
