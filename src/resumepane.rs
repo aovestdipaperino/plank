@@ -49,6 +49,8 @@ pub enum Outcome {
     Rename(String, String),
     /// Delete this session; the pane already took the confirmation.
     Delete(String),
+    /// Delete *every* saved session; the pane already took the confirmation.
+    WipeAll,
     /// Fill in this session's preview text via [`ResumePane::set_preview`].
     LoadPreview(String),
 }
@@ -70,6 +72,8 @@ pub struct ResumePane {
     preview_open: bool,
     /// A delete press is awaiting confirmation.
     pending_delete: bool,
+    /// A wipe-everything press is awaiting confirmation.
+    pending_wipe: bool,
     /// When `Some`, the search box is a rename buffer for the selected session.
     rename: Option<String>,
     /// Project label shown above the list; empty hides the line.
@@ -92,6 +96,7 @@ impl ResumePane {
             previews: HashMap::new(),
             preview_open: false,
             pending_delete: false,
+            pending_wipe: false,
             rename: None,
             scope: String::new(),
             now,
@@ -130,6 +135,22 @@ impl ResumePane {
         self.pending_delete
     }
 
+    /// A wipe-everything press is armed and awaiting its confirmation.
+    #[must_use]
+    pub fn pending_wipe(&self) -> bool {
+        self.pending_wipe
+    }
+
+    /// Cancels whatever destructive press was waiting on a second key.
+    ///
+    /// Every other key runs this, which is the whole safety property: an armed
+    /// delete or wipe survives exactly one keystroke, and that keystroke has to
+    /// be the same chord again.
+    fn disarm(&mut self) {
+        self.pending_delete = false;
+        self.pending_wipe = false;
+    }
+
     /// No session matches the query.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -161,7 +182,7 @@ impl ResumePane {
             .collect();
         self.cursor = self.cursor.min(self.visible.len().saturating_sub(1));
         self.preview_open = false;
-        self.pending_delete = false;
+        self.disarm();
     }
 
     /// Supplies the preview text the pane asked for with
@@ -191,7 +212,16 @@ impl ResumePane {
         if self.pending_delete {
             return "Ctrl+X again to delete · any other key cancels".to_owned();
         }
-        "Space to preview · Ctrl+R to rename · Ctrl+X to delete · Type to search · Esc to cancel"
+        // The wipe names its own scale. "Ctrl+W again" alone would read like
+        // the single delete above, and this one takes every session with it.
+        if self.pending_wipe {
+            return format!(
+                "Ctrl+W again to delete ALL {} saved sessions · any other key cancels",
+                self.entries.len()
+            );
+        }
+        "Space to preview · Ctrl+R to rename · Ctrl+X to delete · Ctrl+W to wipe all · \
+         Type to search · Esc to cancel"
             .to_owned()
     }
 
@@ -261,22 +291,42 @@ impl ResumePane {
                 if let Some(e) = self.selected() {
                     self.rename = Some(e.id.clone());
                     self.preview_open = false;
-                    self.pending_delete = false;
+                    self.disarm();
                 }
                 Outcome::Stay
             }
             // Delete is unreachable behind a rename box: the two would fight
             // over Enter, and confirming a delete you cannot see is worse.
             KeyCode::Char('x') if ctrl && self.rename.is_none() => {
-                if !self.pending_delete {
+                // Disarm first: a `Ctrl+W` waiting for its confirmation must
+                // not still be armed after the user pressed a different chord,
+                // or the *next* `Ctrl+W` would wipe on one press.
+                let armed = self.pending_delete;
+                self.disarm();
+                if !armed {
                     self.pending_delete = self.selected().is_some();
                     return Outcome::Stay;
                 }
-                self.pending_delete = false;
                 match self.selected() {
                     Some(e) => Outcome::Delete(e.id.clone()),
                     None => Outcome::Stay,
                 }
+            }
+            // Wipe everything. Same two-press arming as `Ctrl+X` and the same
+            // rule about the rename box, but the confirmation names the count:
+            // this one is not undoable, and the pane is the last thing between
+            // the chord and an empty cache directory.
+            KeyCode::Char('w') if ctrl && self.rename.is_none() => {
+                let armed = self.pending_wipe;
+                self.disarm();
+                if !armed {
+                    // Nothing saved means nothing to wipe: arming here would
+                    // ask a question whose only honest answer is "there is
+                    // nothing to confirm".
+                    self.pending_wipe = !self.entries.is_empty();
+                    return Outcome::Stay;
+                }
+                Outcome::WipeAll
             }
             // Every other control chord is swallowed rather than falling through
             // to the text arms below. Without this, `Ctrl+X` behind a rename box
@@ -285,7 +335,7 @@ impl ResumePane {
             KeyCode::Up => {
                 self.cursor = self.cursor.saturating_sub(1);
                 self.preview_open = false;
-                self.pending_delete = false;
+                self.disarm();
                 Outcome::Stay
             }
             KeyCode::Down => {
@@ -293,11 +343,11 @@ impl ResumePane {
                     self.cursor += 1;
                 }
                 self.preview_open = false;
-                self.pending_delete = false;
+                self.disarm();
                 Outcome::Stay
             }
             KeyCode::Enter => {
-                self.pending_delete = false;
+                self.disarm();
                 let Some(id) = self.selected().map(|e| e.id.clone()) else {
                     return Outcome::Stay;
                 };
@@ -319,7 +369,7 @@ impl ResumePane {
             }
             KeyCode::Esc => Outcome::Close,
             KeyCode::Backspace => {
-                self.pending_delete = false;
+                self.disarm();
                 if let Some(buf) = self.rename.as_mut() {
                     buf.pop();
                 } else {
@@ -329,7 +379,7 @@ impl ResumePane {
                 Outcome::Stay
             }
             KeyCode::Char(' ') if self.query.is_empty() && self.rename.is_none() => {
-                self.pending_delete = false;
+                self.disarm();
                 self.preview_open = !self.preview_open;
                 match self.selected().map(|e| e.id.clone()) {
                     Some(id) if self.preview_open && !self.previews.contains_key(&id) => {
@@ -339,7 +389,7 @@ impl ResumePane {
                 }
             }
             KeyCode::Char(c) => {
-                self.pending_delete = false;
+                self.disarm();
                 if let Some(buf) = self.rename.as_mut() {
                     buf.push(c);
                 } else {
@@ -677,6 +727,65 @@ mod tests {
         assert!(!p.pending_delete(), "moving away cancels");
         // And a second Ctrl+X after the disarm only re-arms, it does not delete.
         assert!(matches!(p.handle_key(ctrl('x')), Outcome::Stay));
+    }
+
+    #[test]
+    fn ctrl_w_twice_wipes_every_session() {
+        let mut p = pane();
+        assert!(
+            matches!(p.handle_key(ctrl('w')), Outcome::Stay),
+            "armed, not fired"
+        );
+        assert!(p.pending_wipe());
+        // The confirmation says how much is about to go, not just "again".
+        assert!(p.footer().contains("ALL 3"), "{}", p.footer());
+        assert!(matches!(p.handle_key(ctrl('w')), Outcome::WipeAll));
+        assert!(!p.pending_wipe(), "fired, and disarmed behind it");
+    }
+
+    #[test]
+    fn any_other_key_disarms_a_pending_wipe() {
+        let mut p = pane();
+        p.handle_key(ctrl('w'));
+        p.handle_key(key(KeyCode::Down));
+        assert!(!p.pending_wipe(), "moving away cancels");
+        assert!(
+            matches!(p.handle_key(ctrl('w')), Outcome::Stay),
+            "and the next press only re-arms"
+        );
+    }
+
+    /// The bug this guards: an armed wipe left behind by a *different* chord
+    /// would make the next single `Ctrl+W` delete everything.
+    #[test]
+    fn a_pending_wipe_does_not_survive_a_delete_press() {
+        let mut p = pane();
+        p.handle_key(ctrl('w'));
+        p.handle_key(ctrl('x'));
+        assert!(!p.pending_wipe(), "the delete press disarmed the wipe");
+        assert!(p.pending_delete(), "and armed itself instead");
+        assert!(
+            matches!(p.handle_key(ctrl('w')), Outcome::Stay),
+            "so Ctrl+W has to start over"
+        );
+        assert!(!p.pending_delete(), "which disarmed the delete in turn");
+    }
+
+    #[test]
+    fn ctrl_w_does_nothing_while_renaming_or_with_nothing_saved() {
+        let mut p = pane();
+        p.handle_key(ctrl('r'));
+        assert!(matches!(p.handle_key(ctrl('w')), Outcome::Stay));
+        assert!(!p.pending_wipe(), "no wipe armed behind a rename box");
+        assert_eq!(
+            p.rename_buffer(),
+            Some("kv-cache-design"),
+            "and the chord did not type a literal w into the name"
+        );
+
+        let mut empty = ResumePane::new(Vec::new(), 1000);
+        assert!(matches!(empty.handle_key(ctrl('w')), Outcome::Stay));
+        assert!(!empty.pending_wipe(), "nothing saved, nothing to confirm");
     }
 
     #[test]

@@ -6580,6 +6580,20 @@ mod tests {
         }
     }
 
+    /// An armed wipe has to say what it is about to take, in the panel, before
+    /// the second press: the hint line is the only warning there is.
+    #[test]
+    fn an_armed_wipe_names_the_damage_in_the_hints() {
+        let mut pane = resume_test_pane(6);
+        pane.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('w'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let text = resume_frame(&pane, 100, 24);
+        assert!(text.contains("ALL 6 saved sessions"), "{text}");
+        assert!(text.contains("any other key cancels"), "{text}");
+    }
+
     #[test]
     fn a_rename_takes_over_the_search_box() {
         let mut pane = resume_test_pane(3);

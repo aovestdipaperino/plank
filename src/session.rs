@@ -1064,6 +1064,33 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// Deletes every saved session, transcript and KV payload alike, and
+    /// returns how many went.
+    ///
+    /// Behind the `/resume` picker's two-press `Ctrl+W`. Deliberately not
+    /// touching anything else under the cache root: the shared system-prompt
+    /// and project checkpoints are not sessions, and rebuilding them would
+    /// cost a full prefill on the next launch for no reason.
+    ///
+    /// A session that will not delete stops the pass rather than being
+    /// skipped, so the count returned is never a lie about what is left.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be read, or if any
+    /// session file cannot be removed.
+    pub fn delete_all(&self) -> Result<usize> {
+        let mut gone = 0;
+        for (id, path) in self.session_files()? {
+            fs::remove_file(&path)?;
+            let payload = self.payload_path(&id);
+            let _ = fs::remove_file(&payload);
+            let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
+            gone += 1;
+        }
+        Ok(gone)
+    }
+
     /// Renames a saved session, moving its transcript and KV payload sidecar.
     ///
     /// A session's identity *is* its filename ([`SessionStore::load`] takes
@@ -2301,6 +2328,38 @@ mod tests {
 
         // Second pass: nothing left to do, and nothing rewritten.
         assert!(store.retitle_all().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Behind the picker's `Ctrl+W`. What it must leave alone is the point:
+    /// the shared checkpoints are not sessions, and dropping them would cost a
+    /// full prefill on the next launch for nothing.
+    #[test]
+    fn delete_all_takes_the_sessions_and_leaves_the_checkpoints() {
+        let dir = temp_dir("wipe");
+        let store = SessionStore::open(&dir).unwrap();
+        for text in ["one", "two", "three"] {
+            let mut s = Session::new();
+            s.push(Message::user(text));
+            let id = store.save(&mut s).unwrap();
+            // A payload sidecar rides along with each and must go with it.
+            fs::write(store.payload_path(&id), vec![0u8; 16]).unwrap();
+        }
+        fs::write(dir.join("sysprompt-a19f.kv_raw"), vec![0u8; 8]).unwrap();
+        assert_eq!(store.list().unwrap().len(), 3);
+
+        assert_eq!(store.delete_all().unwrap(), 3);
+        assert!(store.list().unwrap().is_empty(), "every session gone");
+        assert!(
+            !dir.join("one.kv_raw").exists(),
+            "payload sidecars went with them"
+        );
+        assert!(
+            dir.join("sysprompt-a19f.kv_raw").exists(),
+            "the shared system-prompt checkpoint survives"
+        );
+        // A second wipe on an empty store is a no-op, not an error.
+        assert_eq!(store.delete_all().unwrap(), 0);
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`Ctrl+W` wipes every saved session** from the `/resume` picker. Same
+  two-press arming as the single-session `Ctrl+X`, but the confirmation names
+  the count — `Ctrl+W again to delete ALL 362 saved sessions` — because this one
+  is not undoable. Transcripts and their KV payloads go; the shared
+  system-prompt and project checkpoints stay, since rebuilding those would cost
+  a full prefill on the next launch for nothing.
+
 ## [3.0.4] - 2026-08-11
 
 ### Added

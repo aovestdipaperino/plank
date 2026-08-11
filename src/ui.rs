@@ -6688,6 +6688,16 @@ impl Agent<'_> {
                         }
                         resume_pane = Some(self.resume_pane());
                     }
+                    // The pane already asked twice. The live session is not
+                    // spared: it is a saved session like any other, and it
+                    // saves itself again on exit if it is worth keeping.
+                    crate::resumepane::Outcome::WipeAll => {
+                        match self.store.delete_all() {
+                            Ok(n) => log.push_plain(format!("deleted {n} saved sessions")),
+                            Err(e) => log.push_plain(format!("wipe failed: {e}")),
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
                     crate::resumepane::Outcome::LoadPreview(id) => {
                         let text = self.resume_preview(&id);
                         if let Some(p) = resume_pane.as_mut() {
