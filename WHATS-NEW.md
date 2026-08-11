@@ -13,8 +13,32 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-The 2.8.1 beta channel has just opened and is identical to the 2.8.0 stable
-release below. Nothing to report here yet.
+### 3.0.1
+
+Pasted screenshots stop being filenames.
+
+👁️ **plank can finally read your screenshots.** Image pasting is on by default
+now, and paired with the new [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp)
+server the model can actually read what you paste. Screenshot a stack trace,
+paste it, ask what it says. The transcription happens on your machine with a
+0.9B OCR model: no cloud, no API key, no image leaving the laptop. Install it
+with `brew install llama.cpp && cargo install ocr-mcp`, register it in
+`.mcp.json`, and the guide walks through
+[the weights](user-guide/09-extending.md#reading-images-with-ocr-mcp).
+
+The feature had been compiled out behind `--features images` for a reason that
+no longer holds. A pasted image reached the model as a path it had no way to
+open, so the whole thing was a tease. Now there is a tool that opens it.
+
+🖼️ **Pasted images are cached exactly as you pasted them.** plank used to
+downsample every PNG to 2000px, a rule inherited from an image-upload API limit
+that plank does not have and never did: the ds4 engine is text-only and never
+uploads pixels anywhere. All the resampling did was throw away the pixel density
+and the DPI metadata that an OCR tool then needs. The bytes now land in
+`~/.plank/image-cache/` byte-for-byte identical to the source.
+
+One consequence worth knowing: the cache is bounded by file count, not bytes, so
+full-resolution captures make it larger than it used to be.
 
 ## Stable releases
 

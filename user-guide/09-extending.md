@@ -208,6 +208,46 @@ what was my last published article on medium?
 
 `/mcp` shows connected servers and their tools. A server that misses the response deadline is dropped along with all of its tools, so check `mcp.timeoutSecs` if one is slow to start.
 
+### Reading images with ocr-mcp
+
+plank can attach a screenshot, but the ds4 engine is text-only, so the model receives a path rather than pixels. [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp) closes that gap: it is a small MCP server that runs a local GLM-OCR model and exposes one tool, `transcribe_image`. Paste a screenshot of a stack trace, ask what it says, and the model calls the tool on the path and reads the answer back. Nothing leaves the machine and there is no API key.
+
+Install it, along with the `llama-server` binary that does the inference:
+
+```sh
+brew install llama.cpp
+cargo install ocr-mcp
+```
+
+Then register it like any other server, in `~/.plank/.mcp.json` to have it everywhere or `./.mcp.json` for one project:
+
+```json
+{
+  "mcpServers": {
+    "ocr": {
+      "command": "ocr-mcp",
+      "env": {
+        "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp",
+        "OCR_MCP_AUTO_DOWNLOAD": "1"
+      }
+    }
+  }
+}
+```
+
+**Getting the weights.** Two files are needed, the model and its matching projector, about 1.34 GiB together. With `OCR_MCP_AUTO_DOWNLOAD` set they are fetched the first time you actually ask for a transcription, not at startup, so plank's handshake is never held up and only that first call is slow. Leave the variable out and nothing is ever downloaded: the first transcription instead returns an error naming the two files and where they go. To fetch them by hand:
+
+```sh
+mkdir -p ~/.cache/ocr-mcp && cd ~/.cache/ocr-mcp
+BASE=https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main
+curl -L "$BASE/GLM-OCR-Q8_0.gguf"        -o glm-ocr.gguf
+curl -L "$BASE/mmproj-GLM-OCR-Q8_0.gguf" -o glm-ocr-mmproj.gguf
+```
+
+The server spawns `llama-server` on the first call, keeps it warm, and kills it after five idle minutes so the memory goes back to ds4. That last part is not incidental on a machine where ds4 already occupies 81 GB: set `OCR_MCP_IDLE_SECS` lower if you want the window shorter.
+
+It is an OCR model, not a general vision model. It reads text well and it will answer confidently and wrongly if you ask it whether a user interface looks right. `/mcp` will show it connected once plank restarts.
+
 ### When a global server fails to start
 
 plank does **not** simply drop it from the prompt. A global server's tool schemas are part of the cached system prompt, so losing one would change that prompt and force the most expensive possible reload. Instead plank substitutes the server's **last-known-good advertisement** from `~/.plank/mcp-advert/`, keeping the prompt byte-identical and the cache valid.
