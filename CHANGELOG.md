@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.4] - 2026-08-11
+
+### Added
+
+- **`/resume` is a picker now.** In the TUI, a bare `/resume` opens a panel over
+  every saved session instead of printing ten numbered lines: type to filter on
+  name, title, tag or last prompt, arrow through the results, Space to preview a
+  session's last turns, `Ctrl+R` to rename, `Ctrl+X` twice to delete, Enter to
+  resume. The plain-stdout path keeps the numbered listing, and `/resume <name>`
+  still resumes directly from either front end.
+
+- **`/retitle`** re-derives every saved session's title from its transcript. It
+  splices the title record in place rather than re-saving, so the `last used`
+  stamps the picker sorts on survive the pass.
+
+### Fixed
+
+- **Session titles no longer name the project instead of the conversation.** A
+  title was taken from the transcript's first user message, and the first user
+  message is usually the session-start context plank injects itself — so every
+  session in a repo was titled `Agent instructions: --- # From: …/CLAUDE.md` and
+  the new picker was a wall of identical rows. Titles now come from the first
+  turn a human actually typed. Existing sessions keep their stored title until
+  `/retitle` is run.
+
 ## [3.0.3] - 2026-08-11
 
 ### Added
