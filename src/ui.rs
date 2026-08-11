@@ -10135,6 +10135,11 @@ fn load_named_contributions(
     (skills, templates)
 }
 
+// Session construction is a long straight line of independent wiring steps —
+// engine, session, plugins, MCP, hooks, sandbox, prompt — each a couple of
+// lines with no branching. Splitting it would mean threading a dozen
+// half-built values through helpers that exist only to satisfy the line count.
+#[allow(clippy::too_many_lines)]
 fn new_agent(
     mut engine: Box<dyn Engine>,
     cfg: &AgentConfig,
