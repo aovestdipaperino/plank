@@ -1121,10 +1121,10 @@ fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
 /// ANSI reset used by the slash-command reports.
 const ANSI_RESET: &str = "\x1b[0m";
 
-/// Image pasting is feature-gated off until the model's handling of
-/// image-file references is understood (`--features images` re-enables it).
-/// The code stays compiled either way; this constant kills every runtime
-/// path: clipboard probing, paste capture, and attachment injection.
+/// Image pasting, on by default since the `images` feature joined the default
+/// set (`--no-default-features` turns it off). The code stays compiled either
+/// way; this constant kills every runtime path: clipboard probing, paste
+/// capture, and attachment injection.
 const IMAGES_ENABLED: bool = cfg!(feature = "images");
 
 /// Renders the `/mcp` server report following Claude Code's layout: a header

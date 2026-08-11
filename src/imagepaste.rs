@@ -6,17 +6,16 @@
 //! Port of Claude Code's image-paste pipeline (see the vault note
 //! `image-paste-prompt.md`) adapted to plank: an empty bracketed paste means
 //! an image is on the clipboard; pasted text that is a path to an image file
-//! attaches that file. Images are downscaled to API-style limits, stored in a
-//! content-addressed LRU cache, and attached to the outgoing message as file
-//! references the model can open with its tools (the ds4 engine is text-only,
-//! so there is no base64 content-block path).
+//! attaches that file. Images are cached byte-for-byte in a content-addressed
+//! LRU cache and attached to the outgoing message as file references the model
+//! can open with its tools (the ds4 engine is text-only, so there is no base64
+//! content-block path, and no reason to resample away pixel density that an
+//! OCR tool will need).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Maximum width/height after downsampling, mirroring `IMAGE_MAX_WIDTH/HEIGHT`.
-const MAX_DIMENSION: u32 = 2000;
 /// Maximum images kept in the cache (LRU by modification time).
 const MAX_CACHED_IMAGES: usize = 200;
 
@@ -81,7 +80,7 @@ pub fn clipboard_has_image() -> bool {
 #[must_use]
 pub fn from_clipboard() -> Option<PastedImage> {
     let bytes = pngpaste_clipboard().or_else(osascript_clipboard)?;
-    process_and_store(bytes, None)
+    process_and_store(&bytes, None)
 }
 
 /// Attaches an image file when the pasted text is a path to one.
@@ -107,7 +106,7 @@ pub fn from_path_text(pasted: &str) -> Option<PastedImage> {
         return None;
     }
     let bytes = std::fs::read(&cleaned).ok()?;
-    process_and_store(bytes, Some(PathBuf::from(cleaned)))
+    process_and_store(&bytes, Some(PathBuf::from(cleaned)))
 }
 
 /// `pngpaste -` writes the clipboard image as PNG to stdout.
@@ -138,24 +137,19 @@ fn osascript_clipboard() -> Option<Vec<u8>> {
     bytes.filter(|b| !b.is_empty())
 }
 
-/// Downsamples (PNG only — the sole decoder plank links), dedups by SHA-256,
-/// stores in the cache, and prunes it to the LRU limit.
-fn process_and_store(mut bytes: Vec<u8>, source_path: Option<PathBuf>) -> Option<PastedImage> {
-    let media_type = detect_media_type(&bytes)?;
+/// Reads dimensions (PNG only — the sole decoder plank links), dedups by
+/// SHA-256, stores the bytes untouched in the cache, and prunes it to the LRU
+/// limit.
+fn process_and_store(bytes: &[u8], source_path: Option<PathBuf>) -> Option<PastedImage> {
+    let media_type = detect_media_type(bytes)?;
     let mut dimensions = None;
+    // Decoded for the dimensions only. The bytes are cached untouched: plank
+    // never uploads them, so resizing or re-encoding would cost pixel density
+    // and DPI metadata and buy nothing.
     if media_type == "image/png"
-        && let Ok(img) = image::load_from_memory(&bytes)
+        && let Ok(img) = image::load_from_memory(bytes)
     {
-        let img = if img.width() > MAX_DIMENSION || img.height() > MAX_DIMENSION {
-            img.thumbnail(MAX_DIMENSION, MAX_DIMENSION)
-        } else {
-            img
-        };
         dimensions = Some((img.width(), img.height()));
-        let mut png = std::io::Cursor::new(Vec::new());
-        if img.write_to(&mut png, image::ImageFormat::Png).is_ok() {
-            bytes = png.into_inner();
-        }
     }
 
     let dir = cache_dir()?;
@@ -166,9 +160,9 @@ fn process_and_store(mut bytes: Vec<u8>, source_path: Option<PathBuf>) -> Option
         "image/webp" => "webp",
         _ => "png",
     };
-    let path = dir.join(format!("{}.{ext}", sha256_hex(&bytes)?));
+    let path = dir.join(format!("{}.{ext}", sha256_hex(bytes)?));
     if !path.exists() {
-        std::fs::write(&path, &bytes).ok()?;
+        std::fs::write(&path, bytes).ok()?;
         prune_cache(&dir);
     }
     Some(PastedImage {
@@ -296,5 +290,40 @@ mod tests {
             sha256_hex(b"abc").as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    /// Pasting must preserve the source bytes exactly. plank never uploads
+    /// image bytes — the ds4 engine is text-only — so re-encoding would only
+    /// throw away the pixel density and DPI metadata that OCR depends on.
+    #[test]
+    fn pasting_preserves_the_source_bytes_and_reports_dimensions() {
+        // A 3x1 PNG with a `pHYs` DPI chunk: big enough to have real
+        // dimensions, small enough to inline. `base64` is only a transitive
+        // dependency of plank, so this is the raw decoded byte array rather
+        // than a base64 literal. Re-encoding through `image`'s PNG writer
+        // drops the DPI chunk and re-filters the pixel data, so a round trip
+        // through decode+encode does not reproduce these bytes.
+        let png: Vec<u8> = vec![
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 3, 0, 0, 0, 1,
+            8, 2, 0, 0, 0, 148, 130, 131, 227, 0, 0, 0, 9, 112, 72, 89, 115, 0, 0, 46, 35, 0, 0,
+            46, 35, 1, 120, 165, 63, 118, 0, 0, 0, 14, 73, 68, 65, 84, 120, 156, 99, 228, 18, 145,
+            99, 0, 3, 0, 1, 224, 0, 62, 230, 147, 130, 105, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
+            96, 130,
+        ];
+
+        let dir = std::env::temp_dir().join(format!("plank-paste-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("shot.png");
+        std::fs::write(&src, &png).unwrap();
+
+        let pasted = from_path_text(src.to_str().unwrap()).expect("should attach");
+        assert_eq!(
+            std::fs::read(&pasted.path).unwrap(),
+            png,
+            "cached bytes must match the source byte for byte"
+        );
+        assert_eq!(pasted.dimensions, Some((3, 1)));
+        assert_eq!(pasted.media_type, "image/png");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -132,11 +132,13 @@ The marker is coloured as you type, by where the output goes: **red `!`** feeds 
 
 ## Pasting images
 
-Paste an image (or a path to one) into the prompt and plank attaches it: PNGs are downsampled, deduplicated by content into `~/.plank/image-cache/`, and attached to your message.
+Paste an image (or a path to one) into the prompt and plank attaches it. On macOS an image on the clipboard arrives as an empty paste, which is the signal plank uses; pasting the *path* to an image file works too, including a file dragged onto the terminal. Either way the file is deduplicated by content into `~/.plank/image-cache/` and attached to your message.
 
-**Be aware of what this does and does not do today.** The local ds4 engine is text-only, so what reaches the model is the *path* to the image, not its pixels. A pasted screenshot of a stack trace is a filename as far as the model is concerned — it can pass the path to a tool, but it cannot see the picture. A vision model to close that gap is designed but not implemented.
+**The bytes are cached exactly as you pasted them.** plank does not resample or re-encode, which it used to do to satisfy an image-upload limit it never actually had. The local ds4 engine is text-only and never uploads pixels anywhere, so shrinking them only threw away the pixel density and DPI metadata that anything reading the image later would want.
 
-If you need the model to act on what is in an image, transcribe the important part into your prompt.
+What reaches the model is the *path*, not the picture. On its own that makes a pasted screenshot of a stack trace just a filename. Give the model a tool that can read image files and the same paste becomes useful, which is what [ocr-mcp](09-extending.md#reading-images-with-ocr-mcp) is for: with it registered, the model calls `transcribe_image` on the path and gets the text back.
+
+Without such a tool, transcribe the important part into your prompt yourself.
 
 ## Reading PDFs
 

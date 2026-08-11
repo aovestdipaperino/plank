@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ocr": {
+      "command": "ocr-mcp",
+      "env": {
+        "OCR_MCP_MODEL_DIR": "~/.cache/ocr-mcp"
+      }
+    }
+  }
+}
