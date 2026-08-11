@@ -454,6 +454,54 @@ what was my last published article on medium?</code></pre>
 that misses the response deadline is dropped along with all of its
 tools, so check <code>mcp.timeoutSecs</code> if one is slow to
 start.</p>
+<h3 id="reading-images-with-ocr-mcp">Reading images with ocr-mcp</h3>
+<p>plank can attach a screenshot, but the ds4 engine is text-only, so
+the model receives a path rather than pixels. <a
+href="https://github.com/aovestdipaperino/ocr-mcp"><code>ocr-mcp</code></a>
+closes that gap: it is a small MCP server that runs a local GLM-OCR
+model and exposes one tool, <code>transcribe_image</code>. Paste a
+screenshot of a stack trace, ask what it says, and the model calls the
+tool on the path and reads the answer back. Nothing leaves the machine
+and there is no API key.</p>
+<p>Install it, along with the <code>llama-server</code> binary that does
+the inference:</p>
+<pre class="sh"><code>brew install llama.cpp
+cargo install ocr-mcp</code></pre>
+<p>Then register it like any other server, in
+<code>~/.plank/.mcp.json</code> to have it everywhere or
+<code>./.mcp.json</code> for one project:</p>
+<pre class="json"><code>{
+  &quot;mcpServers&quot;: {
+    &quot;ocr&quot;: {
+      &quot;command&quot;: &quot;ocr-mcp&quot;,
+      &quot;env&quot;: {
+        &quot;OCR_MCP_MODEL_DIR&quot;: &quot;~/.cache/ocr-mcp&quot;,
+        &quot;OCR_MCP_AUTO_DOWNLOAD&quot;: &quot;1&quot;
+      }
+    }
+  }
+}</code></pre>
+<p><strong>Getting the weights.</strong> Two files are needed, the model
+and its matching projector, about 1.34 GiB together. With
+<code>OCR_MCP_AUTO_DOWNLOAD</code> set they are fetched the first time
+you actually ask for a transcription, not at startup, so plank's
+handshake is never held up and only that first call is slow. Leave the
+variable out and nothing is ever downloaded: the first transcription
+instead returns an error naming the two files and where they go. To
+fetch them by hand:</p>
+<pre class="sh"><code>mkdir -p ~/.cache/ocr-mcp &amp;&amp; cd ~/.cache/ocr-mcp
+BASE=https://huggingface.co/ggml-org/GLM-OCR-GGUF/resolve/main
+curl -L &quot;$BASE/GLM-OCR-Q8_0.gguf&quot;        -o glm-ocr.gguf
+curl -L &quot;$BASE/mmproj-GLM-OCR-Q8_0.gguf&quot; -o glm-ocr-mmproj.gguf</code></pre>
+<p>The server spawns <code>llama-server</code> on the first call, keeps
+it warm, and kills it after five idle minutes so the memory goes back to
+ds4. That last part is not incidental on a machine where ds4 already
+occupies 81 GB: set <code>OCR_MCP_IDLE_SECS</code> lower if you want the
+window shorter.</p>
+<p>It is an OCR model, not a general vision model. It reads text well
+and it will answer confidently and wrongly if you ask it whether a user
+interface looks right. <code>/mcp</code> will show it connected once
+plank restarts.</p>
 <h3 id="when-a-global-server-fails-to-start">When a global server fails
 to start</h3>
 <p>plank does <strong>not</strong> simply drop it from the prompt. A

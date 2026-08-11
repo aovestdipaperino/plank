@@ -137,6 +137,20 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>plank can read your screenshots.</strong> Image pasting is on
+by default now, and paired with the <a
+href="https://github.com/aovestdipaperino/ocr-mcp">ocr-mcp</a> server
+the model can act on what you paste: it calls
+<code>transcribe_image</code> on the cached path and gets the text back.
+Screenshot a stack trace, paste it, ask what it says. Transcription runs
+on your own machine against a 0.9B OCR model, so no image leaves the
+laptop and there is no API key. Install it with
+<code>brew install llama.cpp &amp;&amp; cargo install ocr-mcp</code>,
+register it in <code>.mcp.json</code>, and see <a
+href="/guide/09-extending.html">Extending plank</a> for the weights.
+Pasted images are also cached byte-for-byte now: the old downsampling
+was inherited from an image-upload limit plank never had, and it only
+threw away the pixel density an OCR tool needs.</p>
 <p><strong>Plugins load.</strong> A plugin is one directory bundling
 skills, agents, templates, hooks, an <code>.mcp.json</code> and a
 <code>settings.json</code>, contributed to a session as a unit. plank
