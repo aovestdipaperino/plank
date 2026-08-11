@@ -1016,22 +1016,6 @@ fn hierarchy_with_plugins(
     merge_configs(merge_configs(global, plugin), local)
 }
 
-/// [`config_load_hierarchy`] with plugin-contributed servers inserted between
-/// the global and local configs.
-#[must_use]
-pub fn config_load_hierarchy_with_plugins(
-    local_path: Option<&Path>,
-    plugin_servers: Vec<McpServerConfig>,
-) -> Vec<McpServerConfig> {
-    let global = match global_config_path() {
-        Some(path) => config_load(&path),
-        None => Vec::new(),
-    };
-    let default = Path::new(".mcp.json");
-    let local = config_load(local_path.unwrap_or(default));
-    hierarchy_with_plugins(global, plugin_servers, local)
-}
-
 /// Overlays `local` server configs onto `global`, matching by server name.
 fn merge_configs(
     global: Vec<McpServerConfig>,

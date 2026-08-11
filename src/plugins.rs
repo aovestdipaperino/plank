@@ -567,6 +567,14 @@ pub fn reconcile<T: Named + Clone>(
             .find(|(n, _)| *n == bare)
             .map(|(_, o)| o.clone())
             .unwrap_or_default();
+        // Invariant: an alias always contains `:` and a bare name never does —
+        // `valid_name` rejects `:` in both plugin names and entry names, so the
+        // only `:` in `merged` is the one this function inserts. That is why
+        // `taken_by_local` stays correct even though the aliased copy is pushed
+        // into `merged` on the very next lines and later iterations rescan the
+        // whole vector: an aliased entry can never compare equal to a bare
+        // `name`, so previously-aliased plugin entries are invisible to this
+        // test and only genuine non-plugin entries can contest a bare name.
         let taken_by_local = merged.iter().any(|e| e.name() == bare);
 
         let mut aliased = entry.clone();
@@ -747,6 +755,18 @@ pub fn hooks_with_plugins(cwd: &Path, set: &PluginSet) -> crate::hooks::Hooks {
 /// undone (the caller's `merge_configs` keeps its existing last-write-wins
 /// precedence), but it is reported as a warning naming the colliding servers
 /// and the plugins that contributed them.
+///
+/// Note the deliberate asymmetry against [`reconcile`]. For skills, agents and
+/// templates a non-plugin entry *takes the bare name away* from the plugin,
+/// which is then reachable only as `<plugin>:<name>`. A plugin MCP server does
+/// the opposite: it keeps the bare name here, and the local `.mcp.json` shadows
+/// it afterwards, in the caller's `merge_configs`. The asymmetry is structural,
+/// not an oversight — `reconcile` sees plugin and non-plugin entries together
+/// and can arbitrate between them in one pass, whereas this function only ever
+/// sees plugin servers. Local and global servers are merged in a later, separate
+/// stage that already implements local-wins precedence by name, so pre-renaming
+/// here would defeat that merge: a plugin server renamed out of the way could no
+/// longer be overridden by the local file entry the user wrote to override it.
 #[must_use]
 pub fn mcp_servers(set: &PluginSet) -> (Vec<crate::tools::mcp::McpServerConfig>, Vec<String>) {
     let mut warnings = Vec::new();

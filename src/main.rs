@@ -87,6 +87,14 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     let cwd = std::env::current_dir().unwrap_or_default();
+    // This set is deliberately the PRE-worktree one: it is scanned against the
+    // post-`--chdir` cwd but before `enter_startup_worktree` moves us again.
+    // That ordering is forced, not accidental — `enter_startup_worktree` needs
+    // `hooks_with_plugins(&cwd, plugins)` to decide whether to create the
+    // worktree at all, so the set has to exist first. Rebuilding it after the
+    // worktree move would mean a second full plugin scan (and a second round of
+    // warnings) purely to observe a directory that is a checkout of the same
+    // repo, so the pre-worktree set is reused for the rest of startup.
     let plugins = plank::plugins::load_default(&cwd, &provisional.plugin_dirs);
     for w in plugins.all_warnings() {
         eprintln!("plugin warning: {w}");
