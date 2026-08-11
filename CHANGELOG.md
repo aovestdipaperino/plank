@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.0.2] - 2026-08-11
+
+### Added
+
+- **Plugins load.** A plugin is one directory bundling skills, agents,
+  templates, hooks, an `.mcp.json` and a `settings.json`, contributed to a
+  session as a unit. plank picks them up from `~/.plank/plugins/dev/`, from
+  `./.plank/plugins/`, and from a repeatable `--plugin-dir <path>` that lasts
+  for the session — and it reads both its own spelling (`.plank-plugin/plugin.json`,
+  `templates/`, `hooks.json`) and Claude Code's (`.claude-plugin/plugin.json`,
+  `commands/`, `hooks/hooks.json`). A directory with no manifest but with
+  recognizable components still loads, named after itself.
+
+- **A plugin contribution is always addressable as `<plugin>:<name>`,** and keeps
+  the bare `<name>` only when nothing else claims it, so your own skills, agents
+  and templates never lose theirs to a plugin. Two plugins offering the same name
+  both keep only the namespaced form. MCP servers are the exception: the
+  separator is `-`, because a server name is embedded in `mcp__<server>__<tool>`
+  and split at the first `__` — and a plugin server name containing `__` is
+  rejected outright.
+
+- **Plugin settings sit below yours.** The order is defaults, then plugin
+  settings in load order, then `~/.plank/settings.json`, then
+  `./.plank/settings.json`, then the environment and the command line, so a
+  plugin can never override a setting you wrote. A plugin that sets a `safety.*`
+  key still beats the built-in default, and plank warns by name when one does.
+  Hooks are additive and all run, ordered `~/.plank`, then plugins, then the
+  project file.
+
+- **`/plugins`** lists what loaded, where each plugin came from, what it
+  contributes, and every warning. Nothing about a malformed plugin is fatal: a
+  bad manifest or component demotes itself and says so. There is no installer and
+  no marketplace yet — you place the directory yourself.
+
+- **`/goal [--max <n>] <objective>`** hands control back to the model turn after
+  turn until the objective is settled, instead of you typing "continue". After
+  each turn plank asks for a one-line adjudication (`ATTAINED`, `UNATTAINABLE`,
+  `NEEDS_USER` or `CONTINUE`) and stops on the first terminal verdict, printing a
+  closing line with the reason and the iteration count. Anything unparseable
+  reads as `CONTINUE`, so a parse miss costs an iteration rather than falsely
+  declaring success, and the cap (20 by default) bounds the loop. Ctrl-C in the
+  plain REPL and Esc in the TUI end the goal, not just the turn in flight.
+
+- **The sandbox can grant `~/.plank` writes on request,** per session, for the
+  cases where a tool legitimately needs to write into plank's own home.
+
 ## [3.0.0] - 2026-08-10
 
 ### Added
