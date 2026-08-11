@@ -2645,6 +2645,287 @@ pub fn draw_kvcache(frame: &mut Frame, pane: &crate::kvpane::KvPane) {
     frame.render_widget(Paragraph::new(Text::from(shown)).block(block), rect);
 }
 
+/// Accent for the `/resume` picker: its rule, its header and its selected row.
+const RESUME_ACCENT: Color = Color::Indexed(105);
+/// Every list line opens with a two-column gutter, so the cursor caret and the
+/// scroll arrows can be written into it after the window is chosen without
+/// re-laying out the line.
+const RESUME_GUTTER: &str = "  ";
+
+/// Renders the picker's sessions into display lines.
+///
+/// Returns the lines, the index at which each session's block starts, and the
+/// line the selected session's own name landed on. The starts are what let the
+/// window snap to a session boundary instead of slicing a row in half.
+fn resume_list_lines(
+    pane: &crate::resumepane::ResumePane,
+) -> (Vec<Line<'static>>, Vec<usize>, usize) {
+    let rows = pane.rows();
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(rows.len() * 3);
+    let mut starts: Vec<usize> = Vec::with_capacity(rows.len());
+    let mut selected_line = 0usize;
+    for (i, row) in rows.iter().enumerate() {
+        // A blank line between sessions, never before the first or after the
+        // last: the padding is the separator, so a trailing one would only
+        // spend a line the list could have shown a session on.
+        if i > 0 {
+            lines.push(Line::from(Span::raw(RESUME_GUTTER)));
+        }
+        starts.push(lines.len());
+        if row.selected {
+            selected_line = lines.len();
+        }
+        let name = if row.selected {
+            Style::default()
+                .fg(RESUME_ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if row.selected { "❯ " } else { RESUME_GUTTER },
+                Style::default().fg(RESUME_ACCENT),
+            ),
+            Span::styled(row.label.clone(), name),
+        ]));
+        let dim = Style::default().fg(Color::DarkGray);
+        lines.push(Line::from(vec![
+            Span::raw(RESUME_GUTTER),
+            Span::styled(row.detail.clone(), dim),
+        ]));
+        for extra in &row.extra {
+            lines.push(Line::from(vec![
+                Span::raw(RESUME_GUTTER),
+                Span::styled(extra.clone(), dim),
+            ]));
+        }
+    }
+    (lines, starts, selected_line)
+}
+
+/// Slides `lines` so the selected session is on screen, snapping the top to a
+/// session boundary and marking the cut ends with arrows.
+///
+/// Windowing at a boundary matters for more than looks: the top line of the
+/// view carries the "there is more above" arrow, and an arrow on the tail of
+/// some other session's detail would point at the wrong thing.
+fn resume_window(
+    mut lines: Vec<Line<'static>>,
+    starts: &[usize],
+    selected_line: usize,
+    room: usize,
+) -> Vec<Line<'static>> {
+    let total = lines.len();
+    if room == 0 {
+        return Vec::new();
+    }
+    if total <= room {
+        return lines;
+    }
+    // Aim to sit the selection around the middle of the view rather than at its
+    // top: pinning it to the top would scroll the entire list on every single
+    // Down press, and there would never be a session visible above the cursor.
+    let target = selected_line.saturating_sub(room / 2);
+    let before = |limit: usize| starts.iter().copied().rfind(|&s| s <= limit).unwrap_or(0);
+    let start = before(target).min(total - room);
+    // …but visibility wins over centering: at the end of the list the clamp
+    // above can push the top past the selection, so fall back to the last
+    // boundary that still leaves the selected line inside the window.
+    let start = if selected_line.saturating_sub(start) < room && start <= selected_line {
+        start
+    } else {
+        starts
+            .iter()
+            .copied()
+            .rfind(|&s| s <= selected_line && selected_line - s < room)
+            .unwrap_or(0)
+            .min(total - room)
+    };
+    let end = start + room;
+    let mut shown: Vec<Line<'static>> = lines.split_off(start).into_iter().take(room).collect();
+    let arrow = Style::default().fg(Color::DarkGray);
+    // The arrows replace the gutter, never the cursor caret: the caret is the
+    // one mark that says which session Enter would resume.
+    let mut mark = |line: usize, glyph: &'static str| {
+        if line != selected_line
+            && let Some(span) = shown
+                .get_mut(line - start)
+                .and_then(|l| l.spans.first_mut())
+        {
+            *span = Span::styled(glyph, arrow);
+        }
+    };
+    if start > 0 {
+        mark(start, "↑ ");
+    }
+    // The down arrow rides the last *session name* in view rather than the last
+    // line, which is usually a dim detail line and reads as a stray glyph.
+    if end < total
+        && let Some(&last) = starts.iter().rfind(|&&s| s >= start && s < end)
+    {
+        mark(last, "↓ ");
+    }
+    shown
+}
+
+/// Draws the picker's header: the words in the accent, the count beside them
+/// in gray, so `(3 of 48)` reads as a position rather than part of the title.
+fn draw_resume_header(frame: &mut Frame, rect: Rect, pane: &crate::resumepane::ResumePane) {
+    let header = pane.header();
+    let (title, count) = header.split_once(" (").unwrap_or((header.as_str(), ""));
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title.to_owned(),
+                Style::default()
+                    .fg(RESUME_ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if count.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({count}")
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        rect,
+    );
+}
+
+/// Draws the picker's text field.
+///
+/// One field, two jobs: it becomes the rename box while a rename is open — and
+/// says so, in the accent and with a title — so the pane never shows two places
+/// the keys being typed could be going.
+fn draw_resume_field(frame: &mut Frame, rect: Rect, pane: &crate::resumepane::ResumePane) {
+    let renaming = pane.rename_buffer().is_some();
+    let text = pane.rename_buffer().unwrap_or_else(|| pane.query());
+    let dim = Style::default().fg(Color::DarkGray);
+    let field = if text.is_empty() && !renaming {
+        Line::from(Span::styled("⌕ Search…", dim))
+    } else {
+        Line::from(vec![
+            Span::styled(if renaming { "✎ " } else { "⌕ " }, dim),
+            Span::raw(text.to_owned()),
+            Span::styled("▏", Style::default().fg(RESUME_ACCENT)),
+        ])
+    };
+    let style = if renaming {
+        Style::default().fg(RESUME_ACCENT)
+    } else {
+        dim
+    };
+    frame.render_widget(
+        Paragraph::new(field).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(style)
+                .title(if renaming { " rename " } else { "" })
+                .title_style(style),
+        ),
+        rect,
+    );
+}
+
+/// Draws the `/resume` session picker as a panel anchored above the status bar.
+///
+/// Chrome, top to bottom: an accent rule, the `Resume session (n of m)` header,
+/// a boxed search field (which doubles as the rename field), the project label,
+/// the session list, and the key hints. Everything but the list is fixed, so
+/// the list is the only thing that scrolls — [`resume_window`] slides it.
+pub fn draw_resume(frame: &mut Frame, pane: &crate::resumepane::ResumePane) {
+    let area = frame.area();
+    let (lines, starts, selected_line) = resume_list_lines(pane);
+    let scope_rows = u16::from(!pane.scope().is_empty());
+    // Rule, header, gap, the three rows of the search box, the scope label, a
+    // gap, and two lines of hints — everything the list does not get.
+    let chrome = 1 + 1 + 1 + 3 + scope_rows + 1 + 3;
+    // `max(1)`: an empty result set still needs the one line that says so.
+    let want = u16::try_from(lines.len().max(1))
+        .unwrap_or(u16::MAX)
+        .saturating_add(chrome);
+    // The status bar owns the last row; the panel takes what it needs of the rest.
+    let avail = area.height.saturating_sub(1);
+    let height = want.min(avail);
+    if height == 0 {
+        return;
+    }
+    let panel = Rect {
+        x: area.x,
+        y: area.y + avail - height,
+        width: area.width,
+        height,
+    };
+    frame.render_widget(Clear, panel);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(RESUME_ACCENT)),
+        panel,
+    );
+    // Inset from the rule and the terminal edges; `saturating_sub` keeps a very
+    // narrow terminal from producing a wider-than-frame rect, which panics.
+    let body = Rect {
+        x: panel.x + 2,
+        y: panel.y + 1,
+        width: panel.width.saturating_sub(4),
+        height: panel.height.saturating_sub(1),
+    };
+    let r = Layout::vertical([
+        Constraint::Length(1),          // header
+        Constraint::Length(1),          // gap
+        Constraint::Length(3),          // search box
+        Constraint::Length(scope_rows), // project label
+        Constraint::Length(1),          // gap
+        Constraint::Min(0),             // session list
+        Constraint::Length(3),          // blank line, then two of hints
+    ])
+    .split(body);
+
+    draw_resume_header(frame, r[0], pane);
+    draw_resume_field(frame, r[2], pane);
+
+    if scope_rows == 1 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{RESUME_GUTTER}{}", pane.scope()),
+                Style::default().fg(Color::Gray),
+            ))),
+            r[3],
+        );
+    }
+
+    // An empty result set says so where the list would have been, rather than
+    // leaving a blank panel that looks like a failure to draw.
+    if pane.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                format!("{RESUME_GUTTER}no session matches"),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            r[5],
+        );
+    } else {
+        let shown = resume_window(lines, &starts, selected_line, usize::from(r[5].height));
+        frame.render_widget(Paragraph::new(Text::from(shown)), r[5]);
+    }
+
+    frame.render_widget(
+        Paragraph::new(Text::from(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{RESUME_GUTTER}{}", pane.footer()),
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]))
+        .wrap(Wrap { trim: false }),
+        r[6],
+    );
+}
+
 /// How far a veiled cell's color is pulled toward black.
 const VEIL_KEEP: f32 = 0.32;
 
@@ -6204,5 +6485,111 @@ mod tests {
         assert!(text.contains("session"), "{text}");
         assert!(text.contains("reclaimable"), "{text}");
         assert!(text.contains("Esc close"), "{text}");
+    }
+
+    /// Saved sessions for the `/resume` picker tests, most-recent first.
+    fn resume_test_pane(n: usize) -> crate::resumepane::ResumePane {
+        let entries = (0..n)
+            .map(|i| crate::session::SessionEntry {
+                id: format!("session-{i}"),
+                title: format!("Session number {i}"),
+                created_at: 900 - i as u64,
+                last_used: 900 - i as u64,
+                file_size: 1024 * (i as u64 + 1),
+                tag: String::new(),
+                last_prompt: String::new(),
+                payload_bytes: 0,
+                path: std::path::PathBuf::from(format!("/tmp/session-{i}.kv")),
+            })
+            .collect();
+        crate::resumepane::ResumePane::new(entries, 1000).with_scope("plank")
+    }
+
+    /// Renders `pane` at `w`x`h` and returns the frame as text.
+    fn resume_frame(pane: &crate::resumepane::ResumePane, w: u16, h: u16) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw_resume(f, pane)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_resume_picker_draws_its_header_search_box_scope_and_hints() {
+        let text = resume_frame(&resume_test_pane(3), 90, 24);
+        assert!(text.contains("Resume session (1 of 3)"), "{text}");
+        assert!(text.contains("Search…"), "{text}");
+        assert!(text.contains("plank"), "the project label: {text}");
+        assert!(text.contains("Session number 0"), "{text}");
+        assert!(text.contains("❯ Session number 0"), "the cursor: {text}");
+        assert!(text.contains("Space to preview"), "{text}");
+        // The panel is anchored to the bottom, leaving the status row free.
+        let last = text.lines().next_back().unwrap_or_default().trim();
+        assert!(last.is_empty(), "the status row was painted over: {text}");
+    }
+
+    #[test]
+    fn typing_shows_the_query_and_an_empty_result_says_so() {
+        let mut pane = resume_test_pane(3);
+        for c in "zzz".chars() {
+            pane.handle_key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char(c),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let text = resume_frame(&pane, 90, 24);
+        assert!(text.contains("zzz"), "{text}");
+        assert!(!text.contains("Search…"), "placeholder gone: {text}");
+        assert!(text.contains("no session matches"), "{text}");
+        assert!(text.contains("Resume session (0 of 0)"), "{text}");
+    }
+
+    /// The bug this guards: with more sessions than rows, the selected one has
+    /// to stay on screen — Enter resumes it, and it must be the one being read.
+    #[test]
+    fn a_long_listing_scrolls_to_keep_the_selection_visible() {
+        let mut pane = resume_test_pane(40);
+        for _ in 0..12 {
+            pane.handle_key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Down,
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+        let text = resume_frame(&pane, 90, 24);
+        assert!(text.contains("❯ Session number 12"), "{text}");
+        assert!(
+            !text.contains("Session number 0\n"),
+            "scrolled away: {text}"
+        );
+        assert!(text.contains('↑'), "more above: {text}");
+        assert!(text.contains('↓'), "more below: {text}");
+    }
+
+    /// Small terminals: ratatui does not clip rects for you, so a panel taller
+    /// or wider than the frame aborts the TUI rather than looking wrong.
+    #[test]
+    fn the_resume_picker_survives_a_tiny_terminal() {
+        for (w, h) in [(4u16, 1u16), (10, 3), (24, 8), (200, 60)] {
+            resume_frame(&resume_test_pane(6), w, h);
+        }
+    }
+
+    #[test]
+    fn a_rename_takes_over_the_search_box() {
+        let mut pane = resume_test_pane(3);
+        pane.handle_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('r'),
+            ratatui::crossterm::event::KeyModifiers::CONTROL,
+        ));
+        let text = resume_frame(&pane, 90, 24);
+        assert!(text.contains("rename"), "{text}");
+        assert!(text.contains("session-0"), "prefilled with the id: {text}");
+        assert!(text.contains("Enter to rename"), "{text}");
     }
 }

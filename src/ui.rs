@@ -1235,8 +1235,9 @@ struct Agent<'a> {
     /// Named in-session rollback points (`/checkpoint`, `/rollback`); dropped
     /// when the session is replaced.
     checkpoints: crate::checkpoint::CheckpointStore,
-    /// Absolute path of the last file an `edit` or `write` tool call changed
-    /// this session, and the default target of a bare `/open`.
+    /// Absolute path of the last file this session touched — one an `edit` or
+    /// `write` tool call changed, or one plank itself generated (a `/repro`
+    /// dump) — and the default target of a bare `/open`.
     ///
     /// In-memory only, like [`crate::tools::ToolContext::worktree`]: a resumed
     /// session starts with no pointer rather than one aimed at a file the
@@ -1486,6 +1487,8 @@ fn engine_stats_label(engine: &dyn Engine) -> String {
 const HISTORY_DEFAULT_TURNS: usize = 3;
 /// Sessions shown by the /resume picker.
 const RESUME_LIST_LIMIT: usize = 10;
+/// User turns replayed in a `/resume` row's Space preview.
+const RESUME_PREVIEW_TURNS: usize = 2;
 
 /// Outcome of `/insights`: a written report, or the user's decision to stop.
 ///
@@ -3387,6 +3390,7 @@ impl Agent<'_> {
                 Ok(id) => println!("deleted session {}", &id[..8]),
                 Err(e) => println!("delete failed: {e}"),
             },
+            "/retitle" => println!("{}", self.retitle_sessions()),
             "/resume" => match self.resume_pick(arg) {
                 Ok(None) => match self.store.list() {
                     Ok(entries) => print!(
@@ -4096,6 +4100,75 @@ the original is frozen and listed in /tree"
         )
     }
 
+    /// Builds the `/resume` picker over the saved-session listing.
+    ///
+    /// Errors are folded into an empty pane: the picker then says "no session
+    /// matches", which is the same thing an unreadable store means to someone
+    /// looking for something to resume.
+    fn resume_pane(&self) -> crate::resumepane::ResumePane {
+        let entries = self.store.list().unwrap_or_default();
+        let scope = std::env::current_dir()
+            .ok()
+            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_default();
+        crate::resumepane::ResumePane::new(entries, now_secs()).with_scope(scope)
+    }
+
+    /// Re-derives the titles of every saved session, for `/retitle`.
+    ///
+    /// The picker titles rows from the transcript's first real user turn;
+    /// sessions saved before that rule existed are titled after the injected
+    /// agent-instructions block instead, and only a rewrite fixes those.
+    fn retitle_sessions(&self) -> String {
+        match self.store.retitle_all() {
+            Ok(changed) if changed.is_empty() => {
+                "retitle: every session title is current".to_owned()
+            }
+            Ok(changed) => format!("retitle: rewrote {} session titles", changed.len()),
+            Err(e) => format!("retitle failed: {e}"),
+        }
+    }
+
+    /// Preview text for one saved session: its last few turns, plain, for the
+    /// picker's expanded row. An unreadable session says so rather than
+    /// leaving the row stuck on "loading".
+    fn resume_preview(&self, id: &str) -> String {
+        match self.store.load(id) {
+            Ok(s) => {
+                let text =
+                    crate::session::render_history(&s.transcript, RESUME_PREVIEW_TURNS, false);
+                if text.trim().is_empty() {
+                    "(empty session)".to_owned()
+                } else {
+                    text
+                }
+            }
+            Err(e) => format!("preview failed: {e}"),
+        }
+    }
+
+    /// Makes a just-loaded session the live one: swaps it in, drops everything
+    /// scoped to the old session, and replays its history into the log.
+    ///
+    /// Shared by `/switch` and `/resume` (both the argument form and the
+    /// picker), so the three cannot drift on what "replace the session" clears.
+    fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
+        let note = self.load_session_payload(&s);
+        self.session = s;
+        self.broadcast_session_reset(Some(
+            "[session replaced — its history is on the local screen only]",
+        ));
+        self.last_ctx_used = 0;
+        self.checkpoints.clear();
+        self.usage = SessionUsage::default();
+        // Same reason as `/clear`: the pane is the old session's.
+        sub.reset();
+        self.replay_history_into_log(log);
+        if let Some(note) = note {
+            log.push_dim(note);
+        }
+    }
+
     /// Every fingerprint this launch is using, across every engine it holds and
     /// including the live session's payload.
     ///
@@ -4710,9 +4783,11 @@ the original is frozen and listed in /tree"
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
     /// plus the runtime knobs that shape generation — to `~/.plank/repro/`.
-    /// `note` is an optional free-text description of the bug. Read-only: the
-    /// live session is untouched.
-    fn write_repro(&self, note: &str) -> Result<std::path::PathBuf, String> {
+    /// `note` is an optional free-text description of the bug. Read-only as far
+    /// as the live session goes; the only state it touches is the last-edited
+    /// pointer, so a bare `/open` opens the dump that was just generated (the
+    /// file the user most likely wants to read or annotate next).
+    fn write_repro(&mut self, note: &str) -> Result<std::path::PathBuf, String> {
         let rendered = render_transcript(&self.session, &self.system);
         let version = crate::logo::version_label();
         let date = crate::context::current_local_iso_date();
@@ -4729,7 +4804,11 @@ the original is frozen and listed in /tree"
             note: note.trim(),
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered);
-        crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)
+        let path = crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)?;
+        // `repro::save` builds its path from `$HOME` (or the already-absolute
+        // cwd), so unlike `openfile::note_edited` there is nothing to resolve.
+        self.last_edited = Some(path.clone());
+        Ok(path)
     }
 
     /// Writes a `/export` transcript dump (issue #66). `arg` is
@@ -6131,6 +6210,9 @@ impl Agent<'_> {
         // The `/kvcache` lineage pane, when open; like `/config` it intercepts
         // all keys and renders over the frame until Esc/q/Ctrl-C closes it.
         let mut kv_pane: Option<crate::kvpane::KvPane> = None;
+        // The `/resume` session picker, when open; it owns every key until it
+        // resumes a session or is cancelled.
+        let mut resume_pane: Option<crate::resumepane::ResumePane> = None;
         // Images pasted (clipboard or file path) awaiting the next submit;
         // attached to the message as file references the model's tools can
         // read. Always empty while IMAGES_ENABLED is off.
@@ -6233,6 +6315,9 @@ impl Agent<'_> {
                     if let Some(pane) = &kv_pane {
                         tui::draw_kvcache(f, pane);
                     }
+                    if let Some(pane) = &resume_pane {
+                        tui::draw_resume(f, pane);
+                    }
                     // Drawn last: the arcade covers the whole frame.
                     if arcade.is_open() {
                         tui::draw_arcade(f, &arcade);
@@ -6256,6 +6341,7 @@ impl Agent<'_> {
             if !arcade.is_open()
                 && config_form.is_none()
                 && kv_pane.is_none()
+                && resume_pane.is_none()
                 && let Some(after) = crate::settings::active().ui.screensaver.duration()
                 && last_activity.elapsed() >= after
             {
@@ -6293,6 +6379,7 @@ impl Agent<'_> {
                                 &mut btw_panel,
                                 &mut config_form,
                                 &mut kv_pane,
+                                &mut resume_pane,
                                 &mut arcade,
                                 &mut sub_pane,
                             ) {
@@ -6574,6 +6661,42 @@ impl Agent<'_> {
                 }
                 continue;
             }
+            // The `/resume` picker, likewise: every key is the pane's until it
+            // hands back a session or closes.
+            if let Some(pane) = resume_pane.as_mut() {
+                match pane.handle_key(key) {
+                    crate::resumepane::Outcome::Stay => {}
+                    crate::resumepane::Outcome::Close => resume_pane = None,
+                    crate::resumepane::Outcome::Resume(id) => {
+                        resume_pane = None;
+                        match self.store.load(&id) {
+                            Ok(s) => self.adopt_session(s, &mut log, &mut sub_pane),
+                            Err(e) => log.push_plain(format!("resume failed: {e}")),
+                        }
+                    }
+                    // Rename and delete both change the listing under the pane,
+                    // so it is rebuilt rather than left showing a stale row.
+                    crate::resumepane::Outcome::Rename(id, new) => {
+                        if let Err(e) = self.store.rename(&id, &new) {
+                            log.push_plain(format!("rename failed: {e}"));
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
+                    crate::resumepane::Outcome::Delete(id) => {
+                        if let Err(e) = self.store.delete(&id) {
+                            log.push_plain(format!("delete failed: {e}"));
+                        }
+                        resume_pane = Some(self.resume_pane());
+                    }
+                    crate::resumepane::Outcome::LoadPreview(id) => {
+                        let text = self.resume_preview(&id);
+                        if let Some(p) = resume_pane.as_mut() {
+                            p.set_preview(&id, text);
+                        }
+                    }
+                }
+                continue;
+            }
             // Any keystroke dismisses the mouse selection highlight (the text
             // was already copied on mouse release).
             selection = None;
@@ -6778,6 +6901,7 @@ impl Agent<'_> {
                             &mut btw_panel,
                             &mut config_form,
                             &mut kv_pane,
+                            &mut resume_pane,
                             &mut arcade,
                             &mut sub_pane,
                         ) {
@@ -8502,6 +8626,7 @@ impl Agent<'_> {
         btw: &mut BtwPanel,
         config_form: &mut Option<crate::configform::ConfigForm>,
         kv_pane: &mut Option<crate::kvpane::KvPane>,
+        resume_pane: &mut Option<crate::resumepane::ResumePane>,
         arcade: &mut crate::arcade::Arcade,
         sub: &mut tui::SubPane,
     ) -> bool {
@@ -8702,54 +8827,19 @@ impl Agent<'_> {
                 Err(e) => log.push_plain(format!("list failed: {e}")),
             },
             "/switch" => match self.store.load(arg) {
-                Ok(s) => {
-                    let note = self.load_session_payload(&s);
-                    self.session = s;
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
-                    // Same reason as `/clear`: the pane is the old session's.
-                    sub.reset();
-                    self.replay_history_into_log(log);
-                    if let Some(note) = note {
-                        log.push_dim(note);
-                    }
-                }
+                Ok(s) => self.adopt_session(s, log, sub),
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
             "/del" => match self.store.delete(arg) {
                 Ok(id) => log.push_plain(format!("deleted session {}", &id[..8])),
                 Err(e) => log.push_plain(format!("delete failed: {e}")),
             },
+            "/retitle" => log.push_plain(self.retitle_sessions()),
+            // A bare `/resume` opens the picker; with an argument it resumes
+            // that session outright, exactly as the plain REPL does.
             "/resume" => match self.resume_pick(arg) {
-                Ok(None) => match self.store.list() {
-                    Ok(entries) => log.push_ansi(&crate::session::render_resume_list(
-                        &entries,
-                        now_secs(),
-                        true,
-                        RESUME_LIST_LIMIT,
-                    )),
-                    Err(e) => log.push_plain(format!("resume failed: {e}")),
-                },
-                Ok(Some(s)) => {
-                    let note = self.load_session_payload(&s);
-                    self.session = s;
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
-                    // Same reason as `/clear`: the pane is the old session's.
-                    sub.reset();
-                    self.replay_history_into_log(log);
-                    if let Some(note) = note {
-                        log.push_dim(note);
-                    }
-                }
+                Ok(None) => *resume_pane = Some(self.resume_pane()),
+                Ok(Some(s)) => self.adopt_session(s, log, sub),
                 Err(e) => log.push_plain(format!("resume failed: {e}")),
             },
             "/tag" => {

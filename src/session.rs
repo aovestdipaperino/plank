@@ -989,6 +989,50 @@ impl SessionStore {
         Ok(id)
     }
 
+    /// Re-derives every saved session's title from its transcript, rewriting
+    /// only the ones whose stored title is now wrong.
+    ///
+    /// A one-shot repair for sessions titled before
+    /// [`title_from_transcript`] learned to skip the injected session-start
+    /// context — those all read `Agent instructions: …`, which names the
+    /// project rather than the conversation.
+    ///
+    /// The title record is spliced in place rather than going through
+    /// [`SessionStore::save`], which would stamp `used` with the current time
+    /// and flatten every session's age to "just now" — the very field the
+    /// picker sorts on.
+    ///
+    /// Returns each rewritten session as `(id, new title)`. Unreadable files
+    /// are skipped, not reported: a repair pass is no place to start failing
+    /// over a session that was already unloadable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be read.
+    pub fn retitle_all(&self) -> Result<Vec<(String, String)>> {
+        let mut changed = Vec::new();
+        for (id, path) in self.session_files()? {
+            let Ok(session) = read_session_file(&path) else {
+                continue;
+            };
+            let title = title_from_transcript(&session.transcript, 0);
+            let Ok(body) = fs::read(&path) else { continue };
+            let Some(spliced) = replace_title_record(&body, &title) else {
+                continue;
+            };
+            let tmp = self
+                .dir
+                .join(format!("{id}{FILE_EXT}.tmp.{}", std::process::id()));
+            fs::write(&tmp, &spliced)?;
+            if let Err(e) = fs::rename(&tmp, &path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            changed.push((id, title));
+        }
+        Ok(changed)
+    }
+
     /// Loads the session whose id matches the given hex prefix.
     ///
     /// # Errors
@@ -1429,9 +1473,21 @@ pub fn format_age(when: u64, now: u64) -> String {
 /// Whitespace is collapsed, the result is clipped to `max_bytes` with a
 /// `...` suffix (0 means unlimited), and the placeholders
 /// "(no user prompt)" / "(empty user prompt)" match the C agent.
+///
+/// The session-start context blocks are stored as user turns but were typed by
+/// nobody, so they are skipped: titling every session after the injected
+/// agent-instructions block names the project, not the conversation, and made
+/// the `/resume` picker a wall of identical rows. Only when the transcript is
+/// nothing *but* scaffolding does the first block stand in, since a title of
+/// "(no user prompt)" would say even less.
 #[must_use]
 pub fn title_from_transcript(transcript: &[Message], max_bytes: usize) -> String {
-    let Some(first) = transcript.iter().find(|m| m.role == Role::User) else {
+    let mut users = transcript.iter().filter(|m| m.role == Role::User);
+    let Some(first) = users
+        .clone()
+        .find(|m| !crate::context::is_session_context(&m.text))
+        .or_else(|| users.next())
+    else {
         return "(no user prompt)".to_owned();
     };
     title_from_span(&first.text, max_bytes, "(empty user prompt)")
@@ -1782,6 +1838,53 @@ fn read_head_meta(path: &Path) -> Option<(u64, u64, String)> {
     let end = (offset + title_len).min(buf.len());
     let title = String::from_utf8_lossy(&buf[offset..end]).into_owned();
     Some((created, used, title))
+}
+
+/// Rewrites a session file's `title` record, leaving every other byte — the
+/// `created`/`used` stamps above it and the whole transcript below — alone.
+///
+/// Returns `None` when the header is not the four lines this format promises,
+/// or when the title is already the one asked for: the caller writes nothing in
+/// either case, so an unparseable file is left exactly as it was found.
+fn replace_title_record(body: &[u8], title: &str) -> Option<Vec<u8>> {
+    let mut lines = body.split(|&b| b == b'\n');
+    if lines.next().map(String::from_utf8_lossy).as_deref() != Some(MAGIC) {
+        return None;
+    }
+    lines.next()?; // created
+    lines.next()?; // used
+    let len: usize = String::from_utf8_lossy(lines.next()?)
+        .strip_prefix("title ")?
+        .trim()
+        .parse()
+        .ok()?;
+    // The four header lines, newlines included, are the offset of the title
+    // body; the record ends `len` bytes later, before its own newline.
+    let start: usize = body
+        .split_inclusive(|&b| b == b'\n')
+        .take(4)
+        .map(<[u8]>::len)
+        .sum();
+    let end = start.checked_add(len)?;
+    if end >= body.len() || body[end] != b'\n' {
+        return None;
+    }
+    if &body[start..end] == title.as_bytes() {
+        return None;
+    }
+    let head_end = start - (len_line(len).len() + 1);
+    let mut out = Vec::with_capacity(body.len() + title.len());
+    out.extend_from_slice(&body[..head_end]);
+    out.extend_from_slice(len_line(title.len()).as_bytes());
+    out.push(b'\n');
+    out.extend_from_slice(title.as_bytes());
+    out.extend_from_slice(&body[end..]);
+    Some(out)
+}
+
+/// The `title <len>` header line for a title of `len` bytes.
+fn len_line(len: usize) -> String {
+    format!("title {len}")
 }
 
 /// Renders the optional trailing timestamp of a `msg`/`node` header: a
@@ -2155,6 +2258,50 @@ mod tests {
             std::env::temp_dir().join(format!("plank-session-test-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         dir
+    }
+
+    /// The repair pass for sessions titled before the context blocks were
+    /// skipped. What it must *not* touch is the point: `used` drives the
+    /// picker's recency order, so a pass that re-stamped it would shuffle
+    /// every session to the top of the list.
+    #[test]
+    fn retitle_all_fixes_scaffolding_titles_without_disturbing_the_rest() {
+        let dir = temp_dir("retitle");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("Agent instructions:\n\nread CLAUDE.md"));
+        s.push(Message::user("fix the failing test"));
+        s.push(Message::assistant("done"));
+        s.tag = "wip".to_owned();
+        let id = store.save(&mut s).unwrap();
+        // Force the pre-fix title back onto the file, as an older build wrote it.
+        let path = store.path_for_id(&id);
+        let body = fs::read(&path).unwrap();
+        fs::write(
+            &path,
+            replace_title_record(&body, "Agent instructions: read CLAUDE.md").unwrap(),
+        )
+        .unwrap();
+        let before = store.list().unwrap().into_iter().next().unwrap();
+
+        let changed = store.retitle_all().unwrap();
+        assert_eq!(changed.len(), 1, "one session rewritten");
+        assert_eq!(changed[0].1, "fix the failing test");
+
+        let after = store.list().unwrap().into_iter().next().unwrap();
+        assert_eq!(after.title, "fix the failing test");
+        assert_eq!(after.created_at, before.created_at, "creation time kept");
+        assert_eq!(after.last_used, before.last_used, "recency kept");
+        assert_eq!(after.tag, "wip");
+        assert_eq!(after.last_prompt, before.last_prompt);
+        // The transcript itself round-trips, off-path records and all.
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.transcript.len(), 3);
+        assert_eq!(loaded.transcript[2].text, "done");
+
+        // Second pass: nothing left to do, and nothing rewritten.
+        assert!(store.retitle_all().unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3475,6 +3622,23 @@ hello\n";
         assert!(long.len() <= 10);
         assert_eq!(title_clip("short", 40), "short");
         assert_eq!(title_clip("abcdefghij", 8), "abcde...");
+    }
+
+    /// Session-start context is a user turn nobody typed: titling by it names
+    /// every session in a project the same thing.
+    #[test]
+    fn a_title_skips_the_injected_session_context() {
+        let scaffolding = Message::user("Agent instructions:\n\nread CLAUDE.md");
+        assert_eq!(
+            title_from_transcript(&[scaffolding.clone(), Message::user("fix the bug")], 0),
+            "fix the bug"
+        );
+        // Nothing but scaffolding still has to say *something*, and the block
+        // itself beats "(no user prompt)".
+        assert!(
+            title_from_transcript(&[scaffolding], 0).starts_with("Agent instructions:"),
+            "a context-only session falls back to the block"
+        );
     }
 
     #[test]

@@ -439,7 +439,8 @@ Options:
                            (default: markdown, auto-named in the working
                            directory); HTML output is standalone
   /open [path]             edit a file in the built-in editor; with no path,
-                           reopens the last file a tool call edited
+                           reopens the last file a tool call edited or plank
+                           generated (e.g. a /repro dump)
   /insights [fast]         report on how you have been using plank, from every
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
@@ -662,6 +663,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "delete a saved session",
     },
     SlashCommand {
+        name: "/retitle",
+        args: "",
+        desc: "re-derive every saved session's title from its transcript",
+    },
+    SlashCommand {
         name: "/tag",
         args: "<text>",
         desc: "label this session (\"-\" clears the label)",
@@ -863,6 +869,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         "/help"
             | "/save"
             | "/list"
+            | "/retitle"
             | "/quit"
             | "/exit"
             | "/new"

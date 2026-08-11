@@ -18,7 +18,8 @@ use crate::session::SessionEntry;
 /// One render-ready session, as three lines.
 #[derive(Debug, Clone)]
 pub struct Row {
-    /// Session name, plus ` [tag]` when tagged.
+    /// Session title, plus ` [tag]` when tagged; the id stands in for an
+    /// untitled session, which is also the name you would type at `/resume`.
     pub label: String,
     /// Dim second line: age and file size.
     pub detail: String,
@@ -71,6 +72,8 @@ pub struct ResumePane {
     pending_delete: bool,
     /// When `Some`, the search box is a rename buffer for the selected session.
     rename: Option<String>,
+    /// Project label shown above the list; empty hides the line.
+    scope: String,
     /// Wall clock the ages render against.
     now: u64,
 }
@@ -90,8 +93,23 @@ impl ResumePane {
             preview_open: false,
             pending_delete: false,
             rename: None,
+            scope: String::new(),
             now,
         }
+    }
+
+    /// Sets the project label drawn above the list (typically the working
+    /// directory's own name). Empty means no label line at all.
+    #[must_use]
+    pub fn with_scope(mut self, scope: impl Into<String>) -> Self {
+        self.scope = scope.into();
+        self
+    }
+
+    /// The project label, empty when unset.
+    #[must_use]
+    pub fn scope(&self) -> &str {
+        &self.scope
     }
 
     /// The search text currently typed.
@@ -173,7 +191,7 @@ impl ResumePane {
         if self.pending_delete {
             return "Ctrl+X again to delete · any other key cancels".to_owned();
         }
-        "Ctrl+R to rename · Ctrl+X to delete · Space to preview · Type to search · Esc to cancel"
+        "Space to preview · Ctrl+R to rename · Ctrl+X to delete · Type to search · Esc to cancel"
             .to_owned()
     }
 
@@ -186,10 +204,18 @@ impl ResumePane {
             .filter_map(|(i, &e)| {
                 let entry = self.entries.get(e)?;
                 let selected = i == self.cursor;
-                let label = if entry.tag.is_empty() {
-                    entry.id.clone()
+                // The title is what the session is *about*; the id only stands
+                // in when there is no title to show, which is also the string
+                // the user would type at `/resume <name>`.
+                let name = if entry.title.trim().is_empty() {
+                    &entry.id
                 } else {
-                    format!("{} [{}]", entry.id, entry.tag)
+                    &entry.title
+                };
+                let label = if entry.tag.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{name} [{}]", entry.tag)
                 };
                 // `last_used` is zero on a pre-metadata or unreadable file;
                 // creation time is the only age it can offer.
@@ -409,7 +435,7 @@ mod tests {
     fn a_row_shows_the_name_tag_age_size_and_last_prompt() {
         let p = pane();
         let row = &p.rows()[0];
-        assert_eq!(row.label, "kv-cache-design [wip]");
+        assert_eq!(row.label, "Design KV cache [wip]");
         assert!(
             row.detail.contains("1024") || row.detail.contains("1.0 KB"),
             "{}",
@@ -421,7 +447,21 @@ mod tests {
             row.extra
         );
         // No tag means no brackets rather than an empty pair.
-        assert_eq!(p.rows()[1].label, "guide-update");
+        assert_eq!(p.rows()[1].label, "Update user guide");
+    }
+
+    /// A session saved before it earned a title still has to name itself, and
+    /// the id is the one string the user could type back at `/resume`.
+    #[test]
+    fn an_untitled_session_falls_back_to_its_id() {
+        let p = ResumePane::new(vec![entry("guide-update", "  ", "", "", 600)], 1000);
+        assert_eq!(p.rows()[0].label, "guide-update");
+    }
+
+    #[test]
+    fn the_scope_label_is_carried_through_for_the_list_header() {
+        assert_eq!(pane().scope(), "");
+        assert_eq!(pane().with_scope("plank").scope(), "plank");
     }
 
     #[test]
