@@ -170,8 +170,19 @@ fn menubar(ctx: &mut Context, state: &mut State) {
     {
         let contains_focus = ctx.contains_focus();
 
-        if ctx.menubar_menu_begin("Prompt", 'P') {
-            menu_prompt(ctx, state);
+        // A file gets the conventional File menu (Save / Quit); a prompt keeps
+        // its own language, since its text goes back to the prompt, not to disk.
+        match state.mode {
+            crate::miniedit::Mode::File => {
+                if ctx.menubar_menu_begin("File", 'F') {
+                    menu_file(ctx, state);
+                }
+            }
+            crate::miniedit::Mode::Prompt => {
+                if ctx.menubar_menu_begin("Prompt", 'P') {
+                    menu_prompt(ctx, state);
+                }
+            }
         }
         if !contains_focus && ctx.consume_shortcut(vk::F10) {
             ctx.steal_focus();
@@ -199,6 +210,19 @@ fn menu_prompt(ctx: &mut Context, state: &mut State) {
         state.outcome = Outcome::Accept;
     }
     if ctx.menubar_menu_button("Discard changes (Esc)", 'D', vk::NULL) {
+        state.request_cancel();
+    }
+    ctx.menubar_menu_end();
+}
+
+/// The two ways out of a file edit, in the terminology every other text editor
+/// uses: Save writes the buffer to disk and leaves, Quit leaves without
+/// writing (asking first when there are unsaved changes).
+fn menu_file(ctx: &mut Context, state: &mut State) {
+    if ctx.menubar_menu_button("Save", 'S', kbmod::CTRL | vk::S) {
+        state.outcome = Outcome::Accept;
+    }
+    if ctx.menubar_menu_button("Quit (Esc)", 'Q', vk::NULL) {
         state.request_cancel();
     }
     ctx.menubar_menu_end();
@@ -303,7 +327,11 @@ fn status_bar(ctx: &mut Context, state: &mut State) {
         if ctx.button("accept", accept, ButtonStyle::default()) {
             state.outcome = Outcome::Accept;
         }
-        if ctx.button("cancel", "Discard (Esc)", ButtonStyle::default()) {
+        let cancel = match state.mode {
+            crate::miniedit::Mode::Prompt => "Discard (Esc)",
+            crate::miniedit::Mode::File => "Quit (Esc)",
+        };
+        if ctx.button("cancel", cancel, ButtonStyle::default()) {
             state.request_cancel();
         }
     }
