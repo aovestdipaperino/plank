@@ -99,6 +99,8 @@ lines left over when the turn settles start a fresh turn), and Esc/Ctrl-C set
 a shared interrupt flag. The plain line REPL keeps the synchronous inline
 loop — with piped stdin there is no live input to multiplex.
 
+- `goal.rs` — `/goal` autonomous loop: iteration state, adjudication prompt, and verdict parsing. Pure logic; `ui.rs` drives it from both front ends.
+
 ### Engine abstraction (`engine.rs`, `ds4engine.rs`, `ffi.rs`, `snapshot.rs`)
 - `engine.rs` — the `Engine` trait (`generate` over `Prompt::{Flat, Structured}`,
   `warm_reset`/`warm_append`/`warm_sync`, `get_kv`/`set_kv`, `count_tokens`,

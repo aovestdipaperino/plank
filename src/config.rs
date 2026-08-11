@@ -717,6 +717,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "show the model's task list for this session",
     },
     SlashCommand {
+        name: "/goal",
+        args: "[--max n] <objective>",
+        desc: "work autonomously until the objective is settled",
+    },
+    SlashCommand {
         name: "/skills",
         args: "",
         desc: "list the skills loaded from SKILL.md files",
@@ -922,6 +927,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
         || slash_command_with_args(cmd, "/notify")
+        || slash_command_with_args(cmd, "/goal")
         || slash_command_with_args(cmd, "/remote-control")
         || slash_command_with_args(cmd, "/rc")
 }

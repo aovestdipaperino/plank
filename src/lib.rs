@@ -37,6 +37,7 @@ pub mod errlog;
 pub mod export;
 #[cfg(ds4_engine)]
 pub mod ffi;
+pub mod goal;
 pub mod hooks;
 pub mod host;
 pub mod imagepaste;

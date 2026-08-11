@@ -28,6 +28,14 @@
 //! security boundary — a `*`-glob match against the whole command line skips
 //! the sandbox for that command.
 //!
+//! `~/.plank` is deliberately *not* writable by default: it holds the session
+//! store, the KV cache, hooks and consent markers, so a model-chosen command
+//! that can rewrite it can rewrite plank's own behaviour. It is instead granted
+//! on request — when a sandboxed command names the plank home
+//! ([`mentions_plank_home`]) the bash tool asks the user, and an "always allow"
+//! answer sets [`Sandbox::plank_home_writable`] for the rest of the session
+//! only. Nothing about that grant is written to disk.
+//!
 //! `sandbox-exec` is deprecated by Apple but remains functional and is what
 //! the reference agents use on macOS.
 
@@ -43,6 +51,10 @@ pub struct Sandbox {
     pub writable_paths: Vec<PathBuf>,
     /// `*`-glob patterns for commands that skip the sandbox entirely.
     pub excluded_commands: Vec<String>,
+    /// Session-scoped grant for writes under `~/.plank`, set by an "always
+    /// allow" answer to the bash tool's prompt. In-memory only: a new session
+    /// (or a `/resume` of this one) starts denied again.
+    pub plank_home_writable: bool,
 }
 
 impl Default for Sandbox {
@@ -54,6 +66,7 @@ impl Default for Sandbox {
             enabled: cfg!(target_os = "macos"),
             writable_paths: Vec::new(),
             excluded_commands: Vec::new(),
+            plank_home_writable: false,
         }
     }
 }
@@ -76,8 +89,27 @@ impl Sandbox {
     /// writes, then re-allow writes under cwd, temp roots, /dev, and the
     /// configured extra paths. Later rules win in SBPL, so the allow list
     /// punches holes in the write denial.
+    ///
+    /// `~/.plank` is included only when [`plank_home_writable`](Self::plank_home_writable)
+    /// is set; see [`profile_allowing_plank_home`](Self::profile_allowing_plank_home)
+    /// for the single-command grant.
     #[must_use]
     pub fn profile(&self, cwd: &Path) -> String {
+        self.profile_allowing_plank_home(cwd, self.plank_home_writable)
+    }
+
+    /// Same as [`profile`](Self::profile) with the `~/.plank` write grant forced
+    /// on or off, for a user who answered "Allow" for one command without
+    /// granting the rest of the session.
+    #[must_use]
+    pub fn profile_allowing_plank_home(&self, cwd: &Path, allow_plank_home: bool) -> String {
+        self.profile_with_plank_home(cwd, allow_plank_home.then(plank_home).flatten().as_deref())
+    }
+
+    /// The profile builder proper, with the plank home passed in rather than read
+    /// from `HOME`, so tests need not mutate the environment other tests read.
+    /// `None` withholds the grant.
+    fn profile_with_plank_home(&self, cwd: &Path, plank_home: Option<&Path>) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
         p.push_str("(allow file-write*\n");
         let mut roots: Vec<PathBuf> = vec![
@@ -89,6 +121,9 @@ impl Sandbox {
             PathBuf::from("/dev"),
         ];
         roots.extend(self.writable_paths.iter().cloned());
+        if let Some(home) = plank_home {
+            roots.push(home.to_path_buf());
+        }
         for root in roots {
             // Resolve symlinks where possible: Seatbelt matches the real
             // path, and macOS cwds are often under the /tmp -> /private/tmp
@@ -101,6 +136,54 @@ impl Sandbox {
         p.push_str(")\n");
         p
     }
+}
+
+/// The plank home directory, `$HOME/.plank`, or `None` when `HOME` is unset.
+#[must_use]
+pub fn plank_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".plank"))
+}
+
+/// True when `cmd` names the plank home, in any of the spellings a shell command
+/// plausibly uses: `~/.plank`, `$HOME/.plank`, `${HOME}/.plank`, or the expanded
+/// absolute path.
+///
+/// This is the trigger for the write-permission prompt. It reads the command
+/// text because Seatbelt profiles are built before the command runs, so there is
+/// no write to observe yet — which makes it a heuristic in both directions: a
+/// command that only *reads* `~/.plank` still prompts, and one that reaches the
+/// directory through a variable or a symlink is not caught. It is not the
+/// security boundary; the boundary is the profile, which withholds the write
+/// unless the user grants it.
+#[must_use]
+pub fn mentions_plank_home(cmd: &str) -> bool {
+    mentions_plank_home_at(cmd, plank_home().as_deref())
+}
+
+/// The mention check proper, with the plank home passed in rather than read from
+/// `HOME`, so tests need not mutate the environment other tests read.
+fn mentions_plank_home_at(cmd: &str, plank_home: Option<&Path>) -> bool {
+    let mut needles = vec!["~/.plank", "$HOME/.plank", "${HOME}/.plank"];
+    let expanded = plank_home.map(|h| h.to_string_lossy().into_owned());
+    if let Some(e) = expanded.as_deref() {
+        needles.push(e);
+    }
+    needles.iter().any(|n| contains_path_prefix(cmd, n))
+}
+
+/// True when `needle` occurs in `text` as a whole path component prefix, so
+/// `~/.plank` and `~/.plank/kvcache` match but `~/.plankton` does not.
+fn contains_path_prefix(text: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let end = from + pos + needle.len();
+        let next = text[end..].chars().next();
+        if !next.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+            return true;
+        }
+        from = end;
+    }
+    false
 }
 
 /// Escapes a path for use inside a double-quoted SBPL string literal.
@@ -207,6 +290,7 @@ mod tests {
             enabled: true,
             writable_paths: Vec::new(),
             excluded_commands: vec!["git push*".to_string()],
+            plank_home_writable: false,
         };
         assert!(sb.should_sandbox("cargo build"));
         assert!(!sb.should_sandbox("git push origin main"));
@@ -219,12 +303,74 @@ mod tests {
             enabled: true,
             writable_paths: vec![PathBuf::from("/odd\"name")],
             excluded_commands: Vec::new(),
+            plank_home_writable: false,
         };
         let p = sb.profile(Path::new("/nonexistent/work dir"));
         assert!(p.starts_with("(version 1)\n(allow default)\n(deny file-write*)\n"));
         assert!(p.contains("(subpath \"/nonexistent/work dir\")"));
         assert!(p.contains("(subpath \"/odd\\\"name\")"));
         assert!(p.contains("(subpath \"/dev\")"));
+    }
+
+    /// A plank home that cannot exist, so `canonicalize` is a no-op and the
+    /// profile carries the literal path.
+    const FAKE_PLANK_HOME: &str = "/nonexistent/home/.plank";
+
+    #[test]
+    fn plank_home_is_not_writable_until_granted() {
+        let mut sb = Sandbox {
+            enabled: true,
+            writable_paths: Vec::new(),
+            excluded_commands: Vec::new(),
+            plank_home_writable: false,
+        };
+        let cwd = Path::new("/nonexistent/work");
+        let home = Path::new(FAKE_PLANK_HOME);
+        let subpath = format!("(subpath \"{FAKE_PLANK_HOME}\")");
+
+        // Denied (and the default): no grant reaches the profile at all.
+        assert!(!sb.profile_with_plank_home(cwd, None).contains(".plank"));
+        // A one-command "Allow" punches the hole for that command only...
+        assert!(
+            sb.profile_with_plank_home(cwd, Some(home))
+                .contains(&subpath)
+        );
+        // ...without recording anything on the session.
+        assert!(!sb.plank_home_writable);
+
+        // "Always allow" sets the session flag, which is what `profile` reads.
+        sb.plank_home_writable = true;
+        assert!(sb.plank_home_writable);
+        assert!(
+            sb.profile_allowing_plank_home(cwd, false)
+                .contains("(allow file-write*"),
+            "an explicit false still builds a valid profile"
+        );
+    }
+
+    #[test]
+    fn plank_home_mentions_match_whole_path_components() {
+        let home = Path::new(FAKE_PLANK_HOME);
+        let m = |cmd: &str| mentions_plank_home_at(cmd, Some(home));
+        assert!(m("cat ~/.plank/sandbox.json"));
+        assert!(m("rm -rf $HOME/.plank"));
+        assert!(m("ls ${HOME}/.plank/kvcache"));
+        assert!(m("touch /nonexistent/home/.plank/x"));
+        assert!(m("echo hi > ~/.plank"));
+        // Neighbouring names that merely share the prefix must not prompt.
+        assert!(!m("cat ~/.plankton/config"));
+        assert!(!m("cat ~/.plank-old/config"));
+        assert!(!m("cat ~/.plank_backup"));
+        assert!(!m("ls /nonexistent/home/.plank-sandbox-test-1"));
+        // Unrelated commands, including the project-local .plank directory.
+        assert!(!m("cargo build"));
+        assert!(!m("cat ./.plank/sandbox.json"));
+        // The tilde spellings are recognised even with no HOME to expand.
+        assert!(mentions_plank_home_at("cat ~/.plank/x", None));
+        assert!(!mentions_plank_home_at(
+            "touch /nonexistent/home/.plank/x",
+            None
+        ));
     }
 
     #[test]

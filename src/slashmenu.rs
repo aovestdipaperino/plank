@@ -494,4 +494,15 @@ mod tests {
             .expect("compact");
         assert_eq!(e.label(), "/compact [instructions]");
     }
+
+    #[test]
+    fn goal_is_a_known_command_with_an_argument_label() {
+        assert!(crate::config::slash_command_known("/goal"));
+        let cat = catalog(&[], &[]);
+        let e = cat
+            .iter()
+            .find(|e| e.name == "/goal")
+            .expect("/goal is in the catalogue");
+        assert_eq!(e.label(), "/goal [--max n] <objective>");
+    }
 }
