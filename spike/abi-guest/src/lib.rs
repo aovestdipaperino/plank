@@ -58,3 +58,40 @@ pub fn command_run(input: String) -> FnResult<String> {
         r#"{{"print": ["greeting {args}"], "prompt": "say hello to {args}"}}"#
     ))
 }
+
+// The capability imports. Declared unconditionally: plank provides every host
+// function to every component and checks the grant when called, so importing
+// one this component was not granted is not a load failure — the call simply
+// comes back with a refusal.
+#[host_fn]
+extern "ExtismHost" {
+    fn plank_print(text: String) -> String;
+    fn plank_state_get(key: String) -> Vec<u8>;
+    fn plank_state_set(key: String, value: Vec<u8>) -> String;
+}
+
+/// Prints through the host and reports what the host said. An empty reply
+/// means it worked; anything else is the refusal, which the test asserts on.
+#[plugin_fn]
+pub fn cap_print(text: String) -> FnResult<String> {
+    let reply = unsafe { plank_print(text)? };
+    Ok(reply)
+}
+
+/// A counter in the component's own state: reads, increments, writes back.
+/// Proves state survives across calls and belongs to this component alone.
+#[plugin_fn]
+pub fn cap_bump(_: ()) -> FnResult<String> {
+    let current = unsafe { plank_state_get("counter".to_string())? };
+    let n: u32 = String::from_utf8(current)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0);
+    let next = n + 1;
+    let err = unsafe { plank_state_set("counter".to_string(), next.to_string().into_bytes())? };
+    if err.is_empty() {
+        Ok(next.to_string())
+    } else {
+        Ok(err)
+    }
+}

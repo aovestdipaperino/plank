@@ -773,9 +773,21 @@ pub struct Session {
 
 impl Default for Session {
     fn default() -> Self {
+        Self::new(None)
+    }
+}
+
+impl Session {
+    /// A session whose components store `state` under `home`.
+    ///
+    /// The default has no home, so `state` is unavailable — right for a test
+    /// and for a plank that cannot find one, and wrong to paper over by
+    /// guessing a directory.
+    #[must_use]
+    pub fn new(home: Option<&Path>) -> Self {
         Self {
             registry: Registry::default(),
-            host: crate::wasmhost::host(),
+            host: crate::wasmhost::host(home),
         }
     }
 }
@@ -919,7 +931,17 @@ impl Registry {
                 ));
                 continue;
             };
-            if let Err(e) = host.load(&component.manifest.id, &bytes) {
+            // Exactly the capabilities this component declared — which, by the
+            // time it reaches here, the user has approved. The runtime never
+            // sees the manifest, so the grant set is the whole of what it
+            // knows about what this component may reach.
+            let granted: Vec<&str> = component
+                .manifest
+                .capabilities
+                .iter()
+                .map(|c| c.label())
+                .collect();
+            if let Err(e) = host.load(&component.manifest.id, &bytes, &granted) {
                 out.warnings
                     .push(format!("wasm component '{}': {e}", component.manifest.id));
                 continue;
@@ -1007,7 +1029,17 @@ impl Registry {
             json_str(args)
         );
         match host.call(&id, "command_run", payload.as_bytes()) {
-            Ok(bytes) => Ok(parse_cmd_output(&bytes)),
+            Ok(bytes) => {
+                let mut out = parse_cmd_output(&bytes);
+                // Anything the component printed through the `print` capability
+                // happened *during* the call, so it precedes whatever the reply
+                // asks to print. Draining here rather than in the UI keeps both
+                // front ends from having to remember to do it.
+                let mut printed = host.drain_printed();
+                printed.append(&mut out.print);
+                out.print = printed;
+                Ok(out)
+            }
             Err(e) => {
                 let disabled = self.strike(&id);
                 Err(if disabled {

@@ -10484,6 +10484,11 @@ fn new_agent(
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let plank_home = home.as_ref().map(|h| h.join(".plank"));
         let project = tool_ctx.cwd.clone();
+        // Built with the home *before* activation, not after: the runtime is
+        // what owns a component's `state` directory, and a host constructed
+        // without one would leave every component's storage unavailable for
+        // the whole session.
+        tool_ctx.wasm = crate::wasmreg::Session::new(plank_home.as_deref());
         let warnings =
             tool_ctx
                 .wasm

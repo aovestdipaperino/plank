@@ -92,6 +92,7 @@ pub mod uiremote;
 pub mod upgrade;
 pub mod viz;
 pub mod warp;
+pub mod wasmcaps;
 pub mod wasmhost;
 pub mod wasmreg;
 pub mod worker;

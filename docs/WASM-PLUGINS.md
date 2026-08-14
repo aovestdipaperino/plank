@@ -25,9 +25,17 @@ Held components are listed by `/plugins` with what they want and the exact
 `/plugins trust <id>` that approves them — approval is a typed act, not a modal
 question before the first turn.
 
+**Capabilities — `log`, `print`, `state`.** `src/wasmcaps.rs`, also compiled
+unconditionally: whether a grant is honored, where a key may write and what a
+refusal says are pure functions over a directory, and the Extism glue in
+`wasmhost` is a thin shell over them. Every host function is provided to every
+component and checks its own grant when called, so a missing grant reads as
+"this component was not granted `print`" rather than as a wasm import error.
+`fs`, `net` and `exec` — the three that undo the sandbox — are deliberately not
+wired.
+
 Not yet implemented: `frame`, `segment`, `tool` and `observer` surfaces, the
-event bus, and the capability host functions (a component may *request*
-capabilities and the user approves them, but no host function is wired yet).
+event bus, and the `notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)
 
