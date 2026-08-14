@@ -216,10 +216,19 @@ pub struct GenerateRequest {
     /// Opaque per-turn id; the server uses it to route a `DELETE /generate/{id}`
     /// cancel. The client generates a fresh id per `generate` call.
     pub session_id: String,
-    /// The full rendered transcript (verbatim `render_transcript` bytes).
+    /// The full rendered transcript (verbatim `render_transcript` bytes). On
+    /// `/warm` this is the system tier's text — what `warm_reset` takes.
     pub transcript: String,
     /// Generation options.
     pub opts: WireOptions,
+    /// `/warm` only: the text of every tier below the system one, in order, one
+    /// entry per `warm_append`. Framing matters — the server replays them as
+    /// separate appends, so each tier stays its own chat-template message and a
+    /// tier boundary remains a reproducible token prefix. Absent on `/generate`
+    /// and from pre-v2 clients, which is why it defaults rather than being
+    /// required.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warm_appends: Vec<String>,
 }
 
 /// Request body for `POST /tokenize`.

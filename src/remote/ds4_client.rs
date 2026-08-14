@@ -10,9 +10,15 @@
 //! - `generate` → `POST /generate`, then reads the SSE stream, mapping each
 //!   frame onto `on_event`, polling `interrupt` between frames and firing
 //!   `DELETE /generate/{id}` on interrupt.
-//! - warming (`warm_reset` / `warm_append` / `warm_sync`) is a no-op: the KV lives on the
-//!   server, so there is no client-side cache to prefill and the trait
-//!   defaults are correct.
+//! - warming (`warm_reset` / `warm_append` / `warm_sync`) → `POST /warm`. The KV
+//!   lives on the server, so the client has nothing of its own to prefill; what
+//!   it does have is the tier walk, which only it knows. `warm_reset`/
+//!   `warm_append` therefore buffer the tier texts and `warm_sync` ships the
+//!   whole buffer in one request, streaming the server's prefill frames back so
+//!   the warm-up bar moves for a remote engine as it does for a local one. The
+//!   trait defaults (silent no-ops) used to stand in here, which meant the
+//!   server prefilled the system prompt lazily inside the first turn instead —
+//!   attributing the whole cold prefill to that turn, with no warm-up bar.
 //! - `count_tokens` → `POST /tokenize` (short LRU-free cache), degrading to the
 //!   trait default (`len()/4`) on transport error so accounting never aborts.
 //! - `ctx_size` / `model_name` → cached from the `/info` handshake.
@@ -49,6 +55,14 @@ pub struct RemoteDs4Engine {
     /// Small token-count memo so repeated `count_tokens` on stable prefixes
     /// avoid a round-trip.
     token_cache: RefCell<HashMap<u64, i32>>,
+    /// The tier walk accumulated by `warm_reset`/`warm_append`, shipped to
+    /// `/warm` by `warm_sync`. `.0` is the system tier, `.1` every tier below
+    /// it in order.
+    warm: (String, Vec<String>),
+    /// Whether anything has been buffered since the last `warm_sync`. A second
+    /// sync with nothing new must not re-POST: the server would re-run the same
+    /// prefill decision and the warm-up bar would replay from zero.
+    warm_dirty: bool,
 }
 
 impl RemoteDs4Engine {
@@ -80,6 +94,8 @@ impl RemoteDs4Engine {
             model_name: info.model_name,
             ctx_size: info.ctx_size,
             token_cache: RefCell::new(HashMap::new()),
+            warm: (String::new(), Vec::new()),
+            warm_dirty: false,
         })
     }
 
@@ -217,8 +233,51 @@ impl Engine for RemoteDs4Engine {
             session_id,
             transcript: prompt.flat().to_string(),
             opts: WireOptions::from(opts),
+            warm_appends: Vec::new(),
         };
         self.stream_turn(("/generate", &body), interrupt, on_event)
+    }
+
+    fn warm_reset(&mut self, system: &str) -> Result<(), EngineError> {
+        self.warm = (system.to_string(), Vec::new());
+        self.warm_dirty = true;
+        Ok(())
+    }
+
+    fn warm_append(&mut self, text: Option<&str>) -> Result<(), EngineError> {
+        if let Some(text) = text {
+            self.warm.1.push(text.to_string());
+            self.warm_dirty = true;
+        }
+        Ok(())
+    }
+
+    fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
+        if !self.warm_dirty || self.warm.0.is_empty() {
+            return Ok(false);
+        }
+        let body = GenerateRequest {
+            session_id: format!("warm-{}", TURN_SEQ.fetch_add(1, Ordering::Relaxed)),
+            transcript: self.warm.0.clone(),
+            // Warming is not a generation; the server ignores these, but the
+            // field is not optional on the wire.
+            opts: WireOptions::from(&GenerationOptions::default()),
+            warm_appends: self.warm.1.clone(),
+        };
+        // A prefill frame is the server's own report that it really prefilled —
+        // a cache hit streams none — so it is what the `bool` is derived from,
+        // rather than a second wire field that could disagree with it.
+        let mut prefilled = false;
+        // Warming is uninterruptible by the trait's contract, matching the
+        // local engine's `interrupt: &|| false`.
+        self.stream_turn(("/warm", &body), &|| false, &mut |ev| {
+            if matches!(ev, EngineEvent::Prefill(_)) {
+                prefilled = true;
+            }
+            on_event(ev);
+        })?;
+        self.warm_dirty = false;
+        Ok(prefilled)
     }
 
     fn count_tokens(&self, text: &str) -> i32 {

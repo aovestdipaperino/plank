@@ -430,7 +430,16 @@ fn handle_generate(
         // stanza determinism is reproduced by the engine's own streaming parser.
         let greedy = || false;
         if warm {
+            // One append per tier, in order: the client's `warm_append` calls
+            // are replayed here rather than concatenated, so the server's token
+            // buffer is framed exactly as a local engine's would be.
             eng.warm_reset(&gen_req.transcript)
+                .and_then(|()| {
+                    gen_req
+                        .warm_appends
+                        .iter()
+                        .try_for_each(|t| eng.warm_append(Some(t)))
+                })
                 .and_then(|()| eng.warm_sync(&mut on_event))
                 .map(|_| crate::engine::GenerationStats::default())
         } else {

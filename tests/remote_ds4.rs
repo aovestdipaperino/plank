@@ -236,3 +236,121 @@ fn remote_ds4_count_tokens_degrades_after_server_gone() {
     let text = "abcdefgh"; // 8 bytes -> 2 via len()/4
     assert_eq!(engine.count_tokens(text), 2);
 }
+
+/// Every `(path, body)` a recording mock has served.
+type SeenRequests = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+/// Mock that records every request body it serves, so a test can assert on what
+/// the client actually put on the wire.
+fn start_recording_mock() -> (String, SeenRequests, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen: Arc<std::sync::Mutex<Vec<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(vec![]));
+    let (stop_thread, seen_thread) = (Arc::clone(&stop), Arc::clone(&seen));
+    listener.set_nonblocking(true).unwrap();
+
+    thread::spawn(move || {
+        while !stop_thread.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    let mut reader = BufReader::new(&stream);
+                    let Some((_m, path, body)) = read_request(&mut reader) else {
+                        continue;
+                    };
+                    drop(reader);
+                    seen_thread.lock().unwrap().push((path.clone(), body));
+                    if path == "/info" {
+                        write_json(
+                            &mut stream,
+                            r#"{"model_name":"mock-ds4","ctx_size":4096,"protocol_version":1}"#,
+                        );
+                    } else if path == "/warm" {
+                        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(head.as_bytes());
+                        for f in [
+                            r#"{"type":"prefill","done":7,"total":7,"tps":9.0}"#,
+                            r#"{"type":"done","stats":{"generated":0,"tps":0.0,"ctx_used":7,"interrupted":false}}"#,
+                        ] {
+                            let _ = stream.write_all(format!("data: {f}\n\n").as_bytes());
+                        }
+                    } else {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        );
+                    }
+                    let _ = stream.flush();
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (format!("http://127.0.0.1:{port}"), seen, stop)
+}
+
+/// The warm trio used to be silent no-ops, so a remote engine did its cold
+/// prefill lazily inside the first turn. It now rides `POST /warm`: the tier
+/// walk goes over the wire as a system text plus one entry per append, the
+/// server's prefill frames reach the caller's sink, and `warm_sync` reports
+/// that a prefill really ran.
+#[test]
+fn remote_ds4_warm_posts_the_tier_walk_and_streams_prefill() {
+    let (base, seen, stop) = start_recording_mock();
+    let mut engine = RemoteDs4Engine::connect(&base, None).expect("connect");
+
+    engine.warm_reset("SYSTEM PROMPT").expect("reset");
+    engine.warm_append(None).expect("system tier append");
+    engine.warm_append(Some("project context")).expect("tier 2");
+    engine.warm_append(Some("volatile bits")).expect("tier 3");
+
+    let mut prefill_total = 0;
+    let prefilled = engine
+        .warm_sync(&mut |ev| {
+            if let EngineEvent::Prefill(p) = ev {
+                prefill_total = p.total;
+            }
+        })
+        .expect("warm");
+
+    assert!(prefilled, "the server's prefill frames were not reported");
+    assert_eq!(prefill_total, 7, "prefill progress did not reach the sink");
+
+    let seen = seen.lock().unwrap();
+    let (path, body) = seen.iter().find(|(p, _)| p == "/warm").expect("no /warm");
+    assert_eq!(path, "/warm");
+    let req: serde_json::Value = serde_json::from_str(body).expect("valid request body");
+    assert_eq!(req["transcript"], "SYSTEM PROMPT");
+    // One entry per *appended* tier, in order, and framed separately rather
+    // than concatenated — a tier boundary must stay a message boundary.
+    assert_eq!(
+        req["warm_appends"],
+        serde_json::json!(["project context", "volatile bits"]),
+    );
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// A second sync with nothing newly buffered must not re-POST: the server would
+/// redo the same decision and the warm-up bar would replay from zero.
+#[test]
+fn remote_ds4_warm_sync_is_idempotent_until_more_is_buffered() {
+    let (base, seen, stop) = start_recording_mock();
+    let mut engine = RemoteDs4Engine::connect(&base, None).expect("connect");
+    engine.warm_reset("SYSTEM").expect("reset");
+    assert!(engine.warm_sync(&mut |_| {}).expect("first sync"));
+    assert!(!engine.warm_sync(&mut |_| {}).expect("second sync"));
+    assert_eq!(
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p == "/warm")
+            .count(),
+        1,
+    );
+    stop.store(true, Ordering::Relaxed);
+}
