@@ -103,6 +103,9 @@ pub struct ToolContext {
     /// Plugins activated for this session, contributing skills, agents and
     /// templates alongside the local ones.
     pub plugins: crate::plugins::PluginSet,
+    /// WASM components admitted this session, and the runtime they run in.
+    /// Lives beside `plugins` because a component *is* a plugin contribution.
+    pub wasm: crate::wasmreg::Session,
     /// Seatbelt sandbox policy for model-initiated bash commands.
     pub sandbox: crate::sandbox::Sandbox,
     /// User-only warnings from non-blocking hook failures, drained by the UI
@@ -204,6 +207,7 @@ impl ToolContext {
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
             plugins: crate::plugins::PluginSet::default(),
+            wasm: crate::wasmreg::Session::default(),
             sandbox: crate::sandbox::Sandbox::default(),
             hook_warnings: Vec::new(),
             skills: Vec::new(),

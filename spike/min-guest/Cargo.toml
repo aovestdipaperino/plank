@@ -1,0 +1,25 @@
+# Feasibility-stage guest for the WASM plugin spike (docs/WASM-PLUGINS.md).
+#
+# Deliberately NOT a workspace member of plank: it targets
+# wasm32-unknown-unknown, so folding it into the host build would drag a
+# cross-target into every `cargo build`. Built on demand by
+# `spike/build-guest.sh`; the tests that use it skip when its artifact is
+# absent, which is the normal state of a checkout.
+[workspace]
+
+[package]
+name = "plank-min-guest"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

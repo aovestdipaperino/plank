@@ -3535,7 +3535,7 @@ impl Agent<'_> {
                 self.compact("user request", arg)?;
             }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
-            "/plugins" => print!("{}", crate::plugins::render_list(&self.tool_ctx.plugins)),
+            "/plugins" => print!("{}", self.plugins_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
@@ -3692,7 +3692,29 @@ impl Agent<'_> {
                     self.run_turn()?;
                 }
                 Some(Err(e)) => println!("{e}"),
-                None => println!("unknown command: {cmd}"),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            println!("{line}");
+                        }
+                        if out.inject.is_some() {
+                            // No input box to prefill on this path. Said out
+                            // loud rather than dropped: a component that looks
+                            // like it did nothing is worse than one that
+                            // explains what it could not do here.
+                            println!(
+                                "({cmd} wanted to prefill the input box; not available on the plain REPL)"
+                            );
+                        }
+                        if let Some(prompt) = out.prompt {
+                            print!("{}", status::format_user_prompt_echo(&prompt, self.color));
+                            self.session.push(Message::user(prompt));
+                            self.run_turn()?;
+                        }
+                    }
+                    Some(Err(e)) => println!("{e}"),
+                    None => println!("unknown command: {cmd}"),
+                },
             },
         }
         Ok(true)
@@ -5471,6 +5493,63 @@ the original is frozen and listed in /tree"
         Some(crate::skills::render(skill, arg))
     }
 
+    /// `/plugins` and its one subcommand, shared by both front ends so the
+    /// plain REPL and the TUI cannot drift.
+    ///
+    /// Bare `/plugins` lists; `/plugins trust <id>` approves a held WASM
+    /// component and loads it immediately. Approval is a deliberate, typed act
+    /// rather than a startup prompt: a modal question before the first turn is
+    /// exactly the wrong moment to ask, and a component the user never uses
+    /// should never have to be answered for at all.
+    fn plugins_command(&mut self, arg: &str) -> String {
+        let mut words = arg.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("trust"), Some(id)) => {
+                let home =
+                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".plank"));
+                let project = self.tool_ctx.cwd.clone();
+                match self.tool_ctx.wasm.approve(id, home.as_deref(), &project) {
+                    Ok(name) => format!("approved and loaded wasm component '{name}'\n"),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("trust"), None) => "usage: /plugins trust <component-id>\n".to_string(),
+            (Some(other), _) => format!("unknown /plugins subcommand: {other}\n"),
+            (None, _) => {
+                let mut out = crate::plugins::render_list(&self.tool_ctx.plugins);
+                out.push_str(&crate::wasmreg::render_held(&self.tool_ctx.wasm.registry));
+                out
+            }
+        }
+    }
+
+    /// Resolves `/name args` against this session's WASM `command` components.
+    ///
+    /// Tried only after skills and templates, so a component can never shadow
+    /// a built-in or a user's own extension — the same precedence the slash
+    /// menu shows. `None` means no component owns the name.
+    fn wasm_command(
+        &mut self,
+        cmd: &str,
+        arg: &str,
+    ) -> Option<Result<crate::wasmreg::CmdOutput, String>> {
+        let name = cmd.strip_prefix('/')?;
+        if !self
+            .tool_ctx
+            .wasm
+            .registry
+            .commands()
+            .iter()
+            .any(|(_, c)| c.name == name)
+        {
+            return None;
+        }
+        // Split borrow: the registry drives the call and the host executes it,
+        // and they live in the same struct.
+        let wasm = &mut self.tool_ctx.wasm;
+        Some(wasm.registry.run_command(&mut *wasm.host, name, arg))
+    }
+
     /// Resolves an unrecognized `/name args` against the user's extensions:
     /// skills first, then prompt templates (issue #67). `None` means no
     /// match — the caller reports an unknown command; `Some(Err)` is a
@@ -5561,20 +5640,21 @@ impl TuiInput {
             stash: String::new(),
             popup: None,
             slash: None,
-            slash_catalog: crate::slashmenu::catalog(&[], &[]),
+            slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
         }
     }
 
-    /// Replaces the `/` menu's candidate list, folding this session's skills
-    /// and templates in beside the built-ins.
+    /// Replaces the `/` menu's candidate list, folding this session's skills,
+    /// templates and WASM commands in beside the built-ins.
     fn set_slash_catalog(
         &mut self,
         skills: &[crate::skills::Skill],
         templates: &[crate::templates::Template],
+        wasm: &[(&str, &crate::wasmreg::CommandSpec)],
     ) {
-        self.slash_catalog = crate::slashmenu::catalog(skills, templates);
+        self.slash_catalog = crate::slashmenu::catalog(skills, templates, wasm);
     }
 
     /// The prompt as the renderer needs it: text, cursor, and selection, all
@@ -6143,7 +6223,11 @@ impl Agent<'_> {
         let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
         input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
-        input.set_slash_catalog(&self.skills, &self.templates);
+        input.set_slash_catalog(
+            &self.skills,
+            &self.templates,
+            &self.tool_ctx.wasm.registry.commands(),
+        );
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
 
@@ -9006,7 +9090,7 @@ impl Agent<'_> {
                 }
             }
             "/plugins" => {
-                for line in crate::plugins::render_list(&self.tool_ctx.plugins).lines() {
+                for line in self.plugins_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }
@@ -9229,7 +9313,27 @@ impl Agent<'_> {
                     }
                 }
                 Some(Err(e)) => log.push_plain(e),
-                None => log.push_plain(format!("unknown command: {cmd}")),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            log.push_plain(line.clone());
+                        }
+                        if let Some(text) = out.inject {
+                            input.buf.set_text(text);
+                        }
+                        if let Some(prompt) = out.prompt {
+                            log.push_spans(tui::user_echo_spans(&prompt));
+                            self.session.push(Message::user(prompt));
+                            if let Err(e) =
+                                self.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                            {
+                                log.push_plain(format!("{cmd} failed: {e}"));
+                            }
+                        }
+                    }
+                    Some(Err(e)) => log.push_plain(e),
+                    None => log.push_plain(format!("unknown command: {cmd}")),
+                },
             },
         }
         true
@@ -10372,6 +10476,20 @@ fn new_agent(
         crate::tools::mcp::load_and_start(cfg.mcp_config_path.as_deref(), &tool_ctx.plugins);
     tool_ctx.mcp = mcp;
     contribution_warnings.extend(mcp_warnings);
+    // Before the system prompt is composed, deliberately: a `tool` component
+    // changes the tool list, which changes the prompt, which changes the Tier 1
+    // fingerprint. Activating after that point would build a checkpoint for a
+    // prompt the session does not actually use.
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let plank_home = home.as_ref().map(|h| h.join(".plank"));
+        let project = tool_ctx.cwd.clone();
+        let warnings =
+            tool_ctx
+                .wasm
+                .activate(&tool_ctx.plugins.clone(), plank_home.as_deref(), &project);
+        contribution_warnings.extend(warnings);
+    }
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");

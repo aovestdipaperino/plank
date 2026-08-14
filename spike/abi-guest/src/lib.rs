@@ -31,3 +31,30 @@ pub fn spin() -> FnResult<String> {
         std::hint::spin_loop();
     }
 }
+
+/// The `command` surface's first export: what slash commands this component
+/// contributes. Read once at load, never per keystroke.
+#[plugin_fn]
+pub fn command_specs() -> FnResult<String> {
+    Ok(r#"[{"name": "greet", "args": "<who>", "desc": "say hello from wasm"}]"#.to_string())
+}
+
+/// The second: run one. The reply asks the host to print, and — when given an
+/// argument — to submit a prompt, so both halves of `CmdOutput` are exercised.
+#[plugin_fn]
+pub fn command_run(input: String) -> FnResult<String> {
+    // The host sends {"name": ..., "args": ...}; this guest only has one
+    // command, so it reads the args and ignores the name.
+    let args = input
+        .split_once("\"args\":")
+        .and_then(|(_, rest)| rest.trim().strip_prefix('"'))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("")
+        .to_string();
+    if args.is_empty() {
+        return Ok(r#"{"print": ["hello from wasm"]}"#.to_string());
+    }
+    Ok(format!(
+        r#"{{"print": ["greeting {args}"], "prompt": "say hello to {args}"}}"#
+    ))
+}

@@ -673,6 +673,177 @@ fn json_str(s: &str) -> String {
     out
 }
 
+/// One slash command a `command` component contributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSpec {
+    /// Name without the leading slash.
+    pub name: String,
+    /// Argument hint for the menu; empty when it takes none.
+    pub args: String,
+    /// One-line description.
+    pub desc: String,
+}
+
+/// What a `command_run` asked plank to do.
+///
+/// Every field is optional and they compose: a command may print, *and* leave
+/// text in the input box, *and* submit a prompt. Unknown fields are ignored, as
+/// the payload-evolution rule requires.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CmdOutput {
+    /// Lines to write to scrollback.
+    pub print: Vec<String>,
+    /// Text to place in the input box, replacing what is there.
+    pub inject: Option<String>,
+    /// Text to submit to the model as if typed.
+    pub prompt: Option<String>,
+}
+
+/// Parses the `command_specs` reply.
+fn parse_command_specs(bytes: &[u8]) -> Option<Vec<CommandSpec>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let Json::Arr(items) = json_parse(text)? else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Json::Obj(fields) = item else { continue };
+        let get = |key: &str| match fields.iter().find(|(k, _)| k == key) {
+            Some((_, Json::Str(s))) => s.clone(),
+            _ => String::new(),
+        };
+        let name = get("name");
+        // A command with no name cannot be typed, so it is not a command.
+        // Leading slashes are tolerated and stripped: authors write both.
+        let name = name.trim_start_matches('/').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(CommandSpec {
+            name,
+            args: get("args"),
+            desc: get("desc"),
+        });
+    }
+    Some(out)
+}
+
+/// Parses the `command_run` reply. A malformed reply is an empty outcome
+/// rather than an error: the command ran, it just asked for nothing.
+fn parse_cmd_output(bytes: &[u8]) -> CmdOutput {
+    let mut out = CmdOutput::default();
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return out;
+    };
+    let Some(Json::Obj(fields)) = json_parse(text) else {
+        return out;
+    };
+    for (key, value) in fields {
+        match (key.as_str(), value) {
+            ("print", Json::Arr(items)) => {
+                out.print = items
+                    .iter()
+                    .filter_map(|i| match i {
+                        Json::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .collect();
+            }
+            ("print", Json::Str(s)) => out.print = vec![s],
+            ("inject", Json::Str(s)) => out.inject = Some(s),
+            ("prompt", Json::Str(s)) => out.prompt = Some(s),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A session's WASM state: the admitted components and the runtime they live
+/// in, kept together because neither is useful alone.
+///
+/// Defaults to "nothing discovered, nothing runnable", so a session that never
+/// calls [`Session::activate`] behaves exactly as it did before this existed.
+#[derive(Debug)]
+pub struct Session {
+    /// What was admitted, held back, or complained about.
+    pub registry: Registry,
+    /// The runtime. The no-op unless the `plugins` feature is on.
+    pub host: Box<dyn crate::wasmhost::WasmHost + Send>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self {
+            registry: Registry::default(),
+            host: crate::wasmhost::host(),
+        }
+    }
+}
+
+impl Session {
+    /// Discovers, judges and loads every component in `plugins`.
+    ///
+    /// Called once at startup, after the plugin set is known. Returns the
+    /// warnings the caller should show; held components are not warnings —
+    /// they are in [`Registry::held`] with a reason, because "we did not run
+    /// this" is a different message from "this is broken".
+    pub fn activate(
+        &mut self,
+        plugins: &PluginSet,
+        home: Option<&Path>,
+        project: &Path,
+    ) -> Vec<String> {
+        let found = discover(plugins);
+        let trust = home.map_or_else(TrustStore::ephemeral, TrustStore::load);
+        self.registry = Registry::build(&found, &trust, project, &mut *self.host);
+        self.registry.warnings.clone()
+    }
+
+    /// Approves a held component and loads it, without waiting for a restart.
+    ///
+    /// # Errors
+    /// Returns a message when nothing is held under `id`, when the approval
+    /// cannot be recorded, or when the module then fails to load.
+    pub fn approve(
+        &mut self,
+        id: &str,
+        home: Option<&Path>,
+        project: &Path,
+    ) -> Result<String, String> {
+        let idx = self
+            .registry
+            .held
+            .iter()
+            .position(|(c, _)| c.manifest.id == id)
+            .ok_or_else(|| format!("no held wasm component '{id}'"))?;
+        let (component, _) = self.registry.held[idx].clone();
+        let sha = module_sha256(&component.path)
+            .ok_or_else(|| format!("cannot hash {}", component.path.display()))?;
+        let mut trust = home.map_or_else(TrustStore::ephemeral, TrustStore::load);
+        trust.approve(&component, &sha, project)?;
+
+        // Re-run the admission path for this one component rather than
+        // hand-rolling a second load: the export cross-check and the
+        // command-spec fetch must not have two implementations that can drift.
+        let one = WasmSet {
+            components: vec![component],
+            warnings: Vec::new(),
+        };
+        let fresh = Registry::build(&one, &trust, project, &mut *self.host);
+        if let Some(l) = fresh.loaded.into_iter().next() {
+            self.registry.held.remove(idx);
+            let name = l.component.manifest.id.clone();
+            self.registry.loaded.push(l);
+            return Ok(name);
+        }
+        Err(fresh
+            .warnings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| format!("{id} was approved but would not load")))
+    }
+}
+
 /// A component that was admitted, and the host handle it loaded into.
 #[derive(Debug)]
 pub struct Loaded {
@@ -681,6 +852,12 @@ pub struct Loaded {
     /// Consecutive failures. At [`STRIKE_LIMIT`] the component is disabled for
     /// the rest of the session.
     pub strikes: u8,
+    /// Slash commands this component contributes, read from `command_specs`
+    /// once at load. Read once rather than per keystroke: the menu is rebuilt
+    /// on every input change, and a WASM call per frame to re-derive a list
+    /// that cannot change is the kind of cost that turns a feature into a
+    /// regression.
+    pub commands: Vec<CommandSpec>,
 }
 
 /// How many times a component may trap before it is disabled for the session.
@@ -742,17 +919,104 @@ impl Registry {
                 ));
                 continue;
             };
-            match host.load(&component.manifest.id, &bytes) {
-                Ok(_) => out.loaded.push(Loaded {
-                    component: component.clone(),
-                    strikes: 0,
-                }),
-                Err(e) => out
-                    .warnings
-                    .push(format!("wasm component '{}': {e}", component.manifest.id)),
+            if let Err(e) = host.load(&component.manifest.id, &bytes) {
+                out.warnings
+                    .push(format!("wasm component '{}': {e}", component.manifest.id));
+                continue;
             }
+            // Claiming a surface you did not implement is a load-time error,
+            // not a mystery at the first call: a `command` component whose
+            // exports are missing would otherwise sit in the slash menu and
+            // fail only once a user picked it.
+            let missing = missing_exports(component, host);
+            if !missing.is_empty() {
+                out.warnings.push(format!(
+                    "wasm component '{}' claims surfaces it does not implement (missing {})",
+                    component.manifest.id,
+                    missing.join(", ")
+                ));
+                continue;
+            }
+            let commands = if component.manifest.surfaces.contains(&Surface::Command) {
+                match host.call(&component.manifest.id, "command_specs", b"") {
+                    Ok(bytes) => parse_command_specs(&bytes).unwrap_or_else(|| {
+                        out.warnings.push(format!(
+                            "wasm component '{}': command_specs returned unreadable JSON",
+                            component.manifest.id
+                        ));
+                        Vec::new()
+                    }),
+                    Err(e) => {
+                        out.warnings
+                            .push(format!("wasm component '{}': {e}", component.manifest.id));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            out.loaded.push(Loaded {
+                component: component.clone(),
+                strikes: 0,
+                commands,
+            });
         }
         out
+    }
+
+    /// Every slash command contributed this session, as `(component id, spec)`.
+    #[must_use]
+    pub fn commands(&self) -> Vec<(&str, &CommandSpec)> {
+        self.loaded
+            .iter()
+            .filter(|l| l.strikes < STRIKE_LIMIT)
+            .flat_map(|l| {
+                l.commands
+                    .iter()
+                    .map(move |c| (l.component.manifest.id.as_str(), c))
+            })
+            .collect()
+    }
+
+    /// Runs `name` against the component that contributes it.
+    ///
+    /// A trap costs the component a strike and returns the message for the
+    /// user; it never propagates as a session error. That is the whole
+    /// containment claim, applied at the one place a user can trigger a call
+    /// on purpose.
+    ///
+    /// # Errors
+    /// Returns a human-readable message when no live component owns `name`, or
+    /// when the call traps.
+    pub fn run_command(
+        &mut self,
+        host: &mut dyn crate::wasmhost::WasmHost,
+        name: &str,
+        args: &str,
+    ) -> Result<CmdOutput, String> {
+        let name = name.trim_start_matches('/');
+        let id = self
+            .commands()
+            .into_iter()
+            .find(|(_, c)| c.name == name)
+            .map(|(id, _)| id.to_string())
+            .ok_or_else(|| format!("no wasm command '{name}'"))?;
+        let payload = format!(
+            "{{\"name\": {}, \"args\": {}}}",
+            json_str(name),
+            json_str(args)
+        );
+        match host.call(&id, "command_run", payload.as_bytes()) {
+            Ok(bytes) => Ok(parse_cmd_output(&bytes)),
+            Err(e) => {
+                let disabled = self.strike(&id);
+                Err(if disabled {
+                    format!("{id}: {e} (disabled for this session after {STRIKE_LIMIT} failures)")
+                } else {
+                    format!("{id}: {e}")
+                })
+            }
+        }
     }
 
     /// Records a failure against `id`, returning whether that strike disabled
@@ -778,6 +1042,48 @@ impl Registry {
             .iter()
             .any(|l| l.component.manifest.id == id && l.strikes < STRIKE_LIMIT)
     }
+}
+
+/// Renders the held-components section of `/plugins`: what was found, why it
+/// is not running, and the exact command that would approve it.
+///
+/// Held components are not warnings. "We did not run this" is a different
+/// message from "this is broken", and collapsing the two is how a security
+/// decision gets scrolled past.
+#[must_use]
+pub fn render_held(registry: &Registry) -> String {
+    use std::fmt::Write as _;
+
+    let mut out = String::new();
+    if registry.held.is_empty() {
+        return out;
+    }
+    out.push_str("\nwasm components awaiting approval:\n");
+    for (component, decision) in &registry.held {
+        let _ = writeln!(
+            out,
+            "  {} ({}) — {}",
+            component.manifest.id,
+            component.origin.label(),
+            decision.reason()
+        );
+        let caps: Vec<&str> = component
+            .manifest
+            .capabilities
+            .iter()
+            .map(|c| c.label())
+            .collect();
+        let _ = write!(out, "    wants: {}", caps.join(", "));
+        if component.is_privileged() {
+            out.push_str("  ⚠ this is not a sandboxed component");
+        }
+        let _ = writeln!(
+            out,
+            "\n    approve with: /plugins trust {}",
+            component.manifest.id
+        );
+    }
+    out
 }
 
 /// Renders the WASM section of the `/plugins` listing.
@@ -816,6 +1122,27 @@ pub fn render_components(set: &WasmSet) -> String {
         let _ = writeln!(out, "  warning: {w}");
     }
     out
+}
+
+/// Exports a component's claimed surfaces require but the module does not have.
+///
+/// Only the surfaces implemented so far are checked. A surface plank cannot yet
+/// drive is not a reason to refuse a module that is otherwise sound — the
+/// author may be ahead of the host, which the payload-evolution rule expects.
+fn missing_exports(
+    component: &WasmComponent,
+    host: &dyn crate::wasmhost::WasmHost,
+) -> Vec<&'static str> {
+    let id = &component.manifest.id;
+    let mut missing = Vec::new();
+    if component.manifest.surfaces.contains(&Surface::Command) {
+        for export in ["command_specs", "command_run"] {
+            if !host.has_export(id, export) {
+                missing.push(export);
+            }
+        }
+    }
+    missing
 }
 
 /// SHA-256 of a module's bytes, via the same `shasum` path the image cache
@@ -1140,6 +1467,7 @@ mod tests {
             loaded: vec![Loaded {
                 component: component(Origin::UserScan, vec![]),
                 strikes: 0,
+                commands: Vec::new(),
             }],
             ..Registry::default()
         };
@@ -1153,6 +1481,83 @@ mod tests {
         assert!(reg.strike("dev.plank.demo"));
         assert!(!reg.is_live("dev.plank.demo"));
         assert!(!reg.strike("nobody"), "an unknown id is not a strike");
+    }
+
+    #[test]
+    fn command_specs_parse_and_tolerate_a_leading_slash() {
+        let specs = parse_command_specs(
+            br#"[{"name": "/greet", "args": "<who>", "desc": "hi"},
+                 {"name": "bare"},
+                 {"desc": "nameless, so not a command"}]"#,
+        )
+        .expect("parsed");
+        assert_eq!(specs.len(), 2, "{specs:?}");
+        assert_eq!(specs[0].name, "greet", "a leading slash is stripped");
+        assert_eq!(specs[1].name, "bare");
+        assert!(specs[1].args.is_empty() && specs[1].desc.is_empty());
+    }
+
+    /// A command that replies with nonsense still *ran*; the outcome is empty,
+    /// not an error. Erroring here would cost the component a strike for the
+    /// host's inability to read a reply it did not have to send.
+    #[test]
+    fn a_command_reply_degrades_to_an_empty_outcome() {
+        assert_eq!(parse_cmd_output(b"not json"), CmdOutput::default());
+        assert_eq!(parse_cmd_output(b"{}"), CmdOutput::default());
+        let out = parse_cmd_output(br#"{"print": "one line", "inject": "x", "nonsense": 1}"#);
+        assert_eq!(out.print, vec!["one line".to_string()]);
+        assert_eq!(out.inject.as_deref(), Some("x"));
+        assert_eq!(out.prompt, None, "unknown fields are ignored, not fatal");
+    }
+
+    /// A disabled component drops out of the menu entirely. Leaving it listed
+    /// would offer the user a command that is guaranteed to fail.
+    #[test]
+    fn a_struck_out_component_stops_contributing_commands() {
+        let mut reg = Registry {
+            loaded: vec![Loaded {
+                component: component(Origin::UserScan, vec![]),
+                strikes: 0,
+                commands: vec![CommandSpec {
+                    name: "greet".to_string(),
+                    args: String::new(),
+                    desc: String::new(),
+                }],
+            }],
+            ..Registry::default()
+        };
+        assert_eq!(reg.commands().len(), 1);
+        for _ in 0..STRIKE_LIMIT {
+            reg.strike("dev.plank.demo");
+        }
+        assert!(
+            reg.commands().is_empty(),
+            "a disabled component must not be offered"
+        );
+    }
+
+    /// The held listing has to name the component, the reason, what it wants,
+    /// and the exact command that approves it — a security decision the user
+    /// cannot act on is just noise.
+    #[test]
+    fn the_held_listing_says_what_it_wants_and_how_to_approve_it() {
+        let reg = Registry {
+            held: vec![(
+                component(Origin::ProjectScan, vec![Capability::Exec]),
+                Decision::Unknown,
+            )],
+            ..Registry::default()
+        };
+        let out = render_held(&reg);
+        assert!(out.contains("dev.plank.demo"), "{out}");
+        assert!(out.contains("not seen before"), "{out}");
+        assert!(out.contains("exec"), "{out}");
+        assert!(out.contains("not a sandboxed component"), "{out}");
+        assert!(out.contains("/plugins trust dev.plank.demo"), "{out}");
+        assert!(
+            render_held(&Registry::default()).is_empty(),
+            "nothing held, nothing said"
+        );
     }
 
     /// Test-only helper: sorted copy, so an expectation can be written in the

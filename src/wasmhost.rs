@@ -76,7 +76,12 @@ pub struct LoadedPlugin {
 /// [`WasmError`] rather than panicking or propagating a runtime type, so the
 /// runtime never appears in a signature outside this module and swapping it
 /// stays a one-file change.
-pub trait WasmHost {
+/// `Send` is required, not incidental: [`crate::tools::ToolContext`] owns a
+/// host and is moved into the scoped thread that drives a generation pass.
+/// `Sync` deliberately is *not* — the design forbids re-entrant calls into one
+/// plugin, and plank serializes per instance, so shared access is exactly the
+/// thing that must stay impossible.
+pub trait WasmHost: std::fmt::Debug + Send {
     /// Loads a module and completes the ABI handshake.
     ///
     /// # Errors
@@ -84,11 +89,27 @@ pub trait WasmHost {
     /// [`WasmError::Abi`] when `plank_abi` is absent or disagrees.
     fn load(&mut self, source: &str, wasm: &[u8]) -> Result<LoadedPlugin, WasmError>;
 
-    /// Calls an export with a byte payload, returning its byte reply.
+    /// Calls an export on the plugin loaded under `id`, with a byte payload,
+    /// returning its byte reply.
+    ///
+    /// `id` rather than an opaque handle: the registry already keys everything
+    /// on the component id, and a second identity to keep in sync would only be
+    /// a second thing that can drift.
     ///
     /// # Errors
-    /// [`WasmError::Trap`] when the guest traps or exceeds its budget.
-    fn call(&mut self, export: &str, input: &[u8]) -> Result<Vec<u8>, WasmError>;
+    /// [`WasmError::Trap`] when the guest traps or exceeds its budget,
+    /// [`WasmError::Load`] when nothing is loaded under `id`.
+    fn call(&mut self, id: &str, export: &str, input: &[u8]) -> Result<Vec<u8>, WasmError>;
+
+    /// Whether an export exists on the plugin loaded under `id`.
+    ///
+    /// A surface's contract is "these exports exist", and claiming a surface
+    /// you did not implement is a load-time error rather than a mystery at the
+    /// first call. The no-op answers `false` for everything, which is honest:
+    /// it has nothing loaded.
+    fn has_export(&self, _id: &str, _export: &str) -> bool {
+        false
+    }
 
     /// Whether this host can actually run plugins. `false` for the no-op, and
     /// the one thing a caller may branch on: a `/plugins` listing says "not
@@ -110,7 +131,7 @@ impl WasmHost for NoWasmHost {
         Err(WasmError::Unsupported)
     }
 
-    fn call(&mut self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, WasmError> {
+    fn call(&mut self, _id: &str, _export: &str, _input: &[u8]) -> Result<Vec<u8>, WasmError> {
         Err(WasmError::Unsupported)
     }
 }
@@ -118,7 +139,7 @@ impl WasmHost for NoWasmHost {
 /// The host plank uses in this build: Extism when the feature is on, the no-op
 /// otherwise. Returned boxed so the choice is invisible to callers.
 #[must_use]
-pub fn host() -> Box<dyn WasmHost> {
+pub fn host() -> Box<dyn WasmHost + Send> {
     #[cfg(feature = "plugins")]
     {
         Box::new(ExtismHost::default())
@@ -145,17 +166,20 @@ mod extism_host {
     /// Phase 2's business, and will be far tighter than this.
     const CALL_TIMEOUT_MS: u64 = 1_000;
 
-    /// Extism-backed host. One instance holds at most one plugin at this
-    /// stage; the registry that holds many is Phase 1.
+    /// Extism-backed host holding every loaded plugin, keyed by component id.
+    ///
+    /// One instance per session. Extism plugins are not `Sync` and plank
+    /// serializes per instance anyway (the design forbids re-entrant calls into
+    /// one plugin), so a plain map behind `&mut self` is the whole story.
     #[derive(Default)]
     pub struct ExtismHost {
-        plugin: Option<extism::Plugin>,
+        plugins: std::collections::HashMap<String, extism::Plugin>,
     }
 
     impl std::fmt::Debug for ExtismHost {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("ExtismHost")
-                .field("loaded", &self.plugin.is_some())
+                .field("loaded", &self.plugins.len())
                 .finish()
         }
     }
@@ -187,22 +211,28 @@ mod extism_host {
                     "{source}: plugin speaks ABI {claimed}, this plank implements {ABI_VERSION}"
                 )));
             }
-            self.plugin = Some(plugin);
+            self.plugins.insert(source.to_string(), plugin);
             Ok(LoadedPlugin {
                 source: source.to_string(),
                 abi: claimed,
             })
         }
 
-        fn call(&mut self, export: &str, input: &[u8]) -> Result<Vec<u8>, WasmError> {
+        fn call(&mut self, id: &str, export: &str, input: &[u8]) -> Result<Vec<u8>, WasmError> {
             let plugin = self
-                .plugin
-                .as_mut()
-                .ok_or_else(|| WasmError::Load("no plugin loaded".to_string()))?;
+                .plugins
+                .get_mut(id)
+                .ok_or_else(|| WasmError::Load(format!("nothing loaded under '{id}'")))?;
             plugin
                 .call::<&[u8], &[u8]>(export, input)
                 .map(<[u8]>::to_vec)
-                .map_err(|e| WasmError::Trap(format!("{export}: {e}")))
+                .map_err(|e| WasmError::Trap(format!("{id}:{export}: {e}")))
+        }
+
+        fn has_export(&self, id: &str, export: &str) -> bool {
+            self.plugins
+                .get(id)
+                .is_some_and(|p| p.function_exists(export))
         }
 
         fn is_live(&self) -> bool {
@@ -221,7 +251,8 @@ mod tests {
     fn the_noop_host_refuses_everything_without_panicking() {
         let mut h = NoWasmHost;
         assert_eq!(h.load("x.wasm", b"\0asm"), Err(WasmError::Unsupported));
-        assert_eq!(h.call("plank_abi", b""), Err(WasmError::Unsupported));
+        assert_eq!(h.call("any", "plank_abi", b""), Err(WasmError::Unsupported));
+        assert!(!h.has_export("any", "plank_abi"));
         assert!(!h.is_live(), "the no-op must not claim it can run plugins");
     }
 

@@ -6,6 +6,29 @@
 > and trusted. None of that is implemented. What *is* implemented is the spike
 > below — the trait boundary and the runtime handshake, and nothing more.
 
+## What is implemented
+
+**Phase 0 — feasibility spike.** `src/wasmhost.rs` behind the `plugins`
+feature: the `WasmHost` trait, its always-available no-op, and the Extism
+implementation. Answers below.
+
+**Phase 1 — discovery, trust, registry.** `src/wasmreg.rs`, compiled
+unconditionally. WASM is a component kind inside the existing plugin format;
+trust keys on the module's SHA-256 with per-repo approval for project-local
+components.
+
+**Phase 2 — the `command` surface.** Components claiming `command` contribute
+slash commands to the menu and to both front ends' dispatch. Specs are read
+once at load, never per keystroke. A component claiming a surface whose exports
+it lacks is refused at load rather than failing when a user first picks it.
+Held components are listed by `/plugins` with what they want and the exact
+`/plugins trust <id>` that approves them — approval is a typed act, not a modal
+question before the first turn.
+
+Not yet implemented: `frame`, `segment`, `tool` and `observer` surfaces, the
+event bus, and the capability host functions (a component may *request*
+capabilities and the user approves them, but no host function is wired yet).
+
 ## Feasibility spike (landed)
 
 `src/wasmhost.rs` behind the `plugins` feature (off by default), plus a guest in
