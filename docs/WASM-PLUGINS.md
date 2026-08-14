@@ -94,13 +94,24 @@ Decoding is total — a malformed buffer costs the frame, never the session — 
 the count is validated against the declared area *before* anything is
 allocated, so a two-byte edit cannot ask the host for a huge allocation.
 
-**Still to do for `frame`:** it has no UI yet. The driver is complete and
-tested against a real bouncing-glyph guest, but nothing in `tui.rs` opens one, so
-there is no slash command, no idle rotation and no blitter reuse. The arcade
-migration — six games as guest crates, `ScreensaverFace` becoming a registry,
-`tui::arcade_frame` becoming generic, embedded built-in `.wasm` blobs, and the
-`sound` capability a guest needs because it cannot shell out — is the next
-increment and is larger than everything before it combined.
+**`frame` is wired into the TUI.** `/frame [id] [face]` opens one, the loop
+steps it against the real frame clock, `draw_wasm_frame` blits it, and keys go
+to the component until it closes. It shares `draw_arcade`'s ground painter
+rather than reimplementing it, so a component gets the same veil and the same
+real-black as a built-in face — pinned by a test, since the two must not drift.
+
+**One module, many faces.** The arcade port puts *every* face in a single
+`.wasm` rather than one module per game. `frame_open` therefore carries an
+`arg` naming which face to open, and a component's `command_run` may reply
+`{"open": "<face>"}` to open its own frame — which is how one module gives each
+face its own slash command. A component may only open its own frame: opening
+someone else's window is a capability, and this is a convenience.
+
+**Still to do:** the arcade port itself — the six faces reimplemented as one
+guest module, `ScreensaverFace` becoming a registry over idle-eligible
+components, the embedded built-in blob so an empty plugins directory still has
+screensavers, and the `sound` capability a guest needs because it cannot shell
+out.
 
 Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
 compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.

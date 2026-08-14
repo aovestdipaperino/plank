@@ -3650,6 +3650,11 @@ impl Agent<'_> {
                 self.compact("user request", arg)?;
             }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
+            "/frame" => println!(
+                "/frame needs the full-screen TUI — a piped session has no screen to give a \
+                 component\n{}",
+                self.frame_command("")
+            ),
             "/plugins" => print!("{}", self.plugins_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
@@ -5608,6 +5613,47 @@ the original is frozen and listed in /tree"
         Some(crate::skills::render(skill, arg))
     }
 
+    /// `/frame [id]`: lists openable frame components, or asks for one to be
+    /// opened.
+    ///
+    /// Opening is a *request*, not an action: the frame is owned by the TUI
+    /// event loop, which picks this up on its next tick. That keeps the
+    /// component's lifetime in one place instead of split between the slash
+    /// handler and the loop.
+    fn frame_command(&mut self, arg: &str) -> String {
+        use std::fmt::Write as _;
+
+        // `/frame <id> [face]`: the tail selects which frame a component that
+        // offers several should open.
+        let (id, face) = arg
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((arg.trim(), ""));
+        let openable: Vec<(String, String)> = self
+            .tool_ctx
+            .wasm
+            .openable_frames()
+            .into_iter()
+            .map(|(id, plugin)| (id.to_string(), plugin.to_string()))
+            .collect();
+        if openable.is_empty() {
+            return "no wasm frame components are loaded\n".to_string();
+        }
+        if id.is_empty() {
+            let mut out = String::from("openable frames:\n");
+            for (id, plugin) in &openable {
+                let _ = writeln!(out, "  {id} ({plugin})");
+            }
+            out.push_str("open one with: /frame <id>\n");
+            return out;
+        }
+        if !openable.iter().any(|(known, _)| known == id) {
+            return format!("no openable wasm frame '{id}'\n");
+        }
+        self.tool_ctx.wasm.pending_open = Some((id.to_string(), face.to_string()));
+        String::new()
+    }
+
     /// `/plugins` and its one subcommand, shared by both front ends so the
     /// plain REPL and the TUI cannot drift.
     ///
@@ -6379,6 +6425,11 @@ impl Agent<'_> {
         // arrive.
         let mut arcade = crate::arcade::Arcade::new();
         let mut arcade_last = Instant::now();
+        // An open WASM frame, and its own frame clock. Kept beside the arcade
+        // rather than inside it: a component is not a face the arcade knows
+        // about, and folding it in would mean `Arcade` holding a registry.
+        let mut wasm_frame: Option<crate::wasmreg::OpenFrame> = None;
+        let mut wasm_frame_last = Instant::now();
         // When the user was last heard from, for `ui.screensaver`. Only real
         // input counts: a poll that times out is exactly the idleness the
         // screensaver is waiting for. A running turn never reaches this loop,
@@ -6444,6 +6495,59 @@ impl Agent<'_> {
                 let dt = arcade_last.elapsed();
                 arcade_last = Instant::now();
                 arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+            }
+            // A `/frame <id>` from the last tick's slash handling.
+            // Two ways in: a `/frame` the user typed, or a component's own
+            // command asking to open its frame — which is how one module
+            // holding many faces gives each of them a command.
+            let pending = self
+                .tool_ctx
+                .wasm
+                .pending_open
+                .take()
+                .or_else(|| self.tool_ctx.wasm.registry.take_pending_frame());
+            if let Some((id, face)) = pending {
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                match self.tool_ctx.wasm.open_frame(
+                    &id,
+                    &face,
+                    w,
+                    h.saturating_sub(1),
+                    arcade_seed(),
+                ) {
+                    Ok(open) => {
+                        wasm_frame = Some(open);
+                        wasm_frame_last = Instant::now();
+                        // The component owns the pointer while it is up, for
+                        // the same reason the arcade does.
+                        arcade_hover_reporting(true);
+                    }
+                    Err(e) => log.push_dim(e),
+                }
+            }
+            if let Some(open) = wasm_frame.as_mut() {
+                let dt = wasm_frame_last.elapsed();
+                wasm_frame_last = Instant::now();
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                let now_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis()),
+                )
+                .unwrap_or(0);
+                let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
+                // A step that fails closes the frame and says why: a
+                // full-screen component that can no longer say what to draw
+                // would otherwise sit there looking like a hang.
+                if let Err(e) =
+                    self.tool_ctx
+                        .wasm
+                        .step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
+                {
+                    log.push_dim(e);
+                    wasm_frame = None;
+                    arcade_hover_reporting(false);
+                }
             }
             input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
@@ -6527,6 +6631,12 @@ impl Agent<'_> {
                     // Drawn last: the arcade covers the whole frame.
                     if arcade.is_open() {
                         tui::draw_arcade(f, &arcade);
+                    }
+                    // And a WASM frame covers it in turn — the two are never
+                    // open at once, but ordering them makes that a fact about
+                    // the code rather than an assumption about the callers.
+                    if let Some(open) = &wasm_frame {
+                        tui::draw_wasm_frame(f, open);
                     }
                     remote_capture(rem, f);
                 })
@@ -6800,6 +6910,27 @@ impl Agent<'_> {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // An open component owns every key, on the same terms as the
+            // arcade below it.
+            if let Some(open) = &wasm_frame {
+                let code = tui::key_code_name(key);
+                match self.tool_ctx.wasm.frame_key(open, &code) {
+                    Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                    Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                        if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                            log.push_dim(line);
+                        }
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                    Err(e) => {
+                        log.push_dim(e);
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                }
                 continue;
             }
             // An open easter egg owns every key until Esc/q/Ctrl-C closes it.
@@ -9208,6 +9339,11 @@ impl Agent<'_> {
             }
             "/skills" => {
                 for line in crate::skills::render_list(&self.skills).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/frame" => {
+                for line in self.frame_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }

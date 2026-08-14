@@ -734,8 +734,13 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/plugins",
-        args: "",
-        desc: "list loaded plugins and their contributions",
+        args: "[trust <id>]",
+        desc: "list loaded plugins, or approve a wasm component",
+    },
+    SlashCommand {
+        name: "/frame",
+        args: "[id]",
+        desc: "open a wasm frame component, or list the openable ones",
     },
     SlashCommand {
         name: "/templates",
@@ -880,6 +885,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/init"
             | "/skills"
             | "/plugins"
+            | "/frame"
             | "/templates"
             | "/tasks"
             | "/agent"

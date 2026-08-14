@@ -217,10 +217,16 @@ fn a_command_component_registers_and_runs() {
         .approve("dev.plank.demo", &project)
         .expect("approve");
     assert_eq!(name, "dev.plank.demo");
+    // The fixture contributes two, which is itself the point: one module may
+    // offer several commands, the way one arcade module offers several faces.
     let commands = session.registry.commands();
-    assert_eq!(commands.len(), 1, "{commands:?}");
-    assert_eq!(commands[0].1.name, "greet");
-    assert_eq!(commands[0].1.desc, "say hello from wasm");
+    assert_eq!(commands.len(), 2, "{commands:?}");
+    let greet = commands
+        .iter()
+        .find(|(_, c)| c.name == "greet")
+        .expect("greet");
+    assert_eq!(greet.1.desc, "say hello from wasm");
+    assert!(commands.iter().any(|(_, c)| c.name == "bounce"));
 
     // No argument: it prints and asks for nothing else.
     let out = session
@@ -881,7 +887,7 @@ fn a_frame_component_opens_steps_and_closes() {
     );
 
     let mut frame = session
-        .open_frame("dev.plank.bounce", 40, 20, 1)
+        .open_frame("dev.plank.bounce", "", 40, 20, 1)
         .expect("open");
     assert!(!frame.veiled);
 
@@ -930,7 +936,7 @@ fn a_frame_refuses_to_open_below_its_minimum_size() {
         frame_session("frame-min", &wasm, r#", "min_size": {"w": 30, "h": 9}"#);
 
     let err = session
-        .open_frame("dev.plank.bounce", 20, 5, 0)
+        .open_frame("dev.plank.bounce", "", 20, 5, 0)
         .unwrap_err();
     assert!(err.contains("needs at least 30x9"), "{err}");
     assert!(
@@ -939,7 +945,9 @@ fn a_frame_refuses_to_open_below_its_minimum_size() {
     );
 
     assert!(
-        session.open_frame("dev.plank.bounce", 40, 20, 0).is_ok(),
+        session
+            .open_frame("dev.plank.bounce", "", 40, 20, 0)
+            .is_ok(),
         "a big enough terminal opens"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -975,7 +983,7 @@ fn a_seed_makes_a_frame_reproducible() {
 
     let run = |session: &mut plank::wasmreg::Session, seed: u64| {
         let mut f = session
-            .open_frame("dev.plank.bounce", 40, 20, seed)
+            .open_frame("dev.plank.bounce", "", 40, 20, seed)
             .expect("open");
         session.step_frame(&mut f, 50, 40, 20, 0).expect("step");
         f.last.glyphs[0]
@@ -986,5 +994,33 @@ fn a_seed_makes_a_frame_reproducible() {
     let c = run(&mut session, 8);
     assert_eq!((a.x, a.y), (b.x, b.y), "the same seed must replay exactly");
     assert_ne!((a.x, a.y), (c.x, c.y), "a different seed must differ");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One module, many frames. The face selector reaches the guest and changes
+/// what it draws, and a component's own command can open its own frame — which
+/// together are what lets every arcade face live in a single `.wasm` with a
+/// slash command each, instead of one module per game.
+#[test]
+fn one_component_serves_several_frames_and_opens_them_from_its_own_command() {
+    let wasm = guest_or_skip!();
+    let (root, mut session) = frame_session("frame-faces", &wasm, "");
+
+    // Same seed, same size, same elapsed time — only the face differs, and the
+    // fast face has moved further by the first step.
+    let travel = |session: &mut plank::wasmreg::Session, face: &str| {
+        let mut f = session
+            .open_frame("dev.plank.bounce", face, 60, 30, 0)
+            .expect("open");
+        session.step_frame(&mut f, 100, 60, 30, 0).expect("step");
+        let g = f.last.glyphs[0];
+        (g.x, g.y)
+    };
+    let slow = travel(&mut session, "");
+    let fast = travel(&mut session, "fast");
+    assert_ne!(
+        slow, fast,
+        "the face selector never reached the guest: both drew at {slow:?}"
+    );
     let _ = std::fs::remove_dir_all(&root);
 }

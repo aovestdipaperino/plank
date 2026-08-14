@@ -811,6 +811,13 @@ pub struct CmdOutput {
     pub inject: Option<String>,
     /// Text to submit to the model as if typed.
     pub prompt: Option<String>,
+    /// Open the calling component's own frame, with this string as its `arg`.
+    ///
+    /// Deliberately not "open any component's frame": a command opening
+    /// someone else's window is a capability, and this is a convenience. It is
+    /// how one module serving many frames — every arcade face in one `.wasm` —
+    /// gives each face its own slash command.
+    pub open: Option<String>,
 }
 
 /// Parses the `command_specs` reply.
@@ -866,6 +873,7 @@ fn parse_cmd_output(bytes: &[u8]) -> CmdOutput {
             ("print", Json::Str(s)) => out.print = vec![s],
             ("inject", Json::Str(s)) => out.inject = Some(s),
             ("prompt", Json::Str(s)) => out.prompt = Some(s),
+            ("open", Json::Str(s)) => out.open = Some(s),
             _ => {}
         }
     }
@@ -1022,6 +1030,14 @@ pub struct Session {
     pub registry: Registry,
     /// The runtime. The no-op unless the `plugins` feature is on.
     pub host: Box<dyn crate::wasmhost::WasmHost + Send>,
+    /// A frame the user asked to open, waiting for the UI loop to pick it up.
+    ///
+    /// The slash handler and the loop that owns the open frame are different
+    /// functions with different borrows, and threading an `&mut Option<..>`
+    /// through the handler's dozen parameters to connect them would be worse
+    /// than a one-field handoff — the same shape `pending_aside` already uses
+    /// for `/btw`.
+    pub pending_open: Option<(String, String)>,
     /// The plank home: where trust is recorded and where the `state`
     /// capability writes. Held once, here, because the host and the trust
     /// store both need it and two callers passing the same value into one
@@ -1046,6 +1062,7 @@ impl Session {
         Self {
             registry: Registry::default(),
             host: crate::wasmhost::host(home),
+            pending_open: None,
             home: home.map(Path::to_path_buf),
         }
     }
@@ -1108,7 +1125,18 @@ impl Session {
     /// # Errors
     /// Returns a message when no live component owns `id`, when the area is
     /// below the component's declared minimum, or when `frame_open` traps.
-    pub fn open_frame(&mut self, id: &str, w: u16, h: u16, seed: u64) -> Result<OpenFrame, String> {
+    /// `arg` selects *which* frame a component offers, for a component that
+    /// offers several — one module holding every arcade face, rather than one
+    /// module per face. It is passed through untouched; a component with a
+    /// single frame ignores it.
+    pub fn open_frame(
+        &mut self,
+        id: &str,
+        arg: &str,
+        w: u16,
+        h: u16,
+        seed: u64,
+    ) -> Result<OpenFrame, String> {
         let manifest = self
             .registry
             .loaded
@@ -1122,7 +1150,10 @@ impl Session {
                 "{id} needs at least {min_w}x{min_h}; this terminal offers {w}x{h}"
             ));
         }
-        let payload = format!("{{\"w\": {w}, \"h\": {h}, \"seed\": {seed}}}");
+        let payload = format!(
+            "{{\"w\": {w}, \"h\": {h}, \"seed\": {seed}, \"arg\": {}}}",
+            json_str(arg)
+        );
         if let Err(e) = self.host.call(id, "frame_open", payload.as_bytes()) {
             let disabled = self.registry.strike(id);
             return Err(if disabled {
@@ -1295,6 +1326,9 @@ pub const STRIKE_LIMIT: u8 = 3;
 pub struct Registry {
     /// Admitted components, in discovery order.
     pub loaded: Vec<Loaded>,
+    /// A frame a component's own command asked to open, as `(id, face)`.
+    /// Drained by [`Session::take_pending_frame`].
+    pending_frame: Option<(String, String)>,
     /// Last rendered status-bar cells, highest priority first.
     segments: Vec<Segment>,
     /// When they were last rendered, in milliseconds since an arbitrary epoch
@@ -1422,6 +1456,11 @@ impl Registry {
             });
         }
         out
+    }
+
+    /// Takes a frame-open request a component's command left behind.
+    pub fn take_pending_frame(&mut self) -> Option<(String, String)> {
+        self.pending_frame.take()
     }
 
     /// A registry holding exactly `loaded` and nothing else.
@@ -1632,6 +1671,11 @@ impl Registry {
         match host.call(&id, "command_run", payload.as_bytes()) {
             Ok(bytes) => {
                 let mut out = parse_cmd_output(&bytes);
+                // The component may only open *its own* frame, so the id is
+                // taken from who was called rather than from the reply.
+                if let Some(face) = &out.open {
+                    self.pending_frame = Some((id.clone(), face.clone()));
+                }
                 // Anything the component printed through the `print` capability
                 // happened *during* the call, so it precedes whatever the reply
                 // asks to print. Draining here rather than in the UI keeps both

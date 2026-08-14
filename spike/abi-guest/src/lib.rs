@@ -36,7 +36,11 @@ pub fn spin() -> FnResult<String> {
 /// contributes. Read once at load, never per keystroke.
 #[plugin_fn]
 pub fn command_specs() -> FnResult<String> {
-    Ok(r#"[{"name": "greet", "args": "<who>", "desc": "say hello from wasm"}]"#.to_string())
+    Ok(
+        r#"[{"name": "greet", "args": "<who>", "desc": "say hello from wasm"},
+           {"name": "bounce", "args": "", "desc": "open the fast bouncer"}]"#
+            .to_string(),
+    )
 }
 
 /// The second: run one. The reply asks the host to print, and — when given an
@@ -51,6 +55,10 @@ pub fn command_run(input: String) -> FnResult<String> {
         .and_then(|rest| rest.split('"').next())
         .unwrap_or("")
         .to_string();
+    if input.contains("\"bounce\"") {
+        // A command that opens its own component's frame, picking the face.
+        return Ok(r#"{"open": "fast"}"#.to_string());
+    }
     if args.is_empty() {
         return Ok(r#"{"print": ["hello from wasm"]}"#.to_string());
     }
@@ -188,6 +196,9 @@ pub fn frame_open(input: String) -> FnResult<String> {
             .unwrap_or(0.0)
     };
     let (w, h, seed) = (num("w"), num("h"), num("seed"));
+    // One module can serve several frames; the face arrives as `arg`. This
+    // fixture has two, so a test can prove the selector reaches the guest.
+    let fast = input.contains("\"arg\": \"fast\"");
     unsafe {
         // The seed picks a starting corner, so two opens with different seeds
         // are visibly different and the same seed replays exactly.
@@ -195,8 +206,8 @@ pub fn frame_open(input: String) -> FnResult<String> {
         FRAME = (
             if s % 2 == 0 { 1.0 } else { w - 2.0 },
             if (s / 2) % 2 == 0 { 1.0 } else { h - 2.0 },
-            if s % 2 == 0 { 24.0 } else { -24.0 },
-            if (s / 2) % 2 == 0 { 12.0 } else { -12.0 },
+            if s % 2 == 0 { 24.0 } else { -24.0 } * if fast { 4.0 } else { 1.0 },
+            if (s / 2) % 2 == 0 { 12.0 } else { -12.0 } * if fast { 4.0 } else { 1.0 },
             w as u16,
             h as u16,
             0,
