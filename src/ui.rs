@@ -2511,6 +2511,34 @@ impl Agent<'_> {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+        // user_prompt_submit for WASM subscribers. Transform: a replacement
+        // rewrites the user's last message in place rather than appending
+        // context, because the event exists so a component can *change* what
+        // the model is asked, not only add to it.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::UserPromptSubmit,
+            vec![("prompt", prompt)],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
+            warn(w);
+        }
+        if let Some(text) = wout.replaced
+            && let Some(last) = self
+                .session
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == crate::session::Role::User)
+        {
+            last.text = text;
+        }
+        if let Some((id, reason)) = wout.blocked {
+            // A refused prompt is the user's business, not the model's: it is
+            // reported and the turn does not start.
+            return Some(format!("blocked by wasm component {id}: {reason}"));
+        }
         out.stop_reason
     }
 
@@ -5505,10 +5533,10 @@ the original is frozen and listed in /tree"
         let mut words = arg.split_whitespace();
         match (words.next(), words.next()) {
             (Some("trust"), Some(id)) => {
-                let home =
-                    std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".plank"));
+                // The session already knows the home it was built with; asking
+                // the environment again here is how the two would drift.
                 let project = self.tool_ctx.cwd.clone();
-                match self.tool_ctx.wasm.approve(id, home.as_deref(), &project) {
+                match self.tool_ctx.wasm.approve(id, &project) {
                     Ok(name) => format!("approved and loaded wasm component '{name}'\n"),
                     Err(e) => format!("{e}\n"),
                 }
@@ -10489,10 +10517,7 @@ fn new_agent(
         // without one would leave every component's storage unavailable for
         // the whole session.
         tool_ctx.wasm = crate::wasmreg::Session::new(plank_home.as_deref());
-        let warnings =
-            tool_ctx
-                .wasm
-                .activate(&tool_ctx.plugins.clone(), plank_home.as_deref(), &project);
+        let warnings = tool_ctx.wasm.activate(&tool_ctx.plugins.clone(), &project);
         contribution_warnings.extend(warnings);
     }
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);

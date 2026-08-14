@@ -175,6 +175,9 @@ pub struct WasmManifest {
     pub surfaces: Vec<Surface>,
     /// Capabilities requested, deduplicated and sorted.
     pub capabilities: Vec<Capability>,
+    /// Events subscribed to, deduplicated and sorted. plank calls a component's
+    /// handler only for these, so an unsubscribed event costs nothing.
+    pub events: Vec<crate::wasmevents::EventKind>,
 }
 
 /// One discovered component: its manifest, where it came from, and the plugin
@@ -329,6 +332,18 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         return None;
     }
 
+    let mut events = Vec::new();
+    for e in list("events") {
+        match crate::wasmevents::EventKind::parse(&e) {
+            Some(kind) => events.push(kind),
+            // A typo'd subscription is a handler that never fires, which
+            // presents as "my component ignores everything".
+            None => warnings.push(format!("wasm component '{id}': unknown event '{e}'")),
+        }
+    }
+    events.sort_unstable();
+    events.dedup();
+
     let mut capabilities = Vec::new();
     for c in list("capabilities") {
         match Capability::parse(&c) {
@@ -348,6 +363,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         module,
         surfaces,
         capabilities,
+        events,
     })
 }
 
@@ -769,6 +785,11 @@ pub struct Session {
     pub registry: Registry,
     /// The runtime. The no-op unless the `plugins` feature is on.
     pub host: Box<dyn crate::wasmhost::WasmHost + Send>,
+    /// The plank home: where trust is recorded and where the `state`
+    /// capability writes. Held once, here, because the host and the trust
+    /// store both need it and two callers passing the same value into one
+    /// object is how they drift.
+    home: Option<PathBuf>,
 }
 
 impl Default for Session {
@@ -788,6 +809,7 @@ impl Session {
         Self {
             registry: Registry::default(),
             host: crate::wasmhost::host(home),
+            home: home.map(Path::to_path_buf),
         }
     }
 }
@@ -799,14 +821,12 @@ impl Session {
     /// warnings the caller should show; held components are not warnings —
     /// they are in [`Registry::held`] with a reason, because "we did not run
     /// this" is a different message from "this is broken".
-    pub fn activate(
-        &mut self,
-        plugins: &PluginSet,
-        home: Option<&Path>,
-        project: &Path,
-    ) -> Vec<String> {
+    pub fn activate(&mut self, plugins: &PluginSet, project: &Path) -> Vec<String> {
         let found = discover(plugins);
-        let trust = home.map_or_else(TrustStore::ephemeral, TrustStore::load);
+        let trust = self
+            .home
+            .as_deref()
+            .map_or_else(TrustStore::ephemeral, TrustStore::load);
         self.registry = Registry::build(&found, &trust, project, &mut *self.host);
         self.registry.warnings.clone()
     }
@@ -816,12 +836,7 @@ impl Session {
     /// # Errors
     /// Returns a message when nothing is held under `id`, when the approval
     /// cannot be recorded, or when the module then fails to load.
-    pub fn approve(
-        &mut self,
-        id: &str,
-        home: Option<&Path>,
-        project: &Path,
-    ) -> Result<String, String> {
+    pub fn approve(&mut self, id: &str, project: &Path) -> Result<String, String> {
         let idx = self
             .registry
             .held
@@ -831,7 +846,10 @@ impl Session {
         let (component, _) = self.registry.held[idx].clone();
         let sha = module_sha256(&component.path)
             .ok_or_else(|| format!("cannot hash {}", component.path.display()))?;
-        let mut trust = home.map_or_else(TrustStore::ephemeral, TrustStore::load);
+        let mut trust = self
+            .home
+            .as_deref()
+            .map_or_else(TrustStore::ephemeral, TrustStore::load);
         trust.approve(&component, &sha, project)?;
 
         // Re-run the admission path for this one component rather than
@@ -1051,6 +1069,82 @@ impl Registry {
         }
     }
 
+    /// Dispatches `event` to every live subscriber, in load order.
+    ///
+    /// Transform replacements chain: the second subscriber sees what the first
+    /// produced, which is what makes a redactor and a summarizer composable
+    /// rather than mutually exclusive. A veto stops the chain — once an action
+    /// is refused, asking the rest to weigh in is asking about something that
+    /// will not happen.
+    ///
+    /// A trap costs a strike and becomes a warning. It never propagates: an
+    /// observer that breaks must not take the turn with it.
+    pub fn dispatch(
+        &mut self,
+        host: &mut dyn crate::wasmhost::WasmHost,
+        event: &crate::wasmevents::Event<'_>,
+    ) -> crate::wasmevents::Outcome {
+        use crate::wasmevents::Reply;
+
+        let mut outcome = crate::wasmevents::Outcome::default();
+        let subscribers: Vec<String> = self
+            .loaded
+            .iter()
+            .filter(|l| {
+                l.strikes < STRIKE_LIMIT && l.component.manifest.events.contains(&event.kind)
+            })
+            .map(|l| l.component.manifest.id.clone())
+            .collect();
+        if subscribers.is_empty() {
+            return outcome;
+        }
+
+        let class = event.kind.class();
+        let field = crate::wasmevents::Event::transform_field(event.kind);
+        // The payload is rebuilt per subscriber only when a replacement has
+        // actually changed it; otherwise every subscriber sees the same bytes.
+        let mut payload = event.to_json();
+        for id in subscribers {
+            match host.call(&id, "on_event", payload.as_bytes()) {
+                Ok(bytes) => {
+                    let reply = Reply::parse(&bytes).constrained_to(class);
+                    if let Some(text) = reply.replace
+                        && let Some(field) = field
+                    {
+                        let mut next = event.clone();
+                        for (key, value) in &mut next.fields {
+                            if *key == field {
+                                value.clone_from(&text);
+                            }
+                        }
+                        payload = next.to_json();
+                        outcome.replaced = Some(text);
+                    }
+                    if let Some(reason) = reply.block {
+                        outcome.blocked = Some((id, reason));
+                        break;
+                    }
+                }
+                Err(e) => {
+                    let disabled = self.strike(&id);
+                    outcome.warnings.push(if disabled {
+                        format!(
+                            "{id}: {e} (disabled for this session after {STRIKE_LIMIT} failures)"
+                        )
+                    } else {
+                        format!("{id}: {e}")
+                    });
+                }
+            }
+        }
+        // Whatever the handlers printed, collected once at the end regardless
+        // of class: the sink is shared, so draining per subscriber would only
+        // interleave the same lines differently, and a notify subscriber is
+        // exactly the kind that has nothing to say *except* by printing.
+        outcome.printed = host.drain_printed();
+        outcome
+    }
+
     /// Records a failure against `id`, returning whether that strike disabled
     /// it. Disabling is sticky for the session; nothing resets it but a
     /// restart, because a component that failed three times has earned the
@@ -1173,6 +1267,15 @@ fn missing_exports(
                 missing.push(export);
             }
         }
+    }
+    // `observer` owns nothing but its handler, so a component claiming it
+    // without `on_event` claims nothing at all. A component of any surface that
+    // *subscribes* needs the same export, which is why this is keyed on the
+    // subscription list and not only on the surface.
+    let observes = component.manifest.surfaces.contains(&Surface::Observer)
+        || !component.manifest.events.is_empty();
+    if observes && !host.has_export(id, "on_event") {
+        missing.push("on_event");
     }
     missing
 }
@@ -1346,6 +1449,7 @@ mod tests {
                 module: "demo.wasm".to_string(),
                 surfaces: vec![Surface::Frame],
                 capabilities: caps,
+                events: Vec::new(),
             },
         }
     }

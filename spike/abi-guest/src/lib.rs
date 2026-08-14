@@ -95,3 +95,34 @@ pub fn cap_bump(_: ()) -> FnResult<String> {
         Ok(err)
     }
 }
+
+/// The one event handler. A guest matches on the event name rather than
+/// exporting a function per event — see the host's `wasmevents` docs for why.
+///
+/// This one is a test fixture, so its behaviour is driven by the payload: it
+/// blocks anything mentioning "forbidden", rewrites anything mentioning
+/// "rewrite", and otherwise just counts what it saw into its own state.
+#[plugin_fn]
+pub fn on_event(input: String) -> FnResult<String> {
+    let field = |key: &str| -> String {
+        input
+            .split_once(&format!("\"{key}\":"))
+            .and_then(|(_, rest)| rest.trim_start().strip_prefix('"'))
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or("")
+            .to_string()
+    };
+    let event = field("event");
+    let seen = unsafe { plank_state_get("events".to_string())? };
+    let seen = String::from_utf8(seen).unwrap_or_default();
+    let _ =
+        unsafe { plank_state_set("events".to_string(), format!("{seen}{event};").into_bytes())? };
+
+    if input.contains("forbidden") {
+        return Ok(r#"{"block": "the fixture refuses anything forbidden"}"#.to_string());
+    }
+    if input.contains("rewrite") {
+        return Ok(r#"{"replace": "rewritten by the fixture"}"#.to_string());
+    }
+    Ok("{}".to_string())
+}

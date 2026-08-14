@@ -34,8 +34,26 @@ component and checks its own grant when called, so a missing grant reads as
 `fs`, `net` and `exec` — the three that undo the sandbox — are deliberately not
 wired.
 
-Not yet implemented: `frame`, `segment`, `tool` and `observer` surfaces, the
-event bus, and the `notify`/`agent`/`session`/`sound` capabilities.
+**The `observer` surface and the event bus.** `src/wasmevents.rs`. Five events
+are dispatched — `session_start`, `user_prompt_submit`, `pre_tool_use`,
+`post_tool_use`, `turn_end` — from the same call sites the shell hooks fire
+from, so a component sees what a hook would have seen. Subscriptions are
+declared in the manifest and an unsubscribed event costs nothing.
+
+One deviation from the sketch above: a component implements a single
+`on_event` export rather than a handler per event. Extism cannot type-check an
+export signature, so N exports buy no safety over one, and a new event would
+otherwise oblige every interested component to grow an export — which the
+payload-evolution rule says additions must not do.
+
+An event's class is enforced host-side, not trusted from the guest: a reply
+that vetoes a notify event is dropped rather than honored. Transform
+replacements chain in load order, so a redactor and a summarizer compose
+instead of competing.
+
+Not yet implemented: `frame`, `segment` and `tool` surfaces, the remaining
+events (`idle`, `resize`, `job_*`, the compaction pair), and the
+`notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)
 

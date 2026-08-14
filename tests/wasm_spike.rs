@@ -206,7 +206,7 @@ fn a_command_component_registers_and_runs() {
     let project = root.join("repo");
 
     let mut session = Session::default();
-    session.activate(&plugins, None, &project);
+    session.activate(&plugins, &project);
     // Ephemeral trust with no home: nothing is approved, so nothing loads.
     assert!(session.registry.loaded.is_empty());
     assert_eq!(session.registry.held.len(), 1);
@@ -214,7 +214,7 @@ fn a_command_component_registers_and_runs() {
 
     // Approving it loads it *and* registers its commands, without a restart.
     let name = session
-        .approve("dev.plank.demo", None, &project)
+        .approve("dev.plank.demo", &project)
         .expect("approve");
     assert_eq!(name, "dev.plank.demo");
     let commands = session.registry.commands();
@@ -348,9 +348,9 @@ fn approved_session(
     let (root, plugins) = caps_plugin(tag, wasm, caps);
     let project = root.join("repo");
     let mut session = plank::wasmreg::Session::new(home);
-    session.activate(&plugins, None, &project);
+    session.activate(&plugins, &project);
     session
-        .approve("dev.plank.demo", None, &project)
+        .approve("dev.plank.demo", &project)
         .expect("approve");
     (root, session)
 }
@@ -449,4 +449,197 @@ fn state_without_the_grant_reads_empty_and_refuses_to_write() {
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Loads a component subscribing to `events` with the given capabilities.
+fn subscribed_session(
+    tag: &str,
+    wasm: &[u8],
+    events: &str,
+    home: Option<&std::path::Path>,
+) -> (std::path::PathBuf, plank::wasmreg::Session) {
+    use plank::plugins::{Origin, PluginSet, load_plugin};
+
+    let root = std::env::temp_dir().join(format!("plank-wasm-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("demo");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("demo.wasm"), wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        format!(
+            r#"{{"name": "demo", "wasm": [{{"id": "dev.plank.demo", "module": "demo.wasm",
+                "surfaces": ["observer"], "capabilities": ["state"], "events": [{events}]}}]}}"#
+        ),
+    )
+    .unwrap();
+    let set = PluginSet {
+        plugins: vec![load_plugin(&dir, Origin::UserScan).expect("a plugin")],
+        ..PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = plank::wasmreg::Session::new(home);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.demo", &project)
+        .expect("approve");
+    (root, session)
+}
+
+/// A subscriber sees the events it asked for, in the payload shape the bus
+/// promises — and nothing else.
+#[test]
+fn a_subscriber_receives_only_its_events() {
+    use plank::wasmevents::{Event, EventKind};
+
+    let wasm = guest_or_skip!();
+    let home = std::env::temp_dir().join(format!("plank-wasm-evhome-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+
+    let (root, mut session) =
+        subscribed_session("ev-some", &wasm, r#""pre_tool_use""#, Some(&home));
+
+    let subscribed = Event::new(EventKind::PreToolUse, vec![("name", "bash".to_string())]);
+    let out = session.registry.dispatch(&mut *session.host, &subscribed);
+    assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+
+    // Not subscribed: the component is never called, so its own tally of what
+    // it saw does not grow.
+    let unsubscribed = Event::new(EventKind::TurnEnd, vec![("turn", "1".to_string())]);
+    let out = session.registry.dispatch(&mut *session.host, &unsubscribed);
+    assert!(out.is_quiet(), "an unsubscribed event must cost nothing");
+
+    let tally = std::fs::read_to_string(
+        home.join("plugins")
+            .join("dev.plank.demo")
+            .join("state")
+            .join("events"),
+    )
+    .unwrap();
+    assert_eq!(
+        tally, "pre_tool_use;",
+        "the handler ran exactly once, for the event it subscribed to"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A veto event's block reaches the caller with the component named, so the
+/// user can tell which component refused their tool call.
+#[test]
+fn a_subscriber_can_veto_a_veto_class_event() {
+    use plank::wasmevents::{Event, EventKind};
+
+    let wasm = guest_or_skip!();
+    let (root, mut session) = subscribed_session("ev-veto", &wasm, r#""pre_tool_use""#, None);
+
+    let event = Event::new(
+        EventKind::PreToolUse,
+        vec![
+            ("name", "bash".to_string()),
+            ("args", "forbidden".to_string()),
+        ],
+    );
+    let out = session.registry.dispatch(&mut *session.host, &event);
+    let (id, reason) = out.blocked.expect("blocked");
+    assert_eq!(id, "dev.plank.demo");
+    assert!(reason.contains("refuses anything forbidden"), "{reason}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A transform event's replacement comes back to the host, which is what lets
+/// a component rewrite what the model sees.
+#[test]
+fn a_subscriber_can_rewrite_a_transform_class_event() {
+    use plank::wasmevents::{Event, EventKind};
+
+    let wasm = guest_or_skip!();
+    let (root, mut session) = subscribed_session("ev-xform", &wasm, r#""post_tool_use""#, None);
+
+    let event = Event::new(
+        EventKind::PostToolUse,
+        vec![
+            ("name", "bash".to_string()),
+            ("output", "please rewrite this".to_string()),
+        ],
+    );
+    let out = session.registry.dispatch(&mut *session.host, &event);
+    assert_eq!(out.replaced.as_deref(), Some("rewritten by the fixture"));
+    assert!(out.blocked.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The class is enforced host-side: the same fixture that vetoes a veto event
+/// cannot veto a notify one, no matter what it replies.
+#[test]
+fn a_notify_event_ignores_a_block_reply() {
+    use plank::wasmevents::{Event, EventKind};
+
+    let wasm = guest_or_skip!();
+    let (root, mut session) = subscribed_session("ev-notify", &wasm, r#""turn_end""#, None);
+
+    let event = Event::new(EventKind::TurnEnd, vec![("turn", "forbidden".to_string())]);
+    let out = session.registry.dispatch(&mut *session.host, &event);
+    assert!(
+        out.blocked.is_none(),
+        "a notify event must not be blockable: {:?}",
+        out.blocked
+    );
+    assert!(out.replaced.is_none());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A component claiming `observer` without a handler is refused, the same way
+/// a `command` component without its exports is.
+#[test]
+fn an_observer_without_on_event_is_refused() {
+    use plank::plugins::{Origin, PluginSet, load_plugin};
+    use plank::wasmreg::{Registry, TrustStore, discover, module_sha256};
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/spike/min-guest/target/wasm32-unknown-unknown/release/plank_min_guest.wasm"
+    );
+    let Ok(wasm) = std::fs::read(path) else {
+        eprintln!("skipping: run spike/build-guest.sh first");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("plank-wasm-noobs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("demo");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("demo.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        r#"{"name": "demo", "wasm": [{"id": "dev.plank.deaf", "module": "demo.wasm",
+            "surfaces": ["observer"], "events": ["turn_end"]}]}"#,
+    )
+    .unwrap();
+
+    let set = PluginSet {
+        plugins: vec![load_plugin(&dir, Origin::UserScan).expect("a plugin")],
+        ..PluginSet::default()
+    };
+    let found = discover(&set);
+    let project = root.join("repo");
+    let mut trust = TrustStore::ephemeral();
+    let sha = module_sha256(&found.components[0].path).expect("hash");
+    trust.approve(&found.components[0], &sha, &project).unwrap();
+
+    let mut host = host(None);
+    let reg = Registry::build(&found, &trust, &project, &mut *host);
+    assert!(reg.loaded.is_empty(), "{:?}", reg.warnings);
+    assert!(
+        reg.warnings
+            .iter()
+            .any(|w| w.contains("on_event") && w.contains("dev.plank.deaf")),
+        "{:?}",
+        reg.warnings
+    );
+    let _ = std::fs::remove_dir_all(&root);
 }

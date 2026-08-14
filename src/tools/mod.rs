@@ -297,6 +297,27 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             ));
         }
     }
+    // pre_tool_use for WASM subscribers, after the shell hooks and before the
+    // plan-mode gate: a component sees the same call a hook would have seen,
+    // and a block reaches the model in the same shape.
+    {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::PreToolUse,
+            vec![
+                ("name", call.name.clone()),
+                ("args", mcp::args_to_json(call)),
+            ],
+        );
+        let wasm = &mut ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        ctx.hook_warnings.extend(out.printed);
+        ctx.hook_warnings.extend(out.warnings);
+        if let Some((id, reason)) = out.blocked {
+            return ToolResult::from_output(format!(
+                "Tool error: blocked by wasm component {id}: {reason}\n"
+            ));
+        }
+    }
     // Plan mode (issue #50): while the read-only gate is active, refuse any
     // workspace-mutating tool so the model researches and proposes before it
     // edits. The gate itself is entered/exited by dedicated tools below.
@@ -364,6 +385,32 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
                 output.push('\n');
             }
             let _ = writeln!(output, "[PostToolUse hook] {msg}");
+        }
+    }
+    // post_tool_use for WASM subscribers. Transform: a replacement becomes the
+    // observation the model sees, which is the whole point of the event — a
+    // redactor or a summarizer has nowhere else to stand.
+    {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::PostToolUse,
+            vec![
+                ("name", call.name.clone()),
+                ("args", mcp::args_to_json(call)),
+                ("output", output.clone()),
+            ],
+        );
+        let wasm = &mut ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        ctx.hook_warnings.extend(out.printed);
+        ctx.hook_warnings.extend(out.warnings);
+        if let Some(replaced) = out.replaced {
+            output = replaced;
+        }
+        if let Some((id, reason)) = out.blocked {
+            if !output.ends_with('\n') {
+                output.push('\n');
+            }
+            let _ = writeln!(output, "[wasm {id}] {reason}");
         }
     }
     // PostToolUseFailure hooks: fire only when the tool failed (the C
