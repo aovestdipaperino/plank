@@ -1227,6 +1227,13 @@ pub enum ScreensaverFace {
 }
 
 impl ScreensaverFace {
+    /// The settings spellings of every built-in face, in cycle order.
+    ///
+    /// `random` is last because it is a choice among the others, and a picker
+    /// that offers it first invites choosing it without seeing what it picks
+    /// between.
+    pub const NAMES: [&'static str; 4] = ["matrix", "starfield", "minions", "random"];
+
     /// How many concrete faces plank itself ships.
     ///
     /// The count, not the variants: `Random` is a choice *among* them rather

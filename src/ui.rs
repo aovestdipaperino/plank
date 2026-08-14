@@ -9154,8 +9154,18 @@ impl Agent<'_> {
             "/config" => {
                 // Open the interactive modal; the run loop drives it and
                 // persists on close. `arg` is ignored (the form edits everything).
-                *config_form = Some(crate::configform::ConfigForm::new(
+                // The form cycles through contributed faces as well as the
+                // built-ins, so it is handed what this session actually loaded.
+                let faces = self
+                    .tool_ctx
+                    .wasm
+                    .screensaver_faces()
+                    .into_iter()
+                    .map(|f| f.address)
+                    .collect();
+                *config_form = Some(crate::configform::ConfigForm::with_faces(
                     crate::settings::active().clone(),
+                    faces,
                 ));
             }
             "/new" | "/clear" => {
