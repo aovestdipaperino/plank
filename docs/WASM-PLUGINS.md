@@ -124,10 +124,25 @@ so while `/matrix` still exists as a built-in the component's `matrix` command
 is shadowed and the face is reachable as `/frame dev.plank.arcade matrix`. The
 built-in commands come out as each face lands.
 
-**Still to do:** the remaining faces (starfield, minions, breakout, centipede,
-frogger, invaders), the embedded built-in blob so an empty plugins directory
-still has screensavers, and `ScreensaverFace` becoming a registry rather than a
-closed enum.
+Three faces have landed: the matrix rain, the starfield and breakout — the
+last of which is the first *game*, and a harder case than an ambient face. Each
+goes through the same check, which is now a shared helper rather than a
+one-off: drive the built-in and the port side by side for thirty ticks and fail
+on the first glyph that differs.
+
+A game costs one adaptation an ambient face does not. `handle_key` takes the
+ABI's key *name* instead of a crossterm `KeyEvent`, because a guest never sees
+a `KeyEvent` and pinning the ABI to crossterm's enum is what the name-based
+protocol exists to avoid. Everything else — physics, level table, layout,
+drawing — is carried across untouched, which is what keeps the glyph
+comparison meaningful. Mouse input is dropped for now; the host does not yet
+deliver `frame_mouse`.
+
+**Still to do:** minions, centipede, frogger and invaders; the embedded
+built-in blob so an empty plugins directory still has screensavers; and
+`ScreensaverFace` becoming a registry rather than a closed enum. The built-in
+commands come out as each face lands — until then a ported face is reachable as
+`/frame dev.plank.arcade <face>` while the bare name still opens the built-in.
 
 Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
 compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.

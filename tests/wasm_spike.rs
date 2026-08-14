@@ -1096,28 +1096,15 @@ fn one_component_serves_several_frames_and_opens_them_from_its_own_command() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The arcade port's behaviour-preservation check: the rain drawn by the WASM
-/// component must be the *same* rain the built-in face draws, glyph for glyph.
-///
-/// This is the whole argument for porting a face by carrying its source across
-/// rather than rewriting it. Both sides seed the same `Rng`, integrate the
-/// same `dt`, and lay out the same columns, so the same seed must produce
-/// identical output — and if a port ever drifts, this fails with the exact
-/// glyph that moved instead of with "the screensaver looks a bit different".
-#[test]
-fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
-    use plank::wasmreg::Session;
-
+/// Installs the arcade component and returns a session with it approved.
+fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Session)> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/guests/arcade/target/wasm32-unknown-unknown/release/plank_arcade.wasm"
     );
-    let Ok(wasm) = std::fs::read(path) else {
-        eprintln!("skipping: build guests/arcade first");
-        return;
-    };
+    let wasm = std::fs::read(path).ok()?;
 
-    let root = std::env::temp_dir().join(format!("plank-arcade-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("plank-arcade-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let dir = root.join("arcade");
     std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
@@ -1138,33 +1125,43 @@ fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
         ..plank::plugins::PluginSet::default()
     };
     let project = root.join("repo");
-    let mut session = Session::new(None);
+    let mut session = plank::wasmreg::Session::new(None);
     session.activate(&set, &project);
     session
         .approve("dev.plank.arcade", &project)
         .expect("approve");
+    Some((root, session))
+}
 
-    let (seed, w, h) = (0xDEAD_BEEF_u64, 80_u16, 24_u16);
-
-    // The built-in face, driven exactly as the arcade drives it.
-    let mut native = plank::arcade::matrix::Rain::new(seed);
-    // And the component, driven exactly as the frame loop drives it.
+/// Drives a ported face and the built-in it came from side by side, and fails
+/// on the first glyph that differs.
+///
+/// This is the behaviour-preservation check the whole migration rests on. A
+/// rewritten face could only be checked by eye — and by eye, a rain seeded
+/// wrongly still looks exactly like rain, which is precisely the bug this
+/// caught the first time it ran.
+fn assert_face_matches(
+    session: &mut plank::wasmreg::Session,
+    face: &str,
+    seed: u64,
+    mut native_glyphs: impl FnMut(u64, u16, u16) -> Vec<plank::arcade::Glyph>,
+) {
+    let (w, h) = (80_u16, 24_u16);
     let mut frame = session
-        .open_frame("dev.plank.arcade", "matrix", w, h, seed)
+        .open_frame("dev.plank.arcade", face, w, h, seed)
         .expect("open");
 
+    let mut drew = 0;
     for tick in 0..30 {
-        native.step(33);
+        let expected = native_glyphs(33, w, h);
         session
             .step_frame(&mut frame, 33, w, h, tick * 33)
             .expect("step");
-
-        let expected = native.glyphs(w, h);
         let actual = &frame.last.glyphs;
         assert_eq!(
             actual.len(),
             expected.len(),
-            "tick {tick}: the port drew {} glyphs, the built-in drew {}",
+            "{face} tick {tick}: the port drew {} glyphs, the built-in drew {}",
             actual.len(),
             expected.len()
         );
@@ -1172,16 +1169,163 @@ fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
             assert_eq!(
                 (a.x, a.y, a.ch, a.color),
                 (b.x, b.y, b.ch, b.color),
-                "tick {tick}, glyph {i}: the port drifted from the built-in rain"
+                "{face} tick {tick}, glyph {i}: the port drifted from the built-in"
             );
         }
+        drew = drew.max(actual.len());
     }
-    // And it drew something: an all-empty match would pass the loop above
-    // while proving nothing at all.
+    // An all-empty match would pass the loop above while proving nothing.
+    assert!(drew > 50, "{face} drew at most {drew} glyphs");
+}
+
+/// The matrix rain, ported: same seed, same glyphs, thirty ticks deep.
+#[test]
+fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
+    let Some((root, mut session)) = arcade_session("rain") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0xDEAD_BEEF_u64;
+    let mut native = plank::arcade::matrix::Rain::new(seed);
+    assert_face_matches(&mut session, "matrix", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The starfield, ported. A second face through the same check is what makes
+/// the check a *procedure* rather than a one-off: every face that lands from
+/// here gets exactly this treatment.
+#[test]
+fn the_ported_starfield_matches_the_built_in_field_glyph_for_glyph() {
+    let Some((root, mut session)) = arcade_session("stars") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0x1234_5678_9ABC_u64;
+    // The same star count the component deals itself: a field of a different
+    // size is a different sky, and the comparison would be meaningless.
+    let mut native = plank::arcade::Starfield::new(seed, 220);
+    assert_face_matches(&mut session, "starfield", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Breakout, ported: the first *game* through the check. A game is a harder
+/// case than an ambient face — it has phases, a serve countdown and input —
+/// and its physics still has to land on the same glyphs as the built-in's.
+///
+/// Driven with no input on purpose: the two sides receive keys through
+/// different types (a crossterm `KeyEvent` here, an ABI key *name* there), so
+/// the comparison is of the simulation, which is the part that was carried
+/// across unchanged.
+#[test]
+fn the_ported_breakout_matches_the_built_in_game_glyph_for_glyph() {
+    let Some((root, mut session)) = arcade_session("breakout") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0xC0FF_EE00_u64;
+    let mut native = plank::arcade::breakout::Breakout::new(seed);
+    assert_face_matches(&mut session, "breakout", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A game claims the keys it uses and lets everything else close the frame.
+/// That is what makes Esc and `q` work without every game spelling them, and
+/// what keeps a stray key from dropping a user out of a rally.
+#[test]
+fn a_ported_game_claims_its_own_keys() {
+    use plank::wasmreg::FrameOutcome;
+
+    let Some((root, mut session)) = arcade_session("breakout-keys") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let frame = session
+        .open_frame("dev.plank.arcade", "breakout", 80, 24, 1)
+        .expect("open");
+
+    for claimed in ["left", "right", "h", "l", "p", "space"] {
+        assert_eq!(
+            session.frame_key(&frame, claimed).expect("key"),
+            FrameOutcome::Stay,
+            "breakout dropped the frame on '{claimed}', which it uses"
+        );
+    }
+    for unclaimed in ["q", "escape", "z"] {
+        assert!(
+            matches!(
+                session.frame_key(&frame, unclaimed).expect("key"),
+                FrameOutcome::Close(_)
+            ),
+            "'{unclaimed}' should have closed the frame"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A key does not just get *claimed* — it has to reach the simulation and move
+/// something. Claiming and acting are different failures with the same
+/// symptom (a game that ignores you), and only the second one is visible in a
+/// screenshot, badly.
+#[test]
+fn a_ported_games_input_moves_the_paddle() {
+    let Some((root, mut session)) = arcade_session("breakout-input") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let (w, h) = (80_u16, 24_u16);
+    let mut frame = session
+        .open_frame("dev.plank.arcade", "breakout", w, h, 5)
+        .expect("open");
+
+    // The paddle is the widest run of glyphs on the bottom-most drawn row.
+    let paddle_x = |f: &plank::wasmreg::OpenFrame| -> Option<u16> {
+        let bottom = f.last.glyphs.iter().map(|g| g.y).max()?;
+        f.last
+            .glyphs
+            .iter()
+            .filter(|g| g.y == bottom)
+            .map(|g| g.x)
+            .min()
+    };
+
+    session.step_frame(&mut frame, 16, w, h, 0).expect("step");
+    let before = paddle_x(&frame).expect("a paddle");
+
+    // Hold left: the glide is re-armed by each press, exactly as terminal key
+    // repeat does, so a few presses with steps between them is what actually
+    // happens when a person holds the key down.
+    for tick in 0..6 {
+        session.frame_key(&frame, "left").expect("key");
+        session
+            .step_frame(&mut frame, 16, w, h, (tick + 1) * 16)
+            .expect("step");
+    }
+    let after = paddle_x(&frame).expect("a paddle");
     assert!(
-        frame.last.glyphs.len() > 50,
-        "the rain drew only {} glyphs",
-        frame.last.glyphs.len()
+        after < before,
+        "the paddle did not move left: {before} then {after}"
+    );
+
+    // And back the other way, so the test cannot pass on a paddle that only
+    // ever drifts one direction.
+    for tick in 0..12 {
+        session.frame_key(&frame, "right").expect("key");
+        session
+            .step_frame(&mut frame, 16, w, h, (tick + 8) * 16)
+            .expect("step");
+    }
+    assert!(
+        paddle_x(&frame).expect("a paddle") > after,
+        "the paddle did not come back right"
     );
     let _ = std::fs::remove_dir_all(&root);
 }

@@ -13,7 +13,10 @@
 //! slash command, which is what `command_run` replying `{"open": "<face>"}`
 //! is for: the component asks the host to open its own frame at that face.
 
+mod breakout;
 mod matrix;
+mod shared;
+mod starfield;
 mod support;
 
 use extism_pdk::*;
@@ -35,6 +38,11 @@ static mut FACE: Option<Face> = None;
 enum Face {
     /// Falling glyphs.
     Matrix(matrix::Rain),
+    /// A perspective starfield.
+    Starfield(starfield::Starfield),
+    /// Bricks, a paddle and a ball — the first *game* to land, as opposed to
+    /// a face that only has to look right.
+    Breakout(breakout::Breakout),
 }
 
 impl Face {
@@ -43,6 +51,10 @@ impl Face {
     /// screen would be a worse answer than the default face.
     fn new(name: &str, seed: u64) -> Self {
         match name {
+            // The star count the built-in arcade opens its field with; the
+            // port is only faithful if it is dealt the same number of stars.
+            "starfield" | "stars" => Self::Starfield(starfield::Starfield::new(seed, 220)),
+            "breakout" | "bricks" => Self::Breakout(breakout::Breakout::new(seed)),
             // Every face lands here as it is ported. Until then an unknown
             // name is the rain rather than a failure: the host has already
             // decided to open *something*, and a black screen is a worse
@@ -54,12 +66,16 @@ impl Face {
     fn step(&mut self, dt_ms: u64) {
         match self {
             Self::Matrix(r) => r.step(dt_ms),
+            Self::Starfield(s) => s.step(dt_ms),
+            Self::Breakout(g) => g.step(dt_ms),
         }
     }
 
     fn glyphs(&self, w: u16, h: u16) -> Vec<support::Glyph> {
         match self {
             Self::Matrix(r) => r.glyphs(w, h),
+            Self::Starfield(s) => s.glyphs(w, h),
+            Self::Breakout(g) => g.glyphs(w, h),
         }
     }
 }
@@ -104,16 +120,38 @@ pub fn frame_step(input: String) -> FnResult<Vec<u8>> {
 pub fn frame_key(input: String) -> FnResult<String> {
     let code = support::text(&input, "code");
     let face = unsafe { (*(&raw mut FACE)).as_mut() };
-    let Some(Face::Matrix(rain)) = face else {
-        return Ok(r#"{"close": ""}"#.to_string());
+    let handled = match (face, code.as_str()) {
+        (Some(Face::Matrix(rain)), "up" | "k") => {
+            rain.scale_speed(1.3);
+            true
+        }
+        (Some(Face::Matrix(rain)), "down" | "j") => {
+            rain.scale_speed(1.0 / 1.3);
+            true
+        }
+        (Some(Face::Matrix(rain)), "c") => {
+            rain.cycle_charset();
+            true
+        }
+        (Some(Face::Starfield(sky)), "up" | "k") => {
+            sky.scale_speed(1.3);
+            true
+        }
+        (Some(Face::Starfield(sky)), "down" | "j") => {
+            sky.scale_speed(1.0 / 1.3);
+            true
+        }
+        // A game claims its own keys and says so; anything it does not claim
+        // falls through to the close below, which is how Esc and q work
+        // without every game having to spell them.
+        (Some(Face::Breakout(game)), code) => game.handle_key(code),
+        _ => false,
     };
-    match code.as_str() {
-        "up" | "k" => rain.scale_speed(1.3),
-        "down" | "j" => rain.scale_speed(1.0 / 1.3),
-        "c" => rain.cycle_charset(),
-        _ => return Ok(r#"{"close": ""}"#.to_string()),
+    if handled {
+        Ok(r#"{"stay": true}"#.to_string())
+    } else {
+        Ok(r#"{"close": ""}"#.to_string())
     }
-    Ok(r#"{"stay": true}"#.to_string())
 }
 
 #[plugin_fn]
@@ -127,7 +165,12 @@ pub fn frame_close() -> FnResult<String> {
 /// One slash command per face.
 #[plugin_fn]
 pub fn command_specs() -> FnResult<String> {
-    Ok(r#"[{"name": "matrix", "args": "", "desc": "falling glyphs"}]"#.to_string())
+    Ok(
+        r#"[{"name": "matrix", "args": "", "desc": "falling glyphs"},
+           {"name": "starfield", "args": "", "desc": "a perspective starfield"},
+           {"name": "breakout", "args": "", "desc": "bricks, a paddle and a ball"}]"#
+            .to_string(),
+    )
 }
 
 /// Opens the named face. The host resolves `open` against *this* component's
