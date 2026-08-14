@@ -6113,31 +6113,22 @@ mod tests {
     /// An arcade with `cmd` on screen.
     fn opened(cmd: &str) -> crate::arcade::Arcade {
         let mut a = crate::arcade::Arcade::new();
-        assert!(a.open(cmd, false, 7, 80, 24), "{cmd} did not open");
+        assert!(a.open(cmd, false, 7), "{cmd} did not open");
         a
     }
 
-    /// An arcade showing the starfield screensaver.
+    /// An arcade showing the screensaver.
     ///
     /// The face is asked for rather than left to `ui.screensaverFace`: a test
-    /// about the starfield that silently drew one of the other faces would be
-    /// worse than no test.
+    /// that silently drew a different face would be worse than no test. The
+    /// rain is the only built-in face left — the others are plugins now — so
+    /// it is what these tests draw.
     fn screensaver() -> crate::arcade::Arcade {
         let mut a = crate::arcade::Arcade::new();
-        a.open_screensaver_as(crate::arcade::ScreensaverFace::Starfield, 7, 80, 24);
-        a
-    }
-
-    /// An arcade showing the minions screensaver, three seconds in.
-    ///
-    /// Both numbers matter: they fade up from the dark, so frame zero is
-    /// deliberately empty, and the seed decides where along its crossing the
-    /// pair is — this one has them well inside an 80-column frame rather than
-    /// half off the edge.
-    fn minions_screensaver() -> crate::arcade::Arcade {
-        let mut a = crate::arcade::Arcade::new();
-        a.open_screensaver_as(crate::arcade::ScreensaverFace::Minions, 4, 80, 24);
-        for _ in 0..60 {
+        a.open_screensaver_as(crate::arcade::ScreensaverFace::Matrix, 7);
+        // The rain fades in per column, so a fresh field is nearly empty and a
+        // test about coverage would measure the wrong thing.
+        for _ in 0..40 {
             a.step(50);
         }
         a
@@ -6324,8 +6315,13 @@ mod tests {
             log.visible_text(&format!("output line {i} still readable"));
             log.end_line();
         }
+        // A *game*, not the screensaver: translucency is what happens when a
+        // game opens over a running turn, and the rain — the only built-in
+        // face left — paints nearly every cell, so it would hide the
+        // transcript whatever the veil did. Breakout is sparse, which is the
+        // property this test is really about.
         let draw = |translucent: bool| {
-            let mut arcade = screensaver();
+            let mut arcade = opened("/breakout");
             arcade.translucent = translucent;
             let mut view = OutputView::default();
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -6399,33 +6395,10 @@ mod tests {
     }
 
     #[test]
-    fn arcade_scatters_stars_over_the_whole_frame() {
+    fn the_screensaver_covers_the_whole_frame() {
         let rows = arcade_frame(&screensaver(), 80, 24);
-        // The screensaver has no footer, so every row is sky; stars should
-        // reach the top and the bottom of it, not clump in a band.
-        let painted: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.trim().is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        assert!(painted.len() > 10, "only {} rows had stars", painted.len());
-        assert!(painted[0] < 4, "nothing near the top: {painted:?}");
-        assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("speed") || r.contains("quit")),
-            "the screensaver must not offer the games' controls: {rows:?}"
-        );
-    }
-
-    /// One of the screensaver's faces: two minions on a shore, standing in the
-    /// lower half of the frame with sky above them and water below, and no
-    /// footer of its own either.
-    #[test]
-    fn the_minions_stand_on_their_shore() {
-        let rows = arcade_frame(&minions_screensaver(), 80, 24);
+        // The screensaver has no footer, so every row is drawable; the field
+        // should reach the top and the bottom, not clump in a band.
         let painted: Vec<usize> = rows
             .iter()
             .enumerate()
@@ -6433,19 +6406,13 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(painted.len() > 10, "only {} rows drawn", painted.len());
-        // The pair itself is the widest solid thing on screen: some row in the
-        // lower half has to be more than a scattering of stars.
-        let body = rows[8..20]
-            .iter()
-            .map(|r| r.chars().filter(|c| *c == '█').count())
-            .max()
-            .unwrap_or(0);
-        assert!(body > 6, "no minion found on the shore: {rows:?}");
+        assert!(painted[0] < 4, "nothing near the top: {painted:?}");
+        assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
         assert!(
             !rows
                 .iter()
-                .any(|r| r.contains("pace") || r.contains("quit")),
-            "the screensaver must not offer the controls: {rows:?}"
+                .any(|r| r.contains("speed") || r.contains("quit")),
+            "the screensaver must not offer the games' controls: {rows:?}"
         );
     }
 

@@ -1127,9 +1127,6 @@ mod tests {
         for (text, want) in [
             ("matrix", ScreensaverFace::Matrix),
             ("rain", ScreensaverFace::Matrix),
-            ("starfield", ScreensaverFace::Starfield),
-            ("stars", ScreensaverFace::Starfield),
-            ("minions", ScreensaverFace::Minions),
             ("random", ScreensaverFace::Random),
             ("either", ScreensaverFace::Random),
             ("  MATRIX  ", ScreensaverFace::Matrix),
@@ -1137,7 +1134,20 @@ mod tests {
             let mut s = Settings::default();
             s.overlay(&format!("{{\"ui\":{{\"screensaverFace\":\"{text}\"}}}}"));
             assert_eq!(s.ui.screensaver_face, want, "parsing {text:?}");
+            assert_eq!(s.ui.screensaver_face_plugin, None, "parsing {text:?}");
         }
+
+        // A plugin face is kept verbatim for the opener to resolve: the
+        // installed components are not known at settings-parse time.
+        let mut s = Settings::default();
+        s.overlay("{\"ui\":{\"screensaverFace\":\"screensavers:starfield\"}}");
+        assert_eq!(
+            s.ui.screensaver_face_plugin.as_deref(),
+            Some("screensavers:starfield")
+        );
+        // And selecting a built-in again clears it.
+        s.overlay("{\"ui\":{\"screensaverFace\":\"matrix\"}}");
+        assert_eq!(s.ui.screensaver_face_plugin, None);
 
         // An unusable value leaves the default in place rather than breaking
         // the rest of the file, like every other key here.

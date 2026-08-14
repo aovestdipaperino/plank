@@ -838,13 +838,14 @@ mod tests {
         assert_eq!(
             seen,
             vec![
-                "starfield",
-                "minions",
+                // One built-in face left, then the contributed ones, then
+                // round to the start.
                 "random",
                 "screensavers:starfield",
                 "screensavers:minions",
-                // ...and back to the first built-in.
                 "matrix",
+                "random",
+                "screensavers:starfield",
             ]
         );
     }
@@ -859,7 +860,7 @@ mod tests {
                 display(&form.working, FieldId::UiScreensaverFace)
             })
             .collect();
-        assert_eq!(seen, vec!["starfield", "minions", "random", "matrix"]);
+        assert_eq!(seen, vec!["random", "matrix", "random", "matrix"]);
     }
 
     /// Selecting a contributed face must route to the field that can hold it,

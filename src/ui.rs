@@ -6708,7 +6708,7 @@ impl Agent<'_> {
                         Err(e) => log.push_dim(e),
                     }
                 }
-                arcade.open_screensaver(arcade_seed(), w, h);
+                arcade.open_screensaver(arcade_seed());
                 arcade_last = Instant::now();
             }
 
@@ -9125,11 +9125,10 @@ impl Agent<'_> {
             // the model. They take over the screen until Esc, and resume where
             // they were left unless the argument asks for a new game.
             _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
-                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 let fresh = crate::arcade::Arcade::wants_new(arg);
                 let resuming = !fresh && arcade.has_parked(cmd);
                 arcade_hover_reporting(true);
-                arcade.open(cmd, fresh, arcade_seed(), w, h);
+                arcade.open(cmd, fresh, arcade_seed());
                 arcade.sound.set(crate::arcade::Sound::wanted(arg));
                 if resuming {
                     log.push_dim(format!("{cmd}: resumed where you left off"));
@@ -10584,9 +10583,8 @@ fn busy_ui_loop(
                             let arg = line[cmd.len()..].trim();
                             let fresh = crate::arcade::Arcade::wants_new(arg);
                             let resuming = !fresh && arcade.has_parked(cmd);
-                            let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                             arcade_hover_reporting(true);
-                            arcade.open(cmd, fresh, arcade_seed(), w, h);
+                            arcade.open(cmd, fresh, arcade_seed());
                             arcade.sound.set(crate::arcade::Sound::wanted(arg));
                             arcade.veil();
                             if resuming {

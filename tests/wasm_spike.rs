@@ -1039,11 +1039,17 @@ fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
     let wasm = guest_or_skip!();
     let (root, session) = frame_session("frame-rotate", &wasm, r#", "kind": "screensaver""#);
 
-    // Three built-in faces against this component's one: every face gets a
-    // slot, so the component should come up a quarter of the time.
+    // Every face gets one slot, built-in or contributed, so the split follows
+    // from the counts. Derived rather than hard-coded: the built-in count has
+    // already changed once (three faces became one when the rest moved into
+    // plugins), and a hard-coded share would have failed for the right reason
+    // with a misleading message.
     let builtin = plank::arcade::ScreensaverFace::BUILT_IN;
+    let contributed = session.screensaver_faces().len();
+    let rounds = 400;
+    let want_plugin = rounds * contributed / (builtin + contributed);
     let (mut from_plugin, mut from_core) = (0, 0);
-    for seed in 0..400 {
+    for seed in 0..rounds as u64 {
         match session.pick_idle_face(seed, builtin) {
             Some((id, face)) => {
                 assert_eq!(id, "dev.plank.bounce");
@@ -1053,8 +1059,12 @@ fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
             None => from_core += 1,
         }
     }
-    assert_eq!(from_plugin, 100, "the component never came up");
-    assert_eq!(from_core, 300, "the built-in faces were crowded out");
+    assert_eq!(from_plugin, want_plugin, "the component's share is wrong");
+    assert_eq!(
+        from_core,
+        rounds - want_plugin,
+        "the built-in faces were crowded out"
+    );
 
     // The same seed always lands on the same face.
     assert_eq!(
@@ -1145,76 +1155,6 @@ fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Sess
         .approve("dev.plank.screensavers", &project)
         .expect("approve");
     Some((root, session))
-}
-
-/// Drives a ported face and the built-in it came from side by side, and fails
-/// on the first glyph that differs.
-///
-/// This is the behaviour-preservation check the whole migration rests on. A
-/// rewritten face could only be checked by eye — and by eye, a rain seeded
-/// wrongly still looks exactly like rain, which is precisely the bug this
-/// caught the first time it ran.
-fn assert_face_matches(
-    session: &mut plank::wasmreg::Session,
-    face: &str,
-    seed: u64,
-    mut native_glyphs: impl FnMut(u64, u16, u16) -> Vec<plank::arcade::Glyph>,
-) {
-    let (w, h) = (80_u16, 24_u16);
-    let mut frame = session
-        .open_frame("dev.plank.screensavers", face, w, h, seed)
-        .expect("open");
-
-    let mut drew = 0;
-    for tick in 0..30 {
-        let expected = native_glyphs(33, w, h);
-        session
-            .step_frame(&mut frame, 33, w, h, tick * 33)
-            .expect("step");
-        let actual = &frame.last.glyphs;
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "{face} tick {tick}: the port drew {} glyphs, the built-in drew {}",
-            actual.len(),
-            expected.len()
-        );
-        for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                (a.x, a.y, a.ch, a.color),
-                (b.x, b.y, b.ch, b.color),
-                "{face} tick {tick}, glyph {i}: the port drifted from the built-in"
-            );
-        }
-        drew = drew.max(actual.len());
-    }
-    // An all-empty match would pass the loop above while proving nothing.
-    assert!(drew > 50, "{face} drew at most {drew} glyphs");
-}
-
-/// The starfield, ported into the screensavers plugin, checked glyph for glyph
-/// against the built-in field it came from.
-///
-/// This is the procedure every ported face goes through. plank's own matrix
-/// rain and breakout deliberately do *not* go through it, because they are not
-/// ported: the rain is the default screensaver and breakout is the download
-/// screen, so both stay in the binary where a plank with no plugins still has
-/// them.
-#[test]
-fn the_ported_starfield_matches_the_built_in_field_glyph_for_glyph() {
-    let Some((root, mut session)) = arcade_session("stars") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0x1234_5678_9ABC_u64;
-    // The same star count the component deals itself: a field of a different
-    // size is a different sky, and the comparison would be meaningless.
-    let mut native = plank::arcade::Starfield::new(seed, 220);
-    assert_face_matches(&mut session, "starfield", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// A frame has a budget: at the shared 20 Hz tick there are 50 ms between
@@ -1369,25 +1309,6 @@ fn an_arcade_contributes_no_screensaver_face() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The minions, ported. A second face through the same check, and the one that
-/// carries an *asset*: the sprite sheet travels with the plugin and is packed
-/// by its own build script, so this also pins that the packed art decodes to
-/// the same picture plank's copy does.
-#[test]
-fn the_ported_minions_match_the_built_in_skit_glyph_for_glyph() {
-    let Some((root, mut session)) = arcade_session("minions") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0x5EED_1234_u64;
-    let mut native = plank::arcade::minions::Skit::new(seed);
-    assert_face_matches(&mut session, "minions", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
 /// Installs the arcades component and returns a session with it approved.
 fn arcades_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Session)> {
     let path = concat!(
@@ -1423,89 +1344,6 @@ fn arcades_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Ses
         .approve("dev.plank.arcades", &project)
         .expect("approve");
     Some((root, session))
-}
-
-/// Drives a ported game and the built-in it came from side by side. Same shape
-/// as the screensaver check, against a different component.
-fn assert_game_matches(
-    session: &mut plank::wasmreg::Session,
-    game: &str,
-    seed: u64,
-    mut native_glyphs: impl FnMut(u64, u16, u16) -> Vec<plank::arcade::Glyph>,
-) {
-    let (w, h) = (80_u16, 24_u16);
-    let mut frame = session
-        .open_frame("dev.plank.arcades", game, w, h, seed)
-        .expect("open");
-    let mut drew = 0;
-    for tick in 0..30 {
-        let expected = native_glyphs(33, w, h);
-        session
-            .step_frame(&mut frame, 33, w, h, tick * 33)
-            .expect("step");
-        let actual = &frame.last.glyphs;
-        assert_eq!(
-            actual.len(),
-            expected.len(),
-            "{game} tick {tick}: the port drew {} glyphs, the built-in drew {}",
-            actual.len(),
-            expected.len()
-        );
-        for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
-            assert_eq!(
-                (a.x, a.y, a.ch, a.color),
-                (b.x, b.y, b.ch, b.color),
-                "{game} tick {tick}, glyph {i}: the port drifted from the built-in"
-            );
-        }
-        drew = drew.max(actual.len());
-    }
-    assert!(drew > 20, "{game} drew at most {drew} glyphs");
-}
-
-#[test]
-fn the_ported_centipede_matches_the_built_in_game() {
-    let Some((root, mut session)) = arcades_session("centipede") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0xC0DE_0001_u64;
-    let mut native = plank::arcade::centipede::Centipede::new(seed);
-    assert_game_matches(&mut session, "centipede", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn the_ported_frogger_matches_the_built_in_game() {
-    let Some((root, mut session)) = arcades_session("frogger") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0xC0DE_0002_u64;
-    let mut native = plank::arcade::frogger::Frogger::new(seed);
-    assert_game_matches(&mut session, "frogger", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn the_ported_invaders_match_the_built_in_game() {
-    let Some((root, mut session)) = arcades_session("invaders") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0xC0DE_0003_u64;
-    let mut native = plank::arcade::invaders::Invaders::new(seed);
-    assert_game_matches(&mut session, "invaders", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// An arcade plugin is never offered to the idle rotation, however many games
