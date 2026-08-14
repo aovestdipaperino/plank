@@ -2202,7 +2202,7 @@ impl Agent<'_> {
         // context so the `task` tool mutates the copy that renders and saves.
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| println!("{w}")) {
-            println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+            println!("{}", self.debug_line(&format!("halted: {reason}")));
             return Ok(());
         }
         // A compaction that did not rebuild (interrupted, or no usable summary)
@@ -2312,7 +2312,7 @@ impl Agent<'_> {
                 )));
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+                    println!("{}", self.debug_line(&format!("halted: {reason}")));
                     return Ok(());
                 }
                 continue;
@@ -2344,6 +2344,7 @@ impl Agent<'_> {
             // Turn over: the front end is back at the prompt.
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
+            self.fire_turn_end(stats.generated, turn_start.elapsed());
             return Ok(());
         }
     }
@@ -2482,9 +2483,6 @@ impl Agent<'_> {
     /// last user message). Exit-0 stdout and any exit-2 block feedback inject a
     /// `<hook_context>` user message into this turn; other nonzero exits warn.
     fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
-        if self.tool_ctx.hooks.user_prompt_submit.is_empty() {
-            return None;
-        }
         let prompt = self
             .session
             .transcript
@@ -2493,23 +2491,32 @@ impl Agent<'_> {
             .find(|m| m.role == crate::session::Role::User)
             .map(|m| m.text.clone())
             .unwrap_or_default();
-        let input = crate::hooks::lifecycle_event_input(
-            "UserPromptSubmit",
-            &[("prompt", &prompt)],
-            &self.tool_ctx.cwd,
-        );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.user_prompt_submit,
-            "",
-            &input,
-            &self.tool_ctx.cwd,
-        );
-        for w in out.warnings.into_iter().chain(out.system_messages) {
-            warn(w);
-        }
-        if let Some(ctx) = out.context.or(out.block) {
-            self.session
-                .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+
+        // Shell hooks first, and only when there are any. The WASM dispatch
+        // below runs regardless: guarding it on the hook list is what made this
+        // event silently never fire for a session that had components and no
+        // hooks, which is the ordinary case.
+        let mut hook_stop = None;
+        if !self.tool_ctx.hooks.user_prompt_submit.is_empty() {
+            let input = crate::hooks::lifecycle_event_input(
+                "UserPromptSubmit",
+                &[("prompt", &prompt)],
+                &self.tool_ctx.cwd,
+            );
+            let out = crate::hooks::run_event_ctx(
+                &self.tool_ctx.hooks.user_prompt_submit,
+                "",
+                &input,
+                &self.tool_ctx.cwd,
+            );
+            for w in out.warnings.into_iter().chain(out.system_messages) {
+                warn(w);
+            }
+            if let Some(ctx) = out.context.or(out.block) {
+                self.session
+                    .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+            }
+            hook_stop = out.stop_reason;
         }
         // user_prompt_submit for WASM subscribers. Transform: a replacement
         // rewrites the user's last message in place rather than appending
@@ -2539,13 +2546,27 @@ impl Agent<'_> {
             // reported and the turn does not start.
             return Some(format!("blocked by wasm component {id}: {reason}"));
         }
-        out.stop_reason
+        hook_stop
     }
 
     /// Fires the `SessionStart` hooks with the given source (startup|resume|
     /// clear|compact), injecting any produced context as a `<hook_context>`
     /// user message so it rides along with the session.
     fn fire_session_start(&mut self, source: &str, warn: &mut dyn FnMut(String)) {
+        // The WASM dispatch is deliberately outside the hooks guard below: a
+        // session with components and no shell hooks is the ordinary case, and
+        // returning early on an empty hook list would silently never fire the
+        // event for them.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::SessionStart,
+            vec![("source", source.to_string())],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
+            warn(w);
+        }
+
         if self.tool_ctx.hooks.session_start.is_empty() {
             return;
         }
@@ -2567,6 +2588,28 @@ impl Agent<'_> {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+    }
+
+    /// Dispatches `turn_end` to WASM subscribers. Notify-only, so nothing it
+    /// returns can affect the turn that just finished — which is why this can
+    /// sit at the very end, after the footer and the notification, where a
+    /// veto would have been meaningless anyway.
+    ///
+    /// Anything a subscriber printed lands in the tool-context warnings the UI
+    /// already drains, rather than being written here: the turn is over and the
+    /// front end owns the screen again.
+    fn fire_turn_end(&mut self, generated: i32, elapsed: std::time::Duration) {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::TurnEnd,
+            vec![
+                ("generated", generated.to_string()),
+                ("wall_ms", elapsed.as_millis().to_string()),
+            ],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        self.tool_ctx.hook_warnings.extend(out.printed);
+        self.tool_ctx.hook_warnings.extend(out.warnings);
     }
 
     /// Fires the `SessionEnd` hooks with the exit `reason`. Terminal event: no
@@ -7799,6 +7842,12 @@ impl Agent<'_> {
                 // Turn over: the front end is back at the prompt.
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
+                // Mirrored from the plain path: a component must not observe a
+                // different number of turns depending on which front end the
+                // user happens to be running. The token count is not available
+                // here — this path reports elapsed time only — so the field is
+                // sent as -1 rather than as a plausible-looking zero.
+                self.fire_turn_end(-1, turn_started.elapsed());
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -8045,7 +8094,7 @@ impl Agent<'_> {
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
-            let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+            let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
             return Ok(());
         }
         let compact_interrupt =
@@ -8180,7 +8229,7 @@ impl Agent<'_> {
                 }
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+                    let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);

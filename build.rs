@@ -24,6 +24,16 @@ fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // Opt out of the native engine even when the submodule is present. The
+    // engine needs a multi-gigabyte GGUF to start, so a developer smoke-testing
+    // anything *around* inference — plugins, slash commands, the session
+    // lifecycle — otherwise cannot run the binary at all on a machine that has
+    // the submodule checked out. This builds the same plank CI builds.
+    println!("cargo:rerun-if-env-changed=PLANK_NO_DS4");
+    if std::env::var_os("PLANK_NO_DS4").is_some() {
+        println!("cargo:warning=PLANK_NO_DS4 set; building without the ds4 engine");
+        return;
+    }
     let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap();
     let ds4 = Path::new(&manifest).join("refs/ds4");
     if !ds4.join("ds4.c").exists() {

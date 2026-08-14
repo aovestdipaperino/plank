@@ -321,6 +321,37 @@ mod tests {
         assert_eq!(transform.replace.as_deref(), Some("x"));
     }
 
+    /// Every event the enum names must have a firing site, or it is a promise
+    /// rather than a feature — and a subscriber to it looks broken, not
+    /// unimplemented. This is a source check because there is no runtime
+    /// registry of firing sites to assert against: an event fires from wherever
+    /// in plank the thing it describes happens.
+    ///
+    /// `session_start`, `user_prompt_submit` and `turn_end` shipped defined but
+    /// unfired, behind `if hooks.is_empty() { return }` guards that predate
+    /// components entirely. This is the test that would have caught it.
+    #[test]
+    fn every_event_kind_has_a_firing_site() {
+        let sources = [include_str!("ui.rs"), include_str!("tools/mod.rs")].concat();
+        for kind in [
+            EventKind::SessionStart,
+            EventKind::UserPromptSubmit,
+            EventKind::PreToolUse,
+            EventKind::PostToolUse,
+            EventKind::TurnEnd,
+        ] {
+            // The variant is named at a dispatch site, not merely in a match
+            // arm here: `EventKind::X` appearing in ui.rs or tools/mod.rs means
+            // something builds that event.
+            let needle = format!("EventKind::{kind:?}");
+            assert!(
+                sources.contains(&needle),
+                "{} is defined but nothing fires it",
+                kind.label()
+            );
+        }
+    }
+
     #[test]
     fn every_event_kind_round_trips_its_spelling_and_knows_its_class() {
         for kind in [
