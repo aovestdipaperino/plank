@@ -335,6 +335,48 @@ impl Restored {
     }
 }
 
+/// Instruments one tier's restore decision, gated behind `PLANK_DEBUG_SYSPROMPT`.
+///
+/// The investigation aid for cache churn: two launches leave two diffable
+/// prompt dumps plus a running record of which tier resumed and why. It was
+/// lost when the tier walk replaced `warm_system_prompt` — the one path it hung
+/// off — and its absence is felt every time a "why did it re-prefill?" report
+/// arrives, because [`Restored`] only says what happened to the tier that was
+/// asked about, and only in memory.
+///
+/// The system tier's *text* is dumped, keyed by the first 8 of its fingerprint,
+/// so two launches that disagree can be diffed byte-for-byte. Best-effort
+/// throughout: this must never fail a warm-up.
+fn debug_trace_tier(store: Option<&SessionStore>, tier: &TierSpec, outcome: &str) {
+    if std::env::var_os("PLANK_DEBUG_SYSPROMPT").is_none() {
+        return;
+    }
+    let fp = tier.key.as_ref().map_or("", KvKey::signature);
+    let fp8 = &fp[..fp.len().min(8)];
+    let dump = store.map(|s| {
+        let kind = format!("{:?}", tier.kind).to_ascii_lowercase();
+        let path = s.dir().join(format!("sysprompt-debug-{kind}-{fp8}.txt"));
+        let _ = std::fs::write(&path, &tier.text);
+        path
+    });
+    let line = format!(
+        "pid={} tier={:?} outcome={outcome} fp={fp} text_len={} dump={}\n",
+        std::process::id(),
+        tier.kind,
+        tier.text.len(),
+        dump.as_ref()
+            .map_or_else(String::new, |p| p.display().to_string()),
+    );
+    if let Some(store) = store {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(store.dir().join("sysprompt-debug.log"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+    }
+    eprint!("[sysprompt-debug] {line}");
+}
+
 /// Restores `tier`'s checkpoint into `engine`, or leaves the engine cold.
 ///
 /// The restore leg of [`warm`] without its prefill leg, for callers that must
@@ -358,19 +400,24 @@ pub fn restore(
     tier: &TierSpec,
 ) -> Result<Restored, EngineError> {
     let Some((key, store)) = tier.key.as_ref().zip(store) else {
+        debug_trace_tier(None, tier, Restored::NoKey.reason());
         return Ok(Restored::NoKey);
     };
     let Some(cache) = store.kv_load(key) else {
-        return Ok(if store.kv_path(key).exists() {
+        let outcome = if store.kv_path(key).exists() {
             Restored::Unreadable
         } else {
             Restored::NoCheckpoint
-        });
+        };
+        debug_trace_tier(Some(store), tier, outcome.reason());
+        return Ok(outcome);
     };
     engine.warm_reset(&tier.text)?;
     if engine.set_kv(&cache).is_err() {
+        debug_trace_tier(Some(store), tier, Restored::EngineRefused.reason());
         return Ok(Restored::EngineRefused);
     }
+    debug_trace_tier(Some(store), tier, Restored::Yes.reason());
     // Same reason as the `i < resume` branch in `warm`: the engine's cumulative
     // token buffer must describe the whole restored prefix, or the next sync
     // sees a common prefix shorter than the buffer and throws the restored KV
@@ -428,12 +475,15 @@ pub fn warm(
             .zip(store)
             .and_then(|(key, store)| store.kv_load(key))
         else {
+            debug_trace_tier(store, t, "no checkpoint loaded for this fingerprint");
             continue;
         };
         if engine.set_kv(&cache).is_ok() {
+            debug_trace_tier(store, t, "resumed here");
             resume = i + 1;
             break;
         }
+        debug_trace_tier(store, t, "engine refused the checkpoint");
         // Keyed correctly but the bytes would not load into this build: say so
         // and keep walking upward rather than trusting them.
         on_event(EngineEvent::Notice(
@@ -1056,6 +1106,62 @@ mod warm_tests {
         // throw the restored KV away.
         assert_eq!(e.appended, vec![None]);
         assert!(e.synced.is_empty(), "restore never prefills");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `PLANK_DEBUG_SYSPROMPT` trace hung off `warm_system_prompt` and was
+    /// lost when the tier walk replaced that path, so the one tool for
+    /// diagnosing cache churn silently did nothing. It now covers every tier
+    /// decision on both legs of the walk.
+    #[test]
+    fn the_sysprompt_debug_trace_records_every_tier_decision() {
+        let (store, dir) = spy_store("sysprompt-debug");
+        let tiers = tiers_for("SYSTEM", "agents", "git");
+        let mut e = SpyEngine {
+            supports_kv: true,
+            ..Default::default()
+        };
+        // SAFETY: the trace is read through `var_os` only, and no other test
+        // touches this variable.
+        unsafe { std::env::set_var("PLANK_DEBUG_SYSPROMPT", "1") };
+        // Cold: every tier misses. Then warm again, so the second walk resumes
+        // from a checkpoint the first one wrote.
+        for _ in 0..2 {
+            warm(
+                &mut e,
+                Some(&store),
+                &tiers,
+                &mut |_| {},
+                &mut |_| {},
+                &TierLabels::default(),
+            )
+            .unwrap();
+        }
+        unsafe { std::env::remove_var("PLANK_DEBUG_SYSPROMPT") };
+
+        let log = std::fs::read_to_string(dir.join("sysprompt-debug.log")).expect("no debug log");
+        assert!(
+            log.contains("outcome=no checkpoint loaded for this fingerprint"),
+            "the cold walk's misses are not recorded: {log}"
+        );
+        assert!(
+            log.contains("outcome=resumed here"),
+            "the second walk's resume point is not recorded: {log}"
+        );
+        assert!(log.contains("tier=System"), "{log}");
+        // The prompt text itself is dumped, keyed by fingerprint, so two
+        // launches that disagree can be diffed.
+        let dumps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("sysprompt-debug-system-"))
+            .collect();
+        assert_eq!(dumps.len(), 1, "{dumps:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&dumps[0])).unwrap(),
+            "SYSTEM"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
