@@ -6693,7 +6693,14 @@ impl Agent<'_> {
                 arcade_last = Instant::now();
             }
 
-            let poll = if arcade.is_open() {
+            // An open easter egg *or* an open WASM frame wants the shared
+            // animation tick; the idle 200 ms poll renders either at five
+            // frames a second. Worse than the visible stutter: the frame delta
+            // is measured from real elapsed time and then clamped to
+            // `MAX_STEP_MS`, so at that rate half of every second is simply
+            // dropped from the simulation and the motion runs slow as well as
+            // rough.
+            let poll = if arcade.is_open() || wasm_frame.is_some() {
                 Duration::from_millis(crate::anim::TICK_MS)
             } else {
                 Duration::from_millis(200)

@@ -34,6 +34,16 @@ pub fn plank_abi() -> FnResult<String> {
 /// also what makes a `frame_step` before an open a no-op rather than a trap.
 static mut FACE: Option<Face> = None;
 
+/// Steps since the frame opened.
+///
+/// Reported on close, which makes the achieved frame rate observable from
+/// outside: a face that should be running at the host's 20 Hz and reports 100
+/// steps over five seconds is running at 20, and one that reports 25 is not.
+/// That is not a statistic anyone wants routinely — it is here because the
+/// first version of the host loop polled at 200 ms and rendered every frame
+/// component at five frames a second, and nothing in the system could say so.
+static mut STEPS: u32 = 0;
+
 /// The faces this component offers.
 enum Face {
     /// Falling glyphs.
@@ -87,6 +97,7 @@ pub fn frame_open(input: String) -> FnResult<String> {
     let face = support::text(&input, "arg");
     unsafe {
         FACE = Some(Face::new(&face, seed));
+        STEPS = 0;
     }
     Ok(r#"{"ok": true}"#.to_string())
 }
@@ -105,6 +116,9 @@ pub fn frame_step(input: String) -> FnResult<Vec<u8>> {
         return Ok(support::encode(&[], w, h));
     };
     face.step(dt_ms);
+    unsafe {
+        STEPS = STEPS.saturating_add(1);
+    }
     Ok(support::encode(&face.glyphs(w, h), w, h))
 }
 
@@ -156,10 +170,11 @@ pub fn frame_key(input: String) -> FnResult<String> {
 
 #[plugin_fn]
 pub fn frame_close() -> FnResult<String> {
-    unsafe {
+    let steps = unsafe {
         FACE = None;
-    }
-    Ok("{}".to_string())
+        STEPS
+    };
+    Ok(format!(r#"{{"scrollback": "arcade: {steps} frames"}}"#))
 }
 
 /// One slash command per face.

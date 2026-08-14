@@ -1329,3 +1329,61 @@ fn a_ported_games_input_moves_the_paddle() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A frame has a budget: at the shared 20 Hz tick there are 50 ms between
+/// frames, and a component that eats a meaningful slice of that will stutter
+/// however fast the loop polls.
+///
+/// This measures the whole round trip — payload, guest step, glyph decode —
+/// on the busiest face there is, and asserts real headroom rather than "it
+/// finished". The threshold is deliberately far below the budget: it should
+/// catch an ABI that got ten times slower, not fail on a loaded CI box.
+#[test]
+fn a_frame_step_fits_well_inside_the_animation_budget() {
+    let Some((root, mut session)) = arcade_session("budget") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    // 120x40 is a maximized terminal, and the rain covers it.
+    let (w, h) = (120_u16, 40_u16);
+    let mut frame = session
+        .open_frame("dev.plank.arcade", "matrix", w, h, 42)
+        .expect("open");
+
+    // A few warm-up steps: the first call into a fresh instance pays for
+    // lazily-touched memory that no later frame does.
+    for tick in 0..5 {
+        session
+            .step_frame(&mut frame, 50, w, h, tick * 50)
+            .expect("warm");
+    }
+
+    let frames = 100_u32;
+    let started = std::time::Instant::now();
+    for tick in 0..frames {
+        session
+            .step_frame(&mut frame, 50, w, h, u64::from(tick) * 50)
+            .expect("step");
+    }
+    let per_frame = started.elapsed() / frames;
+    assert!(
+        frame.last.glyphs.len() > 500,
+        "the rain drew only {} glyphs, so this measured nothing",
+        frame.last.glyphs.len()
+    );
+    // The threshold is deliberately loose. A wall-clock assertion inside a
+    // suite that runs its tests in parallel measures the machine's load as
+    // much as the code — this one asserted 10 ms, passed at 3.7 ms alone, and
+    // failed under the full suite. Half the frame budget still catches the
+    // regression worth catching (an ABI that got an order of magnitude
+    // slower) without failing because something else was compiling.
+    assert!(
+        per_frame < std::time::Duration::from_millis(25),
+        "a frame step took {per_frame:?}, which will stutter at 20 Hz"
+    );
+    eprintln!(
+        "frame step: {per_frame:?} for {} glyphs",
+        frame.last.glyphs.len()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
