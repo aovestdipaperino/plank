@@ -5665,6 +5665,39 @@ the original is frozen and listed in /tree"
     fn plugins_command(&mut self, arg: &str) -> String {
         let mut words = arg.split_whitespace();
         match (words.next(), words.next()) {
+            (Some("install"), Some(path)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so there is nowhere to install to\n".to_string();
+                };
+                let src = std::path::PathBuf::from(path);
+                match crate::plugins::install(&src, &home) {
+                    Ok(dest) => format!(
+                        "installed to {}\nit is loaded on the next start; a wasm component \
+                         also needs /plugins trust <id>\n",
+                        dest.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("install"), None) => "usage: /plugins install <directory>\n".to_string(),
+            (Some("remove"), Some(name)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so nothing is installed\n".to_string();
+                };
+                match crate::plugins::uninstall(name, &home) {
+                    // The trust entry is deliberately left behind: it is keyed
+                    // by the component's hash, so reinstalling the same bytes
+                    // is the same component and does not need re-approving,
+                    // while different bytes re-prompt as they always would.
+                    Ok(dir) => format!(
+                        "removed {}\nthis session keeps what it already loaded; it is gone \
+                         on the next start\n",
+                        dir.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("remove"), None) => "usage: /plugins remove <name>\n".to_string(),
             (Some("trust"), Some(id)) => {
                 // The session already knows the home it was built with; asking
                 // the environment again here is how the two would drift.

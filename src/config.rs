@@ -734,8 +734,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/plugins",
-        args: "[trust <id>]",
-        desc: "list loaded plugins, or approve a wasm component",
+        args: "[install <dir>|remove <name>|trust <id>]",
+        desc: "list, install, remove, or approve plugins",
     },
     SlashCommand {
         name: "/frame",

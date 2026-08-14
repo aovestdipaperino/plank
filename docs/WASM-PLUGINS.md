@@ -591,8 +591,26 @@ own config file.
 This mirrors the hierarchical `.mcp.json` resolution already in `tools/mcp.rs`,
 so users learn one precedence rule rather than two.
 
-**Management** is `/plugins` — list with surfaces, capabilities and health;
-`/plugins install <path|url>`; `/plugins disable <id>`; `/plugins reload <id>`.
+**Management** is `/plugins`: bare to list with surfaces, capabilities and
+what is awaiting approval; `install <dir>` to copy a plugin into the user's
+plugin directory; `remove <name>` to delete it; `trust <id>` to approve a
+component.
+
+Install copies rather than links, because a plugin that changed under a
+running session would be one whose approved SHA-256 no longer describes what is
+loaded, and the trust store's whole premise is that the hash *is* the identity.
+It refuses to overwrite for the same reason: replacing an installed plugin is
+new bytes under an approved name, so it is remove-then-install rather than
+something that happens quietly. A `target/` directory is skipped — a guest
+crate's build tree is gigabytes that would be copied into the user's home and
+never read.
+
+Removal leaves the trust entry behind. It is keyed by the component's hash, so
+reinstalling the same bytes is the same component and needs no re-approval,
+while different bytes re-prompt exactly as they would have.
+
+Not yet: install from a URL, signing, or shipping the guest artifacts with a
+release.
 
 ## Versioning
 

@@ -553,6 +553,89 @@ pub fn render_list(set: &PluginSet) -> String {
     out
 }
 
+/// The directory `/plugins install` copies into, and one of the two the loader
+/// auto-scans.
+#[must_use]
+pub fn user_plugin_dir(home: &Path) -> PathBuf {
+    home.join(".plank").join("plugins").join("dev")
+}
+
+/// Installs the plugin directory at `src` for the current user.
+///
+/// A copy rather than a symlink: a plugin that changed under a running session
+/// would be a plugin whose approved SHA-256 no longer describes what is
+/// loaded, and the trust store's whole premise is that the hash *is* the
+/// identity.
+///
+/// Refuses to overwrite. Replacing an installed plugin means new bytes under
+/// an approved name, which is exactly the case trust exists to catch, so it is
+/// a deliberate act (remove, then install) rather than a silent one.
+///
+/// # Errors
+/// Returns a message when `src` is not a plugin, when the destination exists,
+/// or when the copy fails.
+pub fn install(src: &Path, home: &Path) -> Result<PathBuf, String> {
+    let plugin = load_plugin(src, Origin::CliDir)
+        .ok_or_else(|| format!("{} is not a plugin directory", src.display()))?;
+    let dest = user_plugin_dir(home).join(&plugin.name);
+    if dest.exists() {
+        return Err(format!(
+            "'{}' is already installed at {}; remove it first",
+            plugin.name,
+            dest.display()
+        ));
+    }
+    copy_tree(src, &dest).map_err(|e| format!("cannot install into {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+/// Uninstalls the plugin named `name` from the user's plugin directory.
+///
+/// Only ever deletes inside that directory, and only a single path segment:
+/// the name comes from a command line, and a name containing a separator would
+/// otherwise reach anywhere on disk from a `/plugins remove`.
+///
+/// # Errors
+/// Returns a message when the name is not a bare name, or nothing is installed
+/// under it, or the delete fails.
+pub fn uninstall(name: &str, home: &Path) -> Result<PathBuf, String> {
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("'{name}' is not a plugin name"));
+    }
+    let dir = user_plugin_dir(home).join(name);
+    if !dir.is_dir() {
+        return Err(format!("'{name}' is not installed"));
+    }
+    std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Recursively copies `src` to `dest`.
+///
+/// Hand-rolled rather than shelling out to `cp`: a plugin install that depends
+/// on a shell is one that behaves differently under a sandbox, and this runs
+/// on the one path where the user is handing plank code to run.
+fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = dest.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            // A build tree is not part of a plugin: `target/` under a guest
+            // crate is gigabytes of object files that would be copied into the
+            // user's home and never read.
+            if entry.file_name() == "target" {
+                continue;
+            }
+            copy_tree(&from, &to)?;
+        } else {
+            std::fs::copy(&from, &to)?;
+        }
+    }
+    Ok(())
+}
+
 /// Merges plugin-contributed entries into the user+project entries.
 ///
 /// Every plugin entry is registered as `<plugin>:<name>`. It is registered a
@@ -858,6 +941,64 @@ fn duplicate_names_after_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Installing copies the tree, skips build output, and refuses to
+    /// overwrite — replacing an installed plugin is new bytes under an
+    /// approved name, which is the case trust exists to catch.
+    #[test]
+    fn install_copies_a_plugin_and_refuses_to_overwrite() {
+        let root = std::env::temp_dir().join(format!("plank-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src-plugin");
+        std::fs::create_dir_all(src.join(".plank-plugin")).unwrap();
+        std::fs::create_dir_all(src.join("wasm")).unwrap();
+        std::fs::create_dir_all(src.join("target").join("junk")).unwrap();
+        std::fs::write(
+            src.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("wasm").join("demo.wasm"), b"\0asm").unwrap();
+        std::fs::write(src.join("target").join("junk").join("big.o"), b"xxxx").unwrap();
+
+        let home = root.join("home");
+        let dest = install(&src, &home).expect("installed");
+        assert!(dest.ends_with("demo"), "{}", dest.display());
+        assert!(dest.join("wasm").join("demo.wasm").is_file());
+        assert!(
+            !dest.join("target").exists(),
+            "a build tree was copied into the user's home"
+        );
+        // And it lands where the loader looks.
+        assert!(dest.starts_with(user_plugin_dir(&home)));
+
+        let err = install(&src, &home).unwrap_err();
+        assert!(err.contains("already installed"), "{err}");
+        // ...and the message's advice works: remove, then install again.
+        uninstall("demo", &home).expect("removed");
+        assert!(!dest.exists());
+        install(&src, &home).expect("reinstalled after removal");
+
+        // A name is a single path segment. Anything else could reach out of
+        // the plugin directory from a `/plugins remove`.
+        for bad in ["../evil", "a/b", ""] {
+            assert!(
+                uninstall(bad, &home).is_err(),
+                "'{bad}' was accepted as a plugin name"
+            );
+        }
+        assert!(
+            uninstall("absent", &home)
+                .unwrap_err()
+                .contains("not installed")
+        );
+
+        // Not a plugin at all.
+        let bare = root.join("not-a-plugin");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(install(&bare, &home).unwrap_err().contains("not a plugin"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
     use std::path::{Path, PathBuf};
 
     /// Writes `text` to `dir/rel`, creating parent directories.
