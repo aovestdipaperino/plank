@@ -1128,7 +1128,7 @@ fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Sess
         r#"{"name": "screensavers", "wasm": [{"id": "dev.plank.screensavers",
             "module": "faces.wasm", "surfaces": ["frame", "command"],
             "capabilities": [], "kind": "screensaver",
-            "frames": ["starfield"]}]}"#,
+            "frames": ["starfield", "minions"]}]}"#,
     )
     .unwrap();
 
@@ -1331,7 +1331,7 @@ fn screensaver_faces_are_enumerable_and_resolvable_by_address() {
     };
 
     let faces = session.screensaver_faces();
-    assert_eq!(faces.len(), 1, "{faces:?}");
+    assert_eq!(faces.len(), 2, "{faces:?}");
     assert_eq!(faces[0].component, "dev.plank.screensavers");
     assert_eq!(faces[0].face, "starfield");
     assert_eq!(faces[0].address, "screensavers:starfield");
@@ -1366,5 +1366,24 @@ fn an_arcade_contributes_no_screensaver_face() {
     let (root, session) = frame_session("faces-arcade", &wasm, r#", "kind": "arcade""#);
     assert!(session.screensaver_faces().is_empty());
     assert_eq!(session.resolve_screensaver_face("demo:bounce"), None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The minions, ported. A second face through the same check, and the one that
+/// carries an *asset*: the sprite sheet travels with the plugin and is packed
+/// by its own build script, so this also pins that the packed art decodes to
+/// the same picture plank's copy does.
+#[test]
+fn the_ported_minions_match_the_built_in_skit_glyph_for_glyph() {
+    let Some((root, mut session)) = arcade_session("minions") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0x5EED_1234_u64;
+    let mut native = plank::arcade::minions::Skit::new(seed);
+    assert_face_matches(&mut session, "minions", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
     let _ = std::fs::remove_dir_all(&root);
 }

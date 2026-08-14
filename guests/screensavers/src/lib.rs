@@ -15,6 +15,7 @@
 //! one, and a default that depends on a plugin is not a default. The same goes
 //! for breakout, which the download screen draws.
 
+mod minions;
 mod starfield;
 mod support;
 
@@ -28,7 +29,41 @@ pub fn plank_abi() -> FnResult<String> {
 
 /// The open face. A guest is single-threaded and the host serializes calls
 /// into one plugin, so a static is the whole story.
-static mut FACE: Option<starfield::Starfield> = None;
+static mut FACE: Option<Face> = None;
+
+/// The faces this component offers.
+enum Face {
+    /// A perspective starfield.
+    Starfield(starfield::Starfield),
+    /// Two minions on the shore of a night lake.
+    Minions(minions::Skit),
+}
+
+impl Face {
+    /// Builds a face by name. An unknown name is the starfield rather than a
+    /// failure: the host has already decided to open something, and a black
+    /// screen is a worse answer than the wrong ambient face.
+    fn new(name: &str, seed: u64) -> Self {
+        match name {
+            "minions" => Self::Minions(minions::Skit::new(seed)),
+            _ => Self::Starfield(starfield::Starfield::new(seed, STARS)),
+        }
+    }
+
+    fn step(&mut self, dt_ms: u64) {
+        match self {
+            Self::Starfield(s) => s.step(dt_ms),
+            Self::Minions(m) => m.step(dt_ms),
+        }
+    }
+
+    fn glyphs(&self, w: u16, h: u16) -> Vec<support::Glyph> {
+        match self {
+            Self::Starfield(s) => s.glyphs(w, h),
+            Self::Minions(m) => m.glyphs(w, h),
+        }
+    }
+}
 
 /// Steps since the frame opened, reported on close so the achieved frame rate
 /// is observable from outside.
@@ -42,11 +77,9 @@ const STARS: usize = 220;
 #[plugin_fn]
 pub fn frame_open(input: String) -> FnResult<String> {
     let seed = support::int(&input, "seed");
-    // `arg` names the face; there is one so far, and an unknown name falls
-    // back to it rather than failing — the host has already decided to open
-    // something, and a black screen is a worse answer than the default.
+    let face = support::text(&input, "arg");
     unsafe {
-        FACE = Some(starfield::Starfield::new(seed, STARS));
+        FACE = Some(Face::new(&face, seed));
         STEPS = 0;
     }
     Ok(r#"{"ok": true}"#.to_string())
@@ -80,9 +113,11 @@ pub fn frame_key(input: String) -> FnResult<String> {
     let Some(face) = face else {
         return Ok(r#"{"close": ""}"#.to_string());
     };
-    match code.as_str() {
-        "up" | "k" => face.scale_speed(1.3),
-        "down" | "j" => face.scale_speed(1.0 / 1.3),
+    match (face, code.as_str()) {
+        (Face::Starfield(sky), "up" | "k") => sky.scale_speed(1.3),
+        (Face::Starfield(sky), "down" | "j") => sky.scale_speed(1.0 / 1.3),
+        // The minions have no controls; anything closes them, which is what a
+        // screensaver should do.
         _ => return Ok(r#"{"close": ""}"#.to_string()),
     }
     Ok(r#"{"stay": true}"#.to_string())
@@ -94,13 +129,19 @@ pub fn frame_close() -> FnResult<String> {
         FACE = None;
         STEPS
     };
-    Ok(format!(r#"{{"scrollback": "starfield: {steps} frames"}}"#))
+    Ok(format!(
+        r#"{{"scrollback": "screensaver: {steps} frames"}}"#
+    ))
 }
 
 /// One slash command per face.
 #[plugin_fn]
 pub fn command_specs() -> FnResult<String> {
-    Ok(r#"[{"name": "starfield", "args": "", "desc": "a perspective starfield"}]"#.to_string())
+    Ok(
+        r#"[{"name": "starfield", "args": "", "desc": "a perspective starfield"},
+           {"name": "minions", "args": "", "desc": "two minions on a night lake"}]"#
+            .to_string(),
+    )
 }
 
 /// Opens the named face. The host resolves `open` against *this* component's
