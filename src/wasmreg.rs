@@ -161,6 +161,45 @@ impl Capability {
     }
 }
 
+/// When a `frame` component is allowed to take the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Activation {
+    /// Only by an explicit slash command. The default: a component that takes
+    /// the whole terminal unasked is a surprise, and a surprise should be
+    /// opted into.
+    #[default]
+    Manual,
+    /// Eligible for the idle rotation, and not otherwise openable.
+    Idle,
+    /// Both — the arcade games' behaviour.
+    Both,
+}
+
+impl Activation {
+    /// The manifest spelling.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "manual" => Self::Manual,
+            "idle" => Self::Idle,
+            "both" => Self::Both,
+            _ => return None,
+        })
+    }
+
+    /// Whether the idle rotation may pick this component.
+    #[must_use]
+    pub fn idle_eligible(self) -> bool {
+        matches!(self, Self::Idle | Self::Both)
+    }
+
+    /// Whether a slash command may open it.
+    #[must_use]
+    pub fn manually_openable(self) -> bool {
+        matches!(self, Self::Manual | Self::Both)
+    }
+}
+
 /// What a plugin's manifest declares about one WASM component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmManifest {
@@ -175,6 +214,15 @@ pub struct WasmManifest {
     pub surfaces: Vec<Surface>,
     /// Capabilities requested, deduplicated and sorted.
     pub capabilities: Vec<Capability>,
+    /// When a `frame` component may open itself. Meaningless for other
+    /// surfaces, and defaulted rather than required so a manifest that claims
+    /// no frame need not mention it.
+    pub activation: Activation,
+    /// Whether the transcript stays dimly visible under a `frame`.
+    pub veiled: bool,
+    /// Smallest area the component will draw into; below it the frame refuses
+    /// to open rather than drawing into a space it cannot use.
+    pub min_size: (u16, u16),
     /// Events subscribed to, deduplicated and sorted. plank calls a component's
     /// handler only for these, so an unsubscribed event costs nothing.
     pub events: Vec<crate::wasmevents::EventKind>,
@@ -332,6 +380,8 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         return None;
     }
 
+    let (activation, veiled, min_size) = parse_frame_fields(fields, &id, warnings)?;
+
     let mut events = Vec::new();
     for e in list("events") {
         match crate::wasmevents::EventKind::parse(&e) {
@@ -363,8 +413,56 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         module,
         surfaces,
         capabilities,
+        activation,
+        veiled,
+        min_size,
         events,
     })
+}
+
+/// The `frame`-only manifest fields. Split out to keep [`parse_one`] readable,
+/// and because they are the only fields that mean nothing to every other
+/// surface.
+///
+/// Returns `None` — with a warning already pushed — only for an activation
+/// this build does not know: that one is worth refusing the component over,
+/// since guessing between "manual" and "idle" is the difference between a
+/// screensaver that never appears and one that appears unasked.
+fn parse_frame_fields(
+    fields: &[(String, Json)],
+    id: &str,
+    warnings: &mut Vec<String>,
+) -> Option<(Activation, bool, (u16, u16))> {
+    let activation = match fields.iter().find(|(k, _)| k == "activation") {
+        Some((_, Json::Str(s))) => {
+            let Some(parsed) = Activation::parse(s) else {
+                warnings.push(format!("wasm component '{id}': unknown activation '{s}'"));
+                return None;
+            };
+            parsed
+        }
+        _ => Activation::default(),
+    };
+    let veiled = matches!(
+        fields.iter().find(|(k, _)| k == "veiled"),
+        Some((_, Json::Bool(true)))
+    );
+    let min_size = fields
+        .iter()
+        .find(|(k, _)| k == "min_size")
+        .and_then(|(_, v)| match v {
+            Json::Obj(dims) => {
+                let dim = |key: &str| match dims.iter().find(|(k, _)| k == key) {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    Some((_, Json::Num(n))) if *n >= 0.0 => Some(*n as u16),
+                    _ => None,
+                };
+                Some((dim("w").unwrap_or(0), dim("h").unwrap_or(0)))
+            }
+            _ => None,
+        })
+        .unwrap_or((0, 0));
+    Some((activation, veiled, min_size))
 }
 
 /// Discovers every WASM component contributed by `set`.
@@ -879,7 +977,41 @@ fn parse_segment(component: &str, bytes: &[u8]) -> Option<Segment> {
     })
 }
 
-/// A session's WASM state:/// A session's WASM state:/// A session's WASM state: the admitted components and the runtime they live
+/// A `frame` component that currently owns the screen.
+///
+/// Mirrors `arcade::Arcade`'s role rather than its shape: the host owns the
+/// clock, the area and the seed, and the component owns only what it paints.
+/// Everything time-related is passed *in* — a guest has no ambient clock and
+/// no ambient randomness, the same discipline `arcade::Rng` imposes and for
+/// the same reason: a seeded frame can be replayed exactly.
+#[derive(Debug)]
+pub struct OpenFrame {
+    /// Component driving it.
+    pub id: String,
+    /// Whether the transcript stays dimly visible underneath.
+    pub veiled: bool,
+    /// The last frame it painted, kept so a repaint that arrives between steps
+    /// has something to draw.
+    pub last: crate::wasmglyph::GlyphFrame,
+}
+
+/// Longest `dt` a single step will carry, in milliseconds.
+///
+/// The same clamp `arcade::MAX_STEP_MS` applies to the built-in faces, and for
+/// the same reason: the UI loop measures real elapsed time, so the first step
+/// after a suspended terminal would otherwise teleport a simulation.
+pub const MAX_STEP_MS: u64 = 100;
+
+/// What a key press asks the caller to do with the open frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// Stay open; the component absorbed the key.
+    Stay,
+    /// Close, optionally leaving this line in the scrollback.
+    Close(Option<String>),
+}
+
+/// A session's WASM state:/// A session's WASM state:/// A session's WASM state:/// A session's WASM state: the admitted components and the runtime they live
 /// in, kept together because neither is useful alone.
 ///
 /// Defaults to "nothing discovered, nothing runnable", so a session that never
@@ -934,6 +1066,157 @@ impl Session {
             .map_or_else(TrustStore::ephemeral, TrustStore::load);
         self.registry = Registry::build(&found, &trust, project, &mut *self.host);
         self.registry.warnings.clone()
+    }
+
+    /// Frame components that a slash command may open, as `(id, description)`.
+    #[must_use]
+    pub fn openable_frames(&self) -> Vec<(&str, &str)> {
+        self.registry
+            .loaded
+            .iter()
+            .filter(|l| {
+                l.strikes < STRIKE_LIMIT
+                    && l.component.manifest.surfaces.contains(&Surface::Frame)
+                    && l.component.manifest.activation.manually_openable()
+            })
+            .map(|l| {
+                (
+                    l.component.manifest.id.as_str(),
+                    l.component.plugin.as_str(),
+                )
+            })
+            .collect()
+    }
+
+    /// Frame components the idle rotation may pick.
+    #[must_use]
+    pub fn idle_frames(&self) -> Vec<&str> {
+        self.registry
+            .loaded
+            .iter()
+            .filter(|l| {
+                l.strikes < STRIKE_LIMIT
+                    && l.component.manifest.surfaces.contains(&Surface::Frame)
+                    && l.component.manifest.activation.idle_eligible()
+            })
+            .map(|l| l.component.manifest.id.as_str())
+            .collect()
+    }
+
+    /// Opens `id` for a `w`×`h` area, seeded with `seed`.
+    ///
+    /// # Errors
+    /// Returns a message when no live component owns `id`, when the area is
+    /// below the component's declared minimum, or when `frame_open` traps.
+    pub fn open_frame(&mut self, id: &str, w: u16, h: u16, seed: u64) -> Result<OpenFrame, String> {
+        let manifest = self
+            .registry
+            .loaded
+            .iter()
+            .find(|l| l.component.manifest.id == id && l.strikes < STRIKE_LIMIT)
+            .map(|l| l.component.manifest.clone())
+            .ok_or_else(|| format!("no wasm frame '{id}'"))?;
+        let (min_w, min_h) = manifest.min_size;
+        if w < min_w || h < min_h {
+            return Err(format!(
+                "{id} needs at least {min_w}x{min_h}; this terminal offers {w}x{h}"
+            ));
+        }
+        let payload = format!("{{\"w\": {w}, \"h\": {h}, \"seed\": {seed}}}");
+        if let Err(e) = self.host.call(id, "frame_open", payload.as_bytes()) {
+            let disabled = self.registry.strike(id);
+            return Err(if disabled {
+                format!("{id}: {e} (disabled for this session)")
+            } else {
+                format!("{id}: {e}")
+            });
+        }
+        Ok(OpenFrame {
+            id: id.to_string(),
+            veiled: manifest.veiled,
+            last: crate::wasmglyph::GlyphFrame::default(),
+        })
+    }
+
+    /// Advances an open frame by `dt_ms` and decodes what it painted.
+    ///
+    /// A step that traps or returns an undecodable buffer closes the frame:
+    /// there is no sensible way to keep a full-screen component on screen when
+    /// it can no longer say what to draw, and leaving the last frame up
+    /// forever would look like a hang.
+    ///
+    /// # Errors
+    /// Returns the message to show after closing.
+    pub fn step_frame(
+        &mut self,
+        frame: &mut OpenFrame,
+        dt_ms: u64,
+        w: u16,
+        h: u16,
+        now_ms: u64,
+    ) -> Result<(), String> {
+        let payload = format!(
+            "{{\"dt_ms\": {}, \"w\": {w}, \"h\": {h}, \"now_ms\": {now_ms}}}",
+            dt_ms.min(MAX_STEP_MS)
+        );
+        let bytes = self
+            .host
+            .call(&frame.id, "frame_step", payload.as_bytes())
+            .map_err(|e| {
+                self.registry.strike(&frame.id);
+                format!("{}: {e}", frame.id)
+            })?;
+        match crate::wasmglyph::decode(&bytes) {
+            Ok(decoded) => {
+                frame.last = decoded;
+                Ok(())
+            }
+            Err(e) => {
+                self.registry.strike(&frame.id);
+                Err(format!("{}: {e}", frame.id))
+            }
+        }
+    }
+
+    /// Delivers a key. `code` is the key's name (`"left"`, `"q"`, `"space"`).
+    ///
+    /// # Errors
+    /// Returns the message to show when the call traps; the caller closes.
+    pub fn frame_key(&mut self, frame: &OpenFrame, code: &str) -> Result<FrameOutcome, String> {
+        let payload = format!("{{\"code\": {}}}", json_str(code));
+        let bytes = self
+            .host
+            .call(&frame.id, "frame_key", payload.as_bytes())
+            .map_err(|e| {
+                self.registry.strike(&frame.id);
+                format!("{}: {e}", frame.id)
+            })?;
+        let text = String::from_utf8_lossy(&bytes);
+        let Some(Json::Obj(fields)) = json_parse(&text) else {
+            // Unreadable: treat as "stay". A component that fumbles one reply
+            // should not have its window yanked out from under the user.
+            return Ok(FrameOutcome::Stay);
+        };
+        match fields.iter().find(|(k, _)| k == "close") {
+            Some((_, Json::Str(line))) => Ok(FrameOutcome::Close(Some(line.clone()))),
+            Some((_, Json::Bool(true) | Json::Obj(_) | Json::Null)) => {
+                Ok(FrameOutcome::Close(None))
+            }
+            _ => Ok(FrameOutcome::Stay),
+        }
+    }
+
+    /// Closes a frame, returning any scrollback line it asked to leave behind.
+    pub fn close_frame(&mut self, frame: &OpenFrame) -> Option<String> {
+        let bytes = self.host.call(&frame.id, "frame_close", b"").ok()?;
+        let text = String::from_utf8_lossy(&bytes);
+        let Some(Json::Obj(fields)) = json_parse(&text) else {
+            return None;
+        };
+        match fields.iter().find(|(k, _)| k == "scrollback") {
+            Some((_, Json::Str(line))) if !line.is_empty() => Some(line.clone()),
+            _ => None,
+        }
     }
 
     /// Approves a held component and loads it, without waiting for a restart.
@@ -1568,6 +1851,16 @@ fn missing_exports(
             }
         }
     }
+    if component.manifest.surfaces.contains(&Surface::Frame) {
+        // `frame_mouse` is deliberately absent from this list: a component may
+        // implement it, and one that does not simply never sees a mouse event.
+        // Requiring it would refuse a perfectly good keyboard-only game.
+        for export in ["frame_open", "frame_step", "frame_key", "frame_close"] {
+            if !host.has_export(id, export) {
+                missing.push(export);
+            }
+        }
+    }
     if component.manifest.surfaces.contains(&Surface::Segment)
         && !host.has_export(id, "segment_render")
     {
@@ -1761,6 +2054,9 @@ mod tests {
                 module: "demo.wasm".to_string(),
                 surfaces: vec![Surface::Frame],
                 capabilities: caps,
+                activation: Activation::default(),
+                veiled: false,
+                min_size: (0, 0),
                 events: Vec::new(),
             },
         }

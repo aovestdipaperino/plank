@@ -163,3 +163,107 @@ pub fn segment_render(input: String) -> FnResult<String> {
         .to_string();
     Ok(format!(r#"{{"text": "msgs {messages}", "priority": 200}}"#))
 }
+
+// ---------------------------------------------------------------------------
+// The `frame` surface: a bouncing character, in as few lines as the contract
+// allows. It exists to exercise the packed glyph buffer and the open/step/
+// key/close lifecycle, not to be a game.
+// ---------------------------------------------------------------------------
+
+/// Frame state. A guest has no ambient clock and no ambient randomness — both
+/// arrive in the payload — so a static is all the state there is.
+static mut FRAME: (f32, f32, f32, f32, u16, u16, u32) = (0.0, 0.0, 24.0, 12.0, 0, 0, 0);
+
+#[plugin_fn]
+pub fn frame_open(input: String) -> FnResult<String> {
+    let num = |key: &str| -> f32 {
+        input
+            .split_once(&format!("\"{key}\":"))
+            .and_then(|(_, rest)| {
+                rest.trim_start()
+                    .split(&[',', '}'][..])
+                    .next()
+                    .and_then(|n| n.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(0.0)
+    };
+    let (w, h, seed) = (num("w"), num("h"), num("seed"));
+    unsafe {
+        // The seed picks a starting corner, so two opens with different seeds
+        // are visibly different and the same seed replays exactly.
+        let s = seed as u32;
+        FRAME = (
+            if s % 2 == 0 { 1.0 } else { w - 2.0 },
+            if (s / 2) % 2 == 0 { 1.0 } else { h - 2.0 },
+            if s % 2 == 0 { 24.0 } else { -24.0 },
+            if (s / 2) % 2 == 0 { 12.0 } else { -12.0 },
+            w as u16,
+            h as u16,
+            0,
+        );
+    }
+    Ok(r#"{"ok": true}"#.to_string())
+}
+
+#[plugin_fn]
+pub fn frame_step(input: String) -> FnResult<Vec<u8>> {
+    let num = |key: &str| -> f32 {
+        input
+            .split_once(&format!("\"{key}\":"))
+            .and_then(|(_, rest)| {
+                rest.trim_start()
+                    .split(&[',', '}'][..])
+                    .next()
+                    .and_then(|n| n.trim().parse::<f32>().ok())
+            })
+            .unwrap_or(0.0)
+    };
+    let (dt, w, h) = (num("dt_ms") / 1000.0, num("w"), num("h"));
+    let (x, y, steps) = unsafe {
+        let f = &mut *(&raw mut FRAME);
+        f.4 = w as u16;
+        f.5 = h as u16;
+        f.0 += f.2 * dt;
+        f.1 += f.3 * dt;
+        if f.0 < 0.0 || f.0 > w - 1.0 {
+            f.2 = -f.2;
+            f.0 = f.0.clamp(0.0, (w - 1.0).max(0.0));
+        }
+        if f.1 < 0.0 || f.1 > h - 1.0 {
+            f.3 = -f.3;
+            f.1 = f.1.clamp(0.0, (h - 1.0).max(0.0));
+        }
+        f.6 += 1;
+        (f.0 as u16, f.1 as u16, f.6)
+    };
+
+    // The packed layout, written by hand: a guest in another language would do
+    // exactly this, so the fixture proves the format is writable without the
+    // host's own encoder.
+    let mut out = Vec::with_capacity(22);
+    out.extend_from_slice(b"PGLY");
+    out.extend_from_slice(&1u16.to_le_bytes()); // version
+    out.extend_from_slice(&1u16.to_le_bytes()); // count
+    out.extend_from_slice(&(w as u16).to_le_bytes());
+    out.extend_from_slice(&(h as u16).to_le_bytes());
+    out.extend_from_slice(&x.to_le_bytes());
+    out.extend_from_slice(&y.to_le_bytes());
+    out.extend_from_slice(&u32::from('●').to_le_bytes());
+    // Colour drifts with the step count so a test can tell two frames apart.
+    out.extend_from_slice(&[(steps % 256) as u8, 200, 100, 1 /* bold */]);
+    Ok(out)
+}
+
+#[plugin_fn]
+pub fn frame_key(input: String) -> FnResult<String> {
+    if input.contains("\"q\"") || input.contains("escape") {
+        return Ok(r#"{"close": "the bouncer says goodbye"}"#.to_string());
+    }
+    Ok(r#"{"stay": true}"#.to_string())
+}
+
+#[plugin_fn]
+pub fn frame_close() -> FnResult<String> {
+    let steps = unsafe { (*(&raw const FRAME)).6 };
+    Ok(format!(r#"{{"scrollback": "bounced for {steps} steps"}}"#))
+}

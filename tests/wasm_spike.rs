@@ -725,6 +725,9 @@ fn a_contested_tool_name_is_qualified_and_reported() {
                 module: "a.wasm".to_string(),
                 surfaces: vec![plank::wasmreg::Surface::Tool],
                 capabilities: vec![],
+                activation: plank::wasmreg::Activation::Manual,
+                veiled: false,
+                min_size: (0, 0),
                 events: vec![],
             },
         },
@@ -821,5 +824,167 @@ fn a_segment_component_renders_and_is_throttled() {
         10_000 + SEGMENT_MIN_INTERVAL_MS,
     ));
     assert_eq!(session.registry.segments()[0].text, "msgs 99");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Loads the guest as a `frame` component.
+fn frame_session(
+    tag: &str,
+    wasm: &[u8],
+    extra: &str,
+) -> (std::path::PathBuf, plank::wasmreg::Session) {
+    use plank::plugins::{Origin, PluginSet, load_plugin};
+
+    let root = std::env::temp_dir().join(format!("plank-wasm-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("demo");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("demo.wasm"), wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        format!(
+            r#"{{"name": "demo", "wasm": [{{"id": "dev.plank.bounce", "module": "demo.wasm",
+                "surfaces": ["frame"], "capabilities": []{extra}}}]}}"#
+        ),
+    )
+    .unwrap();
+    let set = PluginSet {
+        plugins: vec![load_plugin(&dir, Origin::UserScan).expect("a plugin")],
+        ..PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = plank::wasmreg::Session::new(None);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.bounce", &project)
+        .expect("approve");
+    (root, session)
+}
+
+/// The `frame` lifecycle end to end: open, step into a decoded glyph buffer,
+/// move between steps, refuse to close on an ordinary key, close on `q`, and
+/// leave a scrollback line behind.
+#[test]
+fn a_frame_component_opens_steps_and_closes() {
+    use plank::wasmreg::FrameOutcome;
+
+    let wasm = guest_or_skip!();
+    let (root, mut session) = frame_session("frame", &wasm, "");
+
+    let openable = session.openable_frames();
+    assert_eq!(openable.len(), 1, "{openable:?}");
+    assert_eq!(openable[0].0, "dev.plank.bounce");
+    assert!(
+        session.idle_frames().is_empty(),
+        "activation defaults to manual, so the idle rotation must not pick it"
+    );
+
+    let mut frame = session
+        .open_frame("dev.plank.bounce", 40, 20, 1)
+        .expect("open");
+    assert!(!frame.veiled);
+
+    session
+        .step_frame(&mut frame, 50, 40, 20, 1_000)
+        .expect("step");
+    assert_eq!(frame.last.glyphs.len(), 1, "one bouncing glyph");
+    assert_eq!(frame.last.glyphs[0].ch, '●');
+    assert!(frame.last.bold[0], "the flag byte survived the round trip");
+    assert_eq!((frame.last.w, frame.last.h), (40, 20));
+    let first = frame.last.glyphs[0];
+
+    // A second step moves it: the guest integrates the dt the host supplies.
+    session
+        .step_frame(&mut frame, 100, 40, 20, 1_100)
+        .expect("step");
+    let second = frame.last.glyphs[0];
+    assert!(
+        (first.x, first.y) != (second.x, second.y),
+        "the frame did not advance: {first:?} then {second:?}"
+    );
+
+    // An ordinary key is absorbed; `q` closes with a line for the scrollback.
+    assert_eq!(
+        session.frame_key(&frame, "left").expect("key"),
+        FrameOutcome::Stay
+    );
+    assert_eq!(
+        session.frame_key(&frame, "q").expect("key"),
+        FrameOutcome::Close(Some("the bouncer says goodbye".to_string()))
+    );
+    assert_eq!(
+        session.close_frame(&frame).as_deref(),
+        Some("bounced for 2 steps"),
+        "close reports the state the component accumulated"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A component's declared minimum is enforced by the host, before the guest is
+/// asked to draw into a space it said it cannot use.
+#[test]
+fn a_frame_refuses_to_open_below_its_minimum_size() {
+    let wasm = guest_or_skip!();
+    let (root, mut session) =
+        frame_session("frame-min", &wasm, r#", "min_size": {"w": 30, "h": 9}"#);
+
+    let err = session
+        .open_frame("dev.plank.bounce", 20, 5, 0)
+        .unwrap_err();
+    assert!(err.contains("needs at least 30x9"), "{err}");
+    assert!(
+        err.contains("20x5"),
+        "the message must name what it got: {err}"
+    );
+
+    assert!(
+        session.open_frame("dev.plank.bounce", 40, 20, 0).is_ok(),
+        "a big enough terminal opens"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `activation` decides which openers may pick a frame, and the two lists are
+/// genuinely different — a manual-only component must never be chosen by the
+/// idle rotation, which is what would put a game on screen unasked.
+#[test]
+fn activation_separates_manual_from_idle_frames() {
+    let wasm = guest_or_skip!();
+
+    let (root, session) = frame_session("frame-idle", &wasm, r#", "activation": "idle""#);
+    assert_eq!(session.idle_frames(), vec!["dev.plank.bounce"]);
+    assert!(
+        session.openable_frames().is_empty(),
+        "an idle-only frame is not openable by command"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    let (root, session) = frame_session("frame-both", &wasm, r#", "activation": "both""#);
+    assert_eq!(session.idle_frames().len(), 1);
+    assert_eq!(session.openable_frames().len(), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The same seed replays exactly; a different one does not. A frame has no
+/// ambient randomness for the same reason it has no ambient clock.
+#[test]
+fn a_seed_makes_a_frame_reproducible() {
+    let wasm = guest_or_skip!();
+    let (root, mut session) = frame_session("frame-seed", &wasm, "");
+
+    let run = |session: &mut plank::wasmreg::Session, seed: u64| {
+        let mut f = session
+            .open_frame("dev.plank.bounce", 40, 20, seed)
+            .expect("open");
+        session.step_frame(&mut f, 50, 40, 20, 0).expect("step");
+        f.last.glyphs[0]
+    };
+
+    let a = run(&mut session, 7);
+    let b = run(&mut session, 7);
+    let c = run(&mut session, 8);
+    assert_eq!((a.x, a.y), (b.x, b.y), "the same seed must replay exactly");
+    assert_ne!((a.x, a.y), (c.x, c.y), "a different seed must differ");
     let _ = std::fs::remove_dir_all(&root);
 }

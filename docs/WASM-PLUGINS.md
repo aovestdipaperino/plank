@@ -83,9 +83,27 @@ place where a component gets disabled for having nothing to say. A trap still
 strikes — that means the guest broke, and it will break again on the next
 repaint.
 
-Not yet implemented: the `frame` surface, the remaining events (`idle`,
-`resize`, `job_*`, the compaction pair), and the
-`notify`/`agent`/`session`/`sound` capabilities.
+**The `frame` surface — ABI and driver.** `src/wasmglyph.rs` implements the
+packed glyph buffer; `wasmreg` drives the open/step/key/close lifecycle,
+enforces `min_size`, clamps `dt_ms` the way `arcade::MAX_STEP_MS` does, and
+separates manual from idle activation so a component cannot appear unasked. A
+guest has no ambient clock and no ambient randomness: time and seed arrive in
+the payload, and the same seed replays exactly.
+
+Decoding is total — a malformed buffer costs the frame, never the session — and
+the count is validated against the declared area *before* anything is
+allocated, so a two-byte edit cannot ask the host for a huge allocation.
+
+**Still to do for `frame`:** it has no UI yet. The driver is complete and
+tested against a real bouncing-glyph guest, but nothing in `tui.rs` opens one, so
+there is no slash command, no idle rotation and no blitter reuse. The arcade
+migration — six games as guest crates, `ScreensaverFace` becoming a registry,
+`tui::arcade_frame` becoming generic, embedded built-in `.wasm` blobs, and the
+`sound` capability a guest needs because it cannot shell out — is the next
+increment and is larger than everything before it combined.
+
+Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
+compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)
 

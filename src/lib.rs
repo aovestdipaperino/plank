@@ -94,6 +94,7 @@ pub mod viz;
 pub mod warp;
 pub mod wasmcaps;
 pub mod wasmevents;
+pub mod wasmglyph;
 pub mod wasmhost;
 pub mod wasmreg;
 pub mod worker;
