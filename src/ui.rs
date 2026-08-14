@@ -2332,6 +2332,10 @@ impl Agent<'_> {
                 )));
                 continue;
             }
+            // Before the footer, not after: the bar is rendered from the
+            // published cells, so refreshing afterwards would show every cell
+            // one turn stale and leave the first turn's bar empty.
+            self.refresh_wasm_segments();
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
             }
@@ -2587,6 +2591,46 @@ impl Agent<'_> {
         if let Some(ctx) = out.context {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        }
+    }
+
+    /// Re-renders WASM status cells and publishes them to the bar.
+    ///
+    /// Self-throttled by the registry, so this can be called at any boundary
+    /// that happens to be convenient without the caller owning the cadence.
+    /// Deliberately *not* called from the repaint path: the bar redraws on
+    /// every keystroke, and a guest has no business running there.
+    fn refresh_wasm_segments(&mut self) {
+        use std::fmt::Write as _;
+
+        if self.tool_ctx.wasm.registry.loaded.is_empty() {
+            return;
+        }
+        // The facts a cell is likely to want, in the flat-map shape every
+        // other WASM payload uses. Extending it later is additive.
+        let mut status = String::from("{\"cwd\": ");
+        crate::tools::mcp::json_escape(&mut status, &self.tool_ctx.cwd.display().to_string());
+        let _ = write!(
+            status,
+            ", \"messages\": {}, \"ctx_size\": {}}}",
+            self.session.transcript.len(),
+            self.engine.ctx_size(),
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let wasm = &mut self.tool_ctx.wasm;
+        if wasm
+            .registry
+            .refresh_segments(&mut *wasm.host, &status, now_ms)
+        {
+            let cells: Vec<String> = wasm
+                .registry
+                .segments()
+                .iter()
+                .map(|s| s.text.clone())
+                .collect();
+            crate::status::set_wasm_segments(cells);
         }
     }
 
@@ -7827,6 +7871,7 @@ impl Agent<'_> {
                 //
                 // Blank line first: the footer is a boundary marker, and butted
                 // against the reply's last line it reads as part of it.
+                self.refresh_wasm_segments();
                 log.push_plain("");
                 log.push_spans(vec![ratatui::text::Span::styled(
                     tui::turn_footer(turn_started.elapsed()),

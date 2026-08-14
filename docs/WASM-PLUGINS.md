@@ -67,8 +67,24 @@ tool list that changed mid-session would invalidate the checkpoint under the
 running session. A component approved with `/plugins trust` mid-session is
 dispatchable immediately but reaches the prompt only on the next launch.
 
-Not yet implemented: `frame` and `segment` surfaces, the remaining events
-(`idle`, `resize`, `job_*`, the compaction pair), and the
+**The `segment` surface**, with one deliberate deviation. The design says a
+cell renders "once per status-bar repaint"; this renders at most once a second
+and reads from cache in between. The TUI repaints on every keystroke and every
+throbber tick, so a per-repaint call would run a guest dozens of times a second
+on the UI thread while the user is typing, to refresh data that changes on the
+order of seconds. The refresh is self-throttled inside the registry, so callers
+invoke it at whatever boundary is convenient without owning the cadence — and
+it is called *before* the bar renders, since publishing afterwards leaves every
+cell one turn stale.
+
+A cell that returns nothing is quiet, not broken: an unreadable reply drops the
+cell for that round without a strike, because the status bar must never be a
+place where a component gets disabled for having nothing to say. A trap still
+strikes — that means the guest broke, and it will break again on the next
+repaint.
+
+Not yet implemented: the `frame` surface, the remaining events (`idle`,
+`resize`, `job_*`, the compaction pair), and the
 `notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)

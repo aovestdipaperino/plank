@@ -832,7 +832,54 @@ fn parse_tool_specs(component: &str, bytes: &[u8]) -> Option<Vec<WasmTool>> {
     Some(out)
 }
 
-/// A session's WASM state:/// A session's WASM state: the admitted components and the runtime they live
+/// One rendered status-bar cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// Component that produced it.
+    pub component: String,
+    /// The text to show. Empty means "nothing to say right now", which is a
+    /// segment's ordinary state and not a failure.
+    pub text: String,
+    /// Elision order when the bar overflows: higher survives longer. Plugin
+    /// segments compete in the same order as the built-in ones.
+    pub priority: u8,
+}
+
+/// How often a `segment` component may actually be called.
+///
+/// The design says "once per status-bar repaint". That is the wrong cadence
+/// for this front end: the TUI repaints on every keystroke and every throbber
+/// tick, so a call there costs fuel dozens of times a second and runs a guest
+/// on the UI thread while the user is typing. A status cell's data changes on
+/// the order of seconds, so it is rendered at most this often and read from
+/// cache in between — the same reasoning that cut `token_batch` from v1.
+pub const SEGMENT_MIN_INTERVAL_MS: u64 = 1_000;
+
+/// Parses a `segment_render` reply.
+fn parse_segment(component: &str, bytes: &[u8]) -> Option<Segment> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let Json::Obj(fields) = json_parse(text)? else {
+        return None;
+    };
+    let get = |key: &str| match fields.iter().find(|(k, _)| k == key) {
+        Some((_, Json::Str(s))) => s.clone(),
+        _ => String::new(),
+    };
+    let priority = match fields.iter().find(|(k, _)| k == "priority") {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some((_, Json::Num(n))) if *n >= 0.0 => (*n as u32).min(255) as u8,
+        _ => 128,
+    };
+    Some(Segment {
+        component: component.to_string(),
+        // A cell is one line by construction: a newline in it would tear the
+        // bar apart, so it is folded rather than trusted.
+        text: get("text").replace(['\n', '\r'], " "),
+        priority,
+    })
+}
+
+/// A session's WASM state:/// A session's WASM state:/// A session's WASM state: the admitted components and the runtime they live
 /// in, kept together because neither is useful alone.
 ///
 /// Defaults to "nothing discovered, nothing runnable", so a session that never
@@ -965,6 +1012,11 @@ pub const STRIKE_LIMIT: u8 = 3;
 pub struct Registry {
     /// Admitted components, in discovery order.
     pub loaded: Vec<Loaded>,
+    /// Last rendered status-bar cells, highest priority first.
+    segments: Vec<Segment>,
+    /// When they were last rendered, in milliseconds since an arbitrary epoch
+    /// the caller supplies. `None` until the first render.
+    segments_rendered_ms: Option<u64>,
     /// Components held back, each with the decision that held it.
     pub held: Vec<(WasmComponent, Decision)>,
     /// Non-fatal complaints, including load failures.
@@ -1087,6 +1139,95 @@ impl Registry {
             });
         }
         out
+    }
+
+    /// A registry holding exactly `loaded` and nothing else.
+    ///
+    /// For callers that build a registry directly rather than admitting one —
+    /// tests, and anything that wants to reason about a fixed component set.
+    /// The segment cache stays private because it must stay consistent with
+    /// its own throttle, so it is not something a caller may seed.
+    #[must_use]
+    pub fn with_loaded(loaded: Vec<Loaded>) -> Self {
+        Self {
+            loaded,
+            ..Self::default()
+        }
+    }
+
+    /// The status-bar cells as last rendered, highest priority first.
+    ///
+    /// Cheap and side-effect free: the bar reads this on every repaint, and
+    /// nothing here calls a guest.
+    #[must_use]
+    pub fn segments(&self) -> &[Segment] {
+        &self.segments
+    }
+
+    /// Re-renders the status cells if enough time has passed, returning
+    /// whether anything was rendered.
+    ///
+    /// Self-throttling on purpose: callers should call this wherever they
+    /// naturally can — a turn boundary, an idle tick — without having to own
+    /// the decision about how often a guest may run. `now_ms` is supplied
+    /// rather than read here so the throttle is testable without sleeping.
+    pub fn refresh_segments(
+        &mut self,
+        host: &mut dyn crate::wasmhost::WasmHost,
+        status_json: &str,
+        now_ms: u64,
+    ) -> bool {
+        if let Some(last) = self.segments_rendered_ms
+            && now_ms.saturating_sub(last) < SEGMENT_MIN_INTERVAL_MS
+        {
+            return false;
+        }
+        let ids: Vec<String> = self
+            .loaded
+            .iter()
+            .filter(|l| {
+                l.strikes < STRIKE_LIMIT
+                    && l.component.manifest.surfaces.contains(&Surface::Segment)
+            })
+            .map(|l| l.component.manifest.id.clone())
+            .collect();
+        self.segments_rendered_ms = Some(now_ms);
+        if ids.is_empty() {
+            return false;
+        }
+        let mut rendered = Vec::new();
+        for id in ids {
+            match host.call(&id, "segment_render", status_json.as_bytes()) {
+                // An unreadable reply drops the cell for this round rather
+                // than striking the component: a segment that says nothing is
+                // its ordinary state, and the bar must never be a place where
+                // a component gets disabled for being quiet.
+                Ok(bytes) => {
+                    if let Some(seg) = parse_segment(&id, &bytes).filter(|s| !s.text.is_empty()) {
+                        rendered.push(seg);
+                    }
+                }
+                Err(e) => {
+                    // A trap *is* worth a strike: it means the guest broke,
+                    // and it will break again on the next repaint.
+                    let disabled = self.strike(&id);
+                    self.warnings.push(if disabled {
+                        format!(
+                            "{id}: {e} (disabled for this session after {STRIKE_LIMIT} failures)"
+                        )
+                    } else {
+                        format!("{id}: {e}")
+                    });
+                }
+            }
+        }
+        rendered.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.component.cmp(&b.component))
+        });
+        self.segments = rendered;
+        true
     }
 
     /// Every model-facing tool contributed this session, under the name the
@@ -1426,6 +1567,11 @@ fn missing_exports(
                 missing.push(export);
             }
         }
+    }
+    if component.manifest.surfaces.contains(&Surface::Segment)
+        && !host.has_export(id, "segment_render")
+    {
+        missing.push("segment_render");
     }
     if component.manifest.surfaces.contains(&Surface::Tool) {
         for export in ["tool_specs", "tool_call"] {

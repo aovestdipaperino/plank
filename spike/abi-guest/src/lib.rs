@@ -150,3 +150,16 @@ pub fn tool_call(input: String) -> FnResult<String> {
         .unwrap_or("");
     Ok(format!("{} words\n", text.split_whitespace().count()))
 }
+
+/// The `segment` surface: one status-bar cell. Reads the payload it is given
+/// so the test can prove the host actually passes session facts in.
+#[plugin_fn]
+pub fn segment_render(input: String) -> FnResult<String> {
+    let messages = input
+        .split_once("\"messages\":")
+        .and_then(|(_, rest)| rest.trim_start().split(&[',', '}'][..]).next())
+        .unwrap_or("?")
+        .trim()
+        .to_string();
+    Ok(format!(r#"{{"text": "msgs {messages}", "priority": 200}}"#))
+}

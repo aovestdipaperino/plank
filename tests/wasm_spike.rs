@@ -714,27 +714,24 @@ fn a_contested_tool_name_is_qualified_and_reported() {
         description: String::new(),
         schema: String::new(),
     };
-    let mut reg = Registry {
-        loaded: vec![Loaded {
-            component: plank::wasmreg::WasmComponent {
-                plugin: "a".to_string(),
-                origin: plank::plugins::Origin::UserScan,
-                path: std::path::PathBuf::from("/x"),
-                manifest: plank::wasmreg::WasmManifest {
-                    id: "dev.plank.a".to_string(),
-                    abi: 1,
-                    module: "a.wasm".to_string(),
-                    surfaces: vec![plank::wasmreg::Surface::Tool],
-                    capabilities: vec![],
-                    events: vec![],
-                },
+    let mut reg = Registry::with_loaded(vec![Loaded {
+        component: plank::wasmreg::WasmComponent {
+            plugin: "a".to_string(),
+            origin: plank::plugins::Origin::UserScan,
+            path: std::path::PathBuf::from("/x"),
+            manifest: plank::wasmreg::WasmManifest {
+                id: "dev.plank.a".to_string(),
+                abi: 1,
+                module: "a.wasm".to_string(),
+                surfaces: vec![plank::wasmreg::Surface::Tool],
+                capabilities: vec![],
+                events: vec![],
             },
-            strikes: 0,
-            tools: vec![tool("bash", "dev.plank.a"), tool("unique", "dev.plank.a")],
-            commands: vec![],
-        }],
-        ..Registry::default()
-    };
+        },
+        strikes: 0,
+        tools: vec![tool("bash", "dev.plank.a"), tool("unique", "dev.plank.a")],
+        commands: vec![],
+    }]);
 
     let warnings = reg.resolve_tool_names(&["bash".to_string(), "read".to_string()]);
     let tools = reg.tools();
@@ -754,4 +751,75 @@ fn a_contested_tool_name_is_qualified_and_reported() {
             .any(|w| w.contains("contested") && w.contains("wasm__a__bash")),
         "{warnings:?}"
     );
+}
+
+/// The `segment` surface: a cell renders from the payload the host supplies,
+/// and — the part that matters for a status bar — a second call inside the
+/// throttle window does not reach the guest at all.
+#[test]
+fn a_segment_component_renders_and_is_throttled() {
+    use plank::plugins::{Origin, PluginSet, load_plugin};
+    use plank::wasmreg::{SEGMENT_MIN_INTERVAL_MS, Session};
+
+    let wasm = guest_or_skip!();
+    let root = std::env::temp_dir().join(format!("plank-wasm-seg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("demo");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("demo.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        r#"{"name": "demo", "wasm": [{"id": "dev.plank.demo", "module": "demo.wasm",
+            "surfaces": ["segment"], "capabilities": []}]}"#,
+    )
+    .unwrap();
+
+    let set = PluginSet {
+        plugins: vec![load_plugin(&dir, Origin::UserScan).expect("a plugin")],
+        ..PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = Session::new(None);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.demo", &project)
+        .expect("approve");
+
+    assert!(
+        session.registry.segments().is_empty(),
+        "nothing rendered yet"
+    );
+
+    let rendered = session.registry.refresh_segments(
+        &mut *session.host,
+        r#"{"cwd": "/x", "messages": 7, "ctx_size": 1024}"#,
+        10_000,
+    );
+    assert!(rendered);
+    let cells = session.registry.segments();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].text, "msgs 7", "the payload reached the guest");
+    assert_eq!(cells[0].priority, 200);
+
+    // Inside the window: not re-rendered, and the previous cell survives.
+    let again = session.registry.refresh_segments(
+        &mut *session.host,
+        r#"{"cwd": "/x", "messages": 99, "ctx_size": 1024}"#,
+        10_000 + SEGMENT_MIN_INTERVAL_MS - 1,
+    );
+    assert!(
+        !again,
+        "a call inside the throttle window must not reach the guest"
+    );
+    assert_eq!(session.registry.segments()[0].text, "msgs 7");
+
+    // Past it: rendered again, with the new facts.
+    assert!(session.registry.refresh_segments(
+        &mut *session.host,
+        r#"{"cwd": "/x", "messages": 99, "ctx_size": 1024}"#,
+        10_000 + SEGMENT_MIN_INTERVAL_MS,
+    ));
+    assert_eq!(session.registry.segments()[0].text, "msgs 99");
+    let _ = std::fs::remove_dir_all(&root);
 }

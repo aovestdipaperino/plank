@@ -192,6 +192,37 @@ pub fn set_engine_origin(label: &str) {
 static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
 /// Records the local engine's GPU power cap, from startup config or `/power`.
+/// Status-bar cells contributed by WASM `segment` components, already
+/// rendered.
+///
+/// Published rather than pulled for the same reason the roster and the power
+/// share are: [`build_status_text`] is a pure function called from a dozen
+/// places that have no access to a session, and threading one through all of
+/// them to reach a plugin registry would be a far larger change than the
+/// feature is worth. The registry re-renders on its own cadence and drops the
+/// text here; the bar only ever reads it.
+static WASM_SEGMENTS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Replaces the contributed cells, highest priority first.
+pub fn set_wasm_segments(segments: Vec<String>) {
+    if let Ok(mut slot) = WASM_SEGMENTS.write() {
+        *slot = segments;
+    }
+}
+
+/// The contributed cells, joined for the bar. Empty when there are none, so
+/// the common case adds not one byte to the line.
+#[must_use]
+fn wasm_segment_text() -> String {
+    let Ok(slot) = WASM_SEGMENTS.read() else {
+        return String::new();
+    };
+    if slot.is_empty() {
+        return String::new();
+    }
+    format!(" | {}", slot.join(" | "))
+}
+
 pub fn set_local_power(percent: i32) {
     LOCAL_POWER.store(percent, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1163,6 +1194,9 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         format!("{} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
+    // Contributed cells ride between the state word and the power suffix: the
+    // suffix is the line's right anchor and must stay last.
+    let power = format!("{}{power}", wasm_segment_text());
     let body = match st.state {
         WorkerState::Prefill | WorkerState::Generating => {
             match progress_segment(st, color).filter(|_| progress_in_bar) {
