@@ -161,42 +161,49 @@ impl Capability {
     }
 }
 
-/// When a `frame` component is allowed to take the screen.
+/// What kind of frame a component contributes.
+///
+/// A plugin that draws is one of two things, and they want opposite defaults:
+/// a screensaver appears on its own and must be dismissable by anything, while
+/// a game is started deliberately and owns its keys until it is quit. Making
+/// that a declared *kind* rather than an activation flag means a manifest says
+/// what the thing **is**, and the host derives when it may open from that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Activation {
-    /// Only by an explicit slash command. The default: a component that takes
-    /// the whole terminal unasked is a surprise, and a surprise should be
-    /// opted into.
+pub enum FrameKind {
+    /// Ambient: joins the idle rotation beside the built-in faces, and can
+    /// also be opened on demand. Any key dismisses it.
+    Screensaver,
+    /// A game: opened deliberately, never by the idle timer. The default,
+    /// because a component that takes the whole terminal unasked is a surprise
+    /// and a surprise should be opted into.
     #[default]
-    Manual,
-    /// Eligible for the idle rotation, and not otherwise openable.
-    Idle,
-    /// Both — the arcade games' behaviour.
-    Both,
+    Arcade,
 }
 
-impl Activation {
+impl FrameKind {
     /// The manifest spelling.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         Some(match s {
-            "manual" => Self::Manual,
-            "idle" => Self::Idle,
-            "both" => Self::Both,
+            "screensaver" => Self::Screensaver,
+            "arcade" | "game" => Self::Arcade,
             _ => return None,
         })
     }
 
-    /// Whether the idle rotation may pick this component.
+    /// The manifest spelling, for listings.
     #[must_use]
-    pub fn idle_eligible(self) -> bool {
-        matches!(self, Self::Idle | Self::Both)
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Screensaver => "screensaver",
+            Self::Arcade => "arcade",
+        }
     }
 
-    /// Whether a slash command may open it.
+    /// Whether the idle rotation may pick this.
     #[must_use]
-    pub fn manually_openable(self) -> bool {
-        matches!(self, Self::Manual | Self::Both)
+    pub fn idle_eligible(self) -> bool {
+        matches!(self, Self::Screensaver)
     }
 }
 
@@ -214,10 +221,10 @@ pub struct WasmManifest {
     pub surfaces: Vec<Surface>,
     /// Capabilities requested, deduplicated and sorted.
     pub capabilities: Vec<Capability>,
-    /// When a `frame` component may open itself. Meaningless for other
-    /// surfaces, and defaulted rather than required so a manifest that claims
-    /// no frame need not mention it.
-    pub activation: Activation,
+    /// What kind of frame this is. Meaningless for other surfaces, and
+    /// defaulted rather than required so a manifest that claims no frame need
+    /// not mention it.
+    pub kind: FrameKind,
     /// Whether the transcript stays dimly visible under a `frame`.
     pub veiled: bool,
     /// Smallest area the component will draw into; below it the frame refuses
@@ -380,7 +387,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         return None;
     }
 
-    let (activation, veiled, min_size) = parse_frame_fields(fields, &id, warnings)?;
+    let (kind, veiled, min_size) = parse_frame_fields(fields, &id, warnings)?;
 
     let mut events = Vec::new();
     for e in list("events") {
@@ -413,7 +420,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         module,
         surfaces,
         capabilities,
-        activation,
+        kind,
         veiled,
         min_size,
         events,
@@ -432,16 +439,16 @@ fn parse_frame_fields(
     fields: &[(String, Json)],
     id: &str,
     warnings: &mut Vec<String>,
-) -> Option<(Activation, bool, (u16, u16))> {
-    let activation = match fields.iter().find(|(k, _)| k == "activation") {
+) -> Option<(FrameKind, bool, (u16, u16))> {
+    let kind = match fields.iter().find(|(k, _)| k == "kind") {
         Some((_, Json::Str(s))) => {
-            let Some(parsed) = Activation::parse(s) else {
-                warnings.push(format!("wasm component '{id}': unknown activation '{s}'"));
+            let Some(parsed) = FrameKind::parse(s) else {
+                warnings.push(format!("wasm component '{id}': unknown frame kind '{s}'"));
                 return None;
             };
             parsed
         }
-        _ => Activation::default(),
+        _ => FrameKind::default(),
     };
     let veiled = matches!(
         fields.iter().find(|(k, _)| k == "veiled"),
@@ -462,7 +469,7 @@ fn parse_frame_fields(
             _ => None,
         })
         .unwrap_or((0, 0));
-    Some((activation, veiled, min_size))
+    Some((kind, veiled, min_size))
 }
 
 /// Discovers every WASM component contributed by `set`.
@@ -1104,10 +1111,12 @@ impl Session {
         self.registry
             .loaded
             .iter()
+            // Every frame component is openable on demand, whichever kind it
+            // is: a screensaver the user wants to look at now is a reasonable
+            // thing to ask for, and the kind only decides whether the *idle
+            // timer* may put it up unasked.
             .filter(|l| {
-                l.strikes < STRIKE_LIMIT
-                    && l.component.manifest.surfaces.contains(&Surface::Frame)
-                    && l.component.manifest.activation.manually_openable()
+                l.strikes < STRIKE_LIMIT && l.component.manifest.surfaces.contains(&Surface::Frame)
             })
             .map(|l| {
                 (
@@ -1120,12 +1129,14 @@ impl Session {
 
     /// Which face the idle rotation should put up for `seed`.
     ///
-    /// `Some(id)` is a component; `None` means "use a built-in face". The
-    /// built-ins hold exactly one slot however many components are installed:
-    /// installing a component makes it *a* candidate, not *the* screensaver,
-    /// and someone who installs three should still see the matrix rain
-    /// sometimes. The seed decides, so the choice is as reproducible as the
-    /// face it lands on.
+    /// `Some(id)` is a screensaver component; `None` means "use a built-in
+    /// face". Only components declaring `"kind": "screensaver"` are candidates
+    /// — an arcade game must never appear over someone's work.
+    ///
+    /// The built-in faces hold exactly one slot however many components are
+    /// installed: installing one makes it *a* screensaver, not *the*
+    /// screensaver, and the matrix rain plank ships must keep coming up. The
+    /// seed decides, so the choice is as reproducible as the face it lands on.
     ///
     /// Extracted from the event loop rather than left inline there because a
     /// selection rule that can only be exercised by idling a real terminal for
@@ -1150,7 +1161,7 @@ impl Session {
             .filter(|l| {
                 l.strikes < STRIKE_LIMIT
                     && l.component.manifest.surfaces.contains(&Surface::Frame)
-                    && l.component.manifest.activation.idle_eligible()
+                    && l.component.manifest.kind.idle_eligible()
             })
             .map(|l| l.component.manifest.id.as_str())
             .collect()
@@ -1908,7 +1919,22 @@ pub fn render_components(set: &WasmSet) -> String {
     }
     out.push_str("\nwasm components:\n");
     for c in &set.components {
-        let surfaces: Vec<&str> = c.manifest.surfaces.iter().map(|s| s.label()).collect();
+        let mut surfaces: Vec<String> = c
+            .manifest
+            .surfaces
+            .iter()
+            .map(|s| s.label().to_string())
+            .collect();
+        // A frame's kind is the thing a user actually wants to know about it —
+        // whether it can appear on its own — so it is shown as part of the
+        // surface rather than buried.
+        if c.manifest.surfaces.contains(&Surface::Frame) {
+            for entry in &mut surfaces {
+                if entry == "frame" {
+                    *entry = format!("frame: {}", c.manifest.kind.label());
+                }
+            }
+        }
         let _ = write!(
             out,
             "  {} ({}) [{}]",
@@ -2150,7 +2176,7 @@ mod tests {
                 module: "demo.wasm".to_string(),
                 surfaces: vec![Surface::Frame],
                 capabilities: caps,
-                activation: Activation::default(),
+                kind: FrameKind::default(),
                 veiled: false,
                 min_size: (0, 0),
                 events: Vec::new(),

@@ -127,26 +127,41 @@ argument to remember, and the alias keeps working while a built-in still owns
 the bare name. `/frame` remains for listing what is openable and for a
 component whose frames are not declared as commands.
 
-Three faces have landed: the matrix rain, the starfield and breakout — the
-last of which is the first *game*, and a harder case than an ambient face. Each
-goes through the same check, which is now a shared helper rather than a
-one-off: drive the built-in and the port side by side for thirty ticks and fail
-on the first glyph that differs.
+### Screensavers and arcades are different plugins
 
-A game costs one adaptation an ambient face does not. `handle_key` takes the
-ABI's key *name* instead of a crossterm `KeyEvent`, because a guest never sees
-a `KeyEvent` and pinning the ABI to crossterm's enum is what the name-based
-protocol exists to avoid. Everything else — physics, level table, layout,
-drawing — is carried across untouched, which is what keeps the glyph
-comparison meaningful. Mouse input is dropped for now; the host does not yet
-deliver `frame_mouse`.
+A frame component declares a **kind**, and the host derives everything else
+from it:
 
-**Still to do:** minions, centipede, frogger and invaders; the embedded
-built-in blob so an empty plugins directory still has screensavers; and
-`ScreensaverFace` becoming a registry rather than a closed enum. The built-in
-commands come out as each face lands — until then `/matrix` is the built-in
-rain and `/arcade:matrix` is the ported one, which is exactly what the alias
-convention is for.
+| Kind | Idle rotation | Opened on demand | Keys |
+|---|---|---|---|
+| `screensaver` | yes, beside the built-in faces | yes | anything dismisses it |
+| `arcade` | never | yes | the game claims what it uses |
+
+They ship as separate plugins rather than one artifact with a flag, because
+they are separate things and a user who wants ambient faces should be able to
+install exactly that. `guests/screensavers/` is the first; `guests/arcades/`
+will be the second.
+
+Kind is a property of the *thing*, not a permission: an arcade is never
+rotated because a game appearing over someone's work is wrong, not because it
+lacks a grant. `arcade` is the default, so a manifest that says nothing cannot
+accidentally acquire the screen.
+
+### What stays in the core
+
+**The matrix rain and breakout are not plugins and will not become plugins.**
+The rain is the *default* screensaver — a plank with no plugins installed still
+has one, and a default that depends on a plugin is not a default — and breakout
+is what the download screen draws above the progress gauge (`download.rs`),
+which runs before any plugin could be loaded. Both stay in the binary.
+
+That decides what porting is *for*: not moving the arcade out, but letting
+faces exist that plank does not ship. The starfield is ported as the first such
+face; minions, centipede, frogger and invaders follow, split by kind.
+
+The starfield's port is checked glyph for glyph against the built-in field it
+came from, thirty ticks deep. That check is the procedure for every face that
+lands; the two core faces skip it because they are not going anywhere.
 
 Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
 compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.

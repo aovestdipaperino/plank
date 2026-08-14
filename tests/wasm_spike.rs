@@ -731,7 +731,7 @@ fn a_contested_tool_name_is_qualified_and_reported() {
                 module: "a.wasm".to_string(),
                 surfaces: vec![plank::wasmreg::Surface::Tool],
                 capabilities: vec![],
-                activation: plank::wasmreg::Activation::Manual,
+                kind: plank::wasmreg::FrameKind::Arcade,
                 veiled: false,
                 min_size: (0, 0),
                 events: vec![],
@@ -883,7 +883,7 @@ fn a_frame_component_opens_steps_and_closes() {
     assert_eq!(openable[0].0, "dev.plank.bounce");
     assert!(
         session.idle_frames().is_empty(),
-        "activation defaults to manual, so the idle rotation must not pick it"
+        "a frame is an arcade unless it says otherwise, and an arcade is never rotated"
     );
 
     let mut frame = session
@@ -953,25 +953,33 @@ fn a_frame_refuses_to_open_below_its_minimum_size() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// `activation` decides which openers may pick a frame, and the two lists are
-/// genuinely different — a manual-only component must never be chosen by the
-/// idle rotation, which is what would put a game on screen unasked.
+/// A frame's *kind* decides whether the idle timer may put it up. An arcade
+/// must never be chosen by the rotation — that is what would drop a game over
+/// someone's work — while a screensaver is both rotated and openable on
+/// demand.
 #[test]
-fn activation_separates_manual_from_idle_frames() {
+fn the_frame_kind_decides_what_the_idle_rotation_may_pick() {
     let wasm = guest_or_skip!();
 
-    let (root, session) = frame_session("frame-idle", &wasm, r#", "activation": "idle""#);
+    let (root, session) = frame_session("frame-saver", &wasm, r#", "kind": "screensaver""#);
     assert_eq!(session.idle_frames(), vec!["dev.plank.bounce"]);
-    assert!(
-        session.openable_frames().is_empty(),
-        "an idle-only frame is not openable by command"
+    assert_eq!(
+        session.openable_frames().len(),
+        1,
+        "a screensaver is also openable on demand"
     );
     let _ = std::fs::remove_dir_all(&root);
 
-    let (root, session) = frame_session("frame-both", &wasm, r#", "activation": "both""#);
-    assert_eq!(session.idle_frames().len(), 1);
-    assert_eq!(session.openable_frames().len(), 1);
-    let _ = std::fs::remove_dir_all(&root);
+    // The default, and what a game declares explicitly.
+    for manifest in ["", r#", "kind": "arcade""#] {
+        let (root, session) = frame_session("frame-game", &wasm, manifest);
+        assert!(
+            session.idle_frames().is_empty(),
+            "an arcade was offered to the idle rotation"
+        );
+        assert_eq!(session.openable_frames().len(), 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// The same seed replays exactly; a different one does not. A frame has no
@@ -997,14 +1005,12 @@ fn a_seed_makes_a_frame_reproducible() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The idle rotation must never pick a manual-only component, and an
-/// idle-eligible one must be openable through the same driver a screensaver
-/// uses — the two lists are what stand between "a face the user chose" and "a
-/// game that appeared over their work".
+/// A screensaver component opens through the same driver the idle rotation
+/// uses, and is marked so any activity dismisses it.
 #[test]
 fn an_idle_frame_opens_through_the_same_driver() {
     let wasm = guest_or_skip!();
-    let (root, mut session) = frame_session("frame-idle-open", &wasm, r#", "activation": "idle""#);
+    let (root, mut session) = frame_session("frame-idle-open", &wasm, r#", "kind": "screensaver""#);
 
     let idle = session.idle_frames();
     assert_eq!(idle, vec!["dev.plank.bounce"]);
@@ -1030,7 +1036,7 @@ fn an_idle_frame_opens_through_the_same_driver() {
 #[test]
 fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
     let wasm = guest_or_skip!();
-    let (root, session) = frame_session("frame-rotate", &wasm, r#", "activation": "idle""#);
+    let (root, session) = frame_session("frame-rotate", &wasm, r#", "kind": "screensaver""#);
 
     let (mut component, mut built_in) = (0, 0);
     for seed in 0..100 {
@@ -1056,13 +1062,13 @@ fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
 #[test]
 fn the_idle_rotation_is_untouched_without_components() {
     let wasm = guest_or_skip!();
-    // Manual activation: loaded, but not a screensaver candidate.
+    // An arcade: loaded, and never a screensaver candidate.
     let (root, session) = frame_session("frame-norotate", &wasm, "");
     for seed in 0..20 {
         assert_eq!(
             session.pick_idle_face(seed),
             None,
-            "a manual-only component was picked as a screensaver"
+            "an arcade component was picked as a screensaver"
         );
     }
     let _ = std::fs::remove_dir_all(&root);
@@ -1096,25 +1102,25 @@ fn one_component_serves_several_frames_and_opens_them_from_its_own_command() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Installs the arcade component and returns a session with it approved.
+/// Installs the screensavers component and returns a session with it approved.
 fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Session)> {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/guests/arcade/target/wasm32-unknown-unknown/release/plank_arcade.wasm"
+        "/guests/screensavers/target/wasm32-unknown-unknown/release/plank_screensavers.wasm"
     );
     let wasm = std::fs::read(path).ok()?;
 
     let root = std::env::temp_dir().join(format!("plank-arcade-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    let dir = root.join("arcade");
+    let dir = root.join("screensavers");
     std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
     std::fs::create_dir_all(dir.join("wasm")).unwrap();
-    std::fs::write(dir.join("wasm").join("arcade.wasm"), &wasm).unwrap();
+    std::fs::write(dir.join("wasm").join("faces.wasm"), &wasm).unwrap();
     std::fs::write(
         dir.join(".plank-plugin").join("plugin.json"),
-        r#"{"name": "arcade", "wasm": [{"id": "dev.plank.arcade", "module": "arcade.wasm",
-            "surfaces": ["frame", "command"], "capabilities": [],
-            "activation": "both"}]}"#,
+        r#"{"name": "screensavers", "wasm": [{"id": "dev.plank.screensavers",
+            "module": "faces.wasm", "surfaces": ["frame", "command"],
+            "capabilities": [], "kind": "screensaver"}]}"#,
     )
     .unwrap();
 
@@ -1128,7 +1134,7 @@ fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Sess
     let mut session = plank::wasmreg::Session::new(None);
     session.activate(&set, &project);
     session
-        .approve("dev.plank.arcade", &project)
+        .approve("dev.plank.screensavers", &project)
         .expect("approve");
     Some((root, session))
 }
@@ -1148,7 +1154,7 @@ fn assert_face_matches(
 ) {
     let (w, h) = (80_u16, 24_u16);
     let mut frame = session
-        .open_frame("dev.plank.arcade", face, w, h, seed)
+        .open_frame("dev.plank.screensavers", face, w, h, seed)
         .expect("open");
 
     let mut drew = 0;
@@ -1178,25 +1184,14 @@ fn assert_face_matches(
     assert!(drew > 50, "{face} drew at most {drew} glyphs");
 }
 
-/// The matrix rain, ported: same seed, same glyphs, thirty ticks deep.
-#[test]
-fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
-    let Some((root, mut session)) = arcade_session("rain") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0xDEAD_BEEF_u64;
-    let mut native = plank::arcade::matrix::Rain::new(seed);
-    assert_face_matches(&mut session, "matrix", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// The starfield, ported. A second face through the same check is what makes
-/// the check a *procedure* rather than a one-off: every face that lands from
-/// here gets exactly this treatment.
+/// The starfield, ported into the screensavers plugin, checked glyph for glyph
+/// against the built-in field it came from.
+///
+/// This is the procedure every ported face goes through. plank's own matrix
+/// rain and breakout deliberately do *not* go through it, because they are not
+/// ported: the rain is the default screensaver and breakout is the download
+/// screen, so both stay in the binary where a plank with no plugins still has
+/// them.
 #[test]
 fn the_ported_starfield_matches_the_built_in_field_glyph_for_glyph() {
     let Some((root, mut session)) = arcade_session("stars") else {
@@ -1211,122 +1206,6 @@ fn the_ported_starfield_matches_the_built_in_field_glyph_for_glyph() {
         native.step(dt);
         native.glyphs(w, h)
     });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// Breakout, ported: the first *game* through the check. A game is a harder
-/// case than an ambient face — it has phases, a serve countdown and input —
-/// and its physics still has to land on the same glyphs as the built-in's.
-///
-/// Driven with no input on purpose: the two sides receive keys through
-/// different types (a crossterm `KeyEvent` here, an ABI key *name* there), so
-/// the comparison is of the simulation, which is the part that was carried
-/// across unchanged.
-#[test]
-fn the_ported_breakout_matches_the_built_in_game_glyph_for_glyph() {
-    let Some((root, mut session)) = arcade_session("breakout") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let seed = 0xC0FF_EE00_u64;
-    let mut native = plank::arcade::breakout::Breakout::new(seed);
-    assert_face_matches(&mut session, "breakout", seed, |dt, w, h| {
-        native.step(dt);
-        native.glyphs(w, h)
-    });
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A game claims the keys it uses and lets everything else close the frame.
-/// That is what makes Esc and `q` work without every game spelling them, and
-/// what keeps a stray key from dropping a user out of a rally.
-#[test]
-fn a_ported_game_claims_its_own_keys() {
-    use plank::wasmreg::FrameOutcome;
-
-    let Some((root, mut session)) = arcade_session("breakout-keys") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let frame = session
-        .open_frame("dev.plank.arcade", "breakout", 80, 24, 1)
-        .expect("open");
-
-    for claimed in ["left", "right", "h", "l", "p", "space"] {
-        assert_eq!(
-            session.frame_key(&frame, claimed).expect("key"),
-            FrameOutcome::Stay,
-            "breakout dropped the frame on '{claimed}', which it uses"
-        );
-    }
-    for unclaimed in ["q", "escape", "z"] {
-        assert!(
-            matches!(
-                session.frame_key(&frame, unclaimed).expect("key"),
-                FrameOutcome::Close(_)
-            ),
-            "'{unclaimed}' should have closed the frame"
-        );
-    }
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-/// A key does not just get *claimed* — it has to reach the simulation and move
-/// something. Claiming and acting are different failures with the same
-/// symptom (a game that ignores you), and only the second one is visible in a
-/// screenshot, badly.
-#[test]
-fn a_ported_games_input_moves_the_paddle() {
-    let Some((root, mut session)) = arcade_session("breakout-input") else {
-        eprintln!("skipping: run guests/build.sh first");
-        return;
-    };
-    let (w, h) = (80_u16, 24_u16);
-    let mut frame = session
-        .open_frame("dev.plank.arcade", "breakout", w, h, 5)
-        .expect("open");
-
-    // The paddle is the widest run of glyphs on the bottom-most drawn row.
-    let paddle_x = |f: &plank::wasmreg::OpenFrame| -> Option<u16> {
-        let bottom = f.last.glyphs.iter().map(|g| g.y).max()?;
-        f.last
-            .glyphs
-            .iter()
-            .filter(|g| g.y == bottom)
-            .map(|g| g.x)
-            .min()
-    };
-
-    session.step_frame(&mut frame, 16, w, h, 0).expect("step");
-    let before = paddle_x(&frame).expect("a paddle");
-
-    // Hold left: the glide is re-armed by each press, exactly as terminal key
-    // repeat does, so a few presses with steps between them is what actually
-    // happens when a person holds the key down.
-    for tick in 0..6 {
-        session.frame_key(&frame, "left").expect("key");
-        session
-            .step_frame(&mut frame, 16, w, h, (tick + 1) * 16)
-            .expect("step");
-    }
-    let after = paddle_x(&frame).expect("a paddle");
-    assert!(
-        after < before,
-        "the paddle did not move left: {before} then {after}"
-    );
-
-    // And back the other way, so the test cannot pass on a paddle that only
-    // ever drifts one direction.
-    for tick in 0..12 {
-        session.frame_key(&frame, "right").expect("key");
-        session
-            .step_frame(&mut frame, 16, w, h, (tick + 8) * 16)
-            .expect("step");
-    }
-    assert!(
-        paddle_x(&frame).expect("a paddle") > after,
-        "the paddle did not come back right"
-    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1347,7 +1226,7 @@ fn a_frame_step_fits_well_inside_the_animation_budget() {
     // 120x40 is a maximized terminal, and the rain covers it.
     let (w, h) = (120_u16, 40_u16);
     let mut frame = session
-        .open_frame("dev.plank.arcade", "matrix", w, h, 42)
+        .open_frame("dev.plank.screensavers", "matrix", w, h, 42)
         .expect("open");
 
     // A few warm-up steps: the first call into a fresh instance pays for
@@ -1389,7 +1268,7 @@ fn a_frame_step_fits_well_inside_the_animation_budget() {
 }
 
 /// A component offering several frames is opened by name, not by component id
-/// plus face: `/arcade:matrix` and `/arcade:breakout` are the addresses, the
+/// plus face: `/screensavers:starfield` and `/arcade:breakout` are the addresses, the
 /// same `<plugin>:<name>` shape every other contributed entry uses.
 #[test]
 fn a_multi_frame_component_is_addressable_per_frame() {
@@ -1401,31 +1280,32 @@ fn a_multi_frame_component_is_addressable_per_frame() {
     let commands = session.registry.commands();
     let names: Vec<&str> = commands.iter().map(|(_, c)| c.name.as_str()).collect();
     let aliases: Vec<&str> = commands.iter().map(|(_, c)| c.alias.as_str()).collect();
-    for face in ["matrix", "starfield", "breakout"] {
-        assert!(names.contains(&face), "{face} is not offered: {names:?}");
-        let alias = format!("arcade:{face}");
-        assert!(
-            aliases.contains(&alias.as_str()),
-            "{alias} is not offered: {aliases:?}"
-        );
-    }
+    let face = "starfield";
+    assert!(names.contains(&face), "{face} is not offered: {names:?}");
+    assert!(
+        aliases.contains(&"screensavers:starfield"),
+        "the namespaced form is not offered: {aliases:?}"
+    );
 
     // Running either spelling opens that face — the component gets its own
     // name back, never the alias, so a guest never has to know what plugin
     // directory it was installed under.
-    for spelling in ["arcade:breakout", "breakout"] {
+    for spelling in ["screensavers:starfield", "starfield"] {
         let out = session
             .registry
             .run_command(&mut *session.host, spelling, "")
             .expect("run");
         assert_eq!(
             out.open.as_deref(),
-            Some("breakout"),
-            "'{spelling}' did not ask to open the breakout face"
+            Some("starfield"),
+            "'{spelling}' did not ask to open the starfield face"
         );
         assert_eq!(
             session.registry.take_pending_frame(),
-            Some(("dev.plank.arcade".to_string(), "breakout".to_string())),
+            Some((
+                "dev.plank.screensavers".to_string(),
+                "starfield".to_string()
+            )),
             "'{spelling}' did not queue its own component's frame"
         );
     }

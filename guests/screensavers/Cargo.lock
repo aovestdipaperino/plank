@@ -180,7 +180,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "plank-arcade"
+name = "plank-screensavers"
 version = "0.1.0"
 dependencies = [
  "extism-pdk",
