@@ -643,3 +643,115 @@ fn an_observer_without_on_event_is_refused() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The `tool` surface end to end: specs are read at load, the exposed name is
+/// the bare one when nothing contests it, and a call returns the observation
+/// the model will see.
+#[test]
+fn a_tool_component_registers_and_runs() {
+    use plank::plugins::{Origin, PluginSet, load_plugin};
+    use plank::wasmreg::Session;
+
+    let wasm = guest_or_skip!();
+    let root = std::env::temp_dir().join(format!("plank-wasm-tool-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("demo");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("demo.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        r#"{"name": "demo", "wasm": [{"id": "dev.plank.demo", "module": "demo.wasm",
+            "surfaces": ["tool"], "capabilities": []}]}"#,
+    )
+    .unwrap();
+
+    let set = PluginSet {
+        plugins: vec![load_plugin(&dir, Origin::UserScan).expect("a plugin")],
+        ..PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = Session::new(None);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.demo", &project)
+        .expect("approve");
+
+    let tools = session.registry.tools();
+    assert_eq!(tools.len(), 1, "{tools:?}");
+    assert_eq!(tools[0].name, "wordcount");
+    assert_eq!(tools[0].exposed, "wordcount", "uncontested keeps its name");
+    assert!(
+        tools[0].schema.contains("\"required\":[\"text\"]"),
+        "{}",
+        tools[0].schema
+    );
+
+    let out = session
+        .registry
+        .run_tool(
+            &mut *session.host,
+            "wordcount",
+            r#"{"text":"one two three"}"#,
+        )
+        .expect("run");
+    assert_eq!(out, "3 words\n");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A component cannot take over a built-in. A tool named `bash` is exposed
+/// qualified, and the qualification is reported rather than silent.
+#[test]
+fn a_contested_tool_name_is_qualified_and_reported() {
+    use plank::wasmreg::{Loaded, Registry, WasmTool};
+
+    // Built directly: what is under test is the resolution rule, and driving it
+    // through a guest would only prove the guest can be renamed too.
+    let tool = |name: &str, component: &str| WasmTool {
+        component: component.to_string(),
+        name: name.to_string(),
+        exposed: name.to_string(),
+        description: String::new(),
+        schema: String::new(),
+    };
+    let mut reg = Registry {
+        loaded: vec![Loaded {
+            component: plank::wasmreg::WasmComponent {
+                plugin: "a".to_string(),
+                origin: plank::plugins::Origin::UserScan,
+                path: std::path::PathBuf::from("/x"),
+                manifest: plank::wasmreg::WasmManifest {
+                    id: "dev.plank.a".to_string(),
+                    abi: 1,
+                    module: "a.wasm".to_string(),
+                    surfaces: vec![plank::wasmreg::Surface::Tool],
+                    capabilities: vec![],
+                    events: vec![],
+                },
+            },
+            strikes: 0,
+            tools: vec![tool("bash", "dev.plank.a"), tool("unique", "dev.plank.a")],
+            commands: vec![],
+        }],
+        ..Registry::default()
+    };
+
+    let warnings = reg.resolve_tool_names(&["bash".to_string(), "read".to_string()]);
+    let tools = reg.tools();
+    let bash = tools.iter().find(|t| t.name == "bash").unwrap();
+    let unique = tools.iter().find(|t| t.name == "unique").unwrap();
+    assert_eq!(
+        bash.exposed, "wasm__a__bash",
+        "a built-in must never be shadowed"
+    );
+    assert_eq!(
+        unique.exposed, "unique",
+        "an uncontested name is left alone"
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("contested") && w.contains("wasm__a__bash")),
+        "{warnings:?}"
+    );
+}

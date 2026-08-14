@@ -401,6 +401,19 @@ fn build_tools_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> (String, usize) {
+    build_tools_prompt_parts_with_wasm(mcp_servers, &[], parity)
+}
+
+/// [`build_tools_prompt_parts`] with WASM component tools folded in.
+///
+/// Their schemas land **after** `trusted_len`, beside MCP's and for the same
+/// reason: a component's tool names, descriptions and schemas are arbitrary
+/// third-party text, and the trusted span is exactly the part plank wrote.
+fn build_tools_prompt_parts_with_wasm(
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+    parity: bool,
+) -> (String, usize) {
     let mut out = build_tools_prompt_base(parity);
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
@@ -409,7 +422,27 @@ fn build_tools_prompt_parts(
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
+    append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// Appends one function schema per WASM component tool, in the same shape the
+/// MCP block uses so the model sees one convention rather than two.
+fn append_wasm_tool_schemas(out: &mut String, tools: &[&crate::wasmreg::WasmTool]) {
+    use std::fmt::Write as _;
+
+    if tools.is_empty() {
+        return;
+    }
+    for t in tools {
+        let _ = write!(
+            out,
+            "\n{{\n  \"type\": \"function\",\n  \"function\": {{\n    \"name\": \"{}\",\n    \"description\": ",
+            t.exposed
+        );
+        crate::tools::mcp::json_escape(out, &t.description);
+        let _ = write!(out, ",\n    \"parameters\": {}\n  }}\n}}\n", t.schema);
+    }
 }
 
 /// The C-derived tools prompt with nothing appended.
@@ -765,7 +798,24 @@ pub fn build_system_prompt_parts(
     mcp_servers: &[crate::tools::mcp::McpServer],
     parity: bool,
 ) -> SplitSystemPrompt {
-    let (mut text, trusted_len) = build_tools_prompt_parts(mcp_servers, parity);
+    build_system_prompt_parts_with_wasm(user_system, mcp_servers, &[], parity)
+}
+
+/// [`build_system_prompt_parts`] with WASM component tools folded in.
+///
+/// A separate entry point rather than a fourth parameter on the existing one:
+/// every caller that has no components — every test, every sub-agent path —
+/// keeps working unchanged, and the one caller that does have them says so
+/// explicitly.
+#[must_use]
+pub fn build_system_prompt_parts_with_wasm(
+    user_system: &str,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+    wasm_tools: &[&crate::wasmreg::WasmTool],
+    parity: bool,
+) -> SplitSystemPrompt {
+    let (mut text, trusted_len) =
+        build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
     if !user_system.is_empty() {
         text.push_str("\n\n");
         text.push_str(user_system);

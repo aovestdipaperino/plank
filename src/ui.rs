@@ -10606,11 +10606,23 @@ fn new_agent(
     // whether the name resolves, three call layers below anything that holds
     // the definitions themselves.
     crate::agents::set_roster(&agents);
-    let system = sysprompt::build_system_prompt_parts(
+    // Component tool names are resolved against everything already claimed —
+    // built-ins and MCP — *before* the prompt is composed, because the exposed
+    // name is what goes into it. A rename after this point would put one name
+    // in the prompt and dispatch another.
+    {
+        let taken = sysprompt::tool_names(&tool_ctx.mcp);
+        let warnings = tool_ctx.wasm.registry.resolve_tool_names(&taken);
+        contribution_warnings.extend(warnings);
+    }
+    let wasm_tools = tool_ctx.wasm.registry.tools();
+    let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
+        &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
     );
+    drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
     // own token rather than as spelled-out BPE pieces.

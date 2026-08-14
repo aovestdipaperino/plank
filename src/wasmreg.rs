@@ -774,7 +774,65 @@ fn parse_cmd_output(bytes: &[u8]) -> CmdOutput {
     out
 }
 
-/// A session's WASM state: the admitted components and the runtime they live
+/// One model-facing tool a `tool` component contributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WasmTool {
+    /// Component that owns it, for dispatch and for blame.
+    pub component: String,
+    /// The tool's own name, as the component spells it.
+    pub name: String,
+    /// The name the *model* sees. Bare when nothing else claims it, and
+    /// `wasm__<component>__<tool>` when something does — the precedent every
+    /// other contributed registry in plank already follows, and the shape MCP
+    /// namespaces with, so a user learns one convention rather than two.
+    pub exposed: String,
+    /// One-line description for the tools prompt.
+    pub description: String,
+    /// The parameter JSON Schema, re-serialized compactly. Held as text
+    /// because plank never interprets it: it goes into the system prompt and
+    /// the model is the only reader.
+    pub schema: String,
+}
+
+/// Parses the `tool_specs` reply.
+fn parse_tool_specs(component: &str, bytes: &[u8]) -> Option<Vec<WasmTool>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let Json::Arr(items) = json_parse(text)? else {
+        return None;
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Json::Obj(fields) = item else { continue };
+        let get = |key: &str| match fields.iter().find(|(k, _)| k == key) {
+            Some((_, Json::Str(s))) => s.clone(),
+            _ => String::new(),
+        };
+        let name = get("name");
+        // A tool the model cannot name is not a tool. The character set is the
+        // model's business, not ours, but a name with whitespace could not be
+        // written as a DSML element at all.
+        if name.is_empty() || name.split_whitespace().count() != 1 {
+            continue;
+        }
+        let mut schema = String::new();
+        match fields.iter().find(|(k, _)| k == "parameters") {
+            Some((_, value @ Json::Obj(_))) => crate::tools::mcp::json_write(&mut schema, value),
+            // A tool with no schema takes no parameters; saying so explicitly
+            // beats emitting nothing, which reads to the model as "unknown".
+            _ => schema.push_str(r#"{"type":"object","properties":{}}"#),
+        }
+        out.push(WasmTool {
+            component: component.to_string(),
+            name: name.clone(),
+            exposed: name,
+            description: get("description"),
+            schema,
+        });
+    }
+    Some(out)
+}
+
+/// A session's WASM state:/// A session's WASM state: the admitted components and the runtime they live
 /// in, kept together because neither is useful alone.
 ///
 /// Defaults to "nothing discovered, nothing runnable", so a session that never
@@ -882,6 +940,12 @@ pub struct Loaded {
     /// Consecutive failures. At [`STRIKE_LIMIT`] the component is disabled for
     /// the rest of the session.
     pub strikes: u8,
+    /// Model-facing tools this component contributes, read from `tool_specs`
+    /// once at load. Once at load is not an optimization here but a
+    /// requirement: the tool list is part of the system prompt, and a prompt
+    /// that changed mid-session would invalidate the Tier 1 KV checkpoint
+    /// every time it changed.
+    pub tools: Vec<WasmTool>,
     /// Slash commands this component contributes, read from `command_specs`
     /// once at load. Read once rather than per keystroke: the menu is rebuilt
     /// on every input change, and a WASM call per frame to re-derive a list
@@ -977,6 +1041,26 @@ impl Registry {
                 ));
                 continue;
             }
+            let tools = if component.manifest.surfaces.contains(&Surface::Tool) {
+                match host.call(&component.manifest.id, "tool_specs", b"") {
+                    Ok(bytes) => {
+                        parse_tool_specs(&component.manifest.id, &bytes).unwrap_or_else(|| {
+                            out.warnings.push(format!(
+                                "wasm component '{}': tool_specs returned unreadable JSON",
+                                component.manifest.id
+                            ));
+                            Vec::new()
+                        })
+                    }
+                    Err(e) => {
+                        out.warnings
+                            .push(format!("wasm component '{}': {e}", component.manifest.id));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
             let commands = if component.manifest.surfaces.contains(&Surface::Command) {
                 match host.call(&component.manifest.id, "command_specs", b"") {
                     Ok(bytes) => parse_command_specs(&bytes).unwrap_or_else(|| {
@@ -998,10 +1082,85 @@ impl Registry {
             out.loaded.push(Loaded {
                 component: component.clone(),
                 strikes: 0,
+                tools,
                 commands,
             });
         }
         out
+    }
+
+    /// Every model-facing tool contributed this session, under the name the
+    /// model sees.
+    #[must_use]
+    pub fn tools(&self) -> Vec<&WasmTool> {
+        self.loaded
+            .iter()
+            .filter(|l| l.strikes < STRIKE_LIMIT)
+            .flat_map(|l| l.tools.iter())
+            .collect()
+    }
+
+    /// Resolves collisions among contributed tool names against `taken` — the
+    /// names already claimed by built-ins and MCP.
+    ///
+    /// A contested tool falls back to `wasm__<component>__<tool>`; an
+    /// uncontested one keeps its bare name. Built-ins always win, so no
+    /// component can quietly replace `bash`, and two components claiming one
+    /// name both get qualified rather than one silently losing.
+    pub fn resolve_tool_names(&mut self, taken: &[String]) -> Vec<String> {
+        let mut warnings = Vec::new();
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for l in &self.loaded {
+            for t in &l.tools {
+                *counts.entry(t.name.clone()).or_default() += 1;
+            }
+        }
+        for l in &mut self.loaded {
+            for t in &mut l.tools {
+                let contested =
+                    taken.contains(&t.name) || counts.get(&t.name).is_some_and(|n| *n > 1);
+                if contested {
+                    let short = t.component.rsplit('.').next().unwrap_or(&t.component);
+                    t.exposed = format!("wasm__{short}__{}", t.name);
+                    warnings.push(format!(
+                        "wasm tool '{}' from '{}' is contested; exposed as '{}'",
+                        t.name, t.component, t.exposed
+                    ));
+                }
+            }
+        }
+        warnings
+    }
+
+    /// Runs a model-facing tool by the name the model used.
+    ///
+    /// # Errors
+    /// Returns a message when no live component owns `exposed`, or when the
+    /// call traps — which also costs the component a strike.
+    pub fn run_tool(
+        &mut self,
+        host: &mut dyn crate::wasmhost::WasmHost,
+        exposed: &str,
+        args_json: &str,
+    ) -> Result<String, String> {
+        let (id, name) = self
+            .tools()
+            .into_iter()
+            .find(|t| t.exposed == exposed)
+            .map(|t| (t.component.clone(), t.name.clone()))
+            .ok_or_else(|| format!("no wasm tool '{exposed}'"))?;
+        let payload = format!("{{\"name\": {}, \"args\": {args_json}}}", json_str(&name));
+        match host.call(&id, "tool_call", payload.as_bytes()) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) => {
+                let disabled = self.strike(&id);
+                Err(if disabled {
+                    format!("{id}: {e} (disabled for this session after {STRIKE_LIMIT} failures)")
+                } else {
+                    format!("{id}: {e}")
+                })
+            }
+        }
     }
 
     /// Every slash command contributed this session, as `(component id, spec)`.
@@ -1263,6 +1422,13 @@ fn missing_exports(
     let mut missing = Vec::new();
     if component.manifest.surfaces.contains(&Surface::Command) {
         for export in ["command_specs", "command_run"] {
+            if !host.has_export(id, export) {
+                missing.push(export);
+            }
+        }
+    }
+    if component.manifest.surfaces.contains(&Surface::Tool) {
+        for export in ["tool_specs", "tool_call"] {
             if !host.has_export(id, export) {
                 missing.push(export);
             }
@@ -1603,6 +1769,7 @@ mod tests {
             loaded: vec![Loaded {
                 component: component(Origin::UserScan, vec![]),
                 strikes: 0,
+                tools: Vec::new(),
                 commands: Vec::new(),
             }],
             ..Registry::default()
@@ -1654,6 +1821,7 @@ mod tests {
             loaded: vec![Loaded {
                 component: component(Origin::UserScan, vec![]),
                 strikes: 0,
+                tools: Vec::new(),
                 commands: vec![CommandSpec {
                     name: "greet".to_string(),
                     args: String::new(),

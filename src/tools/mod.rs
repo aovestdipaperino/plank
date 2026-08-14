@@ -356,6 +356,17 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
+        // A WASM component's tool. Checked before the unknown-tool fallthrough
+        // and after every built-in, so a component can extend the table and
+        // never shadow it.
+        name if ctx.wasm.registry.tools().iter().any(|t| t.exposed == name) => {
+            let args = mcp::args_to_json(call);
+            let wasm = &mut ctx.wasm;
+            match wasm.registry.run_tool(&mut *wasm.host, name, &args) {
+                Ok(output) => output,
+                Err(e) => format!("Tool error: {e}\n"),
+            }
+        }
         other => format!("Tool error: unknown tool: {other}\n"),
     };
     // PostToolUse hooks: exit 2 appends stderr to the model's observation.

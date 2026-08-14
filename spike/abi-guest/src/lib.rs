@@ -126,3 +126,27 @@ pub fn on_event(input: String) -> FnResult<String> {
     }
     Ok("{}".to_string())
 }
+
+/// The `tool` surface: what this component offers the model.
+#[plugin_fn]
+pub fn tool_specs() -> FnResult<String> {
+    Ok(r#"[{
+        "name": "wordcount",
+        "description": "count words in a string",
+        "parameters": {"type": "object", "properties": {"text": {"type": "string"}},
+                       "required": ["text"]}
+    }]"#
+    .to_string())
+}
+
+/// Runs it. The host sends `{"name": ..., "args": {...}}`; the reply is the
+/// observation the model sees, verbatim.
+#[plugin_fn]
+pub fn tool_call(input: String) -> FnResult<String> {
+    let text = input
+        .split_once("\"text\":")
+        .and_then(|(_, rest)| rest.trim_start().strip_prefix('"'))
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or("");
+    Ok(format!("{} words\n", text.split_whitespace().count()))
+}

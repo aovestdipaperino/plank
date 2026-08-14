@@ -51,8 +51,24 @@ that vetoes a notify event is dropped rather than honored. Transform
 replacements chain in load order, so a redactor and a summarizer compose
 instead of competing.
 
-Not yet implemented: `frame`, `segment` and `tool` surfaces, the remaining
-events (`idle`, `resize`, `job_*`, the compaction pair), and the
+**The `tool` surface.** A component's tools join the model's registry beside
+`bash` and the MCP servers'. Their schemas are appended to the system prompt
+*after* the trusted span — they are third-party text exactly like MCP's — and
+names resolve against everything already claimed: a bare name when nothing
+contests it, `wasm__<component>__<tool>` when something does, warned either
+way. Built-ins always win, so no component can quietly replace `bash`.
+
+That settles the tool-name collision question the design left open. The
+prompt-cache consequence is real and observable: adding or removing a tool
+component changes the system prompt and therefore forks the Tier 1
+fingerprint, so the two configurations keep separate checkpoints instead of
+invalidating each other. Specs are read once at load for the same reason — a
+tool list that changed mid-session would invalidate the checkpoint under the
+running session. A component approved with `/plugins trust` mid-session is
+dispatchable immediately but reaches the prompt only on the next launch.
+
+Not yet implemented: `frame` and `segment` surfaces, the remaining events
+(`idle`, `resize`, `job_*`, the compaction pair), and the
 `notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)
@@ -647,12 +663,7 @@ ABI break, since adding a surface is additive.
 
 ## Still open
 
-1. **Tool-name collisions** between a WASM plugin, an MCP server, and a
-   built-in. MCP already namespaces as `mcp__<server>__<tool>`; the cheap answer
-   is `wasm__<id>__<tool>`, at the cost of tokens in every system prompt. Must
-   be settled before `tool` ships, not before Phase 1 — and settled together
-   with where tool resolution sits relative to prompt fingerprinting.
-2. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
+1. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
    no source mapping. Do we require DWARF in dev builds, or ship a
    `plank plugin test` harness that runs exports against fixtures?
 
