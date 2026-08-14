@@ -3545,6 +3545,13 @@ impl Agent<'_> {
                     "{cmd} needs the full-screen TUI — a piped session can't mirror output or run remote prompts"
                 );
             }
+            // Reachable but always empty-handed here: a bridge can only be
+            // started from the TUI, so nothing can be waiting for a grant.
+            "/grant" => {
+                for line in self.grant_lines(arg) {
+                    println!("{line}");
+                }
+            }
             "/btw" => {
                 if arg.is_empty() {
                     println!("usage: /btw <question>");
@@ -7780,6 +7787,53 @@ impl Agent<'_> {
         Ok((bound, token))
     }
 
+    /// Applies `/grant [session]`: hands remote control to a client that asked
+    /// for it and is waiting on the local operator's say-so. Bare `/grant`
+    /// answers the oldest waiting request; `/grant <id>` picks one out by
+    /// session id, which is what the request notice prints.
+    ///
+    /// Returns the lines to show. Granting is the local user giving up the
+    /// controller slot, so it is deliberately explicit and never implicit.
+    fn grant_lines(&mut self, arg: &str) -> Vec<String> {
+        let Some(remote) = &self.remote else {
+            return vec!["/grant: remote control is not on (see /rc)".to_owned()];
+        };
+        let Ok(mut policy) = remote.control.lock() else {
+            return vec!["/grant: control policy is poisoned".to_owned()];
+        };
+        let arg = arg.trim();
+        let granted = if arg.is_empty() {
+            policy.grant_next()
+        } else {
+            match arg.parse::<u64>() {
+                Ok(session) if policy.pending().contains(&session) => {
+                    policy.grant(session);
+                    Some(session)
+                }
+                Ok(session) => {
+                    return vec![format!(
+                        "/grant: remote session {session} is not waiting for control"
+                    )];
+                }
+                Err(_) => {
+                    return vec![format!("/grant: {arg:?} is not a session id")];
+                }
+            }
+        };
+        drop(policy);
+        match granted {
+            Some(session) => {
+                // The client learns from its own connection thread, which
+                // notices the role change and sends a `control` frame.
+                let line =
+                    format!("[remote session {session} now holds control — /rc off to end it]");
+                remote.bus.broadcast(UiEvent::Dim(line.clone()));
+                vec![line]
+            }
+            None => vec!["/grant: no remote session is waiting for control".to_owned()],
+        }
+    }
+
     /// Stops the remote-control server and clears the bridge. Connected clients
     /// get a `bye` first. Returns whether a server was running. The token dies
     /// with the server, so an old link is refused by the next one.
@@ -7795,23 +7849,32 @@ impl Agent<'_> {
 
     /// Applies a `/remote-control` toggle and returns the lines to show. `cmd`
     /// is the invoked command name (`/remote-control` or `/rc`), used to name
-    /// the command in error messages. `arg` is `""` (toggle), `"on"`, or
+    /// the command in error messages. `arg` is `""` (toggle), `"on"`, `"ask"`, or
     /// `"off"` (case-insensitive); anything else reports usage.
     ///
     /// Starting from here always uses an ephemeral loopback port, so the command
-    /// never collides with another plank or a stale listener, and always sets
-    /// `allow_control`: the operator typing the command is the consent that a
-    /// remote-side allow flag would otherwise encode.
+    /// never collides with another plank or a stale listener.
+    ///
+    /// `on` sets `allow_control`: the operator typing the command is the consent
+    /// that a remote-side allow flag would otherwise encode, and it is what makes
+    /// the printed link usable while the local TUI holds the slot. `ask` is the
+    /// same bridge without that consent — an attaching client mirrors output but
+    /// must ask, and each request waits for a local `/grant`. Use it when the
+    /// link may reach someone you would rather approve one turn at a time.
     fn remote_toggle_lines(&mut self, cmd: &str, arg: &str) -> Vec<String> {
+        let mut allow_control = true;
         let want_on = if arg.is_empty() {
             !self.remote_is_on()
         } else if arg.eq_ignore_ascii_case("on") {
+            true
+        } else if arg.eq_ignore_ascii_case("ask") {
+            allow_control = false;
             true
         } else if arg.eq_ignore_ascii_case("off") {
             false
         } else {
             return vec![format!(
-                "{cmd}: unknown argument {arg:?} (use on, off, or no argument)"
+                "{cmd}: unknown argument {arg:?} (use on, ask, off, or no argument)"
             )];
         };
         if !want_on {
@@ -7821,13 +7884,23 @@ impl Agent<'_> {
                 vec!["remote control is already off".to_owned()]
             };
         }
-        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, true) {
+        // `remote_on` is idempotent, so `ask` against a live bridge returns the
+        // existing one — whose policy was fixed when it started. Only claim the
+        // ask-mode behavior when this call is what created the server.
+        let fresh = !self.remote_is_on();
+        match self.remote_on(crate::remote::LOOPBACK_EPHEMERAL, None, allow_control) {
             Ok((addr, token)) => {
                 let port = addr.port();
-                vec![
+                let mut lines = vec![
                     format!("remote control on — {}", Self::remote_link(addr, &token)),
                     format!("tunnel:  ssh -L {port}:localhost:{port} user@thishost"),
-                ]
+                ];
+                if fresh && !allow_control {
+                    lines.push(
+                        "clients mirror only — each control request waits for /grant".to_owned(),
+                    );
+                }
+                lines
             }
             Err(e) => vec![format!("{cmd}: could not start: {e}")],
         }
@@ -8959,6 +9032,11 @@ impl Agent<'_> {
             }
             "/remote-control" | "/rc" => {
                 for line in self.remote_toggle_lines(cmd, arg) {
+                    log.push_plain(line);
+                }
+            }
+            "/grant" => {
+                for line in self.grant_lines(arg) {
                     log.push_plain(line);
                 }
             }
@@ -12066,6 +12144,142 @@ mod tests {
             token_of(&on),
             "a fresh activation mints a new token"
         );
+        agent.remote_off();
+    }
+
+    /// `/rc ask` starts the same bridge without pre-authorizing control, which
+    /// is the only way a request reaches the local operator at all: plain `/rc`
+    /// seeds `allow_control`, so every request is a silent grant and `/grant`
+    /// would have nothing to answer.
+    #[test]
+    fn rc_ask_starts_a_bridge_that_withholds_control() {
+        let dir = scratch_dir("rc-ask-withholds-control");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let lines = agent.remote_toggle_lines("/rc", "ask");
+        assert!(agent.remote_is_on());
+        assert!(
+            lines.iter().any(|l| l.contains("/grant")),
+            "ask mode says requests wait for a grant: {lines:?}"
+        );
+
+        let state = agent.remote.clone().expect("bridge installed");
+        let outcome = state.control.lock().expect("policy").request(4);
+        assert_eq!(
+            outcome,
+            crate::remote::control::RequestOutcome::NeedsLocalGrant,
+            "ask mode must not hand control over on its own"
+        );
+        agent.remote_off();
+    }
+
+    #[test]
+    fn grant_hands_control_to_the_waiting_session() {
+        let dir = scratch_dir("grant-hands-control");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+
+        let lines = agent.grant_lines("");
+        assert!(
+            lines.iter().any(|l| l.contains("session 4")),
+            "names the session it granted: {lines:?}"
+        );
+        assert!(
+            state.control.lock().expect("policy").remote_can_control(4),
+            "the waiting session now holds control"
+        );
+        agent.remote_off();
+    }
+
+    /// The operator sees the grant in the log the same way any other session
+    /// event arrives, and so does every attached mirror.
+    #[test]
+    fn grant_announces_itself_on_the_bus() {
+        let dir = scratch_dir("grant-announces");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+        let sub = state.bus.subscribe();
+
+        agent.grant_lines("");
+
+        let seen: Vec<_> = sub.try_iter().map(|s| s.event).collect();
+        assert!(
+            seen.iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("session 4"))),
+            "the grant reached the bus: {seen:?}"
+        );
+        agent.remote_off();
+    }
+
+    #[test]
+    fn grant_with_an_explicit_session_id_picks_that_one() {
+        let dir = scratch_dir("grant-explicit-id");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.remote_toggle_lines("/rc", "ask");
+        let state = agent.remote.clone().expect("bridge installed");
+        {
+            let mut policy = state.control.lock().expect("policy");
+            policy.request(4);
+            policy.request(9);
+        }
+
+        agent.grant_lines("9");
+
+        let policy = state.control.lock().expect("policy");
+        assert!(
+            policy.remote_can_control(9),
+            "granted the id that was asked for"
+        );
+        assert!(!policy.remote_can_control(4));
+        drop(policy);
+        agent.remote_off();
+    }
+
+    /// Each refusal names what went wrong rather than failing silently: nothing
+    /// waiting, an id that is not waiting, a bad id, and no bridge at all.
+    #[test]
+    fn grant_explains_every_way_it_can_decline() {
+        let dir = scratch_dir("grant-declines");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        let no_bridge = agent.grant_lines("");
+        assert!(
+            no_bridge.iter().any(|l| l.contains("/rc")),
+            "points at how to start one: {no_bridge:?}"
+        );
+
+        agent.remote_toggle_lines("/rc", "ask");
+        let nothing_waiting = agent.grant_lines("");
+        assert!(
+            nothing_waiting
+                .iter()
+                .any(|l| l.contains("no remote session")),
+            "{nothing_waiting:?}"
+        );
+
+        let state = agent.remote.clone().expect("bridge installed");
+        state.control.lock().expect("policy").request(4);
+        let wrong_id = agent.grant_lines("5");
+        assert!(
+            wrong_id.iter().any(|l| l.contains("not waiting")),
+            "{wrong_id:?}"
+        );
+        let not_a_number = agent.grant_lines("banana");
+        assert!(
+            not_a_number.iter().any(|l| l.contains("not a session id")),
+            "{not_a_number:?}"
+        );
+        // None of the refusals moved control off the local user.
+        assert!(!state.control.lock().expect("policy").remote_can_control(4));
         agent.remote_off();
     }
 

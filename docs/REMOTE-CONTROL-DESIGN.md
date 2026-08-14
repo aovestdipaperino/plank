@@ -24,10 +24,15 @@ The three that matter, up front:
   the full-screen TUI, and the headless and piped-REPL remote-drive paths were
   written, found unreachable once the flags went, and removed. `/rc` in those
   front-ends declines rather than starting a server nothing can drive.
-- **No `/grant`.** The local-consent handshake below was never wired. Typing
-  `/rc` *is* the consent, so the server always allows an attaching client to take
-  control; §4.4's `NeedsLocalGrant` path exists in the policy but is unreachable
-  in practice.
+- **`/grant` is wired, and reachable through `/rc ask`.** Typing `/rc` (or
+  `/rc on`) is still the consent, so the server pre-authorizes an attaching client
+  and §4.4's `NeedsLocalGrant` path never fires. `/rc ask` starts the same bridge
+  *without* that pre-authorization: a client mirrors output, its
+  `request_control` comes back denied, and the request waits in
+  `ControlPolicy::pending` until the operator runs `/grant` (oldest waiting
+  request) or `/grant <session>`. Granting broadcasts a dim line locally and the
+  granted client's own connection thread notices the role change and sends a
+  `control` frame.
 
 The reference agent's `/remote-control` (documented in `vault/REMOTE-CONTROL.md`)
 is a bidirectional bridge to a hosted backend with OAuth, environment
@@ -221,7 +226,8 @@ Versioned envelope so the web client and server can evolve:
 | `tasks` | `completed`, `total` | the task-list counter |
 | `reset` | — | the transcript was replaced (`/clear`, `/new`, `/switch`, `/resume`) |
 | `notify` | `title`, `body` | end of turn: the payload of the local desktop notification |
-| `control_denied` | `reason` | e.g. "another client holds control" |
+| `control_denied` | `reason` | e.g. "another client holds control"; also a command that cannot run remotely (§4.4) |
+| `control` | `controller` (bool) | this session's role changed after `hello` (a `/grant`, a release, a lapsed grace) |
 | `bye` | `reason` | server shutting the session |
 
 `turn_begin` / `turn_end` were never built: a client that needs the turn boundary
@@ -258,7 +264,7 @@ last thing a remote ever saw was `generating`.
 | `prompt` | `text` | `TurnShared::push_queued` if busy, else start a turn |
 | `btw` | `text` | `TurnShared::push_btw` (respects `BTW_QUEUE_CAP`, returns drop notice) |
 | `interrupt` | — | set `TurnShared::interrupt` |
-| `command` | `text` (a `/slash`) | routed through the same slash dispatcher |
+| `command` | `text` (a `/slash`) | routed through the same slash dispatcher, unless refused as remote-unsafe (§4.4) |
 | `request_control` / `release_control` | — | §4.4 |
 | `permission_response` | `request_id`, `allow` | reserved (§4.5) |
 | `ping` | — | liveness; server replies `pong` (also native WS ping/pong) |
@@ -286,16 +292,33 @@ or one remote session.
   design's `/grant` handshake was never needed. Control releases on disconnect
   (after a grace window, §4.8) or on explicit `release_control`, and returns to
   the local user.
-- **`/grant` was never wired.** `ControlPolicy` still has the `NeedsLocalGrant`
-  outcome and still surfaces `[remote session N wants control — /grant to allow]`
-  locally, but nothing dispatches `/grant`, and with `allow_control` always set
-  the path is unreachable. It survives as the shape a future
-  "start-without-consent" mode would use.
+- **`/rc ask` and `/grant`.** `/rc ask` starts the bridge without
+  `allow_control`, which is what makes `NeedsLocalGrant` reachable: the request is
+  refused, `[remote session N wants control — /grant or /grant N to allow]` is
+  surfaced locally, and the session id is recorded in `ControlPolicy::pending`.
+  Bare `/grant` answers the oldest waiting request, `/grant <session>` picks one
+  out. Granting clears the *whole* pending list — there is one controller, so
+  saying yes to one request says no to the others, and a client that still wants
+  control re-asks. A waiter that disconnects is pruned, so a grant can never land
+  on a dead socket.
 - **Headless server mode** does not exist (see the header). There is no
   no-local-front-end configuration to have a policy for.
-- **A granted request is silent.** There is no `control_granted` frame: only a
-  refusal comes back, as `control_denied`. The web client's role display is
-  therefore optimistic — it assumes the request landed and a denial reverts it.
+- **A granted request is silent, but a role *change* is not.** A successful
+  `request_control` still gets no acknowledgement, so a client's own optimism
+  covers the `/rc on` case. When the role changes later — a `/grant`, a release, a
+  lapsed grace window — the session's connection thread notices on its next poll
+  tick and sends an authoritative `control` frame. Polled rather than pushed
+  because `/grant` runs on the local UI thread, which has no socket, and the bus
+  carries transcript events for every client rather than per-session facts.
+- **Commands that cannot work remotely are refused, not queued.** A `command` (or
+  a `prompt` carrying a slash line) is checked against
+  `config::slash_command_remote_refusal` before it reaches the queue, and a
+  refusal comes back as `control_denied` with the reason. Two families qualify:
+  commands that would take over the *local* terminal (`/open`, and the bare
+  interactive forms of `/kvcache` and `/resume` — the same commands with an
+  argument are non-interactive and stay allowed), and commands that would saw off
+  the branch the client sits on (`/rc`, `/remote-control`, `/quit`, `/exit`, plus
+  `/grant` itself, which from the requesting client would be self-granting).
 - A non-controller's `prompt`/`interrupt`/`command` frames get `control_denied`.
   `btw` is allowed from mirrors (it is ephemeral and read-only by construction —
   see BTW-DESIGN §4.2), giving read-only observers a safe way to ask questions.
@@ -547,7 +570,8 @@ All three are settled:
 - ~~Should headless server mode auto-grant control to the first client?~~ Moot:
   headless server mode does not exist. The equivalent question for the shipped
   design — whether typing `/rc` is consent enough to hand an attaching browser
-  control — was answered yes, which is why `/grant` was never wired.
+  control — was answered yes, and remains the default. `/rc ask` is the other
+  answer for operators who want it, and is what `/grant` serves.
 - ~~Ring-buffer sizing for scrollback replay.~~ A fixed event-count cap
   (`SCROLLBACK_CAP`), not a KB cap and not a flag. A session reset drops the ring
   outright, since everything in it belongs to a transcript that no longer exists.

@@ -113,7 +113,9 @@ is the terminal client: typed lines become prompts, slash lines become commands,
 
 Missing and loopback Origins are always allowed; other browser Origins are refused by default.
 
-A remote client asking for control surfaces a notice locally and waits for approval. The local `/grant` command that approves it is not wired into the UI yet, so for now run the server with `--control-allow` when a remote client needs to drive.
+`/rc` (and `/rc on`) pre-authorizes control: typing the command is your consent, so a client opening the link can drive immediately. `/rc ask` starts the same bridge without that consent. An attaching client then mirrors output but cannot drive; its request surfaces locally as `[remote session 3 wants control — /grant or /grant 3 to allow]` and waits. Bare `/grant` approves the oldest waiting request, `/grant 3` approves that session. Approving one request declines any others, since only one client can drive at a time.
+
+Some commands are refused over the wire rather than queued: `/open`, bare `/kvcache` and bare `/resume` need the local terminal, and `/rc`, `/quit`, `/exit` and `/grant` would cut off the client running them. The refusal comes back with its reason. The same commands with an argument (`/kvcache gc`, `/resume 3`) are not interactive and work normally.
 
 ## `--ui-remote`
 

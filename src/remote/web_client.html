@@ -165,10 +165,10 @@ const $ = (id) => document.getElementById(id);
 const logEl = $("log");
 let ws = null;
 let highestId = null;
-// Whether this session believes it holds control. The server has no
-// "control granted" frame — a granted `request_control` is silent and only a
-// refusal comes back as `control_denied` (src/remote/control.rs:1250) — so this
-// is optimistic: we assume the request landed and a `control_denied` reverts it.
+// Whether this session believes it holds control. A granted `request_control`
+// is silent, so this starts optimistic: we assume the request landed, a
+// `control_denied` reverts it, and a later `control` frame — sent when the role
+// changes under us, e.g. the operator running `/grant` — is authoritative.
 let controller = false;
 
 function setStatus(s, dead) {
@@ -501,6 +501,13 @@ function handleServerMsg(f) {
       line("[denied: " + f.reason + "]", "error");
       setRole(false);
       break;
+    // The authoritative role, sent when it changes under us: the operator ran
+    // /grant, control came back, or a grace window lapsed. Overrides whatever
+    // the optimistic request assumed.
+    case "control":
+      setRole(!!f.controller);
+      line(f.controller ? "[control granted]" : "[control released]", "dim");
+      break;
     case "pong": break;
     case "bye": line("[server: " + f.reason + "]", "dim"); break;
     default: break;
@@ -533,8 +540,9 @@ function connect() {
     // parked button: $("control").disabled = false;
     updateButtons();
     // Opening the `/remote-control` link is the operator's own consent, so claim
-    // control immediately rather than waiting for a click: `/rc` always starts
-    // the server with allow_control, making this a silent Granted.
+    // control immediately rather than waiting for a click: `/rc on` starts the
+    // server with allow_control, making this a silent Granted. Under `/rc ask`
+    // it comes back denied and a `control` frame arrives if the operator grants.
     send({ type: "request_control" });
     setRole(true);
     line("[requested control]", "dim");

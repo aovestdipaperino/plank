@@ -809,12 +809,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/remote-control",
-        args: "",
+        args: "[on|ask|off]",
         desc: "show the TUI remote-control endpoint",
     },
     SlashCommand {
         name: "/rc",
-        args: "",
+        args: "[on|ask|off]",
         desc: "alias for /remote-control",
     },
     SlashCommand {
@@ -824,8 +824,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/grant",
-        args: "",
-        desc: "review and grant pending tool permissions",
+        args: "[session]",
+        desc: "hand remote control to a waiting client",
     },
     SlashCommand {
         name: "/version",
@@ -937,6 +937,41 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/goal")
         || slash_command_with_args(cmd, "/remote-control")
         || slash_command_with_args(cmd, "/rc")
+        // `/grant` takes an optional session id (`/grant 3`) as well as the bare
+        // form that answers the oldest waiting request.
+        || slash_command_with_args(cmd, "/grant")
+}
+
+/// Why a slash command cannot be run from a remote client, or `None` if it can.
+///
+/// A remote `command` frame is queued for the same dispatcher the local user
+/// types into, so most commands work unchanged. Two families do not, and
+/// queueing them silently is worse than refusing them: commands that take over
+/// the *local* terminal (the operator sees a pane open with nobody driving it),
+/// and commands that would saw off the branch the client is sitting on.
+///
+/// Pane commands are refused only in their bare, interactive form —
+/// `/kvcache gc` and `/resume 3` are ordinary non-interactive commands and stay
+/// available. `line` is the whole command line, leading slash included.
+#[must_use]
+pub fn slash_command_remote_refusal(line: &str) -> Option<&'static str> {
+    let mut it = line.split_whitespace();
+    let cmd = it.next().unwrap_or("");
+    let bare = it.next().is_none();
+    match cmd {
+        "/grant" => Some(
+            "/grant answers a remote request and is local-only — asking for it from the client that wants control would be self-granting",
+        ),
+        "/remote-control" | "/rc" => {
+            Some("toggling remote control would disconnect this client; run it locally")
+        }
+        "/open" => Some("/open takes over the local terminal with the built-in editor"),
+        "/quit" | "/exit" => Some("quitting is local-only; use the local terminal to stop plank"),
+        "/kvcache" | "/resume" if bare => {
+            Some("opens an interactive local pane; pass an argument for the non-interactive form")
+        }
+        _ => None,
+    }
 }
 
 /// Parses one engine-tuning option that takes a value (already extracted as
@@ -1944,6 +1979,52 @@ mod tests {
     fn remote_slash_commands() {
         assert!(slash_command_known("/remote"));
         assert!(slash_command_known("/grant"));
+        // `/grant 3` names the waiting session explicitly.
+        assert!(slash_command_known("/grant 3"));
+    }
+
+    #[test]
+    fn ordinary_commands_and_prompts_are_remote_safe() {
+        for line in ["/help", "/context", "/compact focus on the parser", "hello"] {
+            assert_eq!(slash_command_remote_refusal(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn commands_needing_the_local_terminal_are_refused_remotely() {
+        for line in [
+            "/grant",
+            "/grant 3",
+            "/rc",
+            "/rc off",
+            "/remote-control",
+            "/open",
+            "/open src/ui.rs",
+            "/quit",
+            "/exit",
+        ] {
+            assert!(
+                slash_command_remote_refusal(line).is_some(),
+                "{line} should be refused"
+            );
+        }
+    }
+
+    /// A pane command is refused only in its interactive form; the same command
+    /// with an argument does its work without a terminal and stays available.
+    #[test]
+    fn pane_commands_are_refused_bare_but_allowed_with_an_argument() {
+        assert!(slash_command_remote_refusal("/kvcache").is_some());
+        assert_eq!(slash_command_remote_refusal("/kvcache gc"), None);
+        assert!(slash_command_remote_refusal("/resume").is_some());
+        assert_eq!(slash_command_remote_refusal("/resume 3"), None);
+    }
+
+    /// Surrounding whitespace must not smuggle a refused command past the gate.
+    #[test]
+    fn the_remote_gate_ignores_surrounding_whitespace() {
+        assert!(slash_command_remote_refusal("  /quit  ").is_some());
+        assert!(slash_command_remote_refusal("/kvcache   ").is_some());
     }
 
     #[test]

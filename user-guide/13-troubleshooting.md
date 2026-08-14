@@ -135,7 +135,8 @@ Also: `--provider` cannot be combined with `--remote` or the local backend selec
 - Plain `http://` is allowed to localhost only. For anything else, use TLS or pass `--insecure` knowingly.
 - The token comes from `--remote-token` or `$PLANK_REMOTE_TOKEN`.
 - A browser client needs its Origin allowed with `--control-origin`; missing and loopback Origins are always allowed, other browser Origins are refused by default.
-- A remote client that needs to *drive* (not just mirror) currently needs the server started with `--control-allow`, because the local `/grant` approval is not wired into the UI yet.
+- A remote client that mirrors but cannot *drive* is a bridge started with `/rc ask`: approve its request locally with `/grant` (or `/grant <session>`, the id in the notice). Plain `/rc` pre-authorizes control and has no such step.
+- A remote command that comes back refused rather than running is the remote-safety gate, not a bug: `/open`, bare `/kvcache`, bare `/resume`, `/rc`, `/quit`, `/exit` and `/grant` cannot work over the wire, and the refusal says which case applies.
 - A client whose unsent output exceeds `--control-queue-max` is evicted. A very slow link disconnecting mid-turn is that.
 
 ## A hosted turn froze after the network dropped

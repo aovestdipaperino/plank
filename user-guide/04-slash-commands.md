@@ -112,9 +112,9 @@ It edits, and only edits. A path that does not exist is refused rather than crea
 | Command | Status |
 |---|---|
 | `/remote` | recognized as a command |
-| `/grant` | recognized; approves a remote client's control request |
+| `/grant [session]` | approves a remote client's control request |
 
-Both are part of the remote-control surface described in [Remote and hosted engines](10-remote-and-providers.md). The local `/grant` handler is not wired into the UI yet, so today a remote client that needs to take control should be started against a server run with `--control-allow`.
+Both are part of the remote-control surface described in [Remote and hosted engines](10-remote-and-providers.md). `/grant` matters only when the bridge was started with `/rc ask`, which withholds control from attaching clients until you approve each request; plain `/rc` grants it up front and leaves `/grant` with nothing to answer.
 
 ## Not in `/help`
 

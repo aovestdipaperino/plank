@@ -282,6 +282,14 @@ pub enum ServerMsg {
         /// Human-readable reason.
         reason: String,
     },
+    /// This session's control role changed after the `hello` frame: the local
+    /// operator ran `/grant`, control was released back, or a grace window
+    /// lapsed. Sent on transition only, from the session's own connection
+    /// thread, so a client never has to infer its role from silence.
+    Control {
+        /// Whether this session now holds control.
+        controller: bool,
+    },
     /// Reply to a client `ping`.
     Pong,
     /// The server is closing this session.
@@ -418,7 +426,11 @@ pub enum ClientMsg {
     },
     /// Interrupt the current turn.
     Interrupt,
-    /// A `/slash` command (routed through the slash dispatcher; see TODO).
+    /// A `/slash` command. Queued like a prompt and routed through the local
+    /// slash dispatcher when the turn loop drains it (issue #25); the web client
+    /// sends slash lines as `prompt` too, so both take the same path. Commands
+    /// that cannot work remotely are refused with a `control_denied` carrying
+    /// the reason — see [`crate::config::slash_command_remote_refusal`].
     Command {
         /// Command text including the leading slash.
         text: String,
@@ -575,6 +587,11 @@ pub struct ControlPolicy {
     /// A controller that dropped and whose slot is reserved until the deadline
     /// for a reconnecting client to reclaim via `resume_from` (design §4.8).
     grace: Option<(u64, std::time::Instant)>,
+    /// Sessions that asked for control and got [`RequestOutcome::NeedsLocalGrant`],
+    /// oldest first. The local `/grant` command reads this: without it the
+    /// requester's id lives only in the dim line broadcast at request time, and
+    /// there is nothing for the operator to say yes *to*.
+    pending: Vec<u64>,
 }
 
 impl ControlPolicy {
@@ -592,6 +609,7 @@ impl ControlPolicy {
             local_present,
             allow_control,
             grace: None,
+            pending: Vec::new(),
         }
     }
 
@@ -624,6 +642,9 @@ impl ControlPolicy {
     /// reconnecting client reclaim it with [`ControlPolicy::reclaim`]. A
     /// non-controller disconnect just releases as before (design §4.8).
     pub fn disconnect(&mut self, session: u64) {
+        // A client that hangs up while waiting is no longer waiting: otherwise
+        // `/grant` hands control to a socket that is already gone.
+        self.pending.retain(|s| *s != session);
         if self.holder == Holder::Remote(session) {
             self.grace = Some((session, std::time::Instant::now() + CONTROL_GRACE));
         } else {
@@ -661,6 +682,11 @@ impl ControlPolicy {
         match self.holder {
             Holder::Remote(_) => RequestOutcome::Denied("another client holds control".to_owned()),
             Holder::Local if self.local_present && !self.allow_control => {
+                // Remember the asker so `/grant` has a target. Re-requesting is
+                // idempotent rather than a queue of duplicates.
+                if !self.pending.contains(&session) {
+                    self.pending.push(session);
+                }
                 RequestOutcome::NeedsLocalGrant
             }
             _ => {
@@ -670,9 +696,38 @@ impl ControlPolicy {
         }
     }
 
+    /// Sessions awaiting a local `/grant`, oldest request first.
+    #[must_use]
+    pub fn pending(&self) -> &[u64] {
+        &self.pending
+    }
+
     /// The local operator grants control to a remote session (via `/grant`).
+    ///
+    /// The whole pending list is cleared, not just `session`: there is exactly
+    /// one controller, so granting one request answers every other waiting
+    /// request with "no". Those clients already hold a `control_denied`, and a
+    /// fresh `request_control` re-queues them.
     pub fn grant(&mut self, session: u64) {
         self.holder = Holder::Remote(session);
+        self.pending.clear();
+    }
+
+    /// Grants the oldest pending request, returning the session that got it.
+    /// `None` when nothing is waiting — what `/grant` with no argument uses.
+    pub fn grant_next(&mut self) -> Option<u64> {
+        let session = self.pending.first().copied()?;
+        self.grant(session);
+        Some(session)
+    }
+
+    /// Drops a session's pending request without granting it — the local
+    /// operator declining, or the client disconnecting before an answer.
+    /// Returns whether a request was actually dropped.
+    pub fn deny(&mut self, session: u64) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|s| *s != session);
+        self.pending.len() != before
     }
 
     /// A remote session releases control (explicitly or on disconnect). Control
@@ -1159,6 +1214,11 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
     // Subscribe after the snapshot so no event is missed or duplicated.
     let rx = state.bus.subscribe();
     let mut last_status_at: Option<std::time::Instant> = None;
+    // The role this client was last told about (the `hello` frame's value).
+    // Polled rather than pushed: a `/grant` happens on the local UI thread,
+    // which has no socket, and the bus carries transcript events for every
+    // client rather than per-session facts. One `Mutex` read per poll tick.
+    let mut had_control = is_controller(state, session_id)?;
     loop {
         if state.shutdown.load(Ordering::Relaxed) {
             let _ = send(
@@ -1171,6 +1231,19 @@ fn mirror_loop<S: std::io::Read + std::io::Write>(
         }
         // Pump bus → socket, coalescing status frames.
         pump_bus(ws, &rx, &mut last_status_at)?;
+
+        // Tell the client when its role changed under it (`/grant`, a release,
+        // a lapsed grace window). Edge-triggered: no frame while it is stable.
+        let now_control = is_controller(state, session_id)?;
+        if now_control != had_control {
+            had_control = now_control;
+            send(
+                ws,
+                &ServerFrame::control(ServerMsg::Control {
+                    controller: now_control,
+                }),
+            )?;
+        }
 
         // Poll the socket for one inbound frame (times out per POLL_INTERVAL).
         match ws.read() {
@@ -1285,6 +1358,19 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
         }
         ClientMsg::Prompt { text } | ClientMsg::Command { text } => {
             if is_controller(state, session_id)? {
+                // A command that cannot work over the wire is refused here
+                // rather than queued: the dispatcher would otherwise open a
+                // pane on the operator's terminal, or tear down this very
+                // bridge, with the client seeing nothing either way.
+                if let Some(reason) = crate::config::slash_command_remote_refusal(&text) {
+                    send(
+                        ws,
+                        &ServerFrame::control(ServerMsg::ControlDenied {
+                            reason: reason.to_owned(),
+                        }),
+                    )?;
+                    return Ok(false);
+                }
                 // Both land in the shared queue the turn loop drains: `ui.rs`
                 // starts a turn when idle and routes `/`-prefixed lines (the
                 // `command` frames) through the slash dispatcher (issue #25).
@@ -1325,10 +1411,10 @@ fn handle_client_frame<S: std::io::Read + std::io::Write>(
                     )?;
                 }
                 RequestOutcome::NeedsLocalGrant => {
-                    // Surface the request to the local user; grant happens via
-                    // the local `/grant` command (wiring is a ui.rs TODO).
+                    // Surface the request to the local user; the request is now
+                    // recorded as pending, and `Agent::grant_lines` answers it.
                     state.bus.broadcast(UiEvent::Dim(format!(
-                        "[remote session {session_id} wants control — /grant to allow]"
+                        "[remote session {session_id} wants control — /grant or /grant {session_id} to allow]"
                     )));
                     send(
                         ws,
@@ -1572,6 +1658,81 @@ mod tests {
         p.release(1);
         assert_eq!(p.holder(), Holder::Free);
         assert_eq!(p.request(2), RequestOutcome::Granted);
+    }
+
+    /// The request records who asked, which is the whole point: the local
+    /// `/grant` has nothing to act on otherwise.
+    #[test]
+    fn a_request_needing_a_grant_becomes_pending() {
+        let mut p = ControlPolicy::new(true, false);
+        assert!(p.pending().is_empty());
+        assert_eq!(p.request(7), RequestOutcome::NeedsLocalGrant);
+        assert_eq!(p.pending(), &[7]);
+        // Re-asking is idempotent rather than a queue of duplicates.
+        assert_eq!(p.request(7), RequestOutcome::NeedsLocalGrant);
+        assert_eq!(p.pending(), &[7]);
+    }
+
+    #[test]
+    fn grant_next_answers_the_oldest_request_and_clears_the_rest() {
+        let mut p = ControlPolicy::new(true, false);
+        p.request(1);
+        p.request(2);
+        assert_eq!(p.pending(), &[1, 2]);
+        assert_eq!(p.grant_next(), Some(1));
+        assert!(p.remote_can_control(1));
+        // One controller, so granting 1 answers 2 with "no" rather than leaving
+        // it queued to fire the moment control comes back.
+        assert!(p.pending().is_empty());
+        assert!(!p.remote_can_control(2));
+    }
+
+    #[test]
+    fn grant_next_with_nothing_waiting_is_a_no_op() {
+        let mut p = ControlPolicy::new(true, false);
+        assert_eq!(p.grant_next(), None);
+        assert_eq!(p.holder(), Holder::Local);
+    }
+
+    #[test]
+    fn a_specific_grant_picks_one_waiter_out() {
+        let mut p = ControlPolicy::new(true, false);
+        p.request(1);
+        p.request(2);
+        p.grant(2);
+        assert!(p.remote_can_control(2));
+        assert!(p.pending().is_empty());
+    }
+
+    #[test]
+    fn a_waiter_that_hangs_up_stops_being_pending() {
+        let mut p = ControlPolicy::new(true, false);
+        p.request(1);
+        p.request(2);
+        // Not the controller, so this is a plain release plus a pending prune:
+        // granting a dead socket would strand control on nobody.
+        p.disconnect(1);
+        assert_eq!(p.pending(), &[2]);
+        assert_eq!(p.grant_next(), Some(2));
+    }
+
+    #[test]
+    fn deny_drops_a_request_without_granting_it() {
+        let mut p = ControlPolicy::new(true, false);
+        p.request(1);
+        assert!(p.deny(1));
+        assert!(!p.deny(1)); // already gone
+        assert_eq!(p.holder(), Holder::Local);
+        assert_eq!(p.grant_next(), None);
+    }
+
+    /// With `allow_control` seeded, a request is granted outright, so nothing is
+    /// ever pending and `/grant` stays empty-handed — the `/rc on` path.
+    #[test]
+    fn preauthorized_requests_never_become_pending() {
+        let mut p = ControlPolicy::new(true, true);
+        assert_eq!(p.request(1), RequestOutcome::Granted);
+        assert!(p.pending().is_empty());
     }
 
     #[test]
