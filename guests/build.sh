@@ -9,7 +9,7 @@
 # faces without installing games.
 set -e
 cd "$(dirname "$0")"
-for guest in screensavers; do
+for guest in screensavers arcades; do
   (cd "$guest" && cargo build --release --target wasm32-unknown-unknown)
   echo "guest: $(pwd)/$guest/target/wasm32-unknown-unknown/release/plank_$guest.wasm"
 done

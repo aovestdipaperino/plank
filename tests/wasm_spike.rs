@@ -1387,3 +1387,141 @@ fn the_ported_minions_match_the_built_in_skit_glyph_for_glyph() {
     });
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Installs the arcades component and returns a session with it approved.
+fn arcades_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Session)> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/guests/arcades/target/wasm32-unknown-unknown/release/plank_arcades.wasm"
+    );
+    let wasm = std::fs::read(path).ok()?;
+
+    let root = std::env::temp_dir().join(format!("plank-arcades-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("arcades");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("games.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        r#"{"name": "arcades", "wasm": [{"id": "dev.plank.arcades", "module": "games.wasm",
+            "surfaces": ["frame", "command"], "capabilities": [], "kind": "arcade",
+            "frames": ["centipede", "frogger", "invaders"]}]}"#,
+    )
+    .unwrap();
+
+    let set = plank::plugins::PluginSet {
+        plugins: vec![
+            plank::plugins::load_plugin(&dir, plank::plugins::Origin::UserScan).expect("plugin"),
+        ],
+        ..plank::plugins::PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = plank::wasmreg::Session::new(None);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.arcades", &project)
+        .expect("approve");
+    Some((root, session))
+}
+
+/// Drives a ported game and the built-in it came from side by side. Same shape
+/// as the screensaver check, against a different component.
+fn assert_game_matches(
+    session: &mut plank::wasmreg::Session,
+    game: &str,
+    seed: u64,
+    mut native_glyphs: impl FnMut(u64, u16, u16) -> Vec<plank::arcade::Glyph>,
+) {
+    let (w, h) = (80_u16, 24_u16);
+    let mut frame = session
+        .open_frame("dev.plank.arcades", game, w, h, seed)
+        .expect("open");
+    let mut drew = 0;
+    for tick in 0..30 {
+        let expected = native_glyphs(33, w, h);
+        session
+            .step_frame(&mut frame, 33, w, h, tick * 33)
+            .expect("step");
+        let actual = &frame.last.glyphs;
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{game} tick {tick}: the port drew {} glyphs, the built-in drew {}",
+            actual.len(),
+            expected.len()
+        );
+        for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                (a.x, a.y, a.ch, a.color),
+                (b.x, b.y, b.ch, b.color),
+                "{game} tick {tick}, glyph {i}: the port drifted from the built-in"
+            );
+        }
+        drew = drew.max(actual.len());
+    }
+    assert!(drew > 20, "{game} drew at most {drew} glyphs");
+}
+
+#[test]
+fn the_ported_centipede_matches_the_built_in_game() {
+    let Some((root, mut session)) = arcades_session("centipede") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0xC0DE_0001_u64;
+    let mut native = plank::arcade::centipede::Centipede::new(seed);
+    assert_game_matches(&mut session, "centipede", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_ported_frogger_matches_the_built_in_game() {
+    let Some((root, mut session)) = arcades_session("frogger") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0xC0DE_0002_u64;
+    let mut native = plank::arcade::frogger::Frogger::new(seed);
+    assert_game_matches(&mut session, "frogger", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_ported_invaders_match_the_built_in_game() {
+    let Some((root, mut session)) = arcades_session("invaders") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    let seed = 0xC0DE_0003_u64;
+    let mut native = plank::arcade::invaders::Invaders::new(seed);
+    assert_game_matches(&mut session, "invaders", seed, |dt, w, h| {
+        native.step(dt);
+        native.glyphs(w, h)
+    });
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An arcade plugin is never offered to the idle rotation, however many games
+/// it holds — the check that keeps a game off someone's screen unasked.
+#[test]
+fn the_arcades_plugin_is_never_a_screensaver() {
+    let Some((root, session)) = arcades_session("not-a-saver") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+    assert!(session.screensaver_faces().is_empty());
+    assert!(session.idle_frames().is_empty());
+    assert_eq!(
+        session.openable_frames().len(),
+        1,
+        "but it is still openable on demand"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
