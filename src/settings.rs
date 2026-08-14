@@ -131,6 +131,14 @@ pub struct UiSettings {
     /// Which ambient screen the screensaver puts up: the matrix rain, the
     /// starfield, the minions, or a fresh draw each time.
     pub screensaver_face: crate::arcade::ScreensaverFace,
+    /// A plugin face pinned by name, as `<plugin>:<face>`.
+    ///
+    /// Kept beside the built-in enum rather than folded into it. The enum is
+    /// `Copy` and exhaustively matched in half a dozen places; widening it to
+    /// carry a `String` would touch all of them to express something only the
+    /// screensaver opener cares about. `None` means the built-in field decides,
+    /// which is every session with no screensaver plugin installed.
+    pub screensaver_face_plugin: Option<String>,
     /// Whether the arcade easter eggs (`/pelota`, …) exist. On by
     /// default. Turned off they are not merely hidden — they stop being known
     /// commands, so the line goes to the model like any other unrecognized
@@ -159,6 +167,7 @@ impl Default for UiSettings {
             reduced_motion: false,
             screensaver: crate::arcade::ScreensaverDelay::default(),
             screensaver_face: crate::arcade::ScreensaverFace::default(),
+            screensaver_face_plugin: None,
             easter_eggs: true,
             builtin_editor: true,
         }
@@ -421,10 +430,18 @@ impl Settings {
         {
             self.ui.screensaver = d;
         }
-        if let Some(v) = string(ui, "screensaverFace")
-            && let Some(f) = crate::arcade::ScreensaverFace::parse(&v)
-        {
-            self.ui.screensaver_face = f;
+        // A face is either one plank ships or one a plugin contributes. The
+        // built-in spellings win, so a plugin cannot capture the word "matrix"
+        // by naming a face that; anything containing `:` is a plugin address
+        // and is kept verbatim for the opener to resolve, because the plugin
+        // set is not known at settings-parse time.
+        if let Some(v) = string(ui, "screensaverFace") {
+            if let Some(f) = crate::arcade::ScreensaverFace::parse(&v) {
+                self.ui.screensaver_face = f;
+                self.ui.screensaver_face_plugin = None;
+            } else if v.contains(':') {
+                self.ui.screensaver_face_plugin = Some(v);
+            }
         }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).

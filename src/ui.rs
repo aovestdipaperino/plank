@@ -6667,18 +6667,35 @@ impl Agent<'_> {
                 let (w, h) = terminal
                     .size()
                     .map_or((80, 23), |sz| (sz.width, sz.height.saturating_sub(1)));
-                // Idle-eligible components join the rotation rather than
-                // replacing it: a user who installed one still gets the
-                // built-in faces, and one who installed none notices nothing.
-                // The seed picks, so the choice is as reproducible as the face
-                // it lands on.
+                // Three cases, in the order a user would expect them to win:
+                // a pinned plugin face, a pinned built-in face, and only then
+                // the random rotation — which is the one place installed
+                // screensavers mix with the faces plank ships.
+                //
+                // The rotation weighs *faces*, not plugins: a component
+                // offering three does not get a third of the rain's share.
                 let seed = arcade_seed();
-                let candidates = self.tool_ctx.wasm.idle_frames().len();
-                let pick = usize::try_from(seed % (candidates as u64 + 1)).unwrap_or(0);
-                let chosen =
-                    (pick < candidates).then(|| self.tool_ctx.wasm.idle_frames()[pick].to_string());
-                if let Some(id) = chosen {
-                    match self.tool_ctx.wasm.open_frame(&id, "", w, h, seed) {
+                let settings = crate::settings::active();
+                let pinned = settings
+                    .ui
+                    .screensaver_face_plugin
+                    .as_deref()
+                    .and_then(|addr| self.tool_ctx.wasm.resolve_screensaver_face(addr));
+                let chosen = match pinned {
+                    Some(face) => Some(face),
+                    None if settings.ui.screensaver_face
+                        == crate::arcade::ScreensaverFace::Random =>
+                    {
+                        self.tool_ctx
+                            .wasm
+                            .pick_idle_face(seed, crate::arcade::ScreensaverFace::BUILT_IN)
+                    }
+                    // A pinned built-in face: not a rotation, and not this
+                    // code's business.
+                    None => None,
+                };
+                if let Some((id, face)) = chosen {
+                    match self.tool_ctx.wasm.open_frame(&id, &face, w, h, seed) {
                         Ok(mut open) => {
                             open.screensaver = true;
                             wasm_frame = Some(open);

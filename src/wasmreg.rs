@@ -230,6 +230,14 @@ pub struct WasmManifest {
     /// Smallest area the component will draw into; below it the frame refuses
     /// to open rather than drawing into a space it cannot use.
     pub min_size: (u16, u16),
+    /// The faces this component offers, in manifest order.
+    ///
+    /// Declared rather than inferred from the commands, because the two are
+    /// different questions: a command is something a user may type, a face is
+    /// something the *rotation* may pick and the settings picker must be able
+    /// to enumerate. A component with no `frames` entry offers exactly one,
+    /// named after the component, which is the single-face case written short.
+    pub frames: Vec<String>,
     /// Events subscribed to, deduplicated and sorted. plank calls a component's
     /// handler only for these, so an unsubscribed event costs nothing.
     pub events: Vec<crate::wasmevents::EventKind>,
@@ -387,7 +395,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         return None;
     }
 
-    let (kind, veiled, min_size) = parse_frame_fields(fields, &id, warnings)?;
+    let frame = parse_frame_fields(fields, &id, warnings)?;
 
     let mut events = Vec::new();
     for e in list("events") {
@@ -420,11 +428,25 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         module,
         surfaces,
         capabilities,
-        kind,
-        veiled,
-        min_size,
+        kind: frame.kind,
+        veiled: frame.veiled,
+        min_size: frame.min_size,
+        frames: frame.frames,
         events,
     })
+}
+
+/// The `frame`-only manifest fields, as one value.
+///
+/// A struct rather than a tuple because four fields of three different shapes
+/// is exactly where a tuple stops documenting itself — `(FrameKind, bool,
+/// (u16, u16), Vec<String>)` says nothing about which bool or which pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FrameFields {
+    kind: FrameKind,
+    veiled: bool,
+    min_size: (u16, u16),
+    frames: Vec<String>,
 }
 
 /// The `frame`-only manifest fields. Split out to keep [`parse_one`] readable,
@@ -439,7 +461,7 @@ fn parse_frame_fields(
     fields: &[(String, Json)],
     id: &str,
     warnings: &mut Vec<String>,
-) -> Option<(FrameKind, bool, (u16, u16))> {
+) -> Option<FrameFields> {
     let kind = match fields.iter().find(|(k, _)| k == "kind") {
         Some((_, Json::Str(s))) => {
             let Some(parsed) = FrameKind::parse(s) else {
@@ -454,6 +476,21 @@ fn parse_frame_fields(
         fields.iter().find(|(k, _)| k == "veiled"),
         Some((_, Json::Bool(true)))
     );
+    let frames: Vec<String> = fields
+        .iter()
+        .find(|(k, _)| k == "frames")
+        .map(|(_, v)| match v {
+            Json::Arr(items) => items
+                .iter()
+                .filter_map(|i| match i {
+                    Json::Str(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+            Json::Str(s) => vec![s.clone()],
+            _ => Vec::new(),
+        })
+        .unwrap_or_default();
     let min_size = fields
         .iter()
         .find(|(k, _)| k == "min_size")
@@ -469,7 +506,12 @@ fn parse_frame_fields(
             _ => None,
         })
         .unwrap_or((0, 0));
-    Some((kind, veiled, min_size))
+    Some(FrameFields {
+        kind,
+        veiled,
+        min_size,
+        frames,
+    })
 }
 
 /// Discovers every WASM component contributed by `set`.
@@ -1001,6 +1043,17 @@ fn parse_segment(component: &str, bytes: &[u8]) -> Option<Segment> {
     })
 }
 
+/// One screensaver face a component contributes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FaceRef {
+    /// Component that draws it.
+    pub component: String,
+    /// The face's own name, as `frame_open`'s `arg`.
+    pub face: String,
+    /// `<plugin>:<face>` — what a user pins and what a picker lists.
+    pub address: String,
+}
+
 /// A `frame` component that currently owns the screen.
 ///
 /// Mirrors `arcade::Arcade`'s role rather than its shape: the host owns the
@@ -1127,31 +1180,71 @@ impl Session {
             .collect()
     }
 
-    /// Which face the idle rotation should put up for `seed`.
+    /// Every screensaver face installed.
     ///
-    /// `Some(id)` is a screensaver component; `None` means "use a built-in
-    /// face". Only components declaring `"kind": "screensaver"` are candidates
-    /// — an arcade game must never appear over someone's work.
-    ///
-    /// The built-in faces hold exactly one slot however many components are
-    /// installed: installing one makes it *a* screensaver, not *the*
-    /// screensaver, and the matrix rain plank ships must keep coming up. The
-    /// seed decides, so the choice is as reproducible as the face it lands on.
-    ///
-    /// Extracted from the event loop rather than left inline there because a
-    /// selection rule that can only be exercised by idling a real terminal for
-    /// a minute and hoping is a rule nobody will check again.
+    /// The address is `<plugin>:<face>` — what a user writes in
+    /// `ui.screensaverFace` to pin one, and what a settings picker lists.
     #[must_use]
-    pub fn pick_idle_face(&self, seed: u64) -> Option<String> {
-        let candidates = self.idle_frames();
-        if candidates.is_empty() {
-            return None;
-        }
-        let slots = candidates.len() as u64 + 1;
-        let pick = usize::try_from(seed % slots).unwrap_or(0);
-        candidates.get(pick).map(|id| (*id).to_string())
+    pub fn screensaver_faces(&self) -> Vec<FaceRef> {
+        self.registry
+            .loaded
+            .iter()
+            .filter(|l| {
+                l.strikes < STRIKE_LIMIT
+                    && l.component.manifest.surfaces.contains(&Surface::Frame)
+                    && l.component.manifest.kind.idle_eligible()
+            })
+            .flat_map(|l| {
+                let id = l.component.manifest.id.clone();
+                let plugin = l.component.plugin.clone();
+                // A component with no declared faces offers one, named after
+                // the plugin: the single-face case, written short.
+                let faces = if l.component.manifest.frames.is_empty() {
+                    vec![plugin.clone()]
+                } else {
+                    l.component.manifest.frames.clone()
+                };
+                faces.into_iter().map(move |face| FaceRef {
+                    address: format!("{plugin}:{face}"),
+                    component: id.clone(),
+                    face,
+                })
+            })
+            .collect()
     }
 
+    /// Resolves `<plugin>:<face>` to the component and face it names.
+    #[must_use]
+    pub fn resolve_screensaver_face(&self, address: &str) -> Option<(String, String)> {
+        self.screensaver_faces()
+            .into_iter()
+            .find(|f| f.address == address)
+            .map(|f| (f.component, f.face))
+    }
+
+    /// Which face the random rotation should put up for `seed`.
+    ///
+    /// `Some((id, face))` is a component's face; `None` means "use a built-in
+    /// face". Every face gets one slot, plugin or not — the unit is a *face*,
+    /// not a plugin, so a component offering three does not get one third the
+    /// weight of the rain.
+    ///
+    /// Only reached when the user's face setting is `random`. A pinned face —
+    /// built-in or plugin — is not a rotation and is not decided here.
+    #[must_use]
+    pub fn pick_idle_face(&self, seed: u64, builtin_faces: usize) -> Option<(String, String)> {
+        let faces = self.screensaver_faces();
+        let slots = builtin_faces + faces.len();
+        if slots == 0 {
+            return None;
+        }
+        let pick = usize::try_from(seed % slots as u64).unwrap_or(0);
+        pick.checked_sub(builtin_faces)
+            .and_then(|i| faces.get(i))
+            .map(|f| (f.component.clone(), f.face.clone()))
+    }
+
+    /// Frame components the idle rotation may pick.
     /// Frame components the idle rotation may pick.
     #[must_use]
     pub fn idle_frames(&self) -> Vec<&str> {
@@ -2177,6 +2270,7 @@ mod tests {
                 surfaces: vec![Surface::Frame],
                 capabilities: caps,
                 kind: FrameKind::default(),
+                frames: Vec::new(),
                 veiled: false,
                 min_size: (0, 0),
                 events: Vec::new(),

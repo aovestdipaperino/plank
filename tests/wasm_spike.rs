@@ -732,6 +732,7 @@ fn a_contested_tool_name_is_qualified_and_reported() {
                 surfaces: vec![plank::wasmreg::Surface::Tool],
                 capabilities: vec![],
                 kind: plank::wasmreg::FrameKind::Arcade,
+                frames: Vec::new(),
                 veiled: false,
                 min_size: (0, 0),
                 events: vec![],
@@ -1038,22 +1039,28 @@ fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
     let wasm = guest_or_skip!();
     let (root, session) = frame_session("frame-rotate", &wasm, r#", "kind": "screensaver""#);
 
-    let (mut component, mut built_in) = (0, 0);
-    for seed in 0..100 {
-        match session.pick_idle_face(seed) {
-            Some(id) => {
+    // Three built-in faces against this component's one: every face gets a
+    // slot, so the component should come up a quarter of the time.
+    let builtin = plank::arcade::ScreensaverFace::BUILT_IN;
+    let (mut from_plugin, mut from_core) = (0, 0);
+    for seed in 0..400 {
+        match session.pick_idle_face(seed, builtin) {
+            Some((id, face)) => {
                 assert_eq!(id, "dev.plank.bounce");
-                component += 1;
+                assert!(!face.is_empty(), "a picked face must be named");
+                from_plugin += 1;
             }
-            None => built_in += 1,
+            None => from_core += 1,
         }
     }
-    // One component, one built-in slot: both must actually come up.
-    assert_eq!(component, 50, "the component never came up");
-    assert_eq!(built_in, 50, "the built-in faces were crowded out");
+    assert_eq!(from_plugin, 100, "the component never came up");
+    assert_eq!(from_core, 300, "the built-in faces were crowded out");
 
     // The same seed always lands on the same face.
-    assert_eq!(session.pick_idle_face(7), session.pick_idle_face(7));
+    assert_eq!(
+        session.pick_idle_face(7, builtin),
+        session.pick_idle_face(7, builtin)
+    );
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1066,7 +1073,7 @@ fn the_idle_rotation_is_untouched_without_components() {
     let (root, session) = frame_session("frame-norotate", &wasm, "");
     for seed in 0..20 {
         assert_eq!(
-            session.pick_idle_face(seed),
+            session.pick_idle_face(seed, plank::arcade::ScreensaverFace::BUILT_IN),
             None,
             "an arcade component was picked as a screensaver"
         );
@@ -1120,7 +1127,8 @@ fn arcade_session(tag: &str) -> Option<(std::path::PathBuf, plank::wasmreg::Sess
         dir.join(".plank-plugin").join("plugin.json"),
         r#"{"name": "screensavers", "wasm": [{"id": "dev.plank.screensavers",
             "module": "faces.wasm", "surfaces": ["frame", "command"],
-            "capabilities": [], "kind": "screensaver"}]}"#,
+            "capabilities": [], "kind": "screensaver",
+            "frames": ["starfield"]}]}"#,
     )
     .unwrap();
 
@@ -1309,5 +1317,54 @@ fn a_multi_frame_component_is_addressable_per_frame() {
             "'{spelling}' did not queue its own component's frame"
         );
     }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A component's faces are addressable as `<plugin>:<face>`, which is what a
+/// user writes to pin one — and what makes a settings picker able to list
+/// them, rather than a closed enum of the faces plank happens to ship.
+#[test]
+fn screensaver_faces_are_enumerable_and_resolvable_by_address() {
+    let Some((root, mut session)) = arcade_session("faces") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+
+    let faces = session.screensaver_faces();
+    assert_eq!(faces.len(), 1, "{faces:?}");
+    assert_eq!(faces[0].component, "dev.plank.screensavers");
+    assert_eq!(faces[0].face, "starfield");
+    assert_eq!(faces[0].address, "screensavers:starfield");
+
+    assert_eq!(
+        session.resolve_screensaver_face("screensavers:starfield"),
+        Some((
+            "dev.plank.screensavers".to_string(),
+            "starfield".to_string()
+        ))
+    );
+    assert_eq!(
+        session.resolve_screensaver_face("screensavers:nope"),
+        None,
+        "an unknown face must not resolve to some other face"
+    );
+    // A pinned face opens through the ordinary driver.
+    let (component, face) = (faces[0].component.clone(), faces[0].face.clone());
+    let mut frame = session
+        .open_frame(&component, &face, 60, 30, 1)
+        .expect("a pinned face opens");
+    session.step_frame(&mut frame, 33, 60, 30, 0).expect("step");
+    assert!(!frame.last.glyphs.is_empty());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An arcade contributes no screensaver face at all — not merely one the
+/// rotation skips. A game must not be pinnable as a screensaver either.
+#[test]
+fn an_arcade_contributes_no_screensaver_face() {
+    let wasm = guest_or_skip!();
+    let (root, session) = frame_session("faces-arcade", &wasm, r#", "kind": "arcade""#);
+    assert!(session.screensaver_faces().is_empty());
+    assert_eq!(session.resolve_screensaver_face("demo:bounce"), None);
     let _ = std::fs::remove_dir_all(&root);
 }

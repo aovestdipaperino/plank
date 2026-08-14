@@ -1227,6 +1227,13 @@ pub enum ScreensaverFace {
 }
 
 impl ScreensaverFace {
+    /// How many concrete faces plank itself ships.
+    ///
+    /// The count, not the variants: `Random` is a choice *among* them rather
+    /// than one of them. Used to weigh the random rotation, where every face —
+    /// built-in or contributed — gets one slot.
+    pub const BUILT_IN: usize = 3;
+
     /// The settings-file spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
