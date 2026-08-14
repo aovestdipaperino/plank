@@ -607,6 +607,7 @@ impl SessionStore {
     /// what used to delete the other's checkpoint on every launch.
     #[must_use]
     pub fn sweep(&self, active: &[&str], policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
+        let mut freed = self.sweep_orphan_temps(now);
         // One paired walk: node `i` is the metadata of path `i`, so a verdict
         // names exactly one file. Matching on fingerprints instead would delete
         // a kept body that merely shares a doomed one's fingerprint — a root
@@ -614,7 +615,6 @@ impl SessionStore {
         let scan = self.kv_blob_nodes();
         let nodes: Vec<crate::kvmeta::KvMeta> = scan.iter().map(|(_, m)| m.clone()).collect();
         let plan = crate::kvgc::plan_sweep(&nodes, active, policy, now);
-        let mut freed = 0u64;
         for i in plan.doomed {
             let Some((path, seen)) = scan.get(i) else {
                 continue;
@@ -643,6 +643,74 @@ impl SessionStore {
                 // The sidecar must go with the body, or the next scan reports a
                 // phantom node.
                 let _ = fs::remove_file(crate::kvmeta::sidecar_path(path));
+            }
+        }
+        freed
+    }
+
+    /// Deletes `*.tmp.<pid>` staging files no live write can still be using,
+    /// returning the bytes reclaimed.
+    ///
+    /// Every durable write in the cache stages into `<final>.tmp.<pid>` and
+    /// renames. A crash (or a kill) between the two leaves the staging file
+    /// behind, and nothing ever came back for it: the scans all filter these
+    /// names out — deliberately, since a temp file is not a blob — so they were
+    /// invisible to the sweep while still costing the disk a full session
+    /// payload each, which runs to hundreds of megabytes.
+    ///
+    /// Two guards keep this from eating a *live* write. The current process's
+    /// own staging files are never touched, and neither is anything younger
+    /// than [`TEMP_ORPHAN_TTL`] — a sibling plank persisting a large blob holds
+    /// its temp file open for seconds, and a pid is not enough to tell that
+    /// sibling from a dead process whose pid has since been recycled. Age is
+    /// the honest signal; a slow write simply survives to the next launch.
+    fn sweep_orphan_temps(&self, now: u64) -> u64 {
+        fn scan(dir: &Path, out: &mut Vec<PathBuf>, recurse: bool) {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                    if recurse {
+                        scan(&path, out, false);
+                    }
+                    continue;
+                }
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                // `<something>.tmp.<digits>`, and only that shape: a user file
+                // that merely contains ".tmp." is not ours to delete.
+                let Some((_, pid)) = name.rsplit_once(".tmp.") else {
+                    continue;
+                };
+                let Ok(pid) = pid.parse::<u32>() else {
+                    continue;
+                };
+                if pid == std::process::id() {
+                    continue;
+                }
+                out.push(path);
+            }
+        }
+        let mut temps = Vec::new();
+        scan(&self.dir, &mut temps, true);
+        let mut freed = 0u64;
+        for path in temps {
+            let Ok(meta) = fs::metadata(&path) else {
+                continue;
+            };
+            let age = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| now.saturating_sub(d.as_secs()));
+            if age < TEMP_ORPHAN_TTL {
+                continue;
+            }
+            let size = meta.len();
+            if fs::remove_file(&path).is_ok() {
+                freed = freed.saturating_add(size);
             }
         }
         freed
@@ -1271,6 +1339,12 @@ impl SessionStore {
         Ok(out)
     }
 }
+
+/// How long a `*.tmp.<pid>` staging file must sit untouched before
+/// [`SessionStore::sweep`] treats it as crash debris rather than an in-flight
+/// write. An hour is far past the slowest real persist (a multi-hundred-megabyte
+/// KV blob) and far short of leaving the debris around for a second launch.
+const TEMP_ORPHAN_TTL: u64 = 3600;
 
 /// File-stem prefix of the system-prompt KV checkpoints, which share the
 /// cache dir with session files but are not sessions. Names the legacy bare
@@ -2731,6 +2805,61 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Orphaned staging files are the one thing the sweep collects that is not
+    /// a blob. Both guards are exercised: a live process's own temp file and a
+    /// young one are left alone, because neither is distinguishable from a
+    /// write still in flight.
+    #[test]
+    fn sweep_collects_abandoned_staging_files_but_spares_live_ones() {
+        let dir = temp_dir("tmp-orphans");
+        let store = SessionStore::open(&dir).unwrap();
+        let project = Path::new("/proj/tmp");
+        fs::create_dir_all(store.project_dir(project)).unwrap();
+
+        let now = crate::kvmeta::now_secs();
+        let orphan = dir.join("cheeky-bell.kv_raw.tmp.4242");
+        let nested = store
+            .project_dir(project)
+            .join("project-p1.kv_raw.tmp.4242");
+        let mine = dir.join(format!("mine.kv_raw.tmp.{}", std::process::id()));
+        let not_ours = dir.join("notes.tmp.txt");
+        for p in [&orphan, &nested, &mine, &not_ours] {
+            fs::write(p, b"12345").unwrap();
+        }
+
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 30 * 86_400,
+            max_bytes: 0,
+        };
+        // `now` an hour and a bit on: everything written just now reads as past
+        // the TTL, so only the pid guard can spare anything.
+        assert_eq!(
+            store.sweep(&[], &policy, now + TEMP_ORPHAN_TTL + 60),
+            10,
+            "both abandoned staging files, root and project dir"
+        );
+        assert!(!orphan.exists());
+        assert!(!nested.exists());
+        assert!(
+            mine.exists(),
+            "this process's own staging file is in flight"
+        );
+        assert!(not_ours.exists(), "`.tmp.<not-a-pid>` is not our debris");
+
+        // A second sweep at the true clock: this staging file is seconds old,
+        // so it is indistinguishable from a sibling plank mid-persist and
+        // survives.
+        let young = dir.join("young.kv_raw.tmp.4243");
+        fs::write(&young, b"12345").unwrap();
+        assert_eq!(store.sweep(&[], &policy, now), 0);
+        assert!(
+            young.exists(),
+            "a young staging file may still be in flight"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Ported from `gc_keeps_only_the_current_system_checkpoint`: the sweep
     /// still collects a superseded Tier 1 checkpoint and still spares the live
     /// one. What changed is *why* a checkpoint dies — expiry rather than
@@ -2744,8 +2873,9 @@ hello\n";
         for fp in ["aaa", "bbb", "ccc"] {
             fs::write(dir.join(sysprompt_checkpoint_name(fp)), b"fp\nkv").unwrap();
         }
-        // Neighbours in the same root that must survive: a session transcript,
-        // an in-flight temp write, and a non-blob file in a project subdir.
+        // Neighbours in the same root that must survive: a session transcript
+        // and a non-blob file in a project subdir. The temp write below is the
+        // one exception — see the orphan tally.
         let mut s = Session::new();
         s.push(Message::user("hi"));
         store.save(&mut s).unwrap();
@@ -2793,9 +2923,11 @@ hello\n";
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
         let active = ["bbb", "ccc", payload_fp.as_str()];
         // Exactly the two expired, inactive bodies: `sysprompt-aaa` and the
-        // Tier 2 `project-p1`, five bytes of `"fp\nkv"` each. An exact tally
-        // also pins that nothing else was collected.
-        assert_eq!(store.sweep(&active, &policy, future), 10);
+        // Tier 2 `project-p1`, five bytes of `"fp\nkv"` each — plus the nine
+        // bytes of the abandoned `.tmp.4242` staging file, which at 400 days
+        // old is crash debris by any reading. An exact tally also pins that
+        // nothing else was collected.
+        assert_eq!(store.sweep(&active, &policy, future), 10 + 9);
         assert!(dir.join(sysprompt_checkpoint_name("bbb")).exists());
         assert!(dir.join(sysprompt_checkpoint_name("ccc")).exists());
         assert!(!dir.join(sysprompt_checkpoint_name("aaa")).exists());
@@ -2812,7 +2944,10 @@ hello\n";
             store.path_for_id(&s.id).exists(),
             "transcripts are not blobs"
         );
-        assert!(tmp.exists(), "an in-flight temp write is not a blob");
+        assert!(
+            !tmp.exists(),
+            "a long-abandoned staging file is collected as orphan debris"
+        );
         assert!(
             stray.exists(),
             "a non-blob file in a project dir is untouched"
