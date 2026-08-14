@@ -589,6 +589,12 @@ pub struct StreamRenderer<S> {
     pseudo_tool: PseudoToolDetector,
     dsml_in_think: bool,
     dsml_in_think_reported: bool,
+    /// A `</think>` was consumed as parameter-value *content* while a stanza
+    /// was open (see [`Self::think_close_is_control`]). Cleared when that
+    /// stanza parses clean; if it instead dies malformed or is cut off, the
+    /// token was almost certainly the real control token and
+    /// [`Self::resolve_swallowed_think_close`] un-sticks `in_think`.
+    think_close_swallowed: bool,
     /// A tool call was discarded *because* it sat inside `<think>`.
     ///
     /// Distinct from [`Self::dsml_in_think`], which only means the marker was
@@ -677,6 +683,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             pseudo_tool: PseudoToolDetector::default(),
             dsml_in_think: false,
             dsml_in_think_reported: false,
+            think_close_swallowed: false,
             in_think_rejected: false,
             pseudo_tool_fired: false,
             post_think_gap: false,
@@ -1358,6 +1365,10 @@ impl<S: RenderSink> StreamRenderer<S> {
         }
         match self.parser.state() {
             DsmlState::Done => {
+                // The stanza parsed clean, so a `</think>` inside it really was
+                // payload text: leave `in_think` as it stands (the placement
+                // verdict below depends on it) and drop the pending question.
+                self.think_close_swallowed = false;
                 if self.rejects_in_think() {
                     // A discarded in-think stanza must never surface as an
                     // executable call: this parser instance is shared across
@@ -1375,6 +1386,10 @@ impl<S: RenderSink> StreamRenderer<S> {
                 }
             }
             DsmlState::Error => {
+                // Before the placement verdict: a stanza that swallowed a
+                // `</think>` and then failed to parse was not inside thinking
+                // when it died, so it must not be reported as if it were.
+                self.resolve_swallowed_think_close();
                 if self.rejects_in_think() {
                     self.reject_in_think_stanza("malformed tool call inside <think></think>");
                 } else {
@@ -1478,6 +1493,35 @@ impl<S: RenderSink> StreamRenderer<S> {
         !self.dsml_active || self.parser.state() != DsmlState::ParamValue
     }
 
+    /// Settles a `</think>` that was swallowed as parameter-value content by a
+    /// stanza that then failed to parse (or never finished).
+    ///
+    /// Treating it as content is right for a stanza that *completes* — a
+    /// `write` payload may legitimately contain the literal text. But when the
+    /// stanza dies malformed or the stream ends mid-flight, there is no payload
+    /// to protect and the far likelier reading is that it was the control token
+    /// all along. Without this the swallowed token left `in_think` stuck true,
+    /// so every remaining byte of the answer was rendered as thinking, hidden
+    /// from the visible transcript, and `ended_in_think` was reported wrongly.
+    fn resolve_swallowed_think_close(&mut self) {
+        if !std::mem::take(&mut self.think_close_swallowed) || !self.in_think {
+            return;
+        }
+        self.in_think = false;
+        // Same boundary bookkeeping as the control path in `stream_text`: the
+        // answer region starts here even though no `\n` byte crossed it.
+        self.pseudo_tool.reset_line();
+        self.plain_dsml = MarkerDetector::default();
+        // And the same un-holding of the stanza: it opened inside thinking, so
+        // its banner was held back pending the placement verdict. Thinking is
+        // over, so the call is real — render what there is of it rather than
+        // reporting it as a call made inside a thought.
+        if self.dsml_active && self.dsml_ignored {
+            self.dsml_ignored = false;
+            self.viz_start();
+        }
+    }
+
     fn finish_ignored_dsml(&mut self, msg: &str) {
         // The parser buffer is often already drained by the time a rejection
         // lands, which left the most frequent failure in the log recorded with
@@ -1489,6 +1533,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.parser.raw().to_vec()
         };
         log_tool_error(msg, &raw);
+        self.resolve_swallowed_think_close();
         self.dsml_in_think = true;
         self.in_think_rejected = true;
         self.dsml_in_think_reported = true;
@@ -1532,7 +1577,16 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn note_plain_dsml_byte(&mut self, c: u8) {
-        if self.output_frozen() || self.dsml_active || self.in_think || self.dsml_in_think {
+        // Gated on `in_think_rejected`, NOT on `dsml_in_think`. Both are sticky,
+        // but they mean different things: `dsml_in_think` is set the moment
+        // DSML-*shaped* bytes appear inside `<think>`, which is what a model
+        // reasoning about the syntax does, and letting that disable the plain
+        // validator for the rest of the stream meant one quoted marker in
+        // thinking bought the model silent impunity for genuinely malformed
+        // markup in its answer. `in_think_rejected` means a stanza was actually
+        // rejected and the model already has a tool error in hand, so a second
+        // report would be noise.
+        if self.output_frozen() || self.dsml_active || self.in_think || self.in_think_rejected {
             return;
         }
         if self.plain_dsml.feed(c) {
@@ -1659,6 +1713,10 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.flush_start_tail();
                 self.post_think_gap = false;
                 self.in_think = true;
+                // The plain-DSML tail is not fed while thinking, so bytes from
+                // before the block must not glue onto bytes from after it and
+                // spell a marker that was never written.
+                self.plain_dsml = MarkerDetector::default();
                 i += THINK_OPEN.len();
                 continue;
             }
@@ -1683,8 +1741,16 @@ impl<S: RenderSink> StreamRenderer<S> {
                     self.emit_visible_bytes(b"\n");
                     self.post_think_gap = true;
                 }
+                self.plain_dsml = MarkerDetector::default();
                 i += THINK_CLOSE.len();
                 continue;
+            }
+            if rem.starts_with(THINK_CLOSE) {
+                // Not a control token here (the branch above owns that case):
+                // it is inside a parameter value and is about to be fed to the
+                // parser as content. Remember it, in case the stanza never
+                // completes — see `resolve_swallowed_think_close`.
+                self.think_close_swallowed = true;
             }
             if !finish
                 && rem[0] == b'<'
@@ -1710,6 +1776,11 @@ impl<S: RenderSink> StreamRenderer<S> {
             self.flush_start_tail();
             self.post_think_gap = false;
             if self.dsml_active {
+                // A stanza cut off after swallowing a `</think>` never got to
+                // prove the token was payload text, so it is settled as the
+                // control token it most likely was — before the placement
+                // verdict below reads `in_think`.
+                self.resolve_swallowed_think_close();
                 if self.rejects_in_think() {
                     // Cut off mid-stanza and still inside thinking: the model
                     // never left the block, so the placement rule applies.
@@ -2691,6 +2762,65 @@ mod tests {
             sr.finished().error,
             Some("DSML markup outside a valid tool_calls block")
         );
+    }
+
+    /// The model quoting a DSML marker while thinking used to set the sticky
+    /// `dsml_in_think` flag, which disabled the loose-marker validator for the
+    /// whole rest of the stream — so genuinely malformed markup in the answer
+    /// went unreported and the turn ended with nothing for the model to correct.
+    #[test]
+    fn a_quoted_marker_in_think_does_not_disarm_the_loose_marker_validator() {
+        let sr = run_chunked("<think>the ｜DSML｜ marker opens a call</think>junk ｜DSML｜ junk");
+        assert_eq!(
+            sr.finished().error,
+            Some("DSML markup outside a valid tool_calls block"),
+            "{:?}",
+            sr.sink().visible
+        );
+    }
+
+    /// A `</think>` inside a parameter value is consumed as content so a
+    /// payload containing that literal text is not corrupted. When the stanza
+    /// never completes, the token was the real control token: `in_think` must
+    /// not stay stuck, or the stream is reported as having ended mid-thought
+    /// and the cut-off call is misdiagnosed as an in-think placement error.
+    #[test]
+    fn a_think_close_swallowed_by_an_unfinished_stanza_still_ends_thinking() {
+        let sr = run_chunked(concat!(
+            "<think>",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"content\">x</think>",
+        ));
+        let fin = sr.finished();
+        assert!(!fin.ended_in_think, "in_think stayed stuck after </think>");
+        assert!(
+            !fin.in_think_rejected,
+            "a call cut off after thinking closed is not an in-think call"
+        );
+        assert!(
+            sr.sink().visible.contains("[tool call interrupted]"),
+            "{:?}",
+            sr.sink()
+        );
+    }
+
+    /// The mirror case: a stanza that *completes* proves the `</think>` in its
+    /// payload was content, so thinking is still open and the payload keeps the
+    /// literal text.
+    #[test]
+    fn a_think_close_inside_a_valid_payload_stays_payload_text() {
+        let sr = run_chunked(concat!(
+            "<think>",
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">echo </think></｜DSML｜parameter｜>",
+            "</｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>",
+        ));
+        let fin = sr.finished();
+        assert!(fin.ended_in_think, "the thinking block never closed");
+        assert_eq!(fin.calls.len(), 0, "an in-think stanza is not dispatched");
     }
 
     #[test]
