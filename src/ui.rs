@@ -5695,13 +5695,15 @@ the original is frozen and listed in /tree"
         arg: &str,
     ) -> Option<Result<crate::wasmreg::CmdOutput, String>> {
         let name = cmd.strip_prefix('/')?;
+        // Either spelling: `/arcade:matrix` always, `/matrix` when the bare
+        // name was not already claimed by a built-in, a skill or a template.
         if !self
             .tool_ctx
             .wasm
             .registry
             .commands()
             .iter()
-            .any(|(_, c)| c.name == name)
+            .any(|(_, c)| c.alias == name || c.name == name)
         {
             return None;
         }

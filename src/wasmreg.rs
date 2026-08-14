@@ -790,8 +790,16 @@ fn json_str(s: &str) -> String {
 /// One slash command a `command` component contributes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
-    /// Name without the leading slash.
+    /// Name without the leading slash, as the component spells it.
     pub name: String,
+    /// `<plugin>:<name>`, always available.
+    ///
+    /// The plugin loader's convention for every contributed entry: an alias
+    /// that is always addressable, plus the bare name when nothing else claims
+    /// it. A component offering several frames therefore gets `/arcade:matrix`
+    /// and `/arcade:breakout` for free, which is the whole reason `/frame <id>
+    /// <face>` does not have to be how anyone opens one.
+    pub alias: String,
     /// Argument hint for the menu; empty when it takes none.
     pub args: String,
     /// One-line description.
@@ -841,6 +849,7 @@ fn parse_command_specs(bytes: &[u8]) -> Option<Vec<CommandSpec>> {
             continue;
         }
         out.push(CommandSpec {
+            alias: String::new(),
             name,
             args: get("args"),
             desc: get("desc"),
@@ -1460,13 +1469,24 @@ impl Registry {
             };
             let commands = if component.manifest.surfaces.contains(&Surface::Command) {
                 match host.call(&component.manifest.id, "command_specs", b"") {
-                    Ok(bytes) => parse_command_specs(&bytes).unwrap_or_else(|| {
-                        out.warnings.push(format!(
-                            "wasm component '{}': command_specs returned unreadable JSON",
-                            component.manifest.id
-                        ));
-                        Vec::new()
-                    }),
+                    Ok(bytes) => parse_command_specs(&bytes).map_or_else(
+                        || {
+                            out.warnings.push(format!(
+                                "wasm component '{}': command_specs returned unreadable JSON",
+                                component.manifest.id
+                            ));
+                            Vec::new()
+                        },
+                        |mut specs| {
+                            // Stamped here rather than in the parser: the alias
+                            // is `<plugin>:<name>`, and only the load site knows
+                            // which plugin contributed this component.
+                            for spec in &mut specs {
+                                spec.alias = format!("{}:{}", component.plugin, spec.name);
+                            }
+                            specs
+                        },
+                    ),
                     Err(e) => {
                         out.warnings
                             .push(format!("wasm component '{}': {e}", component.manifest.id));
@@ -1685,15 +1705,19 @@ impl Registry {
         args: &str,
     ) -> Result<CmdOutput, String> {
         let name = name.trim_start_matches('/');
-        let id = self
+        // Either spelling resolves: the alias is always addressable, the bare
+        // name only when the menu offered it. Matching both here rather than
+        // making the caller choose keeps `/arcade:matrix` and `/matrix`
+        // indistinguishable once one of them has been typed.
+        let (id, name) = self
             .commands()
             .into_iter()
-            .find(|(_, c)| c.name == name)
-            .map(|(id, _)| id.to_string())
+            .find(|(_, c)| c.alias == name || c.name == name)
+            .map(|(id, c)| (id.to_string(), c.name.clone()))
             .ok_or_else(|| format!("no wasm command '{name}'"))?;
         let payload = format!(
             "{{\"name\": {}, \"args\": {}}}",
-            json_str(name),
+            json_str(&name),
             json_str(args)
         );
         match host.call(&id, "command_run", payload.as_bytes()) {
@@ -2337,6 +2361,7 @@ mod tests {
                 strikes: 0,
                 tools: Vec::new(),
                 commands: vec![CommandSpec {
+                    alias: "demo:greet".to_string(),
                     name: "greet".to_string(),
                     args: String::new(),
                     desc: String::new(),
@@ -2352,6 +2377,36 @@ mod tests {
             reg.commands().is_empty(),
             "a disabled component must not be offered"
         );
+    }
+
+    /// Both spellings resolve to the same command, and the alias is what makes
+    /// a component's frames addressable while a built-in still owns the bare
+    /// name — `/arcade:matrix` when `/matrix` is the built-in rain.
+    #[test]
+    fn a_command_is_addressable_bare_and_namespaced() {
+        let specs =
+            parse_command_specs(br#"[{"name": "matrix", "desc": "rain"}]"#).expect("parsed");
+        assert_eq!(specs[0].name, "matrix");
+        assert!(
+            specs[0].alias.is_empty(),
+            "the alias is stamped at load, where the plugin name is known"
+        );
+
+        let reg = Registry::with_loaded(vec![Loaded {
+            component: component(Origin::UserScan, vec![]),
+            strikes: 0,
+            tools: Vec::new(),
+            commands: vec![CommandSpec {
+                alias: "arcade:matrix".to_string(),
+                name: "matrix".to_string(),
+                args: String::new(),
+                desc: "rain".to_string(),
+            }],
+        }]);
+        let offered = reg.commands();
+        assert_eq!(offered.len(), 1, "one command, two ways to say it");
+        assert_eq!(offered[0].1.alias, "arcade:matrix");
+        assert_eq!(offered[0].1.name, "matrix");
     }
 
     /// The held listing has to name the component, the reason, what it wants,

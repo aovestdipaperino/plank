@@ -1387,3 +1387,47 @@ fn a_frame_step_fits_well_inside_the_animation_budget() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A component offering several frames is opened by name, not by component id
+/// plus face: `/arcade:matrix` and `/arcade:breakout` are the addresses, the
+/// same `<plugin>:<name>` shape every other contributed entry uses.
+#[test]
+fn a_multi_frame_component_is_addressable_per_frame() {
+    let Some((root, mut session)) = arcade_session("aliases") else {
+        eprintln!("skipping: run guests/build.sh first");
+        return;
+    };
+
+    let commands = session.registry.commands();
+    let names: Vec<&str> = commands.iter().map(|(_, c)| c.name.as_str()).collect();
+    let aliases: Vec<&str> = commands.iter().map(|(_, c)| c.alias.as_str()).collect();
+    for face in ["matrix", "starfield", "breakout"] {
+        assert!(names.contains(&face), "{face} is not offered: {names:?}");
+        let alias = format!("arcade:{face}");
+        assert!(
+            aliases.contains(&alias.as_str()),
+            "{alias} is not offered: {aliases:?}"
+        );
+    }
+
+    // Running either spelling opens that face — the component gets its own
+    // name back, never the alias, so a guest never has to know what plugin
+    // directory it was installed under.
+    for spelling in ["arcade:breakout", "breakout"] {
+        let out = session
+            .registry
+            .run_command(&mut *session.host, spelling, "")
+            .expect("run");
+        assert_eq!(
+            out.open.as_deref(),
+            Some("breakout"),
+            "'{spelling}' did not ask to open the breakout face"
+        );
+        assert_eq!(
+            session.registry.take_pending_frame(),
+            Some(("dev.plank.arcade".to_string(), "breakout".to_string())),
+            "'{spelling}' did not queue its own component's frame"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}

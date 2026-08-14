@@ -119,10 +119,13 @@ through `f32`, and a u64 seed does not survive a 24-bit mantissa — so the
 component seeded a *different* rain. Nothing looked wrong; it was still rain.
 Only the glyph-for-glyph comparison could catch it.
 
-**A transitional note:** a built-in command wins over a component's, by design,
-so while `/matrix` still exists as a built-in the component's `matrix` command
-is shadowed and the face is reachable as `/frame dev.plank.arcade matrix`. The
-built-in commands come out as each face lands.
+**Each frame is its own command.** A component's commands follow the plugin
+loader's convention exactly: `<plugin>:<name>` always, plus the bare `<name>`
+when nothing else claims it. So a component holding many frames is opened per
+frame — `/arcade:matrix`, `/arcade:breakout` — with no component id and no face
+argument to remember, and the alias keeps working while a built-in still owns
+the bare name. `/frame` remains for listing what is openable and for a
+component whose frames are not declared as commands.
 
 Three faces have landed: the matrix rain, the starfield and breakout — the
 last of which is the first *game*, and a harder case than an ambient face. Each
@@ -141,8 +144,9 @@ deliver `frame_mouse`.
 **Still to do:** minions, centipede, frogger and invaders; the embedded
 built-in blob so an empty plugins directory still has screensavers; and
 `ScreensaverFace` becoming a registry rather than a closed enum. The built-in
-commands come out as each face lands — until then a ported face is reachable as
-`/frame dev.plank.arcade <face>` while the bare name still opens the built-in.
+commands come out as each face lands — until then `/matrix` is the built-in
+rain and `/arcade:matrix` is the ported one, which is exactly what the alias
+convention is for.
 
 Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
 compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.
