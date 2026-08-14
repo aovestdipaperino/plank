@@ -9,7 +9,7 @@ license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
 rust-version = "1.93"
-exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*"]
+exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
 default = ["use_obscura", "builtin_editor", "docparse", "images"]

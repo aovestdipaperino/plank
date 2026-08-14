@@ -107,11 +107,27 @@ real-black as a built-in face — pinned by a test, since the two must not drift
 face its own slash command. A component may only open its own frame: opening
 someone else's window is a capability, and this is a convenience.
 
-**Still to do:** the arcade port itself — the six faces reimplemented as one
-guest module, `ScreensaverFace` becoming a registry over idle-eligible
-components, the embedded built-in blob so an empty plugins directory still has
-screensavers, and the `sound` capability a guest needs because it cannot shell
-out.
+**The arcade port has started.** `guests/arcade/` is the single component
+every face will live in. The matrix rain is ported, and the port is *verbatim*
+— only the imports changed — because that is what makes it checkable: a test
+drives the built-in `arcade::matrix::Rain` and the component side by side for
+thirty ticks and compares every glyph's position, character and colour. They
+match exactly.
+
+That test earned its place on its first run. The guest was parsing the `seed`
+through `f32`, and a u64 seed does not survive a 24-bit mantissa — so the
+component seeded a *different* rain. Nothing looked wrong; it was still rain.
+Only the glyph-for-glyph comparison could catch it.
+
+**A transitional note:** a built-in command wins over a component's, by design,
+so while `/matrix` still exists as a built-in the component's `matrix` command
+is shadowed and the face is reachable as `/frame dev.plank.arcade matrix`. The
+built-in commands come out as each face lands.
+
+**Still to do:** the remaining faces (starfield, minions, breakout, centipede,
+frogger, invaders), the embedded built-in blob so an empty plugins directory
+still has screensavers, and `ScreensaverFace` becoming a registry rather than a
+closed enum.
 
 Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
 compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.

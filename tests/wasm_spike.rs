@@ -1095,3 +1095,93 @@ fn one_component_serves_several_frames_and_opens_them_from_its_own_command() {
     );
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The arcade port's behaviour-preservation check: the rain drawn by the WASM
+/// component must be the *same* rain the built-in face draws, glyph for glyph.
+///
+/// This is the whole argument for porting a face by carrying its source across
+/// rather than rewriting it. Both sides seed the same `Rng`, integrate the
+/// same `dt`, and lay out the same columns, so the same seed must produce
+/// identical output — and if a port ever drifts, this fails with the exact
+/// glyph that moved instead of with "the screensaver looks a bit different".
+#[test]
+fn the_ported_rain_matches_the_built_in_rain_glyph_for_glyph() {
+    use plank::wasmreg::Session;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/guests/arcade/target/wasm32-unknown-unknown/release/plank_arcade.wasm"
+    );
+    let Ok(wasm) = std::fs::read(path) else {
+        eprintln!("skipping: build guests/arcade first");
+        return;
+    };
+
+    let root = std::env::temp_dir().join(format!("plank-arcade-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let dir = root.join("arcade");
+    std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
+    std::fs::create_dir_all(dir.join("wasm")).unwrap();
+    std::fs::write(dir.join("wasm").join("arcade.wasm"), &wasm).unwrap();
+    std::fs::write(
+        dir.join(".plank-plugin").join("plugin.json"),
+        r#"{"name": "arcade", "wasm": [{"id": "dev.plank.arcade", "module": "arcade.wasm",
+            "surfaces": ["frame", "command"], "capabilities": [],
+            "activation": "both"}]}"#,
+    )
+    .unwrap();
+
+    let set = plank::plugins::PluginSet {
+        plugins: vec![
+            plank::plugins::load_plugin(&dir, plank::plugins::Origin::UserScan).expect("plugin"),
+        ],
+        ..plank::plugins::PluginSet::default()
+    };
+    let project = root.join("repo");
+    let mut session = Session::new(None);
+    session.activate(&set, &project);
+    session
+        .approve("dev.plank.arcade", &project)
+        .expect("approve");
+
+    let (seed, w, h) = (0xDEAD_BEEF_u64, 80_u16, 24_u16);
+
+    // The built-in face, driven exactly as the arcade drives it.
+    let mut native = plank::arcade::matrix::Rain::new(seed);
+    // And the component, driven exactly as the frame loop drives it.
+    let mut frame = session
+        .open_frame("dev.plank.arcade", "matrix", w, h, seed)
+        .expect("open");
+
+    for tick in 0..30 {
+        native.step(33);
+        session
+            .step_frame(&mut frame, 33, w, h, tick * 33)
+            .expect("step");
+
+        let expected = native.glyphs(w, h);
+        let actual = &frame.last.glyphs;
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "tick {tick}: the port drew {} glyphs, the built-in drew {}",
+            actual.len(),
+            expected.len()
+        );
+        for (i, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                (a.x, a.y, a.ch, a.color),
+                (b.x, b.y, b.ch, b.color),
+                "tick {tick}, glyph {i}: the port drifted from the built-in rain"
+            );
+        }
+    }
+    // And it drew something: an all-empty match would pass the loop above
+    // while proving nothing at all.
+    assert!(
+        frame.last.glyphs.len() > 50,
+        "the rain drew only {} glyphs",
+        frame.last.glyphs.len()
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
