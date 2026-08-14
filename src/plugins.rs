@@ -51,19 +51,32 @@ pub struct Plugin {
 /// Component subdirectory spellings, plank name first, Claude Code name
 /// second. Used by the scan to decide whether a manifest-less directory is a
 /// plugin at all, and by the per-contribution accessors in later tasks.
-const COMPONENT_PATHS: [(&str, &str); 6] = [
+const COMPONENT_PATHS: [(&str, &str); 7] = [
     ("skills", "skills"),
     ("agents", "agents"),
     ("templates", "commands"),
     ("hooks.json", "hooks/hooks.json"),
     (".mcp.json", ".mcp.json"),
     ("settings.json", "settings.json"),
+    // WASM components (docs/WASM-PLUGINS.md). No Claude Code spelling exists,
+    // so both entries are the plank one — the pair is positional, and leaving
+    // the second blank would make `component_root` test `plugin.root` itself,
+    // which every plugin has.
+    ("wasm", "wasm"),
 ];
 
 /// Human-readable labels for the listing, in the same order as
 /// [`COMPONENT_PATHS`]. Kept beside it and length-checked below so adding or
 /// reordering a component can't silently truncate or mislabel `contributions`.
-const COMPONENT_LABELS: [&str; 6] = ["skills", "agents", "templates", "hooks", "mcp", "settings"];
+const COMPONENT_LABELS: [&str; 7] = [
+    "skills",
+    "agents",
+    "templates",
+    "hooks",
+    "mcp",
+    "settings",
+    "wasm",
+];
 
 const _: () = assert!(COMPONENT_LABELS.len() == COMPONENT_PATHS.len());
 
@@ -524,6 +537,12 @@ pub fn render_list(set: &PluginSet) -> String {
             let _ = writeln!(out, "  contributes: {}", parts.join(", "));
         }
     }
+    // WASM components live inside these same plugins, so they are listed here
+    // rather than under a command of their own — one place to answer "what is
+    // active in this session, and what can it reach".
+    out.push_str(&crate::wasmreg::render_components(
+        &crate::wasmreg::discover(set),
+    ));
     let warnings = set.all_warnings();
     if !warnings.is_empty() {
         out.push_str("\nwarnings:\n");
