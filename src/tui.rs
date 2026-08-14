@@ -6228,6 +6228,7 @@ mod tests {
         };
         let open = crate::wasmreg::OpenFrame {
             id: "dev.plank.test".to_string(),
+            screensaver: false,
             veiled: false,
             last: crate::wasmglyph::GlyphFrame {
                 w: 80,
@@ -6276,6 +6277,7 @@ mod tests {
         let draw = |veiled: bool| {
             let open = crate::wasmreg::OpenFrame {
                 id: "dev.plank.test".to_string(),
+                screensaver: false,
                 veiled,
                 last: crate::wasmglyph::GlyphFrame::default(),
             };

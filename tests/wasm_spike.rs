@@ -997,6 +997,77 @@ fn a_seed_makes_a_frame_reproducible() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The idle rotation must never pick a manual-only component, and an
+/// idle-eligible one must be openable through the same driver a screensaver
+/// uses — the two lists are what stand between "a face the user chose" and "a
+/// game that appeared over their work".
+#[test]
+fn an_idle_frame_opens_through_the_same_driver() {
+    let wasm = guest_or_skip!();
+    let (root, mut session) = frame_session("frame-idle-open", &wasm, r#", "activation": "idle""#);
+
+    let idle = session.idle_frames();
+    assert_eq!(idle, vec!["dev.plank.bounce"]);
+
+    // What the idle path does: open it, mark it, step it once.
+    let mut open = session
+        .open_frame("dev.plank.bounce", "", 60, 30, 3)
+        .expect("open");
+    open.screensaver = true;
+    session.step_frame(&mut open, 33, 60, 30, 0).expect("step");
+    assert_eq!(open.last.glyphs.len(), 1);
+    assert!(
+        open.screensaver,
+        "an idle-opened frame must be dismissable by any activity"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The rotation gives the built-in faces one slot against each component, so
+/// installing one makes it *a* screensaver, not *the* screensaver. Checked by
+/// sweeping seeds rather than by idling a terminal and hoping — a selection
+/// rule that can only be exercised by waiting a minute is one nobody rechecks.
+#[test]
+fn the_idle_rotation_shares_slots_between_components_and_built_ins() {
+    let wasm = guest_or_skip!();
+    let (root, session) = frame_session("frame-rotate", &wasm, r#", "activation": "idle""#);
+
+    let (mut component, mut built_in) = (0, 0);
+    for seed in 0..100 {
+        match session.pick_idle_face(seed) {
+            Some(id) => {
+                assert_eq!(id, "dev.plank.bounce");
+                component += 1;
+            }
+            None => built_in += 1,
+        }
+    }
+    // One component, one built-in slot: both must actually come up.
+    assert_eq!(component, 50, "the component never came up");
+    assert_eq!(built_in, 50, "the built-in faces were crowded out");
+
+    // The same seed always lands on the same face.
+    assert_eq!(session.pick_idle_face(7), session.pick_idle_face(7));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// With nothing idle-eligible installed, the rotation must not change at all:
+/// a user who installed no component notices nothing.
+#[test]
+fn the_idle_rotation_is_untouched_without_components() {
+    let wasm = guest_or_skip!();
+    // Manual activation: loaded, but not a screensaver candidate.
+    let (root, session) = frame_session("frame-norotate", &wasm, "");
+    for seed in 0..20 {
+        assert_eq!(
+            session.pick_idle_face(seed),
+            None,
+            "a manual-only component was picked as a screensaver"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// One module, many frames. The face selector reaches the guest and changes
 /// what it draws, and a component's own command can open its own frame — which
 /// together are what lets every arcade face live in a single `.wasm` with a

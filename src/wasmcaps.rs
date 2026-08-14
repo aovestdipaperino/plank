@@ -78,6 +78,10 @@ pub struct Grants {
     /// spells them. Strings rather than the enum so this layer and the runtime
     /// stay free of the registry's types.
     pub granted: Vec<String>,
+    /// Whether the user has sound on this session. Held here rather than read
+    /// at the call: the capability answers "may this component ask for a
+    /// noise", and this answers "does this terminal make one".
+    pub sound: crate::arcade::Sound,
     /// Root under which this component's `state` capability may write.
     /// `None` disables `state` outright — a plank with no home has nowhere
     /// private to put it, and inventing a location would be worse.
@@ -212,6 +216,35 @@ pub fn print(grants: &Grants, sink: &SharedSink, text: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// Plays a sound cue on the component's behalf.
+///
+/// A guest cannot shell out and cannot reach an audio device, so the one way
+/// it makes a noise is to ask. The cue set is [`crate::arcade::Cue`] exactly —
+/// three blips with no pitch and no length (see `arcade::Sound`) — so a
+/// component gets the same repertoire as a built-in face and no more.
+///
+/// Whether anything is actually audible is the *user's* setting, not the
+/// component's: `Sound` is off unless the arcade command asked for it, and a
+/// component cannot turn it on. That is deliberate — a plugin that could make
+/// the terminal beep unbidden is a plugin that will.
+///
+/// # Errors
+/// Returns a message when `sound` was not granted, or when the cue is not one
+/// of the three.
+pub fn sound(grants: &Grants, sound: crate::arcade::Sound, cue: &str) -> Result<(), String> {
+    if !grants.allows("sound") {
+        return Err(grants.refusal("sound"));
+    }
+    let cue = match cue {
+        "hit" => crate::arcade::Cue::Hit,
+        "lose" => crate::arcade::Cue::Lose,
+        "win" => crate::arcade::Cue::Win,
+        other => return Err(format!("unknown sound cue '{other}'")),
+    };
+    sound.play(cue);
+    Ok(())
+}
+
 /// Every component's grants for this session, keyed by id.
 pub type GrantTable = BTreeMap<String, Grants>;
 
@@ -221,6 +254,7 @@ pub fn grants_for(id: &str, granted: &[&str], home: Option<&Path>) -> Grants {
     Grants {
         id: id.to_string(),
         granted: granted.iter().map(|s| (*s).to_string()).collect(),
+        sound: crate::arcade::Sound::default(),
         state_root: home.map(|h| h.join("plugins")),
     }
 }
@@ -249,6 +283,26 @@ mod tests {
             "the refusal must name the grant a user can give: {err}"
         );
         assert!(sink.lock().unwrap().is_empty(), "nothing was buffered");
+    }
+
+    /// A component may ask for a noise only if it was granted `sound`, and
+    /// only for a cue that exists — the set a built-in face has, and no more.
+    #[test]
+    fn sound_needs_the_grant_and_a_known_cue() {
+        let ungranted = grants_for("dev.plank.demo", &[], None);
+        assert!(
+            sound(&ungranted, crate::arcade::Sound::default(), "hit")
+                .unwrap_err()
+                .contains("'sound' capability")
+        );
+
+        let granted = grants_for("dev.plank.demo", &["sound"], None);
+        // Silent by default — `Sound::default()` is off — so this plays
+        // nothing and still reports success: the grant was honored.
+        assert!(sound(&granted, crate::arcade::Sound::default(), "hit").is_ok());
+        assert!(sound(&granted, crate::arcade::Sound::default(), "win").is_ok());
+        let err = sound(&granted, crate::arcade::Sound::default(), "explode").unwrap_err();
+        assert!(err.contains("unknown sound cue 'explode'"), "{err}");
     }
 
     /// `log` needs no grant: it reaches plank's own debug file and nothing else.

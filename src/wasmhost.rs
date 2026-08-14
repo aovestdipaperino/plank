@@ -225,6 +225,15 @@ mod extism_host {
         })
     });
 
+    extism::host_fn!(plank_sound(ctx: CallCtx; cue: String) -> String {
+        let ctx = ctx.get()?;
+        let ctx = ctx.lock().unwrap();
+        Ok(match crate::wasmcaps::sound(&ctx.grants, ctx.grants.sound, &cue) {
+            Ok(()) => String::new(),
+            Err(e) => e,
+        })
+    });
+
     extism::host_fn!(plank_state_get(ctx: CallCtx; key: String) -> Vec<u8> {
         let ctx = ctx.get()?;
         let ctx = ctx.lock().unwrap();
@@ -313,6 +322,13 @@ mod extism_host {
                     [extism::PTR],
                     ctx.clone(),
                     plank_print,
+                ),
+                extism::Function::new(
+                    "plank_sound",
+                    [extism::PTR],
+                    [extism::PTR],
+                    ctx.clone(),
+                    plank_sound,
                 ),
                 extism::Function::new(
                     "plank_state_get",

@@ -6655,6 +6655,7 @@ impl Agent<'_> {
             // modal is on screen — a screensaver over a dialog would hide a
             // question the user still has to answer.
             if !arcade.is_open()
+                && wasm_frame.is_none()
                 && config_form.is_none()
                 && kv_pane.is_none()
                 && resume_pane.is_none()
@@ -6664,6 +6665,30 @@ impl Agent<'_> {
                 let (w, h) = terminal
                     .size()
                     .map_or((80, 23), |sz| (sz.width, sz.height.saturating_sub(1)));
+                // Idle-eligible components join the rotation rather than
+                // replacing it: a user who installed one still gets the
+                // built-in faces, and one who installed none notices nothing.
+                // The seed picks, so the choice is as reproducible as the face
+                // it lands on.
+                let seed = arcade_seed();
+                let candidates = self.tool_ctx.wasm.idle_frames().len();
+                let pick = usize::try_from(seed % (candidates as u64 + 1)).unwrap_or(0);
+                let chosen =
+                    (pick < candidates).then(|| self.tool_ctx.wasm.idle_frames()[pick].to_string());
+                if let Some(id) = chosen {
+                    match self.tool_ctx.wasm.open_frame(&id, "", w, h, seed) {
+                        Ok(mut open) => {
+                            open.screensaver = true;
+                            wasm_frame = Some(open);
+                            wasm_frame_last = Instant::now();
+                            arcade_hover_reporting(true);
+                            continue;
+                        }
+                        // A component that will not open must not cost the
+                        // user their screensaver: fall through to a face.
+                        Err(e) => log.push_dim(e),
+                    }
+                }
                 arcade.open_screensaver(arcade_seed(), w, h);
                 arcade_last = Instant::now();
             }
@@ -6753,6 +6778,20 @@ impl Agent<'_> {
             // button the user could not see.
             if arcade.is_screensaver() && from_user {
                 arcade.close();
+                continue;
+            }
+            // Same rule for a component the idle rotation put up: any activity
+            // dismisses it, and the waking event is consumed rather than acted
+            // on. A component opened by `/frame` is *not* dismissed here — the
+            // user asked for that one and owns when it closes.
+            if wasm_frame.as_ref().is_some_and(|f| f.screensaver) && from_user {
+                if let Some(open) = &wasm_frame
+                    && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                {
+                    log.push_dim(line);
+                }
+                wasm_frame = None;
+                arcade_hover_reporting(false);
                 continue;
             }
             // An open easter egg takes the mouse (wheel, click and drag steer

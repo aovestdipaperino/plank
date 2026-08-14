@@ -996,6 +996,10 @@ fn parse_segment(component: &str, bytes: &[u8]) -> Option<Segment> {
 pub struct OpenFrame {
     /// Component driving it.
     pub id: String,
+    /// Opened by the idle rotation rather than by a command, which is what
+    /// makes it dismissable by any activity: a screensaver a person has to
+    /// press the right key to escape is not a screensaver.
+    pub screensaver: bool,
     /// Whether the transcript stays dimly visible underneath.
     pub veiled: bool,
     /// The last frame it painted, kept so a repaint that arrives between steps
@@ -1105,6 +1109,29 @@ impl Session {
             .collect()
     }
 
+    /// Which face the idle rotation should put up for `seed`.
+    ///
+    /// `Some(id)` is a component; `None` means "use a built-in face". The
+    /// built-ins hold exactly one slot however many components are installed:
+    /// installing a component makes it *a* candidate, not *the* screensaver,
+    /// and someone who installs three should still see the matrix rain
+    /// sometimes. The seed decides, so the choice is as reproducible as the
+    /// face it lands on.
+    ///
+    /// Extracted from the event loop rather than left inline there because a
+    /// selection rule that can only be exercised by idling a real terminal for
+    /// a minute and hoping is a rule nobody will check again.
+    #[must_use]
+    pub fn pick_idle_face(&self, seed: u64) -> Option<String> {
+        let candidates = self.idle_frames();
+        if candidates.is_empty() {
+            return None;
+        }
+        let slots = candidates.len() as u64 + 1;
+        let pick = usize::try_from(seed % slots).unwrap_or(0);
+        candidates.get(pick).map(|id| (*id).to_string())
+    }
+
     /// Frame components the idle rotation may pick.
     #[must_use]
     pub fn idle_frames(&self) -> Vec<&str> {
@@ -1164,6 +1191,7 @@ impl Session {
         }
         Ok(OpenFrame {
             id: id.to_string(),
+            screensaver: false,
             veiled: manifest.veiled,
             last: crate::wasmglyph::GlyphFrame::default(),
         })
