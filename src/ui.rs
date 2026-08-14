@@ -15758,11 +15758,22 @@ mod tests {
 
     /// Installs `n` remote definitions named `a0..`, each with its own key
     /// variable and a pre-seeded fan-out-capable engine.
-    fn install_parallel_defs(agent: &mut Agent<'_>, engines: &[(&str, u64, bool)]) -> Vec<String> {
+    ///
+    /// `tag` must be unique per test. The key variables are process-global, and
+    /// the test binary runs these tests on parallel threads: sharing one set of
+    /// names meant one test's `clear_vars` could unset a variable a sibling was
+    /// mid-fan-out on, which cost that sibling its engine and failed it at
+    /// random.
+    fn install_parallel_defs(
+        agent: &mut Agent<'_>,
+        tag: &str,
+        engines: &[(&str, u64, bool)],
+    ) -> Vec<String> {
         let mut vars = Vec::new();
+        let tag = tag.to_ascii_uppercase().replace('-', "_");
         for (i, (reply, delay_ms, fail)) in engines.iter().enumerate() {
             let name = format!("a{i}");
-            let var = format!("PLANK_TEST_FANOUT_{i}");
+            let var = format!("PLANK_TEST_FANOUT_{tag}_{i}");
             unsafe { std::env::set_var(&var, "sk-test") };
             let mut def = remote_def(&name, &var);
             // Distinct models so each slot gets its own cache key.
@@ -15804,6 +15815,7 @@ mod tests {
         // Slot 0 finishes last, so completion order is the reverse of call order.
         let vars = install_parallel_defs(
             &mut agent,
+            "order",
             &[("slow done\n", 120, false), ("fast done\n", 0, false)],
         );
         let calls = vec![
@@ -15823,7 +15835,11 @@ mod tests {
         let dir = scratch_dir("fanout-panic");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("", 0, false), ("ok text\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "panic",
+            &[("", 0, false), ("ok text\n", 0, false)],
+        );
         // Turn slot 0 into a panicking engine, keeping its cache key.
         let key = EngineKey::Provider(
             crate::remote::provider::ProviderKind::Anthropic,
@@ -15983,6 +15999,7 @@ mod tests {
         // Slot 0 finishes last, so a naive implementation would flush out of order.
         let vars = install_parallel_defs(
             &mut agent,
+            "pane",
             &[("slow text\n", 120, false), ("fast text\n", 0, false)],
         );
         let calls = vec![
@@ -16038,8 +16055,11 @@ mod tests {
         let dir = scratch_dir("fanout-fail");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars =
-            install_parallel_defs(&mut agent, &[("", 0, true), ("sibling done\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "fail",
+            &[("", 0, true), ("sibling done\n", 0, false)],
+        );
         let calls = vec![
             agent_call("broken", Some("a0")),
             agent_call("working", Some("a1")),
@@ -16060,7 +16080,8 @@ mod tests {
         let dir = scratch_dir("fanout-mixed");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let vars =
+            install_parallel_defs(&mut agent, "mixed", &[("x\n", 0, false), ("y\n", 0, false)]);
         let calls = vec![
             agent_call("work", Some("a0")),
             ToolCall {
@@ -16085,7 +16106,7 @@ mod tests {
         let dir = scratch_dir("fanout-local");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false)]);
+        let vars = install_parallel_defs(&mut agent, "local", &[("x\n", 0, false)]);
         agent.agents.push(named_def("local", true));
         let calls = vec![agent_call("a", Some("a0")), agent_call("b", Some("local"))];
         assert!(
@@ -16101,7 +16122,11 @@ mod tests {
         let dir = scratch_dir("fanout-width1");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let vars = install_parallel_defs(&mut agent, &[("x\n", 0, false), ("y\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "width1",
+            &[("x\n", 0, false), ("y\n", 0, false)],
+        );
         let mut settings = crate::settings::Settings::default();
         settings.agents.max_parallel = 1;
         crate::settings::install_for_test(settings);
@@ -16122,7 +16147,11 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.push(Message::user("parent question"));
         let before = agent.session.transcript.len();
-        let vars = install_parallel_defs(&mut agent, &[("r0\n", 0, false), ("r1\n", 0, false)]);
+        let vars = install_parallel_defs(
+            &mut agent,
+            "cleanroom",
+            &[("r0\n", 0, false), ("r1\n", 0, false)],
+        );
         let calls = vec![
             agent_call("task zero", Some("a0")),
             agent_call("task one", Some("a1")),
