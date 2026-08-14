@@ -1306,3 +1306,23 @@ test` and review the diff before committing.
   guarded left it green. Any test of an age-sensitive policy has to write
   explicit `last_used` values into its sidecars rather than let the filesystem
   supply "now".
+- **A feature-gated dependency's binary cost is invisible until something calls
+  it.** Adding Extism (and through it wasmtime) behind the `plugins` feature
+  measured as +1.1 MiB, which is roughly wasmtime's *symbol table* and nothing
+  else: no code in `plank` reached `wasmhost::host()`, so the linker dead-stripped
+  the runtime. Forcing one reachable call from `main` put the real number at
+  **+18.0 MiB**. Any "how much does this dependency cost?" measurement has to
+  route through a call site the binary actually retains, or it measures the
+  linker rather than the dependency.
+- **`extism` does not compile with `default-features = false`.** The obvious way
+  to drop its `http`/`register-http`/`register-filesystem` defaults also drops
+  `wasmtime-default-features`, which is what carries the cranelift backend; the
+  result is 41 trait-resolution errors inside `extism` itself, none of which name
+  the missing feature. Disable the three by name and keep
+  `wasmtime-default-features` on.
+- **plank's release flow signs nothing.** `release.yml` is `cargo build
+  --release` into a tarball plus a Homebrew bottle — no codesigning, no hardened
+  runtime, no notarization. That is why a JIT-based plugin runtime is viable at
+  all: the `com.apple.security.cs.allow-jit` entitlement problem a notarized
+  build would have hit does not exist here. Worth re-checking before anyone adds
+  signing, since it would become a blocker retroactively.

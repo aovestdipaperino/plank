@@ -1,9 +1,33 @@
 # WASM plugins
 
-> Status: **design proposal**. Nothing in this document is implemented yet. It
-> describes a plugin system for plank built on sandboxed WebAssembly, the
-> surfaces a plugin may claim, the events it may observe, and how plugins are
-> packaged, versioned and trusted.
+> Status: **design proposal, feasibility-proven**. The document describes a
+> plugin system for plank built on sandboxed WebAssembly, the surfaces a plugin
+> may claim, the events it may observe, and how plugins are packaged, versioned
+> and trusted. None of that is implemented. What *is* implemented is the spike
+> below — the trait boundary and the runtime handshake, and nothing more.
+
+## Feasibility spike (landed)
+
+`src/wasmhost.rs` behind the `plugins` feature (off by default), plus a guest in
+`spike/abi-guest` and `tests/wasm_spike.rs`. It answers the four questions that
+could have killed the design:
+
+| Question | Answer |
+|---|---|
+| Does a JIT survive plank's release flow? | Not a question. `release.yml` signs nothing and notarizes nothing, so there is no hardened-runtime entitlement to fight |
+| What does the runtime cost in binary size? | **+18.0 MiB** (141.1 → 159.9 MB). Enough to keep the feature off by default forever; not enough to reconsider the runtime |
+| Does the ABI handshake work? | Yes. A guest asserts `plank_abi`, and a module that cannot is refused at load with the ABI named as the reason |
+| Does a runaway guest stay contained? | Yes. An infinite loop is stopped by the host deadline and surfaces as `WasmError::Trap`; a fresh plugin loads and answers afterwards |
+
+What the spike deliberately is **not**: no surfaces, no event bus, no manifest,
+no capabilities, no registry, and no call site anywhere in plank — `host()` is
+reachable only from tests. The measured 18 MiB assumes that changes; until it
+does the linker strips most of it (see `FINDINGS.md`).
+
+Remaining before Phase 1 can start, in order: decide whether WASM is a component
+kind inside the existing plugin format (`src/plugins.rs`, already shipped) or a
+parallel system; settle `token_batch`'s place in the streaming hot path or drop
+it from v1; and cut `panel`, which has no consumer.
 
 ## Why
 
