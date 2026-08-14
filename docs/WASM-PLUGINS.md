@@ -24,10 +24,8 @@ no capabilities, no registry, and no call site anywhere in plank — `host()` is
 reachable only from tests. The measured 18 MiB assumes that changes; until it
 does the linker strips most of it (see `FINDINGS.md`).
 
-Remaining before Phase 1 can start, in order: decide whether WASM is a component
-kind inside the existing plugin format (`src/plugins.rs`, already shipped) or a
-parallel system; settle `token_batch`'s place in the streaming hot path or drop
-it from v1; and cut `panel`, which has no consumer.
+The three decisions that gated Phase 1 are settled under *Decisions* below;
+what remains open is listed after them.
 
 ## Why
 
@@ -145,6 +143,9 @@ title) is drawn by plank so panels look uniform.
 `panel` exists so the ABI does not force "a live thing on screen" to mean "the
 entire screen". A token-usage sparkline or a live test-runner pane is a panel.
 
+**Not in v1** — see *Decisions*. Described here because adding a surface is
+additive and this is the shape it would take.
+
 ### `segment` — owns a status-bar cell
 
 ```
@@ -260,6 +261,9 @@ Events fall into three classes by what the return value means:
 `token_batch` is intentionally **notify-only**. A transform here would let a
 plugin corrupt the model's own output stream, and the byte-parity contract with
 the C reference gives us no room to negotiate what the stream contains.
+
+**Not in v1** — see *Decisions*. It is the only event that would put a WASM call
+inside the streaming hot path, and nothing yet needs it.
 
 ### Tools
 
@@ -543,22 +547,65 @@ the `Engine`/`EchoEngine` boundary, and for the same reason: plank must stay
 buildable and testable without the heavy dependency. CI's default path builds
 without wasmtime; a dedicated job builds with it.
 
-## Open questions
+## Decisions
 
-1. **Panel layout.** Who arbitrates when three plugins want a sidebar? A simple
-   priority + user override in settings is probably enough, but it is unproven.
-2. **Tool-name collisions** between a WASM plugin, an MCP server, and a
+Three of the open questions below are now settled, because Phase 1 cannot start
+without them. Each is reversible; each is recorded with what it costs.
+
+### WASM is a component kind, not a parallel plugin system
+
+A plugin stays what `src/plugins.rs` already says it is — a directory bundling
+contributions — and `wasm` joins `skills`, `agents`, `templates`, `hooks`,
+`.mcp.json` and `settings.json` as one more component kind. It is *not* a second
+system with its own directories, its own precedence rule and its own noun.
+
+The loader that shipped in August already carries most of what this design's
+"Packaging and distribution" section asks for: three locations resolved in
+order, two manifest spellings, `<plugin>:<name>` namespacing with bare names
+when uncontested, collision warnings, and plugin settings merged strictly below
+the user's. Building a second resolution order beside it would mean two
+precedence rules for users to learn and two implementations to keep honest, to
+buy nothing the existing one does not already do.
+
+The cost is that the existing manifest has to grow a surfaces/capabilities
+section it was not designed for, and that WASM inherits `./.plank/plugins/`
+auto-scanning — which is the sharp edge, since today cloning a repo silently
+activates its skills and MCP servers. Tolerable for a skill; not tolerable for
+a `.wasm` holding `exec`. **Project-local WASM components are therefore
+default-deny even though project-local skills are not**, and that asymmetry is
+deliberate: the trust question is about what the code can reach, not about where
+the directory sits.
+
+### `token_batch` is not in v1
+
+Cut, not deferred behind a warning. It is the only event that puts a WASM call
+inside `viz::StreamRenderer`'s hot path, it is the one path under a byte-parity
+contract with the C reference, and no known consumer needs per-batch granularity
+that `generation_end` cannot serve. A usage tracker wants totals; a redactor
+belongs at `post_tool_use`, where the veto is honest about its timing.
+
+The cost is that a live token-stream visualiser is not expressible in v1. If one
+is ever wanted, it arrives as a sampled event with an explicit interval — never
+as a subscriber on every batch.
+
+### `panel` is not in v1
+
+Cut. It is the only surface with no consumer, and it is the reason open question
+1 (layout arbitration between competing plugins) exists at all. Cutting it
+deletes that question rather than answering it. `frame` covers the demanding
+case and `segment` covers the cheap one; a panel can be added later without an
+ABI break, since adding a surface is additive.
+
+## Still open
+
+1. **Tool-name collisions** between a WASM plugin, an MCP server, and a
    built-in. MCP already namespaces as `mcp__<server>__<tool>`; the cheap answer
-   is `wasm__<id>__<tool>`, at the cost of tokens in every system prompt.
-3. **`token_batch` cost.** Even coalesced, a subscriber on every batch is a
-   WASM call inside the streaming hot path. It may need to be opt-in behind a
-   warning, or restricted to a sampling interval.
-4. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
+   is `wasm__<id>__<tool>`, at the cost of tokens in every system prompt. Must
+   be settled before `tool` ships, not before Phase 1 — and settled together
+   with where tool resolution sits relative to prompt fingerprinting.
+2. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
    no source mapping. Do we require DWARF in dev builds, or ship a
    `plank plugin test` harness that runs exports against fixtures?
-5. **Whether `panel` ships in v1** at all. `frame` + `segment` cover the known
-   use cases; `panel` is the one surface with no current consumer, and a
-   surface with no consumer is a guess.
 
 ## See also
 
