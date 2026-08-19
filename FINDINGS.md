@@ -1325,11 +1325,24 @@ test` and review the diff before committing.
   lists the rest as a one-line directory, but `provider_tool_registry` pushed a
   `ToolSpec` for *every* MCP tool. With tokensave connected that made a plank
   request 94.5 KB of which 90.2 KB was 140 tool schemas — 95% of the body,
-  resent on every turn. The visible symptom is not the prefill: it is that
-  **decode t/s stays low for the whole session**, because per-token attention
-  cost scales with KV length, so a ~22k-token prefix slows every token compared
-  to the same model under `llama-cli` with a bare prompt. Filtering to primary
-  cut it to 52.6 KB / 66 tools.
+  resent on every turn. Filtering to primary cut it to 52.6 KB / 66 tools.
+
+  Measured on a 27B Q4 Metal server (prompt cache off, so prefill is
+  deterministic): bare prompt 61 tokens / 1.4 s to first token; 66 tools 13.6k
+  tokens / 80.8 s; 140 tools 24.7k tokens / 156.4 s. **The cost is
+  time-to-first-token, not generation speed** — decode came out flat at
+  7.07 / 7.67 / 8.16 t/s across the three, i.e. within noise, and a quieter run
+  put the context penalty at roughly 15% (26.6 t/s bare vs 22.4 t/s at 13.6k).
+  The intuition that a long KV slows every token is real but second-order here;
+  what people report as "plank is much slower than llama-cli" is a ~160 t/s
+  prefill multiplied by a prompt two orders of magnitude larger, which reads as
+  catastrophic t/s only if the measurement divides tokens by wall-clock. With
+  the server's prompt cache on, repeat turns prefill in 0.2 s, so the payload is
+  paid on the first turn of a session and again whenever anything perturbs the
+  prefix (tool list change, a server flapping, compaction rewriting early
+  transcript). Beware measuring any of this on a loaded box: an orphaned
+  benchmark hitting the same server concurrently moved decode between 1 and
+  27 t/s and inverted the ordering.
 - **A text-path tool can be undeclared; a provider-path tool cannot.** The text
   path can leave directory tools out of the prompt because the model emits DSML
   — free text that can name anything. On an OpenAI-compatible endpoint the model
