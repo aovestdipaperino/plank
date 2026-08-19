@@ -1433,3 +1433,12 @@ test` and review the diff before committing.
   `usage`, never from SSE deltas: a delta is not a token. Validated against
   llama.cpp's own `print_timing` for the same turn — plank 8.5 tok/s vs
   llama-server 8.46 t/s over an identical 198-token count.
+- **`--dspark` alone never speculates: the gate is `--temp 0`.** Both the C
+  (`ds4_cli.c:600`) and plank's port fetch the draft-block size only when
+  `temperature <= 0.0`, so at the default temperature of 0.7 the speculative
+  entry point is never called and DSpark buys exactly nothing. Nothing says so:
+  the model still loads, the support GGUF still loads, and the run looks normal.
+  Anything keyed off "is speculation happening" — a status segment, a benchmark,
+  a bug report — has to pass `--temp 0` or it is measuring plain decode with an
+  extra model in memory. (The C also honours `DS4_MTP_SPEC_DISABLE`; plank does
+  not read it.)

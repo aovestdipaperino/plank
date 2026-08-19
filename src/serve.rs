@@ -251,7 +251,9 @@ fn handle_generate_shared(
             if write_err.is_some() {
                 return;
             }
-            let frame = WireEvent::from_engine_event(&ev);
+            let Some(frame) = WireEvent::from_engine_event(&ev) else {
+                return;
+            };
             if let Err(e) = send_frame(out, &frame) {
                 write_err = Some(e);
             }
@@ -421,7 +423,9 @@ fn handle_generate(
             if write_err.is_some() {
                 return;
             }
-            let frame = WireEvent::from_engine_event(&ev);
+            let Some(frame) = WireEvent::from_engine_event(&ev) else {
+                return;
+            };
             if let Err(e) = send_frame(out, &frame) {
                 write_err = Some(e);
             }

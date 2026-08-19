@@ -1205,6 +1205,11 @@ struct Agent<'a> {
     /// no generation has run against the current transcript. Anchors the
     /// `/context` report to the real context usage.
     last_ctx_used: i32,
+    /// Speculative-decoding figures from the last turn that speculated, so the
+    /// idle footer keeps showing them between turns. Not reset with
+    /// `last_ctx_used` on a new session: it describes the engine's behaviour,
+    /// which a `/clear` does not change.
+    last_spec: crate::engine::SpecStats,
     /// Whether the most recent turn ended by user interrupt, so the turn-end
     /// notification says "interrupted" instead of "finished".
     last_turn_interrupted: bool,
@@ -1701,8 +1706,10 @@ impl Agent<'_> {
                             ..Status::default()
                         });
                     }
-                    // Notices are a warm-up-only signal; never emitted mid-turn.
-                    EngineEvent::Notice(_) => {}
+                    // Notices are a warm-up-only signal, never emitted mid-turn;
+                    // Spec counters reach this front-end's status line through
+                    // `stats` below, since the plain REPL has no live footer.
+                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -1710,6 +1717,9 @@ impl Agent<'_> {
         bar.clear();
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
+        if stats.spec.active() {
+            self.last_spec = stats.spec;
+        }
         Ok((stream, assistant_text, stats))
     }
 
@@ -2044,6 +2054,9 @@ impl Agent<'_> {
         )?;
         self.record_usage(&pass.stats);
         self.last_ctx_used = pass.stats.ctx_used;
+        if pass.stats.spec.active() {
+            self.last_spec = pass.stats.spec;
+        }
         Ok((pass.calls, pass.assistant_text, pass.tool_error))
     }
 
@@ -2252,6 +2265,10 @@ impl Agent<'_> {
                 ctx_size: self.engine.ctx_size(),
                 generated: stats.generated,
                 gen_tps: stats.tps,
+                // Carried into idle so the figures are still readable after the
+                // answer lands — during generation they scroll past too fast to
+                // be useful, which is when people actually want them.
+                spec: stats.spec,
                 power_percent: self.power_percent,
                 think: self.think,
                 ..Status::default()
@@ -2891,7 +2908,7 @@ impl Agent<'_> {
                         progress.summarizing(summary.len());
                     }
                     EngineEvent::Prefill(p) => progress.prefill(p.done, p.total),
-                    EngineEvent::Notice(_) => {}
+                    EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -7737,7 +7754,8 @@ impl Agent<'_> {
                         tui::draw_warm(f, p.done, p.total, p.tps, stage.get(), notice.as_deref());
                     });
                 }
-                EngineEvent::Text(_) => {}
+                // Warm never speculates, so Spec cannot arrive here.
+                EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
             &labels,
@@ -7825,7 +7843,8 @@ impl Agent<'_> {
                         }
                     }
                 }
-                EngineEvent::Prefill(_) | EngineEvent::Text(_) => {}
+                // Warm never speculates, so Spec cannot arrive here.
+                EngineEvent::Prefill(_) | EngineEvent::Text(_) | EngineEvent::Spec(_) => {}
             },
             &mut |kind| stage.set(kind.warm_label()),
             &labels,
@@ -7866,6 +7885,7 @@ impl Agent<'_> {
             ctx_size: self.engine.ctx_size(),
             power_percent: self.power_percent,
             think: self.think,
+            spec: self.last_spec,
             ..Status::default()
         }
     }
@@ -8750,6 +8770,9 @@ impl Agent<'_> {
         let prompt_tokens = self.engine.count_tokens(prompt);
         let mut assistant_text = String::new();
         let mut gen_count = 0;
+        // Carried across events so every published status keeps showing the
+        // running figures, not just the one built by a Spec event.
+        let mut spec = crate::engine::SpecStats::default();
         let verb = status::random_verb_index();
         let start = Instant::now();
 
@@ -8772,6 +8795,7 @@ impl Agent<'_> {
                     gen_count += 1;
                     let secs = start.elapsed().as_secs_f64();
                     Status {
+                        spec,
                         state: WorkerState::Generating,
                         generated: gen_count,
                         prefill_label: verb,
@@ -8814,6 +8838,13 @@ impl Agent<'_> {
                 }
                 // Warm-up-only signal; never emitted mid-turn.
                 EngineEvent::Notice(_) => return,
+                // Counters only: the footer picks them up on the next status a
+                // token produces, so a Spec event does not itself force a
+                // repaint on every speculative step.
+                EngineEvent::Spec(s) => {
+                    spec = s;
+                    return;
+                }
             };
             let _ = tx.send(UiEvent::Status(status));
         };
@@ -9044,7 +9075,7 @@ impl Agent<'_> {
                             progress.summarizing(summary.len());
                         }
                         EngineEvent::Prefill(p) => progress.prefill(p.done, p.total),
-                        EngineEvent::Notice(_) => {}
+                        EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                     }
                     sink.redraw();
                 },
@@ -10989,6 +11020,7 @@ fn new_agent(
         show_footer,
         editor_owns_footer: false,
         last_ctx_used: 0,
+        last_spec: crate::engine::SpecStats::default(),
         last_turn_interrupted: false,
         goal: None,
         context_content,
@@ -12404,6 +12436,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -14730,6 +14763,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -14792,6 +14826,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -15492,6 +15527,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -15673,6 +15709,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -15759,6 +15796,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -15832,6 +15870,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -15928,6 +15967,7 @@ mod tests {
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -17437,6 +17477,7 @@ or the user's next message aborts before its first token"
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -17527,6 +17568,7 @@ or the user's next message aborts before its first token"
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -17676,6 +17718,7 @@ or the user's next message aborts before its first token"
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),
@@ -17747,6 +17790,7 @@ or the user's next message aborts before its first token"
             show_footer: false,
             editor_owns_footer: false,
             last_ctx_used: 0,
+            last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
             context_content: crate::context::ContextContent::new(),

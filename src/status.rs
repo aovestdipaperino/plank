@@ -101,7 +101,19 @@ pub struct Status {
     pub think: crate::engine::ThinkMode,
     /// Error text for the `Error` state.
     pub error: String,
+    /// Speculative-decoding counters (`--dspark`). Rendered only when
+    /// [`active`](crate::engine::SpecStats::active); a run without a support
+    /// model never shows the segment.
+    pub spec: crate::engine::SpecStats,
 }
+
+/// Marks the speculative-decoding segment, mirroring how `THINK_MARK` labels
+/// the reasoning level.
+///
+/// Deliberately not `⚡`: the power suffix already owns that glyph (`local
+/// ⚡100%`), and two different meanings for one mark in a single footer is
+/// exactly the sort of thing nobody notices until they misread it.
+const SPEC_MARK: &str = "⏩";
 
 /// Returns the input prompt text.
 #[must_use]
@@ -1194,6 +1206,13 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         format!("{} | {origin}", theme(&cwd))
     };
     let ctx = format!("{think}{ctx}");
+    // The dspark segment sits with the ctx gauge rather than in the state word:
+    // it describes the whole turn, and keeping it left of the state keeps the
+    // power suffix anchored on the right.
+    let ctx = match spec_segment(st) {
+        Some(seg) => format!("{ctx} | {}", theme(&seg)),
+        None => ctx,
+    };
     // Contributed cells ride between the state word and the power suffix: the
     // suffix is the line's right anchor and must stay last.
     let power = format!("{}{power}", wasm_segment_text());
@@ -1222,6 +1241,24 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
         WorkerState::Idle => format!("{ctx} | idle{power}"),
     };
     format!("{dir}{body}")
+}
+
+/// The `--dspark` segment: mean tokens committed per speculative step, then the
+/// share of drafted tokens accepted.
+///
+/// `None` when the pass never speculated, so a plain run's footer is unchanged.
+/// The speedup is the headline because it is what the user feels; acceptance is
+/// the diagnostic that explains it.
+#[must_use]
+pub fn spec_segment(st: &Status) -> Option<String> {
+    if !st.spec.active() {
+        return None;
+    }
+    Some(format!(
+        "{SPEC_MARK}{:.1}x {:.0}%",
+        st.spec.speedup(),
+        100.0 * st.spec.acceptance()
+    ))
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -1335,6 +1372,55 @@ mod tests {
             "{}",
             build_status_text(&st, false, true)
         );
+    }
+
+    #[test]
+    fn dspark_segment_appears_only_when_a_pass_speculated() {
+        // A run without a support model must look exactly as it did before.
+        let plain = Status {
+            ctx_used: 1000,
+            ctx_size: 8000,
+            ..Status::default()
+        };
+        let line = build_status_text(&plain, false, true);
+        assert!(line.ends_with("ctx 12% | idle"), "{line}");
+        assert!(!line.contains(SPEC_MARK), "{line}");
+
+        // 10 steps of a 4-token block, 30 committed: 3.0x, 50% accepted.
+        let spark = Status {
+            spec: crate::engine::SpecStats {
+                steps: 10,
+                committed: 30,
+                drafted: 40,
+            },
+            ..plain
+        };
+        let line = build_status_text(&spark, false, true);
+        assert!(
+            line.ends_with("ctx 12% | \u{23e9}3.0x 50% | idle"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn dspark_segment_survives_into_the_idle_footer() {
+        // The figures are only readable after the answer lands, so an idle
+        // footer carrying them is the point of the feature, not an artefact.
+        let st = Status {
+            state: WorkerState::Idle,
+            ctx_used: 10,
+            ctx_size: 100,
+            spec: crate::engine::SpecStats {
+                steps: 4,
+                committed: 4,
+                drafted: 16,
+            },
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        // Every draft rejected: 1.0x and 0%, still shown — "speculation is on
+        // and buying nothing" is exactly what a user needs to see.
+        assert!(line.contains("\u{23e9}1.0x 0%"), "{line}");
     }
 
     #[test]

@@ -1036,6 +1036,7 @@ impl Engine for Ds4Session {
             0
         };
         let speculative = draft_block > 1;
+        let mut spec = crate::engine::SpecStats::default();
 
         while generated < max_tokens {
             if steady_mark.is_none()
@@ -1091,6 +1092,14 @@ impl Engine for Ds4Session {
                 }
                 // `n` is positive here: negative returned above, zero broke.
                 let run = &accepted[..usize::try_from(n).unwrap_or(0).min(accepted.len())];
+                // Counted before the EOS scan below: the step drafted and
+                // verified regardless of whether its run ends the generation,
+                // and dropping the last step would flatter the acceptance rate
+                // of every turn that stops inside a run.
+                spec.steps = spec.steps.saturating_add(1);
+                spec.committed = spec.committed.saturating_add(n);
+                spec.drafted = spec.drafted.saturating_add(draft_block);
+                on_event(EngineEvent::Spec(spec));
                 let mut hit_eos = false;
                 for &t in run {
                     if t == eos {
@@ -1200,6 +1209,7 @@ impl Engine for Ds4Session {
             ctx_used,
             interrupted,
             usage: None,
+            spec,
         })
     }
 
@@ -1673,6 +1683,8 @@ impl Ds4HostSession {
             ctx_used,
             interrupted,
             usage: None,
+            // The host-session path does not drive the speculative entry point.
+            spec: crate::engine::SpecStats::default(),
         }
     }
 }
@@ -2633,7 +2645,7 @@ mod tests {
                 &mut |e| match e {
                     EngineEvent::Prefill(p) if remaining.is_none() => remaining = Some(p.total),
                     EngineEvent::Text(t) => reply.push_str(&t),
-                    EngineEvent::Prefill(_) | EngineEvent::Notice(_) => {}
+                    EngineEvent::Prefill(_) | EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
                 },
             )
             .unwrap();
@@ -3280,7 +3292,7 @@ mod tests {
                 let e = prefill.entry(id).or_default();
                 *e = (*e).max(p.total);
             }
-            EngineEvent::Notice(_) => {}
+            EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
         });
 
         assert_eq!(outcomes.len(), 3);

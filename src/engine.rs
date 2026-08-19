@@ -403,6 +403,67 @@ pub struct StructuredTurn<'a> {
     pub rendered: &'a str,
 }
 
+/// Speculative-decoding progress for one generation pass (`--dspark`).
+///
+/// Counted per speculative step, where a step drafts `draft_block` tokens and
+/// commits the target model's own sampled token plus however many drafted ones
+/// survived verification. All three counters are cumulative for the pass, so a
+/// live readout and the end-of-turn figure are the same numbers at different
+/// times.
+///
+/// Zeroed when speculation is off (no support model, or a temperature above 0
+/// where the C does not speculate), which is what [`active`](Self::active)
+/// tests: the front-ends hide the segment entirely rather than showing `1.0x`
+/// for a run that never drafted anything.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpecStats {
+    /// Speculative steps taken.
+    ///
+    /// `i32` like every other token count here: these are per-pass counters
+    /// bounded by `n_predict`, and the narrower type converts to `f64`
+    /// losslessly, so the rates below need no lossy cast.
+    pub steps: i32,
+    /// Tokens committed across those steps (sampled + accepted drafts).
+    pub committed: i32,
+    /// Tokens offered to verification across those steps.
+    pub drafted: i32,
+}
+
+impl SpecStats {
+    /// True once a pass has actually speculated.
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.steps > 0
+    }
+
+    /// Mean tokens committed per step — what speculation is buying.
+    ///
+    /// 1.0 means every draft was rejected and each step committed only the
+    /// token the target model sampled itself, i.e. no gain over plain decode.
+    #[must_use]
+    pub fn speedup(&self) -> f64 {
+        if self.steps > 0 {
+            f64::from(self.committed) / f64::from(self.steps)
+        } else {
+            0.0
+        }
+    }
+
+    /// Share of *drafted* tokens that survived verification, 0.0-1.0.
+    ///
+    /// The sampled token is not a draft, so it is excluded from both sides:
+    /// this is `(committed - steps) / drafted`, the figure comparable with
+    /// llama.cpp's own acceptance reporting.
+    #[must_use]
+    pub fn acceptance(&self) -> f64 {
+        if self.drafted > 0 {
+            (f64::from(self.committed - self.steps) / f64::from(self.drafted)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
 /// Engine input, widened for provider backends (design §4.4).
 ///
 /// Local engines ([`EchoEngine`], the ds4 engine, the remote ds4 client) only
@@ -438,6 +499,9 @@ pub enum EngineEvent {
     /// A human-facing note the front-end should surface alongside progress
     /// (e.g. why the system-prompt cache is being rebuilt). May be multi-line.
     Notice(String),
+    /// Cumulative speculative-decoding counters, emitted per step while
+    /// `--dspark` is speculating. Front-ends that do not show them ignore it.
+    Spec(SpecStats),
 }
 
 /// Per-pass token accounting reported by an online provider. Local engines do
@@ -498,6 +562,10 @@ pub struct GenerationStats {
     pub interrupted: bool,
     /// Billed token usage for this pass, when the engine is an online provider.
     pub usage: Option<TokenUsage>,
+    /// Speculative-decoding counters for this pass; zeroed when speculation
+    /// was off, so the front-ends can keep showing the last speculating turn's
+    /// figures rather than blanking on a turn that did not speculate.
+    pub spec: SpecStats,
 }
 
 /// Engine error with a human-readable message.
@@ -1044,12 +1112,68 @@ impl Engine for EchoEngine {
             tps: 0.0,
             ctx_used: self.count_tokens(transcript),
             interrupted: false,
+            spec: SpecStats::default(),
             usage: None,
         })
     }
 
     fn ctx_size(&self) -> i32 {
         self.ctx_size
+    }
+}
+
+#[cfg(test)]
+mod spec_stats_tests {
+    use super::SpecStats;
+
+    #[test]
+    fn speedup_and_acceptance_exclude_the_sampled_token() {
+        // 10 steps, block of 4: 10 sampled tokens are the target model's own,
+        // so of 30 committed only 20 came from the 40 drafted.
+        let s = SpecStats {
+            steps: 10,
+            committed: 30,
+            drafted: 40,
+        };
+        assert!((s.speedup() - 3.0).abs() < 1e-9, "{}", s.speedup());
+        assert!((s.acceptance() - 0.5).abs() < 1e-9, "{}", s.acceptance());
+    }
+
+    #[test]
+    fn every_draft_rejected_reads_as_no_gain_not_as_zero() {
+        // Each step commits only the sampled token: speculation bought nothing,
+        // but decoding still happened, so the speedup is 1.0x rather than 0.
+        let s = SpecStats {
+            steps: 8,
+            committed: 8,
+            drafted: 32,
+        };
+        assert!((s.speedup() - 1.0).abs() < 1e-9);
+        assert!(s.acceptance().abs() < 1e-9);
+        assert!(s.active(), "a pass that speculated is active even at 1.0x");
+    }
+
+    #[test]
+    fn a_pass_that_never_speculated_is_inactive_and_reports_nothing() {
+        let s = SpecStats::default();
+        assert!(!s.active());
+        // Not NaN: the front-ends format these before checking `active` in
+        // some paths, and a division by zero would print "NaNx".
+        assert!(s.speedup().abs() < f64::EPSILON);
+        assert!(s.acceptance().abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn acceptance_is_clamped_when_a_run_is_cut_short() {
+        // The last step of a turn can be truncated by the token budget, so it
+        // may commit against fewer drafted tokens than the block size implies.
+        // The ratio must stay a percentage rather than exceeding 100%.
+        let s = SpecStats {
+            steps: 1,
+            committed: 9,
+            drafted: 4,
+        };
+        assert!((s.acceptance() - 1.0).abs() < 1e-9, "{}", s.acceptance());
     }
 }
 

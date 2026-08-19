@@ -135,7 +135,9 @@ fn remote_ds4_generate_end_to_end() {
             &mut |ev| match ev {
                 EngineEvent::Text(s) => text.push_str(&s),
                 EngineEvent::Prefill(_) => prefill_seen = true,
-                EngineEvent::Notice(_) => {}
+                // The wire carries no speculative counters, so a remote
+                // generate can never deliver one.
+                EngineEvent::Notice(_) | EngineEvent::Spec(_) => {}
             },
         )
         .expect("generate");

@@ -1342,6 +1342,9 @@ impl Engine for ProviderEngine {
             tps,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
+            // A provider decodes on someone else's machine; speculation there
+            // is not ours to report.
+            spec: crate::engine::SpecStats::default(),
             usage: Some(crate::engine::TokenUsage {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
@@ -1370,7 +1373,7 @@ mod tests {
             .iter()
             .filter_map(|e| match e {
                 EngineEvent::Text(t) => Some(t.as_str()),
-                EngineEvent::Prefill(_) | EngineEvent::Notice(_) => None,
+                EngineEvent::Prefill(_) | EngineEvent::Notice(_) | EngineEvent::Spec(_) => None,
             })
             .collect()
     }

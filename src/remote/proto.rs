@@ -274,6 +274,9 @@ impl From<WireStats> for GenerationStats {
             ctx_used: s.ctx_used,
             interrupted: s.interrupted,
             usage: None,
+            // The wire carries no speculative counters; see
+            // `WireEvent::from_engine_event`.
+            spec: crate::engine::SpecStats::default(),
         }
     }
 }
@@ -294,10 +297,16 @@ pub enum WireEvent {
 }
 
 impl WireEvent {
-    /// Maps a streaming [`EngineEvent`] onto its wire frame.
+    /// Maps a streaming [`EngineEvent`] onto its wire frame, or `None` for an
+    /// event the protocol does not carry.
+    ///
+    /// [`EngineEvent::Spec`] is the only such event: speculative counters are a
+    /// local-decode detail, and adding a frame for them would change the wire
+    /// format for every peer. A remote client therefore shows no dspark stats,
+    /// which is honest — the speculation is not happening on its machine.
     #[must_use]
-    pub fn from_engine_event(ev: &EngineEvent) -> Self {
-        match ev {
+    pub fn from_engine_event(ev: &EngineEvent) -> Option<Self> {
+        Some(match ev {
             EngineEvent::Prefill(p) => Self::Prefill {
                 done: p.done,
                 total: p.total,
@@ -307,7 +316,8 @@ impl WireEvent {
             // checkpoint=None, so a Notice never actually reaches the wire; if
             // that changes, surfacing it as text is a reasonable fallback.
             EngineEvent::Text(s) | EngineEvent::Notice(s) => Self::Text { s: s.clone() },
-        }
+            EngineEvent::Spec(_) => return None,
+        })
     }
 
     /// Converts a streaming frame into an [`EngineEvent`]. Returns `None` for
@@ -363,7 +373,7 @@ mod tests {
     #[test]
     fn engine_event_mapping_is_lossless() {
         let text = EngineEvent::Text("abc".to_string());
-        let wire = WireEvent::from_engine_event(&text);
+        let wire = WireEvent::from_engine_event(&text).expect("text maps to a frame");
         match wire.to_engine_event() {
             Some(EngineEvent::Text(s)) => assert_eq!(s, "abc"),
             other => panic!("unexpected: {other:?}"),
