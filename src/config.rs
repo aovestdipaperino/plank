@@ -52,6 +52,12 @@ pub struct AgentConfig {
     pub plugin_dirs: Vec<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
+    /// True when `--minimal-prompt` was given: start with the smallest prompt
+    /// this build can produce — no MCP servers, skills, templates, plugin
+    /// agents, WASM components, or session-start context. For measuring
+    /// throughput against a bare `llama-cli`-style prompt, where a full
+    /// session's tool schemas and context dominate prefill.
+    pub minimal_prompt: bool,
     /// Loopback port for `--ui-remote` TUI remote control; `Some(0)` asks for
     /// an ephemeral port. `None` (the default) leaves the feature off entirely.
     pub ui_remote: Option<u16>,
@@ -296,6 +302,7 @@ impl Default for AgentConfig {
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
             non_interactive: false,
+            minimal_prompt: false,
             ui_remote: None,
             show_help: false,
             help_topic: None,
@@ -445,6 +452,10 @@ Options:
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
       --non-interactive    disable the interactive UI
+      --minimal-prompt     start with the smallest prompt this build can make:
+                           no MCP servers, skills, templates, plugin agents,
+                           WASM components or session-start context. For
+                           measuring throughput against a bare prompt.
       --ui-remote[=PORT]   accept TUI remote control on 127.0.0.1:PORT
                            (omit PORT for an ephemeral one, printed to stderr)
   -sys, --system TEXT      override the system prompt
@@ -1135,6 +1146,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
             // reject it rather than silently binding an ephemeral port and
@@ -1642,6 +1654,26 @@ mod tests {
             ]))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn minimal_prompt_flag() {
+        let c = parse_options(&args(&["--minimal-prompt"])).unwrap();
+        assert!(c.minimal_prompt);
+        // Off unless asked: every other run must keep MCP, skills and context.
+        let d = parse_options(&args(&[])).unwrap();
+        assert!(!d.minimal_prompt);
+        // Composes with the flags a benchmark actually uses.
+        let e = parse_options(&args(&[
+            "--minimal-prompt",
+            "--non-interactive",
+            "--provider",
+            "openai",
+            "--model",
+            "m",
+        ]))
+        .unwrap();
+        assert!(e.minimal_prompt && e.non_interactive);
     }
 
     #[test]

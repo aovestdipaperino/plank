@@ -1401,3 +1401,13 @@ test` and review the diff before committing.
   but it says unknown tool ... maybe it's in the MCP directory". A prompt that
   contradicts itself produces exactly that thrash, and it looks like a model
   failure rather than a naming bug. Assert routability, not presence.
+- **The decode penalty from a long prompt is bigger than a first measurement
+  suggested — but still second to prefill.** `--minimal-prompt` makes the
+  comparison cheap: 2,857 tokens vs 12,170 for a normal session on the same
+  server, back to back. Prefill/TTFT 4.6-6.3 s vs 27.0 s; decode 22-26 t/s vs
+  16.6 t/s, i.e. **25-35% slower decode** at 12k context, not the ~15% an
+  earlier noisy run implied. Both effects are real and they compound; TTFT is
+  the one that dominates a cold turn. Any decode number taken while something
+  else is using the GPU is worthless — the same body has measured 7 t/s and
+  27 t/s on this box — so re-measure the pair back to back rather than trusting
+  a figure from earlier in a session.
