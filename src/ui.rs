@@ -1717,9 +1717,6 @@ impl Agent<'_> {
         bar.clear();
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
-        if stats.spec.active() {
-            self.last_spec = stats.spec;
-        }
         Ok((stream, assistant_text, stats))
     }
 
@@ -2054,9 +2051,6 @@ impl Agent<'_> {
         )?;
         self.record_usage(&pass.stats);
         self.last_ctx_used = pass.stats.ctx_used;
-        if pass.stats.spec.active() {
-            self.last_spec = pass.stats.spec;
-        }
         Ok((pass.calls, pass.assistant_text, pass.tool_error))
     }
 
@@ -3010,6 +3004,16 @@ impl Agent<'_> {
     /// for local engines (`stats.usage` is `None`), so `/usage` stays empty
     /// unless an online provider is driving the turns.
     fn record_usage(&mut self, stats: &crate::engine::GenerationStats) {
+        // Speculation figures for the footer, kept here rather than beside each
+        // `last_ctx_used` assignment: there are three generate paths (the plain
+        // REPL, the quiet pass, the TUI worker) and only this call is on all
+        // three. The first version updated two of them and the TUI — the one
+        // front-end with a footer to show it in — was the one left out.
+        // Only a speculating pass overwrites it, so the last real figure stays
+        // readable across turns that did not speculate.
+        if stats.spec.active() {
+            self.last_spec = stats.spec;
+        }
         // Peak decode rate for this model, reported at exit. Attributed to the
         // engine that actually ran the pass, which during a sidechain is the
         // alt engine — same rule as the token tally below.
@@ -14795,6 +14799,45 @@ mod tests {
              from engine events (got {ticks} ticks)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn record_usage_is_where_the_footer_learns_the_speculation_figures() {
+        // Regression: the update lived beside two of the three
+        // `last_ctx_used` assignments, and the TUI worker — the one front-end
+        // with a footer to render it — was the path left out, so `--dspark`
+        // showed nothing. `record_usage` is the only call all three paths
+        // share, so the invariant is pinned here.
+        let dir = std::env::temp_dir().join(format!("plank-spec-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = crate::config::AgentConfig::default();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        assert!(
+            !agent.idle_status().spec.active(),
+            "clean session shows none"
+        );
+
+        let spec = crate::engine::GenerationStats {
+            spec: crate::engine::SpecStats {
+                steps: 10,
+                committed: 30,
+                drafted: 40,
+            },
+            ..Default::default()
+        };
+        agent.record_usage(&spec);
+        let st = agent.idle_status();
+        assert!(st.spec.active());
+        assert!((st.spec.speedup() - 3.0).abs() < 1e-9);
+
+        // A later non-speculating pass must not blank the figure: it describes
+        // the engine, and a turn that did not speculate says nothing new.
+        agent.record_usage(&crate::engine::GenerationStats::default());
+        assert!(
+            (agent.idle_status().spec.speedup() - 3.0).abs() < 1e-9,
+            "a plain pass wiped the last speculating turn's figures"
+        );
     }
 
     #[test]
