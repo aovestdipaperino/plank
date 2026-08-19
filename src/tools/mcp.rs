@@ -1346,6 +1346,27 @@ fn append_short_description(out: &mut String, desc: &str) {
     }
 }
 
+/// One directory line per non-primary tool: `- mcp__server__tool: short desc`.
+///
+/// Shared by the text path's `### MCP Tool Directory` block and the provider
+/// path's `mcp_call` description, so the two cannot drift into advertising
+/// different tool sets. Empty when every tool is primary.
+#[must_use]
+pub fn directory_listing(servers: &[McpServer]) -> String {
+    let mut out = String::new();
+    for s in servers {
+        for t in &s.tools {
+            if t.primary {
+                continue;
+            }
+            let _ = write!(out, "- mcp__{}__{}: ", s.name, t.name);
+            append_short_description(&mut out, &t.description);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Renders MCP tools for the system prompt.
 ///
 /// Primary tools get their full function-call JSON schema like the native
@@ -1386,16 +1407,7 @@ pub fn append_tool_schemas(out: &mut String, servers: &[McpServer]) {
          }\n\n\
          Directory:\n",
     );
-    for s in servers {
-        for t in &s.tools {
-            if t.primary {
-                continue;
-            }
-            let _ = write!(out, "- mcp__{}__{}: ", s.name, t.name);
-            append_short_description(out, &t.description);
-            out.push('\n');
-        }
-    }
+    out.push_str(&directory_listing(servers));
     out.push('\n');
 }
 
@@ -1539,7 +1551,39 @@ fn offline_tool_error(server: &str) -> String {
 
 /// Executes one `mcp__<server>__<tool>` call, mirroring `agent_tool_mcp_call`.
 pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
-    let Some((server_name, tool_name)) = split_name(&call.name) else {
+    invoke_mcp_tool(servers, &call.name, &args_to_json(call))
+}
+
+/// `mcp_call`: invokes any MCP tool named in the arguments.
+///
+/// The provider (OpenAI-compatible) path advertises only *primary* tools as
+/// native function specs, and a strict gateway — or llama.cpp's grammar-
+/// constrained tool calling — will not let the model emit a function name that
+/// was never declared. Without this escape hatch, narrowing the declared set
+/// would make every directory tool unreachable rather than merely unschema'd.
+/// The text path needs no equivalent: there the model writes DSML, which is
+/// free text and can name any tool.
+#[must_use]
+pub fn tool_mcp_invoke(servers: &mut [McpServer], call: &ToolCall) -> String {
+    let Some(name) = call.arg_value("name").filter(|n| !n.is_empty()) else {
+        return "Tool error: mcp_call requires name\n".to_string();
+    };
+    // Absent arguments is a legitimate no-parameter call, not an error.
+    let args = call.arg_value("arguments").unwrap_or("").trim().to_string();
+    let args = if args.is_empty() { "{}" } else { args.as_str() };
+    // The payload must be a JSON object: forwarding a scalar or an array would
+    // produce a `tools/call` the server rejects with a schema error that reads
+    // as the tool's fault rather than the caller's.
+    if !json_parse(args).is_some_and(|v| matches!(v, Json::Obj(_))) {
+        return "Tool error: mcp_call arguments must be a JSON object\n".to_string();
+    }
+    invoke_mcp_tool(servers, name, args)
+}
+
+/// Shared body of [`tool_mcp_call`] and [`tool_mcp_invoke`]: routes one
+/// `mcp__<server>__<tool>` name plus an already-encoded JSON argument object.
+fn invoke_mcp_tool(servers: &mut [McpServer], full_name: &str, arguments: &str) -> String {
+    let Some((server_name, tool_name)) = split_name(full_name) else {
         return "Tool error: malformed mcp tool name, expected mcp__server__tool\n".to_string();
     };
     // An offline shadow matches too: its tools are advertised in the prompt, so
@@ -1558,13 +1602,13 @@ pub fn tool_mcp_call(servers: &mut [McpServer], call: &ToolCall) -> String {
         return offline_tool_error(&server.name);
     }
     if server.find_tool(tool_name).is_none() {
-        return format!("Tool error: unknown mcp tool: {}\n", call.name);
+        return format!("Tool error: unknown mcp tool: {full_name}\n");
     }
 
     let mut params = String::from("{\"name\":");
     json_escape(&mut params, tool_name);
     params.push_str(",\"arguments\":");
-    params.push_str(&args_to_json(call));
+    params.push_str(arguments);
     params.push('}');
 
     let result = match server.request("tools/call", &params) {
@@ -2448,6 +2492,93 @@ mod tests {
         assert!(
             out.contains("## demo\nUse alpha before omega.\n"),
             "{out:?}"
+        );
+    }
+
+    #[test]
+    fn mcp_call_invokes_a_directory_tool_the_provider_never_declared() {
+        // The provider path advertises only primary tools, so a directory tool
+        // is reachable only through `mcp_call`. This proves the whole route:
+        // name + JSON arguments in, real `tools/call` on the wire, result out.
+        let script = r#"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"protocolVersion\":\"2024-11-05\"}}" ;;
+    *'"tools/list"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"tools\":[{\"name\":\"buried\",\"description\":\"b\",\"inputSchema\":{\"type\":\"object\"}}]}}" ;;
+    *'"tools/call"'*)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"buried ran with depth=2\"}]}}" ;;
+    *)
+      printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":${id:-0},\"error\":{\"message\":\"method not found\"}}" ;;
+  esac
+done
+"#;
+        // `primaryTools: []` makes every tool a directory tool.
+        let path = write_temp_config(&format!(
+            "{{\"mcpServers\":{{\"demo\":{{\"command\":\"sh\",\"args\":[\"-c\",{}],\"primaryTools\":[]}}}}}}",
+            {
+                let mut esc = String::new();
+                json_escape(&mut esc, script);
+                esc
+            }
+        ));
+        let mut servers = start_servers(config_load(&path));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(servers.len(), 1);
+        assert!(!servers[0].tools[0].primary, "should be a directory tool");
+
+        let call = ToolCall {
+            name: "mcp_call".to_string(),
+            args: vec![
+                ToolArg {
+                    name: "name".to_string(),
+                    value: "mcp__demo__buried".to_string(),
+                    is_string: true,
+                },
+                ToolArg {
+                    name: "arguments".to_string(),
+                    value: "{\"depth\": 2}".to_string(),
+                    is_string: true,
+                },
+            ],
+        };
+        assert_eq!(
+            tool_mcp_invoke(&mut servers, &call),
+            "buried ran with depth=2\n"
+        );
+    }
+
+    #[test]
+    fn mcp_call_rejects_a_bad_name_or_non_object_arguments() {
+        let mut servers: Vec<McpServer> = Vec::new();
+        let arg = |n: &str, v: &str| ToolArg {
+            name: n.to_string(),
+            value: v.to_string(),
+            is_string: true,
+        };
+        let call = |args: Vec<ToolArg>| ToolCall {
+            name: "mcp_call".to_string(),
+            args,
+        };
+        assert!(
+            tool_mcp_invoke(&mut servers, &call(vec![])).contains("requires name"),
+            "a missing name must not reach the wire"
+        );
+        // A scalar or array would produce a `tools/call` the server rejects with
+        // a schema error that reads as the tool's fault, not the caller's.
+        let bad = call(vec![arg("name", "mcp__d__t"), arg("arguments", "[1,2]")]);
+        assert!(
+            tool_mcp_invoke(&mut servers, &bad).contains("must be a JSON object"),
+            "non-object arguments must be caught locally"
+        );
+        // No arguments at all is a legitimate zero-parameter call: it must get
+        // past validation and fail only on the (absent) server.
+        let none = call(vec![arg("name", "mcp__d__t")]);
+        assert!(
+            tool_mcp_invoke(&mut servers, &none).contains("server not available"),
+            "omitted arguments must be treated as {{}}"
         );
     }
 

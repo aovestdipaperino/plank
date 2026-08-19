@@ -221,6 +221,15 @@ pub fn provider_tool_registry(
         // running" message instead of the provider rejecting an unknown tool —
         // or a mid-session death, where dispatch reports the failure.
         for tool in &server.tools {
+            // Only primary tools get a full schema, exactly as on the text path
+            // (`append_tool_schemas`). A server like tokensave advertises 82
+            // tools whose schemas are 63 KB of JSON — resent on every request,
+            // where they inflate prefill and slow every subsequent decode by
+            // enlarging the KV context. The rest stay reachable through the
+            // directory below.
+            if !tool.primary {
+                continue;
+            }
             let parameters = serde_json::from_str::<serde_json::Value>(&tool.schema_json)
                 .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} }));
             specs.push(crate::engine::ToolSpec {
@@ -230,6 +239,7 @@ pub fn provider_tool_registry(
             });
         }
     }
+    push_mcp_directory_specs(&mut specs, mcp_servers);
     // Resource tools, advertised only when a server actually publishes
     // resources — mirroring `append_resource_tool_schemas` for the text path.
     if mcp_servers.iter().any(|s| !s.resources().is_empty()) {
@@ -268,6 +278,52 @@ const AGENT_NAME_DESC_EMPTY: &str =
 /// `agent` and plan-mode tools (issue #50). Mirrors the text-path schemas in
 /// [`append_agent_and_plan_schemas`]; split out to keep
 /// [`provider_tool_registry`] under the function-length lint.
+/// Pushes the two specs that keep *non-primary* MCP tools usable on the
+/// provider path: `mcp_describe` for their schemas and `mcp_call` to invoke
+/// them.
+///
+/// The text path can leave directory tools undeclared because the model writes
+/// DSML there — free text, able to name any tool. A provider request has no
+/// such freedom: an OpenAI-compatible gateway rejects a function name that was
+/// never declared, and llama.cpp constrains tool-call names with a grammar
+/// built from the `tools` array, so an undeclared name is literally
+/// ungeneratable. `mcp_call` is therefore the one declared door to all of them,
+/// and its description carries the directory so the model knows what exists.
+fn push_mcp_directory_specs(
+    specs: &mut Vec<crate::engine::ToolSpec>,
+    mcp_servers: &[crate::tools::mcp::McpServer],
+) {
+    let directory = crate::tools::mcp::directory_listing(mcp_servers);
+    if directory.is_empty() {
+        return;
+    }
+    specs.push(crate::engine::ToolSpec {
+        name: "mcp_describe".to_string(),
+        description: "Return the full parameter schema of directory MCP tools (those not listed as function specs). Accepts one or more space-separated tool names. Call this before the first use of a directory tool.".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tools": {"type": "string", "description": "space-separated full tool names, e.g. 'mcp__srv__alpha mcp__srv__beta'"}
+            },
+            "required": ["tools"]
+        }),
+    });
+    specs.push(crate::engine::ToolSpec {
+        name: "mcp_call".to_string(),
+        description: format!(
+            "Invoke one of the MCP directory tools listed below. These tools have no function spec of their own, so call them through this one: pass the full tool name and its arguments as a JSON object. Use mcp_describe first to get a tool's parameter schema.\n\nDirectory:\n{directory}"
+        ),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "full tool name, e.g. 'mcp__srv__alpha'"},
+                "arguments": {"type": "string", "description": "the tool's arguments as a JSON object, e.g. '{\"path\": \"src\"}'; omit for a tool that takes none"}
+            },
+            "required": ["name"]
+        }),
+    });
+}
+
 fn push_agent_and_plan_specs(specs: &mut Vec<crate::engine::ToolSpec>) {
     // No enum of definition names: the roster lives in the session context
     // (`context::agent_roster_context`) so that editing a definition rebuilds
@@ -1057,6 +1113,76 @@ mod tests {
         let (again, trusted_again) = build_tools_prompt_parts(&[], true);
         assert_eq!(text, again);
         assert_eq!(trusted, trusted_again);
+    }
+
+    #[test]
+    fn provider_tool_registry_advertises_only_primary_mcp_tools() {
+        // Regression (perf): every MCP tool used to get a full function spec on
+        // the provider path, ignoring `primary`. With tokensave connected that
+        // was 82 schemas / 63 KB of JSON resent on every request, inflating
+        // prefill and slowing every later decode by enlarging the KV context.
+        // The text path had always filtered; this path now matches it.
+        use crate::tools::mcp::{McpServer, McpTool};
+        let tool = |name: &str, primary: bool| McpTool {
+            name: name.to_string(),
+            description: format!("does {name}"),
+            schema_json: "{\"type\":\"object\",\"properties\":{}}".to_string(),
+            primary,
+        };
+        let rec = crate::tools::mcp_advert::AdvertRecord {
+            server: "srv".to_string(),
+            instructions: String::new(),
+            tools: vec![tool("kept", true), tool("hidden", false)],
+            resources: Vec::new(),
+        };
+        let servers = vec![McpServer::offline(&rec)];
+        let specs = provider_tool_registry(&servers);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"kept"), "primary tool must keep its schema");
+        assert!(
+            !names.contains(&"hidden"),
+            "non-primary tool must not carry a schema: {names:?}"
+        );
+        // ...but it must stay *reachable*: a provider rejects an undeclared
+        // function name, so dropping the schema without the escape hatch would
+        // lose the tool entirely rather than just its parameters.
+        assert!(names.contains(&"mcp_call"), "{names:?}");
+        assert!(names.contains(&"mcp_describe"), "{names:?}");
+        let mcp_call = specs.iter().find(|s| s.name == "mcp_call").unwrap();
+        assert!(
+            mcp_call
+                .description
+                .contains("mcp__srv__hidden: does hidden"),
+            "the directory must name the hidden tool: {}",
+            mcp_call.description
+        );
+        assert!(
+            !mcp_call.description.contains("mcp__srv__kept"),
+            "a primary tool has its own spec and must not be listed twice"
+        );
+    }
+
+    #[test]
+    fn provider_tool_registry_omits_the_escape_hatch_when_every_tool_is_primary() {
+        // The common case (a server with no `primaryTools` filter) must not pay
+        // for two extra specs and an empty directory.
+        use crate::tools::mcp::{McpServer, McpTool};
+        let rec = crate::tools::mcp_advert::AdvertRecord {
+            server: "srv".to_string(),
+            instructions: String::new(),
+            tools: vec![McpTool {
+                name: "only".to_string(),
+                description: "d".to_string(),
+                schema_json: "{}".to_string(),
+                primary: true,
+            }],
+            resources: Vec::new(),
+        };
+        let specs = provider_tool_registry(&[McpServer::offline(&rec)]);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"only"));
+        assert!(!names.contains(&"mcp_call"), "{names:?}");
+        assert!(!names.contains(&"mcp_describe"), "{names:?}");
     }
 
     #[test]

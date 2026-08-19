@@ -345,6 +345,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "google_search" => web::tool_google_search(ctx, call),
         "visit_page" => web::tool_visit_page(ctx, call),
         "mcp_describe" => mcp::tool_mcp_describe(&ctx.mcp, call),
+        "mcp_call" => mcp::tool_mcp_invoke(&mut ctx.mcp, call),
         "mcp_list_resources" => mcp::tool_mcp_list_resources(&ctx.mcp, call),
         "mcp_read_resource" => mcp::tool_mcp_read_resource(&mut ctx.mcp, call),
         "skill" => crate::skills::tool_skill(
