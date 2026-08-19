@@ -1,9 +1,191 @@
 # WASM plugins
 
-> Status: **design proposal**. Nothing in this document is implemented yet. It
-> describes a plugin system for plank built on sandboxed WebAssembly, the
-> surfaces a plugin may claim, the events it may observe, and how plugins are
-> packaged, versioned and trusted.
+> Status: **design proposal, feasibility-proven**. The document describes a
+> plugin system for plank built on sandboxed WebAssembly, the surfaces a plugin
+> may claim, the events it may observe, and how plugins are packaged, versioned
+> and trusted. None of that is implemented. What *is* implemented is the spike
+> below — the trait boundary and the runtime handshake, and nothing more.
+
+## What is implemented
+
+**Phase 0 — feasibility spike.** `src/wasmhost.rs` behind the `plugins`
+feature: the `WasmHost` trait, its always-available no-op, and the Extism
+implementation. Answers below.
+
+**Phase 1 — discovery, trust, registry.** `src/wasmreg.rs`, compiled
+unconditionally. WASM is a component kind inside the existing plugin format;
+trust keys on the module's SHA-256 with per-repo approval for project-local
+components.
+
+**Phase 2 — the `command` surface.** Components claiming `command` contribute
+slash commands to the menu and to both front ends' dispatch. Specs are read
+once at load, never per keystroke. A component claiming a surface whose exports
+it lacks is refused at load rather than failing when a user first picks it.
+Held components are listed by `/plugins` with what they want and the exact
+`/plugins trust <id>` that approves them — approval is a typed act, not a modal
+question before the first turn.
+
+**Capabilities — `log`, `print`, `state`.** `src/wasmcaps.rs`, also compiled
+unconditionally: whether a grant is honored, where a key may write and what a
+refusal says are pure functions over a directory, and the Extism glue in
+`wasmhost` is a thin shell over them. Every host function is provided to every
+component and checks its own grant when called, so a missing grant reads as
+"this component was not granted `print`" rather than as a wasm import error.
+`fs`, `net` and `exec` — the three that undo the sandbox — are deliberately not
+wired.
+
+**The `observer` surface and the event bus.** `src/wasmevents.rs`. Five events
+are dispatched — `session_start`, `user_prompt_submit`, `pre_tool_use`,
+`post_tool_use`, `turn_end` — from the same call sites the shell hooks fire
+from, so a component sees what a hook would have seen. Subscriptions are
+declared in the manifest and an unsubscribed event costs nothing.
+
+One deviation from the sketch above: a component implements a single
+`on_event` export rather than a handler per event. Extism cannot type-check an
+export signature, so N exports buy no safety over one, and a new event would
+otherwise oblige every interested component to grow an export — which the
+payload-evolution rule says additions must not do.
+
+An event's class is enforced host-side, not trusted from the guest: a reply
+that vetoes a notify event is dropped rather than honored. Transform
+replacements chain in load order, so a redactor and a summarizer compose
+instead of competing.
+
+**The `tool` surface.** A component's tools join the model's registry beside
+`bash` and the MCP servers'. Their schemas are appended to the system prompt
+*after* the trusted span — they are third-party text exactly like MCP's — and
+names resolve against everything already claimed: a bare name when nothing
+contests it, `wasm__<component>__<tool>` when something does, warned either
+way. Built-ins always win, so no component can quietly replace `bash`.
+
+That settles the tool-name collision question the design left open. The
+prompt-cache consequence is real and observable: adding or removing a tool
+component changes the system prompt and therefore forks the Tier 1
+fingerprint, so the two configurations keep separate checkpoints instead of
+invalidating each other. Specs are read once at load for the same reason — a
+tool list that changed mid-session would invalidate the checkpoint under the
+running session. A component approved with `/plugins trust` mid-session is
+dispatchable immediately but reaches the prompt only on the next launch.
+
+**The `segment` surface**, with one deliberate deviation. The design says a
+cell renders "once per status-bar repaint"; this renders at most once a second
+and reads from cache in between. The TUI repaints on every keystroke and every
+throbber tick, so a per-repaint call would run a guest dozens of times a second
+on the UI thread while the user is typing, to refresh data that changes on the
+order of seconds. The refresh is self-throttled inside the registry, so callers
+invoke it at whatever boundary is convenient without owning the cadence — and
+it is called *before* the bar renders, since publishing afterwards leaves every
+cell one turn stale.
+
+A cell that returns nothing is quiet, not broken: an unreadable reply drops the
+cell for that round without a strike, because the status bar must never be a
+place where a component gets disabled for having nothing to say. A trap still
+strikes — that means the guest broke, and it will break again on the next
+repaint.
+
+**The `frame` surface — ABI and driver.** `src/wasmglyph.rs` implements the
+packed glyph buffer; `wasmreg` drives the open/step/key/close lifecycle,
+enforces `min_size`, clamps `dt_ms` the way `arcade::MAX_STEP_MS` does, and
+separates manual from idle activation so a component cannot appear unasked. A
+guest has no ambient clock and no ambient randomness: time and seed arrive in
+the payload, and the same seed replays exactly.
+
+Decoding is total — a malformed buffer costs the frame, never the session — and
+the count is validated against the declared area *before* anything is
+allocated, so a two-byte edit cannot ask the host for a huge allocation.
+
+**`frame` is wired into the TUI.** `/frame [id] [face]` opens one, the loop
+steps it against the real frame clock, `draw_wasm_frame` blits it, and keys go
+to the component until it closes. It shares `draw_arcade`'s ground painter
+rather than reimplementing it, so a component gets the same veil and the same
+real-black as a built-in face — pinned by a test, since the two must not drift.
+
+**One module, many faces.** The arcade port puts *every* face in a single
+`.wasm` rather than one module per game. `frame_open` therefore carries an
+`arg` naming which face to open, and a component's `command_run` may reply
+`{"open": "<face>"}` to open its own frame — which is how one module gives each
+face its own slash command. A component may only open its own frame: opening
+someone else's window is a capability, and this is a convenience.
+
+**The arcade port has started.** `guests/arcade/` is the single component
+every face will live in. The matrix rain is ported, and the port is *verbatim*
+— only the imports changed — because that is what makes it checkable: a test
+drives the built-in `arcade::matrix::Rain` and the component side by side for
+thirty ticks and compares every glyph's position, character and colour. They
+match exactly.
+
+That test earned its place on its first run. The guest was parsing the `seed`
+through `f32`, and a u64 seed does not survive a 24-bit mantissa — so the
+component seeded a *different* rain. Nothing looked wrong; it was still rain.
+Only the glyph-for-glyph comparison could catch it.
+
+**Each frame is its own command.** A component's commands follow the plugin
+loader's convention exactly: `<plugin>:<name>` always, plus the bare `<name>`
+when nothing else claims it. So a component holding many frames is opened per
+frame — `/arcade:matrix`, `/arcade:breakout` — with no component id and no face
+argument to remember, and the alias keeps working while a built-in still owns
+the bare name. `/frame` remains for listing what is openable and for a
+component whose frames are not declared as commands.
+
+### Screensavers and arcades are different plugins
+
+A frame component declares a **kind**, and the host derives everything else
+from it:
+
+| Kind | Idle rotation | Opened on demand | Keys |
+|---|---|---|---|
+| `screensaver` | yes, beside the built-in faces | yes | anything dismisses it |
+| `arcade` | never | yes | the game claims what it uses |
+
+They ship as separate plugins rather than one artifact with a flag, because
+they are separate things and a user who wants ambient faces should be able to
+install exactly that. `guests/screensavers/` is the first; `guests/arcades/`
+will be the second.
+
+Kind is a property of the *thing*, not a permission: an arcade is never
+rotated because a game appearing over someone's work is wrong, not because it
+lacks a grant. `arcade` is the default, so a manifest that says nothing cannot
+accidentally acquire the screen.
+
+### What stays in the core
+
+**The matrix rain and breakout are not plugins and will not become plugins.**
+The rain is the *default* screensaver — a plank with no plugins installed still
+has one, and a default that depends on a plugin is not a default — and breakout
+is what the download screen draws above the progress gauge (`download.rs`),
+which runs before any plugin could be loaded. Both stay in the binary.
+
+That decides what porting is *for*: not moving the arcade out, but letting
+faces exist that plank does not ship. The starfield is ported as the first such
+face; minions, centipede, frogger and invaders follow, split by kind.
+
+The starfield's port is checked glyph for glyph against the built-in field it
+came from, thirty ticks deep. That check is the procedure for every face that
+lands; the two core faces skip it because they are not going anywhere.
+
+Not yet implemented: the remaining events (`idle`, `resize`, `job_*`, the
+compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.
+
+## Feasibility spike (landed)
+
+`src/wasmhost.rs` behind the `plugins` feature (off by default), plus a guest in
+`spike/abi-guest` and `tests/wasm_spike.rs`. It answers the four questions that
+could have killed the design:
+
+| Question | Answer |
+|---|---|
+| Does a JIT survive plank's release flow? | Not a question. `release.yml` signs nothing and notarizes nothing, so there is no hardened-runtime entitlement to fight |
+| What does the runtime cost in binary size? | **+18.0 MiB** (141.1 → 159.9 MB). Enough to keep the feature off by default forever; not enough to reconsider the runtime |
+| Does the ABI handshake work? | Yes. A guest asserts `plank_abi`, and a module that cannot is refused at load with the ABI named as the reason |
+| Does a runaway guest stay contained? | Yes. An infinite loop is stopped by the host deadline and surfaces as `WasmError::Trap`; a fresh plugin loads and answers afterwards |
+
+What the spike deliberately is **not**: no surfaces, no event bus, no manifest,
+no capabilities, no registry, and no call site anywhere in plank — `host()` is
+reachable only from tests. The measured 18 MiB assumes that changes; until it
+does the linker strips most of it (see `FINDINGS.md`).
+
+The three decisions that gated Phase 1 are settled under *Decisions* below;
+what remains open is listed after them.
 
 ## Why
 
@@ -121,6 +303,9 @@ title) is drawn by plank so panels look uniform.
 `panel` exists so the ABI does not force "a live thing on screen" to mean "the
 entire screen". A token-usage sparkline or a live test-runner pane is a panel.
 
+**Not in v1** — see *Decisions*. Described here because adding a surface is
+additive and this is the shape it would take.
+
 ### `segment` — owns a status-bar cell
 
 ```
@@ -236,6 +421,9 @@ Events fall into three classes by what the return value means:
 `token_batch` is intentionally **notify-only**. A transform here would let a
 plugin corrupt the model's own output stream, and the byte-parity contract with
 the C reference gives us no room to negotiate what the stream contains.
+
+**Not in v1** — see *Decisions*. It is the only event that would put a WASM call
+inside the streaming hot path, and nothing yet needs it.
 
 ### Tools
 
@@ -403,8 +591,26 @@ own config file.
 This mirrors the hierarchical `.mcp.json` resolution already in `tools/mcp.rs`,
 so users learn one precedence rule rather than two.
 
-**Management** is `/plugins` — list with surfaces, capabilities and health;
-`/plugins install <path|url>`; `/plugins disable <id>`; `/plugins reload <id>`.
+**Management** is `/plugins`: bare to list with surfaces, capabilities and
+what is awaiting approval; `install <dir>` to copy a plugin into the user's
+plugin directory; `remove <name>` to delete it; `trust <id>` to approve a
+component.
+
+Install copies rather than links, because a plugin that changed under a
+running session would be one whose approved SHA-256 no longer describes what is
+loaded, and the trust store's whole premise is that the hash *is* the identity.
+It refuses to overwrite for the same reason: replacing an installed plugin is
+new bytes under an approved name, so it is remove-then-install rather than
+something that happens quietly. A `target/` directory is skipped — a guest
+crate's build tree is gigabytes that would be copied into the user's home and
+never read.
+
+Removal leaves the trust entry behind. It is keyed by the component's hash, so
+reinstalling the same bytes is the same component and needs no re-approval,
+while different bytes re-prompt exactly as they would have.
+
+Not yet: install from a URL, signing, or shipping the guest artifacts with a
+release.
 
 ## Versioning
 
@@ -519,22 +725,60 @@ the `Engine`/`EchoEngine` boundary, and for the same reason: plank must stay
 buildable and testable without the heavy dependency. CI's default path builds
 without wasmtime; a dedicated job builds with it.
 
-## Open questions
+## Decisions
 
-1. **Panel layout.** Who arbitrates when three plugins want a sidebar? A simple
-   priority + user override in settings is probably enough, but it is unproven.
-2. **Tool-name collisions** between a WASM plugin, an MCP server, and a
-   built-in. MCP already namespaces as `mcp__<server>__<tool>`; the cheap answer
-   is `wasm__<id>__<tool>`, at the cost of tokens in every system prompt.
-3. **`token_batch` cost.** Even coalesced, a subscriber on every batch is a
-   WASM call inside the streaming hot path. It may need to be opt-in behind a
-   warning, or restricted to a sampling interval.
-4. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
+Three of the open questions below are now settled, because Phase 1 cannot start
+without them. Each is reversible; each is recorded with what it costs.
+
+### WASM is a component kind, not a parallel plugin system
+
+A plugin stays what `src/plugins.rs` already says it is — a directory bundling
+contributions — and `wasm` joins `skills`, `agents`, `templates`, `hooks`,
+`.mcp.json` and `settings.json` as one more component kind. It is *not* a second
+system with its own directories, its own precedence rule and its own noun.
+
+The loader that shipped in August already carries most of what this design's
+"Packaging and distribution" section asks for: three locations resolved in
+order, two manifest spellings, `<plugin>:<name>` namespacing with bare names
+when uncontested, collision warnings, and plugin settings merged strictly below
+the user's. Building a second resolution order beside it would mean two
+precedence rules for users to learn and two implementations to keep honest, to
+buy nothing the existing one does not already do.
+
+The cost is that the existing manifest has to grow a surfaces/capabilities
+section it was not designed for, and that WASM inherits `./.plank/plugins/`
+auto-scanning — which is the sharp edge, since today cloning a repo silently
+activates its skills and MCP servers. Tolerable for a skill; not tolerable for
+a `.wasm` holding `exec`. **Project-local WASM components are therefore
+default-deny even though project-local skills are not**, and that asymmetry is
+deliberate: the trust question is about what the code can reach, not about where
+the directory sits.
+
+### `token_batch` is not in v1
+
+Cut, not deferred behind a warning. It is the only event that puts a WASM call
+inside `viz::StreamRenderer`'s hot path, it is the one path under a byte-parity
+contract with the C reference, and no known consumer needs per-batch granularity
+that `generation_end` cannot serve. A usage tracker wants totals; a redactor
+belongs at `post_tool_use`, where the veto is honest about its timing.
+
+The cost is that a live token-stream visualiser is not expressible in v1. If one
+is ever wanted, it arrives as a sampled event with an explicit interval — never
+as a subscriber on every batch.
+
+### `panel` is not in v1
+
+Cut. It is the only surface with no consumer, and it is the reason open question
+1 (layout arbitration between competing plugins) exists at all. Cutting it
+deletes that question rather than answering it. `frame` covers the demanding
+case and `segment` covers the cheap one; a panel can be added later without an
+ABI break, since adding a surface is additive.
+
+## Still open
+
+1. **Debugging story.** A trapped plugin currently yields a wasm backtrace with
    no source mapping. Do we require DWARF in dev builds, or ship a
    `plank plugin test` harness that runs exports against fixtures?
-5. **Whether `panel` ships in v1** at all. `frame` + `segment` cover the known
-   use cases; `panel` is the one surface with no current consumer, and a
-   surface with no consumer is a guess.
 
 ## See also
 

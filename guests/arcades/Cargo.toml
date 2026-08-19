@@ -1,0 +1,30 @@
+# The arcade games, as one WASM component.
+#
+# Separate from the screensavers plugin because they are separate things: a
+# game is started deliberately and owns its keys until it is quit, and someone
+# who wants ambient faces should not have to install games to get them.
+#
+# Every game lives in this single module rather than one per game: one artifact
+# to build, one id to trust, one load. `frame_open`'s `arg` selects which game,
+# and each gets its own slash command through `command_specs`.
+#
+# Not a workspace member of plank: it targets wasm32-unknown-unknown, so
+# folding it in would drag a cross-target into every `cargo build`.
+[workspace]
+
+[package]
+name = "plank-arcades"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true

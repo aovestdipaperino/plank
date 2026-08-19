@@ -2992,9 +2992,99 @@ fn arcade_footer_line(arcade: &crate::arcade::Arcade, width: u16) -> String {
 /// `Line`s, because the content is sparse — a starfield touches a few hundred
 /// cells out of several thousand. The bottom row is reserved for the hint line
 /// and any centered banner is stamped over the middle.
-pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
+/// The name a WASM `frame` component sees for a key press.
+///
+/// Lower-case, spelled out for anything that is not a bare character, with
+/// modifiers prefixed (`ctrl-c`, `shift-tab`). A component matches on strings
+/// rather than on a numeric code so the ABI does not pin plank to crossterm's
+/// enum ordering, which is exactly the kind of thing that shifts under a
+/// dependency bump and silently remaps every game's controls.
+#[must_use]
+pub fn key_code_name(key: ratatui::crossterm::event::KeyEvent) -> String {
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+
+    let base = match key.code {
+        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "escape".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::BackTab => "backtab".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        other => format!("{other:?}").to_lowercase(),
+    };
+    let mut out = String::new();
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        out.push_str("ctrl-");
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        out.push_str("alt-");
+    }
+    // Shift is reported only for keys where it is not already in the
+    // character: `shift-a` would be a lie when the char arrives as `A`.
+    if key.modifiers.contains(KeyModifiers::SHIFT) && !matches!(key.code, KeyCode::Char(_)) {
+        out.push_str("shift-");
+    }
+    out.push_str(&base);
+    out
+}
+
+/// Draws an open WASM `frame` component, on the same terms as the built-in
+/// faces: veiled over the live UI, or on a real black ground.
+///
+/// Shares [`draw_arcade`]'s ground-painting rather than reimplementing it —
+/// the veil and the explicit RGB black are hard-won (see that function), and a
+/// component must not get a different-looking screen than a built-in face for
+/// no reason. What it adds is the two things the packed wire format carries
+/// that `arcade::Glyph` does not: bold, and an optional background color.
+pub fn draw_wasm_frame(frame: &mut Frame, open: &crate::wasmreg::OpenFrame) {
     let area = frame.area();
-    if arcade.translucent {
+    paint_frame_ground(frame, area, open.veiled);
+    if area.height < 2 {
+        return;
+    }
+    // The bottom row stays with the UI, exactly as the arcade leaves it.
+    let play = Rect {
+        height: area.height - 1,
+        ..area
+    };
+
+    let buf = frame.buffer_mut();
+    for (i, g) in open.last.glyphs.iter().enumerate() {
+        // A component draws in its own coordinates and may be a frame behind a
+        // resize, so anything outside the current area is dropped rather than
+        // clamped: clamping would pile a whole edge of glyphs into one column.
+        if g.x >= play.width || g.y >= play.height {
+            continue;
+        }
+        let (x, y) = (play.x + g.x, play.y + g.y);
+        let Some(cell) = buf.cell_mut(Position::new(x, y)) else {
+            continue;
+        };
+        let (r, gr, b) = g.color;
+        cell.set_char(g.ch).set_fg(Color::Rgb(r, gr, b));
+        if open.last.bold.get(i).copied().unwrap_or(false) {
+            cell.set_style(cell.style().add_modifier(Modifier::BOLD));
+        }
+        if let Some(Some((br, bg, bb))) = open.last.bg.get(i) {
+            cell.set_bg(Color::Rgb(*br, *bg, *bb));
+        }
+    }
+}
+
+/// Paints the ground an occupying surface draws onto: the veil over the live
+/// UI, or a real black.
+fn paint_frame_ground(frame: &mut Frame, area: Rect, translucent: bool) {
+    if translucent {
         // No Clear: the frame already holds the live UI, and the glyphs land in
         // the gaps between its characters. Pushing everything underneath down
         // to a dim gray is what sells the layer — see `Arcade::translucent` for
@@ -3010,6 +3100,11 @@ pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
             area,
         );
     }
+}
+
+pub fn draw_arcade(frame: &mut Frame, arcade: &crate::arcade::Arcade) {
+    let area = frame.area();
+    paint_frame_ground(frame, area, arcade.translucent);
     if area.height < 2 {
         return;
     }
@@ -6018,31 +6113,22 @@ mod tests {
     /// An arcade with `cmd` on screen.
     fn opened(cmd: &str) -> crate::arcade::Arcade {
         let mut a = crate::arcade::Arcade::new();
-        assert!(a.open(cmd, false, 7, 80, 24), "{cmd} did not open");
+        assert!(a.open(cmd, false, 7), "{cmd} did not open");
         a
     }
 
-    /// An arcade showing the starfield screensaver.
+    /// An arcade showing the screensaver.
     ///
     /// The face is asked for rather than left to `ui.screensaverFace`: a test
-    /// about the starfield that silently drew one of the other faces would be
-    /// worse than no test.
+    /// that silently drew a different face would be worse than no test. The
+    /// rain is the only built-in face left — the others are plugins now — so
+    /// it is what these tests draw.
     fn screensaver() -> crate::arcade::Arcade {
         let mut a = crate::arcade::Arcade::new();
-        a.open_screensaver_as(crate::arcade::ScreensaverFace::Starfield, 7, 80, 24);
-        a
-    }
-
-    /// An arcade showing the minions screensaver, three seconds in.
-    ///
-    /// Both numbers matter: they fade up from the dark, so frame zero is
-    /// deliberately empty, and the seed decides where along its crossing the
-    /// pair is — this one has them well inside an 80-column frame rather than
-    /// half off the edge.
-    fn minions_screensaver() -> crate::arcade::Arcade {
-        let mut a = crate::arcade::Arcade::new();
-        a.open_screensaver_as(crate::arcade::ScreensaverFace::Minions, 4, 80, 24);
-        for _ in 0..60 {
+        a.open_screensaver_as(crate::arcade::ScreensaverFace::Matrix, 7);
+        // The rain fades in per column, so a fresh field is nearly empty and a
+        // test about coverage would measure the wrong thing.
+        for _ in 0..40 {
             a.step(50);
         }
         a
@@ -6116,6 +6202,106 @@ mod tests {
         assert!(field.contains("terminale"), "no explanation:\n{field}");
     }
 
+    /// The generic blitter draws what a component painted, carries the two
+    /// attributes the packed format adds over `arcade::Glyph`, and — the part
+    /// that matters — drops glyphs outside the current area instead of
+    /// clamping them, since a component may be a frame behind a resize.
+    #[test]
+    fn a_wasm_frame_draws_its_glyphs_and_clips_to_the_area() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let glyph = |x, y, ch| crate::arcade::Glyph {
+            x,
+            y,
+            ch,
+            color: (10, 200, 30),
+        };
+        let open = crate::wasmreg::OpenFrame {
+            id: "dev.plank.test".to_string(),
+            screensaver: false,
+            veiled: false,
+            last: crate::wasmglyph::GlyphFrame {
+                w: 80,
+                h: 23,
+                glyphs: vec![glyph(0, 0, 'A'), glyph(3, 1, 'B'), glyph(200, 5, 'X')],
+                bold: vec![true, false, false],
+                bg: vec![None, Some((5, 6, 7)), None],
+            },
+        };
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw_wasm_frame(f, &open)).unwrap();
+        let buf = term.backend().buffer().clone();
+
+        let cell = |x, y| buf.cell(Position::new(x, y)).unwrap().clone();
+        assert_eq!(cell(0, 0).symbol(), "A");
+        assert_eq!(cell(0, 0).fg, Color::Rgb(10, 200, 30));
+        assert!(
+            cell(0, 0).style().add_modifier.contains(Modifier::BOLD),
+            "the bold flag did not reach the cell"
+        );
+        assert_eq!(cell(3, 1).symbol(), "B");
+        assert_eq!(cell(3, 1).bg, Color::Rgb(5, 6, 7), "background colour");
+        assert_eq!(
+            cell(0, 0).bg,
+            Color::Rgb(0, 0, 0),
+            "a glyph without a background keeps the frame's own ground"
+        );
+        // The out-of-area glyph was dropped, not folded onto the last column:
+        // clamping would pile a whole edge into one cell after a resize.
+        assert_eq!(cell(79, 5).symbol(), " ");
+    }
+
+    /// A veiled component leaves the transcript readable underneath, exactly
+    /// as a veiled arcade face does — they share the ground painter, and this
+    /// is what pins that they keep sharing it.
+    #[test]
+    fn a_veiled_wasm_frame_leaves_the_ui_visible_underneath() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut log = OutputLog::new();
+        for i in 0..40 {
+            log.visible_text(&format!("output line {i} still readable"));
+            log.end_line();
+        }
+        let draw = |veiled: bool| {
+            let open = crate::wasmreg::OpenFrame {
+                id: "dev.plank.test".to_string(),
+                screensaver: false,
+                veiled,
+                last: crate::wasmglyph::GlyphFrame::default(),
+            };
+            let mut view = OutputView::default();
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| {
+                render_output(f, f.area(), &log, &mut view, None);
+                draw_wasm_frame(f, &open);
+            })
+            .unwrap();
+            term.backend().buffer().clone()
+        };
+
+        let text_of = |buf: &ratatui::buffer::Buffer| {
+            (0..24)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(
+            text_of(&draw(true)).contains("still readable"),
+            "a veiled frame hid the transcript"
+        );
+        assert!(
+            !text_of(&draw(false)).contains("still readable"),
+            "an opaque frame left the transcript showing"
+        );
+    }
+
     /// The translucent layer is the one piece with no equivalent elsewhere in
     /// the UI, so it is worth pinning: text underneath must survive, and it
     /// must come back dimmed rather than at full brightness.
@@ -6129,8 +6315,13 @@ mod tests {
             log.visible_text(&format!("output line {i} still readable"));
             log.end_line();
         }
+        // A *game*, not the screensaver: translucency is what happens when a
+        // game opens over a running turn, and the rain — the only built-in
+        // face left — paints nearly every cell, so it would hide the
+        // transcript whatever the veil did. Breakout is sparse, which is the
+        // property this test is really about.
         let draw = |translucent: bool| {
-            let mut arcade = screensaver();
+            let mut arcade = opened("/breakout");
             arcade.translucent = translucent;
             let mut view = OutputView::default();
             let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -6204,33 +6395,10 @@ mod tests {
     }
 
     #[test]
-    fn arcade_scatters_stars_over_the_whole_frame() {
+    fn the_screensaver_covers_the_whole_frame() {
         let rows = arcade_frame(&screensaver(), 80, 24);
-        // The screensaver has no footer, so every row is sky; stars should
-        // reach the top and the bottom of it, not clump in a band.
-        let painted: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| !r.trim().is_empty())
-            .map(|(i, _)| i)
-            .collect();
-        assert!(painted.len() > 10, "only {} rows had stars", painted.len());
-        assert!(painted[0] < 4, "nothing near the top: {painted:?}");
-        assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("speed") || r.contains("quit")),
-            "the screensaver must not offer the games' controls: {rows:?}"
-        );
-    }
-
-    /// One of the screensaver's faces: two minions on a shore, standing in the
-    /// lower half of the frame with sky above them and water below, and no
-    /// footer of its own either.
-    #[test]
-    fn the_minions_stand_on_their_shore() {
-        let rows = arcade_frame(&minions_screensaver(), 80, 24);
+        // The screensaver has no footer, so every row is drawable; the field
+        // should reach the top and the bottom, not clump in a band.
         let painted: Vec<usize> = rows
             .iter()
             .enumerate()
@@ -6238,19 +6406,13 @@ mod tests {
             .map(|(i, _)| i)
             .collect();
         assert!(painted.len() > 10, "only {} rows drawn", painted.len());
-        // The pair itself is the widest solid thing on screen: some row in the
-        // lower half has to be more than a scattering of stars.
-        let body = rows[8..20]
-            .iter()
-            .map(|r| r.chars().filter(|c| *c == '█').count())
-            .max()
-            .unwrap_or(0);
-        assert!(body > 6, "no minion found on the shore: {rows:?}");
+        assert!(painted[0] < 4, "nothing near the top: {painted:?}");
+        assert!(painted[painted.len() - 1] > 18, "nothing near the bottom");
         assert!(
             !rows
                 .iter()
-                .any(|r| r.contains("pace") || r.contains("quit")),
-            "the screensaver must not offer the controls: {rows:?}"
+                .any(|r| r.contains("speed") || r.contains("quit")),
+            "the screensaver must not offer the games' controls: {rows:?}"
         );
     }
 

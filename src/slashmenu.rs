@@ -26,6 +26,8 @@ pub enum Source {
     Skill,
     /// A prompt template discovered under `.plank/templates`.
     Template,
+    /// A slash command contributed by a WASM component.
+    Wasm,
 }
 
 impl Source {
@@ -37,6 +39,7 @@ impl Source {
             Self::Builtin => "",
             Self::Skill => "skill",
             Self::Template => "template",
+            Self::Wasm => "wasm",
         }
     }
 }
@@ -77,6 +80,7 @@ impl Entry {
 pub fn catalog(
     skills: &[crate::skills::Skill],
     templates: &[crate::templates::Template],
+    wasm: &[(&str, &crate::wasmreg::CommandSpec)],
 ) -> Vec<Entry> {
     let mut out: Vec<Entry> = crate::config::SLASH_COMMANDS
         .iter()
@@ -116,6 +120,19 @@ pub fn catalog(
             Source::Template,
             &mut out,
         );
+    }
+    // Last, so a WASM component can never shadow a built-in, a skill or a
+    // template — the same rule every other contributed registry follows, and
+    // the reason a plugin cannot silently take over `/compact`.
+    //
+    // Both spellings are offered, exactly as `plugins::reconcile` does for
+    // every other contributed entry: `<plugin>:<name>` always, since it can
+    // never collide, and the bare name only if `push` finds it free. A
+    // component offering several frames is therefore reachable as
+    // `/arcade:matrix` even while the built-in `/matrix` still exists.
+    for (_, c) in wasm {
+        push(&c.alias, &c.args, &c.desc, Source::Wasm, &mut out);
+        push(&c.name, &c.args, &c.desc, Source::Wasm, &mut out);
     }
     out
 }
@@ -477,7 +494,7 @@ mod tests {
             body: String::new(),
             path: std::path::PathBuf::new(),
         };
-        let cat = catalog(&[skill, shadow], &[tpl]);
+        let cat = catalog(&[skill, shadow], &[tpl], &[]);
         let find = |n: &str| cat.iter().find(|e| e.name == n).expect("entry").clone();
         assert_eq!(find("/review").source, Source::Skill);
         assert_eq!(find("/review").desc, "review the diff");
@@ -488,7 +505,7 @@ mod tests {
 
     #[test]
     fn the_label_folds_the_argument_hint_in() {
-        let e = &catalog(&[], &[])
+        let e = &catalog(&[], &[], &[])
             .into_iter()
             .find(|e| e.name == "/compact")
             .expect("compact");
@@ -498,7 +515,7 @@ mod tests {
     #[test]
     fn goal_is_a_known_command_with_an_argument_label() {
         assert!(crate::config::slash_command_known("/goal"));
-        let cat = catalog(&[], &[]);
+        let cat = catalog(&[], &[], &[]);
         let e = cat
             .iter()
             .find(|e| e.name == "/goal")

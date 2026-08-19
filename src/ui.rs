@@ -2202,7 +2202,7 @@ impl Agent<'_> {
         // context so the `task` tool mutates the copy that renders and saves.
         self.tool_ctx.tasks.clone_from(&self.session.tasks);
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| println!("{w}")) {
-            println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+            println!("{}", self.debug_line(&format!("halted: {reason}")));
             return Ok(());
         }
         // A compaction that did not rebuild (interrupted, or no usable summary)
@@ -2312,7 +2312,7 @@ impl Agent<'_> {
                 )));
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    println!("{}", self.debug_line(&format!("halted by hook: {reason}")));
+                    println!("{}", self.debug_line(&format!("halted: {reason}")));
                     return Ok(());
                 }
                 continue;
@@ -2332,6 +2332,10 @@ impl Agent<'_> {
                 )));
                 continue;
             }
+            // Before the footer, not after: the bar is rendered from the
+            // published cells, so refreshing afterwards would show every cell
+            // one turn stale and leave the first turn's bar empty.
+            self.refresh_wasm_segments();
             if self.show_footer && !self.editor_owns_footer {
                 print_footer(&st, self.color);
             }
@@ -2344,6 +2348,7 @@ impl Agent<'_> {
             // Turn over: the front end is back at the prompt.
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
+            self.fire_turn_end(stats.generated, turn_start.elapsed());
             return Ok(());
         }
     }
@@ -2482,9 +2487,6 @@ impl Agent<'_> {
     /// last user message). Exit-0 stdout and any exit-2 block feedback inject a
     /// `<hook_context>` user message into this turn; other nonzero exits warn.
     fn fire_user_prompt_submit(&mut self, warn: &mut dyn FnMut(String)) -> Option<String> {
-        if self.tool_ctx.hooks.user_prompt_submit.is_empty() {
-            return None;
-        }
         let prompt = self
             .session
             .transcript
@@ -2493,31 +2495,82 @@ impl Agent<'_> {
             .find(|m| m.role == crate::session::Role::User)
             .map(|m| m.text.clone())
             .unwrap_or_default();
-        let input = crate::hooks::lifecycle_event_input(
-            "UserPromptSubmit",
-            &[("prompt", &prompt)],
-            &self.tool_ctx.cwd,
+
+        // Shell hooks first, and only when there are any. The WASM dispatch
+        // below runs regardless: guarding it on the hook list is what made this
+        // event silently never fire for a session that had components and no
+        // hooks, which is the ordinary case.
+        let mut hook_stop = None;
+        if !self.tool_ctx.hooks.user_prompt_submit.is_empty() {
+            let input = crate::hooks::lifecycle_event_input(
+                "UserPromptSubmit",
+                &[("prompt", &prompt)],
+                &self.tool_ctx.cwd,
+            );
+            let out = crate::hooks::run_event_ctx(
+                &self.tool_ctx.hooks.user_prompt_submit,
+                "",
+                &input,
+                &self.tool_ctx.cwd,
+            );
+            for w in out.warnings.into_iter().chain(out.system_messages) {
+                warn(w);
+            }
+            if let Some(ctx) = out.context.or(out.block) {
+                self.session
+                    .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+            }
+            hook_stop = out.stop_reason;
+        }
+        // user_prompt_submit for WASM subscribers. Transform: a replacement
+        // rewrites the user's last message in place rather than appending
+        // context, because the event exists so a component can *change* what
+        // the model is asked, not only add to it.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::UserPromptSubmit,
+            vec![("prompt", prompt)],
         );
-        let out = crate::hooks::run_event_ctx(
-            &self.tool_ctx.hooks.user_prompt_submit,
-            "",
-            &input,
-            &self.tool_ctx.cwd,
-        );
-        for w in out.warnings.into_iter().chain(out.system_messages) {
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
             warn(w);
         }
-        if let Some(ctx) = out.context.or(out.block) {
-            self.session
-                .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
+        if let Some(text) = wout.replaced
+            && let Some(last) = self
+                .session
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == crate::session::Role::User)
+        {
+            last.text = text;
         }
-        out.stop_reason
+        if let Some((id, reason)) = wout.blocked {
+            // A refused prompt is the user's business, not the model's: it is
+            // reported and the turn does not start.
+            return Some(format!("blocked by wasm component {id}: {reason}"));
+        }
+        hook_stop
     }
 
     /// Fires the `SessionStart` hooks with the given source (startup|resume|
     /// clear|compact), injecting any produced context as a `<hook_context>`
     /// user message so it rides along with the session.
     fn fire_session_start(&mut self, source: &str, warn: &mut dyn FnMut(String)) {
+        // The WASM dispatch is deliberately outside the hooks guard below: a
+        // session with components and no shell hooks is the ordinary case, and
+        // returning early on an empty hook list would silently never fire the
+        // event for them.
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::SessionStart,
+            vec![("source", source.to_string())],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let wout = wasm.registry.dispatch(&mut *wasm.host, &event);
+        for w in wout.printed.into_iter().chain(wout.warnings) {
+            warn(w);
+        }
+
         if self.tool_ctx.hooks.session_start.is_empty() {
             return;
         }
@@ -2539,6 +2592,68 @@ impl Agent<'_> {
             self.session
                 .push(Message::user(format!("<hook_context>{ctx}</hook_context>")));
         }
+    }
+
+    /// Re-renders WASM status cells and publishes them to the bar.
+    ///
+    /// Self-throttled by the registry, so this can be called at any boundary
+    /// that happens to be convenient without the caller owning the cadence.
+    /// Deliberately *not* called from the repaint path: the bar redraws on
+    /// every keystroke, and a guest has no business running there.
+    fn refresh_wasm_segments(&mut self) {
+        use std::fmt::Write as _;
+
+        if self.tool_ctx.wasm.registry.loaded.is_empty() {
+            return;
+        }
+        // The facts a cell is likely to want, in the flat-map shape every
+        // other WASM payload uses. Extending it later is additive.
+        let mut status = String::from("{\"cwd\": ");
+        crate::tools::mcp::json_escape(&mut status, &self.tool_ctx.cwd.display().to_string());
+        let _ = write!(
+            status,
+            ", \"messages\": {}, \"ctx_size\": {}}}",
+            self.session.transcript.len(),
+            self.engine.ctx_size(),
+        );
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        let wasm = &mut self.tool_ctx.wasm;
+        if wasm
+            .registry
+            .refresh_segments(&mut *wasm.host, &status, now_ms)
+        {
+            let cells: Vec<String> = wasm
+                .registry
+                .segments()
+                .iter()
+                .map(|s| s.text.clone())
+                .collect();
+            crate::status::set_wasm_segments(cells);
+        }
+    }
+
+    /// Dispatches `turn_end` to WASM subscribers. Notify-only, so nothing it
+    /// returns can affect the turn that just finished — which is why this can
+    /// sit at the very end, after the footer and the notification, where a
+    /// veto would have been meaningless anyway.
+    ///
+    /// Anything a subscriber printed lands in the tool-context warnings the UI
+    /// already drains, rather than being written here: the turn is over and the
+    /// front end owns the screen again.
+    fn fire_turn_end(&mut self, generated: i32, elapsed: std::time::Duration) {
+        let event = crate::wasmevents::Event::new(
+            crate::wasmevents::EventKind::TurnEnd,
+            vec![
+                ("generated", generated.to_string()),
+                ("wall_ms", elapsed.as_millis().to_string()),
+            ],
+        );
+        let wasm = &mut self.tool_ctx.wasm;
+        let out = wasm.registry.dispatch(&mut *wasm.host, &event);
+        self.tool_ctx.hook_warnings.extend(out.printed);
+        self.tool_ctx.hook_warnings.extend(out.warnings);
     }
 
     /// Fires the `SessionEnd` hooks with the exit `reason`. Terminal event: no
@@ -3535,7 +3650,12 @@ impl Agent<'_> {
                 self.compact("user request", arg)?;
             }
             "/skills" => print!("{}", crate::skills::render_list(&self.skills)),
-            "/plugins" => print!("{}", crate::plugins::render_list(&self.tool_ctx.plugins)),
+            "/frame" => println!(
+                "/frame needs the full-screen TUI — a piped session has no screen to give a \
+                 component\n{}",
+                self.frame_command("")
+            ),
+            "/plugins" => print!("{}", self.plugins_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!("{}", self.session.tasks.render_list()),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
@@ -3692,7 +3812,29 @@ impl Agent<'_> {
                     self.run_turn()?;
                 }
                 Some(Err(e)) => println!("{e}"),
-                None => println!("unknown command: {cmd}"),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            println!("{line}");
+                        }
+                        if out.inject.is_some() {
+                            // No input box to prefill on this path. Said out
+                            // loud rather than dropped: a component that looks
+                            // like it did nothing is worse than one that
+                            // explains what it could not do here.
+                            println!(
+                                "({cmd} wanted to prefill the input box; not available on the plain REPL)"
+                            );
+                        }
+                        if let Some(prompt) = out.prompt {
+                            print!("{}", status::format_user_prompt_echo(&prompt, self.color));
+                            self.session.push(Message::user(prompt));
+                            self.run_turn()?;
+                        }
+                    }
+                    Some(Err(e)) => println!("{e}"),
+                    None => println!("unknown command: {cmd}"),
+                },
             },
         }
         Ok(true)
@@ -5471,6 +5613,139 @@ the original is frozen and listed in /tree"
         Some(crate::skills::render(skill, arg))
     }
 
+    /// `/frame [id]`: lists openable frame components, or asks for one to be
+    /// opened.
+    ///
+    /// Opening is a *request*, not an action: the frame is owned by the TUI
+    /// event loop, which picks this up on its next tick. That keeps the
+    /// component's lifetime in one place instead of split between the slash
+    /// handler and the loop.
+    fn frame_command(&mut self, arg: &str) -> String {
+        use std::fmt::Write as _;
+
+        // `/frame <id> [face]`: the tail selects which frame a component that
+        // offers several should open.
+        let (id, face) = arg
+            .trim()
+            .split_once(char::is_whitespace)
+            .unwrap_or((arg.trim(), ""));
+        let openable: Vec<(String, String)> = self
+            .tool_ctx
+            .wasm
+            .openable_frames()
+            .into_iter()
+            .map(|(id, plugin)| (id.to_string(), plugin.to_string()))
+            .collect();
+        if openable.is_empty() {
+            return "no wasm frame components are loaded\n".to_string();
+        }
+        if id.is_empty() {
+            let mut out = String::from("openable frames:\n");
+            for (id, plugin) in &openable {
+                let _ = writeln!(out, "  {id} ({plugin})");
+            }
+            out.push_str("open one with: /frame <id>\n");
+            return out;
+        }
+        if !openable.iter().any(|(known, _)| known == id) {
+            return format!("no openable wasm frame '{id}'\n");
+        }
+        self.tool_ctx.wasm.pending_open = Some((id.to_string(), face.to_string()));
+        String::new()
+    }
+
+    /// `/plugins` and its one subcommand, shared by both front ends so the
+    /// plain REPL and the TUI cannot drift.
+    ///
+    /// Bare `/plugins` lists; `/plugins trust <id>` approves a held WASM
+    /// component and loads it immediately. Approval is a deliberate, typed act
+    /// rather than a startup prompt: a modal question before the first turn is
+    /// exactly the wrong moment to ask, and a component the user never uses
+    /// should never have to be answered for at all.
+    fn plugins_command(&mut self, arg: &str) -> String {
+        let mut words = arg.split_whitespace();
+        match (words.next(), words.next()) {
+            (Some("install"), Some(path)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so there is nowhere to install to\n".to_string();
+                };
+                let src = std::path::PathBuf::from(path);
+                match crate::plugins::install(&src, &home) {
+                    Ok(dest) => format!(
+                        "installed to {}\nit is loaded on the next start; a wasm component \
+                         also needs /plugins trust <id>\n",
+                        dest.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("install"), None) => "usage: /plugins install <directory>\n".to_string(),
+            (Some("remove"), Some(name)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so nothing is installed\n".to_string();
+                };
+                match crate::plugins::uninstall(name, &home) {
+                    // The trust entry is deliberately left behind: it is keyed
+                    // by the component's hash, so reinstalling the same bytes
+                    // is the same component and does not need re-approving,
+                    // while different bytes re-prompt as they always would.
+                    Ok(dir) => format!(
+                        "removed {}\nthis session keeps what it already loaded; it is gone \
+                         on the next start\n",
+                        dir.display()
+                    ),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("remove"), None) => "usage: /plugins remove <name>\n".to_string(),
+            (Some("trust"), Some(id)) => {
+                // The session already knows the home it was built with; asking
+                // the environment again here is how the two would drift.
+                let project = self.tool_ctx.cwd.clone();
+                match self.tool_ctx.wasm.approve(id, &project) {
+                    Ok(name) => format!("approved and loaded wasm component '{name}'\n"),
+                    Err(e) => format!("{e}\n"),
+                }
+            }
+            (Some("trust"), None) => "usage: /plugins trust <component-id>\n".to_string(),
+            (Some(other), _) => format!("unknown /plugins subcommand: {other}\n"),
+            (None, _) => {
+                let mut out = crate::plugins::render_list(&self.tool_ctx.plugins);
+                out.push_str(&crate::wasmreg::render_held(&self.tool_ctx.wasm.registry));
+                out
+            }
+        }
+    }
+
+    /// Resolves `/name args` against this session's WASM `command` components.
+    ///
+    /// Tried only after skills and templates, so a component can never shadow
+    /// a built-in or a user's own extension — the same precedence the slash
+    /// menu shows. `None` means no component owns the name.
+    fn wasm_command(
+        &mut self,
+        cmd: &str,
+        arg: &str,
+    ) -> Option<Result<crate::wasmreg::CmdOutput, String>> {
+        let name = cmd.strip_prefix('/')?;
+        // Either spelling: `/arcade:matrix` always, `/matrix` when the bare
+        // name was not already claimed by a built-in, a skill or a template.
+        if !self
+            .tool_ctx
+            .wasm
+            .registry
+            .commands()
+            .iter()
+            .any(|(_, c)| c.alias == name || c.name == name)
+        {
+            return None;
+        }
+        // Split borrow: the registry drives the call and the host executes it,
+        // and they live in the same struct.
+        let wasm = &mut self.tool_ctx.wasm;
+        Some(wasm.registry.run_command(&mut *wasm.host, name, arg))
+    }
+
     /// Resolves an unrecognized `/name args` against the user's extensions:
     /// skills first, then prompt templates (issue #67). `None` means no
     /// match — the caller reports an unknown command; `Some(Err)` is a
@@ -5561,20 +5836,21 @@ impl TuiInput {
             stash: String::new(),
             popup: None,
             slash: None,
-            slash_catalog: crate::slashmenu::catalog(&[], &[]),
+            slash_catalog: crate::slashmenu::catalog(&[], &[], &[]),
             worker: None,
             mcp_extra: Vec::new(),
         }
     }
 
-    /// Replaces the `/` menu's candidate list, folding this session's skills
-    /// and templates in beside the built-ins.
+    /// Replaces the `/` menu's candidate list, folding this session's skills,
+    /// templates and WASM commands in beside the built-ins.
     fn set_slash_catalog(
         &mut self,
         skills: &[crate::skills::Skill],
         templates: &[crate::templates::Template],
+        wasm: &[(&str, &crate::wasmreg::CommandSpec)],
     ) {
-        self.slash_catalog = crate::slashmenu::catalog(skills, templates);
+        self.slash_catalog = crate::slashmenu::catalog(skills, templates, wasm);
     }
 
     /// The prompt as the renderer needs it: text, cursor, and selection, all
@@ -6143,7 +6419,11 @@ impl Agent<'_> {
         let rem = ui_remote.as_deref();
         let mut input = TuiInput::new();
         input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
-        input.set_slash_catalog(&self.skills, &self.templates);
+        input.set_slash_catalog(
+            &self.skills,
+            &self.templates,
+            &self.tool_ctx.wasm.registry.commands(),
+        );
         let hist_path = default_history_path();
         input.history.load(&hist_path).ok();
 
@@ -6180,6 +6460,11 @@ impl Agent<'_> {
         // arrive.
         let mut arcade = crate::arcade::Arcade::new();
         let mut arcade_last = Instant::now();
+        // An open WASM frame, and its own frame clock. Kept beside the arcade
+        // rather than inside it: a component is not a face the arcade knows
+        // about, and folding it in would mean `Arcade` holding a registry.
+        let mut wasm_frame: Option<crate::wasmreg::OpenFrame> = None;
+        let mut wasm_frame_last = Instant::now();
         // When the user was last heard from, for `ui.screensaver`. Only real
         // input counts: a poll that times out is exactly the idleness the
         // screensaver is waiting for. A running turn never reaches this loop,
@@ -6245,6 +6530,59 @@ impl Agent<'_> {
                 let dt = arcade_last.elapsed();
                 arcade_last = Instant::now();
                 arcade.step(u64::try_from(dt.as_millis()).unwrap_or(u64::MAX));
+            }
+            // A `/frame <id>` from the last tick's slash handling.
+            // Two ways in: a `/frame` the user typed, or a component's own
+            // command asking to open its frame — which is how one module
+            // holding many faces gives each of them a command.
+            let pending = self
+                .tool_ctx
+                .wasm
+                .pending_open
+                .take()
+                .or_else(|| self.tool_ctx.wasm.registry.take_pending_frame());
+            if let Some((id, face)) = pending {
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                match self.tool_ctx.wasm.open_frame(
+                    &id,
+                    &face,
+                    w,
+                    h.saturating_sub(1),
+                    arcade_seed(),
+                ) {
+                    Ok(open) => {
+                        wasm_frame = Some(open);
+                        wasm_frame_last = Instant::now();
+                        // The component owns the pointer while it is up, for
+                        // the same reason the arcade does.
+                        arcade_hover_reporting(true);
+                    }
+                    Err(e) => log.push_dim(e),
+                }
+            }
+            if let Some(open) = wasm_frame.as_mut() {
+                let dt = wasm_frame_last.elapsed();
+                wasm_frame_last = Instant::now();
+                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
+                let now_ms = u64::try_from(
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_millis()),
+                )
+                .unwrap_or(0);
+                let dt_ms = u64::try_from(dt.as_millis()).unwrap_or(u64::MAX);
+                // A step that fails closes the frame and says why: a
+                // full-screen component that can no longer say what to draw
+                // would otherwise sit there looking like a hang.
+                if let Err(e) =
+                    self.tool_ctx
+                        .wasm
+                        .step_frame(open, dt_ms, w, h.saturating_sub(1), now_ms)
+                {
+                    log.push_dim(e);
+                    wasm_frame = None;
+                    arcade_hover_reporting(false);
+                }
             }
             input.set_mcp_extra(crate::tools::mcp::resource_candidates(&self.tool_ctx.mcp));
             input.pump_popup();
@@ -6329,6 +6667,12 @@ impl Agent<'_> {
                     if arcade.is_open() {
                         tui::draw_arcade(f, &arcade);
                     }
+                    // And a WASM frame covers it in turn — the two are never
+                    // open at once, but ordering them makes that a fact about
+                    // the code rather than an assumption about the callers.
+                    if let Some(open) = &wasm_frame {
+                        tui::draw_wasm_frame(f, open);
+                    }
                     remote_capture(rem, f);
                 })
                 .map_err(|e| e.to_string())?;
@@ -6346,6 +6690,7 @@ impl Agent<'_> {
             // modal is on screen — a screensaver over a dialog would hide a
             // question the user still has to answer.
             if !arcade.is_open()
+                && wasm_frame.is_none()
                 && config_form.is_none()
                 && kv_pane.is_none()
                 && resume_pane.is_none()
@@ -6355,11 +6700,59 @@ impl Agent<'_> {
                 let (w, h) = terminal
                     .size()
                     .map_or((80, 23), |sz| (sz.width, sz.height.saturating_sub(1)));
-                arcade.open_screensaver(arcade_seed(), w, h);
+                // Three cases, in the order a user would expect them to win:
+                // a pinned plugin face, a pinned built-in face, and only then
+                // the random rotation — which is the one place installed
+                // screensavers mix with the faces plank ships.
+                //
+                // The rotation weighs *faces*, not plugins: a component
+                // offering three does not get a third of the rain's share.
+                let seed = arcade_seed();
+                let settings = crate::settings::active();
+                let pinned = settings
+                    .ui
+                    .screensaver_face_plugin
+                    .as_deref()
+                    .and_then(|addr| self.tool_ctx.wasm.resolve_screensaver_face(addr));
+                let chosen = match pinned {
+                    Some(face) => Some(face),
+                    None if settings.ui.screensaver_face
+                        == crate::arcade::ScreensaverFace::Random =>
+                    {
+                        self.tool_ctx
+                            .wasm
+                            .pick_idle_face(seed, crate::arcade::ScreensaverFace::BUILT_IN)
+                    }
+                    // A pinned built-in face: not a rotation, and not this
+                    // code's business.
+                    None => None,
+                };
+                if let Some((id, face)) = chosen {
+                    match self.tool_ctx.wasm.open_frame(&id, &face, w, h, seed) {
+                        Ok(mut open) => {
+                            open.screensaver = true;
+                            wasm_frame = Some(open);
+                            wasm_frame_last = Instant::now();
+                            arcade_hover_reporting(true);
+                            continue;
+                        }
+                        // A component that will not open must not cost the
+                        // user their screensaver: fall through to a face.
+                        Err(e) => log.push_dim(e),
+                    }
+                }
+                arcade.open_screensaver(arcade_seed());
                 arcade_last = Instant::now();
             }
 
-            let poll = if arcade.is_open() {
+            // An open easter egg *or* an open WASM frame wants the shared
+            // animation tick; the idle 200 ms poll renders either at five
+            // frames a second. Worse than the visible stutter: the frame delta
+            // is measured from real elapsed time and then clamped to
+            // `MAX_STEP_MS`, so at that rate half of every second is simply
+            // dropped from the simulation and the motion runs slow as well as
+            // rough.
+            let poll = if arcade.is_open() || wasm_frame.is_some() {
                 Duration::from_millis(crate::anim::TICK_MS)
             } else {
                 Duration::from_millis(200)
@@ -6444,6 +6837,20 @@ impl Agent<'_> {
             // button the user could not see.
             if arcade.is_screensaver() && from_user {
                 arcade.close();
+                continue;
+            }
+            // Same rule for a component the idle rotation put up: any activity
+            // dismisses it, and the waking event is consumed rather than acted
+            // on. A component opened by `/frame` is *not* dismissed here — the
+            // user asked for that one and owns when it closes.
+            if wasm_frame.as_ref().is_some_and(|f| f.screensaver) && from_user {
+                if let Some(open) = &wasm_frame
+                    && let Some(line) = self.tool_ctx.wasm.close_frame(open)
+                {
+                    log.push_dim(line);
+                }
+                wasm_frame = None;
+                arcade_hover_reporting(false);
                 continue;
             }
             // An open easter egg takes the mouse (wheel, click and drag steer
@@ -6601,6 +7008,27 @@ impl Agent<'_> {
                 continue;
             };
             if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // An open component owns every key, on the same terms as the
+            // arcade below it.
+            if let Some(open) = &wasm_frame {
+                let code = tui::key_code_name(key);
+                match self.tool_ctx.wasm.frame_key(open, &code) {
+                    Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                    Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                        if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                            log.push_dim(line);
+                        }
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                    Err(e) => {
+                        log.push_dim(e);
+                        wasm_frame = None;
+                        arcade_hover_reporting(false);
+                    }
+                }
                 continue;
             }
             // An open easter egg owns every key until Esc/q/Ctrl-C closes it.
@@ -7672,6 +8100,7 @@ impl Agent<'_> {
                 //
                 // Blank line first: the footer is a boundary marker, and butted
                 // against the reply's last line it reads as part of it.
+                self.refresh_wasm_segments();
                 log.push_plain("");
                 log.push_spans(vec![ratatui::text::Span::styled(
                     tui::turn_footer(turn_started.elapsed()),
@@ -7687,6 +8116,12 @@ impl Agent<'_> {
                 // Turn over: the front end is back at the prompt.
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
+                // Mirrored from the plain path: a component must not observe a
+                // different number of turns depending on which front end the
+                // user happens to be running. The token count is not available
+                // here — this path reports elapsed time only — so the field is
+                // sent as -1 rather than as a plausible-looking zero.
+                self.fire_turn_end(-1, turn_started.elapsed());
                 return Ok(());
             }
             run_main = !leftover.is_empty();
@@ -7933,7 +8368,7 @@ impl Agent<'_> {
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
             let _ = tx.send(UiEvent::Dim(w));
         }) {
-            let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+            let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
             return Ok(());
         }
         let compact_interrupt =
@@ -8068,7 +8503,7 @@ impl Agent<'_> {
                 }
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
-                    let _ = tx.send(UiEvent::Dim(format!("halted by hook: {reason}")));
+                    let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -8723,11 +9158,10 @@ impl Agent<'_> {
             // the model. They take over the screen until Esc, and resume where
             // they were left unless the argument asks for a new game.
             _ if crate::arcade::enabled() && crate::arcade::Arcade::COMMANDS.contains(&cmd) => {
-                let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                 let fresh = crate::arcade::Arcade::wants_new(arg);
                 let resuming = !fresh && arcade.has_parked(cmd);
                 arcade_hover_reporting(true);
-                arcade.open(cmd, fresh, arcade_seed(), w, h);
+                arcade.open(cmd, fresh, arcade_seed());
                 arcade.sound.set(crate::arcade::Sound::wanted(arg));
                 if resuming {
                     log.push_dim(format!("{cmd}: resumed where you left off"));
@@ -8752,8 +9186,18 @@ impl Agent<'_> {
             "/config" => {
                 // Open the interactive modal; the run loop drives it and
                 // persists on close. `arg` is ignored (the form edits everything).
-                *config_form = Some(crate::configform::ConfigForm::new(
+                // The form cycles through contributed faces as well as the
+                // built-ins, so it is handed what this session actually loaded.
+                let faces = self
+                    .tool_ctx
+                    .wasm
+                    .screensaver_faces()
+                    .into_iter()
+                    .map(|f| f.address)
+                    .collect();
+                *config_form = Some(crate::configform::ConfigForm::with_faces(
                     crate::settings::active().clone(),
+                    faces,
                 ));
             }
             "/new" | "/clear" => {
@@ -9005,8 +9449,13 @@ impl Agent<'_> {
                     log.push_plain(line.to_owned());
                 }
             }
+            "/frame" => {
+                for line in self.frame_command(arg).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
             "/plugins" => {
-                for line in crate::plugins::render_list(&self.tool_ctx.plugins).lines() {
+                for line in self.plugins_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }
@@ -9229,7 +9678,27 @@ impl Agent<'_> {
                     }
                 }
                 Some(Err(e)) => log.push_plain(e),
-                None => log.push_plain(format!("unknown command: {cmd}")),
+                None => match self.wasm_command(cmd, arg) {
+                    Some(Ok(out)) => {
+                        for line in &out.print {
+                            log.push_plain(line.clone());
+                        }
+                        if let Some(text) = out.inject {
+                            input.buf.set_text(text);
+                        }
+                        if let Some(prompt) = out.prompt {
+                            log.push_spans(tui::user_echo_spans(&prompt));
+                            self.session.push(Message::user(prompt));
+                            if let Err(e) =
+                                self.tui_turn(terminal, log, view, input, btw, arcade, sub)
+                            {
+                                log.push_plain(format!("{cmd} failed: {e}"));
+                            }
+                        }
+                    }
+                    Some(Err(e)) => log.push_plain(e),
+                    None => log.push_plain(format!("unknown command: {cmd}")),
+                },
             },
         }
         true
@@ -10147,9 +10616,8 @@ fn busy_ui_loop(
                             let arg = line[cmd.len()..].trim();
                             let fresh = crate::arcade::Arcade::wants_new(arg);
                             let resuming = !fresh && arcade.has_parked(cmd);
-                            let (w, h) = terminal.size().map_or((80, 24), |s| (s.width, s.height));
                             arcade_hover_reporting(true);
-                            arcade.open(cmd, fresh, arcade_seed(), w, h);
+                            arcade.open(cmd, fresh, arcade_seed());
                             arcade.sound.set(crate::arcade::Sound::wanted(arg));
                             arcade.veil();
                             if resuming {
@@ -10390,6 +10858,27 @@ fn new_agent(
     };
     tool_ctx.mcp = mcp;
     contribution_warnings.extend(mcp_warnings);
+    // Before the system prompt is composed, deliberately: a `tool` component
+    // changes the tool list, which changes the prompt, which changes the Tier 1
+    // fingerprint. Activating after that point would build a checkpoint for a
+    // prompt the session does not actually use.
+    {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        let plank_home = home.as_ref().map(|h| h.join(".plank"));
+        let project = tool_ctx.cwd.clone();
+        // Built with the home *before* activation, not after: the runtime is
+        // what owns a component's `state` directory, and a host constructed
+        // without one would leave every component's storage unavailable for
+        // the whole session.
+        tool_ctx.wasm = crate::wasmreg::Session::new(plank_home.as_deref());
+        // A `tool` component adds tool specs to the prompt, so activation is
+        // skipped rather than activated-and-ignored: the host is still built so
+        // component storage is reachable if something asks.
+        if !minimal {
+            let warnings = tool_ctx.wasm.activate(&tool_ctx.plugins.clone(), &project);
+            contribution_warnings.extend(warnings);
+        }
+    }
     tool_ctx.hooks = crate::plugins::hooks_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     for w in &tool_ctx.hooks.warnings {
         eprintln!("{w}");
@@ -10427,11 +10916,23 @@ fn new_agent(
     // whether the name resolves, three call layers below anything that holds
     // the definitions themselves.
     crate::agents::set_roster(&agents);
-    let system = sysprompt::build_system_prompt_parts(
+    // Component tool names are resolved against everything already claimed —
+    // built-ins and MCP — *before* the prompt is composed, because the exposed
+    // name is what goes into it. A rename after this point would put one name
+    // in the prompt and dispatch another.
+    {
+        let taken = sysprompt::tool_names(&tool_ctx.mcp);
+        let warnings = tool_ctx.wasm.registry.resolve_tool_names(&taken);
+        contribution_warnings.extend(warnings);
+    }
+    let wasm_tools = tool_ctx.wasm.registry.tools();
+    let system = sysprompt::build_system_prompt_parts_with_wasm(
         &cfg.system,
         &tool_ctx.mcp,
+        &wasm_tools,
         !crate::settings::active().engine.thinking_tool_calls,
     );
+    drop(wasm_tools);
     // Tell the engine where the trusted control text ends before it tokenizes
     // anything, so `｜DSML｜` in the prompt's examples prefills as the model's
     // own token rather than as spelled-out BPE pieces.

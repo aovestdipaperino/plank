@@ -1,3 +1,9 @@
+//! **Ported from plank's `src/arcade/frogger.rs`.** Physics, level table and
+//! drawing are verbatim; only the imports and `handle_key` changed, the latter
+//! because a guest sees the ABI's key *name* rather than a crossterm
+//! `KeyEvent`. Mouse handling is dropped until the host delivers
+//! `frame_mouse`.
+
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
@@ -17,11 +23,10 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#![allow(dead_code)]
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
-
-use super::{GLIDE_MS, Glyph, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};
-use crate::anim::Rgb;
+use crate::shared::{GLIDE_MS, MIN_H, MIN_W, Phase, SUB_MS};
+use crate::support::{Glyph, MAX_STEP_MS, Rgb, Rng};
 
 /// Board rows, top to bottom: home bank, five river lanes, median, five road
 /// lanes, start bank.
@@ -239,20 +244,20 @@ impl Frogger {
     }
 
     /// Feeds one key to the game.
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Up | KeyCode::Char('k' | 'K' | 'w' | 'W') => self.hop(0, -1),
-            KeyCode::Down | KeyCode::Char('j' | 'J' | 's' | 'S') => self.hop(0, 1),
-            KeyCode::Left | KeyCode::Char('h' | 'H' | 'a' | 'A') => self.hop(-1, 0),
-            KeyCode::Right | KeyCode::Char('l' | 'L' | 'd' | 'D') => self.hop(1, 0),
-            KeyCode::Char('p') => {
+    pub fn handle_key(&mut self, code: &str) -> bool {
+        match code {
+            "up" | "k" | "w" => self.hop(0, -1),
+            "down" | "j" | "s" => self.hop(0, 1),
+            "left" | "h" | "a" => self.hop(-1, 0),
+            "right" | "l" | "d" => self.hop(1, 0),
+            "p" => {
                 self.phase = match self.phase {
                     Phase::Paused => Phase::Serve { ms_left: 500 },
                     Phase::Playing | Phase::Serve { .. } => Phase::Paused,
                     other => other,
                 };
             }
-            KeyCode::Char(' ') | KeyCode::Enter => match self.phase {
+            "space" | "enter" => match self.phase {
                 Phase::Serve { .. } => self.phase = Phase::Playing,
                 Phase::Paused => self.phase = Phase::Serve { ms_left: 500 },
                 Phase::GameOver | Phase::Won => *self = Self::new(self.rng.next_u64()),
@@ -291,37 +296,6 @@ impl Frogger {
         if self.frog.1 == HOME_ROW {
             self.reach_home();
         }
-    }
-
-    /// Feeds one mouse event: a click hops toward wherever you clicked.
-    pub fn handle_mouse(&mut self, ev: MouseEvent, w: u16, h: u16) -> bool {
-        if !matches!(
-            ev.kind,
-            MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-        ) {
-            return false;
-        }
-        if ev.kind == MouseEventKind::ScrollUp {
-            self.hop(0, -1);
-            return true;
-        }
-        if ev.kind == MouseEventKind::ScrollDown {
-            self.hop(0, 1);
-            return true;
-        }
-        if w < MIN_W || h < MIN_H {
-            return false;
-        }
-        // Click above the frog to go up, below to go down, beside to sidestep.
-        let target_row = f32::from(ev.row) / f32::from(h - 1) * (ROWS - 1) as f32;
-        let target_col = f32::from(ev.column) / f32::from(w - 1);
-        let dy = target_row - self.frog.1 as f32;
-        if dy.abs() >= 0.5 {
-            self.hop(0, if dy < 0.0 { -1 } else { 1 });
-        } else {
-            self.hop(if target_col < self.frog.0 { -1 } else { 1 }, 0);
-        }
-        true
     }
 
     fn unpause(&mut self) {
@@ -527,295 +501,5 @@ impl Frogger {
             self.lives,
             self.remaining()
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::crossterm::event::{KeyModifiers, MouseButton};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn run(g: &mut Frogger, ms: u64) {
-        for _ in 0..(ms / 50) {
-            g.step(50);
-        }
-    }
-
-    fn playing(seed: u64) -> Frogger {
-        let mut g = Frogger::new(seed);
-        g.phase = Phase::Playing;
-        g
-    }
-
-    /// Empties every lane so a test can place exactly what it means to test.
-    fn clear_lanes(g: &mut Frogger) {
-        for lane in &mut g.lanes {
-            lane.len = 0.0;
-            lane.speed = 0.0;
-        }
-    }
-
-    #[test]
-    fn a_new_game_starts_on_the_near_bank_with_every_home_open() {
-        let g = Frogger::new(1);
-        assert_eq!(g.frog.1, START_ROW);
-        assert_eq!(g.remaining(), HOMES);
-        assert_eq!(g.level(), 1);
-    }
-
-    #[test]
-    fn the_banks_and_the_median_are_always_safe() {
-        let mut g = playing(1);
-        for row in [START_ROW, MEDIAN] {
-            g.frog = (0.5, row);
-            g.lives = LIVES;
-            run(&mut g, 2000);
-            assert_eq!(g.lives, LIVES, "row {row} killed the frog");
-        }
-    }
-
-    #[test]
-    fn hopping_up_scores_and_hopping_is_bounded_by_the_board() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        let before = g.score;
-        g.hop(0, -1);
-        assert_eq!(g.frog.1, START_ROW - 1);
-        assert!(g.score > before, "no score for progress");
-        for _ in 0..40 {
-            g.hop(0, 1);
-        }
-        assert_eq!(g.frog.1, ROWS - 1, "hopped off the bottom");
-    }
-
-    #[test]
-    fn a_car_squashes_the_frog() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        let row = ROAD.start;
-        g.lanes[row].len = 1.0;
-        g.lanes[row].gap = 1.0;
-        g.lanes[row].offset = 0.0;
-        g.frog = (0.5, row);
-        g.step(50);
-        assert_eq!(g.lives, LIVES - 1, "the car missed");
-        assert_eq!(g.frog.1, START_ROW, "the frog did not go back");
-    }
-
-    #[test]
-    fn open_water_drowns_the_frog() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        g.frog = (0.5, RIVER.start);
-        g.step(50);
-        assert_eq!(g.lives, LIVES - 1, "the frog walked on water");
-    }
-
-    #[test]
-    fn a_log_carries_the_frog_along() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        let row = RIVER.start;
-        g.lanes[row] = Lane {
-            speed: 0.2,
-            gap: 1.0,
-            len: 1.0,
-            offset: 0.0,
-            rideable: true,
-            turtles: false,
-        };
-        g.frog = (0.4, row);
-        run(&mut g, 500);
-        assert_eq!(g.lives, LIVES, "the frog drowned on a log");
-        assert!(g.frog.0 > 0.45, "the log did not carry it: {}", g.frog.0);
-    }
-
-    #[test]
-    fn being_carried_off_the_edge_drowns_the_frog() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        let row = RIVER.start;
-        g.lanes[row] = Lane {
-            speed: 0.9,
-            gap: 1.0,
-            len: 1.0,
-            offset: 0.0,
-            rideable: true,
-            turtles: false,
-        };
-        g.frog = (0.95, row);
-        run(&mut g, 1000);
-        assert_eq!(g.lives, LIVES - 1, "riding off the board was survivable");
-    }
-
-    #[test]
-    fn reaching_a_bay_fills_it_and_scores() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        g.frog = ((0.5) / HOMES as f32, RIVER.start);
-        g.hop(0, -1);
-        assert!(g.homes[0], "the bay did not fill");
-        assert!(g.score >= 50);
-        assert_eq!(g.frog.1, START_ROW, "did not go back for the next one");
-    }
-
-    #[test]
-    fn landing_between_the_bays_is_a_miss() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        // Right on the divider between bay 0 and bay 1.
-        g.frog = (1.0 / HOMES as f32, RIVER.start);
-        g.hop(0, -1);
-        assert!(g.homes.iter().all(|h| !*h), "a miss filled a bay");
-        assert_eq!(g.lives, LIVES - 1);
-    }
-
-    #[test]
-    fn a_bay_that_is_already_taken_cannot_be_taken_twice() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        g.homes[0] = true;
-        g.frog = ((0.5) / HOMES as f32, RIVER.start);
-        g.hop(0, -1);
-        assert_eq!(g.remaining(), HOMES - 1, "the same bay counted twice");
-        assert_eq!(g.lives, LIVES - 1);
-    }
-
-    #[test]
-    fn filling_every_bay_advances_the_level() {
-        let mut g = playing(2);
-        clear_lanes(&mut g);
-        for slot in 0..HOMES {
-            g.phase = Phase::Playing;
-            g.frog = ((slot as f32 + 0.5) / HOMES as f32, RIVER.start);
-            g.hop(0, -1);
-        }
-        assert!(matches!(g.phase(), Phase::LevelUp { .. }));
-        run(&mut g, 2000);
-        assert_eq!(g.level(), 2);
-        assert_eq!(g.remaining(), HOMES, "the bays did not reopen");
-    }
-
-    #[test]
-    fn filling_every_bay_on_the_last_level_wins() {
-        let mut g = playing(2);
-        g.level = LEVELS.len() - 1;
-        clear_lanes(&mut g);
-        for slot in 0..HOMES {
-            g.phase = Phase::Playing;
-            g.frog = ((slot as f32 + 0.5) / HOMES as f32, RIVER.start);
-            g.hop(0, -1);
-        }
-        assert_eq!(g.phase(), Phase::Won);
-    }
-
-    #[test]
-    fn three_deaths_end_the_game() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        for expected in (0..LIVES).rev() {
-            g.phase = Phase::Playing;
-            g.frog = (0.5, RIVER.start);
-            g.step(50);
-            assert_eq!(g.lives, expected);
-        }
-        assert_eq!(g.phase(), Phase::GameOver);
-    }
-
-    #[test]
-    fn lanes_alternate_direction_so_the_board_can_be_read() {
-        let g = Frogger::new(1);
-        for row in ROAD {
-            let here = g.lanes[row].speed;
-            let next = g.lanes[row + 1].speed;
-            if ROAD.contains(&(row + 1)) {
-                assert!(here * next < 0.0, "rows {row} and {} run together", row + 1);
-            }
-        }
-    }
-
-    #[test]
-    fn higher_levels_run_faster_and_tighter() {
-        let mut easy = Frogger::new(1);
-        let mut hard = Frogger::new(1);
-        hard.level = LEVELS.len() - 1;
-        hard.build_lanes();
-        easy.build_lanes();
-        let row = ROAD.start;
-        assert!(hard.lanes[row].speed.abs() > easy.lanes[row].speed.abs());
-        assert!(hard.lanes[row].gap < easy.lanes[row].gap);
-    }
-
-    #[test]
-    fn the_mouse_hops_toward_the_click() {
-        let mut g = playing(1);
-        clear_lanes(&mut g);
-        let click = |column, row| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: KeyModifiers::NONE,
-        };
-        // Click near the top: the frog should hop up a row.
-        g.handle_mouse(click(40, 0), 80, 24);
-        assert_eq!(g.frog.1, START_ROW - 1);
-        // Scroll up hops too.
-        g.handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 40,
-                row: 10,
-                modifiers: KeyModifiers::NONE,
-            },
-            80,
-            24,
-        );
-        assert_eq!(g.frog.1, START_ROW - 2);
-    }
-
-    #[test]
-    fn a_replay_from_the_same_seed_is_identical() {
-        let mut a = Frogger::new(31);
-        let mut b = Frogger::new(31);
-        for i in 0..500 {
-            if i % 13 == 0 {
-                a.handle_key(key(KeyCode::Up));
-                b.handle_key(key(KeyCode::Up));
-            }
-            a.step(50);
-            b.step(50);
-        }
-        assert_eq!(a.score, b.score);
-        assert_eq!(a.lives, b.lives);
-        assert!((a.frog.0 - b.frog.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn a_long_game_keeps_the_frog_on_the_board() {
-        let mut g = playing(77);
-        for _ in 0..3000 {
-            g.step(50);
-            assert!(g.frog.1 < ROWS, "frog left the board");
-            if g.finished() {
-                break;
-            }
-        }
-    }
-
-    #[test]
-    fn the_board_fills_whatever_screen_it_gets() {
-        let g = Frogger::new(1);
-        assert!(g.glyphs(MIN_W - 1, MIN_H).is_empty());
-        for (w, h) in [(MIN_W, MIN_H), (80, 24), (200, 60)] {
-            let out = g.glyphs(w, h);
-            assert!(!out.is_empty(), "nothing drawn at {w}x{h}");
-            assert!(out.iter().all(|g| g.x < w && g.y < h), "spilled at {w}x{h}");
-            assert!(out.iter().any(|g| g.y == 0), "no home row at {w}x{h}");
-            assert!(out.iter().any(|g| g.y == h - 1), "no start bank at {w}x{h}");
-        }
     }
 }

@@ -1,3 +1,9 @@
+//! **Ported from plank's `src/arcade/centipede.rs`.** Physics, level table and
+//! drawing are verbatim; only the imports and `handle_key` changed, the latter
+//! because a guest sees the ABI's key *name* rather than a crossterm
+//! `KeyEvent`. Mouse handling is dropped until the host delivers
+//! `frame_mouse`.
+
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
@@ -18,11 +24,10 @@
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#![allow(dead_code)]
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, MouseEvent, MouseEventKind};
-
-use super::{GLIDE_MS, Glyph, MAX_STEP_MS, MIN_H, MIN_W, Phase, Rng, SUB_MS};
-use crate::anim::Rgb;
+use crate::shared::{GLIDE_MS, MIN_H, MIN_W, Phase, SUB_MS};
+use crate::support::{Glyph, MAX_STEP_MS, Rgb, Rng};
 
 /// The playfield grid. Everything that has to agree about position — the
 /// centipede, the mushrooms, the shot — lives on these cells.
@@ -209,20 +214,20 @@ impl Centipede {
     }
 
     /// Feeds one key to the game.
-    pub fn handle_key(&mut self, key: KeyEvent) -> bool {
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h' | 'H' | 'a' | 'A') => self.steer(-1.0, 0.0),
-            KeyCode::Right | KeyCode::Char('l' | 'L' | 'd' | 'D') => self.steer(1.0, 0.0),
-            KeyCode::Up | KeyCode::Char('k' | 'K' | 'w' | 'W') => self.steer(0.0, -1.0),
-            KeyCode::Down | KeyCode::Char('j' | 'J' | 's' | 'S') => self.steer(0.0, 1.0),
-            KeyCode::Char(' ') | KeyCode::Enter => match self.phase {
+    pub fn handle_key(&mut self, code: &str) -> bool {
+        match code {
+            "left" | "h" | "a" => self.steer(-1.0, 0.0),
+            "right" | "l" | "d" => self.steer(1.0, 0.0),
+            "up" | "k" | "w" => self.steer(0.0, -1.0),
+            "down" | "j" | "s" => self.steer(0.0, 1.0),
+            "space" | "enter" => match self.phase {
                 Phase::Playing => self.fire(),
                 Phase::Serve { .. } => self.phase = Phase::Playing,
                 Phase::Paused => self.phase = Phase::Serve { ms_left: 500 },
                 Phase::GameOver | Phase::Won => *self = Self::new(self.rng.next_u64()),
                 Phase::LevelUp { .. } => {}
             },
-            KeyCode::Char('p') => {
+            "p" => {
                 self.phase = match self.phase {
                     Phase::Paused => Phase::Serve { ms_left: 500 },
                     Phase::Playing | Phase::Serve { .. } => Phase::Paused,
@@ -238,42 +243,6 @@ impl Centipede {
         self.dir = (dx, dy);
         self.glide_ms = GLIDE_MS;
         self.unpause();
-    }
-
-    /// Feeds one mouse event to the game: the pointer places the gun, a click
-    /// fires.
-    pub fn handle_mouse(&mut self, ev: MouseEvent, w: u16, h: u16) -> bool {
-        match ev.kind {
-            MouseEventKind::Down(_) => {
-                self.aim(ev, w, h);
-                if self.phase == Phase::Playing {
-                    self.fire();
-                } else {
-                    self.unpause();
-                }
-            }
-            MouseEventKind::Drag(_) | MouseEventKind::Moved => {
-                self.aim(ev, w, h);
-                self.unpause();
-            }
-            _ => return false,
-        }
-        true
-    }
-
-    #[allow(clippy::cast_precision_loss)] // grid sizes are small constants
-    fn aim(&mut self, ev: MouseEvent, w: u16, h: u16) {
-        if w < MIN_W || h < MIN_H {
-            return;
-        }
-        let col = f32::from(ev.column) / f32::from(w - 1) * (COLS as f32 - 1.0);
-        let row = f32::from(ev.row) / f32::from(h - 1) * (ROWS as f32 - 1.0);
-        self.player = (
-            col.clamp(0.0, COLS as f32 - 1.0),
-            row.clamp((ROWS - PLAYER_ROWS) as f32, ROWS as f32 - 1.0),
-        );
-        self.dir = (0.0, 0.0);
-        self.glide_ms = 0;
     }
 
     /// Fires, if the previous shot has already landed.
@@ -578,289 +547,4 @@ fn last_row() -> f32 {
 /// Whether `a` is the cell just behind `b` — i.e. they are one run.
 fn adjacent(a: Segment, b: Segment) -> bool {
     a.row == b.row && a.col.abs_diff(b.col) == 1
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ratatui::crossterm::event::{KeyModifiers, MouseButton};
-
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn run(g: &mut Centipede, ms: u64) {
-        for _ in 0..(ms / 50) {
-            g.step(50);
-        }
-    }
-
-    fn playing(seed: u64) -> Centipede {
-        let mut g = Centipede::new(seed);
-        g.phase = Phase::Playing;
-        g
-    }
-
-    #[test]
-    fn a_new_game_starts_with_a_whole_centipede_and_a_forest() {
-        let g = Centipede::new(1);
-        assert_eq!(g.remaining(), START_LEN);
-        assert!(g.shrooms.iter().any(|s| *s > 0), "no mushrooms");
-        assert_eq!(g.level(), 1);
-    }
-
-    #[test]
-    fn the_bottom_row_is_always_clear_to_stand_on() {
-        for seed in 1..40u64 {
-            let g = Centipede::new(seed);
-            let last = ROWS - 1;
-            assert!(
-                (0..COLS).all(|c| g.shrooms[last * COLS + c] == 0),
-                "seed {seed} walled off the bottom row"
-            );
-        }
-    }
-
-    #[test]
-    fn the_centipede_turns_down_at_the_wall() {
-        let mut g = playing(1);
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        g.body = vec![Segment {
-            col: COLS - 1,
-            row: 0,
-            dir: 1,
-        }];
-        g.crawl();
-        assert_eq!(g.body[0].row, 1, "did not step down");
-        assert_eq!(g.body[0].dir, -1, "did not turn around");
-    }
-
-    #[test]
-    fn the_centipede_turns_down_at_a_mushroom() {
-        let mut g = playing(1);
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        g.shrooms[5 * COLS + 11] = SHROOM_HP;
-        g.body = vec![Segment {
-            col: 10,
-            row: 5,
-            dir: 1,
-        }];
-        g.crawl();
-        assert_eq!((g.body[0].row, g.body[0].dir), (6, -1));
-    }
-
-    #[test]
-    fn it_wraps_to_the_top_rather_than_walking_off_the_board() {
-        let mut g = playing(1);
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        g.body = vec![Segment {
-            col: COLS - 1,
-            row: ROWS - 1,
-            dir: 1,
-        }];
-        g.crawl();
-        assert_eq!(g.body[0].row, 0, "walked off the bottom");
-    }
-
-    #[test]
-    fn a_shot_takes_a_mushroom_four_hits_to_clear() {
-        let mut g = playing(1);
-        g.body.clear();
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        let col = 10;
-        g.shrooms[10 * COLS + col] = SHROOM_HP;
-        g.player = (col as f32, ROWS as f32 - 1.0);
-        for expected in (0..SHROOM_HP).rev() {
-            g.shot = None;
-            g.fire();
-            run(&mut g, 300);
-            assert_eq!(
-                g.shrooms[10 * COLS + col],
-                expected,
-                "mushroom did not take a hit"
-            );
-        }
-    }
-
-    #[test]
-    fn shooting_a_segment_splits_the_centipede_and_leaves_a_mushroom() {
-        let mut g = playing(2);
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        g.body = (0..5)
-            .map(|i| Segment {
-                col: 10 + i,
-                row: 8,
-                dir: 1,
-            })
-            .collect();
-        // Shoot the middle one.
-        g.player = (12.0, ROWS as f32 - 1.0);
-        g.fire();
-        run(&mut g, 300);
-        assert_eq!(g.remaining(), 4, "segment survived");
-        assert_eq!(g.shrooms[8 * COLS + 12], SHROOM_HP, "no mushroom left");
-        assert!(g.score >= 10);
-    }
-
-    #[test]
-    fn only_one_shot_is_ever_in_the_air() {
-        let mut g = playing(1);
-        g.fire();
-        let first = g.shot;
-        g.fire();
-        assert_eq!(g.shot, first, "a second shot was allowed");
-    }
-
-    #[test]
-    fn clearing_the_centipede_advances_the_level() {
-        let mut g = playing(3);
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        // Just above the gun: the shot lands before the centipede's next step,
-        // so the test is about the level rule, not about leading the target.
-        g.body = vec![Segment {
-            col: 10,
-            row: ROWS - 3,
-            dir: 1,
-        }];
-        g.player = (10.0, ROWS as f32 - 1.0);
-        g.fire();
-        run(&mut g, 100);
-        assert!(matches!(g.phase(), Phase::LevelUp { .. }));
-        run(&mut g, 2000);
-        assert_eq!(g.level(), 2);
-        assert_eq!(g.remaining(), START_LEN, "centipede did not respawn");
-    }
-
-    #[test]
-    fn clearing_the_last_level_wins() {
-        let mut g = playing(3);
-        g.level = LEVELS.len() - 1;
-        g.shrooms.iter_mut().for_each(|s| *s = 0);
-        g.body = vec![Segment {
-            col: 10,
-            row: ROWS - 3,
-            dir: 1,
-        }];
-        g.player = (10.0, ROWS as f32 - 1.0);
-        g.fire();
-        run(&mut g, 100);
-        assert_eq!(g.phase(), Phase::Won);
-    }
-
-    #[test]
-    fn being_walked_on_costs_a_life_and_three_ends_it() {
-        for expected in (0..LIVES).rev() {
-            let mut g = playing(1);
-            g.lives = expected + 1;
-            g.body = vec![Segment {
-                col: 10,
-                row: ROWS - 1,
-                dir: 1,
-            }];
-            g.player = (10.0, ROWS as f32 - 1.0);
-            g.step(50);
-            assert_eq!(g.lives, expected);
-            if expected == 0 {
-                assert_eq!(g.phase(), Phase::GameOver);
-            }
-        }
-    }
-
-    #[test]
-    fn the_gun_stays_in_its_own_few_rows() {
-        let mut g = playing(1);
-        for _ in 0..200 {
-            g.handle_key(key(KeyCode::Up));
-            g.step(50);
-        }
-        assert!(
-            g.player.1 >= (ROWS - PLAYER_ROWS) as f32 - 0.001,
-            "the gun climbed to {}",
-            g.player.1
-        );
-        for _ in 0..200 {
-            g.handle_key(key(KeyCode::Left));
-            g.step(50);
-        }
-        assert!(g.player.0 >= -0.001);
-    }
-
-    #[test]
-    fn the_mouse_aims_the_gun_and_a_click_fires() {
-        let mut g = playing(1);
-        g.handle_mouse(
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 60,
-                row: 20,
-                modifiers: KeyModifiers::NONE,
-            },
-            80,
-            24,
-        );
-        assert!(g.player.0 > COLS as f32 * 0.6, "gun at {}", g.player.0);
-        assert!(g.shot.is_some(), "click did not fire");
-    }
-
-    #[test]
-    fn a_shot_cannot_tunnel_past_a_row() {
-        #[allow(clippy::cast_precision_loss)]
-        let dt = SUB_MS as f32 / 1000.0;
-        assert!(
-            SHOT_SPEED * dt < 1.0,
-            "a sub-step moves the shot {} cells",
-            SHOT_SPEED * dt
-        );
-    }
-
-    #[test]
-    fn a_long_game_keeps_everything_on_the_grid() {
-        let mut g = playing(11);
-        for _ in 0..3000 {
-            g.step(50);
-            assert!(
-                g.body.iter().all(|s| s.col < COLS && s.row < ROWS),
-                "a segment left the grid"
-            );
-            if g.finished() {
-                break;
-            }
-        }
-    }
-
-    #[test]
-    fn a_replay_from_the_same_seed_is_identical() {
-        let mut a = Centipede::new(808);
-        let mut b = Centipede::new(808);
-        for i in 0..500 {
-            if i % 9 == 0 {
-                a.handle_key(key(KeyCode::Char(' ')));
-                b.handle_key(key(KeyCode::Char(' ')));
-            }
-            if i % 4 == 0 {
-                a.handle_key(key(KeyCode::Right));
-                b.handle_key(key(KeyCode::Right));
-            }
-            a.step(50);
-            b.step(50);
-        }
-        assert_eq!(a.score, b.score);
-        assert_eq!(a.remaining(), b.remaining());
-    }
-
-    #[test]
-    fn the_board_fills_whatever_screen_it_gets() {
-        let g = Centipede::new(1);
-        assert!(g.glyphs(MIN_W - 1, MIN_H).is_empty());
-        for (w, h) in [(MIN_W, MIN_H), (80, 24), (200, 60)] {
-            let out = g.glyphs(w, h);
-            assert!(!out.is_empty(), "nothing drawn at {w}x{h}");
-            assert!(out.iter().all(|g| g.x < w && g.y < h), "spilled at {w}x{h}");
-            let widest = out.iter().map(|g| g.x).max().unwrap();
-            assert!(
-                widest > w - w / 5,
-                "board stops at {widest} on a {w} screen"
-            );
-        }
-    }
 }

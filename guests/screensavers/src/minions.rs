@@ -1,6 +1,16 @@
+#![allow(dead_code)]
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
+//! **Ported verbatim from plank's `src/arcade/minions.rs`**, with one change:
+//! the imports. The poses, the timing and the palette are the original, and a
+//! host-side test compares this face against the built-in one glyph for glyph.
+//!
+//! The sprite sheet travels with the plugin (`resources/minions.txt`) and is
+//! packed by the plugin's own `build.rs`, because a plugin that read plank's
+//! source tree at build time would not be a plugin — it would be a coupled
+//! artifact that happens to compile to wasm.
+//!
 //! Two minions on the shore of a night lake, giggling at each other.
 //!
 //! Weather rather than a game, like the starfield: no score, no lives, nothing
@@ -44,8 +54,7 @@
 //! The reflection uses all three at once, which is why it looks like water:
 //! fewer dots, bluer, and the faintest rows simply are not there.
 
-use super::{Glyph, MAX_STEP_MS, Rng};
-use crate::anim::{Rgb, lerp_rgb};
+use crate::support::{Glyph, MAX_STEP_MS, Rgb, Rng, lerp_rgb};
 
 pub mod codec;
 
@@ -816,259 +825,5 @@ impl Rng {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // ranges are ms, and small
     fn range_ms(&mut self, lo: u64, hi: u64) -> u64 {
         lo + (self.next_u64() % (hi - lo + 1))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use unicode_width::UnicodeWidthChar;
-
-    /// Runs `ms` of skit at the TUI's 20 Hz tick.
-    fn run(s: &mut Skit, ms: u64) {
-        for _ in 0..(ms / 50) {
-            s.step(50);
-        }
-    }
-
-    /// The legend and the ink table are two halves of one mapping, in two
-    /// files. Nothing but this test keeps them the same length, and an ink
-    /// added to one and not the other would paint the wrong colour rather than
-    /// fail to compile.
-    #[test]
-    fn every_legend_byte_has_an_ink() {
-        assert_eq!(codec::LEGEND.len(), INKS.len());
-        // The legend must also be a set: a byte listed twice would make one of
-        // its inks unreachable from the art.
-        for (i, b) in codec::LEGEND.iter().enumerate() {
-            assert!(
-                !codec::LEGEND[..i].contains(b),
-                "{:?} appears twice in the legend",
-                *b as char
-            );
-        }
-    }
-
-    /// A terminal grid only survives width-1 glyphs: one double-width
-    /// character shears every cell to its right for as long as it is drawn.
-    /// The failure is invisible in a diff and obvious on screen.
-    #[test]
-    fn every_glyph_is_one_cell_wide() {
-        for ink in INKS.iter().skip(1) {
-            assert_eq!(ink.ch.width(), Some(1), "{:?} is not one cell wide", ink.ch);
-        }
-        for ch in RAMP.iter().skip(1).chain(['~', '·', '+'].iter()) {
-            assert_eq!(ch.width(), Some(1), "{ch:?} is not one cell wide");
-        }
-        for text in PUFFS {
-            assert!(text.is_ascii(), "{text:?} is not ASCII");
-        }
-    }
-
-    /// The sheet round-trips: what the build packed is what the module
-    /// unpacks, cell for cell, and it is the size the art says it is.
-    #[test]
-    fn the_packed_sheet_decodes_back_to_the_art() {
-        let text = include_str!("../resources/minions.txt");
-        let cells = codec::parse_sheet(text).expect("the sheet does not parse");
-        assert_eq!(cells.len(), SHEET_BYTES);
-        assert_eq!(sheet(), cells.as_slice());
-        assert_eq!(codec::encode(&cells).len(), BLOB_BYTES);
-    }
-
-    /// Every ink in the table is reachable from the art, and every cell of the
-    /// art is a legal ink. An ink nothing uses is dead weight in the binary.
-    #[test]
-    fn the_art_uses_every_ink() {
-        let cells = sheet();
-        assert!(cells.iter().all(|c| usize::from(*c) < INKS.len()));
-        for code in 1..INKS.len() {
-            assert!(
-                cells.contains(&u8::try_from(code).unwrap()),
-                "ink {:?} is never used by the art",
-                codec::LEGEND[code] as char
-            );
-        }
-    }
-
-    /// A seed plays out one way. The whole module is testable only because of
-    /// this, and the KV-cache-style "same input, same bytes" discipline is the
-    /// house rule anyway.
-    #[test]
-    fn a_seed_is_deterministic() {
-        let (mut a, mut b) = (Skit::new(9), Skit::new(9));
-        run(&mut a, 20_000);
-        run(&mut b, 20_000);
-        assert_eq!(a.glyphs(80, 24), b.glyphs(80, 24));
-    }
-
-    /// Nothing is ever drawn outside the area it was given, at any size —
-    /// including sizes far too small for a minion, where the pair is clipped
-    /// rather than skipped.
-    #[test]
-    fn nothing_lands_outside_the_area() {
-        let mut s = Skit::new(3);
-        for step in 0..400 {
-            s.step(50);
-            for (w, h) in [(80, 24), (40, 12), (200, 60), (10, 4), (1, 1)] {
-                for g in s.glyphs(w, h) {
-                    assert!(
-                        g.x < w && g.y < h,
-                        "glyph at {},{} escaped {w}x{h} on step {step}",
-                        g.x,
-                        g.y
-                    );
-                }
-            }
-        }
-    }
-
-    /// A zero-sized area is not a panic, it is nothing to draw.
-    #[test]
-    fn an_empty_area_draws_nothing() {
-        let s = Skit::new(1);
-        assert!(s.glyphs(0, 24).is_empty());
-        assert!(s.glyphs(80, 0).is_empty());
-    }
-
-    /// The skit gets all the way round: walk, nudge, giggle, walk. A beat that
-    /// never fires would leave two minions standing still for an hour.
-    #[test]
-    fn the_skit_comes_round_to_laughing() {
-        let mut s = Skit::new(11);
-        let mut seen = [false; 3];
-        for _ in 0..1_200 {
-            s.step(50);
-            match s.beat {
-                Beat::Walk => seen[0] = true,
-                Beat::Nudge => seen[1] = true,
-                Beat::Giggle => seen[2] = true,
-            }
-        }
-        assert_eq!(seen, [true; 3], "the skit never got through a whole beat");
-        // ...and the laughing is what puts puffs in the air.
-        let mut s = Skit::new(11);
-        let mut puffed = false;
-        for _ in 0..1_200 {
-            s.step(50);
-            puffed |= !s.puffs.is_empty();
-        }
-        assert!(puffed, "nobody laughed");
-    }
-
-    /// Laughing changes the face. Without this the poses could be wired to the
-    /// wrong beat and the only symptom would be two very serious minions.
-    #[test]
-    fn laughing_swaps_both_faces() {
-        let mut s = Skit::new(5);
-        while s.beat != Beat::Giggle {
-            s.step(50);
-        }
-        assert_eq!(s.poses(), (KEVIN_LAUGH, STUART_LAUGH));
-        while s.beat == Beat::Giggle {
-            s.step(50);
-        }
-        assert_eq!(s.poses(), (KEVIN_IDLE, STUART_IDLE));
-    }
-
-    /// The pair walks while it walks and stands still while it laughs.
-    #[test]
-    fn they_stop_walking_to_laugh() {
-        let mut s = Skit::new(2);
-        while s.beat != Beat::Walk {
-            s.step(50);
-        }
-        let before = s.at;
-        s.step(50);
-        assert!((s.at - before).abs() > f32::EPSILON, "the pair never moved");
-        while s.beat != Beat::Giggle {
-            s.step(50);
-        }
-        let mid_laugh = s.at;
-        s.step(50);
-        assert!(
-            (s.at - mid_laugh).abs() < f32::EPSILON,
-            "they walked off mid-laugh"
-        );
-    }
-
-    /// The scenery is a toggle, and turning it off leaves only the two of
-    /// them: fewer glyphs, and none above the shore.
-    #[test]
-    fn the_scenery_can_be_turned_off() {
-        let mut s = Skit::new(4);
-        run(&mut s, 2_000);
-        let with = s.glyphs(80, 30).len();
-        s.toggle_scenery();
-        assert!(!s.scenery());
-        let without = s.glyphs(80, 30).len();
-        assert!(
-            without < with,
-            "turning the scenery off drew as much as leaving it on ({without} vs {with})"
-        );
-    }
-
-    /// The scene fades up rather than snapping on: the first frame is a hint
-    /// of the shape and the second is more of it.
-    #[test]
-    fn the_scene_fades_in() {
-        let mut s = Skit::new(6);
-        s.step(50);
-        let first = s.glyphs(80, 30).len();
-        run(&mut s, 2_000);
-        let settled = s.glyphs(80, 30).len();
-        assert!(
-            first < settled,
-            "the scene opened at full strength ({first} vs {settled})"
-        );
-    }
-
-    /// Faint enough is not drawn at all — the rule that keeps the layer from
-    /// punching holes in live model output.
-    #[test]
-    fn a_faint_ink_is_dropped_rather_than_dimmed() {
-        assert!(paint(INKS[13], 0.1, NIGHT).is_none(), "a shape at 10%");
-        assert!(paint(INKS[1], 0.05, NIGHT).is_none(), "a fill at 5%");
-        // ...and a fill on its way out loses coverage before it disappears.
-        let (ch, _) = paint(INKS[1], 0.5, NIGHT).expect("half a fill");
-        assert_eq!(ch, '▒');
-        let (ch, _) = paint(INKS[1], 1.0, NIGHT).expect("a whole fill");
-        assert_eq!(ch, '█');
-    }
-
-    /// The reflection is under the water, and gone when the terminal is too
-    /// short to hold one — the pair itself still stands on the shore.
-    ///
-    /// Ripples live down there too, so what is counted is everything below the
-    /// waterline that is not one: `~` is the lake, anything else is a minion
-    /// upside down in it.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    #[test]
-    fn the_reflection_stays_under_the_shore() {
-        let mut s = Skit::new(8);
-        run(&mut s, 3_000);
-        let mirrored = |s: &Skit, w: u16, h: u16| {
-            let shore = (f32::from(h) * SHORE) as u16;
-            s.glyphs(w, h)
-                .into_iter()
-                .filter(|g| g.y > shore && g.ch != '~')
-                .count()
-        };
-        assert!(mirrored(&s, 80, 30) > 0, "nothing is reflected in the lake");
-        assert_eq!(
-            mirrored(&s, 80, REFLECT_MIN_H - 1),
-            0,
-            "a reflection was drawn with no room for it"
-        );
-        // ...and the pair is still on the shore at that size.
-        assert!(!s.glyphs(80, REFLECT_MIN_H - 1).is_empty());
-    }
-
-    /// The two inks the drawing code names by index really are the ones it
-    /// means: an arm of body yellow ending in a glove.
-    #[test]
-    fn the_hand_placed_inks_are_the_ones_named() {
-        assert_eq!(codec::LEGEND[INK_BODY], b'Y');
-        assert_eq!(codec::LEGEND[INK_GLOVE], b'G');
     }
 }

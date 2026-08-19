@@ -9,7 +9,7 @@ license = "MIT"
 keywords = ["agent", "llm", "tui", "macos"]
 categories = ["command-line-utilities"]
 rust-version = "1.93"
-exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf"]
+exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
 default = ["use_obscura", "builtin_editor", "docparse", "images"]
@@ -40,6 +40,14 @@ builtin_editor = ["dep:edit", "dep:stdext"]
 # build of libtesseract; disable with `--no-default-features` to get the old
 # behaviour (a PDF reads as bytes).
 docparse = ["dep:liteparse", "dep:tokio"]
+# WASM plugins (docs/WASM-PLUGINS.md), off by default and feasibility-stage.
+# Brings in Extism, and through it wasmtime's cranelift backend — the heaviest
+# dependency in the tree by a wide margin — so the default build stays free of
+# it and CI's default path never compiles it. Everything behind this flag sits
+# under the `WasmHost` trait, whose no-op implementation is what the rest of
+# plank talks to when the feature is off: the same shape as `Engine`/
+# `EchoEngine`, and for the same reason.
+plugins = ["dep:extism"]
 
 [dependencies]
 libc = "0.2"
@@ -85,6 +93,15 @@ liteparse = { version = "=2.10", optional = true }
 # scratch arenas the buffer and TUI allocate from.
 edit = { path = "refs/edit/crates/edit", optional = true }
 stdext = { path = "refs/edit/crates/stdext", optional = true }
+# WASM plugin runtime (feature `plugins`). Extism's `http`, `register-http`
+# and `register-filesystem` defaults are dropped: they would give every plugin
+# a network and loader path that the capability model says must be granted
+# per-plugin, never by the runtime's own default. `wasmtime-default-features`
+# must stay on — it is what carries the cranelift backend, and without it
+# extism itself does not compile.
+extism = { version = "1.30", default-features = false, features = [
+    "wasmtime-default-features",
+], optional = true }
 
 [lints.rust]
 missing_debug_implementations = "warn"

@@ -32,15 +32,11 @@
 //! alongside the first.
 
 pub mod breakout;
-pub mod centipede;
-pub mod frogger;
-pub mod invaders;
 pub mod matrix;
-pub mod minions;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
 
-use crate::anim::{Rgb, lerp_rgb};
+use crate::anim::Rgb;
 
 /// One character to paint, in the arcade's own coordinate space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,201 +111,6 @@ impl Rng {
     /// Next value in `[lo, hi)`.
     pub fn range(&mut self, lo: f32, hi: f32) -> f32 {
         lo + (hi - lo) * self.next_f32()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Starfield
-// ---------------------------------------------------------------------------
-
-/// Depth at which a star has passed the viewer and is recycled.
-const Z_NEAR: f32 = 0.12;
-/// Depth a star is (re)born at.
-const Z_FAR: f32 = 1.0;
-/// Vertical squash of the projection.
-///
-/// Terminal cells are roughly twice as tall as they are wide, so the vertical
-/// axis is halved to keep the outward rush radial instead of egg-shaped.
-const CELL_ASPECT: f32 = 0.5;
-/// Half-height of the spawn box, pre-squash.
-///
-/// The squash is applied on the way to the screen, so spawning `y` in the same
-/// `[-1, 1]` as `x` would land every new star in the middle half of the frame
-/// and leave visible dead bands along the top and bottom edges. Widening the
-/// box by exactly the inverse of the squash makes the projected sky uniform.
-const Y_SPAWN: f32 = 1.0 / CELL_ASPECT;
-/// Brightness ramp, dimmest (far) to brightest (near).
-const STAR_RAMP: [char; 8] = ['.', '.', '·', '·', '+', '*', 'o', '@'];
-/// Color of the most distant stars.
-const STAR_FAR: Rgb = (56, 64, 104);
-/// Color of a star about to sweep past the viewer.
-const STAR_NEAR: Rgb = (255, 255, 255);
-/// Slowest and fastest travel, in depth units per second.
-const SPEED_MIN: f32 = 0.08;
-const SPEED_MAX: f32 = 3.0;
-/// Default travel: already clearly in motion when the sky opens.
-const SPEED_DEFAULT: f32 = 0.9;
-/// How much of a star's recent path is drawn behind it, in seconds.
-///
-/// This is what turns points into streaks. Because it multiplies the star's
-/// own speed, the whole sky stretches when the speed goes up — the jump to
-/// lightspeed — and collapses back to points when it comes down.
-const TRAIL_SECONDS: f32 = 0.24;
-/// How far the streak dims from head to tail, as a fraction of the head.
-const TRAIL_FADE: f32 = 0.8;
-/// Longest streak drawn, in cells. Bounds the per-star cost on a huge screen.
-const MAX_TRAIL: f32 = 48.0;
-
-/// One star in normalized eye space: `x`/`y` in `[-1, 1]`, `z` in `(0, 1]`.
-#[derive(Debug, Clone, Copy)]
-struct Star {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-/// A perspective starfield that rushes outward past the edges of the screen.
-///
-/// Each star travels straight toward the viewer (`z` shrinking); the
-/// projection `x / z` makes it accelerate off the edge, which is the whole
-/// effect. A star is recycled once it passes the viewer *or* leaves the frame,
-/// so the visible density stays constant instead of thinning out.
-#[derive(Debug)]
-pub struct Starfield {
-    stars: Vec<Star>,
-    rng: Rng,
-    speed: f32,
-}
-
-impl Starfield {
-    /// Builds a field of `count` stars, spread over the full depth range so
-    /// the first frame is already a sky rather than a distant wall.
-    #[must_use]
-    pub fn new(seed: u64, count: usize) -> Self {
-        let mut rng = Rng::new(seed);
-        let stars = (0..count)
-            .map(|_| Star {
-                x: rng.range(-1.0, 1.0),
-                y: rng.range(-Y_SPAWN, Y_SPAWN),
-                z: rng.range(Z_NEAR, Z_FAR),
-            })
-            .collect();
-        Self {
-            stars,
-            rng,
-            speed: SPEED_DEFAULT,
-        }
-    }
-
-    /// Current travel speed, in depth units per second.
-    #[must_use]
-    pub const fn speed(&self) -> f32 {
-        self.speed
-    }
-
-    /// Scales the travel speed, clamped to the usable range.
-    pub const fn scale_speed(&mut self, factor: f32) {
-        self.speed = (self.speed * factor).clamp(SPEED_MIN, SPEED_MAX);
-    }
-
-    /// Advances every star by `dt_ms` and recycles the ones that left the frame.
-    #[allow(clippy::cast_precision_loss)] // dt is bounded by MAX_STEP_MS
-    pub fn step(&mut self, dt_ms: u64) {
-        let dt = dt_ms.min(MAX_STEP_MS) as f32 / 1000.0;
-        let travel = self.speed * dt;
-        for i in 0..self.stars.len() {
-            self.stars[i].z -= travel;
-            if Self::escaped(&self.stars[i]) {
-                self.stars[i] = Star {
-                    x: self.rng.range(-1.0, 1.0),
-                    y: self.rng.range(-Y_SPAWN, Y_SPAWN),
-                    z: Z_FAR,
-                };
-            }
-        }
-    }
-
-    /// Whether a star has passed the viewer or swept outside the frame.
-    ///
-    /// The frame test is done in normalized space (the projection maps
-    /// `[-1, 1]` onto the full area whatever the terminal size), so recycling
-    /// does not depend on the caller's geometry.
-    fn escaped(s: &Star) -> bool {
-        if s.z <= Z_NEAR {
-            return true;
-        }
-        // Generous: the head is allowed well past the edge so its streak can
-        // finish sweeping out of frame instead of being cut off mid-flight.
-        (s.x / s.z).abs() > 1.4 || (s.y * CELL_ASPECT / s.z).abs() > 1.4
-    }
-
-    /// Where a star sits on a `fw` x `fh` area at depth `z`.
-    ///
-    /// Every star lies on a ray from the center, so its whole trail projects
-    /// onto that same ray — which is what makes the streaks radiate.
-    fn project(s: &Star, z: f32, fw: f32, fh: f32) -> (f32, f32) {
-        (
-            0.5f32.mul_add(s.x / z, 0.5) * fw,
-            0.5f32.mul_add(s.y * CELL_ASPECT / z, 0.5) * fh,
-        )
-    }
-
-    /// Projects the field onto a `w` x `h` area, each star drawn as the streak
-    /// it swept over the last [`TRAIL_SECONDS`].
-    ///
-    /// The streak length is the star's own motion, so it falls out of the
-    /// perspective for free: near the vanishing point stars are still points,
-    /// and as they accelerate outward they stretch into the lines that read as
-    /// hyperspace. Turning the speed up lengthens every streak at once.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )] // screen coords: small non-negative integers, bounds-checked below
-    #[must_use]
-    pub fn glyphs(&self, w: u16, h: u16) -> Vec<Glyph> {
-        if w == 0 || h == 0 {
-            return Vec::new();
-        }
-        let (fw, fh) = (f32::from(w - 1), f32::from(h - 1));
-        let trail_depth = self.speed * TRAIL_SECONDS;
-        let last = (STAR_RAMP.len() - 1) as f32;
-        let mut out = Vec::with_capacity(self.stars.len() * 3);
-        for star in &self.stars {
-            let (head_x, head_y) = Self::project(star, star.z, fw, fh);
-            // The tail is where the star was; never earlier than its birth.
-            let (tail_x, tail_y) = Self::project(star, (star.z + trail_depth).min(Z_FAR), fw, fh);
-            // One sample per cell along the longer axis: no gaps, no waste.
-            let span = (head_x - tail_x)
-                .abs()
-                .max((head_y - tail_y).abs())
-                .min(MAX_TRAIL);
-            let steps = span.round() as usize;
-            // Nearness in [0, 1]: 0 at the spawn depth, 1 at the viewer.
-            let near = ((Z_FAR - star.z) / (Z_FAR - Z_NEAR)).clamp(0.0, 1.0);
-            // Tail first, so the bright head wins the cell it shares.
-            for i in (0..=steps).rev() {
-                let along = if steps == 0 {
-                    0.0
-                } else {
-                    i as f32 / steps as f32
-                };
-                let px = (tail_x - head_x).mul_add(along, head_x);
-                let py = (tail_y - head_y).mul_add(along, head_y);
-                if px < 0.0 || py < 0.0 || px > fw || py > fh {
-                    continue;
-                }
-                let bright = near * along.mul_add(-TRAIL_FADE, 1.0);
-                let idx = ((bright * last).round() as usize).min(STAR_RAMP.len() - 1);
-                out.push(Glyph {
-                    x: px.round() as u16,
-                    y: py.round() as u16,
-                    ch: STAR_RAMP[idx],
-                    color: lerp_rgb(STAR_FAR, STAR_NEAR, bright),
-                });
-            }
-        }
-        out
     }
 }
 
@@ -975,22 +776,12 @@ impl Sound {
 /// Which easter egg is open.
 #[derive(Debug)]
 pub enum Game {
-    /// A starfield: one of the screensaver's faces (`ui.screensaverFace`).
-    Stars(Starfield),
     /// Falling glyphs: `/matrix`, and one of the screensaver's faces.
     Matrix(matrix::Rain),
-    /// Two minions by a lake: `/minions`, and one of the screensaver's faces.
-    Minions(Box<minions::Skit>),
     /// `/pelota`
     Pelota(Box<Pelota>),
     /// `/breakout`
     Breakout(Box<breakout::Breakout>),
-    /// `/invaders`
-    Invaders(Box<invaders::Invaders>),
-    /// `/centipede`
-    Centipede(Box<centipede::Centipede>),
-    /// `/frogger`
-    Frogger(Box<frogger::Frogger>),
 }
 
 impl Game {
@@ -1003,19 +794,16 @@ impl Game {
     /// notice would be lies.
     #[must_use]
     pub const fn ambient(&self) -> bool {
-        matches!(self, Self::Stars(_) | Self::Matrix(_) | Self::Minions(_))
+        matches!(self, Self::Matrix(_))
     }
 
     /// Whether this game is over, either way. The ambient ones never end.
     #[must_use]
     pub fn finished(&self) -> bool {
         match self {
-            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => false,
+            Self::Matrix(_) => false,
             Self::Pelota(p) => p.finished(),
             Self::Breakout(b) => b.finished(),
-            Self::Invaders(i) => i.finished(),
-            Self::Centipede(c) => c.finished(),
-            Self::Frogger(f) => f.finished(),
         }
     }
 
@@ -1024,7 +812,7 @@ impl Game {
     pub fn closing_line(&self) -> Option<String> {
         match self {
             // Nothing happened that a scrollback line could report.
-            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => None,
+            Self::Matrix(_) => None,
             Self::Pelota(p) => Some(format!(
                 "pelota: level {} — {} to {}{}",
                 p.level(),
@@ -1037,24 +825,6 @@ impl Game {
                 b.level(),
                 b.remaining(),
                 resume_hint(b.finished(), "/breakout")
-            )),
-            Self::Invaders(i) => Some(format!(
-                "invaders: level {} — {} aliens flying{}",
-                i.level(),
-                i.remaining(),
-                resume_hint(i.finished(), "/invaders")
-            )),
-            Self::Centipede(c) => Some(format!(
-                "centipede: level {} — {} segments{}",
-                c.level(),
-                c.remaining(),
-                resume_hint(c.finished(), "/centipede")
-            )),
-            Self::Frogger(f) => Some(format!(
-                "frogger: level {} — {} bays open{}",
-                f.level(),
-                f.remaining(),
-                resume_hint(f.finished(), "/frogger")
             )),
         }
     }
@@ -1077,7 +847,7 @@ impl Game {
         match self {
             // No score, no lives, no levels: nothing that could earn a blip,
             // which is what keeps the ambient screens silent even with sound on.
-            Self::Stars(_) | Self::Matrix(_) | Self::Minions(_) => Vitals {
+            Self::Matrix(_) => Vitals {
                 score: 0,
                 lives: 0,
                 level: 0,
@@ -1095,24 +865,6 @@ impl Game {
                 lives: b.lives(),
                 level: b.level(),
                 phase: Some(b.phase()),
-            },
-            Self::Invaders(i) => Vitals {
-                score: i.score(),
-                lives: i.lives(),
-                level: i.level(),
-                phase: Some(i.phase()),
-            },
-            Self::Centipede(c) => Vitals {
-                score: c.score(),
-                lives: c.lives(),
-                level: c.level(),
-                phase: Some(c.phase()),
-            },
-            Self::Frogger(f) => Vitals {
-                score: f.score(),
-                lives: f.lives(),
-                level: f.level(),
-                phase: Some(f.phase()),
             },
         }
     }
@@ -1172,15 +924,15 @@ pub struct Arcade {
     ///
     /// A terminal cell holds one character and one pair of colors — there is
     /// no alpha to composite with, so real transparency is not on the table.
-    /// What *is*: every one of these games is sparse (a starfield touches maybe
+    /// What *is*: every one of these games is sparse (the rain touches maybe
     /// a quarter of the cells), so leaving the untouched cells alone and
     /// dimming what is underneath reads as a translucent layer. Switched on
     /// when the arcade opens over a running turn, so the model's output stays
-    /// legible behind the stars.
+    /// legible behind the glyphs.
     pub translucent: bool,
     /// Optional blips. Off unless a command was given the `sound` argument.
     pub sound: Sound,
-    /// True while the open starfield is the screensaver rather than a game.
+    /// True while the open ambient face is the screensaver rather than a game.
     /// It has no command and therefore no parking slot, and any key dismisses
     /// it instead of steering.
     screensaver: bool,
@@ -1214,10 +966,6 @@ pub enum ScreensaverFace {
     /// Falling glyphs — the default.
     #[default]
     Matrix,
-    /// A perspective starfield.
-    Starfield,
-    /// Two minions on the shore of a night lake.
-    Minions,
     /// Whichever the seed lands on, decided afresh each time the screensaver
     /// opens. This was the behaviour before the setting existed, and it is
     /// worth keeping reachable: coming back to an idle terminal and finding a
@@ -1227,13 +975,26 @@ pub enum ScreensaverFace {
 }
 
 impl ScreensaverFace {
+    /// The settings spellings of every built-in face, in cycle order.
+    ///
+    /// `random` is last because it is a choice among the others, and a picker
+    /// that offers it first invites choosing it without seeing what it picks
+    /// between.
+    pub const NAMES: [&'static str; 2] = ["matrix", "random"];
+
+    /// How many concrete faces plank itself ships.
+    ///
+    /// One: the matrix rain, which is the *default* screensaver and the reason
+    /// it stayed in the binary when the rest became plugins. Used to weigh the
+    /// random rotation, where every face — built-in or contributed — gets one
+    /// slot.
+    pub const BUILT_IN: usize = 1;
+
     /// The settings-file spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Matrix => "matrix",
-            Self::Starfield => "starfield",
-            Self::Minions => "minions",
             Self::Random => "random",
         }
     }
@@ -1244,8 +1005,6 @@ impl ScreensaverFace {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "matrix" | "rain" => Some(Self::Matrix),
-            "starfield" | "stars" => Some(Self::Starfield),
-            "minions" => Some(Self::Minions),
             "random" | "either" => Some(Self::Random),
             _ => None,
         }
@@ -1255,9 +1014,7 @@ impl ScreensaverFace {
     #[must_use]
     pub const fn cycle(self) -> Self {
         match self {
-            Self::Matrix => Self::Starfield,
-            Self::Starfield => Self::Minions,
-            Self::Minions => Self::Random,
+            Self::Matrix => Self::Random,
             Self::Random => Self::Matrix,
         }
     }
@@ -1268,14 +1025,14 @@ impl ScreensaverFace {
     /// Through the Rng rather than a bare bit test: `arcade_seed` mixes the
     /// wall clock, whose low bit merely alternates second by second.
     #[must_use]
-    fn resolve(self, seed: u64) -> Self {
+    fn resolve(self, _seed: u64) -> Self {
+        // One built-in face left, so `Random` has nothing to choose between
+        // *here*. It still means something: the rotation it feeds mixes this
+        // face with every screensaver a plugin contributes, and that choice is
+        // made by the caller, which is the only place that knows what is
+        // installed.
         match self {
-            Self::Random => match Rng::new(seed).next_u64() % 3 {
-                0 => Self::Matrix,
-                1 => Self::Starfield,
-                _ => Self::Minions,
-            },
-            concrete => concrete,
+            Self::Random | Self::Matrix => Self::Matrix,
         }
     }
 }
@@ -1355,15 +1112,13 @@ pub fn command_of(line: &str) -> Option<&'static str> {
 impl Arcade {
     /// Every command this module answers to. Kept next to [`Self::open`] so the
     /// dispatcher's list and the constructors cannot drift apart.
-    pub const COMMANDS: [&'static str; 7] = [
-        "/pelota",
-        "/breakout",
-        "/invaders",
-        "/centipede",
-        "/frogger",
-        "/matrix",
-        "/minions",
-    ];
+    /// The commands plank itself answers.
+    ///
+    /// Three, since the rest became plugins: pelota and breakout because
+    /// breakout is what the download screen draws and pelota shares its
+    /// physics, and the rain because it is the default screensaver. Anything
+    /// else a user types comes from an installed component.
+    pub const COMMANDS: [&'static str; 3] = ["/pelota", "/breakout", "/matrix"];
     /// The argument that throws the parked game away and deals a new one.
     pub const NEW_ARGS: [&'static str; 2] = ["new", "reset"];
 
@@ -1393,7 +1148,7 @@ impl Arcade {
     /// fresh one otherwise. `fresh` discards whatever was parked.
     ///
     /// Returns false — changing nothing — when `cmd` is not one of ours.
-    pub fn open(&mut self, cmd: &str, fresh: bool, seed: u64, w: u16, h: u16) -> bool {
+    pub fn open(&mut self, cmd: &str, fresh: bool, seed: u64) -> bool {
         let Some(slot) = Self::COMMANDS.iter().position(|c| *c == cmd) else {
             return false;
         };
@@ -1402,7 +1157,7 @@ impl Arcade {
         // not shelved, or the next plain `/pelota` would resume the very game
         // the player just asked to be rid of.
         let resumed = self.parked[slot].take().filter(|_| !fresh);
-        self.open = Some(resumed.unwrap_or_else(|| Self::deal(cmd, seed, w, h)));
+        self.open = Some(resumed.unwrap_or_else(|| Self::deal(cmd, seed)));
         self.open_slot = slot;
         true
     }
@@ -1417,37 +1172,20 @@ impl Arcade {
     }
 
     /// A brand new game for `cmd`.
-    fn deal(cmd: &str, seed: u64, w: u16, h: u16) -> Game {
+    fn deal(cmd: &str, seed: u64) -> Game {
         match cmd {
             "/pelota" => Game::Pelota(Box::new(Pelota::new(seed))),
             "/breakout" => Game::Breakout(Box::new(breakout::Breakout::new(seed))),
-            "/invaders" => Game::Invaders(Box::new(invaders::Invaders::new(seed))),
-            "/centipede" => Game::Centipede(Box::new(centipede::Centipede::new(seed))),
-            "/frogger" => Game::Frogger(Box::new(frogger::Frogger::new(seed))),
-            "/matrix" => Self::rain(seed),
-            "/minions" => Self::minions(seed),
-            // `open` has already rejected commands that are not ours, and the
-            // starfield is no longer one of them — it is the screensaver now.
-            _ => Self::stars(seed, w, h),
+            // `open` has already rejected commands that are not ours, so the
+            // rain is the only thing left to be.
+            _ => Self::rain(seed),
         }
-    }
-
-    /// A starfield sized for a `w`x`h` terminal.
-    fn stars(seed: u64, w: u16, h: u16) -> Game {
-        let count = (usize::from(w) * usize::from(h) / 26).clamp(50, 900);
-        Game::Stars(Starfield::new(seed, count))
     }
 
     /// A field of falling glyphs. It needs no size: everything vertical is a
     /// fraction of the height and the columns outnumber any terminal's.
     fn rain(seed: u64) -> Game {
         Game::Matrix(matrix::Rain::new(seed))
-    }
-
-    /// Two minions by a lake. They need no size: the pair walks a normalized
-    /// crossing and the scene is laid out from whatever height it is given.
-    fn minions(seed: u64) -> Game {
-        Game::Minions(Box::new(minions::Skit::new(seed)))
     }
 
     /// Opens an ambient screen as a screensaver: full screen rather than
@@ -1461,20 +1199,21 @@ impl Arcade {
     /// (`ui.screensaverFace`), defaulting to the rain;
     /// [`ScreensaverFace::Random`] restores the draw this used to do
     /// unconditionally.
-    pub fn open_screensaver(&mut self, seed: u64, w: u16, h: u16) {
-        self.open_screensaver_as(crate::settings::active().ui.screensaver_face, seed, w, h);
+    pub fn open_screensaver(&mut self, seed: u64) {
+        self.open_screensaver_as(crate::settings::active().ui.screensaver_face, seed);
     }
 
     /// [`open_screensaver`](Self::open_screensaver) with the face passed in, so
-    /// a test can drive each one without touching the process-wide settings.
-    pub fn open_screensaver_as(&mut self, face: ScreensaverFace, seed: u64, w: u16, h: u16) {
+    /// a test can drive it without touching the process-wide settings.
+    ///
+    /// `face` is still taken, and still resolved, although one built-in face
+    /// is left and the answer is always the rain: the parameter is what a
+    /// caller *asked* for, and dropping it would make adding a second built-in
+    /// face a signature change rather than a match arm.
+    pub fn open_screensaver_as(&mut self, face: ScreensaverFace, seed: u64) {
         self.park();
-        self.open = Some(match face.resolve(seed) {
-            ScreensaverFace::Starfield => Self::stars(seed, w, h),
-            ScreensaverFace::Minions => Self::minions(seed),
-            // `resolve` has already collapsed `Random` into a concrete face.
-            _ => Self::rain(seed),
-        });
+        let _ = face.resolve(seed);
+        self.open = Some(Self::rain(seed));
         self.screensaver = true;
         self.translucent = false;
     }
@@ -1538,14 +1277,9 @@ impl Arcade {
             return;
         };
         match game {
-            Game::Stars(s) => s.step(dt_ms),
             Game::Matrix(m) => m.step(dt_ms),
-            Game::Minions(m) => m.step(dt_ms),
             Game::Pelota(p) => p.step(dt_ms),
             Game::Breakout(b) => b.step(dt_ms),
-            Game::Invaders(i) => i.step(dt_ms),
-            Game::Centipede(c) => c.step(dt_ms),
-            Game::Frogger(f) => f.step(dt_ms),
         }
     }
 
@@ -1556,14 +1290,9 @@ impl Arcade {
             return Vec::new();
         };
         match game {
-            Game::Stars(s) => s.glyphs(w, h),
             Game::Matrix(m) => m.glyphs(w, h),
-            Game::Minions(m) => m.glyphs(w, h),
             Game::Pelota(p) => p.glyphs(w, h),
             Game::Breakout(b) => b.glyphs(w, h),
-            Game::Invaders(i) => i.glyphs(w, h),
-            Game::Centipede(c) => c.glyphs(w, h),
-            Game::Frogger(f) => f.glyphs(w, h),
         }
     }
 
@@ -1580,12 +1309,9 @@ impl Arcade {
             return Some(format!("serve un terminale di almeno {MIN_W}x{MIN_H}"));
         }
         match game {
-            Game::Stars(_) | Game::Matrix(_) | Game::Minions(_) => None,
+            Game::Matrix(_) => None,
             Game::Pelota(p) => p.banner(),
             Game::Breakout(b) => b.banner(),
-            Game::Invaders(i) => i.banner(),
-            Game::Centipede(c) => c.banner(),
-            Game::Frogger(f) => f.banner(),
         }
     }
 
@@ -1603,18 +1329,10 @@ impl Arcade {
         let veil = if self.translucent { "opaque" } else { "veiled" };
         let blips = if self.sound.is_on() { "mute" } else { "sound" };
         match game {
-            Game::Stars(s) => {
-                format!("↑↓/wheel speed ({:.2}×) · t {veil} · b {blips}", s.speed())
-            }
             Game::Matrix(m) => format!(
                 "↑↓/wheel speed ({:.2}×) · c glyphs ({}) · t {veil} · b {blips}",
                 m.speed(),
                 m.charset().label()
-            ),
-            Game::Minions(m) => format!(
-                "↑↓/wheel pace ({:.2}×) · r scene ({}) · t {veil} · b {blips}",
-                m.speed(),
-                if m.scenery() { "on" } else { "off" }
             ),
             Game::Pelota(p) => {
                 let charge = if p.charged() {
@@ -1631,18 +1349,6 @@ impl Arcade {
                 "{} · ←→/mouse move · space serve · p pause · t {veil} · b {blips}",
                 b.hud()
             ),
-            Game::Invaders(i) => format!(
-                "{} · ←→/mouse move · space/click fire · p pause · t {veil} · b {blips}",
-                i.hud()
-            ),
-            Game::Centipede(c) => format!(
-                "{} · ←→↑↓/mouse move · space/click fire · p pause · t {veil} · b {blips}",
-                c.hud()
-            ),
-            Game::Frogger(f) => format!(
-                "{} · ←→↑↓/click hop · p pause · t {veil} · b {blips}",
-                f.hud()
-            ),
         }
     }
 
@@ -1657,17 +1363,7 @@ impl Arcade {
             return Outcome::Stay;
         };
         match game {
-            Game::Stars(s) => match ev.kind {
-                MouseEventKind::ScrollUp => s.scale_speed(1.3),
-                MouseEventKind::ScrollDown => s.scale_speed(1.0 / 1.3),
-                _ => {}
-            },
             Game::Matrix(m) => match ev.kind {
-                MouseEventKind::ScrollUp => m.scale_speed(1.3),
-                MouseEventKind::ScrollDown => m.scale_speed(1.0 / 1.3),
-                _ => {}
-            },
-            Game::Minions(m) => match ev.kind {
                 MouseEventKind::ScrollUp => m.scale_speed(1.3),
                 MouseEventKind::ScrollDown => m.scale_speed(1.0 / 1.3),
                 _ => {}
@@ -1677,15 +1373,6 @@ impl Arcade {
             }
             Game::Breakout(b) => {
                 b.handle_mouse(ev, w);
-            }
-            Game::Invaders(i) => {
-                i.handle_mouse(ev, w);
-            }
-            Game::Centipede(c) => {
-                c.handle_mouse(ev, w, h);
-            }
-            Game::Frogger(f) => {
-                f.handle_mouse(ev, w, h);
             }
         }
         Outcome::Stay
@@ -1728,11 +1415,6 @@ impl Arcade {
             return Outcome::Stay;
         };
         match game {
-            Game::Stars(s) => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => s.scale_speed(1.3),
-                KeyCode::Down | KeyCode::Char('j') => s.scale_speed(1.0 / 1.3),
-                _ => {}
-            },
             Game::Matrix(m) => match key.code {
                 KeyCode::Up | KeyCode::Char('k') => m.scale_speed(1.3),
                 KeyCode::Down | KeyCode::Char('j') => m.scale_speed(1.0 / 1.3),
@@ -1741,29 +1423,11 @@ impl Arcade {
                 KeyCode::Char('c') => m.cycle_charset(),
                 _ => {}
             },
-            Game::Minions(m) => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => m.scale_speed(1.3),
-                KeyCode::Down | KeyCode::Char('j') => m.scale_speed(1.0 / 1.3),
-                // `r` strips the night back to the two of them. Over live
-                // model output every star painted costs a character of the
-                // text underneath, and this is the way to say no.
-                KeyCode::Char('r') => m.toggle_scenery(),
-                _ => {}
-            },
             Game::Pelota(p) => {
                 p.handle_key(key);
             }
             Game::Breakout(b) => {
                 b.handle_key(key);
-            }
-            Game::Invaders(i) => {
-                i.handle_key(key);
-            }
-            Game::Centipede(c) => {
-                c.handle_key(key);
-            }
-            Game::Frogger(f) => {
-                f.handle_key(key);
             }
         }
         Outcome::Stay
@@ -1797,73 +1461,119 @@ mod tests {
         }
     }
 
+    /// Steering keys must never be read as "quit" — losing a rally to a
+    /// mis-bound key is the worst possible bug in a game. Pelota and breakout
+    /// are what is left in the binary; the ported games carry the same test
+    /// against their own component.
     #[test]
-    fn rng_survives_a_zero_seed() {
-        let mut r = Rng::new(0);
-        assert_ne!(r.next_u64(), 0);
-    }
-
-    #[test]
-    fn stars_are_recycled_once_they_pass_the_viewer() {
-        let mut sky = Starfield::new(1, 200);
-        // Twenty seconds at full tilt: every star has long since swept past.
-        for _ in 0..400 {
-            sky.step(50);
-        }
-        assert!(sky.stars.iter().all(|s| s.z > Z_NEAR && s.z <= Z_FAR));
-    }
-
-    #[test]
-    fn star_density_holds_up_over_time() {
-        let mut sky = Starfield::new(42, 300);
-        let first = sky.glyphs(120, 40).len();
-        for _ in 0..200 {
-            sky.step(50);
-        }
-        let later = sky.glyphs(120, 40).len();
-        // Recycling keeps the sky populated; without it the field would empty.
-        assert!(
-            later * 2 > first,
-            "density collapsed: {first} stars -> {later}"
-        );
-    }
-
-    #[test]
-    fn stars_stay_inside_the_area() {
-        let mut sky = Starfield::new(3, 400);
-        for _ in 0..100 {
-            sky.step(50);
-            for g in sky.glyphs(80, 24) {
-                assert!(g.x < 80 && g.y < 24, "glyph at {},{} escaped", g.x, g.y);
+    fn steering_keys_never_quit() {
+        for (cmd, keys) in [
+            ("/pelota", ['k', 'j', 'w', 's']),
+            ("/breakout", ['h', 'l', 'a', 'd']),
+        ] {
+            let mut a = Arcade::new();
+            a.open(cmd, false, 1);
+            for k in keys {
+                assert!(
+                    matches!(a.handle_key(key(KeyCode::Char(k))), Outcome::Stay),
+                    "{cmd} quit on {k}"
+                );
             }
         }
     }
 
+    /// Switching games parks the one you left and brings it back untouched.
     #[test]
-    fn stars_brighten_as_they_approach() {
-        let far = Starfield::new(5, 1);
-        let mut near = Starfield::new(5, 1);
-        // Pull the single star most of the way to the viewer.
-        near.stars[0].z = Z_NEAR + 0.01;
-        near.stars[0].x = 0.0;
-        near.stars[0].y = 0.0;
-        let dim = far.glyphs(80, 24);
-        let bright = near.glyphs(80, 24);
-        assert_eq!(bright.len(), 1);
-        assert!(bright[0].color.0 > dim.first().map_or(0, |g| g.color.0));
+    fn every_game_keeps_its_own_slot() {
+        let mut a = Arcade::new();
+        a.open("/breakout", false, 1);
+        for _ in 0..100 {
+            a.step(50);
+        }
+        let bricks = match a.open.as_ref() {
+            Some(Game::Breakout(b)) => b.remaining(),
+            _ => panic!(),
+        };
+        // Switch to another game without closing first.
+        a.open("/pelota", false, 2);
+        assert!(matches!(a.open.as_ref(), Some(Game::Pelota(_))));
+        assert!(a.has_parked("/breakout"), "breakout was not parked");
+        a.open("/breakout", false, 3);
+        match a.open.as_ref() {
+            Some(Game::Breakout(b)) => assert_eq!(b.remaining(), bricks),
+            _ => panic!("breakout did not come back"),
+        }
+        assert!(a.has_parked("/pelota"), "pelota was not parked");
     }
 
     #[test]
-    fn starfield_speed_is_clamped_both_ways() {
-        let mut sky = Starfield::new(1, 10);
-        for _ in 0..50 {
-            sky.scale_speed(1.3);
+    fn the_closing_line_says_how_to_get_back_in() {
+        let mut a = Arcade::new();
+        a.open("/breakout", false, 1);
+        let line = a.close().expect("no closing line");
+        assert!(line.contains("/breakout resumes"), "{line}");
+
+        a.open("/pelota", false, 1);
+        match a.open.as_mut() {
+            Some(Game::Pelota(p)) => p.force_finished(),
+            _ => panic!(),
         }
-        assert!((sky.speed() - SPEED_MAX).abs() < f32::EPSILON);
-        for _ in 0..50 {
-            sky.scale_speed(1.0 / 1.3);
+        let line = a.close().expect("no closing line");
+        assert!(line.contains("new game"), "{line}");
+    }
+
+    /// `s` steers in pelota; it must not also be the mute key.
+    #[test]
+    fn the_mute_key_does_not_collide_with_a_steering_key() {
+        for cmd in ["/pelota", "/breakout"] {
+            let mut a = Arcade::new();
+            a.open(cmd, false, 1);
+            let before = a.sound.is_on();
+            a.handle_key(key(KeyCode::Char('s')));
+            assert_eq!(a.sound.is_on(), before, "{cmd}: s muted instead of moving");
         }
-        assert!((sky.speed() - SPEED_MIN).abs() < f32::EPSILON);
+    }
+
+    /// Every spelling the settings file accepts maps back to its canonical
+    /// name, so `/config` writing what it read cannot drift.
+    #[test]
+    fn the_face_setting_round_trips_and_cycles() {
+        for face in [ScreensaverFace::Matrix, ScreensaverFace::Random] {
+            assert_eq!(ScreensaverFace::parse(face.as_str()), Some(face));
+        }
+        assert_eq!(
+            ScreensaverFace::parse("rain"),
+            Some(ScreensaverFace::Matrix)
+        );
+        // Two faces, so the cycle is a toggle and must still come home.
+        assert_eq!(
+            ScreensaverFace::Matrix.cycle().cycle(),
+            ScreensaverFace::Matrix
+        );
+        // The names the picker offers are the names the parser takes.
+        for name in ScreensaverFace::NAMES {
+            assert!(ScreensaverFace::parse(name).is_some(), "{name}");
+        }
+    }
+
+    /// With one built-in face left, `random` resolves to it — but the constant
+    /// the rotation weighs by must agree, or contributed faces get the wrong
+    /// share.
+    #[test]
+    fn random_resolves_to_the_one_built_in_face() {
+        for seed in 0..10 {
+            assert_eq!(
+                ScreensaverFace::Random.resolve(seed),
+                ScreensaverFace::Matrix
+            );
+        }
+        assert_eq!(ScreensaverFace::BUILT_IN, 1);
+    }
+
+    #[test]
+    fn rng_survives_a_zero_seed() {
+        let mut r = Rng::new(0);
+        assert_ne!(r.next_u64(), 0);
     }
 
     #[test]
@@ -2141,85 +1851,9 @@ mod tests {
     }
 
     #[test]
-    fn a_moving_star_is_drawn_as_a_streak_not_a_dot() {
-        let mut sky = Starfield::new(5, 1);
-        // One star, well off-axis and close in: its streak should be long.
-        sky.stars[0] = Star {
-            x: 0.25,
-            y: 0.0,
-            z: 0.3,
-        };
-        let fast = sky.glyphs(120, 40);
-        assert!(fast.len() > 3, "no streak: {} cells", fast.len());
-        // The streak is a line, so its cells share a row here (y = 0 ray).
-        let rows: std::collections::HashSet<u16> = fast.iter().map(|g| g.y).collect();
-        assert_eq!(rows.len(), 1, "streak is not along the ray");
-        // The head is the brightest cell of the streak.
-        let head = fast.last().unwrap();
-        assert!(fast.iter().all(|g| g.color.0 <= head.color.0));
-    }
-
-    #[test]
-    fn streaks_grow_with_speed_and_collapse_when_slow() {
-        let mut sky = Starfield::new(5, 1);
-        sky.stars[0] = Star {
-            x: 0.25,
-            y: 0.0,
-            z: 0.3,
-        };
-        for _ in 0..20 {
-            sky.scale_speed(1.0 / 1.3);
-        }
-        let slow = sky.glyphs(120, 40).len();
-        for _ in 0..40 {
-            sky.scale_speed(1.3);
-        }
-        let fast = sky.glyphs(120, 40).len();
-        assert!(
-            fast > slow * 3,
-            "lightspeed did not stretch the sky: {slow} -> {fast}"
-        );
-    }
-
-    /// The minions are weather, not a game: closing them leaves nothing behind
-    /// and takes no slot, so the next `/minions` is a fresh walk rather than a
-    /// resume notice about a thing that has no state.
-    #[test]
-    fn the_minions_are_not_parked() {
-        let mut a = Arcade::new();
-        a.open("/minions", false, 1, 80, 24);
-        assert!(matches!(a.open.as_ref(), Some(Game::Minions(_))));
-        for _ in 0..200 {
-            a.step(50);
-        }
-        assert_eq!(a.close(), None, "the minions left a line in the scrollback");
-        assert!(!a.has_parked("/minions"), "the minions took a parking slot");
-        assert!(a.parked.iter().all(Option::is_none));
-    }
-
-    /// `r` strips the night back to the two of them rather than quitting or
-    /// steering: over live model output it is the difference between a layer
-    /// and a wall.
-    #[test]
-    fn r_toggles_the_minions_scenery() {
-        let mut a = Arcade::new();
-        a.open("/minions", false, 1, 80, 24);
-        let scenery = |a: &Arcade| match a.open.as_ref() {
-            Some(Game::Minions(m)) => m.scenery(),
-            _ => panic!("the minions are not open"),
-        };
-        assert!(scenery(&a), "the scene should start dressed");
-        assert!(matches!(
-            a.handle_key(key(KeyCode::Char('r'))),
-            Outcome::Stay
-        ));
-        assert!(!scenery(&a), "r did not strip the scene");
-    }
-
-    #[test]
     fn esc_closes_pelota_with_the_score() {
         let mut a = Arcade::new();
-        a.open("/pelota", false, 1, 80, 24);
+        a.open("/pelota", false, 1);
         match a.handle_key(key(KeyCode::Esc)) {
             Outcome::Close(Some(line)) => assert!(line.starts_with("pelota: level 1"), "{line}"),
             other => panic!("expected a closing score line, got {other:?}"),
@@ -2238,7 +1872,7 @@ mod tests {
             KeyCode::Up,
         ] {
             let mut a = Arcade::new();
-            a.open_screensaver(1, 80, 24);
+            a.open_screensaver(1);
             assert!(a.is_open() && a.is_screensaver());
             assert!(
                 matches!(a.handle_key(key(code)), Outcome::Close(None)),
@@ -2253,7 +1887,7 @@ mod tests {
     #[test]
     fn the_screensaver_is_never_parked() {
         let mut a = Arcade::new();
-        a.open_screensaver(1, 80, 24);
+        a.open_screensaver(1);
         a.handle_key(key(KeyCode::Char('x')));
         assert!(!a.is_open());
         assert!(
@@ -2268,7 +1902,7 @@ mod tests {
     #[test]
     fn the_rain_is_not_parked() {
         let mut a = Arcade::new();
-        a.open("/matrix", false, 1, 80, 24);
+        a.open("/matrix", false, 1);
         assert!(matches!(a.open.as_ref(), Some(Game::Matrix(_))));
         for _ in 0..200 {
             a.step(50);
@@ -2278,119 +1912,12 @@ mod tests {
         assert!(a.parked.iter().all(Option::is_none));
     }
 
-    /// Every ambient screen is reachable under `random` — the point of the draw
-    /// is that you do not always get the same one. A face that fell out of
-    /// `resolve` entirely would still leave the other two looking healthy, so
-    /// each is counted rather than merely one being seen.
-    #[test]
-    fn the_random_screensaver_shows_every_face() {
-        let (mut stars, mut rain, mut minions) = (0, 0, 0);
-        for seed in 1..90u64 {
-            let mut a = Arcade::new();
-            a.open_screensaver_as(ScreensaverFace::Random, seed, 80, 24);
-            assert!(a.is_screensaver());
-            match a.open.as_ref() {
-                Some(Game::Stars(_)) => stars += 1,
-                Some(Game::Matrix(_)) => rain += 1,
-                Some(Game::Minions(_)) => minions += 1,
-                _ => panic!("the screensaver opened something playable"),
-            }
-        }
-        assert!(
-            stars > 5 && rain > 5 && minions > 5,
-            "lopsided draw: {stars} stars, {rain} rain, {minions} minions"
-        );
-    }
-
-    /// The settings-reading entry point, which the tests above bypass by
-    /// injecting a face. Without this, `ui.screensaverFace` could be parsed
-    /// and stored correctly and still never reach the screen.
-    #[test]
-    fn the_idle_screensaver_opens_the_configured_face() {
-        let mut settings = crate::settings::Settings::default();
-
-        // The default, untouched: the rain.
-        crate::settings::install_for_test(settings.clone());
-        let mut a = Arcade::new();
-        a.open_screensaver(1, 80, 24);
-        assert!(matches!(a.open.as_ref(), Some(Game::Matrix(_))));
-
-        // ...and the starfield when asked for.
-        settings.ui.screensaver_face = ScreensaverFace::Starfield;
-        crate::settings::install_for_test(settings.clone());
-        let mut a = Arcade::new();
-        a.open_screensaver(1, 80, 24);
-        assert!(matches!(a.open.as_ref(), Some(Game::Stars(_))));
-
-        // ...and the minions, which reach the screen the same way.
-        settings.ui.screensaver_face = ScreensaverFace::Minions;
-        crate::settings::install_for_test(settings);
-        let mut a = Arcade::new();
-        a.open_screensaver(1, 80, 24);
-        assert!(matches!(a.open.as_ref(), Some(Game::Minions(_))));
-    }
-
-    /// A chosen face is honoured every time, not most of the time — the whole
-    /// point of picking one is that the other never turns up.
-    #[test]
-    fn a_chosen_screensaver_face_is_the_one_that_opens() {
-        for seed in 1..40u64 {
-            let mut a = Arcade::new();
-            a.open_screensaver_as(ScreensaverFace::Matrix, seed, 80, 24);
-            assert!(
-                matches!(a.open.as_ref(), Some(Game::Matrix(_))),
-                "seed {seed} opened something other than the rain"
-            );
-            assert!(a.is_screensaver());
-
-            let mut a = Arcade::new();
-            a.open_screensaver_as(ScreensaverFace::Starfield, seed, 80, 24);
-            assert!(
-                matches!(a.open.as_ref(), Some(Game::Stars(_))),
-                "seed {seed} opened something other than the starfield"
-            );
-
-            let mut a = Arcade::new();
-            a.open_screensaver_as(ScreensaverFace::Minions, seed, 80, 24);
-            assert!(
-                matches!(a.open.as_ref(), Some(Game::Minions(_))),
-                "seed {seed} opened something other than the minions"
-            );
-        }
-    }
-
-    #[test]
-    fn the_face_setting_round_trips_and_cycles() {
-        // Every spelling the settings file accepts maps back to its canonical
-        // name, so `/config` writing what it read cannot drift.
-        for face in [
-            ScreensaverFace::Matrix,
-            ScreensaverFace::Starfield,
-            ScreensaverFace::Minions,
-            ScreensaverFace::Random,
-        ] {
-            assert_eq!(ScreensaverFace::parse(face.as_str()), Some(face));
-        }
-        assert_eq!(ScreensaverFace::default(), ScreensaverFace::Matrix);
-        assert_eq!(ScreensaverFace::parse("nope"), None);
-
-        // The `/config` row cycles through all four and comes home.
-        let mut f = ScreensaverFace::default();
-        let mut seen = vec![f];
-        for _ in 0..4 {
-            f = f.cycle();
-            seen.push(f);
-        }
-        assert_eq!(seen.first(), seen.last(), "the cycle must return home");
-        assert_eq!(seen.len() - 1, 4, "and visit each face once");
-    }
-
     /// `c` re-letters the rain rather than quitting or steering — the escape
     /// hatch for a terminal font without katakana has to be reachable.
     #[test]
     fn c_cycles_the_rain_glyphs() {
         let mut a = Arcade::new();
-        a.open("/matrix", false, 1, 80, 24);
+        a.open("/matrix", false, 1);
         let charset = |a: &Arcade| match a.open.as_ref() {
             Some(Game::Matrix(m)) => m.charset(),
             _ => panic!("the rain is not open"),
@@ -2413,7 +1940,7 @@ mod tests {
     #[test]
     fn the_rain_never_blips() {
         let mut a = Arcade::new();
-        a.open("/matrix", false, 1, 80, 24);
+        a.open("/matrix", false, 1);
         a.sound.set(true);
         let before = a.open.as_ref().map(Game::vitals).unwrap();
         for _ in 0..100 {
@@ -2429,7 +1956,7 @@ mod tests {
         assert!(!Arcade::COMMANDS.contains(&"/stars"));
         assert!(command_of("/stars").is_none());
         let mut a = Arcade::new();
-        assert!(!a.open("/stars", false, 1, 80, 24));
+        assert!(!a.open("/stars", false, 1));
     }
 
     #[test]
@@ -2437,27 +1964,9 @@ mod tests {
         let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         for cmd in Arcade::COMMANDS {
             let mut a = Arcade::new();
-            a.open(cmd, false, 1, 80, 24);
+            a.open(cmd, false, 1);
             assert!(matches!(a.handle_key(ctrl_c), Outcome::Close(_)), "{cmd}");
             assert!(!a.is_open(), "{cmd} stayed open");
-        }
-    }
-
-    #[test]
-    fn steering_keys_never_quit() {
-        for (cmd, keys) in [
-            ("/pelota", ['k', 'j', 'w', 's']),
-            ("/breakout", ['h', 'l', 'a', 'd']),
-            ("/invaders", ['h', 'l', 'a', 'd']),
-        ] {
-            let mut a = Arcade::new();
-            a.open(cmd, false, 1, 80, 24);
-            for k in keys {
-                assert!(
-                    matches!(a.handle_key(key(KeyCode::Char(k))), Outcome::Stay),
-                    "{cmd} quit on {k}"
-                );
-            }
         }
     }
 
@@ -2612,7 +2121,7 @@ mod tests {
     fn t_toggles_the_veil_in_any_game() {
         for cmd in Arcade::COMMANDS {
             let mut a = Arcade::new();
-            a.open(cmd, false, 1, 80, 24);
+            a.open(cmd, false, 1);
             assert!(!a.translucent);
             a.handle_key(key(KeyCode::Char('t')));
             assert!(a.translucent, "{cmd} did not veil");
@@ -2636,10 +2145,7 @@ mod tests {
                 crate::config::slash_command_known(&format!("{cmd} new")),
                 "{cmd} new would be sent to the model"
             );
-            assert!(
-                Arcade::new().open(cmd, false, 1, 80, 24),
-                "{cmd} opens nothing"
-            );
+            assert!(Arcade::new().open(cmd, false, 1), "{cmd} opens nothing");
         }
     }
 
@@ -2708,7 +2214,7 @@ mod tests {
     fn every_game_survives_a_long_unattended_run() {
         for cmd in Arcade::COMMANDS {
             let mut a = Arcade::new();
-            a.open(cmd, false, 7, 80, 24);
+            a.open(cmd, false, 7);
             for _ in 0..2000 {
                 a.step(50);
                 // Whatever the state, it must always have something to paint
@@ -2726,7 +2232,7 @@ mod tests {
     #[test]
     fn closing_and_reopening_resumes_the_same_game() {
         let mut a = Arcade::new();
-        assert!(a.open("/breakout", false, 1, 80, 24));
+        assert!(a.open("/breakout", false, 1));
         // Knock the wall about a bit so the state is distinguishable.
         for _ in 0..200 {
             a.step(50);
@@ -2739,7 +2245,7 @@ mod tests {
         assert!(!a.is_open());
         assert!(a.has_parked("/breakout"));
 
-        a.open("/breakout", false, 999, 80, 24);
+        a.open("/breakout", false, 999);
         let after = match a.open.as_ref() {
             Some(Game::Breakout(b)) => (b.level(), b.remaining()),
             _ => panic!("breakout not open"),
@@ -2750,12 +2256,12 @@ mod tests {
     #[test]
     fn the_new_argument_deals_a_fresh_game() {
         let mut a = Arcade::new();
-        a.open("/breakout", false, 1, 80, 24);
+        a.open("/breakout", false, 1);
         for _ in 0..200 {
             a.step(50);
         }
         a.close();
-        a.open("/breakout", true, 2, 80, 24);
+        a.open("/breakout", true, 2);
         match a.open.as_ref() {
             Some(Game::Breakout(b)) => {
                 assert_eq!(b.remaining(), breakout::LEVELS[0].rows * breakout::COLS);
@@ -2776,36 +2282,11 @@ mod tests {
         }
     }
 
-    /// Each command keeps its own game: switching between them and back must
-    /// not shuffle one game into another's slot.
-    #[test]
-    fn every_game_keeps_its_own_slot() {
-        let mut a = Arcade::new();
-        a.open("/breakout", false, 1, 80, 24);
-        for _ in 0..100 {
-            a.step(50);
-        }
-        let bricks = match a.open.as_ref() {
-            Some(Game::Breakout(b)) => b.remaining(),
-            _ => panic!(),
-        };
-        // Switch to another game without closing first.
-        a.open("/invaders", false, 2, 80, 24);
-        assert!(matches!(a.open.as_ref(), Some(Game::Invaders(_))));
-        assert!(a.has_parked("/breakout"), "breakout was not parked");
-        a.open("/breakout", false, 3, 80, 24);
-        match a.open.as_ref() {
-            Some(Game::Breakout(b)) => assert_eq!(b.remaining(), bricks),
-            _ => panic!("breakout did not come back"),
-        }
-        assert!(a.has_parked("/invaders"), "invaders was not parked");
-    }
-
     /// A finished game is not worth resuming onto its own game-over banner.
     #[test]
     fn a_finished_game_is_not_parked() {
         let mut a = Arcade::new();
-        a.open("/pelota", false, 1, 80, 24);
+        a.open("/pelota", false, 1);
         match a.open.as_mut() {
             Some(Game::Pelota(p)) => p.force_finished(),
             _ => panic!("pelota not open"),
@@ -2815,25 +2296,9 @@ mod tests {
     }
 
     #[test]
-    fn the_closing_line_says_how_to_get_back_in() {
-        let mut a = Arcade::new();
-        a.open("/invaders", false, 1, 80, 24);
-        let line = a.close().expect("no closing line");
-        assert!(line.contains("/invaders resumes"), "{line}");
-
-        a.open("/pelota", false, 1, 80, 24);
-        match a.open.as_mut() {
-            Some(Game::Pelota(p)) => p.force_finished(),
-            _ => panic!(),
-        }
-        let line = a.close().expect("no closing line");
-        assert!(line.contains("new game"), "{line}");
-    }
-
-    #[test]
     fn an_unknown_command_opens_nothing() {
         let mut a = Arcade::new();
-        assert!(!a.open("/nope", false, 1, 80, 24));
+        assert!(!a.open("/nope", false, 1));
         assert!(!a.is_open());
     }
 
@@ -2884,24 +2349,12 @@ mod tests {
     #[test]
     fn b_toggles_the_blips() {
         let mut a = Arcade::new();
-        a.open("/breakout", false, 1, 80, 24);
+        a.open("/breakout", false, 1);
         assert!(!a.sound.is_on());
         a.handle_key(key(KeyCode::Char('b')));
         assert!(a.sound.is_on());
         a.handle_key(key(KeyCode::Char('b')));
         assert!(!a.sound.is_on());
-    }
-
-    /// `s` steers in three of these games, so it must never be the mute key.
-    #[test]
-    fn the_mute_key_does_not_collide_with_a_steering_key() {
-        for cmd in ["/pelota", "/centipede", "/frogger"] {
-            let mut a = Arcade::new();
-            a.open(cmd, false, 1, 80, 24);
-            let before = a.sound.is_on();
-            a.handle_key(key(KeyCode::Char('s')));
-            assert_eq!(a.sound.is_on(), before, "{cmd}: s muted instead of moving");
-        }
     }
 
     #[test]
@@ -2949,7 +2402,7 @@ mod tests {
     #[test]
     fn the_starfield_never_blips() {
         let mut a = Arcade::new();
-        a.open_screensaver(1, 80, 24);
+        a.open_screensaver(1);
         a.sound.set(true);
         let before = a.open.as_ref().map(Game::vitals).unwrap();
         for _ in 0..100 {
@@ -2962,7 +2415,7 @@ mod tests {
     #[test]
     fn opening_over_output_starts_veiled() {
         let mut a = Arcade::new();
-        a.open("/pelota", false, 1, 80, 24);
+        a.open("/pelota", false, 1);
         a.veil();
         assert!(a.translucent);
     }
@@ -2970,10 +2423,10 @@ mod tests {
     #[test]
     fn a_too_small_terminal_explains_itself() {
         let mut a = Arcade::new();
-        a.open("/pelota", false, 1, 80, 24);
+        a.open("/pelota", false, 1);
         assert!(a.banner(10, 4).is_some_and(|b| b.contains("terminale")));
         let mut sky = Arcade::new();
-        sky.open_screensaver(1, 80, 24);
+        sky.open_screensaver(1);
         assert!(sky.banner(80, 24).is_none());
     }
 }

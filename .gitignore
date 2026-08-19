@@ -25,3 +25,9 @@ docs/superpowers/
 .wrangler/
 .tokensave/
 .vscode/
+
+# Feasibility-stage WASM guest: a cross-target build tree, never committed.
+spike/abi-guest/target/
+spike/min-guest/target/
+guests/screensavers/target/
+guests/arcades/target/

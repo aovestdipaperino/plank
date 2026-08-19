@@ -204,7 +204,7 @@ pub static FIELDS: &[Field] = &[
         FieldId::UiScreensaverFace,
         "ui",
         "screensaverFace",
-        "which screensaver: matrix, starfield, minions, random",
+        "which screensaver (built-in or plugin face)",
         Kind::Bool,
     ),
     f(
@@ -323,7 +323,12 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
         FieldId::UiScreensaver => s.ui.screensaver.as_str().to_string(),
-        FieldId::UiScreensaverFace => s.ui.screensaver_face.as_str().to_string(),
+        // A contributed face is shown as the user wrote it: `<plugin>:<face>`.
+        FieldId::UiScreensaverFace => {
+            s.ui.screensaver_face_plugin
+                .clone()
+                .unwrap_or_else(|| s.ui.screensaver_face.as_str().to_string())
+        }
         FieldId::UiReducedMotion => s.ui.reduced_motion.to_string(),
         FieldId::UiEasterEggs => s.ui.easter_eggs.to_string(),
         FieldId::UiBuiltinEditor => s.ui.builtin_editor.to_string(),
@@ -365,14 +370,15 @@ fn toggle(s: &mut Settings, id: FieldId) {
         }
         // Cycles 1m -> 2m -> 5m -> never, like the notification modes.
         FieldId::UiScreensaver => s.ui.screensaver = s.ui.screensaver.cycle(),
-        // Cycles matrix -> starfield -> random.
-        FieldId::UiScreensaverFace => s.ui.screensaver_face = s.ui.screensaver_face.cycle(),
         FieldId::UiCrtOff => s.ui.crt_off = !s.ui.crt_off,
         FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
         FieldId::SafetySandbox => s.safety.sandbox = cycle_tri(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = cycle_tri(s.safety.btw_suspend),
+        // `UiScreensaverFace` lands here deliberately: its cycle spans the
+        // contributed faces too, which this value-only function cannot see, so
+        // `ConfigForm` handles that field itself.
         _ => {}
     }
 }
@@ -456,12 +462,23 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
                 .ok_or_else(|| format!("screensaver must be 1m, 2m, 5m, or never (got {raw})"))?;
         }
         FieldId::UiScreensaverFace => {
-            s.ui.screensaver_face =
-                crate::arcade::ScreensaverFace::parse(raw).ok_or_else(|| {
-                    format!(
-                        "screensaverFace must be matrix, starfield, minions, or random (got {raw})"
-                    )
-                })?;
+            // A typed value is either a built-in name or a `<plugin>:<face>`
+            // address. The address is not validated against the loaded
+            // components on purpose: a user editing settings for a plugin they
+            // are about to install should not be told it does not exist, and an
+            // address that never resolves costs a fallback to a built-in face,
+            // not a broken screensaver.
+            if let Some(built_in) = crate::arcade::ScreensaverFace::parse(raw) {
+                s.ui.screensaver_face = built_in;
+                s.ui.screensaver_face_plugin = None;
+            } else if raw.contains(':') {
+                s.ui.screensaver_face_plugin = Some(raw.to_string());
+            } else {
+                return Err(format!(
+                    "screensaverFace must be matrix, starfield, minions, random, \
+                     or a plugin face like screensavers:starfield (got {raw})"
+                ));
+            }
         }
         FieldId::EngineThinkingToolCalls
         | FieldId::UiRespectGitignore
@@ -565,17 +582,66 @@ pub struct ConfigForm {
     cursor: usize,
     edit: Option<String>,
     status: Option<String>,
+    /// Screensaver faces contributed by plugins, as `<plugin>:<face>`.
+    ///
+    /// Passed in rather than looked up: the form is a pure editor over a
+    /// `Settings` value and has no session to ask. Empty is the ordinary case
+    /// and makes the face field behave exactly as it did before contributed
+    /// faces existed.
+    wasm_faces: Vec<String>,
 }
 
 impl ConfigForm {
     /// Opens the form seeded from the given (current) settings.
     #[must_use]
     pub fn new(current: Settings) -> Self {
+        Self::with_faces(current, Vec::new())
+    }
+
+    /// [`new`](Self::new) with the contributed screensaver faces the session
+    /// has loaded, so the face field can cycle through them.
+    #[must_use]
+    pub fn with_faces(current: Settings, wasm_faces: Vec<String>) -> Self {
         Self {
             working: current,
             cursor: 0,
             edit: None,
             status: None,
+            wasm_faces,
+        }
+    }
+
+    /// The face field's full cycle: the built-in names, then every contributed
+    /// face, then back to the start.
+    ///
+    /// One list rather than two fields, because "which screensaver" is one
+    /// question — a user choosing between the rain and a plugin's starfield is
+    /// not thinking about where each came from.
+    fn face_cycle(&self) -> Vec<String> {
+        let mut out: Vec<String> = crate::arcade::ScreensaverFace::NAMES
+            .iter()
+            .map(|n| (*n).to_string())
+            .collect();
+        out.extend(self.wasm_faces.iter().cloned());
+        out
+    }
+
+    /// The face currently selected, as it is written in settings.
+    fn current_face(&self) -> String {
+        self.working
+            .ui
+            .screensaver_face_plugin
+            .clone()
+            .unwrap_or_else(|| self.working.ui.screensaver_face.as_str().to_string())
+    }
+
+    /// Selects `face`, routing it to whichever field can hold it.
+    fn set_face(&mut self, face: &str) {
+        if let Some(built_in) = crate::arcade::ScreensaverFace::parse(face) {
+            self.working.ui.screensaver_face = built_in;
+            self.working.ui.screensaver_face_plugin = None;
+        } else {
+            self.working.ui.screensaver_face_plugin = Some(face.to_string());
         }
     }
 
@@ -617,6 +683,20 @@ impl ConfigForm {
                 self.status = None;
                 let field = self.field();
                 match field.kind {
+                    // The face field cycles through a list the form owns
+                    // (built-ins plus whatever this session loaded), so it
+                    // cannot go through the value-only `toggle`.
+                    Kind::Bool | Kind::Tri if field.id == FieldId::UiScreensaverFace => {
+                        let cycle = self.face_cycle();
+                        let current = self.current_face();
+                        let next = cycle
+                            .iter()
+                            .position(|f| *f == current)
+                            .map_or(0, |i| (i + 1) % cycle.len());
+                        if let Some(face) = cycle.get(next).cloned() {
+                            self.set_face(&face);
+                        }
+                    }
                     Kind::Bool | Kind::Tri => toggle(&mut self.working, field.id),
                     Kind::Count | Kind::OptInt | Kind::OptText => {
                         // Seed the buffer from the current value, minus the
@@ -729,6 +809,85 @@ mod tests {
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Puts the cursor on a field by id, so a test does not depend on how many
+    /// fields happen to sit above it.
+    fn focus(form: &mut ConfigForm, id: FieldId) {
+        form.cursor = FIELDS.iter().position(|f| f.id == id).expect("a field");
+    }
+
+    /// The face field cycles the built-ins and then every contributed face,
+    /// and comes back round. Without the contributed ones it must behave
+    /// exactly as it did before they existed.
+    #[test]
+    fn the_face_field_cycles_built_ins_then_contributed_faces() {
+        let faces = vec![
+            "screensavers:starfield".to_string(),
+            "screensavers:minions".to_string(),
+        ];
+        let mut form = ConfigForm::with_faces(Settings::default(), faces);
+        focus(&mut form, FieldId::UiScreensaverFace);
+
+        let seen: Vec<String> = (0..6)
+            .map(|_| {
+                form.handle_key(k(KeyCode::Enter));
+                display(&form.working, FieldId::UiScreensaverFace)
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                // One built-in face left, then the contributed ones, then
+                // round to the start.
+                "random",
+                "screensavers:starfield",
+                "screensavers:minions",
+                "matrix",
+                "random",
+                "screensavers:starfield",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_face_field_is_unchanged_without_contributed_faces() {
+        let mut form = ConfigForm::new(Settings::default());
+        focus(&mut form, FieldId::UiScreensaverFace);
+        let seen: Vec<String> = (0..4)
+            .map(|_| {
+                form.handle_key(k(KeyCode::Enter));
+                display(&form.working, FieldId::UiScreensaverFace)
+            })
+            .collect();
+        assert_eq!(seen, vec!["random", "matrix", "random", "matrix"]);
+    }
+
+    /// Selecting a contributed face must route to the field that can hold it,
+    /// and selecting a built-in must clear it again — otherwise a user who
+    /// tried a plugin face and went back to the rain would keep getting the
+    /// plugin, since the pinned address wins.
+    #[test]
+    fn choosing_a_built_in_face_clears_a_previously_pinned_plugin_face() {
+        let mut form = ConfigForm::with_faces(
+            Settings::default(),
+            vec!["screensavers:starfield".to_string()],
+        );
+        form.set_face("screensavers:starfield");
+        assert_eq!(
+            form.working.ui.screensaver_face_plugin.as_deref(),
+            Some("screensavers:starfield")
+        );
+
+        form.set_face("matrix");
+        assert_eq!(
+            form.working.ui.screensaver_face_plugin, None,
+            "a pinned plugin face outlived the switch back to a built-in"
+        );
+        assert_eq!(
+            form.working.ui.screensaver_face,
+            crate::arcade::ScreensaverFace::Matrix
+        );
     }
 
     #[test]

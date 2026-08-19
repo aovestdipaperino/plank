@@ -1,0 +1,31 @@
+# The screensaver faces, as one WASM component.
+#
+# Screensavers and arcades are separate plugins because they are separate
+# things: a screensaver joins the idle rotation and is dismissed by any key, a
+# game is started deliberately and owns its keys. Splitting them also means a
+# user who wants ambient faces and no games installs exactly that.
+#
+# Every face lives in this single module rather than one per face: one artifact
+# to build, one id to trust, one load. `frame_open`'s `arg` selects which face,
+# and each gets its own slash command through `command_specs`.
+#
+# Not a workspace member of plank: it targets wasm32-unknown-unknown, so
+# folding it in would drag a cross-target into every `cargo build`.
+[workspace]
+
+[package]
+name = "plank-screensavers"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+extism-pdk = "1"
+
+[profile.release]
+opt-level = "s"
+strip = true
