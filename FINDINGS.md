@@ -1353,3 +1353,18 @@ test` and review the diff before committing.
   description; without one, "hide the schema" silently becomes "delete the
   tool". Measuring a payload win here is easy, and it is exactly the change that
   can lose functionality without failing a single test.
+- **The provider path advertised MCP tools under a name its own dispatcher
+  rejects.** `provider_tool_registry` pushed `ToolSpec { name: tool.name }` —
+  the bare `tokensave_status` — while `dispatch` routes MCP calls on the `mcp__`
+  prefix (`tools/mod.rs`) and the text path spells them `mcp__<server>__<tool>`
+  (`append_one_schema`). So on an OpenAI-compatible provider every MCP tool was
+  offered to the model and then answered with `Tool error: unknown tool`. Two
+  reasons it survived: no test compared the advertised name against what
+  dispatch accepts (they only checked that the name was *present*), and the
+  failure needs a live provider turn plus a tool the model actually decides to
+  call. It stayed invisible until the `mcp_call` directory started listing the
+  qualified spelling next to the bare specs — the model then said so out loud,
+  reasoning that "the tool is listed in the function spec as tokensave_status,
+  but it says unknown tool ... maybe it's in the MCP directory". A prompt that
+  contradicts itself produces exactly that thrash, and it looks like a model
+  failure rather than a naming bug. Assert routability, not presence.

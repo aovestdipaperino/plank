@@ -233,7 +233,13 @@ pub fn provider_tool_registry(
             let parameters = serde_json::from_str::<serde_json::Value>(&tool.schema_json)
                 .unwrap_or_else(|_| serde_json::json!({ "type": "object", "properties": {} }));
             specs.push(crate::engine::ToolSpec {
-                name: tool.name.clone(),
+                // Namespaced, exactly as the text path spells it
+                // (`append_one_schema`). Dispatch routes MCP calls on the
+                // `mcp__` prefix, so a bare name reaches the unknown-tool
+                // fallthrough and the model is told the tool does not exist —
+                // while the directory advertises the qualified spelling, which
+                // is a contradiction it cannot act on.
+                name: format!("mcp__{}__{}", server.name, tool.name),
                 description: tool.description.clone(),
                 parameters,
             });
@@ -1088,10 +1094,19 @@ mod tests {
         let servers = vec![McpServer::offline(&rec)];
         let specs = provider_tool_registry(&servers);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"kept"), "primary tool must keep its schema");
+        // Namespaced: dispatch routes on the `mcp__` prefix, so a bare name
+        // would be advertised and then rejected as an unknown tool.
         assert!(
-            !names.contains(&"hidden"),
+            names.contains(&"mcp__srv__kept"),
+            "primary tool must keep its schema, qualified: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("hidden")),
             "non-primary tool must not carry a schema: {names:?}"
+        );
+        assert!(
+            !names.contains(&"kept"),
+            "an unqualified name reaches the unknown-tool fallthrough: {names:?}"
         );
         // ...but it must stay *reachable*: a provider rejects an undeclared
         // function name, so dropping the schema without the escape hatch would
@@ -1113,6 +1128,61 @@ mod tests {
     }
 
     #[test]
+    fn every_provider_spec_name_is_routable_by_dispatch() {
+        // The bug this pins: MCP specs were advertised under their bare name
+        // while dispatch routes MCP calls on the `mcp__` prefix, so the model
+        // was offered `tokensave_status`, called it, and was told no such tool
+        // exists — with the mcp_call directory simultaneously advertising the
+        // qualified spelling. Asserting the two paths agree is not enough; the
+        // name has to be one dispatch will actually accept.
+        use crate::tools::mcp::{McpServer, McpTool};
+        let rec = crate::tools::mcp_advert::AdvertRecord {
+            server: "srv".to_string(),
+            instructions: String::new(),
+            tools: vec![
+                McpTool {
+                    name: "alpha".to_string(),
+                    description: "a".to_string(),
+                    schema_json: "{}".to_string(),
+                    primary: true,
+                },
+                McpTool {
+                    name: "beta".to_string(),
+                    description: "b".to_string(),
+                    schema_json: "{}".to_string(),
+                    primary: false,
+                },
+            ],
+            resources: Vec::new(),
+        };
+        let specs = provider_tool_registry(&[McpServer::offline(&rec)]);
+        // No hand-copied list of native tools here (it would rot against the
+        // dispatch match): assert the precise invariant instead — a spec named
+        // after a *server-advertised* tool must carry the `mcp__` prefix, since
+        // that prefix is the only thing routing it to the MCP client.
+        for advertised in ["alpha", "beta"] {
+            assert!(
+                !specs.iter().any(|s| s.name == advertised),
+                "{advertised:?} is advertised bare; dispatch would reject it as unknown"
+            );
+        }
+        let mcp_named: Vec<&str> = specs
+            .iter()
+            .filter(|s| s.name.contains("alpha") || s.name.contains("beta"))
+            .map(|s| s.name.as_str())
+            .collect();
+        assert_eq!(
+            mcp_named,
+            vec!["mcp__srv__alpha"],
+            "only the primary tool gets a spec, and it must be qualified"
+        );
+        // The directory must use the same spelling, so mcp_call receives a name
+        // `invoke_mcp_tool` can split.
+        let mcp_call = specs.iter().find(|s| s.name == "mcp_call").unwrap();
+        assert!(mcp_call.description.contains("mcp__srv__beta"));
+    }
+
+    #[test]
     fn provider_tool_registry_omits_the_escape_hatch_when_every_tool_is_primary() {
         // The common case (a server with no `primaryTools` filter) must not pay
         // for two extra specs and an empty directory.
@@ -1130,7 +1200,7 @@ mod tests {
         };
         let specs = provider_tool_registry(&[McpServer::offline(&rec)]);
         let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
-        assert!(names.contains(&"only"));
+        assert!(names.contains(&"mcp__srv__only"), "{names:?}");
         assert!(!names.contains(&"mcp_call"), "{names:?}");
         assert!(!names.contains(&"mcp_describe"), "{names:?}");
     }
