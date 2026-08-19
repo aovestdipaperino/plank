@@ -1306,3 +1306,17 @@ test` and review the diff before committing.
   guarded left it green. Any test of an age-sensitive policy has to write
   explicit `last_used` values into its sidecars rather than let the filesystem
   supply "now".
+- **A discarded stderr turns every server death into a timeout.** plank spawned
+  MCP stdio servers with `.stderr(Stdio::null())` so that only JSON-RPC reached
+  stdout, and reported both a poll timeout and a closed pipe through one string:
+  `no response from server (timeout or closed pipe)`. When `tokensave serve` is
+  started outside an indexed project it prints `no TokenSave index found ...` to
+  stderr and exits 1 *before* answering `initialize`, so the single actionable
+  line was thrown away and the message blamed a 30-second timeout that had not
+  elapsed. Piping stderr into a bounded rolling tail costs nothing and keeps
+  stdout clean; the tail is what makes the failure legible. Two traps in the
+  fix: EOF on stdout **races the child's exit**, so an immediate `try_wait` says
+  "still running" for a process that has already died and the message reverts to
+  blaming the timeout — a short grace poll is required; and a server's startup
+  error is usually followed by a long usage dump, so keep the *tail* and quote
+  the *last* line rather than the first.
