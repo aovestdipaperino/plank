@@ -38,6 +38,12 @@ fn mcp_timeout_sec() -> u64 {
     crate::settings::active().mcp.timeout_secs
 }
 
+/// Bytes of a stdio server's stderr kept for diagnostics.
+///
+/// Enough for a startup error or a panic line; a chatty server that logs to
+/// stderr forever must not grow this without bound.
+const STDERR_TAIL_CAP: usize = 4096;
+
 // ============================================================================
 // Minimal JSON value (port of agent_json)
 // ============================================================================
@@ -417,6 +423,13 @@ struct StdioTransport {
     stdin: ChildStdin,
     stdout: ChildStdout,
     rbuf: Vec<u8>,
+    /// Tail of the server's stderr, drained by a reader thread.
+    ///
+    /// A server that dies during startup usually explains why on stderr (a
+    /// missing index, a bad flag, a panic). Discarding it left every such
+    /// death indistinguishable from a timeout, so keep the last
+    /// [`STDERR_TAIL_CAP`] bytes to quote back in the error.
+    stderr_tail: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 struct HttpTransport {
@@ -493,18 +506,48 @@ impl McpServer {
                 .envs(cfg.env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                // stderr to /dev/null so stdout carries only JSON-RPC.
-                .stderr(Stdio::null())
+                // stderr is piped, not inherited: it must never interleave
+                // with the UI, but it is the only place a server explains its
+                // own death, so a thread drains it into `stderr_tail`.
+                .stderr(Stdio::piped())
                 .process_group(0)
                 .spawn()
                 .map_err(|e| format!("failed to start {}: {e}", cfg.command))?;
             let stdin = child.stdin.take().ok_or("no stdin pipe")?;
             let stdout = child.stdout.take().ok_or("no stdout pipe")?;
+            let stderr_tail = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            if let Some(mut err) = child.stderr.take() {
+                let sink = std::sync::Arc::clone(&stderr_tail);
+                // Detached: it ends at EOF when the child's stderr closes.
+                std::thread::spawn(move || {
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        let Ok(n) = std::io::Read::read(&mut err, &mut chunk) else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        let Ok(mut tail) = sink.lock() else { return };
+                        tail.push_str(&String::from_utf8_lossy(&chunk[..n]));
+                        // Keep the tail, dropping whole chars off the front:
+                        // the newest lines are the ones worth reporting.
+                        if tail.len() > STDERR_TAIL_CAP {
+                            let cut = tail.len() - STDERR_TAIL_CAP;
+                            let cut = (cut..tail.len())
+                                .find(|i| tail.is_char_boundary(*i))
+                                .unwrap_or(tail.len());
+                            tail.drain(..cut);
+                        }
+                    }
+                });
+            }
             Transport::Stdio(StdioTransport {
                 child,
                 stdin,
                 stdout,
                 rbuf: Vec::new(),
+                stderr_tail,
             })
         } else {
             let agent: ureq::Agent = ureq::Agent::config_builder()
@@ -687,6 +730,49 @@ impl McpServer {
 }
 
 impl StdioTransport {
+    /// Explains a failed read: whether the child died (with its status and
+    /// whatever it said on stderr) or simply never answered in time.
+    ///
+    /// `initialize` failing because a server exits on startup and a server
+    /// that ignores requests are very different problems, and the operator
+    /// can only act on the difference if the message states it.
+    fn failure_reason(&mut self) -> String {
+        // EOF on stdout races the child's exit: the pipe closes before
+        // `waitpid` reports a status, so an immediate `try_wait` says "still
+        // running" for a server that has already died and the message would
+        // wrongly blame the timeout. Give the exit a brief grace period.
+        let grace = Instant::now() + Duration::from_millis(250);
+        let exited = loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < grace => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Still running past the grace period, or unknowable.
+                _ => break None,
+            }
+        };
+        let tail = self
+            .stderr_tail
+            .lock()
+            .map(|t| t.trim().to_string())
+            .unwrap_or_default();
+        let mut msg = match exited {
+            Some(status) => match status.code() {
+                Some(code) => format!("server exited with status {code}"),
+                None => "server was killed by a signal".to_string(),
+            },
+            None => format!("no response within {}s", mcp_timeout_sec()),
+        };
+        if !tail.is_empty() {
+            // Last line first: a startup error is usually the final thing
+            // written before the process gives up.
+            let last = tail.lines().next_back().unwrap_or(&tail);
+            let _ = write!(msg, ": {last}");
+        }
+        msg
+    }
+
     /// Reads one newline-delimited message, blocking up to `deadline`.
     ///
     /// Returns `None` on timeout, EOF, or error (the caller marks the server
@@ -737,7 +823,7 @@ impl StdioTransport {
         let deadline = Instant::now() + Duration::from_secs(mcp_timeout_sec());
         loop {
             let Some(line) = self.read_line(deadline) else {
-                return Err("no response from server (timeout or closed pipe)".to_string());
+                return Err(self.failure_reason());
             };
             // Ignore unparsable/log lines on stdout.
             let Some(resp) = json_parse(&line) else {
@@ -2418,6 +2504,47 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn a_server_that_dies_on_startup_reports_its_status_and_stderr() {
+        // Regression: tokensave exits 1 with a "no index found" message on
+        // stderr when started outside an indexed project. With stderr sent to
+        // /dev/null and no exit check, that surfaced as "timeout or closed
+        // pipe" — blaming a timeout that never happened and hiding the one
+        // line that says how to fix it.
+        let script = "echo 'Error: config error: no TokenSave index found' >&2; exit 1";
+        let cfg = McpServerConfig {
+            name: "dying".to_string(),
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: Vec::new(),
+            url: String::new(),
+            headers: Vec::new(),
+            primary_tools: None,
+        };
+        let mut server =
+            McpServer::spawn(&cfg).expect("spawn should succeed; the server dies after");
+        let started = Instant::now();
+        let err = server.handshake(None).expect_err("handshake must fail");
+        assert!(
+            err.contains("exited with status 1"),
+            "should name the exit status, got {err:?}"
+        );
+        assert!(
+            err.contains("no TokenSave index found"),
+            "should quote the server's stderr, got {err:?}"
+        );
+        assert!(
+            !err.contains("no response within"),
+            "a dead server must not be reported as a timeout, got {err:?}"
+        );
+        // And it must fail fast rather than burning the request timeout.
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
