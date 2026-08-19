@@ -1320,3 +1320,23 @@ test` and review the diff before committing.
   blaming the timeout — a short grace poll is required; and a server's startup
   error is usually followed by a long usage dump, so keep the *tail* and quote
   the *last* line rather than the first.
+- **`primaryTools` was honoured on the text path and ignored on the provider
+  path.** `append_tool_schemas` gives a full schema only to primary tools and
+  lists the rest as a one-line directory, but `provider_tool_registry` pushed a
+  `ToolSpec` for *every* MCP tool. With tokensave connected that made a plank
+  request 94.5 KB of which 90.2 KB was 140 tool schemas — 95% of the body,
+  resent on every turn. The visible symptom is not the prefill: it is that
+  **decode t/s stays low for the whole session**, because per-token attention
+  cost scales with KV length, so a ~22k-token prefix slows every token compared
+  to the same model under `llama-cli` with a bare prompt. Filtering to primary
+  cut it to 52.6 KB / 66 tools.
+- **A text-path tool can be undeclared; a provider-path tool cannot.** The text
+  path can leave directory tools out of the prompt because the model emits DSML
+  — free text that can name anything. On an OpenAI-compatible endpoint the model
+  can only call a function that was declared, and llama.cpp goes further by
+  building a *grammar* from the `tools` array, making an undeclared name
+  literally ungeneratable. So narrowing the declared set needs an `mcp_call`
+  escape hatch (full name + JSON arguments) carrying the directory in its
+  description; without one, "hide the schema" silently becomes "delete the
+  tool". Measuring a payload win here is easy, and it is exactly the change that
+  can lose functionality without failing a single test.
