@@ -1401,13 +1401,23 @@ test` and review the diff before committing.
   but it says unknown tool ... maybe it's in the MCP directory". A prompt that
   contradicts itself produces exactly that thrash, and it looks like a model
   failure rather than a naming bug. Assert routability, not presence.
-- **The decode penalty from a long prompt is bigger than a first measurement
-  suggested — but still second to prefill.** `--minimal-prompt` makes the
-  comparison cheap: 2,857 tokens vs 12,170 for a normal session on the same
-  server, back to back. Prefill/TTFT 4.6-6.3 s vs 27.0 s; decode 22-26 t/s vs
-  16.6 t/s, i.e. **25-35% slower decode** at 12k context, not the ~15% an
-  earlier noisy run implied. Both effects are real and they compound; TTFT is
-  the one that dominates a cold turn. Any decode number taken while something
-  else is using the GPU is worthless — the same body has measured 7 t/s and
-  27 t/s on this box — so re-measure the pair back to back rather than trusting
-  a figure from earlier in a session.
+- **A long prompt costs ~20% of decode and all of the TTFT.**
+  `--minimal-prompt` makes the comparison cheap. Measured by warming each prefix
+  once and then sampling decode four times with the server's prompt cache on,
+  same question in every body (±1% repeatability): 59 tokens 6.55 t/s,
+  2,863 tokens 5.37 t/s (**-18%**), 10,679 tokens 5.14 t/s (**-22%**). Cold TTFT
+  over the same three: 0.5 s, 16.1 s, 54.8 s — warm, all three are 0.2-0.3 s.
+  So both effects are real, they compound, and **TTFT is the one that dominates
+  a cold turn** by an order of magnitude.
+
+  Getting a decode number that means anything took three attempts, and the two
+  failures are the lesson. (1) Short natural generations (48-57 tokens) are pure
+  noise: one body measured 20.69 and 7.91 t/s minutes apart. (2) `ignore_eos`,
+  the obvious way to force equal-length generations, **inverts the result** on a
+  speculative-decoding server — past the natural end the model emits degenerate
+  text, the DFlash draft model stops predicting it, acceptance collapses, and
+  the *bare* prompt looks slowest (3.05 t/s) because it reaches that point
+  first. Warm-cache repeat sampling is the method that works. Absolute values
+  still track machine load — the same contexts gave 22-26 t/s on an idle box and
+  5-7 t/s under load average 7.6 — so only ever compare figures measured back to
+  back, and quote ratios rather than absolutes.
