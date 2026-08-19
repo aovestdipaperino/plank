@@ -25,7 +25,7 @@ use crate::engine::{
     ChatMessage, ChatRole, Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats,
     PrefillProgress, Prompt, ToolSpec,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Which provider API family a [`ProviderEngine`] speaks.
 // `Hash`/`Eq` so it can key the per-definition alternate-engine cache.
@@ -1117,56 +1117,20 @@ impl ProviderEngine {
         }
     }
 
-    /// The API endpoint path for this provider's streaming completion.
-    fn endpoint(&self) -> &'static str {
-        match self.kind {
-            ProviderKind::OpenAi => "/chat/completions",
-            ProviderKind::Anthropic => "/messages",
-        }
-    }
-
-    /// A fresh streaming translator for this provider.
-    fn translator(&self) -> Box<dyn SseTranslator> {
-        match self.kind {
-            ProviderKind::OpenAi => Box::new(OpenAiTranslator::new()),
-            ProviderKind::Anthropic => Box::new(AnthropicTranslator::new()),
-        }
-    }
-}
-
-impl Engine for ProviderEngine {
-    fn wants_structured(&self) -> bool {
-        true
-    }
-
-    fn max_parallel(&self) -> usize {
-        // Stateless request/response: there is no live session to interleave, so
-        // the real ceiling is the provider's rate limit rather than anything
-        // plank owns. `agents.maxParallel` is what actually bounds width.
-        MAX_PARALLEL_SIDECHAINS
-    }
-
-    fn generate(
-        &mut self,
-        prompt: Prompt<'_>,
-        opts: &GenerationOptions,
-        interrupt: &dyn Fn() -> bool,
-        _greedy: &dyn Fn() -> bool,
-        on_event: &mut dyn FnMut(EngineEvent),
-    ) -> Result<GenerationStats, EngineError> {
-        let body = self.request_for(prompt, opts);
-        let payload = serde_json::to_string(&body)
-            .map_err(|e| EngineError::new(format!("serialize provider request: {e}")))?;
-
-        // Providers report no prefill; emit one honest done-event so the
-        // progress bar completes instead of hanging (§4.2).
-        let total = self.count_tokens(prompt.flat());
-        on_event(EngineEvent::Prefill(PrefillProgress {
-            done: total,
-            total,
-            tps: 0.0,
-        }));
-
+    /// Sends the request, retrying transient failures, and returns the streaming
+    /// response.
+    ///
+    /// Split out of [`generate`](Self::generate) purely to keep that function
+    /// readable: it is the whole connect-and-retry phase, and nothing after it
+    /// depends on the intermediate state.
+    ///
+    /// # Errors
+    /// Returns the provider's own error text on a non-retryable status or after
+    /// the last attempt.
+    fn send_with_retries(
+        &self,
+        payload: &str,
+    ) -> Result<ureq::http::Response<ureq::Body>, EngineError> {
         let url = format!("{}{}", self.base_url, self.endpoint());
         // Surface HTTP error statuses as ordinary responses instead of ureq's
         // default `StatusCode` error, so we can read the provider's error body
@@ -1196,7 +1160,7 @@ impl Engine for ProviderEngine {
         let mut last_err: Option<String> = None;
         for attempt in 0..MAX_ATTEMPTS {
             let request = ureq_provider_request(&agent, &url, self.kind, &self.api_key);
-            match request.send(payload.as_str()) {
+            match request.send(payload) {
                 Ok(mut r) => {
                     let status = r.status().as_u16();
                     if (200..300).contains(&status) {
@@ -1234,6 +1198,89 @@ impl Engine for ProviderEngine {
                 "provider request: connection failed".to_string()
             })));
         };
+        Ok(resp)
+    }
+
+    /// The API endpoint path for this provider's streaming completion.
+    fn endpoint(&self) -> &'static str {
+        match self.kind {
+            ProviderKind::OpenAi => "/chat/completions",
+            ProviderKind::Anthropic => "/messages",
+        }
+    }
+
+    /// A fresh streaming translator for this provider.
+    fn translator(&self) -> Box<dyn SseTranslator> {
+        match self.kind {
+            ProviderKind::OpenAi => Box::new(OpenAiTranslator::new()),
+            ProviderKind::Anthropic => Box::new(AnthropicTranslator::new()),
+        }
+    }
+}
+
+/// Wall-clock and decode throughput for one provider pass.
+///
+/// Returns `(tps, steady_tps)`. `tps` covers the whole pass, first token
+/// included, matching what the local engines mean by it. `steady_tps` is
+/// measured from `first_text` — the local engines mark "steady" at
+/// [`STEADY_WARMUP_SECS`](crate::engine::STEADY_WARMUP_SECS) into the pass,
+/// which a provider cannot observe, but the first text byte separates the same
+/// thing that warmup exists to exclude: the one-time cost before decoding
+/// begins (connect, queue, server-side prefill).
+///
+/// `generated` comes from the provider's own `usage`, which is authoritative;
+/// counting SSE deltas would not be, since they do not map one-to-one onto
+/// tokens. Either rate is 0 when it cannot be measured, never a guess.
+fn throughput(generated: i32, started: Instant, first_text: Option<Instant>) -> (f64, f64) {
+    let generated = f64::from(generated);
+    if generated <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let rate = |secs: f64| if secs > 0.0 { generated / secs } else { 0.0 };
+    (
+        rate(started.elapsed().as_secs_f64()),
+        first_text.map_or(0.0, |t| rate(t.elapsed().as_secs_f64())),
+    )
+}
+
+impl Engine for ProviderEngine {
+    fn wants_structured(&self) -> bool {
+        true
+    }
+
+    fn max_parallel(&self) -> usize {
+        // Stateless request/response: there is no live session to interleave, so
+        // the real ceiling is the provider's rate limit rather than anything
+        // plank owns. `agents.maxParallel` is what actually bounds width.
+        MAX_PARALLEL_SIDECHAINS
+    }
+
+    fn generate(
+        &mut self,
+        prompt: Prompt<'_>,
+        opts: &GenerationOptions,
+        interrupt: &dyn Fn() -> bool,
+        _greedy: &dyn Fn() -> bool,
+        on_event: &mut dyn FnMut(EngineEvent),
+    ) -> Result<GenerationStats, EngineError> {
+        let body = self.request_for(prompt, opts);
+        let payload = serde_json::to_string(&body)
+            .map_err(|e| EngineError::new(format!("serialize provider request: {e}")))?;
+        // Clocked from before the request so `tps` is the honest wall-clock rate
+        // for the whole pass, retries and all, exactly as the local engines
+        // report it.
+        let started = Instant::now();
+
+        // Providers report no prefill; emit one honest done-event so the
+        // progress bar completes instead of hanging (§4.2).
+        let total = self.count_tokens(prompt.flat());
+        on_event(EngineEvent::Prefill(PrefillProgress {
+            done: total,
+            total,
+            tps: 0.0,
+        }));
+
+        let resp = self.send_with_retries(payload.as_str())?;
 
         let mut translator = self.translator();
         // The body is read on its own thread and consumed through a channel, so
@@ -1245,14 +1292,25 @@ impl Engine for ProviderEngine {
         // cannot cross a thread boundary; this hands the reader thread an owned
         // `'static` body, and drops the response here.
         let rx = crate::remote::spawn_sse_reader(resp.into_body().into_reader());
-        let end = crate::remote::pump_sse(
-            &rx,
-            crate::remote::STREAM_IDLE_TIMEOUT,
-            crate::remote::STREAM_POLL_INTERVAL,
-            interrupt,
-            |data| translator.feed(data, on_event),
-        )
-        .map_err(EngineError::new)?;
+        // When the first text arrives: everything before it is time-to-first-
+        // token (connect, queue, server prefill) and none of it is decode.
+        let first_text = std::cell::Cell::new(None);
+        let end = {
+            let mut tap = |ev: EngineEvent| {
+                if first_text.get().is_none() && matches!(ev, EngineEvent::Text(_)) {
+                    first_text.set(Some(Instant::now()));
+                }
+                on_event(ev);
+            };
+            crate::remote::pump_sse(
+                &rx,
+                crate::remote::STREAM_IDLE_TIMEOUT,
+                crate::remote::STREAM_POLL_INTERVAL,
+                interrupt,
+                |data| translator.feed(data, &mut tap),
+            )
+            .map_err(EngineError::new)?
+        };
         let interrupted = end == crate::remote::SseEnd::Interrupted;
 
         if interrupted {
@@ -1277,11 +1335,11 @@ impl Engine for ProviderEngine {
             .input_tokens
             .saturating_add(usage.cache_creation_input_tokens)
             .saturating_add(usage.cache_read_input_tokens);
+        let (tps, steady_tps) = throughput(usage.output_tokens, started, first_text.get());
         Ok(GenerationStats {
-            // Not a locally measured decode, so no steady rate.
-            steady_tps: 0.0,
+            steady_tps,
             generated: usage.output_tokens,
-            tps: 0.0,
+            tps,
             ctx_used: prompt_total.saturating_add(usage.output_tokens),
             interrupted: false,
             usage: Some(crate::engine::TokenUsage {
@@ -1676,6 +1734,91 @@ mod tests {
         }
         t.finish(&mut |e| events.push(e));
         collect_text(&events)
+    }
+
+    /// A provider pass now reports throughput. `tps` is the whole pass, so a
+    /// slow first token drags it down; `steady_tps` starts at the first text
+    /// byte, so it reflects decode alone. The test makes the gap unmistakable
+    /// by stalling before the first token and then streaming promptly.
+    #[test]
+    fn provider_reports_wall_clock_and_decode_throughput() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 8192];
+            let _ = sock.read(&mut buf);
+            let mut body = String::new();
+            for chunk in [
+                r#"{"choices":[{"delta":{"content":"alpha "}}]}"#,
+                r#"{"choices":[{"delta":{"content":"beta"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":20}}"#,
+                "[DONE]",
+            ] {
+                body.push_str("data: ");
+                body.push_str(chunk);
+                body.push_str("\n\n");
+            }
+            // Content-Length rather than a bare close: the body is still written
+            // late, so the stall is real, but the framing is unambiguous.
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.flush();
+            // Time-to-first-token: long enough that a rate including it cannot
+            // be mistaken for the decode rate.
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = sock.write_all(body.as_bytes());
+            let _ = sock.flush();
+        });
+
+        let mut engine = ProviderEngine::new(
+            ProviderKind::OpenAi,
+            Some(format!("http://127.0.0.1:{port}/v1")),
+            "k".to_string(),
+            "m".to_string(),
+            4096,
+            false,
+        )
+        .expect("engine");
+        let messages = [ChatMessage::new(ChatRole::User, "hi")];
+        let mut events = Vec::new();
+        let stats = engine
+            .generate(
+                Prompt::Structured(&crate::engine::StructuredTurn {
+                    system: "",
+                    messages: &messages,
+                    tools: &[],
+                    rendered: "hi",
+                }),
+                &GenerationOptions::default(),
+                &|| false,
+                &|| false,
+                &mut |e| events.push(e),
+            )
+            .expect("generate");
+        server.join().expect("server thread");
+
+        assert_eq!(stats.generated, 20, "usage is the authoritative count");
+        assert!(stats.tps > 0.0, "wall-clock rate must be reported");
+        assert!(stats.steady_tps > 0.0, "decode rate must be reported");
+        // The 600ms stall is inside `tps` and outside `steady_tps`.
+        assert!(
+            stats.steady_tps > stats.tps,
+            "decode rate {} should exceed the whole-pass rate {} when the first \
+             token is slow",
+            stats.steady_tps,
+            stats.tps
+        );
+        // 20 tokens across a pass that took at least 600ms cannot exceed this.
+        assert!(stats.tps < 34.0, "tps {} ignores the stall", stats.tps);
     }
 
     #[test]

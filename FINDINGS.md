@@ -1421,3 +1421,15 @@ test` and review the diff before committing.
   still track machine load — the same contexts gave 22-26 t/s on an idle box and
   5-7 t/s under load average 7.6 — so only ever compare figures measured back to
   back, and quote ratios rather than absolutes.
+- **A provider engine can report real throughput; it just has to measure a
+  different clock.** `ProviderEngine::generate` hardcoded `tps: 0.0` and
+  `steady_tps: 0.0`, so every provider turn displayed `0.0 t/s` and the
+  `/speeds` peak line was suppressed by its own `> 0.0` guard. Both are
+  measurable from this side: `tps` from a clock started before the request,
+  `steady_tps` from the arrival of the *first text event* — the local engines
+  mark "steady" at `STEADY_WARMUP_SECS` into the pass, which a provider cannot
+  observe, but the first byte separates exactly what that warmup exists to
+  exclude (connect, queue, server-side prefill). Count tokens from the API's
+  `usage`, never from SSE deltas: a delta is not a token. Validated against
+  llama.cpp's own `print_timing` for the same turn — plank 8.5 tok/s vs
+  llama-server 8.46 t/s over an identical 198-token count.
