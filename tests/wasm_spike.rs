@@ -897,6 +897,55 @@ fn frame_session(
 /// The `frame` lifecycle end to end: open, step into a decoded glyph buffer,
 /// move between steps, refuse to close on an ordinary key, close on `q`, and
 /// leave a scrollback line behind.
+/// The text-only guest, loaded and stepped.
+///
+/// The host picks between `frame_step` and `frame_step_text` by which export a
+/// module has, so this needs a module with only the text one — `abi-guest` has
+/// the packed export and could never exercise this path.
+#[test]
+fn a_text_only_frame_component_draws_without_packing_a_buffer() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/spike/text-guest/target/wasm32-unknown-unknown/release/plank_text_guest.wasm"
+    );
+    let Ok(wasm) = std::fs::read(path) else {
+        assert!(
+            !guests_required(),
+            "PLANK_REQUIRE_GUESTS is set but the text-guest is missing: \
+             run spike/build-guest.sh before the test step"
+        );
+        eprintln!("skipping: run spike/build-guest.sh first");
+        return;
+    };
+    let (root, mut session) = frame_session("text", &wasm, "");
+
+    // The load-time contract accepts either step export; a component with only
+    // the text one must not be refused for "missing frame_step".
+    let openable = session.openable_frames();
+    assert_eq!(openable.len(), 1, "{openable:?}");
+
+    let mut frame = session
+        .open_frame("dev.plank.bounce", "", 40, 20, 1)
+        .expect("open");
+    session
+        .step_frame(&mut frame, 50, 40, 20, 1_000)
+        .expect("step");
+
+    // "hello" and "world", ten glyphs, laid out from column zero on rows 0 and 1.
+    assert_eq!(frame.last.glyphs.len(), 10, "{:?}", frame.last.glyphs);
+    assert_eq!((frame.last.w, frame.last.h), (40, 20));
+    let hello: String = frame.last.glyphs[..5].iter().map(|g| g.ch).collect();
+    assert_eq!(hello, "hello");
+    assert!(frame.last.glyphs[..5].iter().all(|g| g.y == 0));
+    // The second row's per-line colour and bold survive the conversion.
+    assert_eq!(frame.last.glyphs[5].y, 1);
+    assert_eq!(frame.last.glyphs[5].color, (1, 2, 3));
+    assert!(frame.last.bold[5]);
+    assert!(!frame.last.bold[0], "row 0 asked for no bold");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 #[test]
 fn a_frame_component_opens_steps_and_closes() {
     use plank::wasmreg::FrameOutcome;

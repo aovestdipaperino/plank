@@ -1407,14 +1407,31 @@ impl Session {
             "{{\"dt_ms\": {}, \"w\": {w}, \"h\": {h}, \"now_ms\": {now_ms}}}",
             dt_ms.min(MAX_STEP_MS)
         );
+        // A component exports one or the other. `frame_step` is the packed
+        // buffer — one memcpy out of linear memory — and is what a component
+        // graduates to; `frame_step_text` returns JSON rows and is the shape an
+        // author writes first. Packed wins when a module somehow has both, so
+        // adding the fallback cannot slow an existing component down.
+        let text_only = !self.host.has_export(&frame.id, "frame_step")
+            && self.host.has_export(&frame.id, "frame_step_text");
+        let export = if text_only {
+            "frame_step_text"
+        } else {
+            "frame_step"
+        };
         let bytes = self
             .host
-            .call(&frame.id, "frame_step", payload.as_bytes())
+            .call(&frame.id, export, payload.as_bytes())
             .map_err(|e| {
                 self.registry.strike(&frame.id);
                 format!("{}: {e}", frame.id)
             })?;
-        match crate::wasmglyph::decode(&bytes) {
+        let decoded = if text_only {
+            crate::wasmglyph::decode_text(&bytes, w, h)
+        } else {
+            crate::wasmglyph::decode(&bytes)
+        };
+        match decoded {
             Ok(decoded) => {
                 frame.last = decoded;
                 Ok(())
@@ -2172,7 +2189,14 @@ fn missing_exports(
         // `frame_mouse` is deliberately absent from this list: a component may
         // implement it, and one that does not simply never sees a mouse event.
         // Requiring it would refuse a perfectly good keyboard-only game.
-        for export in ["frame_open", "frame_step", "frame_key", "frame_close"] {
+        // `frame_mouse` is optional (see above), and a component satisfies the
+        // step requirement with either the packed export or the text one — the
+        // text form exists precisely so a first plugin need not pack buffers,
+        // and demanding the packed export alongside it would defeat that.
+        if !host.has_export(id, "frame_step") && !host.has_export(id, "frame_step_text") {
+            missing.push("frame_step");
+        }
+        for export in ["frame_open", "frame_key", "frame_close"] {
             if !host.has_export(id, export) {
                 missing.push(export);
             }

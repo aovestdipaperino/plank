@@ -55,6 +55,9 @@ pub enum GlyphError {
     /// not a stream: a component claiming ten thousand glyphs for an 80×24
     /// area has miscounted, and decoding it would allocate on its say-so.
     TooManyGlyphs { count: usize, capacity: usize },
+    /// The JSON text form was not `{"lines": [...]}`. Only [`decode_text`]
+    /// produces this; the packed decoder reports [`Self::NotAGlyphBuffer`].
+    NotATextFrame,
 }
 
 impl std::fmt::Display for GlyphError {
@@ -68,6 +71,9 @@ impl std::fmt::Display for GlyphError {
                     f,
                     "glyph buffer declares {count} glyphs for {capacity} cells"
                 )
+            }
+            Self::NotATextFrame => {
+                write!(f, "frame_step_text did not return {{\"lines\": [...]}}")
             }
         }
     }
@@ -90,6 +96,80 @@ pub struct GlyphFrame {
     /// Background colors, parallel to `glyphs`; `None` where the glyph carried
     /// no background.
     pub bg: Vec<Option<(u8, u8, u8)>>,
+}
+
+/// Decodes the JSON text form a `frame_step_text` component returns.
+///
+/// `{"lines": [{"text": "...", "fg": [r,g,b], "bold": true}, ...]}` — one entry
+/// per row from the top, each laid out from column zero. `fg` and `bold` are
+/// per line rather than per span: a first plugin wants "print this row in
+/// green", and per-span colour is what the packed buffer is for.
+///
+/// The point of this path is that an author's first afternoon does not involve
+/// packing binary buffers. It is slower — a `char` at a time into the same
+/// `GlyphFrame` the packed decoder produces — and that is the trade.
+///
+/// Rows past `h` and columns past `w` are dropped rather than erroring: a
+/// component that writes one line too many should lose the line, not the frame.
+///
+/// # Errors
+/// [`GlyphError::NotATextFrame`] when the payload is not an object with a `lines`
+/// array, so a component that returns the wrong shape is told rather than
+/// silently drawing nothing.
+pub fn decode_text(bytes: &[u8], w: u16, h: u16) -> Result<GlyphFrame, GlyphError> {
+    use crate::tools::mcp::Json;
+    let text = String::from_utf8_lossy(bytes);
+    let Some(Json::Obj(top)) = crate::tools::mcp::json_parse(&text) else {
+        return Err(GlyphError::NotATextFrame);
+    };
+    let Some((_, Json::Arr(lines))) = top.iter().find(|(k, _)| k == "lines") else {
+        return Err(GlyphError::NotATextFrame);
+    };
+
+    let mut frame = GlyphFrame {
+        w,
+        h,
+        ..GlyphFrame::default()
+    };
+    for (row, line) in lines.iter().enumerate() {
+        let Ok(y) = u16::try_from(row) else { break };
+        if y >= h {
+            break;
+        }
+        let Json::Obj(fields) = line else { continue };
+        let get = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        let Some(Json::Str(body)) = get("text") else {
+            continue;
+        };
+        let color = match get("fg") {
+            Some(Json::Arr(rgb)) if rgb.len() == 3 => {
+                let byte = |i: usize| match rgb.get(i) {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    Some(Json::Num(n)) => n.clamp(0.0, 255.0) as u8,
+                    _ => 255,
+                };
+                (byte(0), byte(1), byte(2))
+            }
+            _ => (255, 255, 255),
+        };
+        let bold = matches!(get("bold"), Some(Json::Bool(true)));
+        for (col, ch) in body.chars().enumerate() {
+            let Ok(x) = u16::try_from(col) else { break };
+            if x >= w {
+                break;
+            }
+            // Spaces are left undrawn rather than painted: a text component
+            // pads its rows, and painting every pad cell would overwrite
+            // whatever the frame is layered over.
+            if ch == ' ' {
+                continue;
+            }
+            frame.glyphs.push(crate::arcade::Glyph { x, y, ch, color });
+            frame.bold.push(bold);
+            frame.bg.push(None);
+        }
+    }
+    Ok(frame)
 }
 
 /// Decodes a packed buffer.
@@ -209,6 +289,82 @@ pub fn encode(frame: &GlyphFrame) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The text form an author writes first, decoded into the same frame the
+    /// packed buffer produces.
+    #[test]
+    fn text_frames_decode_into_glyphs() {
+        let json = br#"{"lines": [
+            {"text": "hi", "fg": [10, 20, 30], "bold": true},
+            {"text": "x"}
+        ]}"#;
+        let frame = decode_text(json, 40, 12).expect("decodes");
+        assert_eq!((frame.w, frame.h), (40, 12));
+        assert_eq!(frame.glyphs.len(), 3, "{:?}", frame.glyphs);
+        assert_eq!(
+            (frame.glyphs[0].x, frame.glyphs[0].y, frame.glyphs[0].ch),
+            (0, 0, 'h')
+        );
+        assert_eq!(frame.glyphs[0].color, (10, 20, 30));
+        assert!(frame.bold[0], "per-line bold applies to the row");
+        // Second row, and the default colour when `fg` is absent.
+        assert_eq!(
+            (frame.glyphs[2].x, frame.glyphs[2].y, frame.glyphs[2].ch),
+            (0, 1, 'x')
+        );
+        assert_eq!(frame.glyphs[2].color, (255, 255, 255));
+        assert!(!frame.bold[2]);
+        // Parallel arrays stay parallel, which the blitter relies on.
+        assert_eq!(frame.bold.len(), frame.glyphs.len());
+        assert_eq!(frame.bg.len(), frame.glyphs.len());
+    }
+
+    /// Padding spaces are not painted. A text component pads its rows, and
+    /// drawing every pad cell would overwrite whatever the frame is layered
+    /// over — a veiled frame would erase the transcript behind it.
+    #[test]
+    fn spaces_in_a_text_frame_are_left_undrawn() {
+        let frame = decode_text(br#"{"lines": [{"text": "a b"}]}"#, 40, 12).expect("decodes");
+        assert_eq!(frame.glyphs.len(), 2);
+        assert_eq!(frame.glyphs[1].x, 2, "the gap kept its column");
+    }
+
+    /// Overflow is dropped, not an error: a component that writes one row too
+    /// many should lose the row rather than the frame.
+    #[test]
+    fn a_text_frame_is_clipped_to_the_area() {
+        let json = br#"{"lines": [{"text": "abcdef"}, {"text": "zz"}, {"text": "no"}]}"#;
+        let frame = decode_text(json, 3, 2).expect("decodes");
+        // Row 0 keeps 3 of 6 columns, row 1 keeps both, row 2 is past `h`.
+        assert_eq!(frame.glyphs.len(), 5, "{:?}", frame.glyphs);
+        assert!(frame.glyphs.iter().all(|g| g.x < 3 && g.y < 2));
+    }
+
+    /// The wrong shape is reported rather than silently drawing nothing, and it
+    /// is a *different* error from the packed decoder's bad-magic case so the
+    /// message names the export the author actually wrote.
+    #[test]
+    fn a_text_frame_of_the_wrong_shape_is_named() {
+        assert_eq!(
+            decode_text(b"[]", 10, 10),
+            Err(GlyphError::NotATextFrame),
+            "a bare array is not a text frame"
+        );
+        assert_eq!(
+            decode_text(br#"{"rows": []}"#, 10, 10),
+            Err(GlyphError::NotATextFrame)
+        );
+        assert!(
+            decode_text(br#"{"lines": []}"#, 10, 10).is_ok(),
+            "empty is fine"
+        );
+        assert!(
+            GlyphError::NotATextFrame
+                .to_string()
+                .contains("frame_step_text"),
+            "the message must name the export"
+        );
+    }
     use super::*;
 
     fn frame_of(glyphs: Vec<Glyph>) -> GlyphFrame {

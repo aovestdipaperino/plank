@@ -5,7 +5,7 @@
 # critical path of a normal build or of CI's default job.
 set -e
 cd "$(dirname "$0")"
-for guest in abi-guest min-guest; do
+for guest in abi-guest min-guest text-guest; do
   (cd "$guest" && cargo build --release --target wasm32-unknown-unknown)
   echo "guest: $(pwd)/$guest/target/wasm32-unknown-unknown/release/$(echo "plank_$guest" | tr - _).wasm"
 done
