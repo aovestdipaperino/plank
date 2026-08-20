@@ -515,8 +515,24 @@ This maps one-to-one onto `arcade::Glyph { x, y, ch, color }` with
 host-side consumer with only the background-color extension to add.
 
 Plugins that only need text can instead export `frame_step_text` returning a
-JSON `{ lines: [{ text, spans }] }`; the host converts. Slower, far easier to
+JSON `{ lines: [{ text, fg, bold }] }`, one entry per row from the top; the host
+converts into the same `GlyphFrame` the packed buffer decodes to, so the blitter
+is shared. Slower — a `char` at a time rather than a `memcpy` — far easier to
 write, and the right default for a plugin author's first afternoon.
+
+Colour and bold are **per line, not per span**, which is a deliberate narrowing
+of the `{ text, spans }` this document originally specified: an author reaching
+for this export wants "print this row in green", and anyone who needs colour to
+change mid-row is better served by the packed buffer than by a second, slower
+way to express the same thing. Spaces are left undrawn rather than painted,
+because a text component pads its rows and painting pad cells would erase what a
+veiled frame sits over. Rows past `h` and columns past `w` are clipped, not
+refused: a component that writes one line too many should lose the line, not the
+frame.
+
+The host chooses by which export a module has, and the packed one wins if a
+module somehow has both, so the fallback cannot slow an existing component down.
+A `frame` component satisfies the load-time contract with **either** export.
 
 ## Determinism and budgets
 
