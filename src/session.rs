@@ -2308,10 +2308,16 @@ pub fn sha1_hex(data: &[u8]) -> String {
     }
     msg.extend_from_slice(&bit_len.to_be_bytes());
 
-    for block in msg.chunks_exact(64) {
+    // `as_chunks` rather than `chunks_exact`: the compiler knows the chunk is
+    // exactly 64 (or 4) bytes, so indexing inside needs no bounds check and
+    // `from_be_bytes` takes the array directly. Rust 1.98's
+    // `chunks_exact_to_as_chunks` lint asks for this.
+    let (blocks, _) = msg.as_chunks::<64>();
+    for block in blocks {
         let mut w = [0u32; 80];
-        for (i, word) in block.chunks_exact(4).enumerate() {
-            w[i] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, _) = block.as_chunks::<4>();
+        for (i, word) in words.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -3233,6 +3239,19 @@ hello\n";
     fn sha1_known_vectors() {
         assert_eq!(sha1_hex(b""), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
         assert_eq!(sha1_hex(b"abc"), "a9993e364706816aba3e25717850c26c9cd0d89d");
+        // Both of the above are one padded block, so they exercise none of the
+        // block loop. A session id is the hash of a transcript and is routinely
+        // kilobytes, so the multi-block path is the one that actually runs.
+        // 56 bytes is the standard vector that pads into a *second* block.
+        assert_eq!(
+            sha1_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+        );
+        // And four blocks, cross-checked against `shasum -a 1`.
+        assert_eq!(
+            sha1_hex(&[b'a'; 200]),
+            "e61cfffe0d9195a525fc6cf06ca2d77119c24a40"
+        );
     }
 
     #[test]

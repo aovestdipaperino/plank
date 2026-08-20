@@ -559,9 +559,7 @@ mod tests {
         // the top row must not let the ball escape upward.
         let mut b = Breakout::new(9);
         b.phase = Phase::Playing;
-        for brick in &mut b.bricks {
-            *brick = false;
-        }
+        b.bricks.fill(false);
         b.ball = (0.5, 0.02);
         b.vel = (0.0, -0.6);
         run(&mut b, 300);
