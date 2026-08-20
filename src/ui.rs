@@ -5691,7 +5691,15 @@ the original is frozen and listed in /tree"
                     return "no HOME, so there is nowhere to install to\n".to_string();
                 };
                 let src = std::path::PathBuf::from(path);
-                match crate::plugins::install(&src, &home) {
+                // A URL downloads and extracts first; both routes converge on
+                // the same local install, so the overwrite refusal and the
+                // first-load trust prompt are identical either way.
+                let installed = if path.starts_with("http://") || path.starts_with("https://") {
+                    crate::plugins::install_from_url(path, &home)
+                } else {
+                    crate::plugins::install(&src, &home)
+                };
+                match installed {
                     Ok(dest) => format!(
                         "installed to {}\nit is loaded on the next start; a wasm component \
                          also needs /plugins trust <id>\n",
@@ -5700,7 +5708,9 @@ the original is frozen and listed in /tree"
                     Err(e) => format!("{e}\n"),
                 }
             }
-            (Some("install"), None) => "usage: /plugins install <directory>\n".to_string(),
+            (Some("install"), None) => "usage: /plugins install <directory|url>\n\
+                 a url must be a .tar.gz over https (or http to loopback)\n"
+                .to_string(),
             (Some("remove"), Some(name)) => {
                 let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
                     return "no HOME, so nothing is installed\n".to_string();

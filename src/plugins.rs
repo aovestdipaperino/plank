@@ -589,6 +589,149 @@ pub fn install(src: &Path, home: &Path) -> Result<PathBuf, String> {
     Ok(dest)
 }
 
+/// Cap on a downloaded plugin archive.
+///
+/// A plugin is a manifest and a few WASM modules; the two plank ships are well
+/// under a megabyte each. The cap exists so a wrong URL — or a hostile one —
+/// cannot fill the user's disk before anything has been validated.
+const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Downloads the `.tar.gz` at `url` and installs the plugin inside it.
+///
+/// Split from [`install`] rather than folded into it: everything here is about
+/// getting bytes onto disk safely, and once there is a directory the local path
+/// is the same code, with the same refusal to overwrite and the same trust
+/// prompt on first load.
+///
+/// The archive is extracted into a fresh temporary directory and *validated*
+/// before anything is copied into the user's plugin directory:
+///
+/// - TLS is required except to loopback, reusing the `--remote` policy.
+/// - The response is capped at [`MAX_ARCHIVE_BYTES`].
+/// - Extraction goes to a directory this function created and owns, so a
+///   traversal entry cannot land beside an existing plugin.
+/// - Any symlink in the extracted tree is a refusal. A plugin has no use for
+///   one, and `copy_tree` follows links: a `wasm -> /Users/x/.ssh` entry would
+///   otherwise copy a private key into the plugin directory and, worse, make it
+///   readable by anything that reads plugins.
+///
+/// # Errors
+/// Returns a message when the URL is rejected, the download fails, the archive
+/// will not extract, it contains no plugin, or it contains a symlink.
+pub fn install_from_url(url: &str, home: &Path) -> Result<PathBuf, String> {
+    crate::remote::validate_remote_url(url, false)?;
+    let staging = staging_dir(home)?;
+    // The staging directory is removed on every exit path, including the error
+    // ones: a failed install that leaves a half-extracted tree behind would be
+    // found by the next `install` as a plugin nobody asked for.
+    let result = fetch_and_stage(url, &staging).and_then(|root| install(&root, home));
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// A private, empty directory to extract into. Removed by the caller.
+fn staging_dir(home: &Path) -> Result<PathBuf, String> {
+    let base = user_plugin_dir(home).join(".staging");
+    // Fresh every time: reusing a directory would mix an old failed download
+    // with a new one, and the plugin root is found by searching the tree.
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
+    Ok(base)
+}
+
+/// Downloads, extracts and validates, returning the plugin root inside `dir`.
+fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
+    let archive = dir.join("plugin.tar.gz");
+    download_to(url, &archive)?;
+    let status = std::process::Command::new("tar")
+        // No `-P`: tar then refuses absolute paths and `..` components itself,
+        // which is the first of the two lines of defence. The second is the
+        // symlink scan below, which does not depend on tar's behaviour.
+        .arg("-xzf")
+        .arg(&archive)
+        .arg("-C")
+        .arg(dir)
+        .status()
+        .map_err(|e| format!("cannot run tar: {e}"))?;
+    if !status.success() {
+        return Err(format!("{url} did not extract as a .tar.gz"));
+    }
+    let _ = std::fs::remove_file(&archive);
+    reject_symlinks(dir)?;
+    find_plugin_root(dir)
+        .ok_or_else(|| format!("{url} contains no plugin (no .plank-plugin/plugin.json)"))
+}
+
+/// Streams `url` into `path`, refusing anything over [`MAX_ARCHIVE_BYTES`].
+fn download_to(url: &str, path: &Path) -> Result<(), String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_global(Some(std::time::Duration::from_mins(5)))
+        .build()
+        .into();
+    let mut resp = agent
+        .get(url)
+        .call()
+        .map_err(|e| format!("cannot fetch {url}: {e}"))?;
+    // `take` rather than a Content-Length check: the header is advisory and a
+    // server can send more than it promised.
+    let mut body = std::io::Read::take(resp.body_mut().as_reader(), MAX_ARCHIVE_BYTES + 1);
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(&mut body, &mut bytes)
+        .map_err(|e| format!("cannot read {url}: {e}"))?;
+    if bytes.len() as u64 > MAX_ARCHIVE_BYTES {
+        return Err(format!(
+            "{url} is larger than the {} MiB plugin limit",
+            MAX_ARCHIVE_BYTES / (1024 * 1024)
+        ));
+    }
+    std::fs::write(path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Fails when any entry under `dir` is a symlink.
+fn reject_symlinks(dir: &Path) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        // `symlink_metadata`, not `metadata`: the latter follows the link and
+        // would report the target's type, which is the thing being checked.
+        let meta = entry
+            .path()
+            .symlink_metadata()
+            .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
+        if meta.file_type().is_symlink() {
+            return Err(format!(
+                "refusing archive: {} is a symlink, which a plugin never needs",
+                entry.file_name().to_string_lossy()
+            ));
+        }
+        if meta.is_dir() {
+            reject_symlinks(&entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// Finds the directory holding a plugin manifest, at `dir` or one level in.
+///
+/// A release tarball unpacks to `<name>/...`, so the plugin is usually one
+/// level down; a hand-rolled archive may put the manifest at the top.
+fn find_plugin_root(dir: &Path) -> Option<PathBuf> {
+    if manifest_path(dir).is_some() {
+        return Some(dir.to_path_buf());
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && manifest_path(p).is_some())
+        .collect();
+    // Sorted so an archive with two plugins in it resolves the same way twice
+    // rather than depending on directory order.
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 /// Uninstalls the plugin named `name` from the user's plugin directory.
 ///
 /// Only ever deletes inside that directory, and only a single path segment:
@@ -945,6 +1088,216 @@ mod tests {
     /// Installing copies the tree, skips build output, and refuses to
     /// overwrite — replacing an installed plugin is new bytes under an
     /// approved name, which is the case trust exists to catch.
+    /// The URL route is served over loopback HTTP by a throwaway server, so the
+    /// whole path — fetch, extract, find the plugin, install — is exercised
+    /// without a network.
+    #[test]
+    fn install_from_url_fetches_extracts_and_installs() {
+        use std::io::{Read as _, Write as _};
+
+        let root = std::env::temp_dir().join(format!("plank-url-install-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Build the tarball a release would publish: the plugin sits one level
+        // down, under its own directory name.
+        let staged = root.join("stage").join("demo");
+        std::fs::create_dir_all(staged.join(".plank-plugin")).unwrap();
+        std::fs::create_dir_all(staged.join("wasm")).unwrap();
+        std::fs::write(
+            staged.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo", "wasm": [{"id": "dev.plank.demo", "module": "demo.wasm"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(staged.join("wasm").join("demo.wasm"), b"\0asm").unwrap();
+        let tarball = root.join("demo.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(root.join("stage"))
+            .arg("demo")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "could not build the fixture tarball");
+        let bytes = std::fs::read(&tarball).unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(&bytes);
+            let _ = sock.flush();
+        });
+
+        let home = root.join("home");
+        // http to loopback is allowed without --insecure, same rule as --remote.
+        let dest = install_from_url(&format!("http://127.0.0.1:{port}/demo.tar.gz"), &home)
+            .expect("installed from url");
+        server.join().unwrap();
+
+        assert!(dest.ends_with("demo"), "{}", dest.display());
+        assert!(dest.join("wasm").join("demo.wasm").is_file());
+        assert!(dest.starts_with(user_plugin_dir(&home)));
+        // The staging directory must not survive: the next install searches the
+        // tree for a plugin root, and a leftover would be found as one.
+        assert!(
+            !user_plugin_dir(&home).join(".staging").exists(),
+            "staging directory left behind"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same path against the artifact the release actually publishes.
+    ///
+    /// The fixture test above builds its own tarball, which proves the logic
+    /// but not that `guests/package.sh` produces something installable. This
+    /// one consumes the real file. It skips when packaging has not been run —
+    /// the normal state of a checkout — and is required in the CI job that
+    /// packages, via the same `PLANK_REQUIRE_GUESTS` switch the WASM suite uses.
+    #[test]
+    fn the_real_packaged_artifact_installs() {
+        use std::io::{Read as _, Write as _};
+
+        let tarball = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("guests")
+            .join("dist")
+            .join("plank-arcades.tar.gz");
+        let Ok(bytes) = std::fs::read(&tarball) else {
+            assert!(
+                std::env::var_os("PLANK_REQUIRE_GUESTS").is_none_or(|v| v == "0"),
+                "PLANK_REQUIRE_GUESTS is set but {} is missing: run guests/package.sh",
+                tarball.display()
+            );
+            eprintln!("skipping: run guests/package.sh first");
+            return;
+        };
+
+        let root = std::env::temp_dir().join(format!("plank-real-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = bytes.clone();
+        let feeder = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    served.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(&served);
+            let _ = sock.flush();
+        });
+
+        let dest = install_from_url(
+            &format!("http://127.0.0.1:{port}/plank-arcades.tar.gz"),
+            &root,
+        )
+        .expect("the released artifact must install");
+        feeder.join().unwrap();
+
+        // The name comes from the manifest, and the module from its `wasm`
+        // entry: if either drifted from what package.sh writes, the component
+        // would load and then fail to find its own code.
+        assert!(dest.ends_with("arcades"), "{}", dest.display());
+        assert!(
+            dest.join("wasm").join("arcades.wasm").is_file(),
+            "module missing under {}",
+            dest.display()
+        );
+        assert!(dest.join(".plank-plugin").join("plugin.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Plaintext to a non-loopback host is refused before any bytes move, and
+    /// nothing is created on disk by the refusal.
+    #[test]
+    fn install_from_url_requires_tls_off_loopback() {
+        let root = std::env::temp_dir().join(format!("plank-url-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let err = install_from_url("http://plugins.example.com/x.tar.gz", &root)
+            .expect_err("plaintext must be refused");
+        assert!(err.contains("plaintext"), "{err}");
+        assert!(
+            !user_plugin_dir(&root).join(".staging").exists(),
+            "a refused URL still created a staging directory"
+        );
+    }
+
+    /// A symlink in the archive is refused. `copy_tree` follows links, so an
+    /// entry pointing at `~/.ssh` would otherwise be copied into the plugin
+    /// directory and made readable by anything that reads plugins.
+    #[test]
+    fn a_symlink_in_the_extracted_tree_is_refused() {
+        let root = std::env::temp_dir().join(format!("plank-url-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = root.join("tree");
+        std::fs::create_dir_all(tree.join(".plank-plugin")).unwrap();
+        std::fs::write(
+            tree.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo"}"#,
+        )
+        .unwrap();
+        let secret = root.join("secret");
+        std::fs::write(&secret, b"private key").unwrap();
+        std::os::unix::fs::symlink(&secret, tree.join("stolen")).unwrap();
+
+        let err = reject_symlinks(&tree).expect_err("a symlink must be refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            err.contains("stolen"),
+            "the offending entry must be named: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A tarball whose manifest sits at the top level installs too: only the
+    /// release layout puts it one level down.
+    #[test]
+    fn a_plugin_root_is_found_at_the_top_or_one_level_in() {
+        let root = std::env::temp_dir().join(format!("plank-url-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let flat = root.join("flat");
+        std::fs::create_dir_all(flat.join(".plank-plugin")).unwrap();
+        std::fs::write(
+            flat.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "flat"}"#,
+        )
+        .unwrap();
+        assert_eq!(find_plugin_root(&flat).as_deref(), Some(flat.as_path()));
+
+        let nested_parent = root.join("nested");
+        let inner = nested_parent.join("demo");
+        std::fs::create_dir_all(inner.join(".plank-plugin")).unwrap();
+        std::fs::write(
+            inner.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            find_plugin_root(&nested_parent).as_deref(),
+            Some(inner.as_path())
+        );
+
+        // Neither: an archive of something that is not a plugin.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(empty.join("docs")).unwrap();
+        assert!(find_plugin_root(&empty).is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn install_copies_a_plugin_and_refuses_to_overwrite() {
         let root = std::env::temp_dir().join(format!("plank-install-{}", std::process::id()));

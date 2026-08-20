@@ -126,6 +126,14 @@ jobs:
           sh spike/build-guest.sh
           sh guests/build.sh
 
+      # Packaging is verified here rather than only at release time: it is the
+      # step that turns a `.wasm` into something installable, and the plugin
+      # manifests it copies are the only thing standing between a release and a
+      # plugin whose component silently never appears. It also produces the
+      # artifact `the_real_packaged_artifact_installs` consumes.
+      - name: Package plugin archives
+        run: sh guests/package.sh
+
       - name: Clippy (plugins)
         run: cargo clippy --all-targets --features plugins -- -D warnings
 
