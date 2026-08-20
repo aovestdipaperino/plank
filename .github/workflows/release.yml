@@ -92,6 +92,29 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "$GITHUB_REF_NAME" "plank-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" --clobber
 
+      # The WASM plugins shipped nowhere: `guests/` was built only on a
+      # developer's disk, so `/plugins install` had nothing to point at and the
+      # whole plugin system was unreachable for anyone who downloaded plank.
+      # These are the two artifacts that make it reachable.
+      #
+      # Architecture-independent (wasm32 is wasm32), but built in the matrix job
+      # because that is where a toolchain and a checkout already exist; the
+      # single matrix entry means they are produced exactly once. `--clobber`
+      # keeps a re-run idempotent.
+      - name: Add wasm32 target for the guests
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Package plugin archives
+        run: sh guests/package.sh
+
+      - name: Upload plugin archives to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for f in guests/dist/plank-*.tar.gz; do
+            gh release upload "$GITHUB_REF_NAME" "$f" --clobber
+          done
+
       # A Homebrew bottle's inner directory must match the formula name, so
       # the bottle is packaged under the channel's formula name. Promotion
       # tags a fresh `.0` release (rebuilt by this workflow), so stable never

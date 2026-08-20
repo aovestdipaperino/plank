@@ -31,3 +31,5 @@ spike/abi-guest/target/
 spike/min-guest/target/
 guests/screensavers/target/
 guests/arcades/target/
+# Assembled plugin directories and tarballs from guests/package.sh.
+guests/dist/

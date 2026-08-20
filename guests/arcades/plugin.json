@@ -1,0 +1,14 @@
+{
+  "name": "arcades",
+  "version": "0.1.0",
+  "description": "Playable arcade frames: centipede, frogger and invaders",
+  "author": "Enzo Lombardi <enzinol@gmail.com>",
+  "wasm": [
+    {
+      "id": "dev.plank.arcades",
+      "module": "arcades.wasm",
+      "surfaces": ["frame", "command"],
+      "capabilities": []
+    }
+  ]
+}

@@ -159,6 +159,28 @@ impl Capability {
     pub fn undoes_the_sandbox(self) -> bool {
         matches!(self, Self::Exec | Self::Net | Self::Fs)
     }
+
+    /// True when a host function actually stands behind this grant.
+    ///
+    /// `notify`, `agent` and `session` parse, appear in the approval prompt and
+    /// reach nothing; `fs`, `net` and `exec` are the three left out on purpose.
+    /// Approving a capability that does not exist is worse than refusing it —
+    /// the user has consented to something, and nothing tells them it was
+    /// nothing — so the loader warns rather than staying silent.
+    #[must_use]
+    pub fn is_wired(self) -> bool {
+        matches!(self, Self::Log | Self::Print | Self::State | Self::Sound)
+    }
+
+    /// Why an unwired capability is unwired, for the load-time warning.
+    #[must_use]
+    pub fn unwired_reason(self) -> &'static str {
+        if self.undoes_the_sandbox() {
+            "deliberately unimplemented: it would undo the sandbox"
+        } else {
+            "declared but not implemented yet: the grant reaches no host function"
+        }
+    }
 }
 
 /// What kind of frame a component contributes.
@@ -316,6 +338,35 @@ fn parse_manifest_section(text: &str) -> (Vec<WasmManifest>, Vec<String>) {
     (out, warnings)
 }
 
+/// Parses a component's capability grants, naming every one that is misspelled
+/// or that reaches no host function.
+///
+/// Split out of [`parse_one`] to keep it under the function-length lint, and
+/// because "which grants are real" is its own question.
+fn parse_capabilities(id: &str, names: &[String], warnings: &mut Vec<String>) -> Vec<Capability> {
+    let mut capabilities = Vec::new();
+    for c in names {
+        match Capability::parse(c) {
+            Some(cap) => {
+                if !cap.is_wired() {
+                    warnings.push(format!(
+                        "wasm component '{id}': capability '{c}' is {}",
+                        cap.unwired_reason()
+                    ));
+                }
+                capabilities.push(cap);
+            }
+            None => warnings.push(format!("wasm component '{id}': unknown capability '{c}'")),
+        }
+    }
+    // `log` reaches nothing outside plank's own debug file, so it is always
+    // present rather than something every author must remember to ask for.
+    capabilities.push(Capability::Log);
+    capabilities.sort_unstable();
+    capabilities.dedup();
+    capabilities
+}
+
 /// One entry of the `wasm` array. `None` — with a warning already pushed — for
 /// anything malformed: a component that vanishes silently presents as "my
 /// plugin does nothing", the least debuggable failure this system has.
@@ -409,18 +460,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
     events.sort_unstable();
     events.dedup();
 
-    let mut capabilities = Vec::new();
-    for c in list("capabilities") {
-        match Capability::parse(&c) {
-            Some(cap) => capabilities.push(cap),
-            None => warnings.push(format!("wasm component '{id}': unknown capability '{c}'")),
-        }
-    }
-    // `log` reaches nothing outside plank's own debug file, so it is always
-    // present rather than something every author must remember to ask for.
-    capabilities.push(Capability::Log);
-    capabilities.sort_unstable();
-    capabilities.dedup();
+    let capabilities = parse_capabilities(&id, &list("capabilities"), warnings);
 
     Some(WasmManifest {
         id,
@@ -2151,6 +2191,113 @@ mod tests {
         "capabilities": ["state", "sound"]
       }]
     }"#;
+
+    /// A grant with no host function behind it is named at load time.
+    ///
+    /// Silence here means the user approves a capability that reaches nothing:
+    /// they have consented to something and nothing tells them it was nothing.
+    /// The two reasons are distinguished because they mean different things to
+    /// an author — one is "not yet", the other is "not ever, by design".
+    #[test]
+    fn an_unwired_capability_grant_is_warned_about() {
+        let text = r#"{
+          "name": "demo",
+          "wasm": [{
+            "id": "dev.plank.demo",
+            "module": "demo.wasm",
+            "surfaces": ["tool"],
+            "capabilities": ["state", "notify", "exec"]
+          }]
+        }"#;
+        let (manifests, warnings) = parse_manifest_section(text);
+        assert_eq!(manifests.len(), 1, "the component still loads");
+        // Granted anyway: refusing here would change what the approval prompt
+        // shows, and the manifest is the author's statement of intent.
+        assert!(manifests[0].capabilities.contains(&Capability::Notify));
+
+        let joined = warnings.join("\n");
+        assert!(
+            joined.contains("'notify' is declared but not implemented yet"),
+            "{joined}"
+        );
+        assert!(
+            joined.contains("'exec' is deliberately unimplemented"),
+            "{joined}"
+        );
+        // `state` is wired, so it must not be warned about — a warning on every
+        // grant would be noise nobody reads.
+        assert!(!joined.contains("'state'"), "{joined}");
+    }
+
+    /// Every capability is either wired or has a reason. A new variant added
+    /// without a host function must show up as unwired rather than defaulting
+    /// to "fine".
+    #[test]
+    fn wired_capabilities_are_exactly_the_ones_with_host_functions() {
+        for c in [
+            Capability::Log,
+            Capability::Print,
+            Capability::State,
+            Capability::Sound,
+        ] {
+            assert!(c.is_wired(), "{c:?}");
+        }
+        for c in [
+            Capability::Notify,
+            Capability::Agent,
+            Capability::Session,
+            Capability::Fs,
+            Capability::Net,
+            Capability::Exec,
+        ] {
+            assert!(!c.is_wired(), "{c:?}");
+        }
+    }
+
+    /// The manifests plank actually ships must parse with this parser.
+    ///
+    /// They are hand-written JSON in `guests/*/plugin.json`, assembled into a
+    /// plugin directory by `guests/package.sh` and published by the release
+    /// workflow. Nothing else checks them: a typo would ship a plugin whose
+    /// component silently fails to appear, which is the least debuggable
+    /// failure this system has.
+    #[test]
+    fn the_shipped_guest_manifests_parse_clean() {
+        for (guest, id, module) in [
+            (
+                "screensavers",
+                "dev.plank.screensavers",
+                "screensavers.wasm",
+            ),
+            ("arcades", "dev.plank.arcades", "arcades.wasm"),
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("guests")
+                .join(guest)
+                .join("plugin.json");
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let (manifests, warnings) = parse_manifest_section(&text);
+            assert!(warnings.is_empty(), "{guest}: {warnings:?}");
+            assert_eq!(manifests.len(), 1, "{guest}");
+            let m = &manifests[0];
+            assert_eq!(m.id, id, "{guest}");
+            // `module` is what the host opens, and package.sh copies the built
+            // artifact to exactly this name — a mismatch is a plugin that
+            // loads and then cannot find its own code.
+            assert_eq!(m.module, module, "{guest}");
+            assert!(m.surfaces.contains(&Surface::Frame), "{guest}");
+            assert!(m.surfaces.contains(&Surface::Command), "{guest}");
+            // Both guests import only `plank_abi`, so they ask for nothing.
+            // A grant added here without a matching host call would prompt the
+            // user to approve a capability that reaches no code.
+            assert_eq!(
+                m.capabilities,
+                vec![Capability::Log],
+                "{guest} should grant nothing beyond the implicit log"
+            );
+        }
+    }
 
     #[test]
     fn a_manifest_section_parses_surfaces_and_capabilities() {

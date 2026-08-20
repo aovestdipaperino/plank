@@ -1,0 +1,14 @@
+{
+  "name": "screensavers",
+  "version": "0.1.0",
+  "description": "Ambient faces for the idle rotation: a perspective starfield and two minions on a night lake",
+  "author": "Enzo Lombardi <enzinol@gmail.com>",
+  "wasm": [
+    {
+      "id": "dev.plank.screensavers",
+      "module": "screensavers.wasm",
+      "surfaces": ["frame", "command"],
+      "capabilities": []
+    }
+  ]
+}

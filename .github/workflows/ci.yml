@@ -69,3 +69,67 @@ jobs:
 
       - name: Test
         run: cargo test --release --verbose
+
+  # The `plugins` feature was entirely unbuilt by CI: the default job compiles
+  # no wasmtime, so every Extism call site and all 31 integration tests were
+  # verified only on whichever laptop last remembered to run them. This job is
+  # what makes the plugin system continuously verified.
+  #
+  # Deliberately not `--release`: the point is to compile the feature and run
+  # the guest-backed tests, and a debug wasmtime builds in a fraction of the
+  # time. The default job already covers the release profile.
+  plugins:
+    name: Build & test (plugins feature)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          # The guests are cross-compiled; without this target
+          # `spike/build-guest.sh` fails and the tests below would silently
+          # have nothing to run.
+          targets: wasm32-unknown-unknown
+
+      # A distinct prefix: this job's target/ holds a debug build with wasmtime
+      # in it, which has nothing in common with the default job's release
+      # artifacts. Sharing one cache key would have them evicting each other.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: plugins
+
+      # Same reasoning as the default job's pdfium cache: the build script
+      # bakes an absolute path into the binary, so a restored target/ with a
+      # missing cache dir dies in dlopen.
+      - name: Cache pdfium binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdfium-rs
+          key: pdfium-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Ensure pdfium is downloadable
+        run: |
+          if [ ! -d "$HOME/.cache/pdfium-rs" ]; then
+            echo "pdfium cache absent; forcing liteparse-pdfium-sys to rebuild"
+            cargo clean -p liteparse-pdfium-sys || true
+          fi
+
+      # Before the test step, not after: the suite skips when the artifacts are
+      # absent, so building them late would leave a green job that ran nothing.
+      # `PLANK_REQUIRE_GUESTS` below turns that skip into a failure so the
+      # ordering cannot silently regress.
+      - name: Build WASM guests
+        run: |
+          sh spike/build-guest.sh
+          sh guests/build.sh
+
+      - name: Clippy (plugins)
+        run: cargo clippy --all-targets --features plugins -- -D warnings
+
+      - name: Test (plugins)
+        env:
+          PLANK_REQUIRE_GUESTS: "1"
+        run: cargo test --features plugins --verbose

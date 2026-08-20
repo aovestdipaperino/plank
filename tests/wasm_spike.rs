@@ -20,11 +20,26 @@ fn guest() -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
+/// True when a missing guest must fail rather than skip.
+///
+/// CI sets this. Without it a job that forgets to build the guest is green
+/// while running none of these tests, which is indistinguishable from a job
+/// that ran them all — the failure mode that left this suite unverified on
+/// every push for the whole life of the branch.
+fn guests_required() -> bool {
+    std::env::var_os("PLANK_REQUIRE_GUESTS").is_some_and(|v| v != "0")
+}
+
 macro_rules! guest_or_skip {
     () => {
         match guest() {
             Some(w) => w,
             None => {
+                assert!(
+                    !guests_required(),
+                    "PLANK_REQUIRE_GUESTS is set but the guest is missing: \
+                     run spike/build-guest.sh before the test step"
+                );
                 eprintln!("skipping: run spike/build-guest.sh first");
                 return;
             }
@@ -268,6 +283,11 @@ fn a_component_claiming_command_without_the_exports_is_refused() {
         "/spike/min-guest/target/wasm32-unknown-unknown/release/plank_min_guest.wasm"
     );
     let Ok(wasm) = std::fs::read(path) else {
+        assert!(
+            !guests_required(),
+            "PLANK_REQUIRE_GUESTS is set but the min-guest is missing: \
+             run spike/build-guest.sh before the test step"
+        );
         eprintln!("skipping: run spike/build-guest.sh first");
         return;
     };
@@ -610,6 +630,11 @@ fn an_observer_without_on_event_is_refused() {
         "/spike/min-guest/target/wasm32-unknown-unknown/release/plank_min_guest.wasm"
     );
     let Ok(wasm) = std::fs::read(path) else {
+        assert!(
+            !guests_required(),
+            "PLANK_REQUIRE_GUESTS is set but the min-guest is missing: \
+             run spike/build-guest.sh before the test step"
+        );
         eprintln!("skipping: run spike/build-guest.sh first");
         return;
     };
