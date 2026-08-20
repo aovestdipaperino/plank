@@ -625,8 +625,15 @@ Removal leaves the trust entry behind. It is keyed by the component's hash, so
 reinstalling the same bytes is the same component and needs no re-approval,
 while different bytes re-prompt exactly as they would have.
 
-Not yet: install from a URL, signing, or shipping the guest artifacts with a
-release.
+Install accepts a `https://` (or loopback `http://`) URL as well as a local
+directory: it downloads the `.tar.gz`, extracts it into a staging directory it
+owns, and installs the plugin inside. The body is capped, and **any symlink in
+the extracted tree is refused** — the copy follows links, so an entry pointing
+at `~/.ssh` would otherwise be copied into the plugin directory and made
+readable by anything that reads plugins.
+
+Not yet: a registry or any notion of discovery. Finding a plugin is still
+"someone gave you a URL".
 
 ## Versioning
 
@@ -662,10 +669,26 @@ containment.
   artifact's SHA-256 in `~/.plank/plugins/trust.json`. A changed hash on a
   later load re-prompts. This is deliberately the same shape as the SHA-1
   identity discipline in `session.rs`: the hash *is* the identity.
-- **Signatures are optional and advisory.** A `plugin.sig` (minisign over the
-  artifact) with a publisher key in `trust.json` lets updates from a known
-  publisher install without re-prompting. Absence of a signature is not an
-  error; a *bad* signature is.
+- **Signatures are optional and advisory.** A `<module>.minisig` (minisign over
+  the module, named the way minisign names it) with a publisher key in
+  `trust.json` lets updates from a known publisher install without re-prompting.
+  Absence of a signature is not an error; a *bad* signature is.
+
+  Implemented in `src/wasmsig.rs`. Ed25519 comes from `ring`, already present
+  behind rustls; `blake2` is a direct dependency because minisign 0.12 signs
+  `Blake2b-512(file)` by default and only `-l` produces the legacy raw-file
+  form. Both are accepted. The global signature over the trusted comment is
+  verified as well, so the filename and timestamp a user is shown cannot be
+  edited independently of the artifact.
+
+  Publisher keys are accepted with `/plugins publisher <key-file|base64>` and
+  live under a reserved `@publishers` key in `trust.json` — one file a user can
+  read or delete, and a key that cannot collide with a reverse-DNS component id.
+  Key ids are printed the way minisign prints them (byte-reversed, upper-case)
+  so a user can compare them by eye against `minisign -G`.
+
+  A first install is never made quiet by a signature: the design buys quiet
+  *updates*, and the capabilities still get shown once.
 - **Capability grants are per-install and never widened silently.** A plugin
   update that adds `exec` or `net` re-prompts even when its signature is valid.
 - **Project-local plugins are the sharp edge.** `./.plank/plugins/` means
