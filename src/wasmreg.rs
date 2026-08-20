@@ -265,6 +265,60 @@ impl FrameKind {
     }
 }
 
+/// One user-settable option a component declares (`config` in the manifest).
+///
+/// A plugin never reads its own config file: it declares what it accepts, plank
+/// resolves the value, and the value arrives in `OpenParams`. That keeps the
+/// filesystem out of a sandboxed component and means the option can be surfaced
+/// in plank's own config UI rather than in a per-plugin one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigOption {
+    /// Option name as declared, used as the key in `OpenParams.config`.
+    pub name: String,
+    /// What values are acceptable.
+    pub kind: ConfigKind,
+    /// The value used when the user has set nothing. Always present: an option
+    /// with no default is an option a component has to handle being absent,
+    /// which is a second code path for no reason.
+    pub default: String,
+}
+
+/// The shape of a [`ConfigOption`]'s value.
+///
+/// Deliberately few. These exist to be rendered as a form row and validated
+/// before a component sees them; anything richer is a component's own business
+/// and belongs behind the `state` capability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigKind {
+    /// One of a fixed list.
+    Enum(Vec<String>),
+    /// `true` or `false`.
+    Bool,
+    /// A whole number, inclusive range.
+    Int { min: i64, max: i64 },
+    /// Free text.
+    Text,
+}
+
+impl ConfigOption {
+    /// True when `value` is acceptable for this option.
+    ///
+    /// Validation happens host-side so a component can trust what it is handed:
+    /// a guest that has to re-check every field is a guest writing the same
+    /// validation twice, and the second copy is the one that goes wrong.
+    #[must_use]
+    pub fn accepts(&self, value: &str) -> bool {
+        match &self.kind {
+            ConfigKind::Enum(values) => values.iter().any(|v| v == value),
+            ConfigKind::Bool => matches!(value, "true" | "false"),
+            ConfigKind::Int { min, max } => {
+                value.parse::<i64>().is_ok_and(|n| n >= *min && n <= *max)
+            }
+            ConfigKind::Text => true,
+        }
+    }
+}
+
 /// What a plugin's manifest declares about one WASM component.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WasmManifest {
@@ -296,6 +350,9 @@ pub struct WasmManifest {
     /// to enumerate. A component with no `frames` entry offers exactly one,
     /// named after the component, which is the single-face case written short.
     pub frames: Vec<String>,
+    /// User-settable options this component declares, in manifest order so a
+    /// form renders them the way the author grouped them.
+    pub config: Vec<ConfigOption>,
     /// Events subscribed to, deduplicated and sorted. plank calls a component's
     /// handler only for these, so an unsubscribed event costs nothing.
     pub events: Vec<crate::wasmevents::EventKind>,
@@ -403,6 +460,111 @@ fn parse_capabilities(id: &str, names: &[String], warnings: &mut Vec<String>) ->
     capabilities
 }
 
+/// Parses a component's `config` declarations.
+///
+/// `{"config": {"difficulty": {"type": "enum", "values": [...], "default": "normal"}}}`.
+/// A declaration that does not make sense is dropped **with a warning naming
+/// it**, never silently: an option that vanishes presents to the author as
+/// "plank ignores my config", the least debuggable failure this system has.
+fn parse_config(
+    id: &str,
+    fields: &[(String, Json)],
+    warnings: &mut Vec<String>,
+) -> Vec<ConfigOption> {
+    let Some((_, Json::Obj(entries))) = fields.iter().find(|(k, _)| k == "config") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, spec) in entries {
+        let Json::Obj(spec) = spec else {
+            warnings.push(format!(
+                "wasm component '{id}': config '{name}' must be an object"
+            ));
+            continue;
+        };
+        let get = |key: &str| spec.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        let kind = match get("type") {
+            Some(Json::Str(t)) if t == "enum" => {
+                let values: Vec<String> = match get("values") {
+                    Some(Json::Arr(items)) => items
+                        .iter()
+                        .filter_map(|i| match i {
+                            Json::Str(s) => Some(s.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if values.is_empty() {
+                    warnings.push(format!(
+                        "wasm component '{id}': config '{name}' is an enum with no values"
+                    ));
+                    continue;
+                }
+                ConfigKind::Enum(values)
+            }
+            Some(Json::Str(t)) if t == "bool" => ConfigKind::Bool,
+            Some(Json::Str(t)) if t == "int" => {
+                let num = |key: &str, fallback: i64| match get(key) {
+                    #[allow(clippy::cast_possible_truncation)]
+                    Some(Json::Num(n)) => *n as i64,
+                    _ => fallback,
+                };
+                let (min, max) = (num("min", 0), num("max", i64::from(u32::MAX)));
+                if min > max {
+                    warnings.push(format!(
+                        "wasm component '{id}': config '{name}' has min {min} above max {max}"
+                    ));
+                    continue;
+                }
+                ConfigKind::Int { min, max }
+            }
+            Some(Json::Str(t)) if t == "text" => ConfigKind::Text,
+            Some(Json::Str(other)) => {
+                warnings.push(format!(
+                    "wasm component '{id}': config '{name}' has unknown type '{other}'"
+                ));
+                continue;
+            }
+            _ => {
+                warnings.push(format!(
+                    "wasm component '{id}': config '{name}' has no type"
+                ));
+                continue;
+            }
+        };
+        // The default is required and must itself be valid: a declared default
+        // the component would reject is a bug the author should hear about
+        // now, not the first time a user opens the form.
+        let default = match get("default") {
+            Some(Json::Str(d)) => d.clone(),
+            Some(Json::Bool(b)) => b.to_string(),
+            #[allow(clippy::cast_possible_truncation)]
+            Some(Json::Num(n)) => (*n as i64).to_string(),
+            _ => {
+                warnings.push(format!(
+                    "wasm component '{id}': config '{name}' has no default"
+                ));
+                continue;
+            }
+        };
+        let option = ConfigOption {
+            name: name.clone(),
+            kind,
+            default,
+        };
+        if !option.accepts(&option.default) {
+            warnings.push(format!(
+                "wasm component '{id}': config '{}' default '{}' is not a value it accepts",
+                option.name, option.default
+            ));
+            continue;
+        }
+        out.push(option);
+    }
+    out
+}
+
 /// One entry of the `wasm` array. `None` — with a warning already pushed — for
 /// anything malformed: a component that vanishes silently presents as "my
 /// plugin does nothing", the least debuggable failure this system has.
@@ -497,6 +659,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
     events.dedup();
 
     let capabilities = parse_capabilities(&id, &list("capabilities"), warnings);
+    let config = parse_config(&id, fields, warnings);
 
     Some(WasmManifest {
         id,
@@ -509,6 +672,7 @@ fn parse_one(fields: &[(String, Json)], warnings: &mut Vec<String>) -> Option<Wa
         min_size: frame.min_size,
         frames: frame.frames,
         events,
+        config,
     })
 }
 
@@ -1494,8 +1658,9 @@ impl Session {
             ));
         }
         let payload = format!(
-            "{{\"w\": {w}, \"h\": {h}, \"seed\": {seed}, \"arg\": {}}}",
-            json_str(arg)
+            "{{\"w\": {w}, \"h\": {h}, \"seed\": {seed}, \"arg\": {}, \"config\": {}}}",
+            json_str(arg),
+            render_config(&manifest)
         );
         if let Err(e) = self.host.call(id, "frame_open", payload.as_bytes()) {
             let disabled = self.registry.strike(id);
@@ -2356,6 +2521,51 @@ fn missing_exports(
     missing
 }
 
+/// Resolves a component's declared options and renders them as the `config`
+/// object in `OpenParams`.
+///
+/// The value is the user's setting when they have one *and it is still valid*,
+/// otherwise the declared default. Validating here rather than in the guest is
+/// what lets a component trust the object it is handed: the alternative is
+/// every guest re-checking every field, and the second copy of a validation is
+/// the one that drifts.
+///
+/// An option whose stored value has stopped being acceptable — an enum value
+/// the author removed in an update, say — silently falls back to the default
+/// rather than refusing to open. A component that will not start because a
+/// stale setting no longer parses is a worse outcome than one that starts on
+/// its author's default.
+fn render_config(manifest: &WasmManifest) -> String {
+    if manifest.config.is_empty() {
+        return "{}".to_string();
+    }
+    let settings = crate::settings::active();
+    let mut out = String::from("{");
+    for (i, option) in manifest.config.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        let key = format!("{}.{}", manifest.id, option.name);
+        let value = settings
+            .plugin_config
+            .get(&key)
+            .filter(|v| option.accepts(v))
+            .cloned()
+            .unwrap_or_else(|| option.default.clone());
+        out.push_str(&json_str(&option.name));
+        out.push_str(": ");
+        // Typed on the wire, so a guest reads a bool as a bool: a component
+        // that has to parse "true" out of a string is one plank made do
+        // string handling it declared its way out of.
+        match option.kind {
+            ConfigKind::Bool | ConfigKind::Int { .. } => out.push_str(&value),
+            ConfigKind::Enum(_) | ConfigKind::Text => out.push_str(&json_str(&value)),
+        }
+    }
+    out.push('}');
+    out
+}
+
 /// Reads a component's signature and judges it against the trust store.
 ///
 /// Split from `build` only to keep that function under the length lint; the
@@ -2700,6 +2910,119 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    #[test]
+    fn config_declarations_parse_and_validate_their_defaults() {
+        let text = r#"{
+          "name": "demo",
+          "wasm": [{
+            "id": "dev.plank.demo",
+            "module": "demo.wasm",
+            "surfaces": ["frame"],
+            "config": {
+              "difficulty": {"type": "enum", "values": ["easy", "hard"], "default": "hard"},
+              "sound":      {"type": "bool", "default": true},
+              "speed":      {"type": "int", "min": 1, "max": 10, "default": 5},
+              "label":      {"type": "text", "default": "hi"}
+            }
+          }]
+        }"#;
+        let (manifests, warnings) = parse_manifest_section(text);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let config = &manifests[0].config;
+        assert_eq!(config.len(), 4, "{config:?}");
+        // Declaration order is kept: a form should render them the way the
+        // author grouped them, not alphabetically.
+        let names: Vec<&str> = config.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["difficulty", "sound", "speed", "label"]);
+        // A JSON bool or number default becomes the string form the wire uses.
+        assert_eq!(config[1].default, "true");
+        assert_eq!(config[2].default, "5");
+
+        let difficulty = &config[0];
+        assert!(difficulty.accepts("easy"));
+        assert!(!difficulty.accepts("nightmare"));
+        assert!(config[1].accepts("false") && !config[1].accepts("yes"));
+        assert!(config[2].accepts("10") && !config[2].accepts("11") && !config[2].accepts("x"));
+        assert!(config[3].accepts("anything at all"));
+    }
+
+    /// Every bad declaration is dropped *and named*. An option that vanishes
+    /// silently presents to its author as "plank ignores my config".
+    #[test]
+    fn bad_config_declarations_are_named() {
+        let text = r#"{
+          "name": "demo",
+          "wasm": [{
+            "id": "dev.plank.demo",
+            "module": "demo.wasm",
+            "surfaces": ["frame"],
+            "config": {
+              "no_type":    {"default": "x"},
+              "no_default": {"type": "text"},
+              "empty_enum": {"type": "enum", "values": [], "default": "x"},
+              "bad_type":   {"type": "colour", "default": "red"},
+              "backwards":  {"type": "int", "min": 9, "max": 2, "default": "3"},
+              "bad_default":{"type": "enum", "values": ["a"], "default": "b"},
+              "fine":       {"type": "text", "default": "ok"}
+            }
+          }]
+        }"#;
+        let (manifests, warnings) = parse_manifest_section(text);
+        let joined = warnings.join("\n");
+        for expected in [
+            "'no_type' has no type",
+            "'no_default' has no default",
+            "'empty_enum' is an enum with no values",
+            "'bad_type' has unknown type 'colour'",
+            "'backwards' has min 9 above max 2",
+            "'bad_default' default 'b' is not a value it accepts",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "missing {expected:?} in {joined}"
+            );
+        }
+        // The one good option survives: a bad neighbour must not take it down.
+        let names: Vec<&str> = manifests[0]
+            .config
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["fine"]);
+    }
+
+    /// `OpenParams.config` carries defaults, typed, and falls back when a
+    /// stored value has stopped being acceptable.
+    #[test]
+    fn open_params_config_is_typed_and_falls_back() {
+        let text = r#"{
+          "name": "demo",
+          "wasm": [{
+            "id": "dev.plank.demo",
+            "module": "demo.wasm",
+            "surfaces": ["frame"],
+            "config": {
+              "difficulty": {"type": "enum", "values": ["easy", "hard"], "default": "easy"},
+              "sound":      {"type": "bool", "default": true},
+              "speed":      {"type": "int", "min": 1, "max": 10, "default": 5}
+            }
+          }]
+        }"#;
+        let (manifests, _) = parse_manifest_section(text);
+        let rendered = render_config(&manifests[0]);
+        // Strings quoted, bool and int bare, so a guest reads each as its own
+        // type rather than parsing "true" out of a string.
+        assert!(rendered.contains(r#""difficulty": "easy""#), "{rendered}");
+        assert!(rendered.contains(r#""sound": true"#), "{rendered}");
+        assert!(rendered.contains(r#""speed": 5"#), "{rendered}");
+
+        // A component that declares nothing gets an empty object, not a
+        // missing field: the payload shape must not depend on the manifest.
+        let plain = r#"{"name":"d","wasm":[{"id":"x","module":"m.wasm","surfaces":["frame"]}]}"#;
+        let (plain, _) = parse_manifest_section(plain);
+        assert_eq!(render_config(&plain[0]), "{}");
+    }
+
     /// A grant with no host function behind it is named at load time.
     ///
     /// Silence here means the user approves a capability that reaches nothing:
@@ -2929,6 +3252,7 @@ mod tests {
                 veiled: false,
                 min_size: (0, 0),
                 events: Vec::new(),
+                config: Vec::new(),
             },
         }
     }

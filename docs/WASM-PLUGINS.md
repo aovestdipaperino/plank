@@ -594,9 +594,27 @@ values  = ["easy", "normal", "hard"]
 default = "normal"
 ```
 
-`[config.*]` entries become user-settable options surfaced in plank's existing
-config form, and arrive in the plugin's `OpenParams`. A plugin never parses its
-own config file.
+`[config.*]` entries become user-settable options that arrive in the plugin's
+`OpenParams`. A plugin never parses its own config file.
+
+Implemented as a `config` object in the JSON manifest, one entry per option:
+`{"difficulty": {"type": "enum", "values": [...], "default": "hard"}}`. Types are
+`enum`, `bool`, `int` (with `min`/`max`) and `text`; a default is **required**,
+and a default the option would itself reject is a load warning rather than a
+surprise later. Values live in settings under `pluginConfig` keyed
+`<component-id>.<option>`, merged key by key so a project file setting one
+option does not drop the user's others.
+
+Two host-side rules. Values are **validated before a component sees them**, so a
+guest can trust the object it is handed instead of re-checking every field — the
+second copy of a validation is the one that drifts. And a stored value that has
+stopped being acceptable, because an author removed an enum member in an update,
+**falls back to the default rather than refusing to open**: a component that
+will not start because of a stale setting is worse than one that starts on its
+author's default.
+
+Still to come: surfacing these in plank's config form. Until then they are set
+by editing settings, which is enough for an author to develop against.
 
 **Locations**, resolved in order, later overriding earlier by `id`:
 

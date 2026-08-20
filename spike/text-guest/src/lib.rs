@@ -17,9 +17,32 @@ pub fn plank_abi() -> FnResult<String> {
     Ok("1".to_string())
 }
 
+/// Stashes what `OpenParams.config` carried, so a test can prove the host
+/// resolved the declaration rather than merely accepting it.
+static mut SEEN_CONFIG: Option<String> = None;
+
 #[plugin_fn]
-pub fn frame_open(_input: String) -> FnResult<String> {
+pub fn frame_open(input: String) -> FnResult<String> {
+    unsafe { SEEN_CONFIG = Some(input) };
     Ok(r#"{"veiled": false}"#.to_string())
+}
+
+/// Reports the config the host delivered, through the command surface so the
+/// test can read it back without a second export in the frame ABI.
+#[plugin_fn]
+pub fn command_specs() -> FnResult<String> {
+    Ok(r#"[{"name": "seen", "args": "", "desc": "what config arrived"}]"#.to_string())
+}
+
+#[plugin_fn]
+pub fn command_run(_input: String) -> FnResult<String> {
+    let seen = unsafe { (*(&raw const SEEN_CONFIG)).clone() };
+    let seen = seen.unwrap_or_else(|| "never opened".to_string());
+    // Reported through `print`, the command surface's own channel, so the test
+    // reads it as a scrollback line rather than needing a bespoke export. The
+    // payload is JSON inside a JSON string, hence the escaping.
+    let escaped = seen.replace('\\', "\\\\").replace('"', "\\\"");
+    Ok(format!(r#"{{"print": ["{escaped}"]}}"#))
 }
 
 /// One step, as rows of text. The second row carries a colour and bold so a

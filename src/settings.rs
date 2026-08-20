@@ -278,6 +278,15 @@ pub struct Settings {
     pub worktree: WorktreeSettings,
     /// KV-cache retention.
     pub kvcache: KvCacheSettings,
+    /// Values set for plugin-declared `config` options, keyed
+    /// `<component-id>.<option>`.
+    ///
+    /// A flat map rather than a nested block because the keys are component
+    /// ids the user's plugins happen to have, not a schema plank knows at
+    /// compile time. Values are strings for the same reason: a component
+    /// declares the type, and `ConfigOption::accepts` validates against that
+    /// declaration rather than against anything settings.rs believes.
+    pub plugin_config: std::collections::BTreeMap<String, String>,
 }
 
 /// `worktree` block: how [`crate::worktree`] builds a new working copy.
@@ -528,6 +537,17 @@ impl Settings {
         }
         if let Some(v) = num::<u64>(kvcache, "maxBytes") {
             self.kvcache.max_bytes = v;
+        }
+
+        // Merged key by key rather than replaced wholesale: a project file that
+        // sets one plugin option must not silently drop the user's settings for
+        // every other one, which is what assigning the map would do.
+        if let Some(Json::Obj(entries)) = root.get("pluginConfig") {
+            for (key, value) in entries {
+                if let Json::Str(v) = value {
+                    self.plugin_config.insert(key.clone(), v.clone());
+                }
+            }
         }
     }
 

@@ -780,6 +780,7 @@ fn a_contested_tool_name_is_qualified_and_reported() {
                 veiled: false,
                 min_size: (0, 0),
                 events: vec![],
+                config: vec![],
             },
         },
         strikes: 0,
@@ -892,11 +893,19 @@ fn frame_session(
     std::fs::create_dir_all(dir.join(".plank-plugin")).unwrap();
     std::fs::create_dir_all(dir.join("wasm")).unwrap();
     std::fs::write(dir.join("wasm").join("demo.wasm"), wasm).unwrap();
+    // `extra` may declare additional surfaces by starting with them; the
+    // manifest parser takes the first `surfaces` it finds, so a caller wanting
+    // more than `frame` passes them here rather than fighting a duplicate key.
+    let surfaces = if extra.contains("\"surfaces\"") {
+        String::new()
+    } else {
+        r#""surfaces": ["frame"], "#.to_string()
+    };
     std::fs::write(
         dir.join(".plank-plugin").join("plugin.json"),
         format!(
             r#"{{"name": "demo", "wasm": [{{"id": "dev.plank.bounce", "module": "demo.wasm",
-                "surfaces": ["frame"], "capabilities": []{extra}}}]}}"#
+                {surfaces}"capabilities": []{extra}}}]}}"#
         ),
     )
     .unwrap();
@@ -916,6 +925,57 @@ fn frame_session(
 /// The `frame` lifecycle end to end: open, step into a decoded glyph buffer,
 /// move between steps, refuse to close on an ordinary key, close on `q`, and
 /// leave a scrollback line behind.
+/// `[config.*]` end to end: declared in the manifest, resolved by the host,
+/// delivered in `OpenParams`, and read back out of the guest.
+///
+/// The unit tests render the object; this proves it survives the wire and lands
+/// where a component can actually see it.
+#[test]
+fn a_component_receives_its_declared_config_on_open() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/spike/text-guest/target/wasm32-unknown-unknown/release/plank_text_guest.wasm"
+    );
+    let Ok(wasm) = std::fs::read(path) else {
+        assert!(
+            !guests_required(),
+            "PLANK_REQUIRE_GUESTS is set but the text-guest is missing: \
+             run spike/build-guest.sh before the test step"
+        );
+        eprintln!("skipping: run spike/build-guest.sh first");
+        return;
+    };
+    // Declared on the component, with one option of each shape.
+    let extra = r#", "surfaces": ["frame", "command"], "config": {
+        "difficulty": {"type": "enum", "values": ["easy", "hard"], "default": "hard"},
+        "sound": {"type": "bool", "default": false},
+        "speed": {"type": "int", "min": 1, "max": 9, "default": 4}
+    }"#;
+    let (root, mut session) = frame_session("config", &wasm, extra);
+
+    let frame = session
+        .open_frame("dev.plank.bounce", "", 40, 20, 7)
+        .expect("open");
+    // The guest echoes the OpenParams it was handed.
+    let seen = session
+        .registry
+        .run_command(&mut *session.host, "seen", "")
+        .expect("command")
+        .print
+        .join("");
+    assert!(
+        seen.contains(r#""difficulty": "hard""#),
+        "enum default missing from {seen}"
+    );
+    assert!(seen.contains(r#""sound": false"#), "bool default: {seen}");
+    assert!(seen.contains(r#""speed": 4"#), "int default: {seen}");
+    // And the rest of OpenParams is still there — config is an addition, not a
+    // replacement.
+    assert!(seen.contains(r#""seed": 7"#), "{seen}");
+    drop(frame);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The text-only guest, loaded and stepped.
 ///
 /// The host picks between `frame_step` and `frame_step_text` by which export a
