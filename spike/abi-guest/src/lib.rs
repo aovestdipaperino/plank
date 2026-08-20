@@ -273,6 +273,36 @@ pub fn frame_key(input: String) -> FnResult<String> {
     Ok(r#"{"stay": true}"#.to_string())
 }
 
+/// Optional export: the host calls it only when the module has it, so the
+/// spike guest having one is what proves the routing exists at all.
+///
+/// Echoes the coordinates back through the close line, which lets a test
+/// assert the payload the host built rather than merely that a call happened.
+#[plugin_fn]
+pub fn frame_mouse(input: String) -> FnResult<String> {
+    if input.contains("\"down\"") {
+        let x = field(&input, "x");
+        let y = field(&input, "y");
+        return Ok(format!(r#"{{"close": "clicked at {x},{y}"}}"#));
+    }
+    Ok(r#"{"stay": true}"#.to_string())
+}
+
+/// Reads one integer field out of the host's JSON. The guest deliberately does
+/// no real JSON parsing: the spike is about the ABI, not about serde.
+fn field(input: &str, key: &str) -> i64 {
+    let needle = format!("\"{key}\":");
+    let Some(rest) = input.split(&needle).nth(1) else {
+        return -1;
+    };
+    let digits: String = rest
+        .trim_start()
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().unwrap_or(-1)
+}
+
 #[plugin_fn]
 pub fn frame_close() -> FnResult<String> {
     let steps = unsafe { (*(&raw const FRAME)).6 };

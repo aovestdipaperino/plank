@@ -936,6 +936,34 @@ fn a_frame_component_opens_steps_and_closes() {
         "the frame did not advance: {first:?} then {second:?}"
     );
 
+    // Mouse events reach the guest. The host enables mouse reporting for every
+    // frame, so before this was routed it asked the terminal for events and
+    // then dropped them all.
+    let moved = plank::wasmreg::FrameMouse {
+        kind: "move",
+        x: 7,
+        y: 3,
+        w: 40,
+        h: 20,
+    };
+    assert_eq!(
+        session.frame_mouse(&frame, &moved).expect("mouse"),
+        FrameOutcome::Stay
+    );
+    // The coordinates the host put in the payload come back out, so this
+    // asserts the wire shape and not merely that a call happened.
+    let clicked = plank::wasmreg::FrameMouse {
+        kind: "down",
+        x: 11,
+        y: 4,
+        w: 40,
+        h: 20,
+    };
+    assert_eq!(
+        session.frame_mouse(&frame, &clicked).expect("mouse"),
+        FrameOutcome::Close(Some("clicked at 11,4".to_string()))
+    );
+
     // An ordinary key is absorbed; `q` closes with a line for the scrollback.
     assert_eq!(
         session.frame_key(&frame, "left").expect("key"),

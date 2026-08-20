@@ -183,6 +183,42 @@ impl Capability {
     }
 }
 
+/// One mouse event for [`Session::frame_mouse`].
+///
+/// Cell coordinates, plus the frame's size in the same units, so a component
+/// can hit-test without having to remember what it was last stepped with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameMouse {
+    /// `down`, `up`, `drag`, `move`, `scroll_up` or `scroll_down`.
+    pub kind: &'static str,
+    /// Column, 0-based, within the frame.
+    pub x: u16,
+    /// Row, 0-based, within the frame.
+    pub y: u16,
+    /// Frame width in cells.
+    pub w: u16,
+    /// Frame height in cells.
+    pub h: u16,
+}
+
+/// Reads an `Outcome` reply from a frame call.
+///
+/// Shared by [`Session::frame_key`] and [`Session::frame_mouse`] so the two
+/// cannot disagree about what closes a window. An unreadable reply is `Stay`: a
+/// component that fumbles one reply should not have its window yanked out from
+/// under the user.
+fn parse_frame_outcome(bytes: &[u8]) -> FrameOutcome {
+    let text = String::from_utf8_lossy(bytes);
+    let Some(Json::Obj(fields)) = json_parse(&text) else {
+        return FrameOutcome::Stay;
+    };
+    match fields.iter().find(|(k, _)| k == "close") {
+        Some((_, Json::Str(line))) => FrameOutcome::Close(Some(line.clone())),
+        Some((_, Json::Bool(true) | Json::Obj(_) | Json::Null)) => FrameOutcome::Close(None),
+        _ => FrameOutcome::Stay,
+    }
+}
+
 /// What kind of frame a component contributes.
 ///
 /// A plugin that draws is one of two things, and they want opposite defaults:
@@ -1403,19 +1439,45 @@ impl Session {
                 self.registry.strike(&frame.id);
                 format!("{}: {e}", frame.id)
             })?;
-        let text = String::from_utf8_lossy(&bytes);
-        let Some(Json::Obj(fields)) = json_parse(&text) else {
-            // Unreadable: treat as "stay". A component that fumbles one reply
-            // should not have its window yanked out from under the user.
+        Ok(parse_frame_outcome(&bytes))
+    }
+
+    /// Delivers a mouse event to an open frame.
+    ///
+    /// `frame_mouse` is optional — a keyboard-only game is a perfectly good
+    /// component — so a module that does not export it stays open and is not
+    /// struck: not implementing an optional export is not a failure. Without
+    /// this the host enabled mouse reporting for every frame and then dropped
+    /// every event, which is why all four ported games had their mouse
+    /// handlers removed whole rather than left half-wired.
+    ///
+    /// # Errors
+    /// Returns a message when the call itself fails, having struck the
+    /// component.
+    pub fn frame_mouse(
+        &mut self,
+        frame: &OpenFrame,
+        mouse: &FrameMouse,
+    ) -> Result<FrameOutcome, String> {
+        if !self.host.has_export(&frame.id, "frame_mouse") {
             return Ok(FrameOutcome::Stay);
-        };
-        match fields.iter().find(|(k, _)| k == "close") {
-            Some((_, Json::Str(line))) => Ok(FrameOutcome::Close(Some(line.clone()))),
-            Some((_, Json::Bool(true) | Json::Obj(_) | Json::Null)) => {
-                Ok(FrameOutcome::Close(None))
-            }
-            _ => Ok(FrameOutcome::Stay),
         }
+        let payload = format!(
+            "{{\"kind\": {}, \"x\": {}, \"y\": {}, \"w\": {}, \"h\": {}}}",
+            json_str(mouse.kind),
+            mouse.x,
+            mouse.y,
+            mouse.w,
+            mouse.h
+        );
+        let bytes = self
+            .host
+            .call(&frame.id, "frame_mouse", payload.as_bytes())
+            .map_err(|e| {
+                self.registry.strike(&frame.id);
+                format!("{}: {e}", frame.id)
+            })?;
+        Ok(parse_frame_outcome(&bytes))
     }
 
     /// Closes a frame, returning any scrollback line it asked to leave behind.
@@ -2191,6 +2253,33 @@ mod tests {
         "capabilities": ["state", "sound"]
       }]
     }"#;
+
+    /// The `Outcome` reply is read the same way for keys and mouse events, and
+    /// an unreadable one keeps the window open.
+    #[test]
+    fn a_frame_outcome_is_read_the_same_for_every_input() {
+        assert_eq!(parse_frame_outcome(br"{}"), FrameOutcome::Stay);
+        assert_eq!(
+            parse_frame_outcome(br#"{"stay": true}"#),
+            FrameOutcome::Stay
+        );
+        assert_eq!(
+            parse_frame_outcome(br#"{"close": "final score 12"}"#),
+            FrameOutcome::Close(Some("final score 12".to_string()))
+        );
+        assert_eq!(
+            parse_frame_outcome(br#"{"close": true}"#),
+            FrameOutcome::Close(None)
+        );
+        assert_eq!(
+            parse_frame_outcome(br#"{"close": {}}"#),
+            FrameOutcome::Close(None)
+        );
+        // Garbage keeps the window: a component that fumbles one reply should
+        // not have its window yanked out from under the user.
+        assert_eq!(parse_frame_outcome(b"not json at all"), FrameOutcome::Stay);
+        assert_eq!(parse_frame_outcome(b""), FrameOutcome::Stay);
+    }
 
     /// A grant with no host function behind it is named at load time.
     ///

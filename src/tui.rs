@@ -2992,6 +2992,39 @@ fn arcade_footer_line(arcade: &crate::arcade::Arcade, width: u16) -> String {
 /// `Line`s, because the content is sparse — a starfield touches a few hundred
 /// cells out of several thousand. The bottom row is reserved for the hint line
 /// and any centered banner is stamped over the middle.
+/// Maps a crossterm mouse event onto the frame ABI's `MouseEvent`.
+///
+/// `None` for the kinds a component has no use for (non-left buttons, and
+/// button-up of a button it never saw pressed), so an author's handler is not
+/// woken for noise. Coordinates are clamped into the frame: a drag that leaves
+/// the window still reports a position on its edge, which is what a paddle
+/// wants. Kinds are strings for the same reason key names are — the ABI must
+/// not pin plank to crossterm's enum ordering.
+#[must_use]
+pub fn frame_mouse_event(
+    m: &ratatui::crossterm::event::MouseEvent,
+    w: u16,
+    h: u16,
+) -> Option<crate::wasmreg::FrameMouse> {
+    use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+    let kind = match m.kind {
+        MouseEventKind::Down(MouseButton::Left) => "down",
+        MouseEventKind::Up(MouseButton::Left) => "up",
+        MouseEventKind::Drag(MouseButton::Left) => "drag",
+        MouseEventKind::Moved => "move",
+        MouseEventKind::ScrollUp => "scroll_up",
+        MouseEventKind::ScrollDown => "scroll_down",
+        _ => return None,
+    };
+    Some(crate::wasmreg::FrameMouse {
+        kind,
+        x: m.column.min(w.saturating_sub(1)),
+        y: m.row.min(h.saturating_sub(1)),
+        w,
+        h,
+    })
+}
+
 /// The name a WASM `frame` component sees for a key press.
 ///
 /// Lower-case, spelled out for anything that is not a bare character, with
@@ -3822,6 +3855,44 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
 mod tests {
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn frame_mouse_events_map_and_clamp() {
+        use ratatui::crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let ev = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        let m = super::frame_mouse_event(&ev(MouseEventKind::Moved, 5, 3), 40, 12).unwrap();
+        assert_eq!((m.kind, m.x, m.y, m.w, m.h), ("move", 5, 3, 40, 12));
+
+        for (kind, name) in [
+            (MouseEventKind::Down(MouseButton::Left), "down"),
+            (MouseEventKind::Up(MouseButton::Left), "up"),
+            (MouseEventKind::Drag(MouseButton::Left), "drag"),
+            (MouseEventKind::ScrollUp, "scroll_up"),
+            (MouseEventKind::ScrollDown, "scroll_down"),
+        ] {
+            let m = super::frame_mouse_event(&ev(kind, 1, 1), 40, 12).unwrap();
+            assert_eq!(m.kind, name);
+        }
+
+        // Noise a component has no use for is dropped rather than delivered.
+        assert!(
+            super::frame_mouse_event(&ev(MouseEventKind::Down(MouseButton::Right), 1, 1), 40, 12)
+                .is_none()
+        );
+
+        // A drag that left the window reports the edge: a paddle tracking the
+        // pointer must not be handed a coordinate outside its own frame.
+        let m =
+            super::frame_mouse_event(&ev(MouseEventKind::Drag(MouseButton::Left), 99, 99), 40, 12)
+                .unwrap();
+        assert_eq!((m.x, m.y), (39, 11));
+    }
 
     #[test]
     fn a_run_opens_a_row_and_selection_needs_one() {

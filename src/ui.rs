@@ -6884,6 +6884,35 @@ impl Agent<'_> {
                 arcade_hover_reporting(false);
                 continue;
             }
+            // An open WASM frame takes the mouse on the same terms as the
+            // arcade below it: the host already turns on mouse reporting when a
+            // frame opens, so without this branch every event it asked for was
+            // delivered and dropped.
+            if wasm_frame.is_some() && !matches!(ev, Event::Key(_)) {
+                if let (Event::Mouse(m), Some(open)) = (&ev, wasm_frame.as_ref()) {
+                    let (w, h) = terminal
+                        .size()
+                        .map_or((80, 23), |s| (s.width, s.height.saturating_sub(1)));
+                    if let Some(mouse) = tui::frame_mouse_event(m, w, h) {
+                        match self.tool_ctx.wasm.frame_mouse(open, &mouse) {
+                            Ok(crate::wasmreg::FrameOutcome::Stay) => {}
+                            Ok(crate::wasmreg::FrameOutcome::Close(line)) => {
+                                if let Some(line) = self.tool_ctx.wasm.close_frame(open).or(line) {
+                                    log.push_dim(line);
+                                }
+                                wasm_frame = None;
+                                arcade_hover_reporting(false);
+                            }
+                            Err(e) => {
+                                log.push_dim(e);
+                                wasm_frame = None;
+                                arcade_hover_reporting(false);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             // An open easter egg takes the mouse (wheel, click and drag steer
             // the paddle) and swallows everything else that is not a key, so
             // nothing underneath it scrolls or accepts text while it is up.
