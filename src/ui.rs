@@ -5739,6 +5739,56 @@ the original is frozen and listed in /tree"
                 }
             }
             (Some("trust"), None) => "usage: /plugins trust <component-id>\n".to_string(),
+            // A publisher key is accepted once and then applies to everything
+            // it signs, which is the point of having one: without this there is
+            // no way to get a key into the store, and a signature can only ever
+            // read as "signed by someone unknown".
+            (Some("publisher"), Some(arg)) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so there is nowhere to record a publisher\n".to_string();
+                };
+                // A path or the base64 line itself: `minisign -G` prints the
+                // line for pasting, and a key file is what it writes.
+                let text = std::fs::read_to_string(arg).unwrap_or_else(|_| arg.to_string());
+                match crate::wasmsig::PublicKey::parse(&text) {
+                    Ok(key) => {
+                        let encoded = text
+                            .lines()
+                            .map(str::trim)
+                            .rfind(|l| !l.is_empty() && !l.starts_with("untrusted comment:"))
+                            .unwrap_or("")
+                            .to_string();
+                        let mut trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                        match trust.add_publisher(&key, &encoded) {
+                            Ok(()) => format!(
+                                "trusting publisher {}\nsigned updates from it will not re-prompt; \
+                                 capability changes still will\n",
+                                key.key_id_hex()
+                            ),
+                            Err(e) => format!("cannot record the publisher: {e}\n"),
+                        }
+                    }
+                    Err(e) => format!("not a minisign public key: {e}\n"),
+                }
+            }
+            (Some("publisher"), None) => {
+                let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+                    return "no HOME, so no publishers are recorded\n".to_string();
+                };
+                let trust = crate::wasmreg::TrustStore::load(&home.join(".plank"));
+                if trust.publishers().is_empty() {
+                    "no trusted publishers\nusage: /plugins publisher <key-file|base64-key>\n"
+                        .to_string()
+                } else {
+                    let mut out = String::from("trusted publishers:\n");
+                    for id in trust.publishers().keys() {
+                        out.push_str("  ");
+                        out.push_str(id);
+                        out.push('\n');
+                    }
+                    out
+                }
+            }
             (Some(other), _) => format!("unknown /plugins subcommand: {other}\n"),
             (None, _) => {
                 let mut out = crate::plugins::render_list(&self.tool_ctx.plugins);

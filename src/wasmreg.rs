@@ -663,6 +663,32 @@ pub struct TrustEntry {
     /// user-global component; a project-local one is approved per repo, so
     /// cloning a second repo that ships the same bytes still asks.
     pub projects: Vec<PathBuf>,
+    /// The publisher key id whose signature was accepted for these bytes, when
+    /// the install was signed. This is what makes a later update quiet: new
+    /// bytes signed by *this* publisher are the same provenance, whereas new
+    /// bytes signed by anyone else are not.
+    pub publisher: Option<String>,
+}
+
+/// What a component's signature says, computed before [`TrustStore::evaluate`]
+/// so that function stays pure and testable.
+///
+/// See [`crate::wasmsig`] for the format. Signing is provenance, not
+/// containment: the only thing a good signature buys is that an *update* from a
+/// publisher already trusted for this component skips the re-prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigStatus {
+    /// No `.minisig` beside the module. The ordinary case, and not a problem:
+    /// an unsigned plugin falls back to first-use hash approval.
+    Absent,
+    /// Verified against a publisher key the store holds. Carries the key id as
+    /// minisign spells it, which is what gets recorded and shown.
+    Valid(String),
+    /// A signature by a key the store does not know. Not a failure — it just
+    /// buys nothing, so trust falls back to the hash.
+    UnknownKey(String),
+    /// Present and did not verify. The one case that is actively wrong.
+    Invalid(String),
 }
 
 /// What should happen to a component before it is loaded.
@@ -679,6 +705,10 @@ pub enum Decision {
     Widened(Vec<Capability>),
     /// Known and approved, but not for *this* project directory.
     ProjectUnapproved,
+    /// A signature was presented and did not verify. Refused rather than
+    /// prompted: every other verdict means "we do not know about this", and
+    /// this one means someone changed bytes that were signed.
+    BadSignature(String),
 }
 
 impl Decision {
@@ -705,6 +735,7 @@ impl Decision {
             Self::ProjectUnapproved => {
                 "it is project-local and this project has not approved it".to_string()
             }
+            Self::BadSignature(why) => format!("its signature did not verify: {why}"),
         }
     }
 }
@@ -715,6 +746,10 @@ pub struct TrustStore {
     /// Where it persists. `None` for an in-memory store (tests, no HOME).
     path: Option<PathBuf>,
     entries: BTreeMap<String, TrustEntry>,
+    /// Accepted publisher keys, display id to the base64 key line. Held beside
+    /// the per-component entries rather than inside them: a key is trusted for
+    /// everything it signs, which is the whole point of having one.
+    publishers: BTreeMap<String, String>,
 }
 
 impl TrustStore {
@@ -729,6 +764,7 @@ impl TrustStore {
         let mut store = Self {
             path: Some(path.clone()),
             entries: BTreeMap::new(),
+            publishers: BTreeMap::new(),
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
             return store;
@@ -737,6 +773,16 @@ impl TrustStore {
             return store;
         };
         for (id, value) in top {
+            if id == "@publishers" {
+                if let Json::Obj(keys) = &value {
+                    for (key_id, encoded) in keys {
+                        if let Json::Str(encoded) = encoded {
+                            store.publishers.insert(key_id.clone(), encoded.clone());
+                        }
+                    }
+                }
+                continue;
+            }
             let Json::Obj(fields) = value else { continue };
             let field = |key: &str| fields.iter().find(|(k, _)| k == key).map(|(_, v)| v);
             let Some(Json::Str(sha256)) = field("sha256") else {
@@ -762,6 +808,10 @@ impl TrustStore {
                     .collect(),
                 _ => Vec::new(),
             };
+            let publisher = match field("publisher") {
+                Some(Json::Str(p)) => Some(p.clone()),
+                _ => None,
+            };
             let mut granted: Vec<Capability> = granted;
             granted.sort_unstable();
             granted.dedup();
@@ -771,6 +821,7 @@ impl TrustStore {
                     sha256: sha256.clone(),
                     granted,
                     projects,
+                    publisher,
                 },
             );
         }
@@ -791,18 +842,66 @@ impl TrustStore {
         self.entries.get(id)
     }
 
+    /// Publisher keys the user has accepted: display id to the base64 key line.
+    #[must_use]
+    pub fn publishers(&self) -> &BTreeMap<String, String> {
+        &self.publishers
+    }
+
+    /// Records a publisher key, so signatures from it count from now on.
+    ///
+    /// # Errors
+    /// Returns the IO error message when the store cannot be written.
+    pub fn add_publisher(
+        &mut self,
+        key: &crate::wasmsig::PublicKey,
+        encoded: &str,
+    ) -> Result<(), String> {
+        self.publishers
+            .insert(key.key_id_hex(), encoded.trim().to_string());
+        self.persist()
+    }
+
     /// Judges `component`, whose module hashes to `sha256`, in `project`.
     ///
     /// Checks in the order a user would want them explained: unknown before
     /// changed, changed before widened, and the project question last, since
     /// it is the only one whose answer is per-repo rather than per-artifact.
     #[must_use]
-    pub fn evaluate(&self, component: &WasmComponent, sha256: &str, project: &Path) -> Decision {
+    pub fn evaluate(
+        &self,
+        component: &WasmComponent,
+        sha256: &str,
+        project: &Path,
+        sig: &SigStatus,
+    ) -> Decision {
+        // Before anything else, including "we have never seen this": a
+        // signature that does not verify is the only verdict here that means
+        // something is wrong rather than merely unknown, and prompting the user
+        // to approve it would be asking them to wave through the one case the
+        // machine is certain about.
+        if let SigStatus::Invalid(why) = sig {
+            return Decision::BadSignature(why.clone());
+        }
         let Some(entry) = self.entries.get(&component.manifest.id) else {
+            // A valid signature does not auto-approve a first install: the
+            // design buys quiet *updates*, not unattended first contact. The
+            // user still sees the capabilities once.
             return Decision::Unknown;
         };
         if entry.sha256 != sha256 {
-            return Decision::Changed;
+            // The one thing a signature buys. New bytes carrying a good
+            // signature from the same publisher this component was approved
+            // under are the same provenance, so they do not re-prompt — but
+            // they still fall through to the capability check below, because a
+            // publisher is not authorised to widen what their plugin may do.
+            let same_publisher = matches!(
+                (sig, entry.publisher.as_deref()),
+                (SigStatus::Valid(signer), Some(known)) if signer == known
+            );
+            if !same_publisher {
+                return Decision::Changed;
+            }
         }
         let new: Vec<Capability> = component
             .manifest
@@ -836,6 +935,7 @@ impl TrustStore {
         component: &WasmComponent,
         sha256: &str,
         project: &Path,
+        sig: &SigStatus,
     ) -> Result<(), String> {
         let entry = self
             .entries
@@ -844,11 +944,20 @@ impl TrustStore {
                 sha256: sha256.to_string(),
                 granted: Vec::new(),
                 projects: Vec::new(),
+                publisher: None,
             });
         // A re-approval after a change replaces the identity outright: the old
         // hash approved different bytes and must not linger beside the new one.
         entry.sha256 = sha256.to_string();
         entry.granted.clone_from(&component.manifest.capabilities);
+        // Recorded on approval, and cleared when an install is unsigned or
+        // signed by an unknown key: an entry claiming a publisher it was not
+        // actually approved under would make the *next* update quiet on false
+        // grounds, which is the one way this feature could weaken trust.
+        entry.publisher = match sig {
+            SigStatus::Valid(signer) => Some(signer.clone()),
+            _ => None,
+        };
         if component.origin == Origin::ProjectScan && !entry.projects.iter().any(|p| p == project) {
             entry.projects.push(project.to_path_buf());
         }
@@ -865,6 +974,17 @@ impl TrustStore {
             return Ok(());
         };
         let mut out = String::from("{\n");
+        // Under a reserved key rather than a second file: one file a user can
+        // read, edit or delete. `@publishers` cannot collide with a component
+        // id, which is reverse-DNS and never starts with `@`.
+        if !self.publishers.is_empty() {
+            let keys: Vec<String> = self
+                .publishers
+                .iter()
+                .map(|(id, encoded)| format!("    {}: {}", json_str(id), json_str(encoded)))
+                .collect();
+            let _ = write!(out, "  \"@publishers\": {{\n{}\n  }},\n", keys.join(",\n"));
+        }
         for (i, (id, e)) in self.entries.iter().enumerate() {
             if i > 0 {
                 out.push_str(",\n");
@@ -879,13 +999,20 @@ impl TrustStore {
                 .iter()
                 .map(|p| json_str(&p.display().to_string()))
                 .collect();
+            // `publisher` is written only when there is one, so an unsigned
+            // install's record stays exactly the shape it has always been and
+            // an older plank reading this file is unaffected.
+            let publisher = e.publisher.as_ref().map_or_else(String::new, |p| {
+                format!(",\n    \"publisher\": {}", json_str(p))
+            });
             let _ = write!(
                 out,
-                "  {}: {{\n    \"sha256\": {},\n    \"granted\": [{}],\n    \"projects\": [{}]\n  }}",
+                "  {}: {{\n    \"sha256\": {},\n    \"granted\": [{}],\n    \"projects\": [{}]{}\n  }}",
                 json_str(id),
                 json_str(&e.sha256),
                 granted.join(", "),
                 projects.join(", "),
+                publisher,
             );
         }
         out.push_str("\n}\n");
@@ -1529,7 +1656,10 @@ impl Session {
             .home
             .as_deref()
             .map_or_else(TrustStore::ephemeral, TrustStore::load);
-        trust.approve(&component, &sha, project)?;
+        // The publisher recorded with the approval is whoever signed the bytes
+        // being approved right now, not whoever signed them last time.
+        let sig = signature_status(&component.path, &trust);
+        trust.approve(&component, &sha, project, &sig)?;
 
         // Re-run the admission path for this one component rather than
         // hand-rolling a second load: the export cross-check and the
@@ -1629,7 +1759,7 @@ impl Registry {
                 ));
                 continue;
             };
-            let decision = trust.evaluate(component, &sha, project);
+            let decision = judge(component, &sha, project, trust);
             if !decision.is_trusted() {
                 out.held.push((component.clone(), decision));
                 continue;
@@ -2226,6 +2356,61 @@ fn missing_exports(
     missing
 }
 
+/// Reads a component's signature and judges it against the trust store.
+///
+/// Split from `build` only to keep that function under the length lint; the
+/// pairing is the point, since a decision made without looking for a signature
+/// would never let a signed update through.
+fn judge(component: &WasmComponent, sha256: &str, project: &Path, trust: &TrustStore) -> Decision {
+    let sig = signature_status(&component.path, trust);
+    trust.evaluate(component, sha256, project, &sig)
+}
+
+/// Reads `<module>.minisig` beside a module and verifies it against the
+/// publisher keys `trust` holds.
+///
+/// The signature file sits next to the module and is named after it, the way
+/// minisign writes it by default, so a publisher signs with
+/// `minisign -S -m wasm/thing.wasm` and ships the `.minisig` alongside — no
+/// packaging step that could get the pairing wrong.
+///
+/// Absence is [`SigStatus::Absent`], not an error: unsigned is the ordinary
+/// case. A signature by a key the store does not hold is `UnknownKey` rather
+/// than `Invalid` — it proves nothing to *this* user, but nothing is wrong.
+#[must_use]
+pub fn signature_status(module: &Path, trust: &TrustStore) -> SigStatus {
+    let mut sig_path = module.as_os_str().to_os_string();
+    sig_path.push(".minisig");
+    let Ok(sig_text) = std::fs::read_to_string(PathBuf::from(sig_path)) else {
+        return SigStatus::Absent;
+    };
+    let sig = match crate::wasmsig::Signature::parse(&sig_text) {
+        Ok(sig) => sig,
+        // A `.minisig` that will not even parse is malformed rather than
+        // forged, but it is still a signature the publisher meant to be
+        // checked, so it fails rather than being ignored.
+        Err(e) => return SigStatus::Invalid(e.to_string()),
+    };
+    let Ok(bytes) = std::fs::read(module) else {
+        return SigStatus::Invalid("cannot read the module to verify it".to_string());
+    };
+    // Only keys the user has accepted count. Trying every key would let an
+    // attacker who can write the trust file also choose the verdict.
+    for (id, encoded) in trust.publishers() {
+        let Ok(key) = crate::wasmsig::PublicKey::parse(encoded) else {
+            continue;
+        };
+        if key.key_id != sig.key_id() {
+            continue;
+        }
+        return match crate::wasmsig::verify(&bytes, &sig, &key) {
+            Ok(()) => SigStatus::Valid(id.clone()),
+            Err(e) => SigStatus::Invalid(e.to_string()),
+        };
+    }
+    SigStatus::UnknownKey(crate::wasmsig::key_id_display(sig.key_id()))
+}
+
 /// SHA-256 of a module's bytes, via the same `shasum` path the image cache
 /// uses — no crypto dependency, and a subprocess per component at load time is
 /// invisible next to compiling one.
@@ -2303,6 +2488,216 @@ mod tests {
         // not have its window yanked out from under the user.
         assert_eq!(parse_frame_outcome(b"not json at all"), FrameOutcome::Stay);
         assert_eq!(parse_frame_outcome(b""), FrameOutcome::Stay);
+    }
+
+    /// The one thing a signature buys: an update from the publisher this
+    /// component was approved under does not re-prompt.
+    #[test]
+    fn a_signed_update_from_the_same_publisher_is_quiet() {
+        let mut trust = TrustStore::ephemeral();
+        let c = component(Origin::UserScan, vec![]);
+        let project = Path::new("/repo");
+        let signed = SigStatus::Valid("E171F5A2933C03AE".to_string());
+
+        // First install still asks, signature or not: the design buys quiet
+        // updates, not unattended first contact.
+        assert_eq!(
+            trust.evaluate(&c, "hash-a", project, &signed),
+            Decision::Unknown
+        );
+        trust.approve(&c, "hash-a", project, &signed).unwrap();
+        assert_eq!(
+            trust.entry(&c.manifest.id).unwrap().publisher.as_deref(),
+            Some("E171F5A2933C03AE"),
+            "the approval must record who signed it"
+        );
+
+        // New bytes, same publisher: trusted without asking.
+        assert_eq!(
+            trust.evaluate(&c, "hash-b", project, &signed),
+            Decision::Trusted
+        );
+        // New bytes, *different* publisher: this is the case the feature exists
+        // to catch, and it must fall back to asking.
+        let other = SigStatus::Valid("0000000000000000".to_string());
+        assert_eq!(
+            trust.evaluate(&c, "hash-b", project, &other),
+            Decision::Changed
+        );
+        // New bytes, no signature at all: also asks. A previously signed
+        // component going unsigned is not a quiet update.
+        assert_eq!(
+            trust.evaluate(&c, "hash-b", project, &SigStatus::Absent),
+            Decision::Changed
+        );
+    }
+
+    /// A valid signature does not authorise new capabilities. Provenance says
+    /// who built it, not what it may do.
+    #[test]
+    fn a_signature_never_widens_capabilities() {
+        let mut trust = TrustStore::ephemeral();
+        let project = Path::new("/repo");
+        let signed = SigStatus::Valid("E171F5A2933C03AE".to_string());
+        let plain = component(Origin::UserScan, vec![]);
+        trust.approve(&plain, "hash-a", project, &signed).unwrap();
+
+        // Same publisher, new bytes, and now it wants `exec`.
+        let greedy = component(Origin::UserScan, vec![Capability::Exec]);
+        assert_eq!(
+            trust.evaluate(&greedy, "hash-b", project, &signed),
+            Decision::Widened(vec![Capability::Exec]),
+            "a signed update that widens must still prompt"
+        );
+    }
+
+    /// A signature that does not verify is refused rather than prompted, and
+    /// before every other verdict: it is the only one where the machine is
+    /// certain something is wrong.
+    #[test]
+    fn a_bad_signature_is_refused_not_prompted() {
+        let trust = TrustStore::ephemeral();
+        let c = component(Origin::UserScan, vec![]);
+        let bad = SigStatus::Invalid("signature does not match the artifact".to_string());
+        let decision = trust.evaluate(&c, "hash-a", Path::new("/repo"), &bad);
+        assert!(
+            matches!(decision, Decision::BadSignature(_)),
+            "unknown-but-signed-badly must not present as merely unknown: {decision:?}"
+        );
+        assert!(!decision.is_trusted());
+        assert!(
+            decision.reason().contains("did not verify"),
+            "{}",
+            decision.reason()
+        );
+    }
+
+    /// An unknown signing key proves nothing but breaks nothing: trust falls
+    /// back to the hash, exactly as for an unsigned plugin.
+    #[test]
+    fn an_unknown_signing_key_falls_back_to_the_hash() {
+        let mut trust = TrustStore::ephemeral();
+        let c = component(Origin::UserScan, vec![]);
+        let project = Path::new("/repo");
+        let unknown = SigStatus::UnknownKey("DEADBEEFDEADBEEF".to_string());
+        assert_eq!(
+            trust.evaluate(&c, "hash-a", project, &unknown),
+            Decision::Unknown
+        );
+        trust.approve(&c, "hash-a", project, &unknown).unwrap();
+        // No publisher recorded, so a later update cannot be waved through by
+        // claiming to come from one.
+        assert!(trust.entry(&c.manifest.id).unwrap().publisher.is_none());
+        assert_eq!(
+            trust.evaluate(&c, "hash-a", project, &unknown),
+            Decision::Trusted
+        );
+        assert_eq!(
+            trust.evaluate(&c, "hash-b", project, &unknown),
+            Decision::Changed
+        );
+    }
+
+    /// `signature_status` against real files on disk: a real `.minisig` from
+    /// minisign 0.12, beside a real module, resolved through a real store.
+    ///
+    /// The unit tests above pass a `SigStatus` in directly, so this is the only
+    /// thing covering the part that reads the filesystem — the file naming, and
+    /// the rule that only keys the user accepted are tried.
+    #[test]
+    fn signature_status_reads_a_real_minisig_from_disk() {
+        let root = std::env::temp_dir().join(format!("plank-sigstatus-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let module = root.join("thing.wasm");
+        std::fs::write(
+            &module,
+            include_bytes!("../tests/fixtures/minisign/artifact.wasm"),
+        )
+        .unwrap();
+
+        // No signature file: absent, which is the ordinary case.
+        let empty = TrustStore::ephemeral();
+        assert_eq!(signature_status(&module, &empty), SigStatus::Absent);
+
+        // The signature minisign wrote, named the way minisign names it.
+        std::fs::write(
+            root.join("thing.wasm.minisig"),
+            include_str!("../tests/fixtures/minisign/artifact.wasm.minisig"),
+        )
+        .unwrap();
+        // Still unknown until the user has accepted the key: an untrusted
+        // signature must not verify to anything, or writing a key into the file
+        // would be enough to choose the verdict.
+        assert!(matches!(
+            signature_status(&module, &empty),
+            SigStatus::UnknownKey(id) if id == "E171F5A2933C03AE"
+        ));
+
+        let key =
+            crate::wasmsig::PublicKey::parse(include_str!("../tests/fixtures/minisign/pub.key"))
+                .unwrap();
+        let encoded = include_str!("../tests/fixtures/minisign/pub.key")
+            .lines()
+            .next_back()
+            .unwrap();
+        let mut trust = TrustStore::ephemeral();
+        trust.add_publisher(&key, encoded).unwrap();
+        assert_eq!(
+            signature_status(&module, &trust),
+            SigStatus::Valid("E171F5A2933C03AE".to_string())
+        );
+
+        // Change one byte of the module and the same signature must fail.
+        std::fs::write(&module, b"tampered\n").unwrap();
+        assert!(
+            matches!(signature_status(&module, &trust), SigStatus::Invalid(_)),
+            "a modified module with a good signature file must be Invalid"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Publisher keys survive a round trip through the file, beside the
+    /// component entries rather than in a second file.
+    #[test]
+    fn publishers_persist_alongside_the_entries() {
+        let home = std::env::temp_dir().join(format!("plank-pub-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let key =
+            crate::wasmsig::PublicKey::parse(include_str!("../tests/fixtures/minisign/pub.key"))
+                .expect("fixture key parses");
+        let encoded = include_str!("../tests/fixtures/minisign/pub.key")
+            .lines()
+            .next_back()
+            .unwrap()
+            .to_string();
+
+        let mut trust = TrustStore::load(&home);
+        trust.add_publisher(&key, &encoded).expect("persisted");
+        let c = component(Origin::UserScan, vec![]);
+        trust
+            .approve(
+                &c,
+                "hash-a",
+                Path::new("/repo"),
+                &SigStatus::Valid(key.key_id_hex()),
+            )
+            .expect("approved");
+
+        let reloaded = TrustStore::load(&home);
+        assert_eq!(
+            reloaded.publishers().get(&key.key_id_hex()),
+            Some(&encoded),
+            "the publisher key did not survive: {:?}",
+            reloaded.publishers()
+        );
+        assert_eq!(
+            reloaded.entry(&c.manifest.id).unwrap().publisher.as_deref(),
+            Some(key.key_id_hex().as_str())
+        );
+        // And the reserved key is not mistaken for a component.
+        assert!(reloaded.entry("@publishers").is_none());
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     /// A grant with no host function behind it is named at load time.
@@ -2547,18 +2942,29 @@ mod tests {
         let mut trust = TrustStore::ephemeral();
         let c = component(Origin::UserScan, vec![Capability::State]);
 
-        assert_eq!(trust.evaluate(&c, "hash-a", project), Decision::Unknown);
+        assert_eq!(
+            trust.evaluate(&c, "hash-a", project, &SigStatus::Absent),
+            Decision::Unknown
+        );
 
-        trust.approve(&c, "hash-a", project).unwrap();
-        assert_eq!(trust.evaluate(&c, "hash-a", project), Decision::Trusted);
+        trust
+            .approve(&c, "hash-a", project, &SigStatus::Absent)
+            .unwrap();
+        assert_eq!(
+            trust.evaluate(&c, "hash-a", project, &SigStatus::Absent),
+            Decision::Trusted
+        );
 
         // Same id, different bytes.
-        assert_eq!(trust.evaluate(&c, "hash-b", project), Decision::Changed);
+        assert_eq!(
+            trust.evaluate(&c, "hash-b", project, &SigStatus::Absent),
+            Decision::Changed
+        );
 
         // Same bytes, a new capability.
         let greedy = component(Origin::UserScan, vec![Capability::State, Capability::Exec]);
         assert_eq!(
-            trust.evaluate(&greedy, "hash-a", project),
+            trust.evaluate(&greedy, "hash-a", project, &SigStatus::Absent),
             Decision::Widened(vec![Capability::Exec])
         );
         assert!(greedy.is_privileged());
@@ -2571,14 +2977,16 @@ mod tests {
     fn a_project_local_component_is_approved_per_repo() {
         let mut trust = TrustStore::ephemeral();
         let c = component(Origin::ProjectScan, vec![Capability::State]);
-        trust.approve(&c, "hash-a", Path::new("/repo-one")).unwrap();
+        trust
+            .approve(&c, "hash-a", Path::new("/repo-one"), &SigStatus::Absent)
+            .unwrap();
 
         assert_eq!(
-            trust.evaluate(&c, "hash-a", Path::new("/repo-one")),
+            trust.evaluate(&c, "hash-a", Path::new("/repo-one"), &SigStatus::Absent),
             Decision::Trusted
         );
         assert_eq!(
-            trust.evaluate(&c, "hash-a", Path::new("/repo-two")),
+            trust.evaluate(&c, "hash-a", Path::new("/repo-two"), &SigStatus::Absent),
             Decision::ProjectUnapproved
         );
 
@@ -2586,7 +2994,7 @@ mod tests {
         // the user named that directory themselves.
         let user = component(Origin::UserScan, vec![Capability::State]);
         assert_eq!(
-            trust.evaluate(&user, "hash-a", Path::new("/repo-two")),
+            trust.evaluate(&user, "hash-a", Path::new("/repo-two"), &SigStatus::Absent),
             Decision::Trusted
         );
     }
@@ -2600,7 +3008,9 @@ mod tests {
         );
         {
             let mut trust = TrustStore::load(&home);
-            trust.approve(&c, "hash-a", Path::new("/repo")).unwrap();
+            trust
+                .approve(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent)
+                .unwrap();
         }
         let reloaded = TrustStore::load(&home);
         let entry = reloaded.entry("dev.plank.demo").expect("recorded");
@@ -2608,7 +3018,7 @@ mod tests {
         assert!(entry.granted.contains(&Capability::Net));
         assert_eq!(entry.projects, vec![PathBuf::from("/repo")]);
         assert_eq!(
-            reloaded.evaluate(&c, "hash-a", Path::new("/repo")),
+            reloaded.evaluate(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent),
             Decision::Trusted
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -2624,7 +3034,7 @@ mod tests {
         let trust = TrustStore::load(&home);
         let c = component(Origin::UserScan, vec![]);
         assert_eq!(
-            trust.evaluate(&c, "hash-a", Path::new("/repo")),
+            trust.evaluate(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent),
             Decision::Unknown
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -2662,7 +3072,12 @@ mod tests {
         let mut trust = TrustStore::ephemeral();
         let sha = module_sha256(&set.components[0].path).expect("hash");
         trust
-            .approve(&set.components[0], &sha, Path::new("/repo"))
+            .approve(
+                &set.components[0],
+                &sha,
+                Path::new("/repo"),
+                &SigStatus::Absent,
+            )
             .unwrap();
 
         let mut host = crate::wasmhost::NoWasmHost;

@@ -169,7 +169,12 @@ fn a_trusted_component_discovers_and_loads_end_to_end() {
     // Approve it at its real hash, then it loads — ABI handshake included.
     let sha = plank::wasmreg::module_sha256(&found.components[0].path).expect("hash");
     trust
-        .approve(&found.components[0], &sha, &project)
+        .approve(
+            &found.components[0],
+            &sha,
+            &project,
+            &plank::wasmreg::SigStatus::Absent,
+        )
         .expect("approve");
     let mut live = host(None);
     let reg = Registry::build(&found, &trust, &project, &mut *live);
@@ -313,7 +318,14 @@ fn a_component_claiming_command_without_the_exports_is_refused() {
     let project = root.join("repo");
     let mut trust = TrustStore::ephemeral();
     let sha = module_sha256(&found.components[0].path).expect("hash");
-    trust.approve(&found.components[0], &sha, &project).unwrap();
+    trust
+        .approve(
+            &found.components[0],
+            &sha,
+            &project,
+            &plank::wasmreg::SigStatus::Absent,
+        )
+        .unwrap();
 
     let mut host = host(None);
     let reg = Registry::build(&found, &trust, &project, &mut *host);
@@ -660,7 +672,14 @@ fn an_observer_without_on_event_is_refused() {
     let project = root.join("repo");
     let mut trust = TrustStore::ephemeral();
     let sha = module_sha256(&found.components[0].path).expect("hash");
-    trust.approve(&found.components[0], &sha, &project).unwrap();
+    trust
+        .approve(
+            &found.components[0],
+            &sha,
+            &project,
+            &plank::wasmreg::SigStatus::Absent,
+        )
+        .unwrap();
 
     let mut host = host(None);
     let reg = Registry::build(&found, &trust, &project, &mut *host);

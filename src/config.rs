@@ -745,8 +745,8 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/plugins",
-        args: "[install <dir>|remove <name>|trust <id>]",
-        desc: "list, install, remove, or approve plugins",
+        args: "[install <dir|url>|remove <name>|trust <id>|publisher <key>]",
+        desc: "list, install, remove, approve, or trust a signing key",
     },
     SlashCommand {
         name: "/frame",

@@ -97,5 +97,6 @@ pub mod wasmevents;
 pub mod wasmglyph;
 pub mod wasmhost;
 pub mod wasmreg;
+pub mod wasmsig;
 pub mod worker;
 pub mod worktree;
