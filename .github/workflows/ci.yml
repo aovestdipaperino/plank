@@ -126,6 +126,12 @@ jobs:
           sh spike/build-guest.sh
           sh guests/build.sh
 
+      # The shared guest crate has the only tests that pin the RNG sequence and
+      # the glyph wire format, and it is a separate crate targeting the host, so
+      # the workspace's own `cargo test` never reaches it.
+      - name: Test the shared guest crate
+        run: cargo test --manifest-path guests/support/Cargo.toml
+
       # Packaging is verified here rather than only at release time: it is the
       # step that turns a `.wasm` into something installable, and the plugin
       # manifests it copies are the only thing standing between a release and a

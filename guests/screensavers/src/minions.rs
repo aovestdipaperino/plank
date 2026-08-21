@@ -821,7 +821,16 @@ fn put(out: &mut Vec<Glyph>, x: i32, y: i32, ch: char, color: Rgb, w: u16, h: u1
 }
 
 /// Milliseconds in a range, dealt from the field's own generator.
-impl Rng {
+///
+/// An extension trait rather than an inherent `impl`: `Rng` now lives in the
+/// shared support crate, so it cannot be extended here directly — and it should
+/// not be, since this is a skit's idea of a duration and not something every
+/// guest needs.
+trait RangeMs {
+    fn range_ms(&mut self, lo: u64, hi: u64) -> u64;
+}
+
+impl RangeMs for Rng {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // ranges are ms, and small
     fn range_ms(&mut self, lo: u64, hi: u64) -> u64 {
         lo + (self.next_u64() % (hi - lo + 1))

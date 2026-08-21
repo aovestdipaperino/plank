@@ -662,6 +662,15 @@ Removal leaves the trust entry behind. It is keyed by the component's hash, so
 reinstalling the same bytes is the same component and needs no re-approval,
 while different bytes re-prompt exactly as they would have.
 
+The two shipped guests share `guests/support`, a real crate rather than a file
+copied into each: the copies had already begun to drift, and the RNG is the one
+thing that must not — a face's testability rests on "the same seed draws the
+same way", and a subtly different `next_f32` breaks that in a way no test on
+either side would catch. It carries the RNG, the glyph packing and the tiny
+`OpenParams` readers, with tests pinning the RNG sequence and the wire header as
+contracts. It is also the first piece of a plugin SDK, which is the thing that
+makes third-party authoring plausible.
+
 A release publishes `SHA256SUMS` beside the plugin archives: the **module**
 hashes (what the trust store keys on — a tarball's hash says nothing about what
 plank loads) and the `rustc --version` that produced them. `guests/verify.sh`

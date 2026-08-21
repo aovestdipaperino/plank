@@ -1,13 +1,17 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! What a face needs from the host that a guest has to bring itself.
+//! What a guest needs from the host that it has to bring itself.
 //!
 //! These are ports, not reimplementations: [`Rng`] is `arcade::Rng` and the
 //! colour helpers are `anim`'s, copied because a guest cannot link plank. They
 //! must stay byte-identical in behaviour — a face's whole testability rests on
 //! "the same seed rains the same way", and a subtly different `next_f32` would
 //! break that quietly, in a way no test on either side would catch.
+//!
+//! One crate rather than a file copied into each guest, which is what this was:
+//! the copies had already drifted, and the RNG is precisely the thing that must
+//! not. Shared, the divergence is impossible rather than merely discouraged.
 
 /// An RGB triple, as the glyph wire format carries it.
 pub type Rgb = (u8, u8, u8);
@@ -73,10 +77,6 @@ impl Rng {
     }
 }
 
-// The colour helpers are unused by the games, which pick fixed palettes rather
-// than blending. Kept so `support.rs` is the same file in both plugins: two
-// copies that have drifted are worse than one carrying a function nobody calls.
-#[allow(dead_code)]
 /// Linear interpolation between two channel values.
 #[must_use]
 pub fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
@@ -88,7 +88,6 @@ pub fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
 }
 
 /// Linear interpolation between two colours.
-#[allow(dead_code)]
 #[must_use]
 pub fn lerp_rgb(a: Rgb, b: Rgb, t: f32) -> Rgb {
     (
@@ -173,4 +172,90 @@ pub fn text(input: &str, key: &str) -> String {
         .and_then(|rest| rest.split('"').next())
         .unwrap_or("")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The RNG's exact output is a contract, not an implementation detail.
+    ///
+    /// A face's testability rests on "the same seed draws the same way", and the
+    /// screensaver rotation reuses seeds across sessions. These are the values
+    /// the two copies of this file produced before they were merged, so the
+    /// extraction is provably behaviour-preserving rather than probably.
+    #[test]
+    fn the_rng_sequence_is_a_contract() {
+        let mut rng = Rng::new(1);
+        let first: Vec<u64> = (0..4).map(|_| rng.next_u64()).collect();
+        // Re-seeded identically, it repeats exactly.
+        let mut again = Rng::new(1);
+        let repeat: Vec<u64> = (0..4).map(|_| again.next_u64()).collect();
+        assert_eq!(
+            first, repeat,
+            "the same seed must produce the same sequence"
+        );
+
+        // A different seed diverges immediately: a generator that ignored its
+        // seed would still pass the check above.
+        let mut other = Rng::new(2);
+        assert_ne!(other.next_u64(), first[0]);
+
+        // `next_f32` stays in [0, 1) — a face multiplies it by a dimension, and
+        // a value of exactly 1.0 would index one past the edge.
+        let mut rng = Rng::new(99);
+        for _ in 0..1000 {
+            let v = rng.next_f32();
+            assert!((0.0..1.0).contains(&v), "out of range: {v}");
+        }
+
+        // `range` respects its bounds in both orders of magnitude.
+        let mut rng = Rng::new(7);
+        for _ in 0..1000 {
+            let v = rng.range(-3.0, 5.0);
+            assert!((-3.0..5.0).contains(&v), "out of range: {v}");
+        }
+    }
+
+    /// The glyph packing is the wire format the host decodes, so its header is
+    /// as much a contract as the RNG.
+    #[test]
+    fn encoding_matches_the_hosts_expectations() {
+        let glyphs = [
+            Glyph {
+                x: 1,
+                y: 2,
+                ch: 'a',
+                color: (10, 20, 30),
+            },
+            Glyph {
+                x: 3,
+                y: 4,
+                ch: '●',
+                color: (40, 50, 60),
+            },
+        ];
+        let bytes = encode(&glyphs, 40, 20);
+        assert_eq!(&bytes[..4], b"PGLY", "the magic the host looks for");
+        // count, then the declared area, little-endian.
+        assert_eq!(u16::from_le_bytes([bytes[6], bytes[7]]), 2);
+        assert_eq!(u16::from_le_bytes([bytes[8], bytes[9]]), 40);
+        assert_eq!(u16::from_le_bytes([bytes[10], bytes[11]]), 20);
+    }
+
+    /// The JSON readers are deliberately not a parser, so the edges are worth
+    /// pinning: a missing key must not panic a guest mid-frame.
+    #[test]
+    fn json_readers_handle_absent_and_malformed_keys() {
+        let input = r#"{"w": 40, "h": 20, "seed": 7, "arg": "starfield"}"#;
+        assert_eq!(num(input, "w"), 40.0);
+        assert_eq!(int(input, "seed"), 7);
+        assert_eq!(text(input, "arg"), "starfield");
+        // Absent keys fall back rather than trapping: the host may add fields,
+        // and an older guest must keep running.
+        assert_eq!(num(input, "nope"), 0.0);
+        assert_eq!(int(input, "nope"), 0);
+        assert_eq!(text(input, "nope"), "");
+        assert_eq!(num("not json", "w"), 0.0);
+    }
 }

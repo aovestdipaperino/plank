@@ -1,0 +1,28 @@
+# The shared half of a plugin guest: the RNG, the glyph packing, and the tiny
+# JSON readers every component needs for its `OpenParams`.
+#
+# Extracted because `support.rs` existed twice, once per guest, and the two had
+# already begun to drift — by annotations rather than behaviour, but drift is
+# drift, and the RNG is the one thing here that must not: a face's testability
+# rests on "the same seed draws the same way", and a subtly different
+# `next_f32` would break that quietly, in a way no test on either side would
+# catch.
+#
+# Deliberately NOT a workspace member of plank: it targets
+# wasm32-unknown-unknown. This is also the first piece of a plugin SDK — the
+# thing that makes third-party authoring plausible — which is why it is a real
+# crate rather than an `include!`.
+[workspace]
+
+[package]
+name = "plank-guest-support"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+
+[profile.release]
+opt-level = "s"
+strip = true

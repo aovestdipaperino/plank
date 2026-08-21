@@ -15,7 +15,7 @@ mod centipede;
 mod frogger;
 mod invaders;
 mod shared;
-mod support;
+use plank_guest_support as support;
 
 use extism_pdk::*;
 

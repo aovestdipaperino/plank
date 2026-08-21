@@ -17,7 +17,7 @@
 
 mod minions;
 mod starfield;
-mod support;
+use plank_guest_support as support;
 
 use extism_pdk::*;
 

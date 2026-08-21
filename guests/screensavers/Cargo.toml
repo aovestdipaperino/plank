@@ -25,6 +25,9 @@ crate-type = ["cdylib"]
 
 [dependencies]
 extism-pdk = "1"
+# The shared half of a guest: RNG, glyph packing, JSON readers. A path
+# dependency rather than a copied file, because the copies had already drifted.
+plank-guest-support = { path = "../support" }
 
 [profile.release]
 opt-level = "s"

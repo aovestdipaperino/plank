@@ -180,10 +180,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plank-guest-support"
+version = "0.1.0"
+
+[[package]]
 name = "plank-screensavers"
 version = "0.1.0"
 dependencies = [
  "extism-pdk",
+ "plank-guest-support",
 ]
 
 [[package]]
