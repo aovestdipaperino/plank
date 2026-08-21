@@ -347,3 +347,9 @@ ruining the frame rate.
 `guests/build.sh` builds them; `guests/package.sh` assembles installable
 directories and records `SHA256SUMS`; `guests/verify.sh` proves a clean rebuild
 lands on the same bytes.
+
+The "smallest plugin" section above was written and then **followed literally**
+from a directory outside the plank tree — a fresh crate, the manifest as printed,
+`--plugin-dir` — and the result discovered with no warnings and printed
+`hello from wasm` when its command ran. If the walkthrough stops working, that is
+a bug in plank or in this file, not in your setup.
