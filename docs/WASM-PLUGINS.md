@@ -553,6 +553,16 @@ Plugins get **no ambient clock and no ambient randomness**. Time arrives as
 same discipline `arcade::Rng` already imposes, and for the same reason: a
 seeded frame plugin can be replayed exactly in a test.
 
+A `segment_render` reply is `{"text", "priority", "fg", "bg"}`. `priority`
+orders elision: when the bar does not fit, contributed cells are dropped
+lowest-priority first, and only what remains is truncated — truncation alone
+cuts the right edge, which is where the power suffix lives. Built-in segments
+are never elided on a plugin's behalf: a user who cannot see the context gauge
+because a component had something to say is worse off than one who cannot see
+the component. `fg`/`bg` are `[r, g, b]` and are closed by returning to the
+bar's own style rather than by a reset, which would drop the status background
+for the rest of the line.
+
 Calls are made on the UI thread for `frame`/`panel`/`segment` (they are already
 frame-synchronous) and on a worker for `tool` and `observer`. A single plugin
 instance is never called re-entrantly; plank serializes per instance.

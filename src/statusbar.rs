@@ -52,8 +52,12 @@ impl StatusBar {
             return;
         }
         let (_, cols) = term_size();
-        let mut line = status::build_status_text(st, self.color, true);
-        // Keep the status within one screen row so it never wraps.
+        // Width-aware: contributed plugin cells are dropped lowest-priority
+        // first, and only what is left gets truncated. Truncation alone cuts
+        // the right edge, which is the power suffix — the bar's own anchor.
+        let mut line = status::build_status_text_within(st, self.color, true, cols);
+        // Keep the status within one screen row so it never wraps, for the case
+        // where the built-in segments alone exceed the width.
         if line.chars().count() > cols {
             line = line.chars().take(cols).collect();
         }

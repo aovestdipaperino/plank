@@ -213,10 +213,28 @@ static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 /// them to reach a plugin registry would be a far larger change than the
 /// feature is worth. The registry re-renders on its own cadence and drops the
 /// text here; the bar only ever reads it.
-static WASM_SEGMENTS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+/// Each cell is `(text, priority)`: the priority is what `segment_render`
+/// returned, kept so the bar can *elide* rather than truncate when the line
+/// overflows. Dropping a whole cell by priority is what a component asked for
+/// by returning one; chopping the line at the right edge instead removes the
+/// power suffix, which is the bar's own anchor.
+static WASM_SEGMENTS: std::sync::RwLock<Vec<Cell>> = std::sync::RwLock::new(Vec::new());
+
+/// One contributed status-bar cell as the bar needs it.
+#[derive(Debug, Clone, Default)]
+pub struct Cell {
+    /// Rendered text, already one line.
+    pub text: String,
+    /// Elision order: higher survives longer.
+    pub priority: u8,
+    /// Foreground, when the component asked for one.
+    pub fg: Option<(u8, u8, u8)>,
+    /// Background, when the component asked for one.
+    pub bg: Option<(u8, u8, u8)>,
+}
 
 /// Replaces the contributed cells, highest priority first.
-pub fn set_wasm_segments(segments: Vec<String>) {
+pub fn set_wasm_segments(segments: Vec<Cell>) {
     if let Ok(mut slot) = WASM_SEGMENTS.write() {
         *slot = segments;
     }
@@ -225,14 +243,64 @@ pub fn set_wasm_segments(segments: Vec<String>) {
 /// The contributed cells, joined for the bar. Empty when there are none, so
 /// the common case adds not one byte to the line.
 #[must_use]
-fn wasm_segment_text() -> String {
+/// The contributed cells, dropping the lowest-priority ones until at most
+/// `keep` of them remain.
+///
+/// `usize::MAX` keeps them all, which is the ordinary path: elision only
+/// happens when [`build_status_text_within`] has established the line does not
+/// fit.
+fn wasm_segment_text_keeping(keep: usize, color: bool) -> String {
     let Ok(slot) = WASM_SEGMENTS.read() else {
         return String::new();
     };
-    if slot.is_empty() {
+    elide_cells_styled(&slot, keep, color)
+}
+
+/// Joins the highest-priority `keep` cells, prefixed for the bar.
+///
+/// Pure, and takes the cells rather than reading the global, so it is testable
+/// without a shared mutable static that parallel tests would fight over.
+/// Joins the highest-priority `keep` cells, optionally painting each cell's
+/// requested colours.
+///
+/// Pure, and takes the cells rather than reading the published global, so it is
+/// testable without a shared mutable static that parallel tests would fight
+/// over — the first version of its test set that static and broke an unrelated
+/// one.
+///
+/// A cell's colour is closed by returning to the bar's own style rather than by
+/// a full reset, exactly as the theme accent does: a reset here would drop the
+/// status bar's background for the rest of the line.
+fn elide_cells_styled(cells: &[Cell], keep: usize, color: bool) -> String {
+    if cells.is_empty() || keep == 0 {
         return String::new();
     }
-    format!(" | {}", slot.join(" | "))
+    // Already highest-priority-first, so keeping a prefix drops the lowest.
+    let kept: Vec<String> = cells
+        .iter()
+        .take(keep)
+        .map(|cell| {
+            if !color || (cell.fg.is_none() && cell.bg.is_none()) {
+                return cell.text.clone();
+            }
+            let mut out = String::new();
+            if let Some((r, g, b)) = cell.fg {
+                let _ =
+                    std::fmt::Write::write_fmt(&mut out, format_args!("\x1b[38;2;{r};{g};{b}m"));
+            }
+            if let Some((r, g, b)) = cell.bg {
+                let _ =
+                    std::fmt::Write::write_fmt(&mut out, format_args!("\x1b[48;2;{r};{g};{b}m"));
+            }
+            out.push_str(&cell.text);
+            out.push_str(STATUS_STYLE_START);
+            out
+        })
+        .collect();
+    if kept.is_empty() {
+        return String::new();
+    }
+    format!(" | {}", kept.join(" | "))
 }
 
 pub fn set_local_power(percent: i32) {
@@ -1165,6 +1233,19 @@ pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
 /// prefill/generating footers (the TUI renders it in the output area instead).
 #[must_use]
 pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> String {
+    build_status_text_with_cells(st, color, progress_in_bar, usize::MAX)
+}
+
+/// [`build_status_text`] keeping at most `cells` contributed segments.
+///
+/// The elision knob for [`build_status_text_within`]. Private: callers ask for
+/// a width, not for a cell count.
+fn build_status_text_with_cells(
+    st: &Status,
+    color: bool,
+    progress_in_bar: bool,
+    cells: usize,
+) -> String {
     // Context usage shown as a bare percentage of the window (the ctx gauge).
     let ctx = if st.ctx_size > 0 {
         format!(
@@ -1215,7 +1296,7 @@ pub fn build_status_text(st: &Status, color: bool, progress_in_bar: bool) -> Str
     };
     // Contributed cells ride between the state word and the power suffix: the
     // suffix is the line's right anchor and must stay last.
-    let power = format!("{}{power}", wasm_segment_text());
+    let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
     let body = match st.state {
         WorkerState::Prefill | WorkerState::Generating => {
             match progress_segment(st, color).filter(|_| progress_in_bar) {
@@ -1259,6 +1340,61 @@ pub fn spec_segment(st: &Status) -> Option<String> {
         st.spec.speedup(),
         100.0 * st.spec.acceptance()
     ))
+}
+
+/// [`build_status_text`] fitted into `cols` columns.
+///
+/// When the line overflows, contributed cells are dropped lowest-priority
+/// first until it fits, and only then is the result truncated. Plain
+/// truncation alone cuts the *right* edge, which is where the power suffix
+/// lives — the one segment documented as the line's anchor — so a plugin cell
+/// could push the bar's own status off the screen.
+///
+/// The built-in segments are never elided: they are not competing for space on
+/// a plugin's behalf, and a user who cannot see the context gauge because a
+/// component had something to say is worse off than one who cannot see the
+/// component.
+#[must_use]
+pub fn build_status_text_within(
+    st: &Status,
+    color: bool,
+    progress_in_bar: bool,
+    cols: usize,
+) -> String {
+    let full = build_status_text(st, color, progress_in_bar);
+    if visible_width(&full) <= cols {
+        return full;
+    }
+    let total = WASM_SEGMENTS.read().map_or(0, |s| s.len());
+    // Drop one cell at a time rather than computing a budget: the cells are
+    // already ordered, and the number of them is single digits.
+    for keep in (0..total).rev() {
+        let candidate = build_status_text_with_cells(st, color, progress_in_bar, keep);
+        if visible_width(&candidate) <= cols {
+            return candidate;
+        }
+    }
+    build_status_text_with_cells(st, color, progress_in_bar, 0)
+}
+
+/// Visible width, ignoring ANSI escapes so a coloured line is not judged by
+/// the length of its escape sequences.
+fn visible_width(text: &str) -> usize {
+    let mut width = 0;
+    let mut in_escape = false;
+    for c in text.chars() {
+        if in_escape {
+            // A CSI sequence ends at its final byte, which is alphabetic.
+            if c.is_ascii_alphabetic() {
+                in_escape = false;
+            }
+        } else if c == '\u{1b}' {
+            in_escape = true;
+        } else {
+            width += 1;
+        }
+    }
+    width
 }
 
 /// Formats the echoed user prompt line (`* <text>` with bold styling on TTYs).
@@ -1336,6 +1472,80 @@ pub fn no_model_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Elision drops the lowest-priority cells first and keeps the order.
+    ///
+    /// Pure: it takes the cells rather than reaching for the published global,
+    /// which parallel tests would otherwise fight over — the first version of
+    /// this test set that static and broke an unrelated one.
+    #[test]
+    fn cells_are_elided_lowest_priority_first() {
+        // As published: highest priority first.
+        let cell = |text: &str, priority: u8| Cell {
+            text: text.to_string(),
+            priority,
+            fg: None,
+            bg: None,
+        };
+        let cells = vec![
+            cell("IMPORTANT", 200),
+            cell("middling", 128),
+            cell("chatty", 10),
+        ];
+        assert_eq!(
+            elide_cells_styled(&cells, usize::MAX, false),
+            " | IMPORTANT | middling | chatty"
+        );
+        assert_eq!(
+            elide_cells_styled(&cells, 2, false),
+            " | IMPORTANT | middling"
+        );
+        assert_eq!(elide_cells_styled(&cells, 1, false), " | IMPORTANT");
+        // Nothing kept is the empty string, not a dangling separator that
+        // would leave the bar ending in " | ".
+        assert_eq!(elide_cells_styled(&cells, 0, false), "");
+        assert_eq!(elide_cells_styled(&[], usize::MAX, false), "");
+    }
+
+    /// A cell's requested colours are painted, and closed by returning to the
+    /// bar's own style rather than by a reset — a reset would drop the status
+    /// bar's background for the rest of the line.
+    #[test]
+    fn a_cells_colours_are_painted_and_closed_to_the_bar_style() {
+        let coloured = vec![Cell {
+            text: "BUSY".to_string(),
+            priority: 200,
+            fg: Some((255, 0, 0)),
+            bg: Some((0, 0, 128)),
+        }];
+        // Without colour the escapes must not appear at all: a piped run gets
+        // plain text.
+        assert_eq!(elide_cells_styled(&coloured, 1, false), " | BUSY");
+        let painted = elide_cells_styled(&coloured, 1, true);
+        assert!(painted.contains("\x1b[38;2;255;0;0m"), "{painted:?}");
+        assert!(painted.contains("\x1b[48;2;0;0;128m"), "{painted:?}");
+        assert!(painted.ends_with(STATUS_STYLE_START), "{painted:?}");
+        // Colour must not change how wide the bar thinks the cell is.
+        assert_eq!(visible_width(&painted), " | BUSY".len());
+
+        // A cell with no opinion stays untouched even in colour mode.
+        let plain = vec![Cell {
+            text: "quiet".to_string(),
+            priority: 1,
+            fg: None,
+            bg: None,
+        }];
+        assert_eq!(elide_cells_styled(&plain, 1, true), " | quiet");
+    }
+
+    /// Widths are measured in visible columns, so a coloured line is not judged
+    /// by the length of its escape sequences.
+    #[test]
+    fn visible_width_ignores_ansi() {
+        assert_eq!(visible_width("plain"), 5);
+        assert_eq!(visible_width("\x1b[1;31mred\x1b[0m"), 3);
+        assert_eq!(visible_width("\x1b[38;5;120mgreen\x1b[0m!"), 6);
+    }
     use super::*;
 
     #[test]

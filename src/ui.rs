@@ -2635,11 +2635,18 @@ impl Agent<'_> {
             .registry
             .refresh_segments(&mut *wasm.host, &status, now_ms)
         {
-            let cells: Vec<String> = wasm
+            // Priority travels with the text: the bar needs it to decide what
+            // to drop first when the line does not fit.
+            let cells: Vec<crate::status::Cell> = wasm
                 .registry
                 .segments()
                 .iter()
-                .map(|s| s.text.clone())
+                .map(|s| crate::status::Cell {
+                    text: s.text.clone(),
+                    priority: s.priority,
+                    fg: s.fg,
+                    bg: s.bg,
+                })
                 .collect();
             crate::status::set_wasm_segments(cells);
         }
@@ -6707,7 +6714,10 @@ impl Agent<'_> {
             // Republished per tick, like the status text: `/new`, `/switch` and
             // `/resume` all change the name under the loop's feet.
             tui::set_session_name(&self.session.id);
-            let mut status = self.idle_status_text();
+            // Width-aware so a contributed cell cannot push the built-in
+            // segments off the line; see `build_status_text_within`.
+            let cols = terminal.size().map_or(80, |s| s.width) as usize;
+            let mut status = self.idle_status_text(cols);
             if clip_has_image {
                 status.push_str(" | 📷 image in clipboard (Cmd-V attaches)");
             }
@@ -8000,9 +8010,9 @@ impl Agent<'_> {
         Ok(())
     }
 
-    fn idle_status_text(&mut self) -> String {
+    fn idle_status_text(&mut self, cols: usize) -> String {
         let st = self.idle_status();
-        status::build_status_text(&st, false, true)
+        status::build_status_text_within(&st, false, true, cols)
     }
 
     /// The between-turns status snapshot: idle, with the context gauge for the

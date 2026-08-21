@@ -1374,6 +1374,10 @@ pub struct Segment {
     /// Elision order when the bar overflows: higher survives longer. Plugin
     /// segments compete in the same order as the built-in ones.
     pub priority: u8,
+    /// Foreground colour, when the component asked for one.
+    pub fg: Option<(u8, u8, u8)>,
+    /// Background colour, when the component asked for one.
+    pub bg: Option<(u8, u8, u8)>,
 }
 
 /// How often a `segment` component may actually be called.
@@ -1401,12 +1405,31 @@ fn parse_segment(component: &str, bytes: &[u8]) -> Option<Segment> {
         Some((_, Json::Num(n))) if *n >= 0.0 => (*n as u32).min(255) as u8,
         _ => 128,
     };
+    // `[r, g, b]`, each clamped into a byte. Absent is the ordinary case and
+    // means "use the bar's own colour", which is what a component that has no
+    // opinion should get.
+    let colour = |key: &str| -> Option<(u8, u8, u8)> {
+        let Some((_, Json::Arr(parts))) = fields.iter().find(|(k, _)| k == key) else {
+            return None;
+        };
+        if parts.len() != 3 {
+            return None;
+        }
+        let byte = |i: usize| match parts.get(i) {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            Some(Json::Num(n)) => Some(n.clamp(0.0, 255.0) as u8),
+            _ => None,
+        };
+        Some((byte(0)?, byte(1)?, byte(2)?))
+    };
     Some(Segment {
         component: component.to_string(),
         // A cell is one line by construction: a newline in it would tear the
         // bar apart, so it is folded rather than trusted.
         text: get("text").replace(['\n', '\r'], " "),
         priority,
+        fg: colour("fg"),
+        bg: colour("bg"),
     })
 }
 
