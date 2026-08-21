@@ -1896,6 +1896,27 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// Every loaded component's declared config options, component by
+    /// component, for the config form.
+    ///
+    /// Only *loaded* components: an option declared by something held back for
+    /// trust is not in effect, and offering to configure it would imply it was.
+    #[must_use]
+    pub fn declared_config(&self) -> Vec<(String, ConfigOption)> {
+        self.loaded
+            .iter()
+            .flat_map(|l| {
+                let id = l.component.manifest.id.clone();
+                l.component
+                    .manifest
+                    .config
+                    .iter()
+                    .cloned()
+                    .map(move |o| (id.clone(), o))
+            })
+            .collect()
+    }
+
     /// Builds the session registry: hashes each component, asks `trust` about
     /// it, and loads what is approved through `host`.
     ///

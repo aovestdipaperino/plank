@@ -3625,11 +3625,48 @@ impl Agent<'_> {
                         "{}",
                         crate::configform::render_text_list(crate::settings::active())
                     );
+                    // Discoverability: settable-but-unlisted is the same as
+                    // absent for anyone who did not write the plugin.
+                    print!(
+                        "{}",
+                        crate::configform::render_plugin_list(
+                            crate::settings::active(),
+                            &self.tool_ctx.wasm.registry.declared_config(),
+                        )
+                    );
                 } else {
                     let mut p = arg.splitn(2, char::is_whitespace);
                     let key = p.next().unwrap_or("");
                     let val = p.next().unwrap_or("").trim();
                     let mut working = crate::settings::active().clone();
+                    // Plugin options are addressed `pluginConfig.<id>.<option>`
+                    // and validated against the component's own declaration, so
+                    // they cannot go through the `FieldId` setter.
+                    if key.starts_with("pluginConfig.") {
+                        let declared = self.tool_ctx.wasm.registry.declared_config();
+                        match crate::configform::set_plugin_option(
+                            &mut working,
+                            key,
+                            val,
+                            &declared,
+                        ) {
+                            Ok(written) => match crate::settings::project_path() {
+                                Some(path) => match working.save_to(&path) {
+                                    Ok(()) => {
+                                        crate::settings::reinstall(working);
+                                        println!(
+                                            "set pluginConfig.{written} = {val} (saved to {})",
+                                            path.display()
+                                        );
+                                    }
+                                    Err(e) => println!("config save failed: {e}"),
+                                },
+                                None => println!("no project settings file to save to"),
+                            },
+                            Err(e) => println!("{e}"),
+                        }
+                        return Ok(true);
+                    }
                     match crate::configform::set_from_path(&mut working, key, val) {
                         Ok(field) => {
                             let (section, fkey) = (field.section, field.key);
@@ -9319,9 +9356,18 @@ impl Agent<'_> {
                     .into_iter()
                     .map(|f| f.address)
                     .collect();
-                *config_form = Some(crate::configform::ConfigForm::with_faces(
+                let plugin_fields = self
+                    .tool_ctx
+                    .wasm
+                    .registry
+                    .declared_config()
+                    .into_iter()
+                    .map(|(id, option)| crate::configform::PluginField { id, option })
+                    .collect();
+                *config_form = Some(crate::configform::ConfigForm::with_contributions(
                     crate::settings::active().clone(),
                     faces,
+                    plugin_fields,
                 ));
             }
             "/new" | "/clear" => {

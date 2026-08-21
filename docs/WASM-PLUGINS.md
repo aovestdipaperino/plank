@@ -613,8 +613,13 @@ stopped being acceptable, because an author removed an enum member in an update,
 will not start because of a stale setting is worse than one that starts on its
 author's default.
 
-Still to come: surfacing these in plank's config form. Until then they are set
-by editing settings, which is enough for an author to develop against.
+Both front-ends can set them: the TUI `/config` form grows a `plugins` section
+whose rows are labelled `<component-id>.<option>` (qualified, because two
+plugins may both declare `difficulty`), and the plain REPL takes
+`/config pluginConfig.<id>.<option> <value>` and lists the declared options
+alongside the built-in settings. Either path validates against the declaration
+before writing, so the answer a user gets is the same one the component would
+have given.
 
 **Locations**, resolved in order, later overriding earlier by `id`:
 

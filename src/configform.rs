@@ -548,6 +548,54 @@ pub fn set_from_path(s: &mut Settings, path: &str, value: &str) -> Result<&'stat
     Ok(field)
 }
 
+/// Sets a plugin-declared option from `/config pluginConfig.<id>.<option> <v>`.
+///
+/// Separate from [`set_from_path`] because the validation lives in the
+/// component's declaration rather than in a `FieldId`, so the caller has to
+/// supply the declarations. Returns the key that was written.
+///
+/// # Errors
+/// Returns a message when the path names no declared option, or when the value
+/// is not one that option accepts — checked against the declaration so the
+/// answer is the same one the form would give.
+pub fn set_plugin_option(
+    s: &mut Settings,
+    path: &str,
+    value: &str,
+    declared: &[(String, crate::wasmreg::ConfigOption)],
+) -> Result<String, String> {
+    let key = path.strip_prefix("pluginConfig.").ok_or_else(|| {
+        format!("not a plugin option: {path} (expected pluginConfig.<id>.<option>)")
+    })?;
+    // Split from the right: a component id contains dots, the option name does
+    // not, so the last segment is the option and everything before it is the id.
+    let (id, option) = key
+        .rsplit_once('.')
+        .ok_or_else(|| format!("not a plugin option: {path}"))?;
+    let found = declared
+        .iter()
+        .find(|(cid, o)| cid == id && o.name == option)
+        .ok_or_else(|| format!("no loaded component declares '{option}' on '{id}'"))?;
+    if !found.1.accepts(value) {
+        return Err(format!(
+            "'{value}' is not a valid {option}: {}",
+            describe_kind(&found.1.kind)
+        ));
+    }
+    s.plugin_config.insert(key.to_string(), value.to_string());
+    Ok(key.to_string())
+}
+
+/// One line describing what an option accepts, for an error a user can act on.
+fn describe_kind(kind: &crate::wasmreg::ConfigKind) -> String {
+    match kind {
+        crate::wasmreg::ConfigKind::Enum(values) => format!("one of {}", values.join(", ")),
+        crate::wasmreg::ConfigKind::Bool => "true or false".to_string(),
+        crate::wasmreg::ConfigKind::Int { min, max } => format!("a number from {min} to {max}"),
+        crate::wasmreg::ConfigKind::Text => "any text".to_string(),
+    }
+}
+
 /// A render-ready row: either a section header or one editable field.
 #[derive(Debug)]
 pub struct Row {
@@ -575,6 +623,23 @@ pub enum Outcome {
     Save(Box<Settings>),
 }
 
+/// One plugin-declared option, as a form row.
+#[derive(Debug)]
+pub struct PluginField {
+    /// Component that declared it.
+    pub id: String,
+    /// The declared option.
+    pub option: crate::wasmreg::ConfigOption,
+}
+
+impl PluginField {
+    /// The settings key this row writes, matching what `render_config` reads.
+    #[must_use]
+    pub fn key(&self) -> String {
+        format!("{}.{}", self.id, self.option.name)
+    }
+}
+
 /// Interactive editor state over a working copy of [`Settings`].
 #[derive(Debug)]
 pub struct ConfigForm {
@@ -582,6 +647,12 @@ pub struct ConfigForm {
     cursor: usize,
     edit: Option<String>,
     status: Option<String>,
+    /// Options plugin components declared, appended after the static fields.
+    ///
+    /// Passed in for the same reason `wasm_faces` is: the form is a pure editor
+    /// over a `Settings` value and has no session to interrogate. Empty is the
+    /// ordinary case and leaves the form exactly as it was.
+    plugin_fields: Vec<PluginField>,
     /// Screensaver faces contributed by plugins, as `<plugin>:<face>`.
     ///
     /// Passed in rather than looked up: the form is a pure editor over a
@@ -602,13 +673,52 @@ impl ConfigForm {
     /// has loaded, so the face field can cycle through them.
     #[must_use]
     pub fn with_faces(current: Settings, wasm_faces: Vec<String>) -> Self {
+        Self::with_contributions(current, wasm_faces, Vec::new())
+    }
+
+    /// [`with_faces`](Self::with_faces) plus the plugin-declared options this
+    /// session loaded, which become rows under a `plugins` section.
+    #[must_use]
+    pub fn with_contributions(
+        current: Settings,
+        wasm_faces: Vec<String>,
+        plugin_fields: Vec<PluginField>,
+    ) -> Self {
         Self {
             working: current,
             cursor: 0,
             edit: None,
             status: None,
             wasm_faces,
+            plugin_fields,
         }
+    }
+
+    /// Total rows the cursor moves over: the static fields then the plugin ones.
+    fn field_count(&self) -> usize {
+        FIELDS.len() + self.plugin_fields.len()
+    }
+
+    /// The plugin field under the cursor, when the cursor is past the static
+    /// fields.
+    fn plugin_field(&self) -> Option<&PluginField> {
+        self.cursor
+            .checked_sub(FIELDS.len())
+            .and_then(|i| self.plugin_fields.get(i))
+    }
+
+    /// The stored value for a plugin row, or its declared default.
+    ///
+    /// Falls back when the stored value has stopped being acceptable, matching
+    /// what a component is actually handed at open time — a form showing a
+    /// value the component would reject would be lying about what is in effect.
+    fn plugin_value(&self, field: &PluginField) -> String {
+        self.working
+            .plugin_config
+            .get(&field.key())
+            .filter(|v| field.option.accepts(v))
+            .cloned()
+            .unwrap_or_else(|| field.option.default.clone())
     }
 
     /// The face field's full cycle: the built-in names, then every contributed
@@ -673,14 +783,42 @@ impl ConfigForm {
             KeyCode::Esc => return Outcome::Save(Box::new(self.working.clone())),
             KeyCode::Up => {
                 self.status = None;
-                self.cursor = self.cursor.checked_sub(1).unwrap_or(FIELDS.len() - 1);
+                self.cursor = self.cursor.checked_sub(1).unwrap_or(self.field_count() - 1);
             }
             KeyCode::Down => {
                 self.status = None;
-                self.cursor = (self.cursor + 1) % FIELDS.len();
+                self.cursor = (self.cursor + 1) % self.field_count();
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
                 self.status = None;
+                // A plugin row before the static dispatch: its behaviour comes
+                // from the component's declaration, not from a `FieldId`.
+                if let Some(pf) = self.plugin_field() {
+                    let (key, kind, current) =
+                        (pf.key(), pf.option.kind.clone(), self.plugin_value(pf));
+                    match kind {
+                        crate::wasmreg::ConfigKind::Enum(values) => {
+                            let next = values
+                                .iter()
+                                .position(|v| *v == current)
+                                .map_or(0, |i| (i + 1) % values.len());
+                            if let Some(v) = values.get(next) {
+                                self.working.plugin_config.insert(key, v.clone());
+                            }
+                        }
+                        crate::wasmreg::ConfigKind::Bool => {
+                            let flipped = if current == "true" { "false" } else { "true" };
+                            self.working.plugin_config.insert(key, flipped.to_string());
+                        }
+                        // Numbers and text open the same inline editor the
+                        // static fields use, so one editing gesture covers both.
+                        crate::wasmreg::ConfigKind::Int { .. }
+                        | crate::wasmreg::ConfigKind::Text => {
+                            self.edit = Some(current);
+                        }
+                    }
+                    return Outcome::Stay;
+                }
                 let field = self.field();
                 match field.kind {
                     // The face field cycles through a list the form owns
@@ -730,6 +868,21 @@ impl ConfigForm {
             KeyCode::Char(c) => buf.push(c),
             KeyCode::Enter => {
                 let raw = buf.clone();
+                // A plugin row validates against the component's own
+                // declaration, which is the only thing that knows the bounds.
+                // Rejecting here rather than at open time means the user finds
+                // out while they are looking at the field.
+                if let Some(pf) = self.plugin_field() {
+                    let (key, name) = (pf.key(), pf.option.name.clone());
+                    if pf.option.accepts(&raw) {
+                        self.working.plugin_config.insert(key, raw);
+                        self.edit = None;
+                        self.status = None;
+                    } else {
+                        self.status = Some(format!("'{raw}' is not a valid {name}"));
+                    }
+                    return Outcome::Stay;
+                }
                 let id = self.field().id;
                 match set_value(&mut self.working, id, &raw) {
                     Ok(()) => {
@@ -775,8 +928,71 @@ impl ConfigForm {
                 editing,
             });
         }
+        // Plugin options last, under one header: they are the only rows whose
+        // existence depends on what is installed, so keeping them together
+        // means the rest of the form does not move when a plugin is added.
+        if !self.plugin_fields.is_empty() {
+            rows.push(Row {
+                header: true,
+                label: "plugins".to_string(),
+                value: String::new(),
+                selected: false,
+                editing: false,
+            });
+            for (i, pf) in self.plugin_fields.iter().enumerate() {
+                let selected = FIELDS.len() + i == self.cursor;
+                let editing = selected && self.edit.is_some();
+                let value = if editing {
+                    self.edit.clone().unwrap_or_default()
+                } else {
+                    self.plugin_value(pf)
+                };
+                rows.push(Row {
+                    header: false,
+                    // Qualified, because two plugins may both declare
+                    // "difficulty" and a bare label would be ambiguous.
+                    label: pf.key(),
+                    value,
+                    selected,
+                    editing,
+                });
+            }
+        }
         rows
     }
+}
+
+/// Appends the plugin-declared options to a `/config` listing.
+///
+/// Separate function because the caller has the declarations and this module
+/// deliberately does not: the form is a pure editor over a `Settings` value.
+/// Without this the options are settable but undiscoverable, which is the same
+/// as not having them.
+#[must_use]
+pub fn render_plugin_list(
+    s: &Settings,
+    declared: &[(String, crate::wasmreg::ConfigOption)],
+) -> String {
+    use std::fmt::Write as _;
+    if declared.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("  [pluginConfig]\n");
+    for (id, option) in declared {
+        let key = format!("{id}.{}", option.name);
+        let value = s
+            .plugin_config
+            .get(&key)
+            .filter(|v| option.accepts(v))
+            .cloned()
+            .unwrap_or_else(|| option.default.clone());
+        let _ = writeln!(
+            out,
+            "    pluginConfig.{key:<28} = {value:<12} {}",
+            describe_kind(&option.kind)
+        );
+    }
+    out
 }
 
 /// Renders the current settings as a plain text table for the REPL `/config`.
@@ -804,6 +1020,224 @@ pub fn render_text_list(s: &Settings) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The textual path both front-ends share: `/config pluginConfig.<id>.<opt>`.
+    #[test]
+    fn set_plugin_option_validates_and_writes() {
+        use crate::wasmreg::{ConfigKind, ConfigOption};
+        let declared = vec![
+            (
+                "dev.plank.demo".to_string(),
+                ConfigOption {
+                    name: "difficulty".to_string(),
+                    kind: ConfigKind::Enum(vec!["easy".into(), "hard".into()]),
+                    default: "easy".to_string(),
+                },
+            ),
+            (
+                "dev.plank.demo".to_string(),
+                ConfigOption {
+                    name: "speed".to_string(),
+                    kind: ConfigKind::Int { min: 1, max: 9 },
+                    default: "4".to_string(),
+                },
+            ),
+        ];
+        let mut s = Settings::default();
+
+        let written = set_plugin_option(
+            &mut s,
+            "pluginConfig.dev.plank.demo.difficulty",
+            "hard",
+            &declared,
+        )
+        .expect("accepted");
+        // The key written must be exactly what `render_config` looks up, or the
+        // setting is stored somewhere nothing reads.
+        assert_eq!(written, "dev.plank.demo.difficulty");
+        assert_eq!(
+            s.plugin_config.get("dev.plank.demo.difficulty"),
+            Some(&"hard".to_string())
+        );
+
+        // An invalid value is refused, and the message says what is acceptable.
+        let err = set_plugin_option(
+            &mut s,
+            "pluginConfig.dev.plank.demo.difficulty",
+            "nightmare",
+            &declared,
+        )
+        .expect_err("refused");
+        assert!(err.contains("one of easy, hard"), "{err}");
+        // ...and the previous value stands.
+        assert_eq!(
+            s.plugin_config.get("dev.plank.demo.difficulty"),
+            Some(&"hard".to_string())
+        );
+
+        let err = set_plugin_option(&mut s, "pluginConfig.dev.plank.demo.speed", "0", &declared)
+            .expect_err("out of range");
+        assert!(err.contains("from 1 to 9"), "{err}");
+
+        // An option nothing declares is named rather than silently stored: a
+        // typo'd key that "works" is a setting the user believes is in effect.
+        let err = set_plugin_option(&mut s, "pluginConfig.dev.plank.demo.nope", "x", &declared)
+            .expect_err("undeclared");
+        assert!(err.contains("no loaded component declares"), "{err}");
+        assert_eq!(s.plugin_config.len(), 1);
+
+        // A component id containing dots still resolves: the split is from the
+        // right, because ids are reverse-DNS and option names are not.
+        assert!(
+            set_plugin_option(&mut s, "pluginConfig.dev.plank.demo.speed", "9", &declared).is_ok()
+        );
+    }
+
+    /// A plugin option becomes a row, cycles on Enter, and lands under the key
+    /// the host reads at open time.
+    #[test]
+    fn plugin_options_become_rows_and_cycle() {
+        use crate::wasmreg::{ConfigKind, ConfigOption};
+        let field = |name: &str, kind: ConfigKind, default: &str| PluginField {
+            id: "dev.plank.demo".to_string(),
+            option: ConfigOption {
+                name: name.to_string(),
+                kind,
+                default: default.to_string(),
+            },
+        };
+        let fields = vec![
+            field(
+                "difficulty",
+                ConfigKind::Enum(vec!["easy".into(), "hard".into()]),
+                "easy",
+            ),
+            field("sound", ConfigKind::Bool, "true"),
+        ];
+        let mut form = ConfigForm::with_contributions(Settings::default(), Vec::new(), fields);
+
+        // Rows: the static fields, then one `plugins` header, then two options
+        // labelled by their full key so two plugins declaring "difficulty" stay
+        // distinguishable.
+        let rows = form.rows();
+        assert!(rows.iter().any(|r| r.header && r.label == "plugins"));
+        let labels: Vec<&str> = rows.iter().map(|r| r.label.as_str()).collect();
+        assert!(labels.contains(&"dev.plank.demo.difficulty"), "{labels:?}");
+        // Shown value is the declared default until the user sets anything.
+        let row = rows
+            .iter()
+            .find(|r| r.label == "dev.plank.demo.difficulty")
+            .unwrap();
+        assert_eq!(row.value, "easy");
+
+        // Move to the first plugin row and cycle it.
+        for _ in 0..FIELDS.len() {
+            form.handle_key(k(KeyCode::Down));
+        }
+        form.handle_key(k(KeyCode::Enter));
+        let saved = &form.working;
+        assert_eq!(
+            saved.plugin_config.get("dev.plank.demo.difficulty"),
+            Some(&"hard".to_string()),
+            "Enter should advance the enum"
+        );
+        // ...and wrap.
+        form.handle_key(k(KeyCode::Enter));
+        assert_eq!(
+            form.working.plugin_config.get("dev.plank.demo.difficulty"),
+            Some(&"easy".to_string())
+        );
+
+        // The bool row toggles.
+        form.handle_key(k(KeyCode::Down));
+        form.handle_key(k(KeyCode::Enter));
+        assert_eq!(
+            form.working.plugin_config.get("dev.plank.demo.sound"),
+            Some(&"false".to_string())
+        );
+    }
+
+    /// An int option edits inline and refuses a value outside its declared
+    /// bounds, while the user is still looking at the field.
+    #[test]
+    fn a_plugin_int_option_validates_against_its_declaration() {
+        use crate::wasmreg::{ConfigKind, ConfigOption};
+        let fields = vec![PluginField {
+            id: "dev.plank.demo".to_string(),
+            option: ConfigOption {
+                name: "speed".to_string(),
+                kind: ConfigKind::Int { min: 1, max: 9 },
+                default: "4".to_string(),
+            },
+        }];
+        let mut form = ConfigForm::with_contributions(Settings::default(), Vec::new(), fields);
+        for _ in 0..FIELDS.len() {
+            form.handle_key(k(KeyCode::Down));
+        }
+        // Enter opens the editor seeded with the current value.
+        form.handle_key(k(KeyCode::Enter));
+        assert!(form.editing());
+        for _ in 0..3 {
+            form.handle_key(k(KeyCode::Backspace));
+        }
+        for c in "99".chars() {
+            form.handle_key(k(KeyCode::Char(c)));
+        }
+        form.handle_key(k(KeyCode::Enter));
+        // Refused: still editing, with a reason, and nothing written.
+        assert!(form.editing(), "an out-of-range value must not commit");
+        assert!(form.working.plugin_config.is_empty());
+
+        for _ in 0..2 {
+            form.handle_key(k(KeyCode::Backspace));
+        }
+        form.handle_key(k(KeyCode::Char('7')));
+        form.handle_key(k(KeyCode::Enter));
+        assert!(!form.editing());
+        assert_eq!(
+            form.working.plugin_config.get("dev.plank.demo.speed"),
+            Some(&"7".to_string())
+        );
+    }
+
+    /// A stored value that has stopped being acceptable displays as the
+    /// default, because that is what the component will actually be handed.
+    #[test]
+    fn a_stale_plugin_value_displays_as_the_default() {
+        use crate::wasmreg::{ConfigKind, ConfigOption};
+        let mut settings = Settings::default();
+        settings.plugin_config.insert(
+            "dev.plank.demo.difficulty".to_string(),
+            "nightmare".to_string(),
+        );
+        let fields = vec![PluginField {
+            id: "dev.plank.demo".to_string(),
+            option: ConfigOption {
+                name: "difficulty".to_string(),
+                kind: ConfigKind::Enum(vec!["easy".into(), "hard".into()]),
+                default: "hard".to_string(),
+            },
+        }];
+        let form = ConfigForm::with_contributions(settings, Vec::new(), fields);
+        let row = form
+            .rows()
+            .into_iter()
+            .find(|r| r.label == "dev.plank.demo.difficulty")
+            .unwrap();
+        assert_eq!(
+            row.value, "hard",
+            "the form must show what is in effect, not a value the component would reject"
+        );
+    }
+
+    /// With no plugins the form is exactly what it was: no header, no rows.
+    #[test]
+    fn no_plugins_means_no_plugin_section() {
+        let form = ConfigForm::new(Settings::default());
+        let rows = form.rows();
+        assert!(!rows.iter().any(|r| r.header && r.label == "plugins"));
+        assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
+    }
     use super::*;
     use ratatui::crossterm::event::{KeyEvent, KeyModifiers};
 
