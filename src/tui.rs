@@ -1906,10 +1906,18 @@ fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &crate::slashmenu::Sla
             } else {
                 format!("{} · {tag}", e.desc)
             };
+            // Yellow marks a plugin-contributed command. The `wasm` tag says
+            // the same thing, but it sits at the end of the line and is the
+            // first thing elided on a narrow terminal — the colour survives.
+            let name_color = if e.source.is_plugin() {
+                Color::Yellow
+            } else {
+                THEME_GREEN
+            };
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<cmd_w$}", elide_right(label, cmd_w)),
-                    Style::default().fg(THEME_GREEN),
+                    Style::default().fg(name_color),
                 ),
                 Span::raw("  "),
                 Span::styled(
