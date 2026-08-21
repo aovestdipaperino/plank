@@ -12,7 +12,7 @@ rust-version = "1.93"
 exclude = ["assets/*", "refs/ds4/*", "refs/obscura/*", "refs/edit/*", "*.gguf", "ds4flash.gguf", "spike/*", "guests/*"]
 
 [features]
-default = ["use_obscura", "builtin_editor", "docparse", "images"]
+default = ["use_obscura", "builtin_editor", "docparse", "images", "plugins"]
 # Image pasting (Cmd-V clipboard images, image file paths). This was off while
 # the model had no way to act on an image-file reference — the attachment named
 # a path and nothing could read it. The `ocr-mcp` MCP server closes that gap
@@ -40,13 +40,17 @@ builtin_editor = ["dep:edit", "dep:stdext"]
 # build of libtesseract; disable with `--no-default-features` to get the old
 # behaviour (a PDF reads as bytes).
 docparse = ["dep:liteparse", "dep:tokio"]
-# WASM plugins (docs/WASM-PLUGINS.md), off by default and feasibility-stage.
-# Brings in Extism, and through it wasmtime's cranelift backend — the heaviest
-# dependency in the tree by a wide margin — so the default build stays free of
-# it and CI's default path never compiles it. Everything behind this flag sits
-# under the `WasmHost` trait, whose no-op implementation is what the rest of
-# plank talks to when the feature is off: the same shape as `Engine`/
-# `EchoEngine`, and for the same reason.
+# WASM plugins (docs/WASM-PLUGINS.md and WASM-PLUGIN-AUTHORING.md). **On by
+# default**, which is a deliberate reversal: the system was built behind this
+# flag while it was feasibility-stage, and a plugin nobody can run without
+# rebuilding plank is not a plugin system.
+#
+# It costs ~18 MB of binary — Extism, and through it wasmtime's cranelift
+# backend, the heaviest dependency in the tree by a wide margin. Build with
+# `--no-default-features` (plus whichever others you want) to get the lean
+# binary back. Everything behind this flag sits under the `WasmHost` trait,
+# whose no-op implementation is what the rest of plank talks to when the feature
+# is off: the same shape as `Engine`/`EchoEngine`, and for the same reason.
 plugins = ["dep:extism"]
 
 [dependencies]

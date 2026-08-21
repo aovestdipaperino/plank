@@ -1,7 +1,11 @@
 # WASM plugins
 
-> Status: **implemented and shipping**, behind the `plugins` Cargo feature
-> (off by default, at +18 MiB). Merged to `main` on 2026-08-19. This document
+> Status: **implemented and shipping, on by default** as of 2026-08-21. Merged
+> to `main` on 2026-08-19 behind the `plugins` Cargo feature, which was turned on
+> once the system stopped being feasibility-stage: a plugin nobody can run
+> without rebuilding plank is not a plugin system. It costs 18 MiB (134 → 152
+> MiB measured); `--no-default-features` still gets the lean binary, and CI
+> guards that configuration because it is now the one that can rot unnoticed. This document
 > describes the plugin system, the surfaces a plugin may claim, the events it may
 > observe, and how plugins are packaged, versioned and trusted — and it records
 > the reasoning, including for the parts that were deliberately cut.
@@ -178,14 +182,14 @@ compaction pair), and the `notify`/`agent`/`session`/`sound` capabilities.
 
 ## Feasibility spike (landed)
 
-`src/wasmhost.rs` behind the `plugins` feature (off by default), plus a guest in
+`src/wasmhost.rs` behind the `plugins` feature (on by default since 2026-08-21), plus a guest in
 `spike/abi-guest` and `tests/wasm_spike.rs`. It answers the four questions that
 could have killed the design:
 
 | Question | Answer |
 |---|---|
 | Does a JIT survive plank's release flow? | Not a question. `release.yml` signs nothing and notarizes nothing, so there is no hardened-runtime entitlement to fight |
-| What does the runtime cost in binary size? | **+18.0 MiB** (141.1 → 159.9 MB). Enough to keep the feature off by default forever; not enough to reconsider the runtime |
+| What does the runtime cost in binary size? | **+18 MiB** — 141.1 → 159.9 MB when first measured, 134 → 152 MiB today. Kept the feature off through the feasibility stage; not enough to reconsider the runtime, and as of 2026-08-21 not enough to keep it off either |
 | Does the ABI handshake work? | Yes. A guest asserts `plank_abi`, and a module that cannot is refused at load with the ABI named as the reason |
 | Does a runaway guest stay contained? | Yes. An infinite loop is stopped by the host deadline and surfaces as `WasmError::Trap`; a fresh plugin loads and answers afterwards |
 

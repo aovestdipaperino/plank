@@ -21,6 +21,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # The default build includes `plugins` now, so this job compiles the
+          # WASM host and the guest-backed tests. Without the cross target the
+          # guests below cannot be built and those tests would silently skip.
+          targets: wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@v2
 
@@ -64,22 +68,43 @@ jobs:
             cargo clean -p liteparse-pdfium-sys --release || true
           fi
 
+      # Before the test step: the guest-backed suite skips when the artifacts
+      # are absent, so building them late would leave a green job that ran
+      # nothing. `PLANK_REQUIRE_GUESTS` turns that skip into a failure so the
+      # ordering cannot silently regress.
+      - name: Build WASM guests
+        run: |
+          sh spike/build-guest.sh
+          sh guests/build.sh
+
+      - name: Test the shared guest crate
+        run: cargo test --manifest-path guests/support/Cargo.toml
+
+      - name: Package plugin archives
+        run: sh guests/package.sh
+
+      - name: Verify the guests rebuild to the same bytes
+        run: |
+          cp guests/dist/SHA256SUMS /tmp/guest-sums
+          sh guests/verify.sh /tmp/guest-sums
+
       - name: Build
         run: cargo build --release --verbose
 
       - name: Test
+        env:
+          PLANK_REQUIRE_GUESTS: "1"
         run: cargo test --release --verbose
 
-  # The `plugins` feature was entirely unbuilt by CI: the default job compiles
-  # no wasmtime, so every Extism call site and all 31 integration tests were
-  # verified only on whichever laptop last remembered to run them. This job is
-  # what makes the plugin system continuously verified.
+  # `plugins` is on by default now, so the default job above covers it. This
+  # job guards the other direction: the lean build, without the WASM host. That
+  # configuration is the one that can rot unnoticed — every `#[cfg(feature =
+  # "plugins")]` boundary and the no-op `WasmHost` only compile here.
   #
-  # Deliberately not `--release`: the point is to compile the feature and run
-  # the guest-backed tests, and a debug wasmtime builds in a fraction of the
-  # time. The default job already covers the release profile.
-  plugins:
-    name: Build & test (plugins feature)
+  # Not `--no-default-features` alone, which would also drop the editor, doc
+  # parsing and images and test a build nobody ships. Everything except plugins.
+  lean:
+    name: Build & test (no plugins)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -89,21 +114,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          # The guests are cross-compiled; without this target
-          # `spike/build-guest.sh` fails and the tests below would silently
-          # have nothing to run.
-          targets: wasm32-unknown-unknown
 
-      # A distinct prefix: this job's target/ holds a debug build with wasmtime
-      # in it, which has nothing in common with the default job's release
-      # artifacts. Sharing one cache key would have them evicting each other.
       - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: plugins
+          prefix-key: lean
 
-      # Same reasoning as the default job's pdfium cache: the build script
-      # bakes an absolute path into the binary, so a restored target/ with a
-      # missing cache dir dies in dlopen.
       - name: Cache pdfium binaries
         uses: actions/cache@v4
         with:
@@ -117,43 +132,12 @@ jobs:
             cargo clean -p liteparse-pdfium-sys || true
           fi
 
-      # Before the test step, not after: the suite skips when the artifacts are
-      # absent, so building them late would leave a green job that ran nothing.
-      # `PLANK_REQUIRE_GUESTS` below turns that skip into a failure so the
-      # ordering cannot silently regress.
-      - name: Build WASM guests
+      - name: Clippy (no plugins)
         run: |
-          sh spike/build-guest.sh
-          sh guests/build.sh
+          cargo clippy --all-targets --no-default-features \
+            --features use_obscura,builtin_editor,docparse,images -- -D warnings
 
-      # The shared guest crate has the only tests that pin the RNG sequence and
-      # the glyph wire format, and it is a separate crate targeting the host, so
-      # the workspace's own `cargo test` never reaches it.
-      - name: Test the shared guest crate
-        run: cargo test --manifest-path guests/support/Cargo.toml
-
-      # Packaging is verified here rather than only at release time: it is the
-      # step that turns a `.wasm` into something installable, and the plugin
-      # manifests it copies are the only thing standing between a release and a
-      # plugin whose component silently never appears. It also produces the
-      # artifact `the_real_packaged_artifact_installs` consumes.
-      - name: Package plugin archives
-        run: sh guests/package.sh
-
-      # The trust store keys on a module's SHA-256, so a published artifact
-      # nobody can independently reproduce makes that hash an assertion rather
-      # than a check. The modules are byte-reproducible on a given toolchain,
-      # from any build directory, and this is what keeps that true rather than
-      # assumed: a clean rebuild must land on the same bytes.
-      - name: Verify the guests rebuild to the same bytes
+      - name: Test (no plugins)
         run: |
-          cp guests/dist/SHA256SUMS /tmp/guest-sums
-          sh guests/verify.sh /tmp/guest-sums
-
-      - name: Clippy (plugins)
-        run: cargo clippy --all-targets --features plugins -- -D warnings
-
-      - name: Test (plugins)
-        env:
-          PLANK_REQUIRE_GUESTS: "1"
-        run: cargo test --features plugins --verbose
+          cargo test --no-default-features \
+            --features use_obscura,builtin_editor,docparse,images --verbose
