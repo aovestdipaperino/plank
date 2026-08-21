@@ -2470,6 +2470,18 @@ impl Registry {
     ///
     /// A trap costs a strike and becomes a warning. It never propagates: an
     /// observer that breaks must not take the turn with it.
+    /// True when any live component subscribes to `kind`.
+    ///
+    /// Lets a firing site skip building a payload nobody will read. Most
+    /// sessions have no observers at all, and the notify-class events fire on
+    /// every turn.
+    #[must_use]
+    pub fn has_subscriber(&self, kind: crate::wasmevents::EventKind) -> bool {
+        self.loaded
+            .iter()
+            .any(|l| l.strikes < STRIKE_LIMIT && l.component.manifest.events.contains(&kind))
+    }
+
     pub fn dispatch(
         &mut self,
         host: &mut dyn crate::wasmhost::WasmHost,

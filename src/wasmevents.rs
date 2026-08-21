@@ -56,6 +56,19 @@ pub enum EventKind {
     PostToolUse,
     /// A turn ended. Notify.
     TurnEnd,
+    /// A turn is about to start. Notify.
+    ///
+    /// Notify rather than veto deliberately: `user_prompt_submit` already owns
+    /// refusing a turn, and two events that can both stop one would make
+    /// "why did nothing happen" ambiguous.
+    TurnStart,
+    /// The session is ending. Notify. Terminal — nothing a component returns
+    /// can change an exit that has already been decided.
+    SessionEnd,
+    /// Compaction is about to run. Notify.
+    PreCompact,
+    /// Compaction finished. Notify.
+    PostCompact,
 }
 
 /// What a return value means for a given event.
@@ -79,6 +92,10 @@ impl EventKind {
             "pre_tool_use" => Self::PreToolUse,
             "post_tool_use" => Self::PostToolUse,
             "turn_end" => Self::TurnEnd,
+            "turn_start" => Self::TurnStart,
+            "session_end" => Self::SessionEnd,
+            "pre_compact" => Self::PreCompact,
+            "post_compact" => Self::PostCompact,
             _ => return None,
         })
     }
@@ -92,6 +109,10 @@ impl EventKind {
             Self::PreToolUse => "pre_tool_use",
             Self::PostToolUse => "post_tool_use",
             Self::TurnEnd => "turn_end",
+            Self::TurnStart => "turn_start",
+            Self::SessionEnd => "session_end",
+            Self::PreCompact => "pre_compact",
+            Self::PostCompact => "post_compact",
         }
     }
 
@@ -99,7 +120,12 @@ impl EventKind {
     #[must_use]
     pub fn class(self) -> Class {
         match self {
-            Self::SessionStart | Self::TurnEnd => Class::Notify,
+            Self::SessionStart
+            | Self::TurnEnd
+            | Self::TurnStart
+            | Self::SessionEnd
+            | Self::PreCompact
+            | Self::PostCompact => Class::Notify,
             Self::PreToolUse => Class::Veto,
             Self::UserPromptSubmit | Self::PostToolUse => Class::Transform,
         }
@@ -261,6 +287,25 @@ fn json_string(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The four events added later are notify-only. `user_prompt_submit`
+    /// already owns refusing a turn; a second event that could also stop one
+    /// would make "why did nothing happen" ambiguous.
+    #[test]
+    fn the_later_events_cannot_veto() {
+        for kind in [
+            EventKind::TurnStart,
+            EventKind::SessionEnd,
+            EventKind::PreCompact,
+            EventKind::PostCompact,
+        ] {
+            assert_eq!(kind.class(), Class::Notify, "{}", kind.label());
+        }
+        // And the exhaustiveness guard is exercised rather than merely defined.
+        for kind in ALL {
+            all_is_exhaustive(kind);
+        }
+    }
     use super::*;
 
     #[test]
@@ -321,6 +366,40 @@ mod tests {
         assert_eq!(transform.replace.as_deref(), Some("x"));
     }
 
+    /// Every event kind, kept exhaustive by the match below: adding a variant
+    /// without adding it here stops compiling, which is what keeps the three
+    /// tests using this list from silently going stale. An event that is not in
+    /// this list is one nothing checks.
+    const ALL: [EventKind; 9] = [
+        EventKind::SessionStart,
+        EventKind::UserPromptSubmit,
+        EventKind::PreToolUse,
+        EventKind::PostToolUse,
+        EventKind::TurnEnd,
+        EventKind::TurnStart,
+        EventKind::SessionEnd,
+        EventKind::PreCompact,
+        EventKind::PostCompact,
+    ];
+
+    /// Fails to compile if a variant is added without joining [`ALL`].
+    #[allow(dead_code)]
+    fn all_is_exhaustive(kind: EventKind) {
+        match kind {
+            EventKind::SessionStart
+            | EventKind::UserPromptSubmit
+            | EventKind::PreToolUse
+            | EventKind::PostToolUse
+            | EventKind::TurnEnd
+            | EventKind::TurnStart
+            | EventKind::SessionEnd
+            | EventKind::PreCompact
+            | EventKind::PostCompact => {
+                assert!(ALL.contains(&kind), "{} is missing from ALL", kind.label());
+            }
+        }
+    }
+
     /// Every event the enum names must have a firing site, or it is a promise
     /// rather than a feature — and a subscriber to it looks broken, not
     /// unimplemented. This is a source check because there is no runtime
@@ -330,16 +409,14 @@ mod tests {
     /// `session_start`, `user_prompt_submit` and `turn_end` shipped defined but
     /// unfired, behind `if hooks.is_empty() { return }` guards that predate
     /// components entirely. This is the test that would have caught it.
+    ///
+    /// The same trap was live again for `session_end`, whose shell-hook
+    /// function returns early when no shell hook exists; the WASM dispatch goes
+    /// *before* that guard for exactly this reason.
     #[test]
     fn every_event_kind_has_a_firing_site() {
         let sources = [include_str!("ui.rs"), include_str!("tools/mod.rs")].concat();
-        for kind in [
-            EventKind::SessionStart,
-            EventKind::UserPromptSubmit,
-            EventKind::PreToolUse,
-            EventKind::PostToolUse,
-            EventKind::TurnEnd,
-        ] {
+        for kind in ALL {
             // The variant is named at a dispatch site, not merely in a match
             // arm here: `EventKind::X` appearing in ui.rs or tools/mod.rs means
             // something builds that event.
@@ -354,13 +431,7 @@ mod tests {
 
     #[test]
     fn every_event_kind_round_trips_its_spelling_and_knows_its_class() {
-        for kind in [
-            EventKind::SessionStart,
-            EventKind::UserPromptSubmit,
-            EventKind::PreToolUse,
-            EventKind::PostToolUse,
-            EventKind::TurnEnd,
-        ] {
+        for kind in ALL {
             assert_eq!(EventKind::parse(kind.label()), Some(kind));
             // Only transform events name a field, and every one that does must.
             assert_eq!(

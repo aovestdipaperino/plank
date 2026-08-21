@@ -255,12 +255,21 @@ section, or with `/config pluginConfig.<id>.<option> <value>`.
 
 ## Events
 
-Implemented: `session_start`, `user_prompt_submit`, `pre_tool_use`,
-`post_tool_use`, `turn_end`.
+Implemented: `session_start`, `turn_start`, `user_prompt_submit`,
+`pre_tool_use`, `post_tool_use`, `turn_end`, `pre_compact`, `post_compact`,
+`session_end`.
+
+`user_prompt_submit` and `post_tool_use` are *transform* (return a replacement
+and it is used), `pre_tool_use` is *veto* (block with a reason, which the model
+sees as the tool's error), and the rest are notify-only — their replies are
+ignored. `turn_start` is deliberately notify: `user_prompt_submit` already owns
+refusing a turn, and two events that could both stop one would make "why did
+nothing happen" ambiguous.
 
 The design lists around twenty. The rest are not wired, and subscribing to one
 warns rather than silently never firing. If you need one, that is the argument
-for adding it — an event nothing fires is a promise.
+for adding it — an event nothing fires is a promise, and plank has shipped
+three of those by accident.
 
 ## Packaging, signing, installing
 

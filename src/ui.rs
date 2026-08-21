@@ -2222,6 +2222,10 @@ impl Agent<'_> {
         // One clock for the whole turn: elapsed time accumulates across the
         // generate → tools → generate loop instead of restarting per pass.
         let turn_start = Instant::now();
+        // Notify-only: `user_prompt_submit` already owns refusing a turn, and
+        // two events that can both stop one would make "why did nothing happen"
+        // ambiguous.
+        self.fire_notify_event(crate::wasmevents::EventKind::TurnStart, Vec::new());
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
@@ -2661,13 +2665,31 @@ impl Agent<'_> {
     /// already drains, rather than being written here: the turn is over and the
     /// front end owns the screen again.
     fn fire_turn_end(&mut self, generated: i32, elapsed: std::time::Duration) {
-        let event = crate::wasmevents::Event::new(
+        self.fire_notify_event(
             crate::wasmevents::EventKind::TurnEnd,
             vec![
                 ("generated", generated.to_string()),
                 ("wall_ms", elapsed.as_millis().to_string()),
             ],
         );
+    }
+
+    /// Dispatches one notify-class WASM event.
+    ///
+    /// Shared by every event whose reply cannot change anything: four of them
+    /// would otherwise be the same six lines, and the copy that drifts is the
+    /// one that forgets to drain a subscriber's output.
+    fn fire_notify_event(
+        &mut self,
+        kind: crate::wasmevents::EventKind,
+        fields: Vec<(&str, String)>,
+    ) {
+        // Cheap guard: dispatch walks the subscriber list, and the common case
+        // is a session with no observers at all.
+        if !self.tool_ctx.wasm.registry.has_subscriber(kind) {
+            return;
+        }
+        let event = crate::wasmevents::Event::new(kind, fields);
         let wasm = &mut self.tool_ctx.wasm;
         let out = wasm.registry.dispatch(&mut *wasm.host, &event);
         self.tool_ctx.hook_warnings.extend(out.printed);
@@ -2677,6 +2699,12 @@ impl Agent<'_> {
     /// Fires the `SessionEnd` hooks with the exit `reason`. Terminal event: no
     /// context is injected, only user-visible warnings are surfaced.
     fn fire_session_end(&mut self, reason: &str, warn: &mut dyn FnMut(String)) {
+        // Before the early return below: that guard is about shell hooks, and a
+        // WASM subscriber must not be skipped because no shell hook exists.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::SessionEnd,
+            vec![("reason", reason.to_string())],
+        );
         if self.tool_ctx.hooks.session_end.is_empty() {
             return;
         }
@@ -2850,6 +2878,15 @@ impl Agent<'_> {
     /// is appended after the rebuilt transcript. See [`Agent::fire_pre_compact`]
     /// for why this is shared.
     fn fire_post_compact(&mut self, trigger: &str, summary: &str, note: &mut dyn FnMut(String)) {
+        // Dispatched here rather than at each call site: compaction runs from
+        // two front-ends, and a second call site is the one that gets forgotten.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::PostCompact,
+            vec![
+                ("trigger", trigger.to_string()),
+                ("summary_chars", summary.len().to_string()),
+            ],
+        );
         if self.tool_ctx.hooks.post_compact.is_empty() {
             return;
         }
@@ -2882,6 +2919,12 @@ impl Agent<'_> {
         let _title = crate::title::Scoped::set(crate::title::State::Compacting);
         let trigger = Self::compact_trigger(reason);
         self.fire_pre_compact(trigger, &mut |w| println!("{w}"));
+        // Beside the shell hook rather than instead of it: the two extension
+        // mechanisms are peers, and a component should see what a hook sees.
+        self.fire_notify_event(
+            crate::wasmevents::EventKind::PreCompact,
+            vec![("trigger", trigger.to_string())],
+        );
         let mut prompt_text = render_transcript(&self.session, &self.system);
         {
             use std::fmt::Write as _;
