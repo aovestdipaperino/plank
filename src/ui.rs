@@ -5727,6 +5727,55 @@ the original is frozen and listed in /tree"
     /// rather than a startup prompt: a modal question before the first turn is
     /// exactly the wrong moment to ask, and a component the user never uses
     /// should never have to be answered for at all.
+    /// `/plugins info|disable|enable|reload`: the subcommands that read or
+    /// write the trust store.
+    ///
+    /// Split from [`plugins_command`](Self::plugins_command) because they share
+    /// the home lookup and the store load, and because together they pushed
+    /// that function past the length lint.
+    fn plugins_trust_command(&mut self, verb: &str, arg: Option<&str>) -> String {
+        if verb == "reload" {
+            // Refused rather than half-implemented. A `tool` component's
+            // schemas are in the fingerprinted system prompt, so reloading one
+            // mid-session changes the prompt and invalidates the Tier 1 KV
+            // checkpoint; a reload that silently skipped tool components would
+            // be a command that works differently depending on what the plugin
+            // happens to contribute.
+            return "reload is not supported: a tool component's schemas are part of the \
+                    fingerprinted system prompt, so replacing them mid-session would \
+                    invalidate the KV checkpoint\nrestart plank to pick up changed \
+                    components\n"
+                .to_string();
+        }
+        let Some(id) = arg else {
+            return format!("usage: /plugins {verb} <component-id>\n");
+        };
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return "no HOME, so there is no trust store\n".to_string();
+        };
+        let plank_home = home.join(".plank");
+        if verb == "info" {
+            let trust = crate::wasmreg::TrustStore::load(&plank_home);
+            return match self.tool_ctx.wasm.registry.describe(id, &trust) {
+                Some(text) => text,
+                None => format!("no wasm component '{id}'\n"),
+            };
+        }
+        let off = verb == "disable";
+        let mut trust = crate::wasmreg::TrustStore::load(&plank_home);
+        match trust.set_disabled(id, off) {
+            // Deliberately effective next start rather than now: unloading a
+            // live component would take its tools out of the system prompt
+            // mid-session, which invalidates the Tier 1 KV checkpoint — the
+            // same reason `reload` refuses above.
+            Ok(()) => format!(
+                "{} '{id}'; it takes effect on the next start\n",
+                if off { "disabled" } else { "enabled" }
+            ),
+            Err(e) => format!("{e}\n"),
+        }
+    }
+
     fn plugins_command(&mut self, arg: &str) -> String {
         let mut words = arg.split_whitespace();
         match (words.next(), words.next()) {
@@ -5832,6 +5881,12 @@ the original is frozen and listed in /tree"
                     }
                     out
                 }
+            }
+            // The trust-store subcommands live in their own function: they
+            // share a home-directory lookup and a store load, and together they
+            // pushed `plugins_command` past the function-length lint.
+            (Some(verb @ ("info" | "disable" | "enable" | "reload")), rest) => {
+                self.plugins_trust_command(verb, rest)
             }
             (Some(other), _) => format!("unknown /plugins subcommand: {other}\n"),
             (None, _) => {

@@ -641,8 +641,12 @@ This mirrors the hierarchical `.mcp.json` resolution already in `tools/mcp.rs`,
 so users learn one precedence rule rather than two.
 
 **Management** is `/plugins`: bare to list with surfaces, capabilities and
-what is awaiting approval; `install <dir>` to copy a plugin into the user's
-plugin directory; `remove <name>` to delete it; `trust <id>` to approve a
+what is awaiting approval; `info <id>` for one component's full picture
+(surfaces, grants with unwired ones marked, strikes, hash and signature);
+`disable`/`enable <id>` to switch one off without forgetting its approval —
+re-enabling something you turned off should not re-prompt for capabilities you
+already read; `install <dir|url>` to copy a plugin into the user's plugin
+directory; `remove <name>` to delete it; `trust <id>` to approve a
 component.
 
 Install copies rather than links, because a plugin that changed under a

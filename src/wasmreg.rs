@@ -873,6 +873,11 @@ pub enum Decision {
     /// prompted: every other verdict means "we do not know about this", and
     /// this one means someone changed bytes that were signed.
     BadSignature(String),
+    /// The user switched it off with `/plugins disable`. Not a trust verdict at
+    /// all, but it lands in the same list because "why is this not running" has
+    /// one answer per component and a user does not care which mechanism
+    /// withheld it.
+    Disabled,
 }
 
 impl Decision {
@@ -900,6 +905,7 @@ impl Decision {
                 "it is project-local and this project has not approved it".to_string()
             }
             Self::BadSignature(why) => format!("its signature did not verify: {why}"),
+            Self::Disabled => "it is disabled (/plugins enable to switch it back on)".to_string(),
         }
     }
 }
@@ -914,6 +920,8 @@ pub struct TrustStore {
     /// the per-component entries rather than inside them: a key is trusted for
     /// everything it signs, which is the whole point of having one.
     publishers: BTreeMap<String, String>,
+    /// Component ids the user switched off.
+    disabled: std::collections::BTreeSet<String>,
 }
 
 impl TrustStore {
@@ -929,6 +937,7 @@ impl TrustStore {
             path: Some(path.clone()),
             entries: BTreeMap::new(),
             publishers: BTreeMap::new(),
+            disabled: std::collections::BTreeSet::new(),
         };
         let Ok(text) = std::fs::read_to_string(&path) else {
             return store;
@@ -937,6 +946,16 @@ impl TrustStore {
             return store;
         };
         for (id, value) in top {
+            if id == "@disabled" {
+                if let Json::Arr(ids) = &value {
+                    for entry in ids {
+                        if let Json::Str(entry) = entry {
+                            store.disabled.insert(entry.clone());
+                        }
+                    }
+                }
+                continue;
+            }
             if id == "@publishers" {
                 if let Json::Obj(keys) = &value {
                     for (key_id, encoded) in keys {
@@ -1010,6 +1029,33 @@ impl TrustStore {
     #[must_use]
     pub fn publishers(&self) -> &BTreeMap<String, String> {
         &self.publishers
+    }
+
+    /// Ids the user disabled. Kept in the trust file rather than a new one
+    /// because "should this run" and "may this run" are the same question asked
+    /// twice, and a second file is a second thing to find when a component
+    /// mysteriously does nothing.
+    #[must_use]
+    pub fn disabled(&self) -> &std::collections::BTreeSet<String> {
+        &self.disabled
+    }
+
+    /// Disables or re-enables a component by id.
+    ///
+    /// Disabling is deliberately *not* forgetting the approval: re-enabling
+    /// something you disabled should not re-prompt for capabilities you already
+    /// looked at, and the alternative — uninstalling — is a different act with a
+    /// different cost.
+    ///
+    /// # Errors
+    /// Returns the IO error message when the store cannot be written.
+    pub fn set_disabled(&mut self, id: &str, off: bool) -> Result<(), String> {
+        if off {
+            self.disabled.insert(id.to_string());
+        } else {
+            self.disabled.remove(id);
+        }
+        self.persist()
     }
 
     /// Records a publisher key, so signatures from it count from now on.
@@ -1137,22 +1183,28 @@ impl TrustStore {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let mut out = String::from("{\n");
-        // Under a reserved key rather than a second file: one file a user can
-        // read, edit or delete. `@publishers` cannot collide with a component
-        // id, which is reverse-DNS and never starts with `@`.
+        // Every member is built into a list and joined once. The first version
+        // appended `",\n"` after each reserved key on the assumption that a
+        // component entry always followed, so a store holding only publishers
+        // or only disabled ids wrote a trailing comma — invalid JSON, which
+        // `load` then discarded silently, losing the very choice just recorded.
+        let mut members: Vec<String> = Vec::new();
+        // Under reserved keys rather than separate files: one file a user can
+        // read, edit or delete. `@`-prefixed cannot collide with a component id,
+        // which is reverse-DNS.
         if !self.publishers.is_empty() {
             let keys: Vec<String> = self
                 .publishers
                 .iter()
                 .map(|(id, encoded)| format!("    {}: {}", json_str(id), json_str(encoded)))
                 .collect();
-            let _ = write!(out, "  \"@publishers\": {{\n{}\n  }},\n", keys.join(",\n"));
+            members.push(format!("  \"@publishers\": {{\n{}\n  }}", keys.join(",\n")));
         }
-        for (i, (id, e)) in self.entries.iter().enumerate() {
-            if i > 0 {
-                out.push_str(",\n");
-            }
+        if !self.disabled.is_empty() {
+            let ids: Vec<String> = self.disabled.iter().map(|i| json_str(i)).collect();
+            members.push(format!("  \"@disabled\": [{}]", ids.join(", ")));
+        }
+        for (id, e) in &self.entries {
             let granted: Vec<String> = e
                 .granted
                 .iter()
@@ -1169,8 +1221,9 @@ impl TrustStore {
             let publisher = e.publisher.as_ref().map_or_else(String::new, |p| {
                 format!(",\n    \"publisher\": {}", json_str(p))
             });
+            let mut entry = String::new();
             let _ = write!(
-                out,
+                entry,
                 "  {}: {{\n    \"sha256\": {},\n    \"granted\": [{}],\n    \"projects\": [{}]{}\n  }}",
                 json_str(id),
                 json_str(&e.sha256),
@@ -1178,8 +1231,9 @@ impl TrustStore {
                 projects.join(", "),
                 publisher,
             );
+            members.push(entry);
         }
-        out.push_str("\n}\n");
+        let out = format!("{{\n{}\n}}\n", members.join(",\n"));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
@@ -1919,6 +1973,99 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// One component's full picture: surfaces, grants, strikes, hash and
+    /// signature. `None` when nothing by that id is loaded or held.
+    ///
+    /// Every other listing is a summary. When a component misbehaves the
+    /// question is "what is this thing allowed to do, and are these the bytes I
+    /// approved", and answering it should not mean reading two files by hand.
+    #[must_use]
+    pub fn describe(&self, id: &str, trust: &TrustStore) -> Option<String> {
+        use std::fmt::Write as _;
+        let (component, strikes, held_reason) = self
+            .loaded
+            .iter()
+            .find(|l| l.component.manifest.id == id)
+            .map(|l| (&l.component, Some(l.strikes), None))
+            .or_else(|| {
+                self.held
+                    .iter()
+                    .find(|(c, _)| c.manifest.id == id)
+                    .map(|(c, d)| (c, None, Some(d.reason())))
+            })?;
+        let m = &component.manifest;
+        let mut out = String::new();
+        let _ = writeln!(out, "{} (plugin '{}')", m.id, component.plugin);
+        let _ = writeln!(out, "  origin       {}", component.origin.label());
+        let _ = writeln!(out, "  module       {}", component.path.display());
+        let _ = writeln!(out, "  abi          {}", m.abi);
+        let surfaces: Vec<&str> = m.surfaces.iter().map(|s| s.label()).collect();
+        let _ = writeln!(out, "  surfaces     {}", surfaces.join(", "));
+        // Grants are the line a user actually audits, so an unwired one is
+        // marked rather than listed as if it did something.
+        let caps: Vec<String> = m
+            .capabilities
+            .iter()
+            .map(|c| {
+                if c.is_wired() {
+                    c.label().to_string()
+                } else {
+                    format!("{} (not wired)", c.label())
+                }
+            })
+            .collect();
+        let _ = writeln!(out, "  capabilities {}", caps.join(", "));
+        if !m.config.is_empty() {
+            let opts: Vec<&str> = m.config.iter().map(|c| c.name.as_str()).collect();
+            let _ = writeln!(out, "  config       {}", opts.join(", "));
+        }
+        match strikes {
+            // Named even at zero: "how close is this to being disabled" is the
+            // question, and a missing line reads as "no such concept".
+            Some(n) => {
+                let _ = writeln!(out, "  strikes      {n} of {STRIKE_LIMIT}");
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "  status       held — {}",
+                    held_reason.unwrap_or_default()
+                );
+            }
+        }
+        match module_sha256(&component.path) {
+            Some(sha) => {
+                let approved = trust.entry(id).is_some_and(|e| e.sha256 == sha);
+                let _ = writeln!(
+                    out,
+                    "  sha256       {sha}{}",
+                    if approved { " (approved)" } else { "" }
+                );
+            }
+            None => {
+                let _ = writeln!(out, "  sha256       unreadable");
+            }
+        }
+        match signature_status(&component.path, trust) {
+            SigStatus::Absent => {
+                let _ = writeln!(out, "  signature    none");
+            }
+            SigStatus::Valid(who) => {
+                let _ = writeln!(out, "  signature    valid, publisher {who}");
+            }
+            SigStatus::UnknownKey(who) => {
+                let _ = writeln!(out, "  signature    from unknown key {who}");
+            }
+            SigStatus::Invalid(why) => {
+                let _ = writeln!(out, "  signature    INVALID — {why}");
+            }
+        }
+        if let Some(publisher) = trust.entry(id).and_then(|e| e.publisher.as_deref()) {
+            let _ = writeln!(out, "  approved via publisher {publisher}");
+        }
+        Some(out)
+    }
+
     /// Every loaded component's declared config options, component by
     /// component, for the config form.
     ///
@@ -2616,6 +2763,12 @@ fn render_config(manifest: &WasmManifest) -> String {
 /// pairing is the point, since a decision made without looking for a signature
 /// would never let a signed update through.
 fn judge(component: &WasmComponent, sha256: &str, project: &Path, trust: &TrustStore) -> Decision {
+    // Before the signature is even read: a disabled component should not prompt
+    // for approval it will not use, and reading a `.minisig` for something
+    // switched off is work nobody asked for.
+    if trust.disabled().contains(&component.manifest.id) {
+        return Decision::Disabled;
+    }
     let sig = signature_status(&component.path, trust);
     trust.evaluate(component, sha256, project, &sig)
 }
@@ -3065,6 +3218,117 @@ mod tests {
         let plain = r#"{"name":"d","wasm":[{"id":"x","module":"m.wasm","surfaces":["frame"]}]}"#;
         let (plain, _) = parse_manifest_section(plain);
         assert_eq!(render_config(&plain[0]), "{}");
+    }
+
+    /// Disabling is recorded, survives a reload of the store, and reads back
+    /// as its own verdict rather than as a trust failure.
+    #[test]
+    fn disabling_persists_and_is_its_own_verdict() {
+        let home = std::env::temp_dir().join(format!("plank-disable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let mut trust = TrustStore::load(&home);
+        assert!(trust.disabled().is_empty());
+
+        trust.set_disabled("dev.plank.demo", true).expect("written");
+        assert!(trust.disabled().contains("dev.plank.demo"));
+        let reloaded = TrustStore::load(&home);
+        assert!(
+            reloaded.disabled().contains("dev.plank.demo"),
+            "the choice did not survive: {:?}",
+            reloaded.disabled()
+        );
+        // Disabling must not forget the approval: re-enabling should not
+        // re-prompt for capabilities the user already looked at.
+        let c = component(Origin::UserScan, vec![]);
+        let mut trust = reloaded;
+        trust
+            .approve(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent)
+            .unwrap();
+        trust.set_disabled(&c.manifest.id, true).unwrap();
+        let back = TrustStore::load(&home);
+        assert!(back.entry(&c.manifest.id).is_some(), "approval was dropped");
+
+        let mut trust = back;
+        trust.set_disabled(&c.manifest.id, false).unwrap();
+        assert!(TrustStore::load(&home).disabled().is_empty());
+        // And the reserved keys are never mistaken for components.
+        assert!(TrustStore::load(&home).entry("@disabled").is_none());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Each reserved key must round-trip *on its own*.
+    ///
+    /// The first version of `persist` appended a comma after every reserved key
+    /// on the assumption that a component entry always followed, so a store
+    /// holding only publishers — or only disabled ids — wrote invalid JSON that
+    /// `load` then discarded in silence, losing the choice just recorded. That
+    /// is a data-loss bug whose only symptom is "my setting did not stick", so
+    /// each combination is pinned here.
+    #[test]
+    fn a_store_with_only_reserved_keys_round_trips() {
+        let base = std::env::temp_dir().join(format!("plank-reserved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // Disabled ids only.
+        let one = base.join("one");
+        let mut trust = TrustStore::load(&one);
+        trust.set_disabled("dev.plank.only", true).unwrap();
+        assert!(
+            TrustStore::load(&one).disabled().contains("dev.plank.only"),
+            "disabled-only store did not survive"
+        );
+
+        // Publishers only.
+        let two = base.join("two");
+        let key =
+            crate::wasmsig::PublicKey::parse(include_str!("../tests/fixtures/minisign/pub.key"))
+                .unwrap();
+        let encoded = include_str!("../tests/fixtures/minisign/pub.key")
+            .lines()
+            .next_back()
+            .unwrap();
+        let mut trust = TrustStore::load(&two);
+        trust.add_publisher(&key, encoded).unwrap();
+        assert_eq!(
+            TrustStore::load(&two).publishers().len(),
+            1,
+            "publishers-only store did not survive"
+        );
+
+        // Both, and nothing else.
+        let three = base.join("three");
+        let mut trust = TrustStore::load(&three);
+        trust.add_publisher(&key, encoded).unwrap();
+        trust.set_disabled("dev.plank.only", true).unwrap();
+        let back = TrustStore::load(&three);
+        assert_eq!(back.publishers().len(), 1);
+        assert!(back.disabled().contains("dev.plank.only"));
+
+        // And the everything case still parses.
+        let four = base.join("four");
+        let c = component(Origin::UserScan, vec![Capability::State]);
+        let mut trust = TrustStore::load(&four);
+        trust.add_publisher(&key, encoded).unwrap();
+        trust.set_disabled("dev.plank.other", true).unwrap();
+        trust
+            .approve(&c, "hash-a", Path::new("/repo"), &SigStatus::Absent)
+            .unwrap();
+        let back = TrustStore::load(&four);
+        assert_eq!(back.publishers().len(), 1);
+        assert!(back.disabled().contains("dev.plank.other"));
+        assert!(back.entry(&c.manifest.id).is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `Decision::Disabled` explains itself in terms of the switch, not of
+    /// trust: a user reading "we have never seen this" about something they
+    /// turned off themselves would go looking for the wrong problem.
+    #[test]
+    fn a_disabled_component_explains_itself_as_disabled() {
+        let reason = Decision::Disabled.reason();
+        assert!(reason.contains("disabled"), "{reason}");
+        assert!(reason.contains("/plugins enable"), "{reason}");
+        assert!(!Decision::Disabled.is_trusted());
     }
 
     /// A grant with no host function behind it is named at load time.
