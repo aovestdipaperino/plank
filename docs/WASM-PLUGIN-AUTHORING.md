@@ -307,6 +307,23 @@ default) and `-l`.
 Every call has a deadline, so a hang is a failure. If your component vanishes
 mid-session, `/plugins info` will say why.
 
+**Budgets** are per surface, and these are the targets: `frame_step` 50 ms (a
+frame at 30fps has 33 ms for everything, and plank has to draw too),
+`frame_key`/`frame_mouse` and `segment_render` 20 ms (input must feel immediate;
+the bar repaints while you type), `tool_call` 1000 ms (the user is already
+waiting on the model), everything else 200 ms.
+
+A call is only *failed* at four times its target. The measurement is wall-clock,
+and a wall-clock measurement on a busy machine measures the machine — enforcing
+at the target exactly would strike out a working game on a loaded laptop. Treat
+the target as what to design for and the 4× as the line where plank decides you
+are broken rather than unlucky.
+
+This is not fuel metering: fuel meters guest instructions and needs wasmtime
+configuration Extism does not expose. A guest can still burn its whole budget
+inside one host call. What these do catch is the case that matters — a component
+ruining the frame rate.
+
 ## Rules that will bite you
 
 - **Export `plank_abi`.** Nothing else runs until it answers.

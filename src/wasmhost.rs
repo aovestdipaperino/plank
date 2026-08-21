@@ -197,7 +197,52 @@ mod extism_host {
     /// capability would run forever on an unexhausted fuel budget. This is the
     /// *outer* bound — a real per-surface budget (a frame step gets ~2 ms) is
     /// the frame surface's business, and will be far tighter than this.
-    const CALL_TIMEOUT_MS: u64 = 1_000;
+    pub(super) const CALL_TIMEOUT_MS: u64 = 1_000;
+
+    /// Per-surface soft budget, in milliseconds, keyed by export prefix.
+    ///
+    /// The wall-clock timeout above is one number for every call, which is
+    /// wrong in both directions: a second is absurdly generous for a frame step
+    /// that has 33 ms of frame to fit inside, and stingy for a tool the user is
+    /// already waiting on the model for. These are the numbers that actually
+    /// describe each surface.
+    ///
+    /// These are the *targets*. Enforcement is at [`OVERRUN_FACTOR`] times them,
+    /// because the measurement is wall-clock and a wall-clock measurement on a
+    /// busy machine measures the machine. A frame steps around twenty times a
+    /// second and three consecutive failures disable a component, so enforcing
+    /// at the target exactly would strike out a perfectly good game on a loaded
+    /// laptop — which is the failure this project has already recorded once, in
+    /// a test that asserted 10ms and passed alone while failing under load.
+    ///
+    /// This is **not** fuel metering. Fuel meters guest instructions and needs
+    /// wasmtime configuration Extism does not expose; these are wall-clock
+    /// measurements taken host-side, which is strictly weaker — a guest can
+    /// still burn its whole budget inside one host call — but it is the half
+    /// that stops a plugin ruining the frame rate.
+    /// How far over its target a call may go before it counts as broken rather
+    /// than merely unlucky.
+    ///
+    /// Four times, so a frame step has to take over 200ms — unambiguous
+    /// breakage, not a busy machine — before it costs a strike.
+    pub(super) const OVERRUN_FACTOR: u128 = 4;
+
+    pub(super) fn surface_budget_ms(export: &str) -> u64 {
+        match export {
+            // A frame at 30fps has 33ms for everything, and plank has to draw
+            // too. The built-in arcade holds itself to the same order.
+            e if e.starts_with("frame_step") => 50,
+            // The status bar repaints many times a second while the user types,
+            // and input has to feel immediate or the component feels broken —
+            // same number, and for the same reason: both are in the way of a
+            // keystroke.
+            "segment_render" | "frame_key" | "frame_mouse" => 20,
+            // The user is already waiting on the model, so this one may think.
+            "tool_call" => CALL_TIMEOUT_MS,
+            // Everything else — open, close, commands, events — is occasional.
+            _ => 200,
+        }
+    }
 
     /// What a host function needs to answer a call: who is asking, and where
     /// its output goes.
@@ -397,10 +442,24 @@ mod extism_host {
                 .plugins
                 .get_mut(id)
                 .ok_or_else(|| WasmError::Load(format!("nothing loaded under '{id}'")))?;
-            plugin
+            let started = std::time::Instant::now();
+            let out = plugin
                 .call::<&[u8], &[u8]>(export, input)
                 .map(<[u8]>::to_vec)
-                .map_err(|e| WasmError::Trap(format!("{id}:{export}: {e}")))
+                .map_err(|e| WasmError::Trap(format!("{id}:{export}: {e}")))?;
+            // Measured after the call rather than enforced during it: Extism's
+            // timeout is fixed at instantiation, so this is the only place the
+            // budget can differ per surface.
+            let elapsed = started.elapsed().as_millis();
+            let budget = u128::from(surface_budget_ms(export));
+            let ceiling = budget * OVERRUN_FACTOR;
+            if elapsed > ceiling {
+                return Err(WasmError::Trap(format!(
+                    "{id}:{export}: took {elapsed}ms, more than {OVERRUN_FACTOR}x the {budget}ms \
+                     budget for this surface"
+                )));
+            }
+            Ok(out)
         }
 
         fn has_export(&self, id: &str, export: &str) -> bool {
@@ -421,6 +480,54 @@ mod extism_host {
 
 #[cfg(test)]
 mod tests {
+
+    /// The budgets have to differ by surface, or the feature is just the old
+    /// single timeout with more words.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn surface_budgets_differ_and_favour_the_right_calls() {
+        // Enforcement is deliberately looser than the target: a wall-clock
+        // measurement on a busy machine measures the machine, and a frame that
+        // steps twenty times a second would otherwise strike out on a loaded
+        // laptop rather than because it is broken.
+        const _: () = assert!(super::extism_host::OVERRUN_FACTOR > 1);
+
+        use super::extism_host::surface_budget_ms as budget;
+
+        // A frame step must be far tighter than a tool call: one has 33ms of
+        // frame to fit inside, the other has a user already waiting on a model.
+        assert!(budget("frame_step") < budget("tool_call"));
+        assert!(
+            budget("frame_step_text") == budget("frame_step"),
+            "both draw"
+        );
+        // Input has to feel immediate.
+        assert!(budget("frame_key") <= budget("frame_step"));
+        assert!(budget("frame_mouse") <= budget("frame_step"));
+        // The status bar repaints many times a second, competing with typing.
+        assert!(budget("segment_render") < budget("frame_step"));
+        // Anything unrecognised gets the occasional-call default, which must be
+        // neither the tightest nor the most generous.
+        let other = budget("command_run");
+        assert!(other > budget("segment_render"));
+        assert!(other < budget("tool_call"));
+        // And nothing exceeds the hard wall-clock backstop.
+        for export in [
+            "frame_step",
+            "frame_step_text",
+            "frame_key",
+            "frame_mouse",
+            "segment_render",
+            "tool_call",
+            "command_run",
+            "on_event",
+        ] {
+            assert!(
+                budget(export) <= super::extism_host::CALL_TIMEOUT_MS,
+                "{export} claims more than the outer bound"
+            );
+        }
+    }
     use super::*;
 
     /// The point of the no-op is that it is always constructible and never

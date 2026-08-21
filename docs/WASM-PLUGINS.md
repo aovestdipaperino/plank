@@ -548,10 +548,16 @@ A `frame` component satisfies the load-time contract with **either** export.
 
 The UI loop must never be blocked by a plugin. Three mechanisms enforce it:
 
-1. **Fuel.** Every call is metered. Exhausting fuel traps the call, not the
-   host. Per-surface defaults: `frame_step`/`panel_step` and `segment_render`
-   get a budget sized to ~2 ms of a frame; `tool_call` gets a much larger one
-   since the user is already waiting on the model.
+1. **Fuel.** *Not implemented.* Fuel meters guest instructions and needs
+   wasmtime configuration Extism does not expose, so what shipped is
+   wall-clock: a fixed 1s manifest timeout as the outer bound, plus per-surface
+   targets measured host-side (`frame_step` 50 ms, `segment_render` and input
+   20 ms, `tool_call` 1s, else 200 ms). A call fails at **four times** its
+   target rather than at it, because a wall-clock measurement on a busy machine
+   measures the machine and a frame steps twenty times a second — enforcing
+   exactly would strike out a working component on a loaded laptop. A guest can
+   still burn its budget inside one host call; that is the half fuel would
+   cover.
 2. **Epoch interruption.** A wall-clock deadline as a backstop, because fuel
    does not account for host-function time.
 3. **Strike-out.** A plugin that traps or overruns three times in a session is
