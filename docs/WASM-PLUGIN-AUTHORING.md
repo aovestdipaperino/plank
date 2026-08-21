@@ -213,11 +213,19 @@ Declared in the manifest, shown to the user at approval, and **never widened
 silently**: an update that asks for more re-prompts even with a valid signature.
 
 Wired today: `log`, `print`, `state` (a per-component KV store — the only
-persistence most components need, and it needs no filesystem grant), `sound`.
+persistence most components need, and it needs no filesystem grant), `sound`,
+and `notify`.
 
-Declared but reaching nothing yet: `notify`, `agent`, `session`. plank warns at
-load if you ask for one, because approving a capability that does not exist is
-worse than refusing it.
+`notify(title, body)` fires a desktop notification. Your component id prefixes
+the title whether you like it or not — a notification that does not say which
+plugin produced it is one the user cannot act on or switch off — and both
+strings are clipped to 200 characters. It respects the user's own notification
+setting rather than routing around it: a plugin is not more entitled to
+interrupt than plank is.
+
+Declared but reaching nothing yet: `agent`, `session`. plank warns at load if
+you ask for one, because approving a capability that does not exist is worse
+than refusing it.
 
 Deliberately unimplemented: `fs`, `net`, `exec`. These are the three that undo
 the sandbox, and each needs its own decision about what the grant means before

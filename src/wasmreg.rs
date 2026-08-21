@@ -169,7 +169,10 @@ impl Capability {
     /// nothing — so the loader warns rather than staying silent.
     #[must_use]
     pub fn is_wired(self) -> bool {
-        matches!(self, Self::Log | Self::Print | Self::State | Self::Sound)
+        matches!(
+            self,
+            Self::Log | Self::Print | Self::State | Self::Sound | Self::Notify
+        )
     }
 
     /// Why an unwired capability is unwired, for the load-time warning.
@@ -3345,18 +3348,18 @@ mod tests {
             "id": "dev.plank.demo",
             "module": "demo.wasm",
             "surfaces": ["tool"],
-            "capabilities": ["state", "notify", "exec"]
+            "capabilities": ["state", "agent", "exec"]
           }]
         }"#;
         let (manifests, warnings) = parse_manifest_section(text);
         assert_eq!(manifests.len(), 1, "the component still loads");
         // Granted anyway: refusing here would change what the approval prompt
         // shows, and the manifest is the author's statement of intent.
-        assert!(manifests[0].capabilities.contains(&Capability::Notify));
+        assert!(manifests[0].capabilities.contains(&Capability::Agent));
 
         let joined = warnings.join("\n");
         assert!(
-            joined.contains("'notify' is declared but not implemented yet"),
+            joined.contains("'agent' is declared but not implemented yet"),
             "{joined}"
         );
         assert!(
@@ -3378,11 +3381,11 @@ mod tests {
             Capability::Print,
             Capability::State,
             Capability::Sound,
+            Capability::Notify,
         ] {
             assert!(c.is_wired(), "{c:?}");
         }
         for c in [
-            Capability::Notify,
             Capability::Agent,
             Capability::Session,
             Capability::Fs,

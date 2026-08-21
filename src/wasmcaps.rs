@@ -245,6 +245,49 @@ pub fn sound(grants: &Grants, sound: crate::arcade::Sound, cue: &str) -> Result<
     Ok(())
 }
 
+/// The `notify` capability: a desktop notification.
+///
+/// Declared since the first design and reaching nothing until now, which is the
+/// worst state for a grant to be in — a user approving `notify` was approving
+/// something that did not exist.
+///
+/// Two limits the guest cannot argue with. The component's id prefixes the
+/// title, because a notification that does not say which plugin produced it is
+/// one the user cannot act on or switch off. And the text is truncated: a
+/// notification is a line, and a component that pastes a kilobyte into one is
+/// abusing the shared attention of every other plugin.
+///
+/// Respects the user's own notification setting rather than routing around it.
+/// A plugin is not more entitled to interrupt than plank is.
+///
+/// # Errors
+/// Returns the refusal message when the grant is absent.
+pub fn notify(grants: &Grants, title: &str, body: &str) -> Result<(), String> {
+    /// Longest title and body a component may push. A notification is a line.
+    const CAP: usize = 200;
+
+    if !grants.allows("notify") {
+        return Err(grants.refusal("notify"));
+    }
+    let clip = |text: &str| -> String {
+        let mut out: String = text.chars().take(CAP).collect();
+        if out.chars().count() < text.chars().count() {
+            out.push('…');
+        }
+        // A newline in a notification title tears the layout on some servers,
+        // so it is folded rather than trusted — same rule as a status cell.
+        out.replace(['\n', '\r'], " ")
+    };
+    let title = clip(title);
+    let title = if title.trim().is_empty() {
+        grants.id.clone()
+    } else {
+        format!("{}: {title}", grants.id)
+    };
+    crate::notify::notify(&title, &clip(body));
+    Ok(())
+}
+
 /// Every component's grants for this session, keyed by id.
 pub type GrantTable = BTreeMap<String, Grants>;
 
@@ -261,6 +304,28 @@ pub fn grants_for(id: &str, granted: &[&str], home: Option<&Path>) -> Grants {
 
 #[cfg(test)]
 mod tests {
+
+    /// `notify` refuses without the grant, and shapes what it accepts with it.
+    #[test]
+    fn notify_requires_the_grant_and_bounds_what_it_sends() {
+        let denied = grants_for("dev.plank.demo", &[], None);
+        let err = notify(&denied, "hi", "there").expect_err("must refuse");
+        assert!(err.contains("notify"), "{err}");
+
+        // With the grant it succeeds. The delivery itself is a no-op when the
+        // user has notifications off or is not on macOS, which is the same
+        // path plank's own notifications take — a plugin is not more entitled
+        // to interrupt than plank is.
+        let allowed = grants_for("dev.plank.demo", &["notify"], None);
+        assert!(notify(&allowed, "hi", "there").is_ok());
+        // Empty title still works: the component id stands in, because a
+        // notification that does not say who sent it cannot be acted on.
+        assert!(notify(&allowed, "", "body").is_ok());
+        // Absurd lengths are accepted and clipped rather than refused: failing
+        // a component's frame over a long string would be worse than trimming.
+        let long = "x".repeat(10_000);
+        assert!(notify(&allowed, &long, &long).is_ok());
+    }
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {

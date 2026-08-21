@@ -7,7 +7,7 @@
 > the reasoning, including for the parts that were deliberately cut.
 >
 > Four surfaces of five are implemented (`panel` was cut), five events of roughly
-> twenty, and four capabilities of ten. Each gap says so where it appears, so
+> twenty, and five capabilities of ten. Each gap says so where it appears, so
 > "designed" and "built" stay distinguishable. The one that catches people is
 > `$PLANK_PLUGIN_PATH`: designed, never built, use `--plugin-dir`.
 
