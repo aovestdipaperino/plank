@@ -1,10 +1,20 @@
 # WASM plugins
 
-> Status: **design proposal, feasibility-proven**. The document describes a
-> plugin system for plank built on sandboxed WebAssembly, the surfaces a plugin
-> may claim, the events it may observe, and how plugins are packaged, versioned
-> and trusted. None of that is implemented. What *is* implemented is the spike
-> below — the trait boundary and the runtime handshake, and nothing more.
+> Status: **implemented and shipping**, behind the `plugins` Cargo feature
+> (off by default, at +18 MiB). Merged to `main` on 2026-08-19. This document
+> describes the plugin system, the surfaces a plugin may claim, the events it may
+> observe, and how plugins are packaged, versioned and trusted — and it records
+> the reasoning, including for the parts that were deliberately cut.
+>
+> Four surfaces of five are implemented (`panel` was cut), five events of roughly
+> twenty, and four capabilities of ten. Each gap says so where it appears, so
+> "designed" and "built" stay distinguishable. The one that catches people is
+> `$PLANK_PLUGIN_PATH`: designed, never built, use `--plugin-dir`.
+
+> Writing a plugin rather than changing plank? See
+> **[WASM-PLUGIN-AUTHORING.md](WASM-PLUGIN-AUTHORING.md)**, which documents what
+> is implemented from an author's side. This file is the design and records the
+> reasoning, including for parts that were cut.
 
 ## What is implemented
 
@@ -633,7 +643,9 @@ have given.
 
 **Locations**, resolved in order, later overriding earlier by `id`:
 
-1. `$PLANK_PLUGIN_PATH` (colon-separated, for development)
+1. `--plugin-dir <path>`, repeatable, for development. (The original design
+   said `$PLANK_PLUGIN_PATH`; the flag is what shipped, and nothing reads that
+   variable.)
 2. `./.plank/plugins/` — project-local, checked in with the repo
 3. `~/.plank/plugins/` — user-global
 
