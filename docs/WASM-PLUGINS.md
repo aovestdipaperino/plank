@@ -662,6 +662,18 @@ Removal leaves the trust entry behind. It is keyed by the component's hash, so
 reinstalling the same bytes is the same component and needs no re-approval,
 while different bytes re-prompt exactly as they would have.
 
+A release publishes `SHA256SUMS` beside the plugin archives: the **module**
+hashes (what the trust store keys on — a tarball's hash says nothing about what
+plank loads) and the `rustc --version` that produced them. `guests/verify.sh`
+rebuilds from a clean tree and compares, and CI runs it on every push, so the
+published bytes are checkable rather than merely asserted.
+
+The modules are byte-reproducible on a given toolchain and **independent of the
+build directory** — the same source in a different path produces the same
+bytes. Reproducibility *across* rustc versions is not established, which is why
+the version is recorded: a mismatch after a toolchain bump is expected and is
+not evidence of tampering, while a mismatch on the same toolchain is.
+
 Install accepts a `https://` (or loopback `http://`) URL as well as a local
 directory: it downloads the `.tar.gz`, extracts it into a staging directory it
 owns, and installs the plugin inside. The body is capped, and **any symlink in

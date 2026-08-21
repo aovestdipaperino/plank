@@ -114,6 +114,10 @@ jobs:
           for f in guests/dist/plank-*.tar.gz; do
             gh release upload "$GITHUB_REF_NAME" "$f" --clobber
           done
+          # Published alongside, so a user can check what they installed
+          # against what the source builds to. It records the rustc version
+          # because the bytes are only reproducible for a given toolchain.
+          gh release upload "$GITHUB_REF_NAME" guests/dist/SHA256SUMS --clobber
 
       # A Homebrew bottle's inner directory must match the formula name, so
       # the bottle is packaged under the channel's formula name. Promotion

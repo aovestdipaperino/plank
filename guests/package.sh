@@ -35,9 +35,20 @@ for guest in screensavers arcades; do
   # `-C` so the archive holds `<guest>/...` rather than the absolute path, and
   # so extracting it yields a directory that is already a plugin.
   tar -czf "$DIST/plank-$guest.tar.gz" -C "$DIST" "$guest"
-  # The trust store keys on a hash, so print the one a user can compare against.
-  if command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 "$DIST/plank-$guest.tar.gz"
-  fi
   echo "plugin: $out"
 done
+
+# The trust store keys on a *module* hash, so that is what gets recorded — the
+# tarball's hash says nothing about what plank will actually load. The rustc
+# version is recorded beside them because the bytes are only reproducible for a
+# given toolchain: a verifier needs to know what to reproduce *with*.
+#
+# Verified with guests/verify.sh, which rebuilds from a clean tree and compares.
+{
+  echo "# plank guest modules"
+  echo "# $(rustc --version)"
+  for guest in screensavers arcades; do
+    (cd "$DIST/$guest/wasm" && shasum -a 256 "$guest.wasm")
+  done
+} > "$DIST/SHA256SUMS"
+cat "$DIST/SHA256SUMS"

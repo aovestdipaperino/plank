@@ -134,6 +134,16 @@ jobs:
       - name: Package plugin archives
         run: sh guests/package.sh
 
+      # The trust store keys on a module's SHA-256, so a published artifact
+      # nobody can independently reproduce makes that hash an assertion rather
+      # than a check. The modules are byte-reproducible on a given toolchain,
+      # from any build directory, and this is what keeps that true rather than
+      # assumed: a clean rebuild must land on the same bytes.
+      - name: Verify the guests rebuild to the same bytes
+        run: |
+          cp guests/dist/SHA256SUMS /tmp/guest-sums
+          sh guests/verify.sh /tmp/guest-sums
+
       - name: Clippy (plugins)
         run: cargo clippy --all-targets --features plugins -- -D warnings
 
