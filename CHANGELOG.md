@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Greedy chain decode on Metal**, via the ds4 engine's new
+  `ds4_session_eval_chain_greedy`. At temperature 0 plank decodes a run of
+  argmax tokens with the next token id kept on-device, removing the per-token
+  host round-trip (GPU sync, 517 KiB logits readback, CPU argmax). Output is
+  bit-identical to the previous path, verified by md5 over the reply.
+
+  **Off on M5.** Upstream measured +1.75% on an M3 Ultra, but on an M5 Max it
+  is ~1.3% *slower* — it lost all three interleaved pairs — so the chain is
+  enabled everywhere except M5, matching where the fork gates its other Metal
+  decode work. `PLANK_GREEDY_CHAIN=1` forces it on to re-measure after a kernel
+  change; `DS4_DISABLE_GREEDY_CHAIN=1` turns it off everywhere.
+
+  The engine declines the chain for any session holding a `--dspark`/MTP
+  support model, so the two are mutually exclusive.
+
+### Changed
+
+- **The `--dspark` footer segment now reads `1.5t/step`, not `1.5x`.** It was
+  always mean tokens committed per speculative step, which is not a wall-clock
+  speedup: on Metal it reads well above 1.0 on runs that decode *slower* than
+  plain decode, because a batched verify costs more per token than plain decode
+  does. The accompanying percentage is likewise a lower bound — plank cannot
+  see how many tokens the C actually drafted, only the block size it was
+  allowed. `FINDINGS.md` has the measurements.
+
+- **Bumped the `refs/ds4` submodule** to `ivanfioravanti/ds4-metal` for the
+  chain-decode API and the pre-M5 Metal decode work.
+
+
 ## [3.1.0] - 2026-08-22
 
 ### Added

@@ -300,6 +300,42 @@ unsafe extern "C" {
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
+    /// Whether this session can take the Metal greedy-chain decode path.
+    ///
+    /// The C declines for anything the chain cannot reproduce bit-identically:
+    /// a non-Metal backend, GLM, distributed/TP, SSD streaming, quality mode,
+    /// directional steering, a CPU-routed layer — and, notably, **any loaded
+    /// support model**, so `--dspark` and the chain are mutually exclusive.
+    /// Must be called on a prefilled session: it also requires a valid
+    /// checkpoint.
+    /// Non-zero when the Metal device is an Apple M5. Reads the device name
+    /// captured at Metal init, so it is only meaningful once a model is loaded.
+    pub fn ds4_gpu_device_is_m5_apple_silicon() -> c_int;
+    pub fn ds4_session_chain_greedy_supported(s: *const Ds4Session) -> bool;
+    /// Decodes a burst of argmax tokens with the next id kept on-device,
+    /// removing the per-token host round-trip (sync + logits readback + CPU
+    /// argmax) that [`ds4_session_eval`] pays.
+    ///
+    /// The seed is this session's current argmax — the caller does not sample
+    /// it. `on_token` receives the seed first, then every chained id in order;
+    /// returning `false` stops the burst *without* committing that token, so
+    /// EOS and interrupt are both expressed that way. Only approved tokens
+    /// enter the session checkpoint.
+    ///
+    /// Returns the number of approved tokens, or -1 with `err` set. `max_tokens`
+    /// must be at least 2 — a one-token burst never runs a GPU eval and would
+    /// leave the logits stale. When `completed` comes back false the burst
+    /// stopped early and the session's logits are stale; when true they hold
+    /// the logits after the last approved token, as after `ds4_session_eval`.
+    pub fn ds4_session_eval_chain_greedy(
+        s: *mut Ds4Session,
+        max_tokens: c_int,
+        on_token: Option<unsafe extern "C" fn(*mut c_void, c_int) -> bool>,
+        on_token_ctx: *mut c_void,
+        completed: *mut bool,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
     /// Draft-block size the loaded support model can propose per step, or 0
     /// when there is none. `> 1` is the C's own test for "speculation is worth
     /// attempting" — under `DSpark` it is the checkpoint's block size.

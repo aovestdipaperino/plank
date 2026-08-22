@@ -1442,3 +1442,89 @@ test` and review the diff before committing.
   a bug report — has to pass `--temp 0` or it is measuring plain decode with an
   extra model in memory. (The C also honours `DS4_MTP_SPEC_DISABLE`; plank does
   not read it.)
+- **`--dspark` is a net loss on Metal, and the footer's `x` figure hid it.**
+  With `--temp 0` the plumbing works exactly as designed — the support GGUF
+  loads (`stages=3 block=5`), `ds4_engine_mtp_draft_tokens` returns 5, and the
+  speculative entry point runs — yet measured end to end `--dspark` decodes
+  *slower* than plain decode (29.2/19.9 vs 31.9/26.5 tok/s on an M5 Max;
+  16.4 with `DS4_DSPARK_SCHEDULER=0`, 15.1 at `--dspark-confidence 0`). The
+  engine says so itself: `DS4_DSPARK_STATS=1` reports `saved=5178ms` against
+  `propose=1104ms` + `verify=5345ms`, i.e. **`net_saved=-1321ms`**, because a
+  batched verify of 5 positions costs ~27 ms/token against ~26 ms/token for
+  plain decode — the verify runs through the generic *batch prefill* kernels,
+  which carry a 1.5-2.5x per-stage excess over the decode kernels. Upstream
+  (`speed-bench/README.md`) reached the same verdict independently and reverted
+  four bit-exact optimisation attempts that each recovered nothing; the
+  unwritten fix is genuine small-N batched decode-grade verify kernels, and the
+  batch MoE is already at its distinct-expert floor. Treat `--dspark` as an
+  experiment on Metal, not a speedup. The C's adaptive scheduler is what makes
+  it read as merely *neutral* rather than a visible regression: it declined
+  228 of 405 proposals on the run above.
+  Two reporting traps that made this look like a plank bug rather than an
+  engine limit: `SpecStats::tokens_per_step` is *tokens committed per
+  speculative step*, not a wall-clock ratio — it read `2.1x` on the run that
+  was 40% slower, so it is rendered `2.1t/step` now and must never be labelled
+  `Nx`. And `SpecStats::drafted` counts the block size once per step, not what
+  the C actually proposed (the accept-run entry point never reports the draft
+  length), so `block_fill` is a lower bound: 10% where the engine's own
+  counters said 67%.
+- **Greedy chain decode is bit-exact, and a small regression on M5.**
+  `ds4_session_eval_chain_greedy` keeps the next token id on-device and encodes
+  ahead, removing plank's per-token `waitUntilCompleted` + logits readback +
+  CPU argmax (~0.5 ms/token). The output is bit-identical to the classic path —
+  verified by md5 over the reply across both — and upstream measured +1.75% on
+  an M3 Ultra. On an M5 Max it is **~1.3% slower**, losing all three
+  interleaved pairs (37.0/38.0/38.2 chained against 38.0/38.4/38.3 classic,
+  90 s cooldowns): the host boundary it removes is already cheap there, and the
+  device ring plus a shared-event wait per token is not free. Hence plank's
+  `chain_wanted()` gate — and note that the fork's three sibling Metal decode
+  commits are themselves `pre_m5`-gated, so this is the pattern, not an
+  exception.
+  Benchmarking traps that produced a wrong answer first: back-to-back runs
+  without cooldown gave a fake **+11%**, because this box throttles hard after
+  a heavy run and recovers over ~60-90 s (upstream: "one `ds4` instance at a
+  time; idle ~60 s after heavy runs"). Only interleaved pairs with cooldowns
+  mean anything. And `cargo test`/`cargo clippy` do not rebuild
+  `target/release/plank`, so an A/B run right after them can silently measure
+  the previous binary.
+  Three things to know before touching the chain:
+  `ds4_session_chain_greedy_supported` returns false for **any session holding
+  a support model**, so turning on `--dspark` forfeits the chain; the callback
+  must decline a token *before* recording it, because a `false` return leaves
+  that token out of the C's checkpoint and recording it anyway would desync
+  `reply_tokens` from the KV cache; and think-tool recovery has to be judged
+  inside the callback on the reply *without* the current token, which is the
+  same point in the stream as the serial path's post-commit check.
+- **Why llama.cpp's block drafters pay and ds4's DSpark does not: the verify
+  cost curve, not the algorithm.** llama.cpp implements the same family of
+  drafter — `common/speculative.cpp` has both `draft-dflash` and `draft-dspark`
+  in one impl, reading `dflash.block_size` / `selector_rank` / `selector_top_k`,
+  the same shape as ds4's `stages=3 block=5 markov_rank=256`. Measured on the
+  same M5 Max, Qwen3.8-27B + its DFlash2 drafter is **+21%** (30.0/29.7/28.9
+  against 24.5/24.3/24.1 t/s, interleaved with cooldowns, winning every pair).
+  The mechanism is one number: `llama-bench -p 1,2,3,4,5,6,8` gives the verify
+  cost curve directly, because llama.cpp verifies with a plain
+  `llama_decode(ctx_tgt, [id_last, draft...])` — the *same* graph as decode,
+  just wider. Per-forward latency: N=1 40.1 ms, N=2 44.6 (1.11x), N=4 57.8
+  (1.44x), N=8 88.3 (2.20x). ds4's DSpark verify costs **2.03x a plain decode
+  at N=2** (52.9 ms/verify against 26.1 ms/decode from `DS4_DSPARK_STATS=1`;
+  upstream's M3 Ultra figures, 50 vs 23.3 ms, agree). ds4 at N=2 is worse than
+  llama.cpp at N=8, which is the whole story: at 1.44x for four rows a 67%
+  accept rate is hugely profitable, at 2.03x for two rows it cannot be.
+  **The confound that keeps this from being a to-do list:** Qwen3.8-27B is
+  *dense* (llama-bench reports `qwen35 27B`, 26.9B params, 17.66 GiB), while
+  DeepSeek V4 Flash is a large MoE with IQ2 routed experts. Batching N tokens
+  through an MoE touches up to N x distinct experts, so the routed-expert reads
+  that dominate decode do not amortize the way a dense matmul's do — exactly
+  what ds4 upstream reported ("the batch MoE already runs at its
+  distinct-expert floor"). So llama.cpp's win does not prove ds4's verify is
+  fixable; it establishes what "good" looks like (a 4-row forward at 1.44x a
+  1-row forward) and confirms the gap is in the kernels, not the drafter.
+  Two policy differences are replicable in the C engine regardless, though both
+  are symptoms of the cost curve rather than causes — upstream's own knob sweep
+  already showed tuning does not close the gap. llama.cpp truncates a draft at
+  the first token below `p_min` and *keeps the confident prefix*, where ds4's
+  confidence gate declines the whole cycle (45-75% of them) after already
+  paying the propose; and llama.cpp's `p_min` defaults to 0 — never decline —
+  which is only rational because its verify is cheap. Nothing here is
+  actionable in plank: plank's side of the DSpark path is already correct.
