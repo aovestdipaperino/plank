@@ -15072,13 +15072,13 @@ mod tests {
         agent.record_usage(&spec);
         let st = agent.idle_status();
         assert!(st.spec.active());
-        assert!((st.spec.speedup() - 3.0).abs() < 1e-9);
+        assert!((st.spec.tokens_per_step() - 3.0).abs() < 1e-9);
 
         // A later non-speculating pass must not blank the figure: it describes
         // the engine, and a turn that did not speculate says nothing new.
         agent.record_usage(&crate::engine::GenerationStats::default());
         assert!(
-            (agent.idle_status().spec.speedup() - 3.0).abs() < 1e-9,
+            (agent.idle_status().spec.tokens_per_step() - 3.0).abs() < 1e-9,
             "a plain pass wiped the last speculating turn's figures"
         );
     }

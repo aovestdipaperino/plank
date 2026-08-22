@@ -1325,20 +1325,22 @@ fn build_status_text_with_cells(
 }
 
 /// The `--dspark` segment: mean tokens committed per speculative step, then the
-/// share of drafted tokens accepted.
+/// share of the offered draft capacity that survived verification.
 ///
 /// `None` when the pass never speculated, so a plain run's footer is unchanged.
-/// The speedup is the headline because it is what the user feels; acceptance is
-/// the diagnostic that explains it.
+///
+/// Rendered `1.5t/step`, never `1.5x`: it is a per-step token count, not a
+/// wall-clock speedup, and the two diverge badly. See
+/// [`SpecStats::tokens_per_step`](crate::engine::SpecStats::tokens_per_step).
 #[must_use]
 pub fn spec_segment(st: &Status) -> Option<String> {
     if !st.spec.active() {
         return None;
     }
     Some(format!(
-        "{SPEC_MARK}{:.1}x {:.0}%",
-        st.spec.speedup(),
-        100.0 * st.spec.acceptance()
+        "{SPEC_MARK}{:.1}t/step {:.0}%",
+        st.spec.tokens_per_step(),
+        100.0 * st.spec.block_fill()
     ))
 }
 
@@ -1596,7 +1598,7 @@ mod tests {
         assert!(line.ends_with("ctx 12% | idle"), "{line}");
         assert!(!line.contains(SPEC_MARK), "{line}");
 
-        // 10 steps of a 4-token block, 30 committed: 3.0x, 50% accepted.
+        // 10 steps of a 4-token block, 30 committed: 3.0 per step, 50% fill.
         let spark = Status {
             spec: crate::engine::SpecStats {
                 steps: 10,
@@ -1607,7 +1609,7 @@ mod tests {
         };
         let line = build_status_text(&spark, false, true);
         assert!(
-            line.ends_with("ctx 12% | \u{23e9}3.0x 50% | idle"),
+            line.ends_with("ctx 12% | \u{23e9}3.0t/step 50% | idle"),
             "{line}"
         );
     }
@@ -1628,9 +1630,9 @@ mod tests {
             ..Status::default()
         };
         let line = build_status_text(&st, false, true);
-        // Every draft rejected: 1.0x and 0%, still shown — "speculation is on
+        // Every draft rejected: 1.0 per step and 0%, still shown — "speculation is on
         // and buying nothing" is exactly what a user needs to see.
-        assert!(line.contains("\u{23e9}1.0x 0%"), "{line}");
+        assert!(line.contains("\u{23e9}1.0t/step 0%"), "{line}");
     }
 
     #[test]

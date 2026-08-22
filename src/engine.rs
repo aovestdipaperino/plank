@@ -425,7 +425,9 @@ pub struct SpecStats {
     pub steps: i32,
     /// Tokens committed across those steps (sampled + accepted drafts).
     pub committed: i32,
-    /// Tokens offered to verification across those steps.
+    /// Draft *capacity* offered across those steps: the support model's block
+    /// size once per step, including steps where it proposed less than a full
+    /// block or nothing at all. See [`block_fill`](Self::block_fill).
     pub drafted: i32,
 }
 
@@ -436,12 +438,20 @@ impl SpecStats {
         self.steps > 0
     }
 
-    /// Mean tokens committed per step — what speculation is buying.
+    /// Mean tokens committed per speculative step.
     ///
     /// 1.0 means every draft was rejected and each step committed only the
     /// token the target model sampled itself, i.e. no gain over plain decode.
+    ///
+    /// **This is not a wall-clock speedup.** A speculative step costs strictly
+    /// more than a plain decode step — the draft proposal plus a batched
+    /// verify — so 1.5 tokens per step is only a win if a verify of a block is
+    /// cheaper than decoding that block one token at a time. On Metal it is
+    /// not: measured end to end, `--dspark` decodes *slower* than plain decode
+    /// while this figure reads well above 1.0. Report it with a per-step unit,
+    /// never as `Nx`.
     #[must_use]
-    pub fn speedup(&self) -> f64 {
+    pub fn tokens_per_step(&self) -> f64 {
         if self.steps > 0 {
             f64::from(self.committed) / f64::from(self.steps)
         } else {
@@ -449,13 +459,21 @@ impl SpecStats {
         }
     }
 
-    /// Share of *drafted* tokens that survived verification, 0.0-1.0.
+    /// Share of the offered draft *capacity* that survived verification,
+    /// 0.0-1.0.
     ///
     /// The sampled token is not a draft, so it is excluded from both sides:
-    /// this is `(committed - steps) / drafted`, the figure comparable with
-    /// llama.cpp's own acceptance reporting.
+    /// this is `(committed - steps) / drafted`. Note that [`drafted`] counts
+    /// the block size the support model *could* propose, not what it actually
+    /// proposed on each step — the accept-run entry point does not report the
+    /// draft length, and the C often proposes a shorter block or declines
+    /// outright at its confidence gate. So this is a lower bound on the true
+    /// acceptance rate, not the figure comparable with llama.cpp's: on a run
+    /// where the engine's own counters said 67%, this reads 10%.
+    ///
+    /// [`drafted`]: Self::drafted
     #[must_use]
-    pub fn acceptance(&self) -> f64 {
+    pub fn block_fill(&self) -> f64 {
         if self.drafted > 0 {
             (f64::from(self.committed - self.steps) / f64::from(self.drafted)).clamp(0.0, 1.0)
         } else {
@@ -1135,21 +1153,25 @@ mod spec_stats_tests {
             committed: 30,
             drafted: 40,
         };
-        assert!((s.speedup() - 3.0).abs() < 1e-9, "{}", s.speedup());
-        assert!((s.acceptance() - 0.5).abs() < 1e-9, "{}", s.acceptance());
+        assert!(
+            (s.tokens_per_step() - 3.0).abs() < 1e-9,
+            "{}",
+            s.tokens_per_step()
+        );
+        assert!((s.block_fill() - 0.5).abs() < 1e-9, "{}", s.block_fill());
     }
 
     #[test]
     fn every_draft_rejected_reads_as_no_gain_not_as_zero() {
         // Each step commits only the sampled token: speculation bought nothing,
-        // but decoding still happened, so the speedup is 1.0x rather than 0.
+        // but decoding still happened, so it is 1.0 per step rather than 0.
         let s = SpecStats {
             steps: 8,
             committed: 8,
             drafted: 32,
         };
-        assert!((s.speedup() - 1.0).abs() < 1e-9);
-        assert!(s.acceptance().abs() < 1e-9);
+        assert!((s.tokens_per_step() - 1.0).abs() < 1e-9);
+        assert!(s.block_fill().abs() < 1e-9);
         assert!(s.active(), "a pass that speculated is active even at 1.0x");
     }
 
@@ -1159,8 +1181,8 @@ mod spec_stats_tests {
         assert!(!s.active());
         // Not NaN: the front-ends format these before checking `active` in
         // some paths, and a division by zero would print "NaNx".
-        assert!(s.speedup().abs() < f64::EPSILON);
-        assert!(s.acceptance().abs() < f64::EPSILON);
+        assert!(s.tokens_per_step().abs() < f64::EPSILON);
+        assert!(s.block_fill().abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1173,7 +1195,7 @@ mod spec_stats_tests {
             committed: 9,
             drafted: 4,
         };
-        assert!((s.acceptance() - 1.0).abs() < 1e-9, "{}", s.acceptance());
+        assert!((s.block_fill() - 1.0).abs() < 1e-9, "{}", s.block_fill());
     }
 }
 
