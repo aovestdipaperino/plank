@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-08-22
+
 ### Added
 
 - **`Ctrl+W` wipes every saved session** from the `/resume` picker. Same
@@ -14,6 +16,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is not undoable. Transcripts and their KV payloads go; the shared
   system-prompt and project checkpoints stay, since rebuilding those would cost
   a full prefill on the next launch for nothing.
+
+### Changed
+
+- **`--dspark` defaults the sampling temperature to 0.** Speculative decoding
+  only engages at temperature 0, so asking for DSpark and leaving the 0.6
+  default in place silently decoded target-only. An explicit `--temp` still
+  wins, in either flag order.
 
 ## [3.0.4] - 2026-08-11
 
