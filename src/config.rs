@@ -399,6 +399,7 @@ Options:
       --mtp-margin F       MTP acceptance margin (default 3.0)
       --dspark             DSpark speculative decoding; downloads the support model
                            to ~/.plank/ds4flash.dspark.gguf unless --mtp names one
+                           (defaults --temp to 0 unless --temp is given)
       --dspark-confidence F  DSpark confidence pruning threshold 0..1
                            (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
       --dspark-strict      load DSpark support but keep target-only decode
@@ -1065,6 +1066,7 @@ pub fn parse_options_with(
     // Tracks whether a steering scale was given explicitly; a steering file
     // without one defaults the FFN scale to 1.0, like the C.
     let mut steering_scale_set = false;
+    let mut temp_set = false;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -1176,6 +1178,7 @@ pub fn parse_options_with(
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
                 c.generation.temperature = parse_float_range(need_arg(&mut i)?, arg, 0.0, 100.0)?;
+                temp_set = true;
             }
             "--top-p" => c.generation.top_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
             "--min-p" => c.generation.min_p = parse_float_range(need_arg(&mut i)?, arg, 0.0, 1.0)?,
@@ -1230,14 +1233,22 @@ pub fn parse_options_with(
         }
         i += 1;
     }
-    finalize(&mut c, steering_scale_set)?;
+    finalize(&mut c, steering_scale_set, temp_set)?;
     Ok(c)
 }
 
-/// Post-parse fixups: the steering-scale default and `--remote` validation.
-fn finalize(c: &mut AgentConfig, steering_scale_set: bool) -> Result<(), String> {
+/// Post-parse fixups: the steering-scale default, the `--dspark` temperature
+/// default, and `--remote` validation.
+fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Result<(), String> {
     if c.engine.dir_steering_file.is_some() && !steering_scale_set {
         c.engine.dir_steering_ffn = 1.0;
+    }
+    // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
+    // draft gate), so asking for DSpark defaults the temperature to 0. Done
+    // here rather than at the flag because `--temp` may follow it; an explicit
+    // `--temp` in either order still wins.
+    if c.engine.dspark && !temp_set {
+        c.generation.temperature = 0.0;
     }
     // The same context floor `/think max` enforces, applied to `--think-max`.
     // Checked here rather than at the flag because `--ctx` may follow it.
@@ -1738,6 +1749,26 @@ mod tests {
     fn dspark_confidence_is_bounded_to_a_probability() {
         let err = parse_options(&args(&["--dspark-confidence", "1.5"])).unwrap_err();
         assert!(err.contains("--dspark-confidence"));
+    }
+
+    #[test]
+    fn dspark_defaults_the_temperature_to_zero() {
+        let c = parse_options(&args(&["--dspark"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+
+        // The implying flags carry the same default.
+        let c = parse_options(&args(&["--dspark-strict"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+        let c = parse_options(&args(&["--dspark-confidence", "0.3"])).unwrap();
+        assert!((c.generation.temperature - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn an_explicit_temp_beats_the_dspark_default_in_either_order() {
+        let c = parse_options(&args(&["--dspark", "--temp", "0.9"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
+        let c = parse_options(&args(&["--temp", "0.9", "--dspark"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
     }
 
     #[test]
