@@ -728,6 +728,84 @@ fn ureq_provider_request(
     }
 }
 
+/// Opens the streaming completion, retrying transient failures, and returns the
+/// body reader positioned at the first SSE byte.
+///
+/// Runs entirely on [`crate::remote::spawn_sse_stream`]'s reader thread, so the
+/// blocking connect/send never sits on the turn thread: [`crate::remote::pump_sse`]
+/// polls `interrupt` and enforces [`crate::remote::STREAM_IDLE_TIMEOUT`] across
+/// this whole phase, connect and prefill included.
+///
+/// `timeout_connect` bounds a dead-on-arrival connection. There is deliberately
+/// **no** `timeout_recv_response`: in ureq 3.x that deadline is carried forward
+/// as the body's ceiling (`headers_arrival + recv_response`; see
+/// `timings::Timeout::preceeding`), so any finite value silently caps a healthy
+/// long generation — the very bug this function was restructured to remove.
+/// A black-holed read is caught instead by the caller's idle timeout, which can
+/// tell silence from a slow-but-live stream where a total-duration cap cannot.
+///
+/// `http_status_as_error(false)` surfaces error statuses as ordinary responses
+/// so we can read the provider's error body (a useful message, not "http status:
+/// 500") and any `Retry-After` before deciding whether to retry.
+///
+/// # Errors
+/// Returns the provider's own error text on a non-retryable status or after the
+/// last attempt.
+fn open_provider_stream(
+    kind: ProviderKind,
+    url: &str,
+    api_key: &str,
+    payload: &str,
+) -> Result<ureq::BodyReader<'static>, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(30)))
+        .build()
+        .into();
+
+    // Retry transient failures with exponential, jittered backoff: HTTP
+    // 408/429/5xx and connection-setup drops (a pooled keep-alive socket the
+    // server closed between turns — the write never reached it, so a fresh
+    // connection is safe). Auth/permission and other 4xx fail fast, so a real
+    // HTTP status error does not aimlessly retry a request that can't succeed.
+    let mut last_err: Option<String> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let request = ureq_provider_request(&agent, url, kind, api_key);
+        match request.send(payload) {
+            Ok(mut r) => {
+                let status = r.status().as_u16();
+                if (200..300).contains(&status) {
+                    return Ok(r.into_body().into_reader());
+                }
+                let retry_after = r
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after);
+                let body = r.body_mut().read_to_string().unwrap_or_default();
+                let msg = format!(
+                    "provider request failed (HTTP {status}): {}",
+                    provider_error_message(&body)
+                );
+                if attempt + 1 < MAX_ATTEMPTS && status_is_retryable(status) {
+                    std::thread::sleep(
+                        retry_after.unwrap_or_else(|| jittered(backoff_base(attempt))),
+                    );
+                    last_err = Some(msg);
+                } else {
+                    return Err(msg);
+                }
+            }
+            Err(e) if attempt + 1 < MAX_ATTEMPTS && is_transient_send_error(&e) => {
+                std::thread::sleep(jittered(backoff_base(attempt)));
+                last_err = Some(format!("provider request: {e}"));
+            }
+            Err(e) => return Err(format!("provider request: {e}")),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "provider request: connection failed".to_string()))
+}
+
 /// The Anthropic beta opt-in required for the 1-hour prompt-cache tier.
 pub(crate) const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 
@@ -1117,90 +1195,6 @@ impl ProviderEngine {
         }
     }
 
-    /// Sends the request, retrying transient failures, and returns the streaming
-    /// response.
-    ///
-    /// Split out of [`generate`](Self::generate) purely to keep that function
-    /// readable: it is the whole connect-and-retry phase, and nothing after it
-    /// depends on the intermediate state.
-    ///
-    /// # Errors
-    /// Returns the provider's own error text on a non-retryable status or after
-    /// the last attempt.
-    fn send_with_retries(
-        &self,
-        payload: &str,
-    ) -> Result<ureq::http::Response<ureq::Body>, EngineError> {
-        let url = format!("{}{}", self.base_url, self.endpoint());
-        // Surface HTTP error statuses as ordinary responses instead of ureq's
-        // default `StatusCode` error, so we can read the provider's error body
-        // (a useful message, not just "http status: 500") and any `Retry-After`
-        // header before deciding whether to retry.
-        //
-        // The two timeouts bound the phases that happen *before* any SSE byte
-        // arrives, where the streaming pump cannot help: a network drop during
-        // connect or while waiting on the response headers would otherwise park
-        // this thread forever (every `ureq` timeout defaults to `None`, and a
-        // silently dropped connection produces no RST for the kernel to
-        // report). Neither bounds the body, so a long generation is unaffected
-        // — that job belongs to `STREAM_IDLE_TIMEOUT` below.
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_connect(Some(Duration::from_secs(30)))
-            .timeout_recv_response(Some(Duration::from_mins(2)))
-            .build()
-            .into();
-
-        // Retry transient failures with exponential, jittered backoff: HTTP
-        // 408/429/5xx and connection-setup drops (a pooled keep-alive socket the
-        // server closed between turns — the write never reached it, so a fresh
-        // connection is safe). Auth/permission and other 4xx fail fast. A real
-        // HTTP status error therefore no longer aborts the whole session.
-        let mut resp = None;
-        let mut last_err: Option<String> = None;
-        for attempt in 0..MAX_ATTEMPTS {
-            let request = ureq_provider_request(&agent, &url, self.kind, &self.api_key);
-            match request.send(payload) {
-                Ok(mut r) => {
-                    let status = r.status().as_u16();
-                    if (200..300).contains(&status) {
-                        resp = Some(r);
-                        break;
-                    }
-                    let retry_after = r
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_retry_after);
-                    let body = r.body_mut().read_to_string().unwrap_or_default();
-                    let msg = format!(
-                        "provider request failed (HTTP {status}): {}",
-                        provider_error_message(&body)
-                    );
-                    if attempt + 1 < MAX_ATTEMPTS && status_is_retryable(status) {
-                        std::thread::sleep(
-                            retry_after.unwrap_or_else(|| jittered(backoff_base(attempt))),
-                        );
-                        last_err = Some(msg);
-                    } else {
-                        return Err(EngineError::new(msg));
-                    }
-                }
-                Err(e) if attempt + 1 < MAX_ATTEMPTS && is_transient_send_error(&e) => {
-                    std::thread::sleep(jittered(backoff_base(attempt)));
-                    last_err = Some(format!("provider request: {e}"));
-                }
-                Err(e) => return Err(EngineError::new(format!("provider request: {e}"))),
-            }
-        }
-        let Some(resp) = resp else {
-            return Err(EngineError::new(last_err.unwrap_or_else(|| {
-                "provider request: connection failed".to_string()
-            })));
-        };
-        Ok(resp)
-    }
-
     /// The API endpoint path for this provider's streaming completion.
     fn endpoint(&self) -> &'static str {
         match self.kind {
@@ -1280,18 +1274,21 @@ impl Engine for ProviderEngine {
             tps: 0.0,
         }));
 
-        let resp = self.send_with_retries(payload.as_str())?;
-
         let mut translator = self.translator();
-        // The body is read on its own thread and consumed through a channel, so
-        // `interrupt` is polled on a clock rather than per arriving event. The
-        // old shape checked it inside the SSE callback, which meant a stream
-        // delivering nothing — exactly what a dropped network produces — could
-        // never be cancelled: the turn froze and Ctrl-C had nothing to reach.
-        // `into_reader` (rather than `as_reader`) because the borrowed form
-        // cannot cross a thread boundary; this hands the reader thread an owned
-        // `'static` body, and drops the response here.
-        let rx = crate::remote::spawn_sse_reader(resp.into_body().into_reader());
+        // Connect, send, retries and the body read all run on one reader thread,
+        // consumed here through a channel, so `interrupt` is polled on a clock
+        // rather than per arriving event and the blocking send never sits on the
+        // turn thread. The old shape checked `interrupt` inside the SSE callback
+        // (a stream delivering nothing — exactly what a dropped network produces
+        // — could never be cancelled) and did the send synchronously here (a
+        // black-holed connect froze the turn with nothing for Ctrl-C to reach).
+        // Both are now covered by `pump_sse`'s clock below.
+        let url = format!("{}{}", self.base_url, self.endpoint());
+        let kind = self.kind;
+        let api_key = self.api_key.clone();
+        let rx = crate::remote::spawn_sse_stream(move || {
+            open_provider_stream(kind, &url, &api_key, &payload)
+        });
         // When the first text arrives: everything before it is time-to-first-
         // token (connect, queue, server prefill) and none of it is decode.
         let first_text = std::cell::Cell::new(None);

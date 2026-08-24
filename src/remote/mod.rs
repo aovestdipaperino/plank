@@ -130,6 +130,11 @@ pub enum SseItem {
     /// The reader finished; carries its final result (a clean EOF or the read
     /// error that ended it).
     End(std::io::Result<()>),
+    /// A failure *before* the body began — connect drop, retries exhausted, or a
+    /// non-2xx status — from a [`spawn_sse_stream`] whose `open` returned an
+    /// error. Surfaced verbatim, since the provider's own message is more useful
+    /// than a generic read-error wrapper.
+    Error(String),
 }
 
 /// How a [`pump_sse`] run ended, short of an error.
@@ -180,6 +185,36 @@ pub fn spawn_sse_reader<R: Read + Send + 'static>(reader: R) -> std::sync::mpsc:
     rx
 }
 
+/// Like [`spawn_sse_reader`], but runs `open` — the whole connect + send +
+/// retry sequence — *on the reader thread* and streams the body it returns.
+///
+/// This keeps the blocking send off the turn thread, so [`pump_sse`]'s clock
+/// governs the entire request: `interrupt` is honoured during connect and
+/// prefill (not just between tokens), and no ureq deadline caps a healthy long
+/// generation. A pre-body failure comes back as a single [`SseItem::Error`]
+/// carrying the provider's own message; a body read failure comes back through
+/// [`SseItem::End`] exactly as for [`spawn_sse_reader`].
+pub fn spawn_sse_stream<R, F>(open: F) -> std::sync::mpsc::Receiver<SseItem>
+where
+    R: Read + Send + 'static,
+    F: FnOnce() -> Result<R, String> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(64);
+    std::thread::spawn(move || match open() {
+        Ok(reader) => {
+            let res = read_sse(reader, |data| {
+                tx.send(SseItem::Data(data.to_string())).is_ok()
+            });
+            let _ = tx.send(SseItem::End(res));
+        }
+        // Best-effort: the receiver is already gone if the turn was cancelled.
+        Err(msg) => {
+            let _ = tx.send(SseItem::Error(msg));
+        }
+    });
+    rx
+}
+
 /// Drives a [`spawn_sse_reader`] channel, feeding each payload to `on_data`.
 ///
 /// The point of this loop is that it polls `interrupt` on a *clock* rather
@@ -222,6 +257,9 @@ pub fn pump_sse(
                     .map(|()| SseEnd::Finished)
                     .map_err(|e| format!("provider stream read: {e}"));
             }
+            // A pre-body failure carries the provider's own message; surface it
+            // as-is rather than dressing it up as a read error.
+            Ok(SseItem::Error(msg)) => return Err(msg),
             // The reader thread is gone without an `End` — it panicked, or the
             // channel was dropped. Treat it as a clean end: whatever arrived is
             // what there is.
@@ -340,6 +378,50 @@ mod tests {
         )
         .expect_err("a read error must not look like a clean finish");
         assert!(err.contains("connection reset"), "lost the cause: {err}");
+    }
+
+    /// The stream spawner runs the caller's `open` (connect + send + retries)
+    /// on the reader thread and then streams the body it returns, so a healthy
+    /// response is delivered payload-by-payload exactly like the plain reader.
+    #[test]
+    fn spawn_stream_delivers_body_from_a_successful_open() {
+        let raw = "data: one\n\ndata: two\n\n";
+        let rx = spawn_sse_stream(move || Ok(raw.as_bytes()));
+        let mut got = Vec::new();
+        let end = pump_sse(
+            &rx,
+            Duration::from_mins(1),
+            Duration::from_millis(5),
+            &|| false,
+            |d| {
+                got.push(d.to_string());
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(got, vec!["one", "two"]);
+        assert_eq!(end, SseEnd::Finished);
+    }
+
+    /// A pre-body failure (connect drop, retries exhausted, non-2xx status) is
+    /// surfaced *verbatim* — no `provider stream read:` prefix, which belongs
+    /// only to errors that happen while reading the body. The provider's own
+    /// message (e.g. "provider request failed (HTTP 401): bad key") must reach
+    /// the user unchanged.
+    #[test]
+    fn spawn_stream_surfaces_an_open_error_verbatim() {
+        let rx = spawn_sse_stream(|| -> Result<&[u8], String> {
+            Err("provider request failed (HTTP 401): bad key".to_string())
+        });
+        let err = pump_sse(
+            &rx,
+            Duration::from_mins(1),
+            Duration::from_millis(5),
+            &|| false,
+            |_| true,
+        )
+        .expect_err("an open failure must not look like a clean finish");
+        assert_eq!(err, "provider request failed (HTTP 401): bad key");
     }
 
     #[test]

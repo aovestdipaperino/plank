@@ -1150,13 +1150,31 @@ test` and review the diff before committing.
   rebind) produces no RST and no FIN, and once the request is fully sent plank
   is purely *receiving* — so there is no unacked data for TCP to retransmit and
   therefore no kernel timeout can ever fire. The socket sits established and
-  black-holed, and a blocking read on it parks forever. Every agent needs
-  explicit `timeout_connect` / `timeout_recv_response`; the streaming ones need
-  more than that, because `timeout_recv_body` bounds the *total* body duration
-  and so cannot tell a dead socket from a long healthy generation. The body
-  therefore gets an **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`),
-  which is only sound because both providers keepalive their SSE streams
-  (Anthropic `event: ping`, OpenAI comment frames).
+  black-holed, and a blocking read on it parks forever. Every agent needs an
+  explicit `timeout_connect`; the streaming ones can bound *nothing else* with a
+  ureq deadline, because `timeout_recv_body` bounds the *total* body duration and
+  so cannot tell a dead socket from a long healthy generation. The body gets an
+  **idle** timeout instead (`remote::STREAM_IDLE_TIMEOUT`), which is only sound
+  because both providers keepalive their SSE streams (Anthropic `event: ping`,
+  OpenAI comment frames).
+
+- **`timeout_recv_response` silently caps the whole body, not just the header
+  wait.** The obvious reading — "it bounds waiting for the response, the body is
+  separate" — is wrong in ureq 3.x. `timings::Timeout::preceeding` lists
+  `RecvResponse` as a *preceding* timeout of `RecvBody`, and `next_timeout` takes
+  the **min** across a phase and all its predecessors. `RecvResponse` is recorded
+  when the headers arrive (`run.rs`), so with `recv_body` unset the body's only
+  finite deadline becomes `headers_arrival + recv_response`. A 2-minute
+  `timeout_recv_response` therefore killed any turn whose prefill+generation ran
+  past 2 minutes of wall-clock — exactly the large-context case (523k input
+  tokens), surfacing as `provider stream read: timeout: receive response` (ureq's
+  own error, *not* plank's "stalled: no data" idle message). The fix is to set
+  **no** `recv_response` at all and run the whole connect+send+retry phase on the
+  reader thread (`remote::spawn_sse_stream`), so `pump_sse`'s idle timeout +
+  interrupt polling cover connect, prefill and streaming uniformly — the one
+  bound that can distinguish silence from a slow-but-live stream. Bonus: a
+  black-holed *connect* is now interruptible (it parks the reader thread, not the
+  turn), which the old synchronous send was not.
 
 - **Never poll a cancellation flag from a data-driven callback.** The provider
   and ds4 clients used to check `interrupt()` inside the `read_sse` callback,
