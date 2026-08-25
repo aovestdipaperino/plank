@@ -465,16 +465,17 @@ the command is not available.</p>
 <td>recognized as a command</td>
 </tr>
 <tr>
-<td><code>/grant</code></td>
-<td>recognized; approves a remote client's control request</td>
+<td><code>/grant [session]</code></td>
+<td>approves a remote client's control request</td>
 </tr>
 </tbody>
 </table>
 <p>Both are part of the remote-control surface described in <a
-href="10-remote-and-providers.html">Remote and hosted engines</a>. The
-local <code>/grant</code> handler is not wired into the UI yet, so today
-a remote client that needs to take control should be started against a
-server run with <code>--control-allow</code>.</p>
+href="10-remote-and-providers.html">Remote and hosted engines</a>.
+<code>/grant</code> matters only when the bridge was started with
+<code>/rc ask</code>, which withholds control from attaching clients
+until you approve each request; plain <code>/rc</code> grants it up
+front and leaves <code>/grant</code> with nothing to answer.</p>
 <h2 id="not-in-help">Not in <code>/help</code></h2>
 <p>Five arcade commands are deliberately absent from <code>/help</code>
 and from the completion popup. They are covered in <a

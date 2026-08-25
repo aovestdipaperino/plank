@@ -7,6 +7,43 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**The exit summary says where the session went.** It used to end with a peak
+prefill rate and a peak generation rate — one lucky pass each, which tells you
+nothing about the run you just had. Now every model that ran gets a line: time
+spent prefilling and time spent generating, each with the session's average
+rate, and time spent running tools.
+
+```
+avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+```
+
+That last number is the one nobody was measuring, and a turn that felt slow is
+often not the model at all.
+
+**The think segment shows the router working.** Two braille cells beside the
+reasoning level re-roll on every decoded token, standing in for the
+mixture-of-experts routing. Being straight about it: the real selection never
+leaves the GPU on the Metal path, so the pattern is derived from the token id.
+It is honest about sparsity, about routing changing every token, and about the
+same token lighting the same dots — and it does not know which experts. The
+reasoning level itself is now colored by how hard the model is thinking, red for
+`max` down to grey for `off`.
+
+**The decode rate stopped lying on long prompts.** It was timed from the start of
+the generation call, so it divided tokens by decode time plus prefill plus the
+wait for the first token, and opened far below the real rate. It is measured
+from the first token out now.
+
+**Greedy chain decode on Metal.** At temperature 0 a run of argmax tokens decodes
+with the next token id kept on-device, dropping the per-token GPU sync and logits
+readback. Output is bit-identical. Off on M5, where it measures slightly slower
+than the plain path.
+
+**The `--dspark` footer reads `1.5t/step`, not `1.5x`.** It was always tokens
+committed per speculative step, and that is not a wall-clock speedup: on Metal it
+sits above 1.0 on runs that decode *slower* than plain decode. Calling it a
+multiplier was the bug.
+
 **plank can read your screenshots.** Image pasting is on by default now, and paired
 with the [ocr-mcp](https://github.com/aovestdipaperino/ocr-mcp) server the model can
 act on what you paste: it calls `transcribe_image` on the cached path and gets the
@@ -29,7 +66,7 @@ what each one contributes and every warning. There is no installer and no market
 yet — you place the directory yourself. See
 [Extending plank](/guide/09-extending.html).
 
-**v3.0.0 is out**, and the beta channel has opened on 3.0.1. The patch number is
+**v3.2.0 is out**, and the beta channel has opened on 3.2.1. The patch number is
 still the channel: `.0` is stable, anything above it is beta.
 
 **Your session has a name from the first frame.** The memorable

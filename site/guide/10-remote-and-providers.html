@@ -338,10 +338,22 @@ comma-separated)</td>
 </table>
 <p>Missing and loopback Origins are always allowed; other browser
 Origins are refused by default.</p>
-<p>A remote client asking for control surfaces a notice locally and
-waits for approval. The local <code>/grant</code> command that approves
-it is not wired into the UI yet, so for now run the server with
-<code>--control-allow</code> when a remote client needs to drive.</p>
+<p><code>/rc</code> (and <code>/rc on</code>) pre-authorizes control:
+typing the command is your consent, so a client opening the link can
+drive immediately. <code>/rc ask</code> starts the same bridge without
+that consent. An attaching client then mirrors output but cannot drive;
+its request surfaces locally as
+<code>[remote session 3 wants control — /grant or /grant 3 to allow]</code>
+and waits. Bare <code>/grant</code> approves the oldest waiting request,
+<code>/grant 3</code> approves that session. Approving one request
+declines any others, since only one client can drive at a time.</p>
+<p>Some commands are refused over the wire rather than queued:
+<code>/open</code>, bare <code>/kvcache</code> and bare
+<code>/resume</code> need the local terminal, and <code>/rc</code>,
+<code>/quit</code>, <code>/exit</code> and <code>/grant</code> would cut
+off the client running them. The refusal comes back with its reason. The
+same commands with an argument (<code>/kvcache gc</code>,
+<code>/resume 3</code>) are not interactive and work normally.</p>
 <h2 id="--ui-remote"><code>--ui-remote</code></h2>
 <p>For driving the TUI from a test harness:</p>
 <pre class="sh"><code>plank --ui-remote=7777</code></pre>

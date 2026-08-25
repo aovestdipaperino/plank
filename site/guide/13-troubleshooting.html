@@ -324,10 +324,16 @@ anything else, use TLS or pass <code>--insecure</code> knowingly.</li>
 <li>A browser client needs its Origin allowed with
 <code>--control-origin</code>; missing and loopback Origins are always
 allowed, other browser Origins are refused by default.</li>
-<li>A remote client that needs to <em>drive</em> (not just mirror)
-currently needs the server started with <code>--control-allow</code>,
-because the local <code>/grant</code> approval is not wired into the UI
-yet.</li>
+<li>A remote client that mirrors but cannot <em>drive</em> is a bridge
+started with <code>/rc ask</code>: approve its request locally with
+<code>/grant</code> (or <code>/grant &lt;session&gt;</code>, the id in
+the notice). Plain <code>/rc</code> pre-authorizes control and has no
+such step.</li>
+<li>A remote command that comes back refused rather than running is the
+remote-safety gate, not a bug: <code>/open</code>, bare
+<code>/kvcache</code>, bare <code>/resume</code>, <code>/rc</code>,
+<code>/quit</code>, <code>/exit</code> and <code>/grant</code> cannot
+work over the wire, and the refusal says which case applies.</li>
 <li>A client whose unsent output exceeds
 <code>--control-queue-max</code> is evicted. A very slow link
 disconnecting mid-turn is that.</li>
