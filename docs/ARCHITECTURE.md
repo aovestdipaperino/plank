@@ -116,9 +116,10 @@ loop — with piped stdin there is no live input to multiplex.
   field inserted mid-struct upstream shifts everything after it with no compile
   error; `ffi::tests` pins every offset and the struct size against `offsetof`
   on the checked-out header.
-- `speeds.rs` — per-model peak prefill and generation rates for the current
-  session, printed in the exit message. Session-scoped and never persisted;
-  both rates exclude the first `STEADY_WARMUP_SECS` of their phase.
+- `speeds.rs` — per-model prefill, generation and tool-dispatch totals for the
+  current session (tokens and wall-clock seconds), printed in the exit message
+  as a time plus the session average rate for each phase. Session-scoped and
+  never persisted.
 - `ds4engine.rs` — the safe wrapper, split (issue #28) into `Ds4Model` (immutable
   `Arc`-shareable weights / tokenizer / Metal queue) and `Ds4Session` (one live
   FFI session, its KV suffix + cursor, implements `Engine`). The single-owner

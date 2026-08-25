@@ -89,7 +89,7 @@ plank --dspark --temp 0
 - `--dspark-confidence F` — pruning threshold, `0..1`. `0` forces fixed five-token blocks (diagnostics). The default is the engine's own and depends on the backend.
 - `--dspark-strict` — load the drafter but keep target-only decode, for comparisons and correctness checks.
 
-Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it actually pays depends on the engine build, the quant, and the machine — on an M5 Max it was a 0.71× *slowdown* until upstream pipelined the Metal verifier, after which the same measurement read 1.19×. Plank's exit message reports the session's peak prefill and generation rates, which is the quickest way to check on your own hardware.
+Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it actually pays depends on the engine build, the quant, and the machine — on an M5 Max it was a 0.71× *slowdown* until upstream pipelined the Metal verifier, after which the same measurement read 1.19×. Plank's exit message reports, per model, how long the session spent prefilling and generating with the average rate for each (and how long it spent in tools), which is the quickest way to check on your own hardware.
 
 ### Plank-only features
 

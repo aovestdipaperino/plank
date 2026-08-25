@@ -1430,6 +1430,41 @@ fn fmt_duration(d: std::time::Duration) -> String {
     }
 }
 
+/// Formats a phase duration for the end-of-session stats: sub-minute spans
+/// keep a decimal (`8.4s`) because a tool phase is often seconds long, longer
+/// ones round to `M:SS`.
+fn fmt_secs(secs: f64) -> String {
+    if secs < 60.0 {
+        return format!("{secs:.1}s");
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = secs as u64;
+    fmt_duration(std::time::Duration::from_secs(whole))
+}
+
+/// Times a tool dispatch and charges the elapsed wall-clock to `model` on drop,
+/// so an early return or a panic-free `?` still books the time it cost.
+struct ToolClock {
+    model: String,
+    start: Instant,
+}
+
+impl ToolClock {
+    /// Starts the clock for `model`.
+    fn start(model: String) -> Self {
+        Self {
+            model,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ToolClock {
+    fn drop(&mut self) {
+        crate::speeds::note_tool_time(&self.model, self.start.elapsed().as_secs_f64());
+    }
+}
+
 /// Running tally of provider token usage across a session's turns.
 #[derive(Debug, Clone, Copy, Default)]
 struct SessionUsage {
@@ -1680,8 +1715,8 @@ impl Agent<'_> {
                         }
                     }
                     EngineEvent::Prefill(p) => {
-                        // Every sample, not just the last: the peak is measured
-                        // from the warmup mark onward, which needs the series.
+                        // Every sample, not just the last: a pass that ends
+                        // without a final event still cost the time it cost.
                         crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
                         bar.show(&Status {
                             // A finished prefill means the engine is sampling,
@@ -1729,6 +1764,9 @@ impl Agent<'_> {
     /// for zero behavioral change; the special path only engages when the model
     /// actually delegates.
     fn run_tool_calls(&mut self, calls: &[ToolCall]) -> String {
+        // Charged to whichever engine is driving this turn — during a sidechain
+        // that is the alt engine, same rule as the token tally.
+        let _tool_clock = ToolClock::start(self.engine.model_name());
         // Holds the tool label in the status bar for the whole dispatch, then
         // clears it on drop whichever way we return.
         let _running = (!calls.is_empty()).then(|| {
@@ -3064,10 +3102,10 @@ impl Agent<'_> {
         if stats.spec.active() {
             self.last_spec = stats.spec;
         }
-        // Peak decode rate for this model, reported at exit. Attributed to the
-        // engine that actually ran the pass, which during a sidechain is the
-        // alt engine — same rule as the token tally below.
-        crate::speeds::note_generation(&self.engine.model_name(), stats.steady_tps);
+        // Decode tokens and time for this model, reported at exit. Attributed
+        // to the engine that actually ran the pass, which during a sidechain is
+        // the alt engine — same rule as the token tally below.
+        crate::speeds::note_generation(&self.engine.model_name(), stats.generated, stats.tps);
         // Engine-agnostic in/out tally. Must run before `self.last_ctx_used` is
         // updated for this pass, so the local input estimate below sees the
         // previous context size.
@@ -5032,7 +5070,7 @@ the original is frozen and listed in /tree"
             fmt_u64(s.input_tokens),
             fmt_u64(s.output_tokens),
         );
-        self.report_peak_speeds(bold, dim, reset);
+        Self::report_model_speeds(bold, dim, reset);
         // Only when more than one engine served: with a single one the rows
         // would just repeat the totals a line lower.
         if s.by_engine.len() < 2 {
@@ -5049,38 +5087,54 @@ the original is frozen and listed in /tree"
         }
     }
 
-    /// Prints the peak prefill and generation rates this session reached.
+    /// Prints, for each model that ran this session, how long it spent
+    /// prefilling and generating (with the average rate for each) and how long
+    /// it spent running tools.
     ///
-    /// Session-scoped: nothing is stored, so there is no cross-run "best" to
-    /// compare against — a peak from another day was a different engine build
-    /// on a cooler machine.
+    /// Averages rather than peaks: a peak is one lucky pass, while the average
+    /// beside the phase's wall-clock says where the session actually went.
+    ///
+    /// Session-scoped: nothing is stored, so there is no cross-run figure to
+    /// compare against — yesterday's was a different engine build on a cooler
+    /// machine.
     ///
     /// Silent for engines that never reported a rate — the echo stub, and
     /// online providers, whose throughput is someone else's network — so a
     /// provider-only session's exit message is unchanged.
-    fn report_peak_speeds(&self, bold: &str, dim: &str, reset: &str) {
-        let model = self.engine.model_name();
-        let best = crate::speeds::session_best(&model);
-        if best.is_empty() {
-            return;
+    fn report_model_speeds(bold: &str, dim: &str, reset: &str) {
+        let models = crate::speeds::session_all();
+        // One model gets no label column: the row is unambiguous without it.
+        let width = (models.len() > 1)
+            .then(|| models.iter().map(|(m, _)| m.chars().count()).max())
+            .flatten();
+        for (model, r) in &models {
+            let mut parts: Vec<String> = Vec::new();
+            if r.prefill_secs > 0.0 {
+                parts.push(format!(
+                    "prefill {bold}{}{reset} {dim}({:.1} tok/s){reset}",
+                    fmt_secs(r.prefill_secs),
+                    r.prefill_tps(),
+                ));
+            }
+            if r.gen_secs > 0.0 {
+                parts.push(format!(
+                    "generation {bold}{}{reset} {dim}({:.1} tok/s){reset}",
+                    fmt_secs(r.gen_secs),
+                    r.gen_tps(),
+                ));
+            }
+            if r.tool_secs > 0.0 {
+                parts.push(format!("tools {bold}{}{reset}", fmt_secs(r.tool_secs)));
+            }
+            if parts.is_empty() {
+                continue;
+            }
+            let sep = format!("  {dim}·{reset}  ");
+            match width {
+                Some(w) => println!("  {dim}{model:<w$}{reset}  {}", parts.join(&sep)),
+                None => println!("{dim}avg{reset} {model}  {}", parts.join(&sep)),
+            }
         }
-        let mut parts: Vec<String> = Vec::new();
-        if best.prefill_tps > 0.0 {
-            parts.push(format!(
-                "prefill {bold}{:.1}{reset} tok/s",
-                best.prefill_tps
-            ));
-        }
-        if best.gen_tps > 0.0 {
-            parts.push(format!("generation {bold}{:.1}{reset} tok/s", best.gen_tps));
-        }
-        if parts.is_empty() {
-            return;
-        }
-        println!(
-            "{dim}peak{reset} {model}  {}",
-            parts.join(&format!("  {dim}·{reset}  ")),
-        );
     }
 
     /// Writes a `/repro` diagnostic dump — the exact rendered engine input
@@ -9100,7 +9154,7 @@ impl Agent<'_> {
                     }
                 }
                 EngineEvent::Prefill(p) => {
-                    // Every sample feeds the peak; see the plain path.
+                    // Every sample feeds the totals; see the plain path.
                     crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
                     Status {
                         // See the plain-REPL path: a completed prefill is the

@@ -534,14 +534,14 @@ pub fn warm(
         }
         on_stage(t.kind);
         // Warming is where a cold session does its heaviest prefill — the
-        // system prompt and project context — so the peak prefill rate is
-        // mostly earned here rather than in a turn's own short suffix.
+        // system prompt and project context — so most of a session's prefill
+        // time is spent here rather than in a turn's own short suffix.
         // Recorded at the one chokepoint every front-end shares.
         let model = engine.model_name();
         // Buffered rather than recorded live: a tier served from a KV
         // checkpoint still reports its token count against an elapsed of
         // almost nothing, which reads as thousands of tok/s — a number no
-        // model produces, and one a peak would never let go of. `warm_sync`
+        // model produces, and one that would skew the average. `warm_sync`
         // only says whether it really prefilled once it returns.
         let mut samples: Vec<(i32, f64)> = Vec::new();
         let did_prefill = engine.warm_sync(&mut |ev| {
