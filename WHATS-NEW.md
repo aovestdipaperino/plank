@@ -13,9 +13,59 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-### 3.0.1
+### 3.2.1
 
-Pasted screenshots stop being filenames.
+Opens the new beta channel on the same code as 3.2.0. Nothing rides ahead of
+stable yet.
+
+## Stable releases
+
+### 3.2.0
+
+The 3.1 beta line, promoted: the status bar learns to show what the model is
+doing, the exit message learns to say where the session went, and — carried up
+from the 3.0 betas — plank learns to read the screenshots you paste at it.
+
+⏱️ **The exit summary reports where the time went, per model.** It used to print
+a peak prefill rate and a peak generation rate — one lucky pass each, which
+tells you nothing about the session you just had. Now every model that ran gets
+a line: how long it spent prefilling and how long generating, each with the
+session's average rate, and how long it spent running tools.
+
+```
+avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+```
+
+That last figure is the one nobody was measuring. A turn that feels slow is
+often not the model at all.
+
+🧠 **The think segment shows the router working.** Two braille cells beside the
+reasoning level re-roll on every decoded token, standing in for the mixture-of-
+experts routing. Being straight about it: the real selection never leaves the
+GPU on the Metal path, so plank derives the pattern from the token id. It is
+honest about sparsity, about routing changing every token, and about the same
+token lighting the same dots — and it does not know which experts. The reasoning
+level itself is now colored by temperature, red for `max` down to grey for
+`off`, so three columns are readable without reading the word.
+
+📉 **The decode rate in the footer stopped lying on long prompts.** It was timed
+from the start of the generation call, so it divided tokens by decode time plus
+prefill plus the wait for the first token, and opened far below the real rate.
+It is now measured from the first token out.
+
+⚡ **Greedy chain decode on Metal.** At temperature 0 a run of argmax tokens is
+decoded with the next token id kept on-device, dropping the per-token GPU sync
+and logits readback. Output is bit-identical. It is off on M5, where it measures
+slightly slower than the plain path — `PLANK_GREEDY_CHAIN=1` forces it on if you
+want to re-measure on your own machine.
+
+🔢 **The `--dspark` footer reads `1.5t/step`, not `1.5x`.** It was always tokens
+committed per speculative step, and that is not a wall-clock speedup: on Metal
+it sits above 1.0 on runs that decode *slower* than plain decode. Calling it a
+multiplier was the bug.
+
+And carried up from the 3.0 betas, which never got a stable entry of their own:
+pasted screenshots stop being filenames.
 
 👁️ **plank can finally read your screenshots.** Image pasting is on by default
 now, and paired with the new [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp)
@@ -39,8 +89,6 @@ and the DPI metadata that an OCR tool then needs. The bytes now land in
 
 One consequence worth knowing: the cache is bounded by file count, not bytes, so
 full-resolution captures make it larger than it used to be.
-
-## Stable releases
 
 ### 2.8.0
 

@@ -6,7 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+
+## [3.2.0] - 2026-08-25
+
 ### Added
+
+- **Per-model phase times in the exit message.** The session summary used to end
+  with one peak prefill and one peak generation rate. A peak is one lucky pass
+  and says nothing about where the session actually went, so it now reports, for
+  each model that ran, how long that model spent prefilling and generating with
+  the session average rate beside each, plus how long it spent running tools:
+
+  ```
+  avg deepseek-v4-flash  prefill 12.3s (1420.5 tok/s)  ·  generation 45.2s (38.1 tok/s)  ·  tools 8.4s
+  ```
+
+  With more than one model the rows are labeled and aligned with the per-engine
+  token rows below them. Tool time is charged at the single dispatch chokepoint
+  every front-end shares and attributed to whichever engine drove the turn — the
+  alt engine during a sidechain, same rule as the token tally. Online providers
+  report neither a token count nor a local rate, so a provider-only session's
+  exit message is unchanged.
+
+- **The think segment draws the router.** Two braille cells beside the reasoning
+  level stand in for the `MoE` expert routing, re-rolled on every decoded token.
+  The real selection never leaves the GPU on the Metal path, so the display is
+  derived from the token id rather than read from the engine: it is honest about
+  sparsity (a few of many), about routing changing per token, and about the same
+  token lighting the same experts — and says nothing about *which* experts. Two
+  columns wide, exactly like the 🧠 it replaces, so the footer never reflows.
+
+- **The reasoning level is colored by temperature** — red for `max`, white for
+  `med`, blue for `low`, grey for `off` — so a three-column segment is legible
+  without reading the word.
 
 - **Greedy chain decode on Metal**, via the ds4 engine's new
   `ds4_session_eval_chain_greedy`. At temperature 0 plank decodes a run of
@@ -24,6 +56,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   support model, so the two are mutually exclusive.
 
 ### Changed
+
+- **The live decode rate is measured from the first token out.** It was anchored
+  at the start of the `generate` call, so on a long prompt it divided the token
+  count by decode time *plus* prefill *plus* time-to-first-token: the footer
+  opened far below the real rate and only crept toward it as the pass ran.
 
 - **The `--dspark` footer segment now reads `1.5t/step`, not `1.5x`.** It was
   always mean tokens committed per speculative step, which is not a wall-clock
