@@ -111,15 +111,12 @@ unsafe extern "C" fn progress_cb(
 /// `mark` is the instant and token count at which the pass crossed
 /// [`crate::engine::STEADY_WARMUP_SECS`]; `generated` is the count now.
 fn steady_rate(mark: Option<(std::time::Instant, i32)>, generated: i32) -> f64 {
-    let Some((at, tokens_at)) = mark else {
-        return 0.0;
-    };
-    let secs = at.elapsed().as_secs_f64();
-    let tokens = generated - tokens_at;
-    if secs <= 0.0 || tokens < STEADY_MIN_TOKENS {
-        return 0.0;
+    // The span arithmetic is `rate_since`'s; what is specific to the steady rate
+    // is the floor on how much has to have happened after the mark.
+    match mark {
+        Some((_, tokens_at)) if generated - tokens_at < STEADY_MIN_TOKENS => 0.0,
+        mark => crate::engine::rate_since(mark, generated),
     }
-    f64::from(tokens) / secs
 }
 
 /// Tokens a pass must produce *after* the warmup before its steady rate is
@@ -630,6 +627,8 @@ unsafe extern "C" fn chain_on_token(
     }
     let text = ctx.utf8.push(ctx.model.token_bytes(token));
     ctx.reply_tokens.push(token);
+    // Feeds the status bar's expert-routing glyph; see `crate::experts`.
+    crate::status::note_routed_token(token);
     if !text.is_empty() {
         ctx.reply_text.push_str(&text);
         (ctx.on_event)(EngineEvent::Text(text));
@@ -1258,6 +1257,8 @@ impl Engine for Ds4Session {
                         }
                         let text = utf8.push(self.model.token_bytes(t));
                         reply_tokens.push(t);
+                        // Feeds the status bar's expert-routing glyph; see `crate::experts`.
+                        crate::status::note_routed_token(t);
                         if !text.is_empty() {
                             reply_text.push_str(&text);
                             on_event(EngineEvent::Text(text));
@@ -1280,6 +1281,8 @@ impl Engine for Ds4Session {
                     }
                     let text = utf8.push(self.model.token_bytes(token));
                     reply_tokens.push(token);
+                    // Feeds the status bar's expert-routing glyph; see `crate::experts`.
+                    crate::status::note_routed_token(token);
                     if !text.is_empty() {
                         reply_text.push_str(&text);
                         on_event(EngineEvent::Text(text));
@@ -1911,6 +1914,8 @@ impl HostSession for Ds4HostSession {
             }
             let text = st.utf8.push(self.inner.model.token_bytes(token));
             st.reply_tokens.push(token);
+            // Feeds the status bar's expert-routing glyph; see `crate::experts`.
+            crate::status::note_routed_token(token);
             if !text.is_empty() {
                 st.reply_text.push_str(&text);
                 sink(EngineEvent::Text(text));

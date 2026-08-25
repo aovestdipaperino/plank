@@ -3645,7 +3645,30 @@ impl Agent<'_> {
                 }
                 None => println!("usage: /power <1..100>"),
             },
-            "/think" => println!("{}", self.think_command(arg)),
+            "/think" => {
+                // A level change that moves the effort preamble re-warms the KV
+                // before returning. The plain REPL has no persistent prompt to
+                // replace, so the analogue of the TUI throbber is one transient
+                // stderr line, erased once the KV is back (matching `/clear`).
+                let color = self.color;
+                let mut announced = false;
+                let msg = self.think_command(arg, &mut || {
+                    if !announced {
+                        announced = true;
+                        if color {
+                            eprint!("\x1b[33mre-warming the cache…{ANSI_RESET}");
+                        } else {
+                            eprint!("re-warming the cache…");
+                        }
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    }
+                });
+                if announced {
+                    eprint!("\r\x1b[2K");
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                println!("{msg}");
+            }
             "/notify" => println!("{}", Self::notify_command(arg)),
             // Non-advertised: re-shows the last desktop notification so it can be
             // screenshotted. Not in `/help` or `slash_command_known`.
@@ -4621,8 +4644,15 @@ the original is frozen and listed in /tree"
     /// smaller context is not meant to hold, and a refusal the user can act on
     /// (raise `--ctx-size`) beats the C's silent downgrade to `medium`.
     ///
+    /// `on_progress` is forwarded to [`Self::rewarm_after_reset`], so it fires
+    /// only for a level change that moves the effort preamble *and* lands on a
+    /// session with unsaved activity behind it. That re-warm is a blocking,
+    /// uninterruptible read of tens of megabytes, so a front end that cannot
+    /// paint during it looks frozen — which is what `/think max` did. Each
+    /// front-end passes the same indicator it uses for `/clear`.
+    ///
     /// [`THINK_MAX_MIN_CONTEXT`]: crate::engine::THINK_MAX_MIN_CONTEXT
-    fn think_command(&mut self, arg: &str) -> String {
+    fn think_command(&mut self, arg: &str, on_progress: &mut dyn FnMut()) -> String {
         use crate::engine::{THINK_MAX_MIN_CONTEXT, ThinkMode};
 
         let current = self.think;
@@ -4663,9 +4693,24 @@ the original is frozen and listed in /tree"
         }
         // Only the live engine is re-warmed: an alt engine's own first take
         // restores its Tier 1 checkpoint under the new fingerprint.
+        // Skipped on a clean session: the re-warm exists to reinstate a *live*
+        // frontier the engine would otherwise discard behind its end, and a
+        // session with nothing to save has none — only the startup warm (or
+        // `/clear`'s), keyed to the level we just left. Rebuilding it now would
+        // block the front end for a checkpoint the next turn may never want
+        // (nothing stops a second `/think`), and when that turn does come it
+        // prefills under its own drawn progress bar. So `/think` as the opening
+        // move of a session is instant, which is when it is usually set.
+        //
+        // `dirty` rather than `last_ctx_used`: it is the broader flag of the two
+        // — a turn always sets it, so no real frontier is ever missed — at the
+        // cost of re-warming after a change that dirtied the session without
+        // generating anything, such as `/tag`.
         if prefix_changed {
             self.local_alt_warmed = false;
-            self.rewarm_after_reset(&mut || {});
+            if self.session.dirty {
+                self.rewarm_after_reset(on_progress);
+            }
         }
         format!("thinking {}", level.name())
     }
@@ -9012,7 +9057,12 @@ impl Agent<'_> {
         // running figures, not just the one built by a Spec event.
         let mut spec = crate::engine::SpecStats::default();
         let verb = status::random_verb_index();
-        let start = Instant::now();
+        // Marks the first token out, so the live decode rate is measured over the
+        // decode phase alone. Anchoring it at the pass's start instead folded in
+        // the sync/prefill and the time-to-first-token, which on a long prompt
+        // showed a rate far below the real one that only crept up as the pass
+        // ran (`crate::engine::rate_since`).
+        let mut gen_mark: Option<(Instant, i32)> = None;
 
         let interrupt = || {
             shared.interrupt.load(Ordering::Relaxed)
@@ -9031,17 +9081,15 @@ impl Agent<'_> {
                         preflight_stop.store(true, Ordering::Relaxed);
                     }
                     gen_count += 1;
-                    let secs = start.elapsed().as_secs_f64();
+                    if gen_mark.is_none() {
+                        gen_mark = Some((Instant::now(), gen_count));
+                    }
                     Status {
                         spec,
                         state: WorkerState::Generating,
                         generated: gen_count,
                         prefill_label: verb,
-                        gen_tps: if secs > 0.0 {
-                            f64::from(gen_count) / secs
-                        } else {
-                            0.0
-                        },
+                        gen_tps: crate::engine::rate_since(gen_mark, gen_count),
                         elapsed_secs: turn_start.elapsed().as_secs_f64(),
                         ctx_used: prompt_tokens + gen_count,
                         ctx_size,
@@ -9684,7 +9732,32 @@ impl Agent<'_> {
                 None => log.push_plain("usage: /power <1..100>"),
             },
             "/think" => {
-                let msg = self.think_command(arg);
+                // Moving to (or off) `max` changes the effort preamble, which
+                // re-warms the KV inline — long enough to notice. Pin a throbber
+                // and redraw on every tick, the same "agent is busy" shape
+                // `/clear` uses (`draw` with `input: None`), so no input can be
+                // typed into a session whose KV is still being restored.
+                let msg = self.think_command(arg, &mut || {
+                    log.set_progress(Some(tui::progress_line(&format!(
+                        "{} re-warming the cache",
+                        crate::status::throbber()
+                    ))));
+                    let (l, v) = (&*log, &mut *view);
+                    let _ = terminal.draw(|f| {
+                        tui::draw(
+                            f,
+                            l,
+                            None,
+                            "",
+                            v,
+                            None,
+                            &tui::TaskView::default(),
+                            None,
+                            &tui::RosterView::default(),
+                        );
+                    });
+                });
+                log.set_progress(None);
                 log.push_plain(msg);
             }
             "/notify" => log.push_plain(Self::notify_command(arg)),
@@ -13774,7 +13847,7 @@ mod tests {
         let dir = scratch_dir("think-report");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let out = agent.think_command("");
+        let out = agent.think_command("", &mut || {});
         assert!(out.contains("off"), "got: {out}");
         assert!(out.contains("medium") && out.contains("max"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Off);
@@ -13794,13 +13867,13 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let out = agent.think_command("medium");
+        let out = agent.think_command("medium", &mut || {});
         assert!(out.contains("medium"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Medium);
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Medium]);
 
         // A no-op change says so and does not disturb the engine.
-        let out = agent.think_command("medium");
+        let out = agent.think_command("medium", &mut || {});
         assert!(out.contains("already"), "got: {out}");
         assert_eq!(seen.lock().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
@@ -13871,7 +13944,7 @@ mod tests {
         );
         agent.local_alt_warmed = true;
 
-        let out = agent.think_command("max");
+        let out = agent.think_command("max", &mut || {});
         assert!(out.contains("max"), "got: {out}");
 
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
@@ -13880,6 +13953,52 @@ mod tests {
             "a new fingerprint means a new checkpoint to restore"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A level change that moves the effort preamble re-warms the KV before
+    /// returning — a blocking read of tens of megabytes
+    /// (`rewarm_after_reset`). It therefore has to hand the front end a progress
+    /// tick, exactly as `/clear` does: without one the caller cannot paint or
+    /// read input for the whole restore, which is a frozen UI, not a slow one.
+    /// `max` is where it was noticed (the longest preamble, so the longest
+    /// rebuild), but `low` moves the preamble too — only `off` and `medium`
+    /// share one.
+    ///
+    /// Two things must *not* tick, and both are the point: a change that leaves
+    /// the preamble alone has nothing to rebuild, and a clean session has no
+    /// live frontier to reinstate — setting the level as the opening move of a
+    /// session must be instant.
+    #[test]
+    fn think_command_reports_progress_only_when_it_rewarms() {
+        let dir = scratch_dir("think-progress");
+        let cfg = test_cfg();
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                ctx_override: Some(crate::engine::THINK_MAX_MIN_CONTEXT),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+
+        // First command of the session: nothing to save, so nothing to re-warm.
+        assert!(!agent.session.dirty, "a fresh session starts clean");
+        let mut ticks = 0usize;
+        let out = agent.think_command("max", &mut || ticks += 1);
+        assert!(out.contains("max"), "got: {out}");
+        assert_eq!(ticks, 0, "a /think on a clean session must be instant");
+
+        // With activity behind it there is a frontier worth reinstating.
+        agent.session.dirty = true;
+        let out = agent.think_command("medium", &mut || ticks += 1);
+        assert!(out.contains("medium"), "got: {out}");
+        assert!(ticks > 0, "the re-warm must be visible to the front end");
+
+        // `off` and `medium` share the empty preamble, so this pair is the free
+        // one: nothing to rebuild, nothing to announce, turn or no turn.
+        ticks = 0;
+        agent.think_command("off", &mut || ticks += 1);
+        assert_eq!(ticks, 0, "no preamble change, no re-warm, no indicator");
     }
 
     // `low` is selectable at any context — unlike `max` it has no floor — and
@@ -13895,13 +14014,13 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let out = agent.think_command("low");
+        let out = agent.think_command("low", &mut || {});
         assert!(out.contains("low"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Low);
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Low]);
 
         // And the level listing offers it, so it is discoverable.
-        let out = agent.think_command("");
+        let out = agent.think_command("", &mut || {});
         assert!(out.contains("low"), "got: {out}");
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -13919,7 +14038,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let out = agent.think_command("max");
+        let out = agent.think_command("max", &mut || {});
         assert!(
             out.contains(&crate::engine::THINK_MAX_MIN_CONTEXT.to_string()),
             "the refusal must name the context it needs; got: {out}"
@@ -13942,7 +14061,7 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, engine, &cfg);
 
-        let out = agent.think_command("max");
+        let out = agent.think_command("max", &mut || {});
         assert!(out.contains("max"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Max);
         assert_eq!(*seen.lock().unwrap(), vec![ThinkMode::Max]);
@@ -13954,7 +14073,7 @@ mod tests {
         let dir = scratch_dir("think-bad");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let out = agent.think_command("turbo");
+        let out = agent.think_command("turbo", &mut || {});
         assert!(out.contains("turbo"), "got: {out}");
         assert_eq!(agent.think, ThinkMode::Off, "level unchanged");
         std::fs::remove_dir_all(&dir).ok();

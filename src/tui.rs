@@ -3757,38 +3757,49 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // The think segment is its own span: plain, like the ctx gauge and power
     // suffix it sits beside, and kept away from `push_accented`'s verb shimmer.
     //
-    // While the *local* engine is prefilling or generating, its brain blinks —
-    // the one on-screen signal that says which engine is actually working, which
-    // is otherwise invisible for a `provider: local` sidechain under a remote
-    // main agent.
+    // While the *local* engine is prefilling or generating, the brain gives way
+    // to `crate::experts`' routing glyph: the one on-screen signal that says
+    // which engine is actually working, which is otherwise invisible for a
+    // `provider: local` sidechain under a remote main agent. It replaced a blink
+    // because a two-state pulse says only "something is happening", while the
+    // glyph carries the shape of the work — a few of many experts per token,
+    // changing every token. It is a stand-in, not a readout; `crate::experts`
+    // documents exactly what it does and does not claim.
     //
-    // The dark half replaces the glyph with its own width in spaces, so the
-    // brain genuinely disappears and the rest of the bar holds still. Styling
-    // the emoji is not an option: `THINK_MARK` is a color emoji, and a terminal
-    // paints those from the glyph's own palette — an earlier version dimmed its
-    // foreground, which a terminal simply does not render.
+    // Braille rather than a second emoji so the segment can carry the theme
+    // color: `THINK_MARK` is a color emoji, and a terminal paints those from the
+    // glyph's own palette — an earlier version dimmed its foreground, which a
+    // terminal simply does not render. Two cells, matching the brain's two
+    // columns, so the swap never reflows the bar.
     //
-    // Phased off the pass's own elapsed time rather than `tick_ms`: the status
-    // bar redraws when a prefill/generation event lands — the same event that
-    // moves the `9s` and `t/s` readouts — so tying the blink to that interval
-    // keeps the two in step and makes every pass start with the brain showing.
+    // Seeded off the live token (else off the pass's own elapsed time, not
+    // `tick_ms`): the status bar redraws when a prefill/generation event lands —
+    // the same event that moves the `9s` and `t/s` readouts — so the glyph steps
+    // in time with the counters beside it.
     if text.starts_with(think_mark)
         && let Some(i) = text.find(" | ")
     {
         let segment = &text[..i];
-        let showing = !crate::status::local_pass_active()
-            || crate::anim::reduced_motion()
-            || crate::status::brain_blink_on(crate::status::local_pass_ms());
-        if showing {
-            spans.push(Span::styled(segment.to_string(), base));
-        } else {
-            let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
+        // Reduced motion holds the static brain, like every other effect.
+        let routing = crate::status::local_pass_active() && !crate::anim::reduced_motion();
+        let rest = segment.strip_prefix(think_mark).unwrap_or(segment);
+        // The level name is temperature-colored (`crate::status::think_color`).
+        // The level is read back out of the rendered footer rather than threaded
+        // in: `ThinkMode::parse` accepts the footer's own three-column spelling
+        // for exactly this kind of round-trip. An unparseable segment (a level
+        // this build does not know) simply stays plain.
+        let level = crate::engine::ThinkMode::parse(rest).map_or(base, |m| {
+            base.fg(Color::Indexed(crate::status::think_color(m)))
+        });
+        if routing {
             spans.push(Span::styled(
-                " ".repeat(UnicodeWidthStr::width(think_mark)),
-                base,
+                crate::experts::glyphs(crate::status::routing_seed()),
+                theme,
             ));
-            spans.push(Span::styled(rest.to_string(), base));
+        } else {
+            spans.push(Span::styled(think_mark.to_string(), base));
         }
+        spans.push(Span::styled(rest.to_string(), level));
         spans.push(Span::styled(" | ".to_string(), base));
         text = &text[i + " | ".len()..];
     }
@@ -5399,11 +5410,24 @@ mod tests {
             .expect("branch span ends at the branch");
         assert_eq!(branch.style.fg, Some(theme));
 
-        // The segment renders as its own plain span, and only once.
+        // The mark renders as its own span, plain like the ctx gauge, and only
+        // once. The level rides in the span after it, temperature-colored — red
+        // here, `max` being the hottest level.
         let think: Vec<_> = line.iter().filter(|s| s.content.contains(mark)).collect();
         assert_eq!(think.len(), 1, "{line:?}");
-        assert_eq!(think[0].content, format!("{mark} max"));
+        assert_eq!(think[0].content, mark);
         assert_eq!(think[0].style.fg, None, "plain, like the ctx gauge");
+        let level = line
+            .iter()
+            .find(|s| s.content.contains("max"))
+            .expect("level span present");
+        assert_eq!(
+            level.style.fg,
+            Some(Color::Indexed(crate::status::think_color(
+                crate::engine::ThinkMode::Max
+            ))),
+            "the level is temperature-colored"
+        );
 
         // Nothing is dropped: the rendered spans still spell the input.
         let joined: String = line.iter().map(|s| s.content.as_ref()).collect();
@@ -5540,19 +5564,17 @@ mod tests {
         );
     }
 
-    /// The brain blinks only while a local pass is in flight, and the dark half
-    /// is the glyph's own width in spaces so the bar never reflows. This is the
+    /// The routing glyph replaces the brain for exactly the span of a local
+    /// pass, in the glyph's own width, so the bar never reflows. This is the
     /// only signal that says *which* engine is working, so it has to hold still
-    /// when nothing local is running and actually alternate when something is.
+    /// (as the brain) when nothing local is running and actually move when
+    /// something is.
     ///
-    /// Asserts on the glyph's presence and the row's width, not on a color:
-    /// `THINK_MARK` is a color emoji, and an earlier version that changed its
-    /// foreground passed a color assertion while the screen showed nothing.
-    ///
-    /// The phase comes from the pass's own elapsed time, not from `tick_ms`, so
-    /// the sweep here moves the pass clock rather than the animation clock.
+    /// The seed comes from the pass's own elapsed time when no token has been
+    /// decoded, so the sweep here moves the pass clock rather than the animation
+    /// clock.
     #[test]
-    fn the_brain_blinks_only_while_a_local_pass_runs() {
+    fn the_routing_glyph_replaces_the_brain_only_while_a_local_pass_runs() {
         let base = Style::default();
         let mark = crate::status::THINK_MARK;
         let text = format!("~/x | {mark} med | ctx 12% | generating");
@@ -5563,47 +5585,44 @@ mod tests {
                 .collect()
         };
         let brain_showing = || rows().iter().any(|r| r.contains(mark));
-        // Every rendering must occupy the same columns, blinked or not.
+        // Every rendering must occupy the same columns, brain or braille.
         let widths = |r: &[String]| -> Vec<usize> { r.iter().map(|l| l.width()).collect() };
         let reference = widths(&rows());
 
-        // Idle: showing, whatever the clock is doing.
+        // Idle: the brain, whatever the clock is doing.
         assert!(!crate::status::local_pass_active());
-        assert!(brain_showing(), "no blink when nothing local is running");
+        assert!(brain_showing(), "no routing when nothing local is running");
 
-        // A local pass in flight: both phases appear across one cycle, and it
-        // starts showing — the point of phasing off the pass's own clock.
         {
             let _guard = crate::status::LocalPass::begin();
             assert!(crate::status::local_pass_active());
-            assert!(brain_showing(), "a pass starts with the brain showing");
-            let phases: Vec<bool> = (0..8u64)
+            assert!(!brain_showing(), "a local pass draws the routing instead");
+
+            // Frames actually advance with the pass clock, and every one of them
+            // keeps the bar's columns.
+            let frames: std::collections::HashSet<Vec<String>> = (0..8u64)
                 .map(|step| {
-                    crate::status::set_local_pass_ms(step * crate::status::BRAIN_BLINK_MS / 8);
-                    assert_eq!(widths(&rows()), reference, "the bar holds its columns");
-                    brain_showing()
+                    crate::status::set_local_pass_ms(step * crate::status::EXPERT_FRAME_MS);
+                    let r = rows();
+                    assert_eq!(widths(&r), reference, "the bar holds its columns");
+                    r
                 })
                 .collect();
-            assert!(phases.contains(&false), "{phases:?}");
-            assert!(phases.contains(&true), "{phases:?}");
+            assert!(frames.len() > 1, "the glyph never moved: {frames:?}");
 
-            // Reduced motion collapses the blink to its static form like every
-            // other effect: showing, even mid-cycle where it would otherwise be
-            // dark. Asserted here rather than in a test of its own — both the
+            // Reduced motion collapses it to the static brain like every other
+            // effect. Asserted here rather than in a test of its own — both the
             // reduced-motion toggle and the local-pass flag are process-global,
             // so two tests holding them would race under the default harness.
-            crate::status::set_local_pass_ms(crate::status::BRAIN_BLINK_MS * 3 / 4);
-            assert!(!brain_showing(), "the phase used for the check");
             crate::anim::set_reduced_motion(true);
-            let still_showing = brain_showing();
+            let brain_back = brain_showing();
             crate::anim::set_reduced_motion(false);
-            assert!(still_showing, "reduced motion holds the brain showing");
+            assert!(brain_back, "reduced motion holds the brain");
 
             // And end-to-end through a real terminal buffer, which is the only
-            // place the property that matters is visible: the dark half leaves
-            // the emoji's cells genuinely blank and everything after them
-            // exactly where it was. Folded in here rather than given a test of
-            // its own because the local-pass flag is process-global.
+            // place the property that matters is visible: the braille lands in
+            // the emoji's cells and everything after it stays exactly where it
+            // was. Folded in here because the local-pass flag is process-global.
             let rendered = |ms: u64| -> String {
                 crate::status::set_local_pass_ms(ms);
                 let mut term =
@@ -5630,20 +5649,19 @@ mod tests {
                     .collect::<Vec<_>>()
                     .join("\n")
             };
-            let on = rendered(0);
-            let off = rendered(crate::status::BRAIN_BLINK_MS * 3 / 4);
-            assert!(on.contains(mark), "the lit half draws the brain: {on:?}");
-            assert!(!off.contains(mark), "the dark half does not: {off:?}");
-            assert_eq!(
-                on.chars().count(),
-                off.chars().count(),
-                "only the glyph's own cells changed"
+            let screen = rendered(0);
+            assert!(!screen.contains(mark), "the brain is gone: {screen:?}");
+            assert!(
+                screen
+                    .chars()
+                    .any(|c| ('\u{2800}'..='\u{28ff}').contains(&c)),
+                "braille drawn: {screen:?}"
             );
-            assert!(off.contains("med | ctx 12%"), "{off:?}");
+            assert!(screen.contains("med | ctx 12%"), "{screen:?}");
         }
 
         // And the guard's drop ends it, so a finished pass cannot leave the bar
-        // blinking forever.
+        // animating forever.
         assert!(!crate::status::local_pass_active());
         assert!(brain_showing());
     }

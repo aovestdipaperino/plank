@@ -559,6 +559,31 @@ impl TokenUsage {
 /// from the progress event stream) so both mean the same thing by "steady".
 pub const STEADY_WARMUP_SECS: f64 = 2.0;
 
+/// Tokens produced *after* `mark` over the time since it, or 0 when there is no
+/// mark yet or nothing has been produced since.
+///
+/// The mark is `(instant, count)` at the moment a phase genuinely began — for
+/// decoding, the first token out. Rates measured from anything earlier fold the
+/// phases together: a live figure anchored at the start of a `generate` call
+/// divides the token count by decode time *plus* prefill time *plus* the
+/// time-to-first-token, which reads far below the real decode rate on a long
+/// prompt and only creeps up as the pass runs.
+///
+/// One token is no rate, so a mark's own token does not count toward its
+/// numerator: `count - count_at` tokens over the span they actually took.
+#[must_use]
+pub fn rate_since(mark: Option<(std::time::Instant, i32)>, count: i32) -> f64 {
+    let Some((at, count_at)) = mark else {
+        return 0.0;
+    };
+    let secs = at.elapsed().as_secs_f64();
+    let tokens = count - count_at;
+    if secs <= 0.0 || tokens <= 0 {
+        return 0.0;
+    }
+    f64::from(tokens) / secs
+}
+
 /// Outcome of a generation pass.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationStats {
@@ -1215,6 +1240,23 @@ mod tests {
     }
 
     // The default is ordinary thinking, the level plank has always run at.
+    #[test]
+    fn rate_since_measures_only_the_span_after_the_mark() {
+        use std::time::{Duration, Instant};
+        // No mark: the phase has not started, so there is no rate to report.
+        assert!((super::rate_since(None, 10) - 0.0).abs() < f64::EPSILON);
+        // The mark's own token is not in the numerator — one token is no rate.
+        let at = Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("a second before now");
+        assert!((super::rate_since(Some((at, 1)), 1) - 0.0).abs() < f64::EPSILON);
+        // Nine tokens in the second since the mark.
+        let r = super::rate_since(Some((at, 1)), 10);
+        assert!((r - 9.0).abs() < 0.5, "got {r}");
+        // A backwards count cannot produce a negative rate.
+        assert!((super::rate_since(Some((at, 10)), 4) - 0.0).abs() < f64::EPSILON);
+    }
+
     #[test]
     fn think_mode_defaults_to_medium() {
         assert_eq!(ThinkMode::default(), ThinkMode::Medium);

@@ -48,6 +48,27 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// `push_dir_prefix` mistake it for part of the branch name.
 pub const THINK_MARK: &str = "🧠";
 
+/// The think segment's level name colored by *temperature*: the hotter the
+/// reasoning effort, the hotter the color. Red for `max`, white for `med`, blue
+/// for `low`, grey for `off` — so the level is legible at a glance, from a
+/// segment only three columns wide, without reading the word.
+///
+/// A 256-color index rather than an RGB triple: the footer is written as
+/// `38;5;<n>` escapes on the plain path and as `Color::Indexed` in the TUI, and
+/// one number serves both. Grey 245 rather than the 240 used for dim text
+/// elsewhere: the status bar's own background is 238, and 240 on 238 is not a
+/// contrast so much as a rumor.
+#[must_use]
+pub fn think_color(mode: crate::engine::ThinkMode) -> u8 {
+    use crate::engine::ThinkMode;
+    match mode {
+        ThinkMode::Max => 196,
+        ThinkMode::Medium => 231,
+        ThinkMode::Low => 39,
+        ThinkMode::Off => 245,
+    }
+}
+
 const PROGRESS_BAR_WIDTH: usize = 32;
 
 /// Worker lifecycle state mirrored from `agent_worker_state`.
@@ -877,6 +898,7 @@ impl LocalPass {
             crate::anim::epoch_ms(),
             std::sync::atomic::Ordering::Relaxed,
         );
+        ROUTED_TOKEN.store(NO_ROUTED_TOKEN, std::sync::atomic::Ordering::Relaxed);
         LOCAL_PASS.store(true, std::sync::atomic::Ordering::Relaxed);
         Self
     }
@@ -926,15 +948,44 @@ pub(crate) fn set_local_pass_ms(ms: u64) {
 static LOCAL_PASS_OVERRIDE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX);
 
-/// How long one on/off cycle of the local-engine brain blink takes. Slower than
-/// the tool blink: this is a reassurance, not an alert, and a fast pulse next to
-/// the shimmering verb would be noise.
-pub const BRAIN_BLINK_MS: u64 = 1200;
+/// Sentinel for "no token has been decoded in this pass yet".
+const NO_ROUTED_TOKEN: u64 = u64::MAX;
 
-/// Whether the brain is in the lit half of its blink at `tick_ms`.
+/// The token whose expert routing the think segment is currently drawing.
+///
+/// Process-global for the same reason [`LOCAL_PASS`] is: the pass runs on the
+/// worker thread while the TUI draws on the UI thread, and the renderer only
+/// ever receives the rendered status string.
+static ROUTED_TOKEN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(NO_ROUTED_TOKEN);
+
+/// Records the token just decoded, so [`crate::experts`] can draw its routing.
+///
+/// Called from the local decode loop; a pass that never reports one (prefill, or
+/// any engine but the native one) falls back to the pass clock in
+/// [`routing_seed`], so the glyph still animates on the `EchoEngine` path.
+pub fn note_routed_token(token: i32) {
+    ROUTED_TOKEN.store(
+        u64::from(token.unsigned_abs()),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// How long one expert frame holds when the seed comes from the clock rather
+/// than from a real token. Close to a fast decode rate: slow enough to read as
+/// distinct frames, fast enough to look like work.
+pub const EXPERT_FRAME_MS: u64 = 120;
+
+/// The seed [`crate::experts`] draws the current routing from: the live token
+/// when the decode loop is reporting them, else the pass clock in frame steps.
 #[must_use]
-pub fn brain_blink_on(tick_ms: u64) -> bool {
-    tick_ms % BRAIN_BLINK_MS < BRAIN_BLINK_MS / 2
+pub fn routing_seed() -> u64 {
+    let token = ROUTED_TOKEN.load(std::sync::atomic::Ordering::Relaxed);
+    if token == NO_ROUTED_TOKEN {
+        local_pass_ms() / EXPERT_FRAME_MS
+    } else {
+        token
+    }
 }
 
 /// Sets the running-tools label for as long as the guard lives, then hands it
@@ -1260,7 +1311,18 @@ fn build_status_text_with_cells(
     // worth a permanent slot rather than appearing only when off the default.
     // Abbreviated to a fixed three columns so changing level does not shift the
     // rest of the footer sideways.
-    let think = format!("{THINK_MARK} {} | ", st.think.short_name());
+    // The level itself is temperature-colored (see `think_color`); the mark and
+    // separator stay in the footer's own style.
+    let level = if color {
+        format!(
+            "\x1b[38;5;{}m{}{STATUS_STYLE_START}",
+            think_color(st.think),
+            st.think.short_name()
+        )
+    } else {
+        st.think.short_name().to_owned()
+    };
+    let think = format!("{THINK_MARK} {level} | ");
     let power = power_suffix(st);
     // Theme-colored accent text; returns to the footer style (not a full
     // reset) so the status bar's background survives on color terminals.
@@ -1959,6 +2021,46 @@ mod tests {
         // Leave the process-global clean for other tests in this binary.
         clear_flash_tip();
         assert_eq!(flash_tip(), None);
+    }
+
+    /// The level is colored by temperature — red `max`, white `med`, blue `low`,
+    /// grey `off` — and the four are distinct, which is the whole point: the
+    /// color has to identify the level on its own, from three columns.
+    ///
+    /// Colored only when the caller asked for color; the TUI renders the footer
+    /// plain and re-styles it span by span, so an escape leaking into that text
+    /// would be drawn literally.
+    #[test]
+    fn the_think_level_is_colored_by_temperature() {
+        use crate::engine::ThinkMode;
+
+        let levels = [
+            ThinkMode::Off,
+            ThinkMode::Low,
+            ThinkMode::Medium,
+            ThinkMode::Max,
+        ];
+        let colors: std::collections::HashSet<u8> =
+            levels.iter().map(|&m| think_color(m)).collect();
+        assert_eq!(colors.len(), levels.len(), "a shared color hides a level");
+        // Hotter effort, hotter color: max is the red one, off the grey one.
+        assert_eq!(think_color(ThinkMode::Max), 196);
+        assert_eq!(think_color(ThinkMode::Off), 245);
+
+        for level in levels {
+            let st = Status {
+                think: level,
+                ctx_size: 1000,
+                ctx_used: 30,
+                ..Status::default()
+            };
+            let want = format!("\x1b[38;5;{}m{}", think_color(level), level.short_name());
+            let colored = build_status_text(&st, true, true);
+            assert!(colored.contains(&want), "{level:?}: {colored:?}");
+            let plain = build_status_text(&st, false, true);
+            assert!(!plain.contains("\x1b["), "{level:?}: {plain:?}");
+            assert!(plain.contains(level.short_name()), "{level:?}: {plain:?}");
+        }
     }
 
     /// The think segment sits immediately before the ctx gauge, in every state,
