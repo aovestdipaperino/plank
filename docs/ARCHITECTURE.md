@@ -20,6 +20,18 @@ for wire formats and prompt text.
   syntax, and the system prompt are reproduced verbatim from the C reference.
 - **Correctness before cleverness.** The KV cache reuses only a genuinely
   matching token prefix; a stale disk checkpoint is rebuilt, never trusted.
+- **The log-everything invariant.** Anything that reaches a model request must
+  be reconstructible from the session log — either as a transcript entry, or
+  as the separately-fingerprinted system prompt. `/fork`, `/clone`,
+  `/rollback`, `/checkpoint`, `/branch`, `/resume` and `/repro` all replay the
+  transcript, and a replayed transcript that differs from the recorded one
+  produces a KV prefix that silently disagrees with the blob on disk. This is
+  the text-level analogue of the KV discipline in `docs/KV-CACHING.md` (a
+  blob's embedded signature is the sole trust input): the same rule applied to
+  text instead of tensors. Where content is injected at request-assembly time,
+  log the *rendered* text as a system-role transcript entry at the moment it
+  is injected, rather than recomputing it at replay time. Deliberate
+  exceptions are recorded in `FINDINGS.md` with the reason.
 
 ## Layers
 

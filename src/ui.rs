@@ -806,7 +806,12 @@ fn push_session_context(session: &mut Session, content: &ContextContent) {
 }
 
 /// Renders the session transcript as plain text for the engine.
-fn render_transcript(session: &Session, system: &str) -> String {
+///
+/// `pub` so the log-everything invariant test (`tests/log_invariant.rs`) can
+/// assemble the real request and assert every span of it is attributable to a
+/// transcript entry or the system prompt.
+#[must_use]
+pub fn render_transcript(session: &Session, system: &str) -> String {
     use std::fmt::Write as _;
     let mut out = format!("[system]\n{system}\n");
     // Append-only invariant (matching the C's token transcript): nothing is

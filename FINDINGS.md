@@ -635,6 +635,30 @@ test` and review the diff before committing.
   callers print it with the fingerprint and the exact path, because two rounds
   were spent guessing at it.
 
+## The log-everything invariant (M3) — the two suspects, decided
+
+The invariant (written into `docs/ARCHITECTURE.md`): anything that reaches a
+model request must be reconstructible from the session log, either as a
+transcript entry or as the separately-fingerprinted system prompt. The audit
+found plank already honours it at every injection site — context blocks,
+reinjection, task list, skills/templates, memory, and subagent messages are all
+pushed into the transcript via `session.push`; the system prompt (including MCP
+adverts) is fingerprinted (`fp1`) and stored as `sysprompt-<fp1>.kv_raw`. Two
+narrow suspects were resolved:
+
+- **`volatile_context()` on resume: faithful replay, not recomputation.** Git
+  status and the date line are time-varying, but a resumed session loads the
+  transcript from disk (`resume_from_cli`/`resume_pick` assign `self.session`
+  from the store) and never re-runs `ContextContent::new_with_agents`, so the
+  context the model sees is exactly the context recorded at session start.
+  This is the faithful-replay choice; it is deliberate and needs no exception.
+- **MCP advertisements: accounted for by the system-prompt fingerprint.** The
+  advert text (`src/tools/mcp_advert.rs`) is rendered into the tools prompt,
+  which is part of the fingerprinted system prompt. A server's tool list
+  changing underneath a resumed session changes `fp1`, which invalidates the
+  `sysprompt-<fp1>.kv_raw` snapshot and forces a rebuild — survivable, never a
+  silent gain or loss of tools relative to the session's own record.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
