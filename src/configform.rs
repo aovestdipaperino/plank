@@ -47,6 +47,7 @@ pub enum FieldId {
     AskMaxOptions,
     AgentsAutoRoute,
     AgentsMaxParallel,
+    GitSignCommits,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -270,6 +271,13 @@ pub static FIELDS: &[Field] = &[
         "max concurrent sub-agents",
         Kind::Count,
     ),
+    f(
+        FieldId::GitSignCommits,
+        "git",
+        "signCommits",
+        "sign commits with plank's trailer",
+        Kind::Bool,
+    ),
 ];
 
 const fn f(
@@ -338,6 +346,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::AskMaxOptions => s.ask.max_options.to_string(),
         FieldId::AgentsAutoRoute => s.agents.auto_route.to_string(),
         FieldId::AgentsMaxParallel => s.agents.max_parallel.to_string(),
+        FieldId::GitSignCommits => s.git.sign_commits.to_string(),
     }
 }
 
@@ -489,7 +498,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiReducedMotion
         | FieldId::UiEasterEggs
         | FieldId::UiBuiltinEditor
-        | FieldId::AgentsAutoRoute => {
+        | FieldId::AgentsAutoRoute
+        | FieldId::GitSignCommits => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -511,6 +521,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiEasterEggs => s.ui.easter_eggs = b,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
         FieldId::AgentsAutoRoute => s.agents.auto_route = b,
+        FieldId::GitSignCommits => s.git.sign_commits = b,
         _ => {}
     }
 }
@@ -1456,7 +1467,10 @@ mod tests {
             .filter(|r| r.header)
             .map(|r| r.label.as_str())
             .collect();
-        assert_eq!(headers, ["engine", "ui", "safety", "mcp", "ask", "agents"]);
+        assert_eq!(
+            headers,
+            ["engine", "ui", "safety", "mcp", "ask", "agents", "git"]
+        );
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }
 }

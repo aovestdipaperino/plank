@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Commits plank writes are signed.** The system prompt now asks the model to
+  end each commit message it writes with a blank line and the trailer
+  `--with help from plank`. Set `git.signCommits` to `false` in
+  `settings.json` (or `/config git.signCommits false`) to drop the
+  instruction and leave commit messages to your repository's own conventions.
+
+### Changed
+
+- **DSpark speculative decoding is on by default.** `--dspark` is now the
+  explicit opt-in (it was the only way to turn it on), and `--dspark-off`
+  selects target-only decode. Because speculation only engages at temperature
+  0, a bare run now samples argmax; an explicit `--temp` still wins, and
+  `--dspark-off` leaves the 0.6 sampling default in force.
 
 ## [3.2.0] - 2026-08-25
 

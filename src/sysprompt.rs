@@ -128,6 +128,10 @@ ask permission to start a browser.\n\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\
 - Preserve the current system configuration integrity unless explicitly asked otherwise.\n",
     );
+    if crate::settings::active().git.sign_commits {
+        out.push('\n');
+        out.push_str(COMMIT_SIGNATURE_INSTRUCTION);
+    }
     if !user_system.is_empty() {
         out.push('\n');
         out.push_str(user_system);
@@ -798,6 +802,25 @@ pub fn build_system_prompt_reminder(
     out
 }
 
+/// The attribution trailer plank asks the model to end its commit messages
+/// with, disabled by `git.signCommits` in `settings.json`.
+pub const COMMIT_SIGNATURE_TRAILER: &str = "--with help from plank";
+
+/// Instruction that puts [`COMMIT_SIGNATURE_TRAILER`] on the commits the model
+/// makes.
+///
+/// It is appended *after* [`SplitSystemPrompt::trusted_len`] on purpose: it is
+/// plank's own text, but nothing in it teaches DSML, so there is no reason to
+/// widen the span that gets the control-text tokenizer. It is settings-derived
+/// yet still cache-stable — `settings.json` does not change within a session,
+/// and editing it correctly re-fingerprints `sysprompt.kv`.
+pub const COMMIT_SIGNATURE_INSTRUCTION: &str = concat!(
+    "## Commits\n\n",
+    "When you create a git commit, end its message with a blank line followed by the",
+    " single line `--with help from plank`. Leave the trailer out only if the user",
+    " asks you to, or if the message already ends with it.\n"
+);
+
 /// Composes the initial system prompt: tools prompt plus optional user text.
 ///
 /// Mirrors `agent_append_system_prompt`: the built-in tools prompt comes
@@ -878,6 +901,10 @@ pub fn build_system_prompt_parts_with_wasm(
 ) -> SplitSystemPrompt {
     let (mut text, trusted_len) =
         build_tools_prompt_parts_with_wasm(mcp_servers, wasm_tools, parity);
+    if crate::settings::active().git.sign_commits {
+        text.push_str("\n\n");
+        text.push_str(COMMIT_SIGNATURE_INSTRUCTION);
+    }
     if !user_system.is_empty() {
         text.push_str("\n\n");
         text.push_str(user_system);
@@ -1052,6 +1079,16 @@ mod tests {
                 "volatile marker {marker:?} leaked into the cached prefix"
             );
         }
+    }
+
+    #[test]
+    fn commit_signature_instruction_is_in_the_default_prompt() {
+        // Default settings sign commits, and the trailer must land outside the
+        // trusted control-text span.
+        let parts = build_system_prompt_parts("", &[], true);
+        assert!(parts.text.contains("--with help from plank"));
+        assert!(!parts.text[..parts.trusted_len].contains("--with help from plank"));
+        assert!(provider_system_prompt("").contains("--with help from plank"));
     }
 
     #[test]
@@ -1318,7 +1355,12 @@ mod tests {
     #[test]
     fn trusted_span_ends_before_anything_appended() {
         let bare = build_system_prompt_parts("", &[], true);
-        assert_eq!(bare.trusted_len, bare.text.len(), "nothing untrusted yet");
+        // Only the commit-signature instruction sits past the boundary here.
+        assert_eq!(
+            &bare.text[bare.trusted_len..],
+            format!("\n\n{COMMIT_SIGNATURE_INSTRUCTION}"),
+            "nothing untrusted but the signature note"
+        );
 
         let with_user = build_system_prompt_parts("Be terse.", &[], true);
         assert_eq!(with_user.trusted_len, bare.trusted_len);
@@ -1378,9 +1420,12 @@ mod tests {
 
     #[test]
     fn system_prompt_composition() {
+        // Default settings append the commit-signature instruction between the
+        // tools prompt and the user's `-sys` text.
+        let signature = format!("\n\n{COMMIT_SIGNATURE_INSTRUCTION}");
         assert_eq!(
             build_system_prompt("", &[], true),
-            build_tools_prompt(&[], true)
+            format!("{}{signature}", build_tools_prompt(&[], true))
         );
         let with_extra = build_system_prompt("Be terse.", &[], true);
         assert!(with_extra.starts_with(&build_tools_prompt(&[], true)));

@@ -152,6 +152,7 @@ need not exist, and any subset of keys works.</p>
   &quot;ask&quot;:    { &quot;maxOptions&quot;: 7 },
   &quot;update&quot;: { &quot;check&quot;: true },
   &quot;agents&quot;: { &quot;autoRoute&quot;: true, &quot;maxParallel&quot;: 4 },
+  &quot;git&quot;:    { &quot;signCommits&quot;: true },
   &quot;worktree&quot;: { &quot;sparsePaths&quot;: [&quot;src&quot;, &quot;docs&quot;],
                 &quot;symlinkDirectories&quot;: [&quot;target&quot;], &quot;isolateAgents&quot;: false }
 }</code></pre>
@@ -361,6 +362,26 @@ dropped along with all its tools.</td>
 <td><code>agents.maxParallel</code></td>
 <td>4</td>
 <td>how many subagents may run at once (capped at 16)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="git"><code>git</code></h3>
+<table>
+<thead>
+<tr>
+<th>Key</th>
+<th>Default</th>
+<th>What</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>signCommits</code></td>
+<td><code>true</code></td>
+<td>ask the model to end each commit message it writes with a blank line
+and <code>--with help from plank</code>. Set it to <code>false</code>
+and commit messages follow your repository's conventions and nothing
+else.</td>
 </tr>
 </tbody>
 </table>
@@ -627,7 +648,11 @@ suspending</td>
 <tbody>
 <tr>
 <td><code>--dspark</code></td>
-<td>DSpark speculative decoding, off by default</td>
+<td>DSpark speculative decoding, on by default</td>
+</tr>
+<tr>
+<td><code>--dspark-off</code></td>
+<td>disable DSpark speculative decoding (target-only decode)</td>
 </tr>
 <tr>
 <td><code>--dspark-confidence F</code></td>
@@ -640,14 +665,15 @@ five-token blocks)</td>
 </tr>
 </tbody>
 </table>
-<p><code>--dspark</code> turns on DeepSeek's auxiliary draft checkpoint
-for V4 Flash: it proposes up to five tokens ahead and the main model
-verifies them, committing only the prefix it agrees with, so one
-verification pass can advance the stream by several tokens. The support
-model (~5.6 GB) needs no flag of its own — it resolves to
-<code>~/.plank/ds4flash.dspark.gguf</code> and is offered for download
-through the same resumable path as the main model, unless
-<code>--mtp</code> names one.</p>
+<p>DSpark speculative decoding is <strong>on by default</strong>:
+DeepSeek's auxiliary draft checkpoint for V4 Flash proposes up to five
+tokens ahead and the main model verifies them, committing only the
+prefix it agrees with, so one verification pass can advance the stream
+by several tokens. <code>--dspark-off</code> turns it off for
+target-only decode. The support model (~5.6 GB) needs no flag of its own
+— it resolves to <code>~/.plank/ds4flash.dspark.gguf</code> and is
+offered for download through the same resumable path as the main model,
+unless <code>--mtp</code> names one.</p>
 <p>Verification is argmax, so proposals are only used at
 <code>--temp 0</code>; sampled decoding ignores them. Whether it pays
 depends on the engine build, the quant and the machine: on an M5 Max it

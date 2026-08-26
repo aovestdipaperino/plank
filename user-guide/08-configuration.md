@@ -29,6 +29,7 @@ Hierarchical like the MCP config: `~/.plank/settings.json` applies everywhere, `
   "ask":    { "maxOptions": 7 },
   "update": { "check": true },
   "agents": { "autoRoute": true, "maxParallel": 4 },
+  "git":    { "signCommits": true },
   "worktree": { "sparsePaths": ["src", "docs"],
                 "symlinkDirectories": ["target"], "isolateAgents": false }
 }
@@ -91,6 +92,12 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 | `update.check` | `true` | check GitHub Releases at startup for a newer version |
 | `agents.autoRoute` | `true` | let the model pick a subagent definition on its own |
 | `agents.maxParallel` | 4 | how many subagents may run at once (capped at 16) |
+
+### `git`
+
+| Key | Default | What |
+|---|---|---|
+| `signCommits` | `true` | ask the model to end each commit message it writes with a blank line and `--with help from plank`. Set it to `false` and commit messages follow your repository's conventions and nothing else. |
 
 ### `kvcache`
 
@@ -178,11 +185,12 @@ One limitation: settings come from the directory plank launches in, so project s
 
 | Flag | What |
 |---|---|
-| `--dspark` | DSpark speculative decoding, off by default |
+| `--dspark` | DSpark speculative decoding, on by default |
+| `--dspark-off` | disable DSpark speculative decoding (target-only decode) |
 | `--dspark-confidence F` | pruning threshold, `0..1` (`0` forces fixed five-token blocks) |
 | `--dspark-strict` | load the drafter but keep target-only decode, for comparisons |
 
-`--dspark` turns on DeepSeek's auxiliary draft checkpoint for V4 Flash: it proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. The support model (~5.6 GB) needs no flag of its own — it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp` names one.
+DSpark speculative decoding is **on by default**: DeepSeek's auxiliary draft checkpoint for V4 Flash proposes up to five tokens ahead and the main model verifies them, committing only the prefix it agrees with, so one verification pass can advance the stream by several tokens. `--dspark-off` turns it off for target-only decode. The support model (~5.6 GB) needs no flag of its own — it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download through the same resumable path as the main model, unless `--mtp` names one.
 
 Verification is argmax, so proposals are only used at `--temp 0`; sampled decoding ignores them. Whether it pays depends on the engine build, the quant and the machine: on an M5 Max it was a 0.71× *slowdown* until the Metal verifier was pipelined upstream, after which the same measurement read 1.19×. The peak rates in the exit message are the way to check on your own hardware.
 

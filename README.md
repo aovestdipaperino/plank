@@ -159,6 +159,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
   "mcp":    { "timeoutSecs": 30 },
   "ask":    { "maxOptions": 7 },
   "agents": { "autoRoute": true, "maxParallel": 4 },
+  "git":    { "signCommits": true },
   "worktree": { "sparsePaths": ["src", "docs"],
                 "symlinkDirectories": ["target"], "isolateAgents": false }
 }
@@ -191,6 +192,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | `ask` | `maxOptions` | 7 | Most options the `ask` tool may offer in one question (minimum is fixed at 2). |
 | `agents` | `autoRoute` | `true` | Whether the model may select a sub-agent definition on its own initiative. |
 | | `maxParallel` | 4 | How many sub-agents may run concurrently (clamped to 16). |
+| `git` | `signCommits` | `true` | Ask the model to end each commit message it writes with a blank line and `--with help from plank`. `false` drops the instruction and leaves commit messages to your repository's own conventions. |
 | `worktree` | `sparsePaths` | `[]` | Cone-mode sparse-checkout paths for a new worktree. Empty checks out everything; set it when a second full checkout of the repo is painful. |
 | | `symlinkDirectories` | `[]` | Directories symlinked from the main checkout rather than duplicated, e.g. `target` or `node_modules`. A name that could climb out of the worktree is ignored. |
 | | `isolateAgents` | `false` | Give every sub-agent its own throwaway worktree. Off because a checkout per agent costs disk and time and the work must then be merged back; use `isolation: worktree` on the definitions that need it instead. |

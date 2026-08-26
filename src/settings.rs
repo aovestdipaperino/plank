@@ -35,7 +35,8 @@
 //!   "safety": { "sandbox": true, "btwSuspend": false },
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 },
-//!   "agents": { "autoRoute": true, "maxParallel": 4 }
+//!   "agents": { "autoRoute": true, "maxParallel": 4 },
+//!   "git":    { "signCommits": true }
 //! }
 //! ```
 
@@ -254,6 +255,21 @@ impl Default for AgentSettings {
     }
 }
 
+/// Git conventions the model is told to follow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitSettings {
+    /// Whether the system prompt asks the model to sign the commits it makes
+    /// with plank's attribution trailer. Set to `false` to leave commit
+    /// messages entirely to the model and the repository's own conventions.
+    pub sign_commits: bool,
+}
+
+impl Default for GitSettings {
+    fn default() -> Self {
+        Self { sign_commits: true }
+    }
+}
+
 /// Ceiling on `agents.maxParallel`; a higher configured value clamps to this.
 pub const AGENT_MAX_PARALLEL: usize = 16;
 
@@ -278,6 +294,8 @@ pub struct Settings {
     pub worktree: WorktreeSettings,
     /// KV-cache retention.
     pub kvcache: KvCacheSettings,
+    /// Git conventions the model is told to follow.
+    pub git: GitSettings,
     /// Values set for plugin-declared `config` options, keyed
     /// `<component-id>.<option>`.
     ///
@@ -537,6 +555,10 @@ impl Settings {
         }
         if let Some(v) = num::<u64>(kvcache, "maxBytes") {
             self.kvcache.max_bytes = v;
+        }
+
+        if let Some(v) = boolean(root.get("git"), "signCommits") {
+            self.git.sign_commits = v;
         }
 
         // Merged key by key rather than replaced wholesale: a project file that
@@ -945,6 +967,11 @@ impl Settings {
             upsert(a, "autoRoute", Json::Bool(self.agents.auto_route));
             upsert(a, "maxParallel", unum(self.agents.max_parallel as u64));
         }
+        upsert(
+            section(&mut root, "git"),
+            "signCommits",
+            Json::Bool(self.git.sign_commits),
+        );
 
         let mut out = String::new();
         write_pretty(&mut out, &Json::Obj(root), 0);
