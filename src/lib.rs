@@ -36,6 +36,7 @@ pub mod engine;
 pub mod errlog;
 pub mod experts;
 pub mod export;
+pub mod feedback;
 #[cfg(ds4_engine)]
 pub mod ffi;
 pub mod goal;

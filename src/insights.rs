@@ -742,6 +742,17 @@ pub struct Aggregated {
 
     /// One line per counted session, newest first, for the narrative prompt.
     pub highlights: Vec<String>,
+
+    /// Feedback ratings (M2): total, positive, negative.
+    pub ratings_total: u32,
+    pub ratings_positive: u32,
+    pub ratings_negative: u32,
+    /// Satisfaction over time: `(day, positive share)` per local day with a
+    /// rating, newest first.
+    pub satisfaction_by_day: Vec<(String, f64)>,
+    /// Worst-rated turns: `(session id, note)` for negative ratings, newest
+    /// first. The note is the user's own words; no transcript text is quoted.
+    pub worst_turns: Vec<(String, String)>,
 }
 
 impl Aggregated {
@@ -926,6 +937,58 @@ pub fn aggregate(metas: &[SessionMeta], tz_offset: i64) -> Aggregated {
         .collect();
 
     agg
+}
+
+/// Fills the feedback fields of an [`Aggregated`] from every session's rating
+/// sidecar (M2). Ratings never enter the transcript, model context, or KV —
+/// they are facts *about* sessions, consumed only here.
+///
+/// Satisfaction is the positive share per local day; worst-rated turns are the
+/// user's own notes on negative ratings, never transcript text.
+pub fn aggregate_feedback(
+    agg: &mut Aggregated,
+    feedback: &[(String, Vec<crate::feedback::Rating>)],
+    tz_offset: i64,
+) {
+    let mut by_day: BTreeMap<i64, (u32, u32)> = BTreeMap::new();
+    let mut worst: Vec<(String, String)> = Vec::new();
+    for (session_id, ratings) in feedback {
+        for r in ratings {
+            agg.ratings_total += 1;
+            if r.positive {
+                agg.ratings_positive += 1;
+            } else {
+                agg.ratings_negative += 1;
+                worst.push((session_id.clone(), r.note.clone()));
+            }
+            let day = local_day(r.at, tz_offset);
+            let (pos, neg) = by_day.entry(day).or_insert((0, 0));
+            if r.positive {
+                *pos += 1;
+            } else {
+                *neg += 1;
+            }
+        }
+    }
+    let mut days: Vec<(i64, (u32, u32))> = by_day.into_iter().collect();
+    days.sort_by_key(|(d, _)| std::cmp::Reverse(*d));
+    agg.satisfaction_by_day = days
+        .into_iter()
+        .map(|(day, (pos, neg))| {
+            let total = pos + neg;
+            let share = if total == 0 {
+                0.0
+            } else {
+                f64::from(pos) / f64::from(total)
+            };
+            (
+                date_str(u64::try_from(day).unwrap_or(0) * 86_400, tz_offset),
+                share,
+            )
+        })
+        .collect();
+    worst.sort_by_key(|(_, note)| note.clone());
+    agg.worst_turns = worst;
 }
 
 /// Finds sessions whose messages interleave, and counts how many messages
@@ -1358,6 +1421,8 @@ pub fn now_secs() -> u64 {
 
 /// Condensed report for the terminal: the numbers that fit on a screen, plus
 /// whichever narrative made it back.
+// A render function; the length is not complexity.
+#[allow(clippy::too_many_lines)]
 #[must_use]
 pub fn render_summary(
     agg: &Aggregated,
@@ -1438,6 +1503,39 @@ pub fn render_summary(
             .and_then(serde_json::Value::as_str)
         {
             out.push(format!("{field}: {text}"));
+        }
+    }
+    // Feedback (M2): satisfaction over time and the worst-rated turns. The
+    // ratings are sidecar facts, never transcript text.
+    if agg.ratings_total > 0 {
+        let pct = f64::from(agg.ratings_positive) * 100.0 / f64::from(agg.ratings_total);
+        out.push(format!(
+            "{} ratings: {} positive ({:.0}%), {} negative",
+            agg.ratings_total, agg.ratings_positive, pct, agg.ratings_negative
+        ));
+        let days = agg
+            .satisfaction_by_day
+            .iter()
+            .take(5)
+            .map(|(d, s)| format!("{d} {:.0}%", s * 100.0))
+            .collect::<Vec<_>>()
+            .join(", ");
+        out.push(format!("satisfaction by day: {days}"));
+        if !agg.worst_turns.is_empty() {
+            let worst = agg
+                .worst_turns
+                .iter()
+                .take(5)
+                .map(|(id, note)| {
+                    if note.is_empty() {
+                        id.clone()
+                    } else {
+                        format!("{id}: {note}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(format!("worst-rated turns: {worst}"));
         }
     }
     out
@@ -1951,6 +2049,52 @@ mod tests {
         assert_eq!(meta.pushes, 1);
         // "b" became "c", and "d" was appended.
         assert_eq!((meta.lines_added, meta.lines_removed), (2, 1));
+    }
+
+    #[test]
+    fn aggregate_feedback_counts_and_ranks() {
+        let mut agg = Aggregated::default();
+        let feedback = vec![
+            (
+                "s1".to_string(),
+                vec![
+                    crate::feedback::Rating {
+                        ordinal: 0,
+                        digest: "a".to_string(),
+                        positive: true,
+                        note: "great".to_string(),
+                        at: 1_700_000_000,
+                    },
+                    crate::feedback::Rating {
+                        ordinal: 1,
+                        digest: "b".to_string(),
+                        positive: false,
+                        note: "confusing".to_string(),
+                        at: 1_700_000_000,
+                    },
+                ],
+            ),
+            (
+                "s2".to_string(),
+                vec![crate::feedback::Rating {
+                    ordinal: 0,
+                    digest: "c".to_string(),
+                    positive: true,
+                    note: String::new(),
+                    at: 1_700_000_000,
+                }],
+            ),
+        ];
+        aggregate_feedback(&mut agg, &feedback, 0);
+        assert_eq!(agg.ratings_total, 3);
+        assert_eq!(agg.ratings_positive, 2);
+        assert_eq!(agg.ratings_negative, 1);
+        assert_eq!(
+            agg.worst_turns,
+            vec![("s1".to_string(), "confusing".to_string())]
+        );
+        assert_eq!(agg.satisfaction_by_day.len(), 1);
+        assert!((agg.satisfaction_by_day[0].1 - 2.0 / 3.0).abs() < 1e-9);
     }
 
     #[test]

@@ -3905,6 +3905,13 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            "/rate" => match self.rate_last_turn(arg) {
+                Ok(path) => println!(
+                    "{}",
+                    self.debug_line(&format!("[rating saved to {}]", path.display()))
+                ),
+                Err(e) => println!("{e}\nusage: /rate [+|-] [note]"),
+            },
             "/export" => match self.write_export(arg) {
                 Ok(path) => println!("exported session to {}", path.display()),
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
@@ -4836,6 +4843,8 @@ the original is frozen and listed in /tree"
     /// The two halves are deliberately unequal in status: the statistics are
     /// the report, and every model call is allowed to fail without taking
     /// anything else down with it.
+    // A long straight-line pipeline; the length is not complexity.
+    #[allow(clippy::too_many_lines)]
     fn run_insights(
         &mut self,
         arg: &str,
@@ -4881,7 +4890,10 @@ the original is frozen and listed in /tree"
             crate::interrupt::clear();
             return Ok(Insights::Cancelled);
         };
-        let agg = insights::aggregate(&metas, tz);
+        let mut agg = insights::aggregate(&metas, tz);
+        // Feedback ratings live in a sidecar, never the transcript; fold them
+        // into the deterministic statistics half of the report.
+        insights::aggregate_feedback(&mut agg, &crate::feedback::load_all(&root), tz);
 
         let mut narrative = insights::Narrative::new();
         if agg.sessions_counted == 0 {
@@ -5256,6 +5268,48 @@ the original is frozen and listed in /tree"
         }
         std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
         Ok(path)
+    }
+
+    /// Rates the last assistant turn (`/rate [+|-] [note]`), recording it in
+    /// the feedback sidecar. The rating never touches the transcript, model
+    /// context, or KV — see `crate::feedback`.
+    fn rate_last_turn(&self, arg: &str) -> Result<std::path::PathBuf, String> {
+        let mut parts = arg.trim().splitn(2, char::is_whitespace);
+        let sign = parts.next().unwrap_or("").trim();
+        let note = parts.next().unwrap_or("").trim();
+        let positive = match sign {
+            "+" | "up" | "good" => true,
+            "-" | "down" | "bad" => false,
+            _ => return Err(format!("expected + or -, got {sign:?}")),
+        };
+        let last = self
+            .session
+            .transcript
+            .iter()
+            .rev()
+            .find(|m| m.role == crate::session::Role::Assistant)
+            .ok_or_else(|| "no assistant turn to rate yet".to_string())?;
+        let ordinal = self
+            .session
+            .transcript
+            .iter()
+            .position(|m| std::ptr::eq(m, last))
+            .ok_or_else(|| "turn not in transcript".to_string())?;
+        let rating = crate::feedback::Rating {
+            ordinal,
+            digest: crate::session::sha1_hex(last.text.as_bytes()),
+            positive,
+            note: note.to_string(),
+            at: now_secs(),
+        };
+        let root = crate::insights::usage_dir();
+        crate::feedback::record(&root, &self.session.id, &rating).map_err(|e| {
+            format!(
+                "{}: {e}",
+                crate::feedback::feedback_path(&root, &self.session.id).display()
+            )
+        })?;
+        Ok(crate::feedback::feedback_path(&root, &self.session.id))
     }
 
     /// Starts a `/subagent` fork: appends the framed task to the live
@@ -7615,6 +7669,12 @@ impl Agent<'_> {
                 KeyCode::Char('w') if ctrl => input.buf.delete_prev_word(),
                 KeyCode::Char('a') if ctrl => input.buf.move_home(),
                 KeyCode::Char('e') if ctrl => input.buf.move_end(),
+                // Ctrl-R rates the last assistant turn into the feedback
+                // sidecar (never the transcript, model context, or KV).
+                KeyCode::Char('r') if ctrl => match self.rate_last_turn("+") {
+                    Ok(path) => log.push_dim(format!("[rated +; saved to {}]", path.display())),
+                    Err(e) => log.push_dim(format!("rate failed: {e}")),
+                },
                 KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
                     input.hist_idx = None;
                     input.buf.insert(c.to_string());
