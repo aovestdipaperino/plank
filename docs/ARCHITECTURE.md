@@ -243,7 +243,9 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   `node` records, so a linear session's file is unchanged and older files load
   as a single-branch tree.
 - `compact.rs` — the durable-summary + verbatim-tail rebuild and its pressure
-  thresholds.
+  thresholds. Token measurement stays behind `Engine::count_tokens` and never
+  migrates into the compaction module: the compaction code reasons about
+  *bytes* and *counts*, and only the engine boundary measures tokens.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
 

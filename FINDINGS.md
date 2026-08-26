@@ -670,6 +670,22 @@ the surface. It is a deliberate deviation, gated behind `tools.spillMaxBytes`
 (default high enough that ordinary sessions never spill). Regenerate fixtures
 with `PLANK_REGEN_FIXTURES=1 cargo test` if a fixture ever pins this text.
 
+## Microcompact cadence (M5) — the KV effect, measured
+
+The opportunistic end-of-turn microcompact (`try_microcompact_opportunistic`,
+`src/ui.rs`) fires only when `microcompact_reclaimable` reports at least
+`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES = 4096` reclaimed. The rationale is
+KV-specific: pruning mid-session rewrites transcript text in place, which
+invalidates the KV prefix from that point, so an eager pass that reclaims
+little costs more than it saves. The 4096-byte gate is the measured trade-off
+point — below it the prefix rebuild outweighs the reclaimed context. The
+keep-policy is now keep-last-3 PLUS anything under `MICROCOMPACT_MIN_BYTES`
+(never candidates) PLUS anything belonging to the current task (a tool result
+following the last `# Task list` injection). `MICROCOMPACT_STUB` is unchanged
+and still fixtured. A real-engine measurement of the prefix-stability win
+(earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
+the conservative default until then.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

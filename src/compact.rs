@@ -28,20 +28,25 @@ pub const MICROCOMPACT_MIN_BYTES: usize = 256;
 /// Replacement body for tool results cleared by microcompact.
 pub const MICROCOMPACT_STUB: &str =
     "[old tool result cleared to reclaim context; rerun the tool if the output is needed again]";
+/// An opportunistic end-of-turn microcompact only fires when it would reclaim
+/// at least this many bytes: pruning mid-session rewrites transcript text in
+/// place, which invalidates the KV prefix from that point, so an eager pass
+/// that reclaims little costs more than it saves.
+pub const MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES: usize = 4096;
 /// Maximum files re-injected after a full compaction.
 pub const REINJECT_MAX_FILES: usize = 5;
 /// Hard cap on the post-compaction re-injection budget, in tokens.
 pub const REINJECT_CAP_TOKENS: i32 = 50_000;
 
-/// Clears the bodies of old tool results in place, keeping the newest
-/// [`MICROCOMPACT_KEEP_RESULTS`] intact; returns how many were cleared.
-///
-/// This is the cheap first step of compaction: no model round-trip, and the
-/// conversation flow (user turns, assistant turns, tool-call structure) is
-/// preserved — only bulky, stale tool output is dropped. Clearing an early
-/// message invalidates the KV prefix from that point, but so would a full
-/// compaction, and this one costs zero generated tokens.
-pub fn microcompact(transcript: &mut [Message]) -> usize {
+/// The indices of tool-result bodies microcompact would clear: the newest
+/// [`MICROCOMPACT_KEEP_RESULTS`] survive, plus anything under
+/// [`MICROCOMPACT_MIN_BYTES`] (never candidates) plus anything belonging to
+/// the current task — a tool result that follows the last `# Task list`
+/// injection is part of the active work and is kept.
+fn clear_set(transcript: &[Message]) -> Vec<usize> {
+    let task_inject = transcript
+        .iter()
+        .rposition(|m| m.text.contains("# Task list"));
     let idx: Vec<usize> = transcript
         .iter()
         .enumerate()
@@ -52,11 +57,44 @@ pub fn microcompact(transcript: &mut [Message]) -> usize {
         })
         .map(|(i, _)| i)
         .collect();
-    let clear_upto = idx.len().saturating_sub(MICROCOMPACT_KEEP_RESULTS);
-    for &i in &idx[..clear_upto] {
+    idx.iter()
+        .enumerate()
+        .filter(|(pos, i)| {
+            let is_last = *pos >= idx.len().saturating_sub(MICROCOMPACT_KEEP_RESULTS);
+            let is_task = task_inject.is_some_and(|t| **i > t);
+            !is_last && !is_task
+        })
+        .map(|(_, i)| *i)
+        .collect()
+}
+
+/// Bytes a microcompact would reclaim, without clearing anything. Used to gate
+/// the opportunistic end-of-turn pass on [`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES`].
+#[must_use]
+pub fn microcompact_reclaimable(transcript: &[Message]) -> usize {
+    clear_set(transcript)
+        .iter()
+        .map(|&i| transcript[i].text.len())
+        .sum()
+}
+
+/// Clears the bodies of old tool results in place, keeping the newest
+/// [`MICROCOMPACT_KEEP_RESULTS`] intact plus anything belonging to the current
+/// task; returns `(cleared, bytes_reclaimed)`.
+///
+/// This is the cheap first step of compaction: no model round-trip, and the
+/// conversation flow (user turns, assistant turns, tool-call structure) is
+/// preserved — only bulky, stale tool output is dropped. Clearing an early
+/// message invalidates the KV prefix from that point, but so would a full
+/// compaction, and this one costs zero generated tokens.
+pub fn microcompact(transcript: &mut [Message]) -> (usize, usize) {
+    let clear = clear_set(transcript);
+    let mut bytes = 0usize;
+    for &i in &clear {
+        bytes += transcript[i].text.len();
         transcript[i].text = format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>");
     }
-    clear_upto
+    (clear.len(), bytes)
 }
 
 /// Token budget for the post-compaction file re-injection.
@@ -327,9 +365,10 @@ mod tests {
             big_tool_result("fourth"),
             big_tool_result("fifth"),
         ];
-        let cleared = microcompact(&mut t);
+        let (cleared, bytes) = microcompact(&mut t);
         // Five large results; the newest three survive.
         assert_eq!(cleared, 2);
+        assert!(bytes > 0, "reclaimed bytes reported");
         assert!(t[1].text.contains(MICROCOMPACT_STUB));
         assert!(t[3].text.contains(MICROCOMPACT_STUB));
         assert!(t[4].text.contains("third"));
@@ -340,7 +379,30 @@ mod tests {
         assert_eq!(t[2].text, "<tool_result>tiny</tool_result>");
         assert_eq!(t[5].text, "working on it");
         // Idempotent: cleared stubs are small, nothing more to do.
-        assert_eq!(microcompact(&mut t), 0);
+        assert_eq!(microcompact(&mut t), (0, 0));
+    }
+
+    #[test]
+    fn results_after_a_task_list_injection_are_kept() {
+        // A tool result that follows the last `# Task list` injection belongs
+        // to the current task and survives microcompact even when it is old.
+        let mut t = vec![
+            Message::user("do the thing"),
+            big_tool_result("first"),
+            big_tool_result("second"),
+            Message::user("# Task list\n\nYour current tasks"),
+            big_tool_result("third"),
+            big_tool_result("fourth"),
+        ];
+        let (cleared, _) = microcompact(&mut t);
+        // "first" is old and not part of the current task -> cleared.
+        assert_eq!(cleared, 1);
+        assert!(t[1].text.contains(MICROCOMPACT_STUB));
+        // "second" survives as one of the newest three.
+        assert!(t[2].text.contains("second"));
+        // "third"/"fourth" follow the injection -> kept as current-task work.
+        assert!(t[4].text.contains("third"));
+        assert!(t[5].text.contains("fourth"));
     }
 
     #[test]

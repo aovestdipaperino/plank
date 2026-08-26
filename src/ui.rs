@@ -2449,6 +2449,16 @@ impl Agent<'_> {
                 self.notify_task_complete();
             }
             // Turn over: the front end is back at the prompt.
+            // Opportunistic microcompact (M5): drop stale tool-result bodies
+            // before pressure builds, so the KV suffix stops growing earlier.
+            if let Some(cleared) = self.try_microcompact_opportunistic() {
+                println!(
+                    "{}",
+                    self.debug_line(&format!(
+                        "microcompacted: cleared {cleared} old tool result(s)"
+                    ))
+                );
+            }
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
@@ -2869,7 +2879,7 @@ impl Agent<'_> {
     /// context to skip full compaction, `None` when full compaction is still
     /// needed (any clearing done is kept — it only helps the summary pass).
     fn try_microcompact(&mut self) -> Option<usize> {
-        let cleared = compact::microcompact(&mut self.session.transcript);
+        let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         if cleared == 0 {
             return None;
         }
@@ -2877,6 +2887,21 @@ impl Agent<'_> {
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
         (!compact::should_compact(self.engine.ctx_size(), used)).then_some(cleared)
+    }
+
+    /// Runs microcompact opportunistically at end-of-turn, gated on a minimum
+    /// reclaimed-bytes threshold (M5). Pruning mid-session rewrites transcript
+    /// text in place, which invalidates the KV prefix from that point, so an
+    /// eager pass that reclaims little costs more than it saves — only fire
+    /// when the cleared results are worth the prefix rebuild.
+    fn try_microcompact_opportunistic(&mut self) -> Option<usize> {
+        let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
+        if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
+            return None;
+        }
+        let (cleared, _) = compact::microcompact(&mut self.session.transcript);
+        self.last_ctx_used = 0;
+        Some(cleared)
     }
 
     /// Rebuilds the transcript after a summarization pass: extracted summary
@@ -8596,6 +8621,12 @@ impl Agent<'_> {
                     self.notify_task_complete();
                 }
                 // Turn over: the front end is back at the prompt.
+                // Opportunistic microcompact (M5), mirrored from the plain path.
+                if let Some(cleared) = self.try_microcompact_opportunistic() {
+                    log.push_dim(format!(
+                        "microcompacted: cleared {cleared} old tool result(s)"
+                    ));
+                }
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
@@ -12080,7 +12111,7 @@ mod tests {
         }
         s.tasks.add("keep me across compaction", None);
         let before = s.tasks.clone();
-        let cleared = crate::compact::microcompact(&mut s.transcript);
+        let (cleared, _) = crate::compact::microcompact(&mut s.transcript);
         assert!(cleared > 0, "compaction should clear some large results");
         assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
         let block = s.tasks.inject_block().expect("non-empty list has a block");
