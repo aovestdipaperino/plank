@@ -270,6 +270,28 @@ impl Default for GitSettings {
     }
 }
 
+/// Tool-dispatch tuning: loop guards and call deadlines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolsSettings {
+    /// Whether the repeat-tool advisory is on. Default on; a deliberate
+    /// deviation from the C reference, documented in
+    /// `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+    pub repeat_advisory: bool,
+    /// Dispatch-level wall-clock deadline in seconds for a single tool call.
+    /// `0` (the default) is off — parity is untouched until a user opts in.
+    /// Bash keeps its own model-supplied timeout; this is the outer bound.
+    pub call_timeout_sec: u64,
+}
+
+impl Default for ToolsSettings {
+    fn default() -> Self {
+        Self {
+            repeat_advisory: true,
+            call_timeout_sec: 0,
+        }
+    }
+}
+
 /// Ceiling on `agents.maxParallel`; a higher configured value clamps to this.
 pub const AGENT_MAX_PARALLEL: usize = 16;
 
@@ -296,6 +318,8 @@ pub struct Settings {
     pub kvcache: KvCacheSettings,
     /// Git conventions the model is told to follow.
     pub git: GitSettings,
+    /// Tool-dispatch tuning: loop guards and call deadlines.
+    pub tools: ToolsSettings,
     /// Values set for plugin-declared `config` options, keyed
     /// `<component-id>.<option>`.
     ///
@@ -560,6 +584,16 @@ impl Settings {
         if let Some(v) = boolean(root.get("update"), "check") {
             self.update.check = v;
             self.note("update.check", origin);
+        }
+
+        let tools = root.get("tools");
+        if let Some(v) = boolean(tools, "repeatAdvisory") {
+            self.tools.repeat_advisory = v;
+            self.note("tools.repeatAdvisory", origin);
+        }
+        if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
+            self.tools.call_timeout_sec = v;
+            self.note("tools.callTimeoutSec", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);

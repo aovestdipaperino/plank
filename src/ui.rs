@@ -1049,6 +1049,50 @@ fn format_tool_results(results: &[(String, String)]) -> String {
     }
     all
 }
+
+/// A normalised digest of a tool call's arguments, for the loop guard: the
+/// `name=value` pairs in streamed order. Two calls with identical args digest
+/// identically, so a repeated call is detected regardless of arg order.
+fn normalise_args(call: &ToolCall) -> String {
+    let mut s = String::new();
+    for arg in &call.args {
+        s.push_str(&arg.name);
+        s.push('=');
+        s.push_str(&arg.value);
+        s.push('\n');
+    }
+    s
+}
+
+/// Observes each tool call against the loop guard and appends any advisory to
+/// the observations the model receives. The async-job polling path
+/// (`bash_status`/`bash_stop`) is exempted: it polls with identical args by
+/// design, and a legitimate poll must never be mistaken for a stuck loop.
+fn apply_loop_guard(
+    guard: &mut crate::guard::LoopGuard,
+    calls: &[ToolCall],
+    observations: String,
+) -> String {
+    use std::fmt::Write as _;
+    if !crate::settings::active().tools.repeat_advisory {
+        return observations;
+    }
+    let mut observations = observations;
+    for call in calls {
+        if matches!(call.name.as_str(), "bash_status" | "bash_stop") {
+            continue;
+        }
+        let digest = crate::session::sha1_hex(normalise_args(call).as_bytes());
+        if let crate::guard::Nudge::Advisory(text) = guard.observe(&call.name, digest) {
+            if !observations.ends_with('\n') {
+                observations.push('\n');
+            }
+            let _ = writeln!(observations, "[loop guard] {text}");
+        }
+    }
+    observations
+}
+
 fn session_to_messages(session: &Session) -> Vec<crate::engine::ChatMessage> {
     use crate::engine::{ChatMessage, ChatRole, ToolCallRef};
     let mut out = Vec::new();
@@ -1217,6 +1261,9 @@ struct Agent<'a> {
     /// clear it before returning to the prompt, so a resumed or cleared session
     /// never inherits a goal (`docs/superpowers/specs/2026-08-10-goal-command-design.md`).
     goal: Option<crate::goal::GoalLoop>,
+    /// Detects repeated identical tool calls and nudges the model (M1 loop
+    /// guards). Owned by the turn loop; advisory only, never blocking.
+    loop_guard: crate::guard::LoopGuard,
     /// A framed `/btw` prompt waiting to be answered *alongside* the next main
     /// pass rather than in place of it (`docs/SESSION-CLONE-DESIGN.md` §6.2).
     ///
@@ -1783,29 +1830,27 @@ impl Agent<'_> {
                 .join(", ");
             crate::status::ToolActivity::begin(format!("🔧 {names}"))
         });
-        if !calls.iter().any(|c| c.name == "agent") {
-            return dispatch_all(calls, &mut self.tool_ctx);
-        }
-        if calls.is_empty() {
-            return "Tool error: empty tool call block\n".to_string();
-        }
-        // A block of nothing but remote-backed agent calls runs concurrently.
-        // Anything else falls through to the serial loop below.
-        if let Some(results) = self.run_agent_fanout(calls) {
-            return format_tool_results(&results);
-        }
-        // Mirror dispatch_all: clear any undrained previews so cards never leak.
-        self.tool_ctx.edit_previews.clear();
-        let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
-        for call in calls {
-            let out = if call.name == "agent" {
-                self.run_agent_tool(call)
-            } else {
-                dispatch(call, &mut self.tool_ctx).output
-            };
-            results.push((call.name.clone(), out));
-        }
-        format_tool_results(&results)
+        let observations = if !calls.iter().any(|c| c.name == "agent") {
+            dispatch_all(calls, &mut self.tool_ctx)
+        } else if calls.is_empty() {
+            "Tool error: empty tool call block\n".to_string()
+        } else if let Some(results) = self.run_agent_fanout(calls) {
+            format_tool_results(&results)
+        } else {
+            // Mirror dispatch_all: clear any undrained previews so cards never leak.
+            self.tool_ctx.edit_previews.clear();
+            let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
+            for call in calls {
+                let out = if call.name == "agent" {
+                    self.run_agent_tool(call)
+                } else {
+                    dispatch(call, &mut self.tool_ctx).output
+                };
+                results.push((call.name.clone(), out));
+            }
+            format_tool_results(&results)
+        };
+        apply_loop_guard(&mut self.loop_guard, calls, observations)
     }
 
     /// Sends an event on the worker→UI channel when the front end is listening.
@@ -11417,6 +11462,7 @@ fn new_agent(
         last_spec: crate::engine::SpecStats::default(),
         last_turn_interrupted: false,
         goal: None,
+        loop_guard: crate::guard::LoopGuard::new(),
         context_content,
         skills,
         templates,
@@ -11831,6 +11877,52 @@ mod tests {
     /// Flattened text of a line, for asserting on layout.
     fn text_of(line: &ratatui::text::Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn read_call(path: &str) -> ToolCall {
+        ToolCall {
+            name: "read".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "path".to_string(),
+                value: path.to_string(),
+                is_string: true,
+            }],
+        }
+    }
+
+    fn poll_call() -> ToolCall {
+        ToolCall {
+            name: "bash_status".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "job_id".to_string(),
+                value: "1".to_string(),
+                is_string: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn loop_guard_advisory_fires_on_the_third_identical_call() {
+        let mut guard = crate::guard::LoopGuard::new();
+        let out1 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r1".to_string());
+        assert!(!out1.contains("[loop guard]"), "first call: no advisory");
+        let out2 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r2".to_string());
+        assert!(!out2.contains("[loop guard]"), "second call: no advisory");
+        let out3 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r3".to_string());
+        assert!(out3.contains("[loop guard]"), "third call: advisory");
+        assert!(out3.contains("3 times"));
+    }
+
+    #[test]
+    fn loop_guard_exempts_async_job_polling() {
+        // A legitimate poll of an async bash job looks identical to a stuck
+        // loop; it must never trigger the advisory.
+        let mut guard = crate::guard::LoopGuard::new();
+        let mut out = String::new();
+        for _ in 0..5 {
+            out = apply_loop_guard(&mut guard, &[poll_call()], out);
+        }
+        assert!(!out.contains("[loop guard]"), "polls must be exempt: {out}");
     }
 
     #[test]
@@ -12833,6 +12925,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -15206,6 +15299,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -15308,6 +15402,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16009,6 +16104,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16191,6 +16287,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16278,6 +16375,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16352,6 +16450,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -16449,6 +16548,7 @@ mod tests {
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -17959,6 +18059,7 @@ or the user's next message aborts before its first token"
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -18050,6 +18151,7 @@ or the user's next message aborts before its first token"
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -18200,6 +18302,7 @@ or the user's next message aborts before its first token"
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),
@@ -18272,6 +18375,7 @@ or the user's next message aborts before its first token"
             last_spec: crate::engine::SpecStats::default(),
             last_turn_interrupted: false,
             goal: None,
+            loop_guard: crate::guard::LoopGuard::new(),
             context_content: crate::context::ContextContent::new(),
             skills: Vec::new(),
             templates: Vec::new(),

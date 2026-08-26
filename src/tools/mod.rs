@@ -327,6 +327,12 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             call.name
         ));
     }
+    // Dispatch-level wall-clock deadline (`tools.callTimeoutSec`): the outer
+    // bound on a single tool call, off by default. Bash keeps its own
+    // model-supplied timeout; this is the outer bound of the two. Measured
+    // around the tool body only, so hooks still see the full output.
+    let deadline = crate::settings::active().tools.call_timeout_sec;
+    let start = std::time::Instant::now();
     let output = match call.name.as_str() {
         "EnterWorktree" => worktree::tool_enter_worktree(ctx, call),
         "ExitWorktree" => worktree::tool_exit_worktree(ctx, call),
@@ -429,6 +435,18 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     // `Tool error:` convention); success never reaches here.
     if output.starts_with("Tool error:") && !ctx.hooks.post_tool_use_failure.is_empty() {
         fire_post_tool_failure(ctx, call, &arg_values, &mut output);
+    }
+    // Deadline notice: the tool exceeded `callTimeoutSec`. Post-hoc (the tool
+    // already ran) but actionable — the model sees it exceeded the budget.
+    if deadline > 0 && start.elapsed().as_secs() >= deadline {
+        if !output.ends_with('\n') {
+            output.push('\n');
+        }
+        let _ = writeln!(
+            output,
+            "[deadline] {call} exceeded tools.callTimeoutSec={deadline}s",
+            call = call.name
+        );
     }
     ToolResult::from_output(output)
 }
@@ -733,6 +751,16 @@ mod tests {
             dispatch_all(&[], &mut ctx),
             "Tool error: empty tool call block\n"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn deadline_notice_is_off_by_default() {
+        // `tools.callTimeoutSec` defaults to 0 (off), so parity is untouched
+        // until a user opts in: no deadline notice on an ordinary dispatch.
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("nope", &[]), &mut ctx);
+        assert!(!res.output.contains("[deadline]"));
         std::fs::remove_dir_all(dir).ok();
     }
 }

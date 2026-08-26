@@ -48,6 +48,8 @@ pub enum FieldId {
     AgentsAutoRoute,
     AgentsMaxParallel,
     GitSignCommits,
+    ToolsRepeatAdvisory,
+    ToolsCallTimeoutSec,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -278,6 +280,20 @@ pub static FIELDS: &[Field] = &[
         "sign commits with plank's trailer",
         Kind::Bool,
     ),
+    f(
+        FieldId::ToolsRepeatAdvisory,
+        "tools",
+        "repeatAdvisory",
+        "nudge the model when it repeats a tool call",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::ToolsCallTimeoutSec,
+        "tools",
+        "callTimeoutSec",
+        "per-call deadline (s); 0 = off",
+        Kind::Count,
+    ),
 ];
 
 const fn f(
@@ -347,6 +363,8 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::AgentsAutoRoute => s.agents.auto_route.to_string(),
         FieldId::AgentsMaxParallel => s.agents.max_parallel.to_string(),
         FieldId::GitSignCommits => s.git.sign_commits.to_string(),
+        FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory.to_string(),
+        FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec.to_string(),
     }
 }
 
@@ -459,6 +477,7 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
             let n = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
             s.agents.max_parallel = n.min(crate::settings::AGENT_MAX_PARALLEL);
         }
+        FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec = parse_pos(0)?,
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
         FieldId::UiNotifications => {
@@ -499,7 +518,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiEasterEggs
         | FieldId::UiBuiltinEditor
         | FieldId::AgentsAutoRoute
-        | FieldId::GitSignCommits => {
+        | FieldId::GitSignCommits
+        | FieldId::ToolsRepeatAdvisory => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -522,6 +542,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = b,
         FieldId::AgentsAutoRoute => s.agents.auto_route = b,
         FieldId::GitSignCommits => s.git.sign_commits = b,
+        FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory = b,
         _ => {}
     }
 }
