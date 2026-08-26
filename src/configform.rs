@@ -50,6 +50,8 @@ pub enum FieldId {
     GitSignCommits,
     ToolsRepeatAdvisory,
     ToolsCallTimeoutSec,
+    ToolsSpillMaxBytes,
+    ToolsSpillPreviewBytes,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -294,6 +296,20 @@ pub static FIELDS: &[Field] = &[
         "per-call deadline (s); 0 = off",
         Kind::Count,
     ),
+    f(
+        FieldId::ToolsSpillMaxBytes,
+        "tools",
+        "spillMaxBytes",
+        "spill a tool result larger than this (bytes)",
+        Kind::Count,
+    ),
+    f(
+        FieldId::ToolsSpillPreviewBytes,
+        "tools",
+        "spillPreviewBytes",
+        "inline preview bytes of a spilled result",
+        Kind::Count,
+    ),
 ];
 
 const fn f(
@@ -365,6 +381,8 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::GitSignCommits => s.git.sign_commits.to_string(),
         FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory.to_string(),
         FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec.to_string(),
+        FieldId::ToolsSpillMaxBytes => s.tools.spill_max_bytes.to_string(),
+        FieldId::ToolsSpillPreviewBytes => s.tools.spill_preview_bytes.to_string(),
     }
 }
 
@@ -478,6 +496,12 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
             s.agents.max_parallel = n.min(crate::settings::AGENT_MAX_PARALLEL);
         }
         FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec = parse_pos(0)?,
+        FieldId::ToolsSpillMaxBytes => {
+            s.tools.spill_max_bytes = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
+        }
+        FieldId::ToolsSpillPreviewBytes => {
+            s.tools.spill_preview_bytes = usize::try_from(parse_pos(1)?).unwrap_or(usize::MAX);
+        }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
         FieldId::UiNotifications => {
@@ -1490,7 +1514,9 @@ mod tests {
             .collect();
         assert_eq!(
             headers,
-            ["engine", "ui", "safety", "mcp", "ask", "agents", "git"]
+            [
+                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools"
+            ]
         );
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());
     }

@@ -4584,7 +4584,13 @@ the original is frozen and listed in /tree"
         let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
         let keep = self.active_kv_fingerprints(&self.kv_tiers());
         let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
-        let freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
+        let now = crate::kvmeta::now_secs();
+        // Spill blobs (M4) live under the same TTL and byte-budget policy that
+        // governs kvcache — no second GC.
+        let freed = self
+            .store
+            .sweep(&keep, &policy, now)
+            .saturating_add(crate::spill::sweep(&policy, now));
         format!("kvcache: reclaimed {}", crate::kvpane::human_bytes(freed))
     }
 
@@ -8089,7 +8095,11 @@ impl Agent<'_> {
         let keep = self.active_kv_fingerprints(tiers);
         let keep: Vec<&str> = keep.iter().map(String::as_str).collect();
         let policy = crate::kvgc::SweepPolicy::from_settings(&crate::settings::active().kvcache);
-        let _freed = self.store.sweep(&keep, &policy, crate::kvmeta::now_secs());
+        let now = crate::kvmeta::now_secs();
+        let _freed = self
+            .store
+            .sweep(&keep, &policy, now)
+            .saturating_add(crate::spill::sweep(&policy, now));
     }
 
     /// Re-establishes the warm KV prefix after the transcript is reset by
@@ -11375,6 +11385,8 @@ fn new_agent(
     // `save_for_exit`.)
     session.dirty = false;
     let mut tool_ctx = ToolContext::new(cwd);
+    // Spill storage is scoped per session (`~/.plank/spill/<id>/`).
+    tool_ctx.session_id.clone_from(&session.id);
     // Built once in `main()` against the session's real working directory
     // (post-`--chdir`/`--worktree` resolution happens below) and threaded in
     // here rather than rebuilt, so this set and `main()`'s agree and its

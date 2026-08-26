@@ -245,6 +245,36 @@ pub fn tool_more(ctx: &mut ToolContext, call: &ToolCall) -> String {
         1,
         i64::MAX,
     );
+    // A spilled tool result (M4) takes precedence: continue reading the spill
+    // by id, `count` bytes at a time, until the payload is exhausted.
+    if let Some(spilled) = ctx.spill.clone() {
+        let start = spilled.offset;
+        let n = usize::try_from(count).unwrap_or(usize::MAX);
+        let bytes = std::fs::read(&spilled.path).unwrap_or_default();
+        let total = bytes.len();
+        let chunk = &bytes[start.min(total)..];
+        let chunk = &chunk[..n.min(chunk.len())];
+        let mut out = String::from_utf8_lossy(chunk).into_owned();
+        let new_offset = start + chunk.len();
+        if new_offset >= total {
+            ctx.spill = None;
+        } else {
+            if let Some(s) = ctx.spill.as_mut() {
+                s.offset = new_offset;
+            }
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            // Model-facing locator, built with `write!` (never a
+            // `\`-continued literal). Reuses the fixture-blessed shape.
+            let _ = writeln!(
+                out,
+                "[Output truncated at {new_offset} bytes of {total}. continue_offset={new_offset}. \
+                 Call more with count={count} to read the next chunk.]"
+            );
+        }
+        return out;
+    }
     let Some(more) = ctx.more.clone() else {
         return "Tool error: no previous output to continue\n".to_string();
     };

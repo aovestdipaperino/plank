@@ -81,6 +81,7 @@ pub mod slashmenu;
 pub mod slice;
 pub mod snapshot;
 pub mod speeds;
+pub mod spill;
 pub mod status;
 pub mod statusbar;
 pub mod stderrline;

@@ -281,6 +281,12 @@ pub struct ToolsSettings {
     /// `0` (the default) is off — parity is untouched until a user opts in.
     /// Bash keeps its own model-supplied timeout; this is the outer bound.
     pub call_timeout_sec: u64,
+    /// A tool result larger than this many bytes is spilled to
+    /// `~/.plank/spill/<session-id>/` and replaced inline by a bounded preview
+    /// plus a locator. Defaults high enough that ordinary sessions never spill.
+    pub spill_max_bytes: usize,
+    /// How many bytes of a spilled result stay inline as the preview.
+    pub spill_preview_bytes: usize,
 }
 
 impl Default for ToolsSettings {
@@ -288,6 +294,8 @@ impl Default for ToolsSettings {
         Self {
             repeat_advisory: true,
             call_timeout_sec: 0,
+            spill_max_bytes: 1_048_576,
+            spill_preview_bytes: 4096,
         }
     }
 }
@@ -594,6 +602,14 @@ impl Settings {
         if let Some(v) = num::<u64>(tools, "callTimeoutSec") {
             self.tools.call_timeout_sec = v;
             self.note("tools.callTimeoutSec", origin);
+        }
+        if let Some(v) = num::<usize>(tools, "spillMaxBytes") {
+            self.tools.spill_max_bytes = v;
+            self.note("tools.spillMaxBytes", origin);
+        }
+        if let Some(v) = num::<usize>(tools, "spillPreviewBytes") {
+            self.tools.spill_preview_bytes = v;
+            self.note("tools.spillPreviewBytes", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);

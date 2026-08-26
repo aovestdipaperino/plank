@@ -659,6 +659,17 @@ narrow suspects were resolved:
   `sysprompt-<fp1>.kv_raw` snapshot and forces a rebuild — survivable, never a
   silent gain or loss of tools relative to the session's own record.
 
+## Output spill (M4) — the locator line is new model-facing text
+
+The spill preview banner (`[Output truncated at N bytes of M. continue_offset=K.
+Call more with count=C to read the next chunk.]`, `src/spill.rs`) is a new
+model-facing sentence. The C agent has no spill concept, so there is no
+`refs/ds4` wording to match; the shape deliberately reuses the fixture-blessed
+`[Read truncated at line N of M. continue_offset=K. ...]` sentence to minimise
+the surface. It is a deliberate deviation, gated behind `tools.spillMaxBytes`
+(default high enough that ordinary sessions never spill). Regenerate fixtures
+with `PLANK_REGEN_FIXTURES=1 cargo test` if a fixture ever pins this text.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

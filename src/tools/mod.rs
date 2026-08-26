@@ -84,6 +84,11 @@ pub struct ToolContext {
     pub cwd: PathBuf,
     /// Continuation state for the `more` tool, if a read was truncated.
     pub more: Option<MoreState>,
+    /// The last spilled tool result, for the `more` tool to continue reading
+    /// it by spill id. Set by the dispatch-level spill policy.
+    pub spill: Option<crate::spill::Spilled>,
+    /// Session id, used to scope spill storage under `~/.plank/spill/<id>/`.
+    pub session_id: String,
     /// Table of live and finished asynchronous bash jobs.
     pub bash: bash::BashJobs,
     /// Per-session web tool state (sticky approval flag).
@@ -199,6 +204,8 @@ impl ToolContext {
         Self {
             cwd: cwd.into(),
             more: None,
+            spill: None,
+            session_id: String::new(),
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
             web_confirm: None,
@@ -448,7 +455,18 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
             call = call.name
         );
     }
-    ToolResult::from_output(output)
+    // Output spill (M4): applied AFTER the PostToolUse hooks, so a hook sees
+    // the full output and only the model sees the preview. The full payload is
+    // written to `~/.plank/spill/<session-id>/` and the inline result becomes a
+    // bounded preview plus a locator the `more` tool can continue.
+    let s = crate::settings::active().tools.clone();
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: s.spill_max_bytes,
+        preview_bytes: s.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, &call.name, output);
+    ctx.spill = spilled;
+    ToolResult::from_output(preview)
 }
 
 /// Fires the `PostToolUseFailure` hooks and appends any exit-2 block message to
@@ -761,6 +779,35 @@ mod tests {
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("nope", &[]), &mut ctx);
         assert!(!res.output.contains("[deadline]"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn dispatch_spills_oversized_results_and_more_continues() {
+        // A 5 MB-style oversized result (here a 1000-byte read under a 100-byte
+        // cap) yields a bounded preview plus a locator, and the generalised
+        // `more` continues the spill by id.
+        let mut s = crate::settings::Settings::default();
+        s.tools.spill_max_bytes = 100;
+        s.tools.spill_preview_bytes = 50;
+        crate::settings::install_for_test(s);
+        let (mut ctx, dir) = test_ctx();
+        ctx.session_id = "sess".to_string();
+        let big = dir.join("big.txt");
+        std::fs::write(&big, "x".repeat(1000)).expect("write");
+        let res = dispatch(&test_call("read", &[("path", "big.txt")]), &mut ctx);
+        assert!(
+            res.output.contains("[Output truncated at 50 bytes of"),
+            "preview + locator: {}",
+            res.output
+        );
+        assert!(ctx.spill.is_some(), "spill state set for `more`");
+        let more = dispatch(&test_call("more", &[("count", "100")]), &mut ctx);
+        assert!(
+            more.output.contains("continue_offset="),
+            "more continues the spill: {}",
+            more.output
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 }
