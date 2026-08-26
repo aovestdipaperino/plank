@@ -198,7 +198,7 @@ pub struct EngineTuning {
     pub mtp_draft_tokens: i32,
     /// MTP acceptance margin from `--mtp-margin` (C default: 3.0).
     pub mtp_margin: f32,
-    /// Use a `DSpark` draft model, from `--dspark`.
+    /// Use a `DSpark` draft model. On by default; `--dspark-off` turns it off.
     ///
     /// The support GGUF comes from `--mtp` when given; otherwise it is
     /// resolved to `~/.plank/ds4flash.dspark.gguf` at startup and downloaded
@@ -253,7 +253,7 @@ impl Default for EngineTuning {
             mtp_path: None,
             mtp_draft_tokens: 1,
             mtp_margin: 3.0,
-            dspark: false,
+            dspark: true,
             dspark_strict: false,
             dspark_confidence: None,
             prefill_chunk: DEFAULT_PREFILL_CHUNK,
@@ -397,9 +397,10 @@ Options:
       --mtp PATH           multi-token-prediction draft model (GGUF)
       --mtp-draft N        draft tokens per MTP step (default 1)
       --mtp-margin F       MTP acceptance margin (default 3.0)
-      --dspark             DSpark speculative decoding; downloads the support model
-                           to ~/.plank/ds4flash.dspark.gguf unless --mtp names one
-                           (defaults --temp to 0 unless --temp is given)
+      --dspark             DSpark speculative decoding (on by default); downloads
+                           the support model to ~/.plank/ds4flash.dspark.gguf unless
+                           --mtp names one (defaults --temp to 0 unless --temp is given)
+      --dspark-off         disable DSpark speculative decoding (target-only decode)
       --dspark-confidence F  DSpark confidence pruning threshold 0..1
                            (engine default: Metal 0.6, CUDA/ROCm 0.7; 0 = fixed blocks)
       --dspark-strict      load DSpark support but keep target-only decode
@@ -1208,6 +1209,7 @@ pub fn parse_options_with(
             "--ssd-streaming" => c.engine.ssd_streaming = true,
             "--ssd-streaming-cold" => c.engine.ssd_streaming_cold = true,
             "--dspark" => c.engine.dspark = true,
+            "--dspark-off" => c.engine.dspark = false,
             "--dspark-strict" => {
                 c.engine.dspark = true;
                 c.engine.dspark_strict = true;
@@ -1244,9 +1246,9 @@ fn finalize(c: &mut AgentConfig, steering_scale_set: bool, temp_set: bool) -> Re
         c.engine.dir_steering_ffn = 1.0;
     }
     // Speculative decoding only engages at temperature 0 (see `ds4engine`'s
-    // draft gate), so asking for DSpark defaults the temperature to 0. Done
-    // here rather than at the flag because `--temp` may follow it; an explicit
-    // `--temp` in either order still wins.
+    // draft gate), so DSpark defaults the temperature to 0. Done here rather
+    // than at the flag because `--temp` may follow it; an explicit `--temp` in
+    // either order still wins. `--dspark-off` leaves the 0.6 default in force.
     if c.engine.dspark && !temp_set {
         c.generation.temperature = 0.0;
     }
@@ -1753,7 +1755,8 @@ mod tests {
 
     #[test]
     fn dspark_defaults_the_temperature_to_zero() {
-        let c = parse_options(&args(&["--dspark"])).unwrap();
+        // DSpark is on by default, so a bare run samples argmax.
+        let c = parse_options(&args(&[])).unwrap();
         assert!((c.generation.temperature - 0.0).abs() < 1e-6);
 
         // The implying flags carry the same default.
@@ -1764,17 +1767,29 @@ mod tests {
     }
 
     #[test]
+    fn dspark_off_keeps_the_sampling_default() {
+        // --dspark-off turns speculation off, so the 0.6 temperature default
+        // stays in force rather than being forced to 0.
+        let c = parse_options(&args(&["--dspark-off"])).unwrap();
+        assert!(!c.engine.dspark);
+        assert!((c.generation.temperature - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
     fn an_explicit_temp_beats_the_dspark_default_in_either_order() {
         let c = parse_options(&args(&["--dspark", "--temp", "0.9"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
         let c = parse_options(&args(&["--temp", "0.9", "--dspark"])).unwrap();
         assert!((c.generation.temperature - 0.9).abs() < 1e-6);
+        // --dspark-off with an explicit --temp also keeps the explicit value.
+        let c = parse_options(&args(&["--dspark-off", "--temp", "0.9"])).unwrap();
+        assert!((c.generation.temperature - 0.9).abs() < 1e-6);
     }
 
     #[test]
-    fn dspark_is_off_by_default() {
+    fn dspark_is_on_by_default() {
         let c = parse_options(&args(&[])).unwrap();
-        assert!(!c.engine.dspark);
+        assert!(c.engine.dspark);
         assert!(!c.engine.dspark_strict);
         assert_eq!(c.engine.dspark_confidence, None);
     }

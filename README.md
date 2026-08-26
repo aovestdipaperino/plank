@@ -78,14 +78,15 @@ Without a model (or on non-macOS platforms) plank still runs against a built-in 
 
 ### Speculative decoding (DSpark)
 
-`--dspark` turns on DeepSeek's auxiliary draft checkpoint for V4 Flash: it reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with — so one verification pass can advance the stream by several tokens. It is off by default.
+DSpark speculative decoding is **on by default**: DeepSeek's auxiliary draft checkpoint for V4 Flash reads hidden states from the main model, proposes up to five tokens ahead, and the main model verifies them and commits only the prefix it agrees with — so one verification pass can advance the stream by several tokens. `--dspark-off` turns it off for target-only decode.
 
 The support model (~5.6 GB) does not need a flag of its own. It resolves to `~/.plank/ds4flash.dspark.gguf` and, when missing, is offered for download through the same resumable, playable path as the main model. Passing `--mtp <path>` overrides it, which is also how a legacy one-stage MTP drafter is supplied.
 
 ```sh
-plank --dspark --temp 0
+plank --temp 0
 ```
 
+- `--dspark-off` — disable DSpark speculative decoding (target-only decode).
 - `--dspark-confidence F` — pruning threshold, `0..1`. `0` forces fixed five-token blocks (diagnostics). The default is the engine's own and depends on the backend.
 - `--dspark-strict` — load the drafter but keep target-only decode, for comparisons and correctness checks.
 

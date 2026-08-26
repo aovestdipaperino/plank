@@ -1615,9 +1615,12 @@ mod tests {
 
     #[test]
     fn support_resolution_is_skipped_unless_dspark_was_asked_for() {
-        // No --dspark: the resolver must not touch mtp_path, and so must never
+        // --dspark-off: the resolver must not touch mtp_path, and so must never
         // reach the filesystem or a prompt.
-        let mut e = crate::config::EngineTuning::default();
+        let mut e = crate::config::EngineTuning {
+            dspark: false,
+            ..crate::config::EngineTuning::default()
+        };
         assert!(ensure_dspark_support(&mut e).is_ok());
         assert_eq!(e.mtp_path, None);
     }

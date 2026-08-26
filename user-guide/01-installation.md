@@ -60,7 +60,7 @@ Things worth knowing before you start an 87 GB transfer:
 - **It is honest about the wait.** Size and rate counters, plus a rotation of two hundred status messages.
 - **It is headless-safe.** With stdin not on a terminal there is nobody to answer the prompt, so plank exits with instructions rather than hanging your script.
 
-The DSpark draft checkpoint (~5.6 GB) follows the same path when `--dspark` asks for it: it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download with the same prompt, resume and progress. See [Configuration](08-configuration.md#speculative-decoding).
+The DSpark draft checkpoint (~5.6 GB) follows the same path — DSpark is on by default, so it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download with the same prompt, resume and progress (`--dspark-off` skips it). See [Configuration](08-configuration.md#speculative-decoding).
 
 To use a model you already have somewhere else:
 
