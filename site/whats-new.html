@@ -137,6 +137,27 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>plank signs the commits it writes.</strong> When the model
+creates a git commit, the message now ends with a blank line and the
+single line <code>--with help from plank</code>, so a
+<code>git log</code> months from now still says which commits came out
+of a session rather than out of your fingers. It is a system-prompt
+instruction, not a hook, which means the model can be told to leave it
+off for one commit and your repository conventions still come first. If
+you would rather it never appear, set
+<code>"git": { "signCommits": false }</code> in
+<code>settings.json</code> or run
+<code>/config git.signCommits false</code>, and the instruction is gone
+from the prompt entirely. See <a
+href="/guide/08-configuration.html#git">Configuration</a>.</p>
+<p><strong>DSpark speculative decoding is on by default.</strong> The
+auxiliary draft checkpoint used to need <code>--dspark</code>; now it is
+the default and <code>--dspark-off</code> is how you get target-only
+decode. Speculation only engages at temperature 0, so a bare
+<code>plank</code> samples argmax: pass <code>--temp</code> if you want
+sampling back, and <code>--dspark-off</code> leaves the old 0.6 default
+in force. The support model is still fetched on demand the first time it
+is needed.</p>
 <p><strong>The exit summary says where the session went.</strong> It
 used to end with a peak prefill rate and a peak generation rate — one
 lucky pass each, which tells you nothing about the run you just had. Now
@@ -197,8 +218,8 @@ agents never lose theirs. Plugin settings sit below your own files, and
 every warning. There is no installer and no marketplace yet — you place
 the directory yourself. See <a href="/guide/09-extending.html">Extending
 plank</a>.</p>
-<p><strong>v3.2.0 is out</strong>, and the beta channel has opened on
-3.2.1. The patch number is still the channel: <code>.0</code> is stable,
+<p><strong>v3.3.0 is out</strong>, and the beta channel has opened on
+3.3.1. The patch number is still the channel: <code>.0</code> is stable,
 anything above it is beta.</p>
 <p><strong>Your session has a name from the first frame.</strong> The
 memorable <code>adjective-celebrity</code> name used to be minted when a

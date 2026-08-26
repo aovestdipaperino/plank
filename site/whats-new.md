@@ -7,6 +7,23 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**plank signs the commits it writes.** When the model creates a git commit, the
+message now ends with a blank line and the single line `--with help from plank`,
+so a `git log` months from now still says which commits came out of a session
+rather than out of your fingers. It is a system-prompt instruction, not a hook,
+which means the model can be told to leave it off for one commit and your
+repository conventions still come first. If you would rather it never appear,
+set `"git": { "signCommits": false }` in `settings.json` or run
+`/config git.signCommits false`, and the instruction is gone from the prompt
+entirely. See [Configuration](/guide/08-configuration.html#git).
+
+**DSpark speculative decoding is on by default.** The auxiliary draft checkpoint
+used to need `--dspark`; now it is the default and `--dspark-off` is how you get
+target-only decode. Speculation only engages at temperature 0, so a bare `plank`
+samples argmax: pass `--temp` if you want sampling back, and `--dspark-off`
+leaves the old 0.6 default in force. The support model is still fetched on
+demand the first time it is needed.
+
 **The exit summary says where the session went.** It used to end with a peak
 prefill rate and a peak generation rate — one lucky pass each, which tells you
 nothing about the run you just had. Now every model that ran gets a line: time
@@ -66,7 +83,7 @@ what each one contributes and every warning. There is no installer and no market
 yet — you place the directory yourself. See
 [Extending plank](/guide/09-extending.html).
 
-**v3.2.0 is out**, and the beta channel has opened on 3.2.1. The patch number is
+**v3.3.0 is out**, and the beta channel has opened on 3.3.1. The patch number is
 still the channel: `.0` is stable, anything above it is beta.
 
 **Your session has a name from the first frame.** The memorable

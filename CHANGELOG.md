@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.3.0] - 2026-08-26
+
 ### Added
 
 - **Commits plank writes are signed.** The system prompt now asks the model to
