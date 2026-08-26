@@ -783,13 +783,15 @@ fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
 ///
 /// Every plugin entry is registered as `<plugin>:<name>`. It is registered a
 /// second time under the bare `<name>` only when no non-plugin entry and no
-/// other plugin claims that name. Returns the merged list and the collision
-/// warnings.
+/// other plugin claims that name. Returns the merged list, the collision
+/// warnings, and the claiming provenance (`component` names the kind of entry,
+/// e.g. `skills`) for `/config --resolved`.
 #[must_use]
 pub fn reconcile<T: Named + Clone>(
+    component: &str,
     local: Vec<T>,
     plugin_entries: Vec<(String, T)>,
-) -> (Vec<T>, Vec<String>) {
+) -> (Vec<T>, Vec<String>, Vec<crate::provenance::ClaimInfo>) {
     let mut warnings = Vec::new();
     let mut merged = local;
 
@@ -802,6 +804,25 @@ pub fn reconcile<T: Named + Clone>(
             Some((_, owners)) => owners.push(plugin.clone()),
             None => claims.push((key, vec![plugin.clone()])),
         }
+    }
+
+    // Claiming provenance: for each bare name, which plugin won it (if any) and
+    // which plugins lost it. A plugin wins the bare name only when no
+    // non-plugin entry holds it and no other plugin offers it.
+    let mut claim_infos = Vec::new();
+    for (bare, owners) in &claims {
+        let taken_by_local = merged.iter().any(|e| e.name() == bare);
+        let (winner, shadowed) = if taken_by_local || owners.len() > 1 {
+            (None, owners.clone())
+        } else {
+            (Some(owners[0].clone()), Vec::new())
+        };
+        claim_infos.push(crate::provenance::ClaimInfo {
+            component: component.to_string(),
+            name: bare.clone(),
+            winner,
+            shadowed,
+        });
     }
 
     for (plugin, entry) in plugin_entries {
@@ -841,7 +862,7 @@ pub fn reconcile<T: Named + Clone>(
         }
         merged.push(entry);
     }
-    (merged, warnings)
+    (merged, warnings, claim_infos)
 }
 
 /// Loads one component out of every plugin in the set, tagging each entry
@@ -873,7 +894,11 @@ pub fn skills_in(
     home: Option<&Path>,
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::skills::Skill>, Vec<String>) {
+) -> (
+    Vec<crate::skills::Skill>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let mut roots = Vec::new();
     if let Some(home) = home {
         roots.push(home.join(".plank").join("skills"));
@@ -881,16 +906,21 @@ pub fn skills_in(
     roots.push(cwd.join(".plank").join("skills"));
     let local = crate::skills::load_from(&roots);
     let plugin = gather(set, "skills", "skills", crate::skills::load_from);
-    reconcile(local, plugin)
+    reconcile("skills", local, plugin)
 }
 
 /// Skills from `~/.plank` and `./.plank`, plus every plugin's, namespaced per
-/// the collision rule. Returns the merged list and the collision warnings.
+/// the collision rule. Returns the merged list, the collision warnings, and the
+/// claiming provenance.
 #[must_use]
 pub fn skills_with_plugins(
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::skills::Skill>, Vec<String>) {
+) -> (
+    Vec<crate::skills::Skill>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     skills_in(home.as_deref(), cwd, set)
 }
@@ -903,7 +933,11 @@ pub fn agents_in(
     home: Option<&Path>,
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::agents::AgentDef>, Vec<String>) {
+) -> (
+    Vec<crate::agents::AgentDef>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let mut roots = Vec::new();
     if let Some(home) = home {
         roots.push(home.join(".plank").join("agents"));
@@ -911,7 +945,7 @@ pub fn agents_in(
     roots.push(cwd.join(".plank").join("agents"));
     let local = crate::agents::load_from(&roots);
     let plugin = gather(set, "agents", "agents", crate::agents::load_from);
-    reconcile(local, plugin)
+    reconcile("agents", local, plugin)
 }
 
 /// Agent definitions from `~/.plank` and `./.plank`, plus every plugin's.
@@ -919,7 +953,11 @@ pub fn agents_in(
 pub fn agents_with_plugins(
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::agents::AgentDef>, Vec<String>) {
+) -> (
+    Vec<crate::agents::AgentDef>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     agents_in(home.as_deref(), cwd, set)
 }
@@ -934,7 +972,11 @@ pub fn templates_in(
     home: Option<&Path>,
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::templates::Template>, Vec<String>) {
+) -> (
+    Vec<crate::templates::Template>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let mut roots = Vec::new();
     if let Some(home) = home {
         roots.push(home.join(".plank").join("templates"));
@@ -942,7 +984,7 @@ pub fn templates_in(
     roots.push(cwd.join(".plank").join("templates"));
     let local = crate::templates::load_from(&roots);
     let plugin = gather(set, "templates", "commands", crate::templates::load_from);
-    reconcile(local, plugin)
+    reconcile("templates", local, plugin)
 }
 
 /// Prompt templates from `~/.plank` and `./.plank`, plus every plugin's.
@@ -952,7 +994,11 @@ pub fn templates_in(
 pub fn templates_with_plugins(
     cwd: &Path,
     set: &PluginSet,
-) -> (Vec<crate::templates::Template>, Vec<String>) {
+) -> (
+    Vec<crate::templates::Template>,
+    Vec<String>,
+    Vec<crate::provenance::ClaimInfo>,
+) {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     templates_in(home.as_deref(), cwd, set)
 }
@@ -1554,15 +1600,22 @@ mod tests {
 
     #[test]
     fn an_uncontested_plugin_entry_gets_both_the_bare_name_and_the_alias() {
-        let (merged, warnings) =
-            reconcile(vec![], vec![("demo".to_string(), item("greet", "plugin"))]);
+        let (merged, warnings, claims) = reconcile(
+            "skills",
+            vec![],
+            vec![("demo".to_string(), item("greet", "plugin"))],
+        );
         assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
         assert!(warnings.is_empty());
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].winner.as_deref(), Some("demo"));
+        assert!(claims[0].shadowed.is_empty());
     }
 
     #[test]
     fn a_user_entry_keeps_the_bare_name_and_the_plugin_keeps_only_the_alias() {
-        let (merged, warnings) = reconcile(
+        let (merged, warnings, claims) = reconcile(
+            "skills",
             vec![item("greet", "user")],
             vec![("demo".to_string(), item("greet", "plugin"))],
         );
@@ -1576,11 +1629,16 @@ mod tests {
             "user"
         );
         assert!(warnings.iter().any(|w| w.contains("demo:greet")));
+        // A local entry holds the bare name, so no plugin wins it.
+        assert_eq!(claims.len(), 1);
+        assert!(claims[0].winner.is_none());
+        assert_eq!(claims[0].shadowed, vec!["demo".to_string()]);
     }
 
     #[test]
     fn two_colliding_plugins_both_lose_the_bare_name() {
-        let (merged, warnings) = reconcile(
+        let (merged, warnings, claims) = reconcile(
+            "skills",
             vec![],
             vec![
                 ("alpha".to_string(), item("greet", "alpha")),
@@ -1594,11 +1652,22 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("alpha") && w.contains("beta"))
         );
+        // Two colliding plugins: neither wins the bare name, both shadowed.
+        assert_eq!(claims.len(), 1);
+        assert!(claims[0].winner.is_none());
+        assert_eq!(
+            claims[0].shadowed,
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
     }
 
     #[test]
     fn an_uncontested_plugin_entry_is_listed_once_under_its_bare_name() {
-        let (merged, _) = reconcile(vec![], vec![("demo".to_string(), item("greet", "plugin"))]);
+        let (merged, _, _) = reconcile(
+            "skills",
+            vec![],
+            vec![("demo".to_string(), item("greet", "plugin"))],
+        );
         assert_eq!(names(&merged), vec!["demo:greet", "greet"]);
         let listed = listing(&merged);
         assert_eq!(listed.len(), 1, "rendered once");
@@ -1608,7 +1677,8 @@ mod tests {
 
     #[test]
     fn a_contested_plugin_entry_is_listed_under_its_alias_beside_the_local_one() {
-        let (merged, _) = reconcile(
+        let (merged, _, _) = reconcile(
+            "skills",
             vec![item("greet", "user")],
             vec![("demo".to_string(), item("greet", "plugin"))],
         );
@@ -1635,7 +1705,7 @@ mod tests {
             "---\nname: greet\ndescription: says hi\n---\nHello\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (skills, _) = skills_in(Some(&home), &cwd, &set);
+        let (skills, _, _) = skills_in(Some(&home), &cwd, &set);
         assert_eq!(skills.len(), 2, "both names stay resolvable");
         for out in [
             crate::skills::render_list(&skills),
@@ -1688,7 +1758,7 @@ mod tests {
             "---\nname: greet\ndescription: says hi\n---\nHello\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (skills, warnings) = skills_in(Some(&home), &cwd, &set);
+        let (skills, warnings, _) = skills_in(Some(&home), &cwd, &set);
         assert!(skills.iter().any(|s| s.name == "greet"));
         assert!(skills.iter().any(|s| s.name == "demo:greet"));
         assert!(warnings.is_empty());
@@ -1713,7 +1783,7 @@ mod tests {
             "---\nname: greet\ndescription: plugin version\n---\nPlugin\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (skills, warnings) = skills_in(Some(&home), &cwd, &set);
+        let (skills, warnings, _) = skills_in(Some(&home), &cwd, &set);
         let unqualified = skills
             .iter()
             .find(|s| s.name == "greet")
@@ -1738,7 +1808,7 @@ mod tests {
             "---\ndescription: a note\n---\nBody\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (templates, _) = templates_in(Some(&home), &cwd, &set);
+        let (templates, _, _) = templates_in(Some(&home), &cwd, &set);
         assert!(templates.iter().any(|t| t.name == "note"));
         assert!(templates.iter().any(|t| t.name == "demo:note"));
     }
@@ -1758,7 +1828,7 @@ mod tests {
             "---\ndescription: scouts\n---\nBe a scout.\n",
         );
         let set = load_in(Some(&home), &cwd, &[plugin]);
-        let (agents, _) = agents_in(Some(&home), &cwd, &set);
+        let (agents, _, _) = agents_in(Some(&home), &cwd, &set);
         assert!(agents.iter().any(|a| a.name == "demo:scout"));
     }
 
@@ -2044,7 +2114,7 @@ mod tests {
             "precondition: the collision is not in the load-time warnings"
         );
 
-        let (_, skill_warnings) = skills_in(Some(&home), &cwd, &set);
+        let (_, skill_warnings, _) = skills_in(Some(&home), &cwd, &set);
         let (_, mcp_warnings) = mcp_servers(&set);
         assert!(!skill_warnings.is_empty(), "the collision was reported");
         assert!(!mcp_warnings.is_empty(), "the `__` server was rejected");

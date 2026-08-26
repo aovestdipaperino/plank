@@ -305,6 +305,10 @@ pub struct Settings {
     /// declares the type, and `ConfigOption::accepts` validates against that
     /// declaration rather than against anything settings.rs believes.
     pub plugin_config: std::collections::BTreeMap<String, String>,
+    /// Provenance of each effective settings key (`section.key`), keyed by the
+    /// addressing `/config` and `configform::FIELDS` use. Populated during
+    /// overlay; CLI overrides are recorded separately on `AgentConfig`.
+    pub provenance: std::collections::BTreeMap<String, crate::provenance::Provenance>,
 }
 
 /// `worktree` block: how [`crate::worktree`] builds a new working copy.
@@ -405,57 +409,81 @@ impl Settings {
     /// Parses one `settings.json`, overlaying `self` key by key.
     ///
     /// Unknown keys are ignored, so a newer plank's file stays loadable by an
-    /// older one.
+    /// older one. Provenance is recorded as [`Origin::UserSettings`] — the
+    /// test-only convenience; the layered loaders use [`overlay_from`](Self::overlay_from).
+    #[cfg(test)]
     fn overlay(&mut self, text: &str) {
+        self.overlay_from(text, &crate::provenance::Origin::UserSettings);
+    }
+
+    /// [`overlay`](Self::overlay) with the provenance origin the file came from,
+    /// so `/config --resolved` can report which layer won each key.
+    // A mechanical key-by-key overlay; the length is not complexity.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn overlay_from(&mut self, text: &str, origin: &crate::provenance::Origin) {
         let Some(root) = json_parse(text) else { return };
         let engine = root.get("engine");
         if let Some(v) = string(engine, "model") {
             self.engine.model = Some(expand_tilde(&v));
+            self.note("engine.model", origin);
         }
         if let Some(v) = num(engine, "threads") {
             self.engine.threads = Some(v);
+            self.note("engine.threads", origin);
         }
         if let Some(v) = string(engine, "backend") {
             self.engine.backend = Some(v);
+            self.note("engine.backend", origin);
         }
         if let Some(v) = num(engine, "power") {
             self.engine.power = Some(v);
+            self.note("engine.power", origin);
         }
         if let Some(v) = num(engine, "ctx") {
             self.engine.ctx = Some(v);
+            self.note("engine.ctx", origin);
         }
         if let Some(v) = boolean(engine, "thinkingToolCalls") {
             self.engine.thinking_tool_calls = v;
+            self.note("engine.thinkingToolCalls", origin);
         }
 
         let ui = root.get("ui");
         if let Some(v) = boolean(ui, "respectGitignore") {
             self.ui.respect_gitignore = v;
+            self.note("ui.respectGitignore", origin);
         }
         // A zero-row popup or zero-entry history would silently disable the
         // feature rather than tune it; treat those as unset.
         if let Some(v) = num::<usize>(ui, "popupRows").filter(|v| *v > 0) {
             self.ui.popup_rows = v;
+            self.note("ui.popupRows", origin);
         }
         if let Some(v) = num(ui, "indexRefreshSecs") {
             self.ui.index_refresh_secs = v;
+            self.note("ui.indexRefreshSecs", origin);
         }
         if let Some(v) = num::<usize>(ui, "historySize").filter(|v| *v > 0) {
             self.ui.history_size = v;
+            self.note("ui.historySize", origin);
         }
         if let Some(v) = boolean(ui, "showToolCalls") {
             self.ui.show_tool_calls = v;
+            self.note("ui.showToolCalls", origin);
         }
         if let Some(v) = boolean(ui, "showToolResults") {
             self.ui.show_tool_results = v;
+            self.note("ui.showToolResults", origin);
         }
         if let Some(v) = boolean(ui, "showThinking") {
             self.ui.show_thinking = v;
+            self.note("ui.showThinking", origin);
         }
         if let Some(v) = string(ui, "screensaver")
             && let Some(d) = crate::arcade::ScreensaverDelay::parse(&v)
         {
             self.ui.screensaver = d;
+            self.note("ui.screensaver", origin);
         }
         // A face is either one plank ships or one a plugin contributes. The
         // built-in spellings win, so a plugin cannot capture the word "matrix"
@@ -469,6 +497,7 @@ impl Settings {
             } else if v.contains(':') {
                 self.ui.screensaver_face_plugin = Some(v);
             }
+            self.note("ui.screensaverFace", origin);
         }
         // `notifications` accepts a mode string (always/unfocused/never) or
         // the legacy booleans (true=always, false=never).
@@ -478,87 +507,116 @@ impl Settings {
             } else {
                 crate::notify::NotifyMode::Never
             };
+            self.note("ui.notifications", origin);
         } else if let Some(v) =
             string(ui, "notifications").and_then(|s| crate::notify::NotifyMode::parse(&s))
         {
             self.ui.notifications = v;
+            self.note("ui.notifications", origin);
         }
         if let Some(v) = num(ui, "notifyAfterSecs") {
             self.ui.notify_after_secs = v;
+            self.note("ui.notifyAfterSecs", origin);
         }
         if let Some(v) = boolean(ui, "crtOff") {
             self.ui.crt_off = v;
+            self.note("ui.crtOff", origin);
         }
         if let Some(v) = boolean(ui, "reducedMotion") {
             self.ui.reduced_motion = v;
+            self.note("ui.reducedMotion", origin);
         }
         if let Some(v) = boolean(ui, "easterEggs") {
             self.ui.easter_eggs = v;
+            self.note("ui.easterEggs", origin);
         }
         if let Some(v) = boolean(ui, "builtinEditor") {
             self.ui.builtin_editor = v;
+            self.note("ui.builtinEditor", origin);
         }
 
         let safety = root.get("safety");
         if let Some(v) = boolean(safety, "sandbox") {
             self.safety.sandbox = Some(v);
+            self.note("safety.sandbox", origin);
         }
         if let Some(v) = boolean(safety, "btwSuspend") {
             self.safety.btw_suspend = Some(v);
+            self.note("safety.btwSuspend", origin);
         }
 
         if let Some(v) = num::<u64>(root.get("mcp"), "timeoutSecs").filter(|v| *v > 0) {
             self.mcp.timeout_secs = v;
+            self.note("mcp.timeoutSecs", origin);
         }
 
         // A max below the fixed minimum would make every `ask` call impossible;
         // clamp it up rather than silently breaking the tool.
         if let Some(v) = num::<usize>(root.get("ask"), "maxOptions") {
             self.ask.max_options = v.max(ASK_MIN_OPTIONS);
+            self.note("ask.maxOptions", origin);
         }
 
         if let Some(v) = boolean(root.get("update"), "check") {
             self.update.check = v;
+            self.note("update.check", origin);
         }
 
-        self.overlay_agents_and_worktree(&root);
+        self.overlay_agents_and_worktree(&root, origin);
+    }
+
+    /// Records that `origin` set the settings key `key` (`section.key`).
+    fn note(&mut self, key: &str, origin: &crate::provenance::Origin) {
+        self.provenance
+            .entry(key.to_string())
+            .or_insert_with(|| crate::provenance::Provenance::new(origin.clone()))
+            .note(origin.clone());
     }
 
     /// The `agents` and `worktree` half of [`overlay`](Self::overlay), split out
     /// only to keep each function under the length lint.
-    fn overlay_agents_and_worktree(&mut self, root: &Json) {
+    fn overlay_agents_and_worktree(&mut self, root: &Json, origin: &crate::provenance::Origin) {
         let agents = root.get("agents");
         if let Some(v) = boolean(agents, "autoRoute") {
             self.agents.auto_route = v;
+            self.note("agents.autoRoute", origin);
         }
         if let Some(v) = num::<usize>(agents, "maxParallel") {
             self.agents.max_parallel = v.clamp(1, AGENT_MAX_PARALLEL);
+            self.note("agents.maxParallel", origin);
         }
 
         let worktree = root.get("worktree");
         if let Some(v) = strings(worktree, "sparsePaths") {
             self.worktree.sparse_paths = v;
+            self.note("worktree.sparsePaths", origin);
         }
         if let Some(v) = strings(worktree, "symlinkDirectories") {
             self.worktree.symlink_directories = v;
+            self.note("worktree.symlinkDirectories", origin);
         }
         if let Some(v) = boolean(worktree, "isolateAgents") {
             self.worktree.isolate_agents = v;
+            self.note("worktree.isolateAgents", origin);
         }
 
         let kvcache = root.get("kvcache");
         if let Some(v) = num::<u64>(kvcache, "ttlSessionDays") {
             self.kvcache.ttl_session_days = v;
+            self.note("kvcache.ttlSessionDays", origin);
         }
         if let Some(v) = num::<u64>(kvcache, "ttlTierDays") {
             self.kvcache.ttl_tier_days = v;
+            self.note("kvcache.ttlTierDays", origin);
         }
         if let Some(v) = num::<u64>(kvcache, "maxBytes") {
             self.kvcache.max_bytes = v;
+            self.note("kvcache.maxBytes", origin);
         }
 
         if let Some(v) = boolean(root.get("git"), "signCommits") {
             self.git.sign_commits = v;
+            self.note("git.signCommits", origin);
         }
 
         // Merged key by key rather than replaced wholesale: a project file that
@@ -568,6 +626,7 @@ impl Settings {
             for (key, value) in entries {
                 if let Json::Str(v) = value {
                     self.plugin_config.insert(key.clone(), v.clone());
+                    self.note(&format!("pluginConfig.{key}"), origin);
                 }
             }
         }
@@ -579,9 +638,23 @@ impl Settings {
     #[must_use]
     pub fn load_from_paths(low: &[PathBuf], high: &[PathBuf]) -> Self {
         let mut s = Self::default();
-        for p in low.iter().chain(high.iter()) {
+        // Provenance per file: `low` is the plugin layer, `high` is the user
+        // file then the project file (see `paths_in`). Overlay runs low-to-high,
+        // so a later layer demotes the earlier one to shadowed.
+        let low_origins = low
+            .iter()
+            .map(|p| (p, crate::provenance::Origin::Plugin(String::new())));
+        let high_origins = high.iter().enumerate().map(|(i, p)| {
+            let origin = if i == 0 {
+                crate::provenance::Origin::UserSettings
+            } else {
+                crate::provenance::Origin::ProjectSettings
+            };
+            (p, origin)
+        });
+        for (p, origin) in low_origins.chain(high_origins) {
             if let Ok(text) = std::fs::read_to_string(p) {
-                s.overlay(&text);
+                s.overlay_from(&text, &origin);
             }
         }
         s
@@ -1650,5 +1723,53 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_records_plugin_below_user_below_project() {
+        // The plugin-below-user rule from CLAUDE.md must be visible in the
+        // provenance, not just in the docs: a plugin setting loses to the user
+        // file, which loses to the project file, and each loser is shadowed.
+        let dir = std::env::temp_dir().join(format!("plank-provenance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(cwd.join(".plank")).expect("mkdir cwd");
+
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"kvcache":{"maxBytes":111}}"#).expect("write plugin");
+        let user = home.join(".plank").join("settings.json");
+        std::fs::write(&user, r#"{"kvcache":{"maxBytes":222}}"#).expect("write user");
+        let project = cwd.join(".plank").join("settings.json");
+        std::fs::write(&project, r#"{"kvcache":{"maxBytes":333}}"#).expect("write project");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(s.kvcache.max_bytes, 333);
+        let p = s
+            .provenance
+            .get("kvcache.maxBytes")
+            .expect("provenance recorded");
+        assert_eq!(p.origin, crate::provenance::Origin::ProjectSettings);
+        assert_eq!(
+            p.shadowed,
+            vec![
+                crate::provenance::Origin::Plugin(String::new()),
+                crate::provenance::Origin::UserSettings,
+            ],
+            "plugin then user, in increasing precedence, both shadowed by project"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_records_a_key_only_when_it_takes_effect() {
+        // A malformed value is ignored by overlay, so it must not be recorded
+        // as provenance — the resolved dump lists effective keys only.
+        let mut s = Settings::default();
+        s.overlay(r#"{"kvcache":{"maxBytes":"soon"}}"#);
+        assert!(!s.provenance.contains_key("kvcache.maxBytes"));
+        assert_eq!(s.kvcache.max_bytes, 21_474_836_480);
     }
 }

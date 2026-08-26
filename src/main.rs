@@ -116,6 +116,13 @@ fn main() -> ExitCode {
         print!("{}", usage());
         return ExitCode::SUCCESS;
     }
+    // `--dump-config` prints the resolved configuration (every effective key
+    // with the layer it came from) and exits, without starting a session. It
+    // works under `--non-interactive` because it needs no UI.
+    if cfg.dump_config {
+        print!("{}", plank::provenance::render_resolved(&settings, &cfg));
+        return ExitCode::SUCCESS;
+    }
     // Settings can move plank off Metal or shrink the context, and both are
     // invisible once the UI is up — you just notice it got slow. Say so.
     if let Some(note) = plank::settings::startup_note(&settings, &cfg) {

@@ -3731,7 +3731,12 @@ impl Agent<'_> {
             }
             "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
             "/config" => {
-                if arg.is_empty() {
+                if arg == "--resolved" {
+                    print!(
+                        "{}",
+                        crate::provenance::render_resolved(crate::settings::active(), self.cfg)
+                    );
+                } else if arg.is_empty() {
                     print!(
                         "{}",
                         crate::configform::render_text_list(crate::settings::active())
@@ -9555,30 +9560,39 @@ impl Agent<'_> {
                 Err(usage) => log.push_dim(usage),
             },
             "/config" => {
-                // Open the interactive modal; the run loop drives it and
-                // persists on close. `arg` is ignored (the form edits everything).
-                // The form cycles through contributed faces as well as the
-                // built-ins, so it is handed what this session actually loaded.
-                let faces = self
-                    .tool_ctx
-                    .wasm
-                    .screensaver_faces()
-                    .into_iter()
-                    .map(|f| f.address)
-                    .collect();
-                let plugin_fields = self
-                    .tool_ctx
-                    .wasm
-                    .registry
-                    .declared_config()
-                    .into_iter()
-                    .map(|(id, option)| crate::configform::PluginField { id, option })
-                    .collect();
-                *config_form = Some(crate::configform::ConfigForm::with_contributions(
-                    crate::settings::active().clone(),
-                    faces,
-                    plugin_fields,
-                ));
+                // `--resolved` prints the provenance dump instead of opening the
+                // modal, mirroring the plain-stdout path.
+                if arg == "--resolved" {
+                    log.push_ansi(&crate::provenance::render_resolved(
+                        crate::settings::active(),
+                        self.cfg,
+                    ));
+                } else {
+                    // Open the interactive modal; the run loop drives it and
+                    // persists on close. `arg` is ignored (the form edits everything).
+                    // The form cycles through contributed faces as well as the
+                    // built-ins, so it is handed what this session actually loaded.
+                    let faces = self
+                        .tool_ctx
+                        .wasm
+                        .screensaver_faces()
+                        .into_iter()
+                        .map(|f| f.address)
+                        .collect();
+                    let plugin_fields = self
+                        .tool_ctx
+                        .wasm
+                        .registry
+                        .declared_config()
+                        .into_iter()
+                        .map(|(id, option)| crate::configform::PluginField { id, option })
+                        .collect();
+                    *config_form = Some(crate::configform::ConfigForm::with_contributions(
+                        crate::settings::active().clone(),
+                        faces,
+                        plugin_fields,
+                    ));
+                }
             }
             "/new" | "/clear" => {
                 self.session = Session::new();
@@ -11173,9 +11187,9 @@ fn load_named_contributions(
     tool_ctx: &mut ToolContext,
     mut earlier: Vec<String>,
 ) -> (Vec<crate::skills::Skill>, Vec<crate::templates::Template>) {
-    let (skills, skill_warnings) =
+    let (skills, skill_warnings, skill_claims) =
         crate::plugins::skills_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
-    let (templates, template_warnings) =
+    let (templates, template_warnings, template_claims) =
         crate::plugins::templates_with_plugins(&tool_ctx.cwd, &tool_ctx.plugins);
     earlier.extend(skill_warnings);
     earlier.extend(template_warnings);
@@ -11183,6 +11197,10 @@ fn load_named_contributions(
         eprintln!("plugin warning: {w}");
     }
     tool_ctx.plugins.add_warnings(earlier);
+    // Record which plugin won each bare skill/template name, for
+    // `/config --resolved`.
+    crate::provenance::add_claims(skill_claims);
+    crate::provenance::add_claims(template_claims);
     (skills, templates)
 }
 
@@ -11216,11 +11234,13 @@ fn new_agent(
     // in the prompt (the `agent` tool's `name` enum), so an empty one is part of
     // making the prompt small.
     let minimal = cfg.minimal_prompt;
-    let (agents, agent_warnings) = if minimal {
-        (Vec::new(), Vec::new())
+    let (agents, agent_warnings, agent_claims) = if minimal {
+        (Vec::new(), Vec::new(), Vec::new())
     } else {
         crate::plugins::agents_with_plugins(&cwd, &plugins)
     };
+    // Record which plugin won each bare agent name, for `/config --resolved`.
+    crate::provenance::add_claims(agent_claims);
     // Every collision the reconciliation reports is accumulated here and
     // folded onto the plugin set below, so `/plugins` shows it beside the
     // load-time warnings instead of it being computed and dropped. The set is

@@ -134,6 +134,14 @@ pub struct AgentConfig {
     /// it may be replaced by the provider's reported window; an explicit value
     /// is the user's decision and is never overridden.
     pub ctx_size_explicit: bool,
+    /// Settings keys (`section.key`) a CLI flag overrode, for `/config
+    /// --resolved`. Populated by [`parse_options_with`]; empty when no flag
+    /// shadowed a settings key.
+    pub cli_provenance: std::collections::BTreeMap<String, crate::provenance::Origin>,
+    /// True when `--dump-config` was given: print the resolved configuration
+    /// (every effective key with its origin) and exit, without starting a
+    /// session. Works under `--non-interactive`.
+    pub dump_config: bool,
 }
 
 /// Third-party provider family selector (`--provider`).
@@ -327,6 +335,8 @@ impl Default for AgentConfig {
             provider_api_key: None,
             provider_cache: true,
             ctx_size_explicit: false,
+            cli_provenance: std::collections::BTreeMap::new(),
+            dump_config: false,
         }
     }
 }
@@ -364,6 +374,13 @@ impl AgentConfig {
             c.btw.suspend = b;
         }
         c
+    }
+
+    /// Records that a CLI flag set the settings key `key` (`section.key`), so
+    /// `/config --resolved` can show the flag beating the file provenance.
+    fn cli_set(&mut self, key: &str) {
+        self.cli_provenance
+            .insert(key.to_string(), crate::provenance::Origin::Cli);
     }
 }
 
@@ -454,6 +471,8 @@ Options:
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
       --non-interactive    disable the interactive UI
+      --dump-config        print every effective setting with the layer it came
+                           from (default, plugin, ~/.plank, ./.plank, CLI) and exit
       --minimal-prompt     start with the smallest prompt this build can make:
                            no MCP servers, skills, templates, plugin agents,
                            WASM components or session-start context. For
@@ -1088,19 +1107,36 @@ pub fn parse_options_with(
                 }
                 return Ok(c);
             }
-            "-m" | "--model" => c.model_path = Some(PathBuf::from(need_arg(&mut i)?)),
-            "-t" | "--threads" => c.n_threads = parse_int(need_arg(&mut i)?, arg)?,
+            "-m" | "--model" => {
+                c.model_path = Some(PathBuf::from(need_arg(&mut i)?));
+                c.cli_set("engine.model");
+            }
+            "-t" | "--threads" => {
+                c.n_threads = parse_int(need_arg(&mut i)?, arg)?;
+                c.cli_set("engine.threads");
+            }
             "--backend" => {
                 let v = need_arg(&mut i)?;
                 c.backend = Some(parse_backend(v).ok_or_else(|| format!("invalid backend: {v}"))?);
+                c.cli_set("engine.backend");
             }
-            "--metal" => c.backend = Some(Backend::Metal),
-            "--cuda" => c.backend = Some(Backend::Cuda),
-            "--cpu" => c.backend = Some(Backend::Cpu),
+            "--metal" => {
+                c.backend = Some(Backend::Metal);
+                c.cli_set("engine.backend");
+            }
+            "--cuda" => {
+                c.backend = Some(Backend::Cuda);
+                c.cli_set("engine.backend");
+            }
+            "--cpu" => {
+                c.backend = Some(Backend::Cpu);
+                c.cli_set("engine.backend");
+            }
             "--power" => {
                 let v = need_arg(&mut i)?;
                 c.power_percent = parse_power_percent(v)
                     .ok_or_else(|| format!("invalid value for {arg}: {v}"))?;
+                c.cli_set("engine.power");
             }
             "-p" | "--prompt" => c.prompt = Some(need_arg(&mut i)?.to_owned()),
             "/resume" => {
@@ -1149,6 +1185,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
             // number is almost certainly someone meaning to pin one, so
@@ -1175,6 +1212,7 @@ pub fn parse_options_with(
             "-c" | "--ctx" => {
                 c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?;
                 c.ctx_size_explicit = true;
+                c.cli_set("engine.ctx");
             }
             "-n" | "--tokens" => c.generation.n_predict = parse_int(need_arg(&mut i)?, arg)?,
             "--temp" => {
@@ -1200,10 +1238,22 @@ pub fn parse_options_with(
             }
             "--mcp-config" => c.mcp_config_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "--plugin-dir" => c.plugin_dirs.push(PathBuf::from(need_arg(&mut i)?)),
-            "--sandbox" => c.sandbox_override = Some(true),
-            "--no-sandbox" => c.sandbox_override = Some(false),
-            "--btw-suspend" => c.btw.suspend = true,
-            "--disable-btw-suspend" => c.btw.suspend = false,
+            "--sandbox" => {
+                c.sandbox_override = Some(true);
+                c.cli_set("safety.sandbox");
+            }
+            "--no-sandbox" => {
+                c.sandbox_override = Some(false);
+                c.cli_set("safety.sandbox");
+            }
+            "--btw-suspend" => {
+                c.btw.suspend = true;
+                c.cli_set("safety.btwSuspend");
+            }
+            "--disable-btw-suspend" => {
+                c.btw.suspend = false;
+                c.cli_set("safety.btwSuspend");
+            }
             "--quality" => c.engine.quality = true,
             "--warm-weights" => c.engine.warm_weights = true,
             "--ssd-streaming" => c.engine.ssd_streaming = true,
@@ -1375,6 +1425,49 @@ mod tests {
         assert_eq!(c.generation.ctx_size, 8192);
         assert_eq!(c.sandbox_override, Some(false));
         assert!(!c.btw.suspend);
+    }
+
+    #[test]
+    fn cli_flags_record_provenance_for_the_keys_they_override() {
+        // `/config --resolved` needs to show a CLI flag beating the file
+        // provenance, so every flag that shadows a settings key must record it.
+        use crate::provenance::Origin;
+        let c = parse_options_with(
+            &full_settings(),
+            &args(&[
+                "-m",
+                "/from/flag.gguf",
+                "-t",
+                "16",
+                "--metal",
+                "--power",
+                "90",
+                "-c",
+                "8192",
+                "--no-sandbox",
+                "--disable-btw-suspend",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(c.cli_provenance.get("engine.model"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.threads"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.backend"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.power"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("engine.ctx"), Some(&Origin::Cli));
+        assert_eq!(c.cli_provenance.get("safety.sandbox"), Some(&Origin::Cli));
+        assert_eq!(
+            c.cli_provenance.get("safety.btwSuspend"),
+            Some(&Origin::Cli)
+        );
+        // A flag that shadows no settings key records nothing.
+        let c = parse_options(&args(&["--non-interactive"])).unwrap();
+        assert!(c.cli_provenance.is_empty());
+    }
+
+    #[test]
+    fn dump_config_flag_is_parsed() {
+        let c = parse_options(&args(&["--dump-config"])).unwrap();
+        assert!(c.dump_config);
     }
 
     #[test]
