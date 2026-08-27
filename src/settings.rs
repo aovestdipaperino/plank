@@ -292,6 +292,12 @@ pub struct ToolsSettings {
     /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
     /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
     pub recall: bool,
+    /// Whether the `fanout` tool is offered to the model (M9). Default off:
+    /// a new model-facing tool that runs independent subtasks and joins their
+    /// reports deterministically. On the `ds4_engine` path subtasks are
+    /// interleaved on one Metal queue, not parallel — the description promises
+    /// a deterministic join, not speed.
+    pub fanout: bool,
 }
 
 impl Default for ToolsSettings {
@@ -302,6 +308,7 @@ impl Default for ToolsSettings {
             spill_max_bytes: 1_048_576,
             spill_preview_bytes: 4096,
             recall: false,
+            fanout: false,
         }
     }
 }
@@ -620,6 +627,10 @@ impl Settings {
         if let Some(v) = boolean(tools, "recall") {
             self.tools.recall = v;
             self.note("tools.recall", origin);
+        }
+        if let Some(v) = boolean(tools, "fanout") {
+            self.tools.fanout = v;
+            self.note("tools.fanout", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);

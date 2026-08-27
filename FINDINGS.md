@@ -711,6 +711,18 @@ so this is survivable — but it is a versioned deviation, gated behind
 Batch the fingerprint churn with any other tools-prompt change (M10) so it
 happens once rather than twice.
 
+## Subagent fan-out (M9) — a tools-prompt change, fp1 churn
+
+The `fanout` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
+`tools.fanout` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+The description promises a deterministic join, not speed: on the `ds4_engine`
+path subtasks are interleaved on one Metal queue, not parallel
+(`docs/SHARED-ENGINE-DESIGN.md` §2), so the concurrency bound is 1 until
+issue #28's `Ds4Session` split and cooperative GPU-thread scheduler land.
+Batch the fingerprint churn with M8/M10 so it happens once.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

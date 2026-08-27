@@ -229,3 +229,8 @@ changes so the fingerprint churns once rather than once per feature.
   sessions and the current one's pre-compaction portion, scoped to the current
   project. The C agent has no such tool, so it is advertised in the tools
   prompt only when enabled.
+- **`tools.fanout` (M9, default off).** The `fanout` tool runs a list of
+  independent subtasks, each delegated to a named sub-agent, and joins their
+  reports deterministically. The C agent has no such tool; the description
+  deliberately promises a deterministic join, not speed — on the `ds4_engine`
+  path subtasks are interleaved on one Metal queue, not parallel.

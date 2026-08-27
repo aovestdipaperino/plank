@@ -672,12 +672,16 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
-    // The `recall` tool (M8) is a deliberate deviation from the C reference:
-    // the C agent has no such tool, so it is advertised only when the user
-    // opts in (`tools.recall`), which changes the system prompt and churns the
-    // `fp1` fingerprint — documented in docs/SYSTEM-PROMPT-OVERRIDES.md.
+    // The `recall` tool (M8) and the `fanout` tool (M9) are deliberate
+    // deviations from the C reference: the C agent has neither, so each is
+    // advertised only when the user opts in (`tools.recall` / `tools.fanout`),
+    // which changes the system prompt and churns the `fp1` fingerprint —
+    // documented in docs/SYSTEM-PROMPT-OVERRIDES.md.
     if crate::settings::active().tools.recall {
         append_recall_schema(out);
+    }
+    if crate::settings::active().tools.fanout {
+        append_fanout_schema(out);
     }
 }
 
@@ -696,6 +700,29 @@ fn append_recall_schema(out: &mut String) {
          \x20       \"query\": {\"type\": \"string\", \"description\": \"the text to search for\"}\n\
          \x20     },\n\
          \x20     \"required\": [\"query\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+}
+
+/// Appends the `fanout` tool schema (M9): run independent subtasks and join
+/// their reports deterministically. The description deliberately promises a
+/// deterministic join, not speed — on the `ds4_engine` path subtasks are
+/// interleaved on one Metal queue, not parallel.
+fn append_fanout_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"fanout\",\n\
+         \x20   \"description\": \"Run a list of independent subtasks, each delegated to a named sub-agent, and join their reports into one deterministic result. Subtasks run serially on the shared engine — this buys structure, not speed.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"subtasks\": {\"type\": \"array\", \"description\": \"JSON array of {\\\"name\\\": <agent name>, \\\"task\\\": <task text>} objects\", \"items\": {\"type\": \"object\"}}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"subtasks\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",
@@ -1072,6 +1099,28 @@ mod tests {
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(text.contains("\"recall\""), "recall schema when enabled");
+    }
+
+    #[test]
+    fn fanout_schema_is_advertised_only_when_enabled() {
+        // `tools.fanout` defaults to false: the `fanout` tool is a deliberate
+        // deviation from the C reference, so it must not appear in the prompt
+        // until the user opts in (which churns the fp1 fingerprint).
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"fanout\""),
+            "fanout must be off by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.fanout = true;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(text.contains("\"fanout\""), "fanout schema when enabled");
+        // The description must promise a deterministic join, not speed: on the
+        // ds4_engine path subtasks are interleaved on one Metal queue.
+        assert!(text.contains("deterministic"), "{text}");
     }
 
     #[test]

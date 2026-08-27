@@ -1055,6 +1055,14 @@ fn format_tool_results(results: &[(String, String)]) -> String {
     all
 }
 
+/// One subtask of the `fanout` tool (M9): the agent name to delegate to and
+/// the task text. Parsed from the `subtasks` JSON array argument.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct FanoutTask {
+    name: String,
+    task: String,
+}
+
 /// A normalised digest of a tool call's arguments, for the loop guard: the
 /// `name=value` pairs in streamed order. Two calls with identical args digest
 /// identically, so a repeated call is detected regardless of arg order.
@@ -1840,7 +1848,10 @@ impl Agent<'_> {
                 .join(", ");
             crate::status::ToolActivity::begin(format!("🔧 {names}"))
         });
-        let observations = if !calls.iter().any(|c| c.name == "agent") {
+        let observations = if !calls
+            .iter()
+            .any(|c| c.name == "agent" || c.name == "fanout")
+        {
             dispatch_all(calls, &mut self.tool_ctx)
         } else if calls.is_empty() {
             "Tool error: empty tool call block\n".to_string()
@@ -1853,6 +1864,8 @@ impl Agent<'_> {
             for call in calls {
                 let out = if call.name == "agent" {
                     self.run_agent_tool(call)
+                } else if call.name == "fanout" {
+                    self.run_fanout_tool(call)
                 } else {
                     dispatch(call, &mut self.tool_ctx).output
                 };
@@ -1982,6 +1995,48 @@ impl Agent<'_> {
                 None => "Tool error: sub-agent produced no report\n".to_string(),
             },
         }
+    }
+
+    /// Runs the `fanout` tool (M9): a list of independent subtasks, each
+    /// delegated to a named sub-agent, joined into one deterministic result.
+    ///
+    /// Subtasks run serially (concurrency bound of 1) — on the `ds4_engine`
+    /// path they are interleaved on one Metal queue, not parallel, so the tool
+    /// description promises a deterministic join, not speed. Off by default
+    /// (`tools.fanout`); when off, the tool dispatches as unknown.
+    fn run_fanout_tool(&mut self, call: &ToolCall) -> String {
+        use std::fmt::Write as _;
+        if !crate::settings::active().tools.fanout {
+            return "Tool error: unknown tool: fanout\n".to_string();
+        }
+        let subtasks = call.arg_value("subtasks").unwrap_or("");
+        let parsed: Vec<FanoutTask> = serde_json::from_str(subtasks).unwrap_or_default();
+        if parsed.is_empty() {
+            return "Tool error: fanout requires a non-empty 'subtasks' JSON array\n".to_string();
+        }
+        let mut out = String::new();
+        for (i, st) in parsed.iter().enumerate() {
+            // Reuse the `agent` driver: it resolves the name, sets up worktree
+            // isolation where the def asks for one, and extracts the report.
+            let agent_call = ToolCall {
+                name: "agent".to_string(),
+                args: vec![
+                    crate::dsml::ToolArg {
+                        name: "name".to_string(),
+                        value: st.name.clone(),
+                        is_string: true,
+                    },
+                    crate::dsml::ToolArg {
+                        name: "task".to_string(),
+                        value: st.task.clone(),
+                        is_string: true,
+                    },
+                ],
+            };
+            let report = self.run_agent_tool(&agent_call);
+            let _ = writeln!(out, "Subtask {} ({name}):\n{report}", i + 1, name = st.name);
+        }
+        out
     }
 
     /// Creates the throwaway worktree for an `isolation: worktree` sub-agent
@@ -12191,6 +12246,39 @@ mod tests {
             out = apply_loop_guard(&mut guard, &[poll_call()], out);
         }
         assert!(!out.contains("[loop guard]"), "polls must be exempt: {out}");
+    }
+
+    #[test]
+    fn fanout_is_off_by_default_and_rejects_an_empty_list_when_enabled() {
+        let dir = scratch_dir("fanout");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let call = ToolCall {
+            name: "fanout".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "subtasks".to_string(),
+                value: r#"[{"name":"scout","task":"look"}]"#.to_string(),
+                is_string: true,
+            }],
+        };
+        // Off by default: the tool dispatches as unknown.
+        let out = agent.run_fanout_tool(&call);
+        assert!(out.contains("unknown tool: fanout"), "{out}");
+        // Enabled: an empty subtasks array is rejected.
+        let mut s = crate::settings::Settings::default();
+        s.tools.fanout = true;
+        crate::settings::install_for_test(s);
+        let empty = ToolCall {
+            name: "fanout".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "subtasks".to_string(),
+                value: "[]".to_string(),
+                is_string: true,
+            }],
+        };
+        let out = agent.run_fanout_tool(&empty);
+        assert!(out.contains("non-empty 'subtasks'"), "{out}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
