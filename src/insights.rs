@@ -1374,7 +1374,7 @@ fn dur(secs: u64) -> String {
 }
 
 /// A `YYYY-MM-DD` date for a unix second at the given offset.
-fn date_str(ts: u64, offset: i64) -> String {
+pub(crate) fn date_str(ts: u64, offset: i64) -> String {
     // Civil-from-days, Howard Hinnant's algorithm: the report needs calendar
     // dates and plank has no date dependency to lean on.
     let days = local_day(ts, offset);

@@ -72,6 +72,7 @@ pub mod resumepane;
 pub mod sandbox;
 pub mod serve;
 pub mod session;
+pub mod sessionindex;
 pub mod settings;
 pub mod singleton;
 pub mod skills;

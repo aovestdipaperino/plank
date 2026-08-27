@@ -3942,6 +3942,13 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /rate [+|-] [note]"),
             },
+            "/search" => {
+                if arg.trim().is_empty() {
+                    println!("usage: /search <query> [--all]");
+                } else {
+                    print!("{}", self.search_command(arg));
+                }
+            }
             "/export" => match self.write_export(arg) {
                 Ok(path) => println!("exported session to {}", path.display()),
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
@@ -5346,6 +5353,59 @@ the original is frozen and listed in /tree"
             )
         })?;
         Ok(crate::feedback::feedback_path(&root, &self.session.id))
+    }
+
+    /// `/search <query> [--all]`: builds the session index, searches it scoped
+    /// to the current project by default, and renders hits as a numbered list
+    /// with title, age and a snippet, offering `/resume` on a hit.
+    fn search_command(&self, arg: &str) -> String {
+        use std::fmt::Write as _;
+        let mut parts = arg.trim().splitn(2, char::is_whitespace);
+        let query = parts.next().unwrap_or("").trim();
+        let rest = parts.next().unwrap_or("").trim();
+        let all = rest == "--all";
+        let mut out = String::new();
+        let store = SessionStore::open(SessionStore::default_dir());
+        let store = match store {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(out, "search failed: {e}");
+                return out;
+            }
+        };
+        if let Err(e) = crate::sessionindex::build(&store, &crate::sessionindex::index_dir()) {
+            let _ = writeln!(out, "search failed: {e}");
+            return out;
+        }
+        let project = if all {
+            None
+        } else {
+            Some(crate::session::project_key(&self.tool_ctx.cwd))
+        };
+        let hits = crate::sessionindex::search(
+            query,
+            project.as_deref(),
+            all,
+            &crate::sessionindex::index_dir(),
+        );
+        if hits.is_empty() {
+            let _ = writeln!(out, "no sessions match {query:?}");
+            return out;
+        }
+        for (i, hit) in hits.iter().enumerate() {
+            let age =
+                crate::insights::date_str(hit.created_at, crate::insights::local_utc_offset());
+            let _ = writeln!(
+                out,
+                "{}. {} — {} — {}",
+                i + 1,
+                hit.session_id,
+                hit.title,
+                age
+            );
+            let _ = writeln!(out, "   {}\n   /resume {}", hit.snippet, hit.session_id);
+        }
+        out
     }
 
     /// Starts a `/subagent` fork: appends the framed task to the live
@@ -10075,6 +10135,15 @@ impl Agent<'_> {
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
                 }
             },
+            "/search" => {
+                if arg.trim().is_empty() {
+                    log.push_plain("usage: /search <query> [--all]".to_owned());
+                } else {
+                    // Static-text equivalent of the plain path; a dedicated
+                    // pane (like kvpane/resumepane) is a follow-up.
+                    log.push_plain(self.search_command(arg));
+                }
+            }
             "/export" => match self.write_export(arg) {
                 Ok(path) => log.push_plain(format!("exported session to {}", path.display())),
                 Err(e) => {
