@@ -52,6 +52,7 @@ pub enum FieldId {
     ToolsCallTimeoutSec,
     ToolsSpillMaxBytes,
     ToolsSpillPreviewBytes,
+    ToolsRecall,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -310,6 +311,13 @@ pub static FIELDS: &[Field] = &[
         "inline preview bytes of a spilled result",
         Kind::Count,
     ),
+    f(
+        FieldId::ToolsRecall,
+        "tools",
+        "recall",
+        "offer the recall tool to the model",
+        Kind::Bool,
+    ),
 ];
 
 const fn f(
@@ -383,6 +391,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsCallTimeoutSec => s.tools.call_timeout_sec.to_string(),
         FieldId::ToolsSpillMaxBytes => s.tools.spill_max_bytes.to_string(),
         FieldId::ToolsSpillPreviewBytes => s.tools.spill_preview_bytes.to_string(),
+        FieldId::ToolsRecall => s.tools.recall.to_string(),
     }
 }
 
@@ -543,7 +552,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::UiBuiltinEditor
         | FieldId::AgentsAutoRoute
         | FieldId::GitSignCommits
-        | FieldId::ToolsRepeatAdvisory => {
+        | FieldId::ToolsRepeatAdvisory
+        | FieldId::ToolsRecall => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -567,6 +577,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::AgentsAutoRoute => s.agents.auto_route = b,
         FieldId::GitSignCommits => s.git.sign_commits = b,
         FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory = b,
+        FieldId::ToolsRecall => s.tools.recall = b,
         _ => {}
     }
 }

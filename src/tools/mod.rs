@@ -89,6 +89,10 @@ pub struct ToolContext {
     pub spill: Option<crate::spill::Spilled>,
     /// Session id, used to scope spill storage under `~/.plank/spill/<id>/`.
     pub session_id: String,
+    /// The live transcript, for the `recall` tool to search the current
+    /// session's pre-compaction portion alongside the saved-session index.
+    /// Populated by the turn loop before dispatch; empty in tests.
+    pub current_transcript: Vec<crate::session::Message>,
     /// Table of live and finished asynchronous bash jobs.
     pub bash: bash::BashJobs,
     /// Per-session web tool state (sticky approval flag).
@@ -206,6 +210,7 @@ impl ToolContext {
             more: None,
             spill: None,
             session_id: String::new(),
+            current_transcript: Vec::new(),
             bash: bash::BashJobs::default(),
             web: web::WebState::default(),
             web_confirm: None,
@@ -369,6 +374,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         ),
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
+        "recall" => tool_recall(ctx, call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         // A WASM component's tool. Checked before the unknown-tool fallthrough
         // and after every built-in, so a component can extend the table and
@@ -660,6 +666,76 @@ pub fn parse_bool_default(s: Option<&str>, def: bool) -> bool {
     def
 }
 
+/// Implements the `recall` tool (M8): searches prior sessions and the current
+/// one's pre-compaction portion, scoped to the current project. Off by default
+/// (`tools.recall`); when off, the tool is not advertised and dispatches as
+/// unknown. Results are bounded through the M4 spill policy like any other
+/// tool result.
+fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    use std::fmt::Write as _;
+    if !crate::settings::active().tools.recall {
+        return "Tool error: unknown tool: recall\n".to_string();
+    }
+    let query = call.arg_value("query").unwrap_or("").trim().to_string();
+    if query.is_empty() {
+        return "Tool error: recall requires a non-empty 'query'\n".to_string();
+    }
+    let mut out = String::new();
+    let project = crate::session::project_key(&ctx.cwd);
+    // Saved sessions, scoped to the current project. Best-effort: an index
+    // build failure (e.g. an ambiguous session prefix) skips the saved-session
+    // search but never blocks the current-transcript search below.
+    let hits = match crate::session::SessionStore::open(crate::session::SessionStore::default_dir())
+    {
+        Ok(store) => match crate::sessionindex::build(&store, &crate::sessionindex::index_dir()) {
+            Ok(_) => crate::sessionindex::search(
+                &query,
+                Some(&project),
+                false,
+                &crate::sessionindex::index_dir(),
+            ),
+            Err(_) => Vec::new(),
+        },
+        Err(_) => Vec::new(),
+    };
+    // The current session's pre-compaction portion: search the live transcript
+    // directly (it is not yet in the index).
+    let mut current: Vec<(String, String)> = Vec::new();
+    for m in &ctx.current_transcript {
+        if let Some(pos) = m.text.find(&query) {
+            let start = pos.saturating_sub(40);
+            let end = (pos + query.len() + 40).min(m.text.len());
+            let mut snippet = String::new();
+            if start > 0 {
+                snippet.push('…');
+            }
+            snippet.push_str(&m.text[start..end]);
+            if end < m.text.len() {
+                snippet.push('…');
+            }
+            current.push(("current session".to_string(), snippet));
+        }
+    }
+    if hits.is_empty() && current.is_empty() {
+        let _ = writeln!(out, "No sessions match {query:?}.");
+        return out;
+    }
+    for hit in hits {
+        let _ = writeln!(out, "{} — {} — {}", hit.session_id, hit.title, hit.snippet);
+    }
+    for (label, snippet) in current {
+        let _ = writeln!(out, "{label} — {snippet}");
+    }
+    // Bound the result through the M4 spill policy.
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: crate::settings::active().tools.spill_max_bytes,
+        preview_bytes: crate::settings::active().tools.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, "recall", out);
+    ctx.spill = spilled;
+    preview
+}
+
 #[cfg(test)]
 pub(crate) fn test_call(name: &str, args: &[(&str, &str)]) -> ToolCall {
     ToolCall {
@@ -780,6 +856,33 @@ mod tests {
         let res = dispatch(&test_call("nope", &[]), &mut ctx);
         assert!(!res.output.contains("[deadline]"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn recall_is_off_by_default_and_dispatches_when_enabled() {
+        // `tools.recall` defaults to false: the tool is not advertised and a
+        // call dispatches as unknown, so parity is untouched until a user opts
+        // in.
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
+        assert!(res.is_error);
+        assert!(res.output.contains("unknown tool: recall"));
+        // With the setting on, the tool dispatches (and searches the current
+        // transcript's pre-compaction portion).
+        let mut s = crate::settings::Settings::default();
+        s.tools.recall = true;
+        crate::settings::install_for_test(s);
+        let (mut ctx, dir2) = test_ctx();
+        ctx.current_transcript = vec![crate::session::Message::user("a needle here")];
+        let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
+        assert!(
+            !res.is_error,
+            "recall dispatches when enabled: {}",
+            res.output
+        );
+        assert!(res.output.contains("current session"), "{}", res.output);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]

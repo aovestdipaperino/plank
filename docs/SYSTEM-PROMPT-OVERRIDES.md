@@ -211,3 +211,21 @@ loop on every turn.
   context is untouched.
 - Should `SYSTEM-PROMPT.md` support the same `$ARGUMENTS`/template substitution
   the skills loader does? Plan assumes no, beyond `{{PLANK_TOOLS}}`.
+
+## Deviations from the C reference (model-facing text)
+
+These are deliberate, versioned deviations from `refs/ds4`'s prompt/tool text,
+each gated behind a setting that defaults to off (or on with a documented
+exception) so parity is untouched until a user opts in. Each changes the
+system prompt, which changes the `fp1` fingerprint and invalidates the
+`sysprompt-<fp1>.kv_raw` snapshots — survivable (they rebuild), but batch such
+changes so the fingerprint churns once rather than once per feature.
+
+- **`tools.repeatAdvisory` (M1, default on).** The loop-guard advisory line
+  (`[loop guard] you have called this tool with these arguments N times; the
+  result has not changed`) is appended to a tool result the model sees. The C
+  agent has no such concept.
+- **`tools.recall` (M8, default off).** The `recall` tool searches prior
+  sessions and the current one's pre-compaction portion, scoped to the current
+  project. The C agent has no such tool, so it is advertised in the tools
+  prompt only when enabled.

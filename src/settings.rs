@@ -287,6 +287,11 @@ pub struct ToolsSettings {
     pub spill_max_bytes: usize,
     /// How many bytes of a spilled result stay inline as the preview.
     pub spill_preview_bytes: usize,
+    /// Whether the `recall` tool is offered to the model (M8). Default off:
+    /// the C agent has no such tool, so advertising it changes the system
+    /// prompt and churns the `fp1` fingerprint — a deliberate, versioned
+    /// deviation, documented in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+    pub recall: bool,
 }
 
 impl Default for ToolsSettings {
@@ -296,6 +301,7 @@ impl Default for ToolsSettings {
             call_timeout_sec: 0,
             spill_max_bytes: 1_048_576,
             spill_preview_bytes: 4096,
+            recall: false,
         }
     }
 }
@@ -610,6 +616,10 @@ impl Settings {
         if let Some(v) = num::<usize>(tools, "spillPreviewBytes") {
             self.tools.spill_preview_bytes = v;
             self.note("tools.spillPreviewBytes", origin);
+        }
+        if let Some(v) = boolean(tools, "recall") {
+            self.tools.recall = v;
+            self.note("tools.recall", origin);
         }
 
         self.overlay_agents_and_worktree(&root, origin);

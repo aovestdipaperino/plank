@@ -1819,6 +1819,11 @@ impl Agent<'_> {
         // Charged to whichever engine is driving this turn — during a sidechain
         // that is the alt engine, same rule as the token tally.
         let _tool_clock = ToolClock::start(self.engine.model_name());
+        // The `recall` tool searches the current session's pre-compaction
+        // portion alongside the saved-session index.
+        self.tool_ctx
+            .current_transcript
+            .clone_from(&self.session.transcript);
         // Holds the tool label in the status bar for the whole dispatch, then
         // clears it on drop whichever way we return.
         let _running = (!calls.is_empty()).then(|| {

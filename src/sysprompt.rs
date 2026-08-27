@@ -672,6 +672,34 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
+    // The `recall` tool (M8) is a deliberate deviation from the C reference:
+    // the C agent has no such tool, so it is advertised only when the user
+    // opts in (`tools.recall`), which changes the system prompt and churns the
+    // `fp1` fingerprint — documented in docs/SYSTEM-PROMPT-OVERRIDES.md.
+    if crate::settings::active().tools.recall {
+        append_recall_schema(out);
+    }
+}
+
+/// Appends the `recall` tool schema (M8): search prior sessions and the
+/// current one's pre-compaction portion, scoped to the current project.
+fn append_recall_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"recall\",\n\
+         \x20   \"description\": \"Search your prior sessions and the current one's pre-compaction portion for a query, scoped to the current project. Returns matching session titles, ages and snippets.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"query\": {\"type\": \"string\", \"description\": \"the text to search for\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"query\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
 }
 
 /// Appends the `agent` (sub-agent delegation) and plan-mode tool schemas
@@ -1025,6 +1053,25 @@ mod tests {
         ] {
             assert!(text.contains(name), "text schemas are missing {name}");
         }
+    }
+
+    #[test]
+    fn recall_schema_is_advertised_only_when_enabled() {
+        // `tools.recall` defaults to false: the `recall` tool is a deliberate
+        // deviation from the C reference, so it must not appear in the prompt
+        // until the user opts in (which churns the fp1 fingerprint).
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"recall\""),
+            "recall must be off by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.recall = true;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(text.contains("\"recall\""), "recall schema when enabled");
     }
 
     #[test]

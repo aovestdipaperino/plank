@@ -700,6 +700,17 @@ compaction re-injection) is the record of what was shown, so the
 log-everything invariant (M3) holds — the field never becomes a second
 unlogged source of model-visible text.
 
+## The recall tool (M8) — a tools-prompt change, fp1 churn
+
+The `recall` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot
+(`session::sysprompt_checkpoint_name`). Snapshots rebuild rather than break,
+so this is survivable — but it is a versioned deviation, gated behind
+`tools.recall` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+Batch the fingerprint churn with any other tools-prompt change (M10) so it
+happens once rather than twice.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
