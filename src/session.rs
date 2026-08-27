@@ -277,6 +277,11 @@ pub struct Session {
     /// Model-visible task list (issue #35), persisted next to the transcript so
     /// it survives compaction, `/resume`, and checkpoint rollback.
     pub tasks: crate::tasks::TaskList,
+    /// Durable goal state (M7): the objective, iteration counter and status,
+    /// persisted so `/resume` and compaction know what the session is for.
+    /// `None` when no goal is set. The field is the durable fact; the kickoff
+    /// message in the transcript is the record of what was shown.
+    pub goal: Option<crate::goal::GoalState>,
     /// True when the transcript has unsaved changes.
     pub dirty: bool,
 }
@@ -294,6 +299,7 @@ impl Session {
             transcript: Vec::new(),
             branches: Vec::new(),
             tasks: crate::tasks::TaskList::new(),
+            goal: None,
             dirty: false,
         }
     }
@@ -1028,6 +1034,20 @@ impl SessionStore {
                 body.extend_from_slice(af.as_bytes());
                 body.push(b'\n');
             }
+        }
+        // Durable goal state (M7): omitted entirely when no goal is set, so
+        // pre-goal files stay byte-identical.
+        if let Some(g) = &session.goal {
+            let _ = writeln!(
+                body,
+                "goal {} {} {} {}",
+                g.objective.len(),
+                g.max_iters,
+                g.iter,
+                g.status.tag()
+            );
+            body.extend_from_slice(g.objective.as_bytes());
+            body.push(b'\n');
         }
         // Project directory (issue: `/insights`): omitted when unset so a
         // session saved by an older build round-trips byte-identically.
@@ -2044,6 +2064,8 @@ fn parse_node_record(
 }
 
 /// Parses the on-disk session format documented in the module docs.
+// A line-oriented parser; the length is not complexity.
+#[allow(clippy::too_many_lines)]
 fn read_session_file(path: &Path) -> Result<Session> {
     let data = fs::read(path)?;
     let mut pos = 0usize;
@@ -2079,6 +2101,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
     let mut tasks: Vec<crate::tasks::Task> = Vec::new();
     let mut tasks_next_id: u32 = 0;
     let mut branches: Vec<crate::branch::OffNode> = Vec::new();
+    let mut goal: Option<crate::goal::GoalState> = None;
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
         // Session-tree off-path nodes (issue #65); absent in linear sessions
@@ -2122,6 +2145,23 @@ fn read_session_file(path: &Path) -> Result<Session> {
             cwd = take(&data, &mut pos, len)?;
             continue;
         }
+        // Durable goal state (M7); absent in pre-goal files.
+        if let Some(rest) = header.strip_prefix("goal ") {
+            let mut it = rest.split(' ');
+            let obj_len: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let max_iters: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let iter: usize = it.next().and_then(|v| v.parse().ok()).ok_or_else(corrupt)?;
+            let status = it.next().ok_or_else(corrupt)?;
+            let status = crate::goal::GoalStatus::parse(status).ok_or_else(corrupt)?;
+            let objective = take(&data, &mut pos, obj_len)?;
+            goal = Some(crate::goal::GoalState {
+                objective,
+                max_iters,
+                iter,
+                status,
+            });
+            continue;
+        }
         // Trailing metadata record: tag + clipped last prompt (derived, so
         // only the tag is carried into the session).
         if let Some(rest) = header.strip_prefix("meta ") {
@@ -2158,6 +2198,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         transcript,
         branches,
         tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
+        goal,
         dirty: false,
     })
 }
@@ -3320,6 +3361,47 @@ hello\n";
         assert_eq!(loaded.tasks.next_id(), s.tasks.next_id());
         // The transcript and tag survive alongside the task list.
         assert_eq!(loaded.transcript, s.transcript);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn goal_round_trips_through_save_and_load() {
+        use crate::goal::{GoalState, GoalStatus};
+        let dir = temp_dir("goal");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("work towards a goal"));
+        s.goal = Some(GoalState {
+            objective: "ship the feature".to_string(),
+            max_iters: 5,
+            iter: 2,
+            status: GoalStatus::Active,
+        });
+        let id = store.save(&mut s).unwrap();
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.goal, s.goal);
+        assert_eq!(loaded.goal.as_ref().unwrap().objective, "ship the feature");
+        assert_eq!(loaded.goal.as_ref().unwrap().iter, 2);
+        assert_eq!(loaded.goal.as_ref().unwrap().status, GoalStatus::Active);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pre_goal_file_loads_with_goal_none_and_resaves_byte_identically() {
+        let dir = temp_dir("pregool");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("no goal here"));
+        let id = store.save(&mut s).unwrap();
+        let loaded = store.load(&id).unwrap();
+        assert!(loaded.goal.is_none(), "pre-goal file loads with goal: None");
+        // Resaving with no goal set must not add a goal record: the file stays
+        // byte-identical, so older files are untouched by the new field.
+        let before = fs::read(store.path_for_id(&id)).unwrap();
+        let mut again = loaded;
+        assert_eq!(store.save(&mut again).unwrap(), id);
+        let after = fs::read(store.path_for_id(&id)).unwrap();
+        assert_eq!(before, after, "no goal set: resave is byte-identical");
         let _ = fs::remove_dir_all(&dir);
     }
 

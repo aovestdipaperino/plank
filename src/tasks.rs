@@ -210,11 +210,24 @@ impl TaskList {
     /// The model-facing full listing (one task per line), or a clear
     /// no-tasks message.
     #[must_use]
-    pub fn render_list(&self) -> String {
-        if self.tasks.is_empty() {
-            return "No tasks in the list.\n".to_string();
-        }
+    pub fn render_list(&self, goal: Option<&crate::goal::GoalState>) -> String {
         let mut out = String::new();
+        // The durable goal (M7) sits above the task list: the goal is the
+        // objective, the task list is the plan for it.
+        if let Some(g) = goal {
+            let _ = writeln!(
+                out,
+                "goal: {} (iteration {}/{}, {})",
+                g.objective,
+                g.iter,
+                g.max_iters,
+                g.status.tag()
+            );
+        }
+        if self.tasks.is_empty() {
+            out.push_str("No tasks in the list.\n");
+            return out;
+        }
         for t in &self.tasks {
             let _ = writeln!(out, "- [{}] {}: {}", t.id, t.status.as_str(), t.subject);
         }
@@ -226,17 +239,33 @@ impl TaskList {
     /// turns: the transcript is append-only so the engine's KV prefix stays
     /// valid, and mutating `task` ops instead carry the fresh list in their
     /// appended tool observations.
+    ///
+    /// The durable goal (M7) is included above the list, so a compaction
+    /// rebuild re-surfaces both the objective and the plan for it.
     #[must_use]
-    pub fn inject_block(&self) -> Option<String> {
-        if self.tasks.is_empty() {
+    pub fn inject_block(&self, goal: Option<&crate::goal::GoalState>) -> Option<String> {
+        if self.tasks.is_empty() && goal.is_none() {
             return None;
         }
-        let mut out = String::from(
-            "# Task list\n\nYour current tasks (manage with the `task` tool, \
-             op=add|update|list):\n",
-        );
-        for t in &self.tasks {
-            let _ = writeln!(out, "- [{}] {}: {}", t.id, t.status.as_str(), t.subject);
+        let mut out = String::new();
+        if let Some(g) = goal {
+            let _ = writeln!(
+                out,
+                "Current goal: {}\n(iteration {}/{}, {})",
+                g.objective,
+                g.iter,
+                g.max_iters,
+                g.status.tag()
+            );
+        }
+        if !self.tasks.is_empty() {
+            out.push_str(
+                "# Task list\n\nYour current tasks (manage with the `task` tool, \
+                 op=add|update|list):\n",
+            );
+            for t in &self.tasks {
+                let _ = writeln!(out, "- [{}] {}: {}", t.id, t.status.as_str(), t.subject);
+            }
         }
         Some(out)
     }
@@ -312,7 +341,7 @@ pub fn tool_task(
             let id = tasks.add(subject, active_form);
             format!(
                 "Added task [{id}]: {subject}\n\nCurrent task list:\n{}",
-                tasks.render_list()
+                tasks.render_list(None)
             )
         }
         "update" => {
@@ -357,7 +386,7 @@ pub fn tool_task(
                             t.id,
                             t.subject,
                             t.status.as_str(),
-                            tasks.render_list()
+                            tasks.render_list(None)
                         )
                     }
                     // Unreachable: `update` returned Ok, so the id exists.
@@ -366,7 +395,7 @@ pub fn tool_task(
                 Err(id) => format!("Tool error: no task with id {id}\n"),
             }
         }
-        "list" => tasks.render_list(),
+        "list" => tasks.render_list(None),
         "" => "Tool error: task requires 'op' set to add, update, or list\n".to_string(),
         other => {
             format!("Tool error: unknown task op '{other}'; use add, update, or list\n")
@@ -455,7 +484,7 @@ mod tests {
 
     #[test]
     fn empty_list_injects_nothing() {
-        assert_eq!(TaskList::new().inject_block(), None);
+        assert_eq!(TaskList::new().inject_block(None), None);
         assert!(TaskList::new().strip_rows().is_empty());
     }
 
@@ -466,7 +495,7 @@ mod tests {
         list.update(1, Some(TaskStatus::InProgress), None, None)
             .unwrap();
         list.add("write tests", None);
-        let block = list.inject_block().unwrap();
+        let block = list.inject_block(None).unwrap();
         assert!(
             block.contains("- [1] in_progress: read the spec"),
             "{block}"

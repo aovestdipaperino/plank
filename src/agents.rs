@@ -455,7 +455,11 @@ pub fn render_list(defs: &[AgentDef]) -> String {
 /// Frames the delegated task as the sidechain's user turn. `instructions`, when
 /// present, is a named definition's body prepended as the subagent's persona.
 #[must_use]
-pub fn task_message(instructions: Option<&str>, task: &str) -> String {
+pub fn task_message(
+    instructions: Option<&str>,
+    task: &str,
+    goal: Option<&crate::goal::GoalState>,
+) -> String {
     let mut out = String::from(
         "<system-reminder>\n\
          You are now acting as a subagent, handling a task delegated from the \
@@ -469,6 +473,12 @@ pub fn task_message(instructions: Option<&str>, task: &str) -> String {
          a report that argues with itself as unreliable and redo the work.\n\
          </system-reminder>\n\n",
     );
+    // The ambient objective (M7): a subagent knows what the session is for.
+    if let Some(g) = goal {
+        out.push_str("Session goal: ");
+        out.push_str(g.objective.trim());
+        out.push_str("\n\n");
+    }
     if let Some(instructions) = instructions {
         let instructions = instructions.trim();
         if !instructions.is_empty() {
@@ -525,10 +535,11 @@ mod tests {
 
     #[test]
     fn task_and_report_framing() {
-        let task = task_message(None, "count the tests\n");
+        let task = task_message(None, "count the tests\n", None);
         assert!(task.starts_with("<system-reminder>\n"));
         assert!(task.ends_with("Task: count the tests"));
         assert!(!task.contains("Instructions:"));
+        assert!(!task.contains("Session goal:"));
         // The report is the answer, not a transcript of getting there: a
         // sub-agent that narrates its reasoning produces a report the parent
         // distrusts and re-verifies by hand.
@@ -541,10 +552,23 @@ mod tests {
 
     #[test]
     fn task_message_embeds_instructions() {
-        let task = task_message(Some("  Be terse.\n"), "count the tests");
+        let task = task_message(Some("  Be terse.\n"), "count the tests", None);
         assert!(task.contains("Instructions:\nBe terse.\n\nTask: count the tests"));
         // An empty/whitespace body adds no Instructions block.
-        assert!(!task_message(Some("   "), "do it").contains("Instructions:"));
+        assert!(!task_message(Some("   "), "do it", None).contains("Instructions:"));
+    }
+
+    #[test]
+    fn task_message_embeds_the_session_goal() {
+        let goal = crate::goal::GoalState {
+            objective: "ship the feature".to_string(),
+            max_iters: 5,
+            iter: 2,
+            status: crate::goal::GoalStatus::Active,
+        };
+        let task = task_message(None, "do it", Some(&goal));
+        assert!(task.contains("Session goal: ship the feature"), "{task}");
+        assert!(task.ends_with("Task: do it"));
     }
 
     fn write_def(root: &Path, file: &str, content: &str) {

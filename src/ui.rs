@@ -2515,6 +2515,15 @@ impl Agent<'_> {
     /// the closing notice or propagate the error.
     fn run_goal_loop(&mut self, goal: &str, max_iters: usize) -> Result<(), String> {
         self.goal = Some(crate::goal::GoalLoop::new(goal, max_iters));
+        // Durable goal state (M7): the field is the fact, the kickoff message
+        // is the record of what was shown. Both are written; neither is a
+        // second unlogged source of model-visible text.
+        self.session.goal = Some(crate::goal::GoalState {
+            objective: goal.to_owned(),
+            max_iters,
+            iter: 0,
+            status: crate::goal::GoalStatus::Active,
+        });
         self.session
             .push(Message::user(crate::goal::kickoff_message(goal)));
         let result = self.drive_goal_loop();
@@ -2527,6 +2536,9 @@ impl Agent<'_> {
         // the goal ends here, so this is the one place that always runs.
         if outcome == crate::goal::Outcome::Interrupted {
             crate::interrupt::clear();
+        }
+        if let Some(g) = self.session.goal.as_mut() {
+            g.status = crate::goal::GoalStatus::Done;
         }
         println!(
             "{}",
@@ -2546,6 +2558,10 @@ impl Agent<'_> {
                     .expect("goal is live inside its own loop");
                 (g.next_iteration(), g.max_iters())
             };
+            // Sync the durable field so `/resume` and compaction see progress.
+            if let Some(g) = self.session.goal.as_mut() {
+                g.iter = iter;
+            }
             println!("{}", self.debug_line(&crate::goal::banner(iter, max)));
             self.run_turn()?;
             if self.last_turn_interrupted || crate::interrupt::pending() {
@@ -2938,9 +2954,13 @@ impl Agent<'_> {
             self.session.push(Message::user(block));
         }
         // The rebuild already invalidated the KV prefix, so re-surfacing the
-        // task list here is free — and afterwards the transcript is append-only
-        // again, keeping the engine's cached prefix valid (issue #35).
-        if let Some(block) = self.session.tasks.inject_block() {
+        // task list (and the durable goal above it, M7) here is free — and
+        // afterwards the transcript is append-only again, keeping the engine's
+        // cached prefix valid (issue #35). The goal statement is treated like
+        // the durable summary, never like a tool result; the field is the
+        // durable fact and this transcript entry is the record of what was
+        // shown, so the log-everything invariant (M3) holds.
+        if let Some(block) = self.session.tasks.inject_block(self.session.goal.as_ref()) {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
@@ -3887,9 +3907,31 @@ impl Agent<'_> {
             "/context" => print!("{}", self.render_context_report(self.color)),
             "/usage" => print!("{}", self.render_usage_report(self.color)),
             "/goal" => {
-                match crate::goal::parse_command(arg) {
-                    Ok((goal, max)) => self.run_goal_loop(&goal, max)?,
-                    Err(usage) => println!("{usage}"),
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    // No argument: print the durable goal and its progress.
+                    match &self.session.goal {
+                        Some(g) => println!(
+                            "goal: {} (iteration {}/{}, {})",
+                            g.objective,
+                            g.iter,
+                            g.max_iters,
+                            g.status.tag()
+                        ),
+                        None => println!("no goal set"),
+                    }
+                } else if arg == "clear" {
+                    // `/goal clear` ends the durable goal without settling it.
+                    if let Some(g) = self.session.goal.as_mut() {
+                        g.status = crate::goal::GoalStatus::Cleared;
+                    }
+                    self.goal = None;
+                    println!("goal cleared");
+                } else {
+                    match crate::goal::parse_command(arg) {
+                        Ok((goal, max)) => self.run_goal_loop(&goal, max)?,
+                        Err(usage) => println!("{usage}"),
+                    }
                 }
                 return Ok(true);
             }
@@ -3906,7 +3948,10 @@ impl Agent<'_> {
             ),
             "/plugins" => print!("{}", self.plugins_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
-            "/tasks" => print!("{}", self.session.tasks.render_list()),
+            "/tasks" => print!(
+                "{}",
+                self.session.tasks.render_list(self.session.goal.as_ref())
+            ),
             "/agent" => print!("{}", crate::agents::render_list(&self.agents)),
             "/hooks" => print!("{}", crate::hooks::render_list(&self.tool_ctx.hooks)),
             "/remote-control" | "/rc" => {
@@ -5438,6 +5483,7 @@ the original is frozen and listed in /tree"
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
+            self.session.goal.as_ref(),
         )));
         fork_at
     }
@@ -5487,6 +5533,7 @@ the original is frozen and listed in /tree"
                     session.push(Message::user(crate::agents::task_message(
                         Some(body.as_str()),
                         task,
+                        self.session.goal.as_ref(),
                     )));
                     slots.push(FanoutSlot {
                         key,
@@ -9757,19 +9804,53 @@ impl Agent<'_> {
             // `tui_slash` returns `bool` and has no terminal handles of its own,
             // so it can only *arm* the loop; the call sites in `tui_loop` see
             // `self.goal` set and start the first turn.
-            "/goal" => match crate::goal::parse_command(arg) {
-                Ok((goal, max)) => {
-                    self.goal = Some(crate::goal::GoalLoop::new(&goal, max));
-                    self.session
-                        .push(Message::user(crate::goal::kickoff_message(&goal)));
-                    let (iter, m) = {
-                        let g = self.goal.as_mut().expect("just set");
-                        (g.next_iteration(), g.max_iters())
-                    };
-                    log.push_dim(crate::goal::banner(iter, m));
+            "/goal" => {
+                let arg = arg.trim();
+                if arg.is_empty() {
+                    // No argument: print the durable goal and its progress.
+                    match &self.session.goal {
+                        Some(g) => log.push_plain(format!(
+                            "goal: {} (iteration {}/{}, {})",
+                            g.objective,
+                            g.iter,
+                            g.max_iters,
+                            g.status.tag()
+                        )),
+                        None => log.push_plain("no goal set".to_owned()),
+                    }
+                } else if arg == "clear" {
+                    // `/goal clear` ends the durable goal without settling it.
+                    if let Some(g) = self.session.goal.as_mut() {
+                        g.status = crate::goal::GoalStatus::Cleared;
+                    }
+                    self.goal = None;
+                    log.push_plain("goal cleared".to_owned());
+                } else {
+                    match crate::goal::parse_command(arg) {
+                        Ok((goal, max)) => {
+                            self.goal = Some(crate::goal::GoalLoop::new(&goal, max));
+                            // Durable goal state (M7), mirrored from the plain path.
+                            self.session.goal = Some(crate::goal::GoalState {
+                                objective: goal.clone(),
+                                max_iters: max,
+                                iter: 0,
+                                status: crate::goal::GoalStatus::Active,
+                            });
+                            self.session
+                                .push(Message::user(crate::goal::kickoff_message(&goal)));
+                            let (iter, m) = {
+                                let g = self.goal.as_mut().expect("just set");
+                                (g.next_iteration(), g.max_iters())
+                            };
+                            if let Some(g) = self.session.goal.as_mut() {
+                                g.iter = iter;
+                            }
+                            log.push_dim(crate::goal::banner(iter, m));
+                        }
+                        Err(usage) => log.push_dim(usage),
+                    }
                 }
-                Err(usage) => log.push_dim(usage),
-            },
+            }
             "/config" => {
                 // `--resolved` prints the provenance dump instead of opening the
                 // modal, mirroring the plain-stdout path.
@@ -10095,7 +10176,12 @@ impl Agent<'_> {
                 }
             }
             "/tasks" => {
-                for line in self.session.tasks.render_list().lines() {
+                for line in self
+                    .session
+                    .tasks
+                    .render_list(self.session.goal.as_ref())
+                    .lines()
+                {
                     log.push_plain(line.to_owned());
                 }
             }
@@ -12183,7 +12269,10 @@ mod tests {
         let (cleared, _) = crate::compact::microcompact(&mut s.transcript);
         assert!(cleared > 0, "compaction should clear some large results");
         assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
-        let block = s.tasks.inject_block().expect("non-empty list has a block");
+        let block = s
+            .tasks
+            .inject_block(None)
+            .expect("non-empty list has a block");
         assert!(block.contains("keep me across compaction"));
     }
 
@@ -12306,6 +12395,31 @@ mod tests {
         assert!(
             rendered.contains("# Task list") && rendered.contains("still pending after compact"),
             "{rendered}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rebuild_after_compact_pins_the_durable_goal() {
+        let dir = scratch_dir("compact-goal");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("old context"));
+        agent.session.goal = Some(crate::goal::GoalState {
+            objective: "ship the feature".to_string(),
+            max_iters: 5,
+            iter: 2,
+            status: crate::goal::GoalStatus::Active,
+        });
+        agent.rebuild_after_compact("<summary>did things</summary>");
+        let rendered = render_transcript(&agent.session, "SYS");
+        assert!(
+            rendered.contains("Current goal: ship the feature"),
+            "the goal statement must survive compaction: {rendered}"
+        );
+        assert!(
+            rendered.contains("(iteration 2/5, active)"),
+            "progress must survive compaction: {rendered}"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -686,6 +686,20 @@ and still fixtured. A real-engine measurement of the prefix-stability win
 (earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
 the conservative default until then.
 
+## Durable goal state (M7) — model-facing text, fixtures
+
+The goal statement is now durable session state (`Session.goal`), pinned
+against compaction and re-injected above the task list. Two surfaces are
+model-facing and changed: `TaskList::inject_block` now carries the goal line
+(`Current goal: ...`), and `agents::task_message` prepends `Session goal: ...`
+to a subagent's preamble. Both are new model-facing text — check `refs/ds4`
+for the C behaviour first and regenerate fixtures with
+`PLANK_REGEN_FIXTURES=1 cargo test` if a fixture pins either. The goal field
+itself is the durable fact; the transcript entry (kickoff message, and the
+compaction re-injection) is the record of what was shown, so the
+log-everything invariant (M3) holds — the field never becomes a second
+unlogged source of model-visible text.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

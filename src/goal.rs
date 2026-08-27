@@ -99,6 +99,58 @@ impl Outcome {
     }
 }
 
+/// Durable goal state, persisted on the session (M7) so `/resume` and
+/// compaction know what the session is for. The field is the durable *fact*;
+/// the transcript entry (the kickoff message) is the record of what was shown.
+/// Per the log-everything invariant (M3), the field must never become a second
+/// unlogged source of model-visible text — anything it renders is also pushed
+/// into the transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalState {
+    /// The objective text, as the user typed it.
+    pub objective: String,
+    /// Iteration cap (`--max <n>`, default [`DEFAULT_MAX_ITERS`]).
+    pub max_iters: usize,
+    /// Iterations started so far; 0 before the first one.
+    pub iter: usize,
+    /// Lifecycle status.
+    pub status: GoalStatus,
+}
+
+/// Lifecycle status of a durable goal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalStatus {
+    /// The goal is live and being worked.
+    Active,
+    /// The loop settled (attained, unattainable, needs user, cap, interrupted).
+    Done,
+    /// `/goal clear` ended it without settling.
+    Cleared,
+}
+
+impl GoalStatus {
+    /// The record tag written to the session file.
+    #[must_use]
+    pub fn tag(self) -> &'static str {
+        match self {
+            GoalStatus::Active => "active",
+            GoalStatus::Done => "done",
+            GoalStatus::Cleared => "cleared",
+        }
+    }
+
+    /// Parses a record tag; `None` for anything unrecognised.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "active" => Some(Self::Active),
+            "done" => Some(Self::Done),
+            "cleared" => Some(Self::Cleared),
+            _ => None,
+        }
+    }
+}
+
 /// Live state of one `/goal` run. Transient: it lives on the `Agent` only while
 /// the loop runs and is dropped before control returns to the prompt.
 #[derive(Debug, Clone)]
