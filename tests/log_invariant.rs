@@ -41,7 +41,7 @@ fn every_injection_site_is_reconstructible_from_the_transcript() {
     // Task-list re-injection (post-compaction): the rendered block is pushed
     // into the transcript, never injected at request-assembly time.
     session.tasks.add("do the thing", None);
-    if let Some(block) = session.tasks.inject_block() {
+    if let Some(block) = session.tasks.inject_block(None) {
         session.push(Message::user(block));
     }
 
