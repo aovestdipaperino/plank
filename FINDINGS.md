@@ -723,6 +723,20 @@ path subtasks are interleaved on one Metal queue, not parallel
 issue #28's `Ds4Session` split and cooperative GPU-thread scheduler land.
 Batch the fingerprint churn with M8/M10 so it happens once.
 
+## run_code (M10) — a tools-prompt change, fp1 churn
+
+The `run_code` tool is a deliberate deviation from the C reference: the C agent
+has no such tool, so advertising it changes the system prompt, which changes
+`fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
+`tools.runCode` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+The minimal viable version executes a script of named operations
+(read/glob/edit/bash), one per line, each routed through the existing
+`tools::dispatch` so the consent and sandbox checks apply — a binding that
+shortcuts them would be a hole straight through every guard those files
+implement. The guest-language design (a small interpreted language compiled to
+the WASM host, `src/wasmhost.rs`) is a follow-up. Batch the fingerprint churn
+with M8/M9 so it happens once.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

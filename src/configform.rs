@@ -54,6 +54,7 @@ pub enum FieldId {
     ToolsSpillPreviewBytes,
     ToolsRecall,
     ToolsFanout,
+    ToolsRunCode,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -326,6 +327,13 @@ pub static FIELDS: &[Field] = &[
         "offer the fanout tool to the model",
         Kind::Bool,
     ),
+    f(
+        FieldId::ToolsRunCode,
+        "tools",
+        "runCode",
+        "offer the run_code tool to the model",
+        Kind::Bool,
+    ),
 ];
 
 const fn f(
@@ -401,6 +409,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsSpillPreviewBytes => s.tools.spill_preview_bytes.to_string(),
         FieldId::ToolsRecall => s.tools.recall.to_string(),
         FieldId::ToolsFanout => s.tools.fanout.to_string(),
+        FieldId::ToolsRunCode => s.tools.run_code.to_string(),
     }
 }
 
@@ -563,7 +572,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::GitSignCommits
         | FieldId::ToolsRepeatAdvisory
         | FieldId::ToolsRecall
-        | FieldId::ToolsFanout => {
+        | FieldId::ToolsFanout
+        | FieldId::ToolsRunCode => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -589,6 +599,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::ToolsRepeatAdvisory => s.tools.repeat_advisory = b,
         FieldId::ToolsRecall => s.tools.recall = b,
         FieldId::ToolsFanout => s.tools.fanout = b,
+        FieldId::ToolsRunCode => s.tools.run_code = b,
         _ => {}
     }
 }

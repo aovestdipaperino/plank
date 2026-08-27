@@ -234,3 +234,8 @@ changes so the fingerprint churns once rather than once per feature.
   reports deterministically. The C agent has no such tool; the description
   deliberately promises a deterministic join, not speed — on the `ds4_engine`
   path subtasks are interleaved on one Metal queue, not parallel.
+- **`tools.runCode` (M10, default off).** The `run_code` tool executes a small
+  script of named operations (read/glob/edit/bash), one per line, each routed
+  through the existing tool dispatch so the consent and sandbox checks apply.
+  The C agent has no such tool; the guest-language design (a small interpreted
+  language compiled to the WASM host) is a follow-up.

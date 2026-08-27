@@ -672,16 +672,20 @@ fn append_native_extra_schemas(out: &mut String) {
          }\n",
     );
     append_agent_and_plan_schemas(out);
-    // The `recall` tool (M8) and the `fanout` tool (M9) are deliberate
-    // deviations from the C reference: the C agent has neither, so each is
-    // advertised only when the user opts in (`tools.recall` / `tools.fanout`),
-    // which changes the system prompt and churns the `fp1` fingerprint —
-    // documented in docs/SYSTEM-PROMPT-OVERRIDES.md.
+    // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
+    // deliberate deviations from the C reference: the C agent has none of
+    // them, so each is advertised only when the user opts in
+    // (`tools.recall` / `tools.fanout` / `tools.runCode`), which changes the
+    // system prompt and churns the `fp1` fingerprint — documented in
+    // docs/SYSTEM-PROMPT-OVERRIDES.md.
     if crate::settings::active().tools.recall {
         append_recall_schema(out);
     }
     if crate::settings::active().tools.fanout {
         append_fanout_schema(out);
+    }
+    if crate::settings::active().tools.run_code {
+        append_run_code_schema(out);
     }
 }
 
@@ -723,6 +727,30 @@ fn append_fanout_schema(out: &mut String) {
          \x20       \"subtasks\": {\"type\": \"array\", \"description\": \"JSON array of {\\\"name\\\": <agent name>, \\\"task\\\": <task text>} objects\", \"items\": {\"type\": \"object\"}}\n\
          \x20     },\n\
          \x20     \"required\": [\"subtasks\"]\n\
+         \x20   }\n\
+         \x20 }\n\
+         }\n",
+    );
+}
+
+/// Appends the `run_code` tool schema (M10): run a small script of named
+/// operations (read/glob/edit/bash) through the existing tool dispatch path,
+/// so the consent and sandbox checks apply. The minimal viable guest language
+/// is a sequence of operations; a full interpreted guest compiled to the WASM
+/// host is a documented follow-up.
+fn append_run_code_schema(out: &mut String) {
+    out.push_str(
+        "{\n\
+         \x20 \"type\": \"function\",\n\
+         \x20 \"function\": {\n\
+         \x20   \"name\": \"run_code\",\n\
+         \x20   \"description\": \"Run a small script of named operations (read <path>, glob <pattern>, edit <path> <old> <new>, bash <command>) through the same checks as the tools, collecting outputs into one result. One line per operation, one operation per line.\",\n\
+         \x20   \"parameters\": {\n\
+         \x20     \"type\": \"object\",\n\
+         \x20     \"properties\": {\n\
+         \x20       \"script\": {\"type\": \"string\", \"description\": \"the script, one operation per line\"}\n\
+         \x20     },\n\
+         \x20     \"required\": [\"script\"]\n\
          \x20   }\n\
          \x20 }\n\
          }\n",
@@ -1121,6 +1149,28 @@ mod tests {
         // The description must promise a deterministic join, not speed: on the
         // ds4_engine path subtasks are interleaved on one Metal queue.
         assert!(text.contains("deterministic"), "{text}");
+    }
+
+    #[test]
+    fn run_code_schema_is_advertised_only_when_enabled() {
+        // `tools.runCode` defaults to false: the `run_code` tool is a
+        // deliberate deviation from the C reference, so it must not appear in
+        // the prompt until the user opts in (which churns the fp1 fingerprint).
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"run_code\""),
+            "run_code must be off by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.run_code = true;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"run_code\""),
+            "run_code schema when enabled"
+        );
     }
 
     #[test]

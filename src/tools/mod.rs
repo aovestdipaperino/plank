@@ -375,6 +375,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "task" => crate::tasks::tool_task(&mut ctx.tasks, &mut ctx.task_completions, call),
         "ask" => ask::tool_ask(ctx.asker.as_mut(), call),
         "recall" => tool_recall(ctx, call),
+        "run_code" => tool_run_code(ctx, call),
         name if name.starts_with("mcp__") => mcp::tool_mcp_call(&mut ctx.mcp, call),
         // A WASM component's tool. Checked before the unknown-tool fallthrough
         // and after every built-in, so a component can extend the table and
@@ -736,6 +737,69 @@ fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
     preview
 }
 
+/// Implements the `run_code` tool (M10): a small script of named operations
+/// (read/glob/edit/bash), one per line, each dispatched through the existing
+/// tool path so the consent and sandbox checks apply — a binding that
+/// shortcuts them would be a hole straight through every guard. Off by default
+/// (`tools.runCode`); when off, the tool dispatches as unknown. Output is
+/// bounded through the M4 spill policy.
+fn tool_run_code(ctx: &mut ToolContext, call: &ToolCall) -> String {
+    use std::fmt::Write as _;
+    if !crate::settings::active().tools.run_code {
+        return "Tool error: unknown tool: run_code\n".to_string();
+    }
+    let script = call.arg_value("script").unwrap_or("").trim();
+    if script.is_empty() {
+        return "Tool error: run_code requires a non-empty 'script'\n".to_string();
+    }
+    let mut out = String::new();
+    for (i, line) in script.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let (op, rest) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+        let rest = rest.trim();
+        let (name, args): (&str, Vec<(&str, &str)>) = match op {
+            "read" => ("read", vec![("path", rest)]),
+            "glob" => ("glob", vec![("pattern", rest)]),
+            "edit" => {
+                let mut parts = rest.splitn(3, char::is_whitespace);
+                let path = parts.next().unwrap_or("");
+                let old = parts.next().unwrap_or("");
+                let new = parts.next().unwrap_or("");
+                ("edit", vec![("path", path), ("old", old), ("new", new)])
+            }
+            "bash" => ("bash", vec![("command", rest)]),
+            _ => {
+                let _ = writeln!(out, "Step {}: unknown operation {op:?}", i + 1);
+                continue;
+            }
+        };
+        let tool_call = ToolCall {
+            name: name.to_string(),
+            args: args
+                .iter()
+                .map(|(n, v)| crate::dsml::ToolArg {
+                    name: (*n).to_string(),
+                    value: (*v).to_string(),
+                    is_string: true,
+                })
+                .collect(),
+        };
+        let res = dispatch(&tool_call, ctx);
+        let _ = writeln!(out, "Step {} ({name}):\n{}", i + 1, res.output);
+    }
+    // Bound through the M4 spill policy like any other tool result.
+    let policy = crate::spill::SpillPolicy {
+        max_bytes: crate::settings::active().tools.spill_max_bytes,
+        preview_bytes: crate::settings::active().tools.spill_preview_bytes,
+    };
+    let (preview, spilled) = crate::spill::apply(&policy, &ctx.session_id, "run_code", out);
+    ctx.spill = spilled;
+    preview
+}
+
 #[cfg(test)]
 pub(crate) fn test_call(name: &str, args: &[(&str, &str)]) -> ToolCall {
     ToolCall {
@@ -856,6 +920,41 @@ mod tests {
         let res = dispatch(&test_call("nope", &[]), &mut ctx);
         assert!(!res.output.contains("[deadline]"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn run_code_is_off_by_default_and_executes_a_script_when_enabled() {
+        // `tools.runCode` defaults to false: the tool is not advertised and a
+        // call dispatches as unknown, so parity is untouched until a user opts
+        // in.
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(
+            &test_call("run_code", &[("script", "read x.txt")]),
+            &mut ctx,
+        );
+        assert!(res.is_error);
+        assert!(res.output.contains("unknown tool: run_code"));
+        // With the setting on, a script of named operations executes through
+        // the existing dispatch path (so consent/sandbox checks apply) and
+        // collects outputs.
+        let mut s = crate::settings::Settings::default();
+        s.tools.run_code = true;
+        crate::settings::install_for_test(s);
+        let (mut ctx, dir2) = test_ctx();
+        let f = dir2.join("x.txt");
+        std::fs::write(&f, "hello").expect("write");
+        let res = dispatch(
+            &test_call("run_code", &[("script", "read x.txt")]),
+            &mut ctx,
+        );
+        assert!(
+            !res.is_error,
+            "run_code dispatches when enabled: {}",
+            res.output
+        );
+        assert!(res.output.contains("hello"), "{}", res.output);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
     }
 
     #[test]
