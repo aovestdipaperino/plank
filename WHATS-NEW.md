@@ -13,12 +13,86 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-### 3.2.1
+### 3.4.1
 
-Opens the new beta channel on the same code as 3.2.0. Nothing rides ahead of
+Opens the new beta channel on the same code as 3.4.0. Nothing rides ahead of
 stable yet.
 
 ## Stable releases
+
+### 3.4.0
+
+Eleven features built on the DeepSeek-harness plan, and the theme is
+self-knowledge: plank gets better at telling you what it is doing, remembering
+what it has done, and staying inside its own guard rails while doing more.
+
+🔍 **`plank --dump-config` tells you where every setting came from.** Settings
+arrive from five layers — defaults, plugins, `~/.plank`, `./.plank`, CLI flags —
+and "I set that and nothing happened" used to be a code-reading exercise. Now
+each key prints with the layer that won and the layers it beat.
+
+```
+engine.ctx = 8192        <- CLI flag
+                              (shadowed: ~/.plank/settings.json)
+```
+
+`/config --resolved` does the same inside a session, and additionally shows
+which plugin won each contested skill or agent name.
+
+🔁 **Loop guards.** The classic local-model failure is a loop: a stale edit
+anchor sends the model into read/edit/read/edit and it does not notice. On the
+third identical call it now sees *"you have called this tool with these
+arguments 3 times; the result has not changed"*. Nothing is blocked — a
+legitimate third read exists — and polling an async job is exempt, because a
+poll looks exactly like a stuck loop. Separately, `tools.callTimeoutSec` gives
+tool calls a budget and tells the model when one blew it, so a hung test suite
+stops being invisible.
+
+📄 **Big tool output is no longer a dead end.** Ask about a 5 MB build log and
+`read` used to truncate with no way forward. Now the full payload goes to
+`~/.plank/spill/`, the model gets a bounded preview plus a `continue_offset` it
+can page with `more`, and `/export` still sees everything. The same applies to
+oversized MCP results, which previously had no cap at all — one chatty server
+could eat a whole context in a single call.
+
+🧹 **Context gets reclaimed without a round-trip.** After a dozen large reads
+their bodies are dead weight. Microcompact clears the old ones at end of turn,
+keeping the newest three, anything small, and everything belonging to the task
+you are on. It only runs when it would reclaim at least 4 KiB, because
+rewriting the transcript invalidates the KV prefix and an eager pass costs more
+than it saves.
+
+🔎 **`/search` across your own history.** You remember fixing a Metal crash a
+few weeks ago but not how. `/search metal` finds the session, shows the
+snippet, and offers `/resume`. Crucially it is compaction-proof: long sessions
+are both the ones worth searching and the ones that get compacted, so the index
+keeps conversation the transcript has dropped.
+
+🎯 **Goals survive the session.** `/goal --max 5 make the failing test pass`
+runs an adjudicated loop you can walk away from. The objective is durable state
+— it survives `/save`, `/resume` and `/compact`, so tomorrow you can still see
+what it was pursuing and how far it got.
+
+⭐ **`/rate` records what worked, where the model cannot see it.** A rating
+lives in a sidecar, never the transcript, context or KV — if the model could
+read your ratings it would optimise for them and the signal would be worthless.
+`/insights` turns a week of them into satisfaction over time and the notes on
+the worst turns.
+
+🧰 **Three new tools, on by default.** `recall` lets the model search that same
+session history instead of guessing or interrupting you. `fanout` runs several
+independent subtasks and joins their reports in a fixed order, with optional
+throwaway-worktree isolation for subtasks that edit. `run_code` batches a few
+pre-decided operations into one turn instead of one round-trip each — and every
+operation goes through the normal tool dispatch, so the sandbox, the `~/.plank`
+grant and the `PreToolUse` hooks apply exactly as they would to a bare call.
+Each can be switched off individually with `tools.recall`, `tools.fanout` or
+`tools.runCode`.
+
+🪵 **And a rule the rest of it rests on.** A test now asserts structurally that
+everything reaching the model is reconstructible from the session log — either
+a transcript entry or the separately-fingerprinted system prompt. Without it,
+`/repro` and `/resume` are guesses.
 
 ### 3.2.0
 

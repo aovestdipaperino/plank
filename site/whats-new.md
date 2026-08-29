@@ -7,6 +7,66 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**plank tells you where every setting came from.** Settings arrive from five
+layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and
+CLI flags — and "I set that and nothing happened" used to mean reading code.
+`plank --dump-config` now prints each effective key with the layer that won and
+the layers it beat, and `/config --resolved` does the same inside a session,
+including which plugin won a contested skill or agent name. See
+[Configuration](/guide/08-configuration.html).
+
+**Loop guards for the failure local models actually have.** A stale edit anchor
+sends a model into read/edit/read/edit, and small models often do not notice. On
+the third identical call the result now carries *"you have called this tool with
+these arguments 3 times; the result has not changed"*. Nothing is blocked — a
+legitimate third read exists, and blocking on a guess would be worse — and
+polling an async job is exempt, because a poll looks exactly like a stuck loop.
+Set `tools.callTimeoutSec` and the model is also told when a call overran its
+budget, so a hung test suite stops being invisible.
+
+**Large tool output is no longer a dead end.** Ask about a 5 MB build log and
+`read` used to truncate with nowhere to go. The full payload now goes to
+`~/.plank/spill/`, the model gets a bounded preview plus a `continue_offset` it
+can page through with `more`, and `/export` still sees everything the tool
+returned. The same bound applies to oversized MCP results, which previously had
+no cap at all — a single chatty server could fill your context in one call.
+
+**Context reclaims itself between turns.** After a dozen large reads those
+bodies are dead weight. plank now clears the old ones at end of turn — keeping
+the newest three, anything small, and everything belonging to the task you are
+on — with no model round-trip and no summarising. It holds off unless it would
+reclaim at least 4 KiB, because rewriting the transcript invalidates the KV
+prefix and an eager pass costs more than it saves.
+
+**`/search` across your own sessions.** You remember fixing a Metal crash a few
+weeks ago but not how. `/search metal` finds the session, shows the matching
+snippet and offers `/resume`; `--all` widens beyond the current project. It is
+deliberately compaction-proof — long sessions are both the ones worth searching
+and the ones that get compacted, so the index keeps conversation the transcript
+has since dropped.
+
+**Goals that outlive the session.** `/goal --max 5 make the failing test pass`
+runs a loop that adjudicates its own progress and stops on a verdict or the cap.
+The objective is durable state: it survives `/save`, `/resume` and `/compact`,
+so you can come back tomorrow and still see what it was pursuing and how far it
+got.
+
+**`/rate` records what worked, somewhere the model cannot see.** A rating goes
+to a sidecar, never the transcript, context or KV — if the model could read your
+ratings it would start optimising for them and the signal would be worthless.
+`/insights` turns a week of them into satisfaction over time plus the notes on
+the turns that went wrong.
+
+**Three new tools, on by default.** `recall` gives the model that same session
+history, so it can look up a past decision instead of guessing or interrupting
+you. `fanout` runs several independent subtasks and joins their reports in a
+fixed order, with optional throwaway-worktree isolation when subtasks edit
+files. `run_code` batches a few pre-decided operations — `read`, `glob`, `edit`,
+`bash` — into one turn instead of a round-trip each; every operation is routed
+through the normal tool dispatch, so the sandbox, the `~/.plank` write grant and
+your `PreToolUse` hooks apply exactly as they would to a bare call. Switch any
+of them off with `tools.recall`, `tools.fanout` or `tools.runCode`.
+
 **plank signs the commits it writes.** When the model creates a git commit, the
 message now ends with a blank line and the single line `--with help from plank`,
 so a `git log` months from now still says which commits came out of a session

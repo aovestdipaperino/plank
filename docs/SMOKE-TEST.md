@@ -25,21 +25,25 @@ because several steps write settings and read/write session state:
 cp -r ~/.plank ~/.plank.bak
 ```
 
-Several milestones are **off by default** on purpose (parity: enabling them changes the
-tools prompt and therefore the system-prompt fingerprint `fp1`). Turn on the ones you
-want to exercise in `~/.plank/settings.json`:
+`recall` (M8), `fanout` (M9) and `runCode` (M10) are **on by default** as of 3.4.0. They
+are still deviations from the C reference — their schemas sit in the tools prompt, so
+`fp1` differs from the C agent's — which is why each can be switched off individually.
+The settings you may want while running this pass:
 
 ```json
 {
   "tools": {
-    "recall": true,
-    "fanout": true,
-    "runCode": true,
     "callTimeoutSec": 10,
     "spillMaxBytes": 2048,
     "spillPreviewBytes": 256
   }
 }
+```
+
+To exercise the off-path of the three gated tools, set any of them to `false`:
+
+```json
+{ "tools": { "recall": false, "fanout": false, "runCode": false } }
 ```
 
 The two spill numbers above are deliberately tiny so ordinary output spills and you can
@@ -404,14 +408,15 @@ still read `session.goal` directly, so a settled goal is *reported* with its sta
 though it is no longer injected; a cleared goal is gone from both, and its `goal` record
 is absent from the saved session file.
 
-## M8 — The `recall` tool (needs `tools.recall: true`, needs inference)
+## M8 — The `recall` tool (on by default, needs inference)
 
-With `recall` off (the default), ask the model to use it.
+Set `tools.recall: false` and ask the model to use it.
 
 **Pass when:** it is not advertised in the tools prompt at all, and a hand-forced call
 returns `Tool error: unknown tool: recall`.
 
-Turn it on, then in a *fresh* session ask something only an earlier session knows:
+Restore the default, then in a *fresh* session ask something only an earlier session
+knows:
 
 > recall what we decided about the KV sysprompt fingerprint
 
@@ -429,17 +434,17 @@ the repository instead of calling the tool at all.
 > least one `current session —` line always comes back. Both are covered by
 > `tools::tests::recall_rejects_an_empty_query_and_reports_no_match`.
 
-**Parity note to verify, not to be surprised by:** enabling `recall` changes the tools
+**Parity note to verify, not to be surprised by:** toggling `recall` changes the tools
 prompt, which changes `fp1`, which invalidates `sysprompt-<fp1>.kv_raw`.
 
 **Pass when:** the first turn after flipping the setting is slower (snapshot rebuild) and
 a new `sysprompt-<fp1>.kv_raw` appears in `~/.plank/kvcache` — rebuilt, not broken.
 
-## M9 — Subagent fan-out (needs `tools.fanout: true`, needs inference)
+## M9 — Subagent fan-out (on by default, needs inference)
 
-Off by default; same unknown-tool check as M8.
+Same off-path check as M8, via `tools.fanout: false`.
 
-Turn it on and ask for two independent subtasks that map to named agents you have
+At the default, ask for two independent subtasks that map to named agents you have
 defined, e.g.:
 
 > use fanout to have the reviewer agent check src/spill.rs and the reviewer agent check src/guard.rs
@@ -457,11 +462,11 @@ because one Metal command queue buys no parallel throughput; the tool descriptio
 on purpose. If a fan-out of two subtasks takes about as long as two sequential agent
 calls, that is correct behaviour, not a bug.
 
-## M10 — `run_code` (needs `tools.runCode: true`)
+## M10 — `run_code` (on by default)
 
-Off by default; same unknown-tool check as M8.
+Same off-path check as M8, via `tools.runCode: false`.
 
-Turn it on and have the model run a script — one operation per line, from
+At the default, have the model run a script — one operation per line, from
 `read | glob | edit | bash`:
 
 ```
@@ -526,9 +531,11 @@ text in the TUI (no dedicated pane yet) and `/rate` is plain-path only.
 cargo test --test c_parity
 ```
 
-**Pass when:** green with all the new tools **off** (the default). With `recall`/`fanout`/
-`runCode` on, the tools prompt legitimately differs — that is the versioned deviation
-recorded in `FINDINGS.md` and `docs/SYSTEM-PROMPT-OVERRIDES.md`, not a failure.
+**Pass when:** green. Since 3.4.0 the committed fixtures include the `recall`, `fanout`
+and `run_code` schemas, because those tools ship on. The C-*derived* text is still checked
+byte-for-byte and independently by `tools_prompt_matches_c_source` — that is the assertion
+that must never bend. The extra schemas are the versioned deviation recorded in
+`FINDINGS.md` and `docs/SYSTEM-PROMPT-OVERRIDES.md`.
 
 **No second cache, no second GC.** Fill `~/.plank/spill`, the session index and the
 feedback sidecars, then let the startup sweep run (or force it via `/kvcache gc`).

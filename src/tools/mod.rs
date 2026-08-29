@@ -923,10 +923,12 @@ mod tests {
     }
 
     #[test]
-    fn run_code_is_off_by_default_and_executes_a_script_when_enabled() {
-        // `tools.runCode` defaults to false: the tool is not advertised and a
-        // call dispatches as unknown, so parity is untouched until a user opts
-        // in.
+    fn run_code_executes_a_script_by_default_and_can_be_disabled() {
+        // `tools.runCode` defaults to true. Turning it off makes the call
+        // dispatch as unknown, matching the prompt where it is unadvertised.
+        let mut off = crate::settings::Settings::default();
+        off.tools.run_code = false;
+        crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(
             &test_call("run_code", &[("script", "read x.txt")]),
@@ -934,12 +936,10 @@ mod tests {
         );
         assert!(res.is_error);
         assert!(res.output.contains("unknown tool: run_code"));
-        // With the setting on, a script of named operations executes through
-        // the existing dispatch path (so consent/sandbox checks apply) and
-        // collects outputs.
-        let mut s = crate::settings::Settings::default();
-        s.tools.run_code = true;
-        crate::settings::install_for_test(s);
+        // At the default, a script of named operations executes through the
+        // existing dispatch path (so consent/sandbox checks apply) and collects
+        // outputs.
+        crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         let f = dir2.join("x.txt");
         std::fs::write(&f, "hello").expect("write");
@@ -993,9 +993,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
-        let mut s = crate::settings::Settings::default();
-        s.tools.run_code = true;
-        crate::settings::install_for_test(s);
+        crate::settings::install_for_test(crate::settings::Settings::default());
 
         // The scratch dir lives under temp_dir(), which the sandbox profile
         // always allows, so the escape target must sit outside both cwd and
@@ -1042,19 +1040,19 @@ mod tests {
     }
 
     #[test]
-    fn recall_is_off_by_default_and_dispatches_when_enabled() {
-        // `tools.recall` defaults to false: the tool is not advertised and a
-        // call dispatches as unknown, so parity is untouched until a user opts
-        // in.
+    fn recall_dispatches_by_default_and_can_be_disabled() {
+        // `tools.recall` defaults to true: the tool dispatches and searches the
+        // current transcript's pre-compaction portion. Turning it off makes the
+        // call dispatch as unknown, matching the prompt where it is unadvertised.
+        let mut off = crate::settings::Settings::default();
+        off.tools.recall = false;
+        crate::settings::install_for_test(off);
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
         assert!(res.is_error);
         assert!(res.output.contains("unknown tool: recall"));
-        // With the setting on, the tool dispatches (and searches the current
-        // transcript's pre-compaction portion).
-        let mut s = crate::settings::Settings::default();
-        s.tools.recall = true;
-        crate::settings::install_for_test(s);
+        // Back at the default, it dispatches.
+        crate::settings::install_for_test(crate::settings::Settings::default());
         let (mut ctx, dir2) = test_ctx();
         ctx.current_transcript = vec![crate::session::Message::user("a needle here")];
         let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
@@ -1074,9 +1072,7 @@ mod tests {
         // the model: the request itself quotes the query, so the current
         // transcript always self-matches and `No sessions match` never fires
         // in a live session.
-        let mut s = crate::settings::Settings::default();
-        s.tools.recall = true;
-        crate::settings::install_for_test(s);
+        crate::settings::install_for_test(crate::settings::Settings::default());
 
         let (mut ctx, dir) = test_ctx();
         let res = dispatch(&test_call("recall", &[("query", "   ")]), &mut ctx);

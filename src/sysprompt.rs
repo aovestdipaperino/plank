@@ -673,11 +673,13 @@ fn append_native_extra_schemas(out: &mut String) {
     );
     append_agent_and_plan_schemas(out);
     // The `recall` (M8), `fanout` (M9) and `run_code` (M10) tools are
-    // deliberate deviations from the C reference: the C agent has none of
-    // them, so each is advertised only when the user opts in
-    // (`tools.recall` / `tools.fanout` / `tools.runCode`), which changes the
-    // system prompt and churns the `fp1` fingerprint — documented in
-    // docs/SYSTEM-PROMPT-OVERRIDES.md.
+    // deliberate deviations from the C reference: the C agent has none of them.
+    // They are advertised by default and can be switched off individually
+    // (`tools.recall` / `tools.fanout` / `tools.runCode`). Because they are in
+    // the prompt, `fp1` differs from the C agent's fingerprint — the versioned
+    // deviation documented in docs/SYSTEM-PROMPT-OVERRIDES.md. What parity
+    // still holds byte-for-byte is the C-*derived* text, which
+    // `tools_prompt_matches_c_source` checks independently of this list.
     if crate::settings::active().tools.recall {
         append_recall_schema(out);
     }
@@ -1110,66 +1112,69 @@ mod tests {
         }
     }
 
+    /// The three plank-native tools (M8/M9/M10) are advertised by default and
+    /// can be switched off. They are still deviations from the C reference —
+    /// the C agent has none of them — so `fp1` differs from the C agent's
+    /// fingerprint for every session. What parity still guarantees is that the
+    /// C-*derived* text is byte-identical, which `tools_prompt_matches_c_source`
+    /// checks independently of this schema list.
     #[test]
-    fn recall_schema_is_advertised_only_when_enabled() {
-        // `tools.recall` defaults to false: the `recall` tool is a deliberate
-        // deviation from the C reference, so it must not appear in the prompt
-        // until the user opts in (which churns the fp1 fingerprint).
+    fn recall_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"recall\""),
+            "recall is advertised by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.recall = false;
+        crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
             !text.contains("\"recall\""),
-            "recall must be off by default"
+            "tools.recall = false removes the schema"
         );
-        let mut s = crate::settings::Settings::default();
-        s.tools.recall = true;
-        crate::settings::install_for_test(s);
-        let mut text = String::new();
-        append_native_extra_schemas(&mut text);
-        assert!(text.contains("\"recall\""), "recall schema when enabled");
     }
 
     #[test]
-    fn fanout_schema_is_advertised_only_when_enabled() {
-        // `tools.fanout` defaults to false: the `fanout` tool is a deliberate
-        // deviation from the C reference, so it must not appear in the prompt
-        // until the user opts in (which churns the fp1 fingerprint).
+    fn fanout_schema_is_advertised_by_default_and_can_be_disabled() {
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            text.contains("\"fanout\""),
+            "fanout is advertised by default"
+        );
+        // The description must promise a deterministic join, not speed: on the
+        // ds4_engine path subtasks are interleaved on one Metal queue.
+        assert!(text.contains("deterministic"), "{text}");
+        let mut s = crate::settings::Settings::default();
+        s.tools.fanout = false;
+        crate::settings::install_for_test(s);
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
             !text.contains("\"fanout\""),
-            "fanout must be off by default"
+            "tools.fanout = false removes the schema"
         );
-        let mut s = crate::settings::Settings::default();
-        s.tools.fanout = true;
-        crate::settings::install_for_test(s);
-        let mut text = String::new();
-        append_native_extra_schemas(&mut text);
-        assert!(text.contains("\"fanout\""), "fanout schema when enabled");
-        // The description must promise a deterministic join, not speed: on the
-        // ds4_engine path subtasks are interleaved on one Metal queue.
-        assert!(text.contains("deterministic"), "{text}");
     }
 
     #[test]
-    fn run_code_schema_is_advertised_only_when_enabled() {
-        // `tools.runCode` defaults to false: the `run_code` tool is a
-        // deliberate deviation from the C reference, so it must not appear in
-        // the prompt until the user opts in (which churns the fp1 fingerprint).
-        let mut text = String::new();
-        append_native_extra_schemas(&mut text);
-        assert!(
-            !text.contains("\"run_code\""),
-            "run_code must be off by default"
-        );
-        let mut s = crate::settings::Settings::default();
-        s.tools.run_code = true;
-        crate::settings::install_for_test(s);
+    fn run_code_schema_is_advertised_by_default_and_can_be_disabled() {
         let mut text = String::new();
         append_native_extra_schemas(&mut text);
         assert!(
             text.contains("\"run_code\""),
-            "run_code schema when enabled"
+            "run_code is advertised by default"
+        );
+        let mut s = crate::settings::Settings::default();
+        s.tools.run_code = false;
+        crate::settings::install_for_test(s);
+        let mut text = String::new();
+        append_native_extra_schemas(&mut text);
+        assert!(
+            !text.contains("\"run_code\""),
+            "tools.runCode = false removes the schema"
         );
     }
 

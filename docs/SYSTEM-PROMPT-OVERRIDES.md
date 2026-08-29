@@ -215,27 +215,39 @@ loop on every turn.
 ## Deviations from the C reference (model-facing text)
 
 These are deliberate, versioned deviations from `refs/ds4`'s prompt/tool text,
-each gated behind a setting that defaults to off (or on with a documented
-exception) so parity is untouched until a user opts in. Each changes the
-system prompt, which changes the `fp1` fingerprint and invalidates the
-`sysprompt-<fp1>.kv_raw` snapshots — survivable (they rebuild), but batch such
-changes so the fingerprint churns once rather than once per feature.
+each gated behind a setting, so any one of them can be switched off. Each
+changes the system prompt, which changes the `fp1` fingerprint and invalidates
+the `sysprompt-<fp1>.kv_raw` snapshots — survivable (they rebuild), but batch
+such changes so the fingerprint churns once rather than once per feature.
+
+**As of 3.4.0 the M8/M9/M10 tools ship on by default.** Their schemas are
+therefore part of the standing prompt, and `fp1` no longer matches the C
+agent's fingerprint for an out-of-the-box session. This is a deliberate,
+versioned deviation, not a regression: what parity still guarantees
+byte-for-byte is the C-*derived* text, checked independently by
+`tools_prompt_matches_c_source`, which passes unchanged. The committed
+`tests/fixtures/tools_prompt.txt` and `system_prompt_reminder.txt` fixtures
+were regenerated to include the three schemas — the diff is purely additive.
+Switch all three off to get a tools prompt that is byte-identical to the C
+agent's again.
 
 - **`tools.repeatAdvisory` (M1, default on).** The loop-guard advisory line
   (`[loop guard] you have called this tool with these arguments N times; the
   result has not changed`) is appended to a tool result the model sees. The C
   agent has no such concept.
-- **`tools.recall` (M8, default off).** The `recall` tool searches prior
+- **`tools.recall` (M8, default **on**).** The `recall` tool searches prior
   sessions and the current one's pre-compaction portion, scoped to the current
-  project. The C agent has no such tool, so it is advertised in the tools
-  prompt only when enabled.
-- **`tools.fanout` (M9, default off).** The `fanout` tool runs a list of
+  project. The C agent has no such tool, so its schema is a standing deviation
+  in the tools prompt; set `tools.recall = false` to remove it.
+- **`tools.fanout` (M9, default **on**).** The `fanout` tool runs a list of
   independent subtasks, each delegated to a named sub-agent, and joins their
   reports deterministically. The C agent has no such tool; the description
   deliberately promises a deterministic join, not speed — on the `ds4_engine`
-  path subtasks are interleaved on one Metal queue, not parallel.
-- **`tools.runCode` (M10, default off).** The `run_code` tool executes a small
+  path subtasks are interleaved on one Metal queue, not parallel. Set
+  `tools.fanout = false` to remove it.
+- **`tools.runCode` (M10, default **on**).** The `run_code` tool executes a small
   script of named operations (read/glob/edit/bash), one per line, each routed
   through the existing tool dispatch so the consent and sandbox checks apply.
   The C agent has no such tool; the guest-language design (a small interpreted
-  language compiled to the WASM host) is a follow-up.
+  language compiled to the WASM host) is a follow-up. Set
+  `tools.runCode = false` to remove it.

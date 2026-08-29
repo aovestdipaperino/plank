@@ -380,5 +380,47 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
     }
   }
 }
+{
+  "type": "function",
+  "function": {
+    "name": "recall",
+    "description": "Search your prior sessions and the current one's pre-compaction portion for a query, scoped to the current project. Returns matching session titles, ages and snippets.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {"type": "string", "description": "the text to search for"}
+      },
+      "required": ["query"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "fanout",
+    "description": "Run a list of independent subtasks, each delegated to a named sub-agent, and join their reports into one deterministic result. Subtasks run serially on the shared engine — this buys structure, not speed.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "subtasks": {"type": "array", "description": "JSON array of {\"name\": <agent name>, \"task\": <task text>} objects", "items": {"type": "object"}}
+      },
+      "required": ["subtasks"]
+    }
+  }
+}
+{
+  "type": "function",
+  "function": {
+    "name": "run_code",
+    "description": "Run a small script of named operations (read <path>, glob <pattern>, edit <path> <old> <new>, bash <command>) through the same checks as the tools, collecting outputs into one result. One line per operation, one operation per line.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "script": {"type": "string", "description": "the script, one operation per line"}
+      },
+      "required": ["script"]
+    }
+  }
+}
 [End system prompt reminder.]
 

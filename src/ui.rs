@@ -12269,7 +12269,7 @@ mod tests {
     }
 
     #[test]
-    fn fanout_is_off_by_default_and_rejects_an_empty_list_when_enabled() {
+    fn fanout_rejects_an_empty_list_and_can_be_disabled() {
         let dir = scratch_dir("fanout");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -12281,13 +12281,15 @@ mod tests {
                 is_string: true,
             }],
         };
-        // Off by default: the tool dispatches as unknown.
+        // Turned off, the tool dispatches as unknown, matching the prompt where
+        // it is unadvertised.
+        let mut off = crate::settings::Settings::default();
+        off.tools.fanout = false;
+        crate::settings::install_for_test(off);
         let out = agent.run_fanout_tool(&call);
         assert!(out.contains("unknown tool: fanout"), "{out}");
-        // Enabled: an empty subtasks array is rejected.
-        let mut s = crate::settings::Settings::default();
-        s.tools.fanout = true;
-        crate::settings::install_for_test(s);
+        // At the default an empty subtasks array is rejected.
+        crate::settings::install_for_test(crate::settings::Settings::default());
         let empty = ToolCall {
             name: "fanout".to_string(),
             args: vec![crate::dsml::ToolArg {

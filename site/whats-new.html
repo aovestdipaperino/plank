@@ -137,6 +137,72 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>plank tells you where every setting came from.</strong>
+Settings arrive from five layers — built-in defaults, plugins,
+<code>~/.plank</code>, the project's <code>./.plank</code>, and CLI
+flags — and "I set that and nothing happened" used to mean reading code.
+<code>plank --dump-config</code> now prints each effective key with the
+layer that won and the layers it beat, and
+<code>/config --resolved</code> does the same inside a session,
+including which plugin won a contested skill or agent name. See <a
+href="/guide/08-configuration.html">Configuration</a>.</p>
+<p><strong>Loop guards for the failure local models actually
+have.</strong> A stale edit anchor sends a model into
+read/edit/read/edit, and small models often do not notice. On the third
+identical call the result now carries <em>"you have called this tool
+with these arguments 3 times; the result has not changed"</em>. Nothing
+is blocked — a legitimate third read exists, and blocking on a guess
+would be worse — and polling an async job is exempt, because a poll
+looks exactly like a stuck loop. Set <code>tools.callTimeoutSec</code>
+and the model is also told when a call overran its budget, so a hung
+test suite stops being invisible.</p>
+<p><strong>Large tool output is no longer a dead end.</strong> Ask about
+a 5 MB build log and <code>read</code> used to truncate with nowhere to
+go. The full payload now goes to <code>~/.plank/spill/</code>, the model
+gets a bounded preview plus a <code>continue_offset</code> it can page
+through with <code>more</code>, and <code>/export</code> still sees
+everything the tool returned. The same bound applies to oversized MCP
+results, which previously had no cap at all — a single chatty server
+could fill your context in one call.</p>
+<p><strong>Context reclaims itself between turns.</strong> After a dozen
+large reads those bodies are dead weight. plank now clears the old ones
+at end of turn — keeping the newest three, anything small, and
+everything belonging to the task you are on — with no model round-trip
+and no summarising. It holds off unless it would reclaim at least 4 KiB,
+because rewriting the transcript invalidates the KV prefix and an eager
+pass costs more than it saves.</p>
+<p><strong><code>/search</code> across your own sessions.</strong> You
+remember fixing a Metal crash a few weeks ago but not how.
+<code>/search metal</code> finds the session, shows the matching snippet
+and offers <code>/resume</code>; <code>--all</code> widens beyond the
+current project. It is deliberately compaction-proof — long sessions are
+both the ones worth searching and the ones that get compacted, so the
+index keeps conversation the transcript has since dropped.</p>
+<p><strong>Goals that outlive the session.</strong>
+<code>/goal --max 5 make the failing test pass</code> runs a loop that
+adjudicates its own progress and stops on a verdict or the cap. The
+objective is durable state: it survives <code>/save</code>,
+<code>/resume</code> and <code>/compact</code>, so you can come back
+tomorrow and still see what it was pursuing and how far it got.</p>
+<p><strong><code>/rate</code> records what worked, somewhere the model
+cannot see.</strong> A rating goes to a sidecar, never the transcript,
+context or KV — if the model could read your ratings it would start
+optimising for them and the signal would be worthless.
+<code>/insights</code> turns a week of them into satisfaction over time
+plus the notes on the turns that went wrong.</p>
+<p><strong>Three new tools, on by default.</strong> <code>recall</code>
+gives the model that same session history, so it can look up a past
+decision instead of guessing or interrupting you. <code>fanout</code>
+runs several independent subtasks and joins their reports in a fixed
+order, with optional throwaway-worktree isolation when subtasks edit
+files. <code>run_code</code> batches a few pre-decided operations —
+<code>read</code>, <code>glob</code>, <code>edit</code>,
+<code>bash</code> — into one turn instead of a round-trip each; every
+operation is routed through the normal tool dispatch, so the sandbox,
+the <code>~/.plank</code> write grant and your <code>PreToolUse</code>
+hooks apply exactly as they would to a bare call. Switch any of them off
+with <code>tools.recall</code>, <code>tools.fanout</code> or
+<code>tools.runCode</code>.</p>
 <p><strong>plank signs the commits it writes.</strong> When the model
 creates a git commit, the message now ends with a blank line and the
 single line <code>--with help from plank</code>, so a

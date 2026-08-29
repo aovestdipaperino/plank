@@ -316,9 +316,9 @@ impl Default for ToolsSettings {
             call_timeout_sec: 0,
             spill_max_bytes: 1_048_576,
             spill_preview_bytes: 4096,
-            recall: false,
-            fanout: false,
-            run_code: false,
+            recall: true,
+            fanout: true,
+            run_code: true,
         }
     }
 }

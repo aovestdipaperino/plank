@@ -707,7 +707,8 @@ has no such tool, so advertising it changes the system prompt, which changes
 `fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot
 (`session::sysprompt_checkpoint_name`). Snapshots rebuild rather than break,
 so this is survivable — but it is a versioned deviation, gated behind
-`tools.recall` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+`tools.recall` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
 Batch the fingerprint churn with any other tools-prompt change (M10) so it
 happens once rather than twice.
 
@@ -716,7 +717,8 @@ happens once rather than twice.
 The `fanout` tool is a deliberate deviation from the C reference: the C agent
 has no such tool, so advertising it changes the system prompt, which changes
 `fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
-`tools.fanout` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+`tools.fanout` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
 The description promises a deterministic join, not speed: on the `ds4_engine`
 path subtasks are interleaved on one Metal queue, not parallel
 (`docs/SHARED-ENGINE-DESIGN.md` §2), so the concurrency bound is 1 until
@@ -728,7 +730,8 @@ Batch the fingerprint churn with M8/M10 so it happens once.
 The `run_code` tool is a deliberate deviation from the C reference: the C agent
 has no such tool, so advertising it changes the system prompt, which changes
 `fp1` and invalidates every `sysprompt-<fp1>.kv_raw` snapshot. Gated behind
-`tools.runCode` (default off), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
+`tools.runCode` (default **on** since 3.4.0; set it to `false` to remove the
+schema), recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`.
 The minimal viable version executes a script of named operations
 (read/glob/edit/bash), one per line, each routed through the existing
 `tools::dispatch` so the consent and sandbox checks apply — a binding that

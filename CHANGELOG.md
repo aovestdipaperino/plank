@@ -6,6 +6,76 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.4.0] - 2026-08-29
+
+### Added
+
+- **Configuration provenance (M0).** `plank --dump-config` and
+  `/config --resolved` print every effective setting with the layer it came
+  from and the layers it shadowed, so "my setting did not take effect" is one
+  command rather than a code read.
+- **Loop guards (M1).** A repeat advisory tells the model when it has made the
+  same call three times (`tools.repeatAdvisory`, on by default; async job polls
+  are exempt), and an optional per-call budget (`tools.callTimeoutSec`) reports
+  when a tool overran it. Neither blocks or cancels — both inform the model.
+- **Feedback sidecar (M2).** `/rate + note` / `/rate -` records a rating in
+  `~/.plank/usage-data/feedback/<session>.jsonl`, deliberately outside the
+  transcript, context and KV so the model can never read or play to it.
+  `/insights` reports satisfaction over time and the worst-rated turns, and
+  now reports ratings orphaned by compaction separately instead of counting
+  them.
+- **The log-everything invariant (M3).** `tests/log_invariant.rs` asserts
+  structurally that every span of an assembled request is either a transcript
+  entry or the separately-fingerprinted system prompt, so `/repro` and
+  `/resume` cannot silently omit injected text.
+- **Output spill (M4).** Oversized tool output is written to
+  `~/.plank/spill/<session>/<n>.txt` and the model sees a bounded preview plus
+  a `continue_offset` locator it can page with `more`. Applied post-dispatch to
+  every tool, including MCP results, which previously had no cap at all.
+  Defaults are 1 MiB / 4 KiB (`tools.spillMaxBytes`, `tools.spillPreviewBytes`).
+- **Microcompact cadence and keep-policy (M5).** Old tool-result bodies are
+  cleared at end of turn without a model round-trip, keeping the newest three
+  result messages, anything under 256 bytes, and everything belonging to the
+  active task. The pass only fires when it would reclaim at least 4 KiB,
+  because rewriting the transcript invalidates the KV prefix.
+- **Cross-session search (M6).** `/search <query> [--all]` searches prior
+  sessions, scoped to the current project by default. The index archives
+  conversation that compaction removes, so history stays findable after the
+  transcript no longer holds it.
+- **Durable goal state (M7).** `/goal --max N <objective>` runs an adjudicated
+  loop; the goal is durable session state that survives `/save`, `/resume` and
+  `/compact`. Only an *active* goal is injected into subagent preambles.
+- **The `recall` tool (M8).** Gives the model the session index: prior sessions
+  scoped to this project, plus the current transcript.
+- **Subagent fan-out (M9).** One call runs several independent subtasks and
+  joins their reports in a deterministic order. Agents declaring
+  `isolation: worktree` run in a throwaway worktree. Serial by design — the
+  value is the deterministic join and the isolation, not throughput.
+- **`run_code` (M10).** A short script of `read`/`glob`/`edit`/`bash`
+  operations executed in one turn. Each operation is routed through the normal
+  tool dispatch, so the sandbox, the `~/.plank` grant and the `PreToolUse`
+  hooks all apply exactly as they would to a bare call.
+
+### Changed
+
+- **`tools.recall`, `tools.fanout` and `tools.runCode` now default to `true`.**
+  Their schemas are part of the standing tools prompt, so `fp1` no longer
+  matches the C agent's fingerprint out of the box. This is a versioned
+  deviation recorded in `docs/SYSTEM-PROMPT-OVERRIDES.md`; the C-*derived*
+  prompt text is still asserted byte-for-byte by
+  `tools_prompt_matches_c_source`. Set any of the three to `false` to remove
+  its schema.
+
+### Fixed
+
+- `/insights` no longer folds ratings whose turn compaction renumbered into the
+  satisfaction statistics; they are reported as orphaned and excluded.
+- `/search` no longer loses text that compaction removed from a session.
+- `/goal clear` drops the goal outright, and a settled or cleared goal is no
+  longer injected into subagent preambles as if it were the live objective.
+- The spill tests no longer read and write the real `~/.plank/spill`, where
+  blobs left by an interrupted run could make later runs fail.
+
 ## [3.3.0] - 2026-08-26
 
 ### Added
