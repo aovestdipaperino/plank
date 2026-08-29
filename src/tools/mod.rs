@@ -953,8 +953,92 @@ mod tests {
             res.output
         );
         assert!(res.output.contains("hello"), "{}", res.output);
+        // An empty script is rejected: a documented criterion the model will
+        // not produce on its own.
+        let empty = dispatch(&test_call("run_code", &[("script", "   ")]), &mut ctx);
+        assert_eq!(
+            empty.output,
+            "Tool error: run_code requires a non-empty 'script'\n"
+        );
+        // An unrecognised operation reports and continues rather than aborting
+        // the rest of the script.
+        let mixed = dispatch(
+            &test_call(
+                "run_code",
+                &[("script", "frobnicate something\nread x.txt")],
+            ),
+            &mut ctx,
+        );
+        assert!(
+            mixed
+                .output
+                .contains("Step 1: unknown operation \"frobnicate\""),
+            "{}",
+            mixed.output
+        );
+        assert!(
+            mixed.output.contains("Step 2 (read):") && mixed.output.contains("hello"),
+            "a bad step must not abort the script: {}",
+            mixed.output
+        );
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    /// The M10 security assertion: `run_code` binds operations *through*
+    /// `dispatch`, so a `bash` step inside a script must hit exactly the same
+    /// sandbox refusal a bare `bash` tool call does. If a step ever succeeded
+    /// here, it would be a hole straight through every guard in `sandbox.rs`.
+    /// Requires /usr/bin/sandbox-exec, so macOS only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
+        let mut s = crate::settings::Settings::default();
+        s.tools.run_code = true;
+        crate::settings::install_for_test(s);
+
+        // The scratch dir lives under temp_dir(), which the sandbox profile
+        // always allows, so the escape target must sit outside both cwd and
+        // temp — the same reasoning as `bash_sandbox_blocks_writes_outside_cwd`.
+        let home = std::env::var("HOME").expect("HOME set");
+        let outside =
+            std::path::Path::new(&home).join(format!(".plank-runcode-test-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let escape = format!("echo escape > '{}/escape.txt'", outside.display());
+
+        // Bare `bash` tool call: refused by the sandbox.
+        let (mut ctx, dir) = test_ctx();
+        ctx.sandbox.enabled = true;
+        let bare = dispatch(&test_call("bash", &[("command", &escape)]), &mut ctx);
+        assert!(
+            bare.output.contains("[sandbox blocked:"),
+            "bare call must be blocked: {}",
+            bare.output
+        );
+
+        // The same command as a `run_code` step: identically refused.
+        let (mut ctx2, dir2) = test_ctx();
+        ctx2.sandbox.enabled = true;
+        let script = format!("bash {escape}");
+        let via_run_code = dispatch(&test_call("run_code", &[("script", &script)]), &mut ctx2);
+        assert!(
+            via_run_code.output.contains("[sandbox blocked:"),
+            "run_code must not bypass the sandbox: {}",
+            via_run_code.output
+        );
+        assert!(
+            !via_run_code.output.contains("exit_status=0\n"),
+            "the escaping step must not succeed: {}",
+            via_run_code.output
+        );
+        assert!(
+            !outside.join("escape.txt").exists(),
+            "the write must not have landed"
+        );
+
+        std::fs::remove_dir_all(outside).ok();
+        std::fs::remove_dir_all(dir).ok();
+        std::fs::remove_dir_all(dir2).ok();
     }
 
     #[test]
@@ -985,6 +1069,40 @@ mod tests {
     }
 
     #[test]
+    fn recall_rejects_an_empty_query_and_reports_no_match() {
+        // Both are documented M8 pass criteria that cannot be reached through
+        // the model: the request itself quotes the query, so the current
+        // transcript always self-matches and `No sessions match` never fires
+        // in a live session.
+        let mut s = crate::settings::Settings::default();
+        s.tools.recall = true;
+        crate::settings::install_for_test(s);
+
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(&test_call("recall", &[("query", "   ")]), &mut ctx);
+        assert!(res.is_error, "a blank query is an error: {}", res.output);
+        assert_eq!(
+            res.output,
+            "Tool error: recall requires a non-empty 'query'\n"
+        );
+
+        let (mut ctx, dir2) = test_ctx();
+        ctx.current_transcript = vec![crate::session::Message::user("nothing relevant here")];
+        let res = dispatch(
+            &test_call("recall", &[("query", "qqzzxxnomatchtoken")]),
+            &mut ctx,
+        );
+        assert!(
+            res.output
+                .contains("No sessions match \"qqzzxxnomatchtoken\"."),
+            "no-match message: {}",
+            res.output
+        );
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
     fn dispatch_spills_oversized_results_and_more_continues() {
         // A 5 MB-style oversized result (here a 1000-byte read under a 100-byte
         // cap) yields a bounded preview plus a locator, and the generalised
@@ -994,7 +1112,14 @@ mod tests {
         s.tools.spill_preview_bytes = 50;
         crate::settings::install_for_test(s);
         let (mut ctx, dir) = test_ctx();
-        ctx.session_id = "sess".to_string();
+        // Dispatch spills through the real `~/.plank/spill`, so use a session
+        // id unique to this test run: a fixed one collides with other tests and
+        // leaves blobs behind that shift the next run's spill numbering.
+        ctx.session_id = format!(
+            "plank-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        );
         let big = dir.join("big.txt");
         std::fs::write(&big, "x".repeat(1000)).expect("write");
         let res = dispatch(&test_call("read", &[("path", "big.txt")]), &mut ctx);
@@ -1010,6 +1135,7 @@ mod tests {
             "more continues the spill: {}",
             more.output
         );
+        std::fs::remove_dir_all(crate::spill::spill_dir().join(&ctx.session_id)).ok();
         std::fs::remove_dir_all(dir).ok();
     }
 }

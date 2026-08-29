@@ -383,6 +383,76 @@ mod tests {
     }
 
     #[test]
+    fn reclaimable_gates_the_opportunistic_pass() {
+        // The M5 gate: `try_microcompact_opportunistic` fires only when the
+        // pass would reclaim at least MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES.
+        // Pruning rewrites transcript text in place and invalidates the KV
+        // prefix from that point, so a pass that reclaims little costs more
+        // than it saves. This pins the predicate that gate reads.
+
+        // Nothing clearable: the newest three results are all there is.
+        let short = vec![
+            Message::user("do the thing"),
+            big_tool_result("first"),
+            big_tool_result("second"),
+            big_tool_result("third"),
+        ];
+        assert_eq!(
+            microcompact_reclaimable(&short),
+            0,
+            "the newest three are never candidates"
+        );
+        assert!(microcompact_reclaimable(&short) < MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
+
+        // Two clearable results, each just over the small-result floor: worth
+        // reclaiming in principle, but under the opportunistic threshold.
+        let mut small = vec![Message::user("do the thing")];
+        for tag in ["first", "second"] {
+            small.push(big_tool_result(tag));
+        }
+        for tag in ["third", "fourth", "fifth"] {
+            small.push(big_tool_result(tag));
+        }
+        let reclaimable = microcompact_reclaimable(&small);
+        assert!(reclaimable > 0, "two old results are clearable");
+        assert!(
+            reclaimable < MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES,
+            "{reclaimable} bytes must not trip the {MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES}-byte gate"
+        );
+
+        // The same shape with genuinely large results clears the gate.
+        let mut large = vec![Message::user("do the thing")];
+        for tag in ["first", "second"] {
+            large.push(Message::user(format!(
+                "<tool_result>{tag} {}</tool_result>",
+                "x".repeat(MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES)
+            )));
+        }
+        for tag in ["third", "fourth", "fifth"] {
+            large.push(big_tool_result(tag));
+        }
+        assert!(
+            microcompact_reclaimable(&large) >= MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES,
+            "two large old results must trip the gate"
+        );
+
+        // The predicate agrees with what the pass actually clears.
+        let mut t = large.clone();
+        let before = microcompact_reclaimable(&t);
+        let (cleared, bytes) = microcompact(&mut t);
+        assert_eq!(cleared, 2);
+        assert_eq!(
+            bytes, before,
+            "reclaimable must predict the bytes the pass reclaims"
+        );
+        assert_eq!(
+            microcompact_reclaimable(&t),
+            0,
+            "nothing left to reclaim after the pass"
+        );
+    }
+
+    #[test]
     fn results_after_a_task_list_injection_are_kept() {
         // A tool result that follows the last `# Task list` injection belongs
         // to the current task and survives microcompact even when it is old.

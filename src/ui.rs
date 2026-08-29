@@ -2965,6 +2965,19 @@ impl Agent<'_> {
         (!compact::should_compact(self.engine.ctx_size(), used)).then_some(cleared)
     }
 
+    /// The durable goal *only while it is being worked*. Model-facing
+    /// injections use this rather than `session.goal` directly: a settled goal
+    /// is history, and feeding it to a subagent as "Session goal: …" would
+    /// present an objective nobody is pursuing as the live one. The `/goal`
+    /// and `/tasks` displays deliberately keep using `session.goal`, since
+    /// they render the status alongside it.
+    fn active_goal(&self) -> Option<&crate::goal::GoalState> {
+        self.session
+            .goal
+            .as_ref()
+            .filter(|g| g.status == crate::goal::GoalStatus::Active)
+    }
+
     /// Runs microcompact opportunistically at end-of-turn, gated on a minimum
     /// reclaimed-bytes threshold (M5). Pruning mid-session rewrites transcript
     /// text in place, which invalidates the KV prefix from that point, so an
@@ -3020,7 +3033,7 @@ impl Agent<'_> {
         // the durable summary, never like a tool result; the field is the
         // durable fact and this transcript entry is the record of what was
         // shown, so the log-everything invariant (M3) holds.
-        if let Some(block) = self.session.tasks.inject_block(self.session.goal.as_ref()) {
+        if let Some(block) = self.session.tasks.inject_block(self.active_goal()) {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
@@ -3981,10 +3994,10 @@ impl Agent<'_> {
                         None => println!("no goal set"),
                     }
                 } else if arg == "clear" {
-                    // `/goal clear` ends the durable goal without settling it.
-                    if let Some(g) = self.session.goal.as_mut() {
-                        g.status = crate::goal::GoalStatus::Cleared;
-                    }
+                    // `/goal clear` drops the durable goal outright: a cleared
+                    // goal must leave no trace the model or a later `/goal`
+                    // could mistake for a live objective.
+                    self.session.goal = None;
                     self.goal = None;
                     println!("goal cleared");
                 } else {
@@ -5041,7 +5054,15 @@ the original is frozen and listed in /tree"
         let mut agg = insights::aggregate(&metas, tz);
         // Feedback ratings live in a sidecar, never the transcript; fold them
         // into the deterministic statistics half of the report.
-        insights::aggregate_feedback(&mut agg, &crate::feedback::load_all(&root), tz);
+        // Orphan check (M2): a rating points at a turn by ordinal plus digest,
+        // and a compaction renumbers the transcript. The subject is the
+        // session's own transcript, loaded on demand for rated sessions only.
+        insights::aggregate_feedback(
+            &mut agg,
+            &crate::feedback::load_all(&root),
+            tz,
+            &|session_id| self.store.load(session_id).ok().map(|s| s.transcript),
+        );
 
         let mut narrative = insights::Narrative::new();
         if agg.sessions_counted == 0 {
@@ -5543,7 +5564,7 @@ the original is frozen and listed in /tree"
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
-            self.session.goal.as_ref(),
+            self.active_goal(),
         )));
         fork_at
     }
@@ -5593,7 +5614,7 @@ the original is frozen and listed in /tree"
                     session.push(Message::user(crate::agents::task_message(
                         Some(body.as_str()),
                         task,
-                        self.session.goal.as_ref(),
+                        self.active_goal(),
                     )));
                     slots.push(FanoutSlot {
                         key,
@@ -9879,10 +9900,9 @@ impl Agent<'_> {
                         None => log.push_plain("no goal set".to_owned()),
                     }
                 } else if arg == "clear" {
-                    // `/goal clear` ends the durable goal without settling it.
-                    if let Some(g) = self.session.goal.as_mut() {
-                        g.status = crate::goal::GoalStatus::Cleared;
-                    }
+                    // See the plain-REPL arm: a cleared goal is dropped, not
+                    // merely marked, so nothing model-facing can still see it.
+                    self.session.goal = None;
                     self.goal = None;
                     log.push_plain("goal cleared".to_owned());
                 } else {
@@ -12489,6 +12509,49 @@ mod tests {
             rendered.contains("# Task list") && rendered.contains("still pending after compact"),
             "{rendered}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn only_an_active_goal_reaches_the_model() {
+        // M7: `/goal clear` drops the goal outright, and a goal that has
+        // settled is history — neither may be injected into a subagent
+        // preamble or a task block as if it were the live objective.
+        let dir = scratch_dir("goal-active");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let mut state = crate::goal::GoalState {
+            objective: "ship the feature".to_string(),
+            max_iters: 5,
+            iter: 2,
+            status: crate::goal::GoalStatus::Active,
+        };
+        agent.session.goal = Some(state.clone());
+        assert!(
+            agent.active_goal().is_some(),
+            "an active goal is model-facing"
+        );
+
+        // Settled by the loop: still on the session for `/goal` to report,
+        // but no longer injected anywhere the model can see.
+        state.status = crate::goal::GoalStatus::Done;
+        agent.session.goal = Some(state.clone());
+        assert!(
+            agent.active_goal().is_none(),
+            "a settled goal must not be injected as the live objective"
+        );
+        assert!(
+            agent.session.goal.is_some(),
+            "but it stays on the session, so `/goal` can still report it"
+        );
+
+        // Cleared: gone entirely.
+        agent.slash("/goal clear").expect("clear");
+        assert!(
+            agent.session.goal.is_none(),
+            "`/goal clear` drops the durable goal"
+        );
+        assert!(agent.active_goal().is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 

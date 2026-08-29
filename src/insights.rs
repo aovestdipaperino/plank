@@ -743,10 +743,16 @@ pub struct Aggregated {
     /// One line per counted session, newest first, for the narrative prompt.
     pub highlights: Vec<String>,
 
-    /// Feedback ratings (M2): total, positive, negative.
+    /// Feedback ratings (M2): total, positive, negative. These count only
+    /// ratings that still have a subject; see `ratings_orphaned`.
     pub ratings_total: u32,
     pub ratings_positive: u32,
     pub ratings_negative: u32,
+    /// Ratings whose turn no longer exists: the transcript was compacted or
+    /// rolled back and renumbered, or the session file is gone. They are
+    /// reported but never counted into the satisfaction statistics, and never
+    /// reattributed to whatever now sits at the same index.
+    pub ratings_orphaned: u32,
     /// Satisfaction over time: `(day, positive share)` per local day with a
     /// rating, newest first.
     pub satisfaction_by_day: Vec<(String, f64)>,
@@ -949,11 +955,25 @@ pub fn aggregate_feedback(
     agg: &mut Aggregated,
     feedback: &[(String, Vec<crate::feedback::Rating>)],
     tz_offset: i64,
+    transcript_of: &dyn Fn(&str) -> Option<Vec<crate::session::Message>>,
 ) {
     let mut by_day: BTreeMap<i64, (u32, u32)> = BTreeMap::new();
     let mut worst: Vec<(String, String)> = Vec::new();
     for (session_id, ratings) in feedback {
+        // One load per rated session, not per rating: `/insights` reads the
+        // whole history and most sessions carry no ratings at all.
+        let transcript = transcript_of(session_id);
         for r in ratings {
+            // A rating whose turn is gone is reported as orphaned and kept out
+            // of the statistics. A session whose file no longer exists has no
+            // subject either, so its ratings are orphaned too.
+            let orphaned = transcript
+                .as_ref()
+                .is_none_or(|t| crate::feedback::is_orphaned(t, r));
+            if orphaned {
+                agg.ratings_orphaned += 1;
+                continue;
+            }
             agg.ratings_total += 1;
             if r.positive {
                 agg.ratings_positive += 1;
@@ -1538,6 +1558,14 @@ pub fn render_summary(
             out.push(format!("worst-rated turns: {worst}"));
         }
     }
+    // Reported even when every rating is orphaned and the block above is
+    // skipped: silently dropping them would look like the ratings vanished.
+    if agg.ratings_orphaned > 0 {
+        out.push(format!(
+            "{} orphaned (the rated turn is gone; not counted above)",
+            agg.ratings_orphaned
+        ));
+    }
     out
 }
 
@@ -2051,41 +2079,42 @@ mod tests {
         assert_eq!((meta.lines_added, meta.lines_removed), (2, 1));
     }
 
+    /// The transcript a rating points at, and a rating that matches it. Ratings
+    /// are keyed by ordinal *and* digest, so a test fixture has to carry the
+    /// real sha1 of the message text or every rating reads as orphaned.
+    #[cfg(test)]
+    fn rated(text: &str, ordinal: usize, positive: bool, note: &str) -> crate::feedback::Rating {
+        crate::feedback::Rating {
+            ordinal,
+            digest: crate::session::sha1_hex(text.as_bytes()),
+            positive,
+            note: note.to_string(),
+            at: 1_700_000_000,
+        }
+    }
+
     #[test]
     fn aggregate_feedback_counts_and_ranks() {
         let mut agg = Aggregated::default();
+        let s1 = vec![Message::user("turn zero"), Message::assistant("turn one")];
+        let s2 = vec![Message::user("only turn")];
         let feedback = vec![
             (
                 "s1".to_string(),
                 vec![
-                    crate::feedback::Rating {
-                        ordinal: 0,
-                        digest: "a".to_string(),
-                        positive: true,
-                        note: "great".to_string(),
-                        at: 1_700_000_000,
-                    },
-                    crate::feedback::Rating {
-                        ordinal: 1,
-                        digest: "b".to_string(),
-                        positive: false,
-                        note: "confusing".to_string(),
-                        at: 1_700_000_000,
-                    },
+                    rated("turn zero", 0, true, "great"),
+                    rated("turn one", 1, false, "confusing"),
                 ],
             ),
-            (
-                "s2".to_string(),
-                vec![crate::feedback::Rating {
-                    ordinal: 0,
-                    digest: "c".to_string(),
-                    positive: true,
-                    note: String::new(),
-                    at: 1_700_000_000,
-                }],
-            ),
+            ("s2".to_string(), vec![rated("only turn", 0, true, "")]),
         ];
-        aggregate_feedback(&mut agg, &feedback, 0);
+        let lookup = |id: &str| match id {
+            "s1" => Some(s1.clone()),
+            "s2" => Some(s2.clone()),
+            _ => None,
+        };
+        aggregate_feedback(&mut agg, &feedback, 0, &lookup);
+        assert_eq!(agg.ratings_orphaned, 0, "every rating still has its turn");
         assert_eq!(agg.ratings_total, 3);
         assert_eq!(agg.ratings_positive, 2);
         assert_eq!(agg.ratings_negative, 1);
@@ -2095,6 +2124,62 @@ mod tests {
         );
         assert_eq!(agg.satisfaction_by_day.len(), 1);
         assert!((agg.satisfaction_by_day[0].1 - 2.0 / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_rating_orphaned_by_compaction_is_reported_and_not_counted() {
+        // The M2 assertion: compaction renumbers the transcript, so a rating
+        // keyed to the old index no longer has a subject. It must be reported
+        // as orphaned, kept out of the satisfaction statistics, and never
+        // reattributed to whatever now sits at that index.
+        let mut agg = Aggregated::default();
+        let feedback = vec![(
+            "s1".to_string(),
+            vec![
+                rated("kept turn", 0, true, ""),
+                rated("rated turn", 1, false, "was wrong"),
+            ],
+        )];
+        // Compaction rewrote index 1 into something else.
+        let compacted = vec![Message::user("kept turn"), Message::assistant("a summary")];
+        aggregate_feedback(&mut agg, &feedback, 0, &|_| Some(compacted.clone()));
+        assert_eq!(agg.ratings_orphaned, 1, "the renumbered rating is orphaned");
+        assert_eq!(agg.ratings_total, 1, "orphans stay out of the total");
+        assert_eq!(agg.ratings_positive, 1);
+        assert_eq!(
+            agg.ratings_negative, 0,
+            "the orphan must not be reattributed to the summary now at index 1"
+        );
+        assert!(
+            agg.worst_turns.is_empty(),
+            "an orphaned negative rating names no turn: {:?}",
+            agg.worst_turns
+        );
+    }
+
+    #[test]
+    fn ratings_for_a_vanished_session_are_orphaned() {
+        // The session file was swept; its ratings have no subject at all.
+        let mut agg = Aggregated::default();
+        let feedback = vec![("gone".to_string(), vec![rated("whatever", 0, true, "")])];
+        aggregate_feedback(&mut agg, &feedback, 0, &|_| None);
+        assert_eq!(agg.ratings_orphaned, 1);
+        assert_eq!(agg.ratings_total, 0);
+    }
+
+    #[test]
+    fn an_all_orphan_report_still_mentions_them() {
+        // `sessions_counted` is non-zero or the summary short-circuits.
+        let agg = Aggregated {
+            sessions_counted: 1,
+            ratings_orphaned: 2,
+            ..Default::default()
+        };
+        let lines = render_summary(&agg, &Narrative::new(), 0, 1_700_000_000);
+        assert!(
+            lines.iter().any(|l| l.contains("2 orphaned")),
+            "orphans must be reported even with no live ratings: {lines:?}"
+        );
     }
 
     #[test]

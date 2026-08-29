@@ -59,10 +59,24 @@ pub fn apply(
     tool: &str,
     result: String,
 ) -> (String, Option<Spilled>) {
+    apply_in(&spill_dir(), policy, session_id, tool, result)
+}
+
+/// [`apply`], against an explicit spill root. Production callers use `apply`,
+/// which supplies [`spill_dir`]; tests pass a scratch root so they never touch
+/// the real `~/.plank/spill` and stay parallel-safe.
+#[must_use]
+pub fn apply_in(
+    root: &std::path::Path,
+    policy: &SpillPolicy,
+    session_id: &str,
+    tool: &str,
+    result: String,
+) -> (String, Option<Spilled>) {
     if result.len() <= policy.max_bytes {
         return (result, None);
     }
-    let dir = spill_dir().join(session_id);
+    let dir = root.join(session_id);
     let _ = std::fs::create_dir_all(&dir);
     // Next free index: the first `<n>.txt` that does not exist.
     let mut n = 0usize;
@@ -114,7 +128,13 @@ pub fn apply(
 /// Reads the full payload of a spilled result by id (`"<session-id>/<n>"`).
 #[must_use]
 pub fn read_spill(id: &str) -> Option<String> {
-    let path = spill_dir().join(id).with_extension("txt");
+    read_spill_in(&spill_dir(), id)
+}
+
+/// [`read_spill`], against an explicit spill root.
+#[must_use]
+pub fn read_spill_in(root: &std::path::Path, id: &str) -> Option<String> {
+    let path = root.join(id).with_extension("txt");
     std::fs::read_to_string(path).ok()
 }
 
@@ -126,8 +146,14 @@ pub fn read_spill(id: &str) -> Option<String> {
 /// recurses into the per-session subdirectories.
 #[must_use]
 pub fn sweep(policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
+    sweep_in(&spill_dir(), policy, now)
+}
+
+/// [`sweep`], against an explicit spill root.
+#[must_use]
+pub fn sweep_in(root: &std::path::Path, policy: &crate::kvgc::SweepPolicy, now: u64) -> u64 {
     let mut files: Vec<PathBuf> = Vec::new();
-    collect_txt(&spill_dir(), &mut files);
+    collect_txt(root, &mut files);
     let mut freed = 0u64;
     let mut survivors: Vec<(u64, PathBuf, u64)> = Vec::new(); // (mtime, path, bytes)
     for path in files {
@@ -184,56 +210,108 @@ fn collect_txt(dir: &std::path::Path, out: &mut Vec<PathBuf>) {
 mod tests {
     use super::*;
 
+    /// A scratch spill root unique to one test. Spill state is on-disk and
+    /// `sweep` walks the whole root, so tests sharing `~/.plank/spill` corrupt
+    /// each other's file numbering and evict each other's blobs. Passing an
+    /// explicit root keeps them hermetic and parallel-safe, and leaves the
+    /// user's real spill directory untouched.
+    struct ScratchRoot(PathBuf);
+
+    impl ScratchRoot {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "plank-spill-test-{}-{name}-{:?}",
+                std::process::id(),
+                std::thread::current().id(),
+            ));
+            std::fs::remove_dir_all(&dir).ok();
+            std::fs::create_dir_all(&dir).expect("scratch spill root");
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchRoot {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
     #[test]
     fn small_results_pass_through_untouched() {
+        let root = ScratchRoot::new("small");
         let policy = SpillPolicy {
             max_bytes: 100,
             preview_bytes: 50,
         };
-        let (out, spilled) = apply(&policy, "sess", "read", "small".to_string());
+        let (out, spilled) = apply_in(root.path(), &policy, "sess", "read", "small".to_string());
         assert_eq!(out, "small");
         assert!(spilled.is_none());
     }
 
     #[test]
     fn oversized_results_spill_to_a_preview_plus_locator() {
+        let root = ScratchRoot::new("oversized");
         let policy = SpillPolicy {
             max_bytes: 10,
             preview_bytes: 5,
         };
         let big = "x".repeat(100);
-        let (out, spilled) = apply(&policy, "sess", "mcp_call", big.clone());
+        let (out, spilled) = apply_in(root.path(), &policy, "sess", "mcp_call", big.clone());
         let spilled = spilled.expect("spilled");
         assert!(out.contains("[Output truncated at 5 bytes of 100."));
         assert!(out.contains("continue_offset=5."));
         assert!(out.contains("Call more with count=4096"));
         // The full payload is recoverable by id.
-        assert_eq!(read_spill(&spilled.id).as_deref(), Some(big.as_str()));
-        std::fs::remove_dir_all(spill_dir().join("sess")).ok();
+        assert_eq!(
+            read_spill_in(root.path(), &spilled.id).as_deref(),
+            Some(big.as_str())
+        );
     }
 
     #[test]
     fn spill_files_are_numbered_incrementally() {
+        let root = ScratchRoot::new("numbered");
         let policy = SpillPolicy {
             max_bytes: 1,
             preview_bytes: 1,
         };
-        let (_, a) = apply(&policy, "num", "read", "aaaa".to_string());
-        let (_, b) = apply(&policy, "num", "read", "bbbb".to_string());
+        let (_, a) = apply_in(root.path(), &policy, "num", "read", "aaaa".to_string());
+        let (_, b) = apply_in(root.path(), &policy, "num", "read", "bbbb".to_string());
         assert_eq!(a.expect("a").id, "num/0");
         assert_eq!(b.expect("b").id, "num/1");
-        std::fs::remove_dir_all(spill_dir().join("num")).ok();
+    }
+
+    /// A stale blob left by an earlier run must not shift the numbering of a
+    /// later one: this is the non-hermeticity that made the suite fail only
+    /// after an interrupted run.
+    #[test]
+    fn numbering_is_unaffected_by_another_roots_blobs() {
+        let mine = ScratchRoot::new("mine");
+        let theirs = ScratchRoot::new("theirs");
+        let policy = SpillPolicy {
+            max_bytes: 1,
+            preview_bytes: 1,
+        };
+        let (_, other) = apply_in(theirs.path(), &policy, "num", "read", "aaaa".to_string());
+        assert_eq!(other.expect("other").id, "num/0");
+        let (_, first) = apply_in(mine.path(), &policy, "num", "read", "bbbb".to_string());
+        assert_eq!(first.expect("first").id, "num/0");
     }
 
     #[test]
     fn sweep_removes_old_blobs_and_enforces_the_byte_budget() {
+        let root = ScratchRoot::new("sweep");
         let policy = SpillPolicy {
             max_bytes: 1,
             preview_bytes: 1,
         };
-        let (_, _) = apply(&policy, "sweep", "read", "aaaa".to_string());
-        let (_, _) = apply(&policy, "sweep", "read", "bbbb".to_string());
-        let dir = spill_dir().join("sweep");
+        let (_, _) = apply_in(root.path(), &policy, "sweep", "read", "aaaa".to_string());
+        let (_, _) = apply_in(root.path(), &policy, "sweep", "read", "bbbb".to_string());
+        let dir = root.path().join("sweep");
         let now = crate::kvmeta::now_secs();
         // TTL pass: nothing is old yet.
         let sweep_policy = crate::kvgc::SweepPolicy {
@@ -241,17 +319,16 @@ mod tests {
             ttl_tier_secs: 3600,
             max_bytes: 0,
         };
-        assert_eq!(sweep(&sweep_policy, now), 0);
+        assert_eq!(sweep_in(root.path(), &sweep_policy, now), 0);
         // Byte budget: cap below the total evicts the oldest.
         let tight = crate::kvgc::SweepPolicy {
             ttl_session_secs: 3600,
             ttl_tier_secs: 3600,
             max_bytes: 4,
         };
-        let freed = sweep(&tight, now);
+        let freed = sweep_in(root.path(), &tight, now);
         assert!(freed > 0, "budget pass must reclaim bytes");
         let remaining = std::fs::read_dir(&dir).map_or(0, std::iter::Iterator::count);
         assert!(remaining < 2, "at least one blob evicted");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }

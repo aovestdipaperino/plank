@@ -18,6 +18,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Most bytes of archived (no-longer-live) conversation kept per session.
+/// Archived text only grows when a transcript loses messages, and only
+/// conversation is eligible (see [`worth_archiving`]), so this is a backstop
+/// against a pathological session rather than a routine limit.
+const ARCHIVE_MAX_BYTES: usize = 65_536;
+
 /// One indexed session: the source stamp for validation, the project key for
 /// scoping, and the transcript text to search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,8 +39,50 @@ pub struct IndexEntry {
     pub title: String,
     /// Creation time in unix seconds, for the age shown in hits.
     pub created_at: u64,
-    /// The full transcript text, searched by substring.
+    /// The current transcript, one entry per message.
+    #[serde(default)]
+    pub messages: Vec<String>,
+    /// Conversation an earlier version of this transcript carried and the
+    /// current one does not: compaction replaces the transcript with a summary
+    /// plus a tail, and re-indexing is wholesale, so without this the dropped
+    /// text would stop being findable. Keeping it is what makes `/search`
+    /// compaction-proof. Oldest-first; trimmed from the front at
+    /// [`ARCHIVE_MAX_BYTES`].
+    #[serde(default)]
+    pub archived: Vec<String>,
+    /// Legacy field: the joined transcript written by index files that predate
+    /// `messages`. Read for migration, never written again.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+}
+
+impl IndexEntry {
+    /// The current transcript messages, migrating a legacy `text` entry.
+    fn current(&self) -> Vec<&str> {
+        if self.messages.is_empty() && !self.text.is_empty() {
+            return vec![self.text.as_str()];
+        }
+        self.messages.iter().map(String::as_str).collect()
+    }
+
+    /// Everything this entry can answer a query from: archived history first
+    /// (oldest), then the live transcript.
+    fn searchable(&self) -> String {
+        let mut parts: Vec<&str> = self.archived.iter().map(String::as_str).collect();
+        parts.extend(self.current());
+        parts.join("\n")
+    }
+}
+
+/// Whether a message that has left the transcript is worth keeping in the
+/// archive. Tool results are excluded deliberately: microcompact clears large
+/// result bodies on most turns, so archiving them would make the index grow
+/// without bound and turn it into a second copy of every tool output ever
+/// produced. Tool output is re-derivable by rerunning the tool; the
+/// conversation is not.
+fn worth_archiving(text: &str) -> bool {
+    let t = text.trim_start();
+    !t.starts_with("<tool_result>") && !t.is_empty()
 }
 
 /// One search hit.
@@ -85,20 +133,25 @@ pub fn build(
     for entry in entries {
         let mtime = mtime_secs(&entry.path);
         let path = root.join(format!("{}.json", entry.id));
-        let cached = std::fs::read_to_string(&path)
+        let prior = std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str::<IndexEntry>(&s).ok())
-            .filter(|e| e.src_size == entry.file_size && e.src_mtime == mtime);
-        if cached.is_some() {
+            .and_then(|s| serde_json::from_str::<IndexEntry>(&s).ok());
+        if prior
+            .as_ref()
+            .is_some_and(|e| e.src_size == entry.file_size && e.src_mtime == mtime)
+        {
             continue;
         }
         let session = store.load(&entry.id).map_err(|e| e.to_string())?;
-        let text = session
+        let messages: Vec<String> = session
             .transcript
             .iter()
-            .map(|m| m.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>();
+        // Compaction-proofing: anything the previous version carried that the
+        // new transcript has dropped moves to the archive, so a query still
+        // finds it after the text is gone from the session file.
+        let archived = merge_archive(prior.as_ref(), &messages);
         let project_key = crate::session::project_key(std::path::Path::new(&session.cwd));
         let index = IndexEntry {
             src_size: entry.file_size,
@@ -106,7 +159,9 @@ pub fn build(
             project_key,
             title: entry.title.clone(),
             created_at: entry.created_at,
-            text,
+            messages,
+            archived,
+            text: String::new(),
         };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
@@ -117,6 +172,35 @@ pub fn build(
         }
     }
     Ok(indexed)
+}
+
+/// The archive for a re-indexed session: whatever the previous entry already
+/// archived, plus any of its conversation messages the new transcript no
+/// longer carries. Oldest-first, de-duplicated, and trimmed from the front to
+/// [`ARCHIVE_MAX_BYTES`].
+fn merge_archive(prior: Option<&IndexEntry>, current: &[String]) -> Vec<String> {
+    let Some(prior) = prior else {
+        return Vec::new();
+    };
+    let live: std::collections::HashSet<&str> = current.iter().map(String::as_str).collect();
+    let mut archived: Vec<String> = prior.archived.clone();
+    for old in prior.current() {
+        if live.contains(old) || !worth_archiving(old) {
+            continue;
+        }
+        if !archived.iter().any(|a| a == old) {
+            archived.push(old.to_string());
+        }
+    }
+    // Trim oldest-first until the archive fits its budget.
+    let mut total: usize = archived.iter().map(String::len).sum();
+    let mut drop_to = 0usize;
+    while total > ARCHIVE_MAX_BYTES && drop_to < archived.len() {
+        total -= archived[drop_to].len();
+        drop_to += 1;
+    }
+    archived.drain(..drop_to);
+    archived
 }
 
 /// Searches the index for `query`, scoped to `project_key` unless `all` is
@@ -147,10 +231,13 @@ pub fn search(
         if !all && index.project_key != project_key.unwrap_or_default() {
             continue;
         }
-        let Some(pos) = index.text.find(query) else {
+        // Archived history is searched alongside the live transcript: that is
+        // what keeps a hit findable after compaction dropped its text.
+        let haystack = index.searchable();
+        let Some(pos) = haystack.find(query) else {
             continue;
         };
-        let snippet = snippet_of(&index.text, pos, query.len());
+        let snippet = snippet_of(&haystack, pos, query.len());
         hits.push(Hit {
             session_id: id,
             title: index.title,
@@ -234,6 +321,152 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].session_id, "s1");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn text_dropped_by_compaction_is_still_findable() {
+        // M6's headline claim: compaction replaces the transcript with a
+        // summary plus a tail, and re-indexing is wholesale, so the index must
+        // archive what the transcript lost or the history stops being findable.
+        let dir = scratch("compaction-proof");
+        let root = dir.join("index");
+        let store = crate::session::SessionStore::open(&dir).expect("open");
+        let key = crate::session::project_key(std::path::Path::new("/tmp/proj"));
+
+        write_session(&store, "s1", "a precompactionmarker worth finding");
+        build(&store, &root).expect("build");
+        assert_eq!(
+            search("precompactionmarker", Some(&key), false, &root).len(),
+            1,
+            "findable before compaction"
+        );
+
+        // Compaction: the marker survives in neither summary nor tail.
+        write_session(
+            &store,
+            "s1",
+            "Compacted session summary: the user said hello",
+        );
+        build(&store, &root).expect("build");
+        let hits = search("precompactionmarker", Some(&key), false, &root);
+        assert_eq!(hits.len(), 1, "still findable after compaction");
+        assert_eq!(hits[0].session_id, "s1");
+        assert!(
+            hits[0].snippet.contains("precompactionmarker"),
+            "the snippet quotes the archived text: {:?}",
+            hits[0].snippet
+        );
+        assert_eq!(
+            search("Compacted", Some(&key), false, &root).len(),
+            1,
+            "the live summary is findable too"
+        );
+
+        // A second compaction must not lose the first one's history.
+        write_session(&store, "s1", "Compacted again: nothing of note");
+        build(&store, &root).expect("build");
+        assert_eq!(
+            search("precompactionmarker", Some(&key), false, &root).len(),
+            1,
+            "archive survives repeated compaction"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cleared_tool_results_are_not_archived() {
+        // Microcompact clears large tool-result bodies on most turns. Archiving
+        // those would make the index grow without bound and duplicate every
+        // tool output ever produced, so only conversation is archived.
+        let dir = scratch("no-tool-archive");
+        let root = dir.join("index");
+        let store = crate::session::SessionStore::open(&dir).expect("open");
+        let key = crate::session::project_key(std::path::Path::new("/tmp/proj"));
+
+        let mut s = Session::new();
+        s.id = "s1".to_string();
+        s.cwd = "/tmp/proj".to_string();
+        s.push(Message::user(
+            "<tool_result>a giant toolneedle payload</tool_result>",
+        ));
+        s.push(Message::user("keep this conversationneedle"));
+        store.save(&mut s).expect("save");
+        build(&store, &root).expect("build");
+        assert_eq!(search("toolneedle", Some(&key), false, &root).len(), 1);
+
+        // Microcompact replaces the body with the stub and the turn moves on.
+        let mut s2 = Session::new();
+        s2.id = "s1".to_string();
+        s2.cwd = "/tmp/proj".to_string();
+        s2.push(Message::user(
+            "<tool_result>[old tool result cleared]</tool_result>",
+        ));
+        store.save(&mut s2).expect("save");
+        build(&store, &root).expect("build");
+
+        assert_eq!(
+            search("toolneedle", Some(&key), false, &root).len(),
+            0,
+            "a cleared tool result is not archived"
+        );
+        assert_eq!(
+            search("conversationneedle", Some(&key), false, &root).len(),
+            1,
+            "conversation that left the transcript is archived"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_archive_is_capped() {
+        // Growth backstop: the archive is trimmed oldest-first to a budget, so
+        // a pathological session cannot grow its index entry without bound.
+        let oldest = "x".repeat(ARCHIVE_MAX_BYTES);
+        let prior = IndexEntry {
+            src_size: 0,
+            src_mtime: 0,
+            project_key: String::new(),
+            title: String::new(),
+            created_at: 0,
+            messages: vec!["newer conversation".to_string()],
+            archived: vec![oldest],
+            text: String::new(),
+        };
+        // The live message is gone, so it joins the archive and pushes the
+        // total past the cap.
+        let merged = merge_archive(Some(&prior), &["something else".to_string()]);
+        let total: usize = merged.iter().map(String::len).sum();
+        assert!(
+            total <= ARCHIVE_MAX_BYTES,
+            "archive trimmed to the budget, got {total}"
+        );
+        assert!(
+            merged.iter().any(|m| m == "newer conversation"),
+            "the newest entry survives the trim"
+        );
+    }
+
+    #[test]
+    fn a_legacy_index_entry_still_searches() {
+        // Index files written before `messages` carry a joined `text` field.
+        // They must keep answering queries and migrate on the next rebuild.
+        let legacy = IndexEntry {
+            src_size: 0,
+            src_mtime: 0,
+            project_key: String::new(),
+            title: String::new(),
+            created_at: 0,
+            messages: Vec::new(),
+            archived: Vec::new(),
+            text: "a legacyneedle in the old joined field".to_string(),
+        };
+        assert!(legacy.searchable().contains("legacyneedle"));
+        // And its content is archived when the transcript moves on.
+        let merged = merge_archive(Some(&legacy), &["replacement".to_string()]);
+        assert!(
+            merged.iter().any(|m| m.contains("legacyneedle")),
+            "legacy text is archived, not silently dropped: {merged:?}"
+        );
     }
 
     #[test]
