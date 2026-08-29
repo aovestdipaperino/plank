@@ -2455,7 +2455,10 @@ impl Agent<'_> {
                 let mut renderer = stream.into_sink().renderer;
                 renderer.finish();
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
-                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                crate::openfile::note_written(
+                    &mut self.last_edited,
+                    self.tool_ctx.last_written.take(),
+                );
                 for preview in previews {
                     print!("{}", preview.to_ansi(self.color));
                 }
@@ -4068,7 +4071,10 @@ impl Agent<'_> {
                 }
             }
             "/export" => match self.write_export(arg) {
-                Ok(path) => println!("exported session to {}", path.display()),
+                Ok(path) => {
+                    println!("exported session to {}", path.display());
+                    self.last_edited = Some(path);
+                }
                 Err(e) => println!("export failed: {e}\nusage: /export [md|html] [path]"),
             },
             // miniedit needs the raw terminal and only the TUI can suspend
@@ -4093,6 +4099,10 @@ impl Agent<'_> {
                             println!("{line}");
                         }
                         println!("report written to {}", path.display());
+                        // Like `/repro`: aim a bare `/open` at the report that
+                        // was just generated, since reading it is the whole
+                        // point of having run the command.
+                        self.last_edited = Some(path);
                     }
                     Ok(Insights::Cancelled) => println!("insights cancelled"),
                     Err(e) => println!("insights failed: {e}\nusage: /insights [fast]"),
@@ -9183,7 +9193,10 @@ impl Agent<'_> {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
-                crate::openfile::note_edited(&mut self.last_edited, &previews, &self.tool_ctx.cwd);
+                crate::openfile::note_written(
+                    &mut self.last_edited,
+                    self.tool_ctx.last_written.take(),
+                );
                 for preview in previews {
                     let _ = tx.send(UiEvent::EditCard(preview));
                 }
@@ -10311,7 +10324,10 @@ impl Agent<'_> {
                 }
             }
             "/export" => match self.write_export(arg) {
-                Ok(path) => log.push_plain(format!("exported session to {}", path.display())),
+                Ok(path) => {
+                    log.push_plain(format!("exported session to {}", path.display()));
+                    self.last_edited = Some(path);
+                }
                 Err(e) => {
                     log.push_plain(format!("export failed: {e}"));
                     log.push_dim("usage: /export [md|html] [path]".to_owned());
@@ -10384,6 +10400,8 @@ impl Agent<'_> {
                             log.push_plain(line);
                         }
                         log.push_dim(format!("report written to {}", path.display()));
+                        // See the plain-REPL arm: bare `/open` opens the report.
+                        self.last_edited = Some(path);
                     }
                     Ok(Insights::Cancelled) => log.push_dim("insights cancelled".to_owned()),
                     Err(e) => {

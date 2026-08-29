@@ -291,6 +291,7 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         return format!("Tool error: write {path}: {e}\n");
     }
 
+    ctx.last_written = Some(full_path.clone());
     // Record a diff preview for the UI change card.
     ctx.edit_previews.push(crate::tools::diff::edit_preview(
         path,

@@ -309,6 +309,10 @@ pub fn tool_write(ctx: &mut ToolContext, call: &ToolCall) -> String {
     if let Err(e) = std::io::Write::write_all(&mut file, content.as_bytes()) {
         return format!("Tool error: write failed: {e}\n");
     }
+    // Aim a bare `/open` here. Unconditional, unlike the diff card below: a
+    // freshly created file is exactly the one the user asked for and wants to
+    // read back, even though it gets no card.
+    ctx.last_written = Some(full.clone());
     // A new file is shown by the streaming dim preview; only an overwrite gets
     // a post-edit diff card here.
     if let Some(prior) = &prior {
@@ -797,6 +801,23 @@ mod tests {
         assert_eq!(
             tool_write(&mut ctx, &test_call("write", &[("path", "p")])),
             "Tool error: write requires content\n"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// A new file gets no diff card, but it is still the file a bare `/open`
+    /// should open — so the pointer must be set independently of the card.
+    #[test]
+    fn write_records_the_target_even_when_it_creates_the_file() {
+        let (mut ctx, dir) = test_ctx();
+        tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "status.md"), ("content", "hi\n")]),
+        );
+        assert!(ctx.edit_previews.is_empty(), "new file still gets no card");
+        assert_eq!(
+            ctx.last_written.as_deref(),
+            Some(dir.join("status.md").as_path())
         );
         std::fs::remove_dir_all(dir).ok();
     }

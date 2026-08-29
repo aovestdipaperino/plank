@@ -150,6 +150,11 @@ pub struct ToolContext {
     /// Diff previews from `edit`/`write` calls this dispatch, drained by the UI
     /// to render a git-style change card. Empty when nothing changed a file.
     pub edit_previews: Vec<diff::EditPreview>,
+    /// Absolute path of the file a tool most recently wrote, drained by the UI
+    /// to aim a bare `/open`. Distinct from [`edit_previews`](Self::edit_previews):
+    /// creating a new file deliberately produces no diff card (the streaming
+    /// preview already showed it) but is still the file the user wants to open.
+    pub last_written: Option<PathBuf>,
     /// Front end that presents `ask` questions (issue #34); `None` in
     /// non-interactive mode, where `ask` fast-fails instead of blocking.
     pub asker: Option<Box<dyn ask::Asker>>,
@@ -231,6 +236,7 @@ impl ToolContext {
             tasks: crate::tasks::TaskList::new(),
             task_completions: Vec::new(),
             edit_previews: Vec::new(),
+            last_written: None,
             asker: None,
             ask_bridge: None,
             #[cfg(ds4_engine)]

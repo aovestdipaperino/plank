@@ -11,8 +11,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::tools::diff::EditPreview;
-
 /// What bare `/open` says when nothing has been edited yet.
 pub const NO_LAST_EDITED: &str = "no file edited yet this session — usage: /open <path>";
 
@@ -140,18 +138,20 @@ pub fn save(path: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Points `last` at the file the just-finished dispatch edited, if any.
+/// Points `last` at the file the just-finished dispatch wrote, if any.
 ///
-/// Both `edit` and `write` push an [`EditPreview`], so the previews the UI
-/// already drains after every dispatch are a complete record of what changed —
-/// no extra plumbing through `ToolContext` is needed. The final preview wins:
-/// "the last file edited" is the last one in dispatch order.
+/// `written` is `ToolContext::last_written`, set by every file-mutating tool.
+/// This deliberately does *not* read the diff previews: creating a new file
+/// pushes no preview (the streaming dim preview already showed it), so a
+/// preview-driven pointer silently missed exactly the case a bare `/open` is
+/// most useful for — "write a summary to status.md", then open it.
 ///
-/// Paths are resolved against `cwd` here rather than stored as the raw relative
-/// string, because `EnterWorktree` moves the cwd mid-session.
-pub fn note_edited(last: &mut Option<PathBuf>, previews: &[EditPreview], cwd: &Path) {
-    if let Some(p) = previews.last() {
-        *last = Some(resolve(&p.path, cwd));
+/// The tool resolves against the cwd at write time, so the stored path is
+/// already absolute; that is what keeps it correct across an `EnterWorktree`
+/// that moves the cwd mid-session.
+pub fn note_written(last: &mut Option<PathBuf>, written: Option<PathBuf>) {
+    if let Some(p) = written {
+        *last = Some(p);
     }
 }
 
@@ -321,50 +321,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Builds a preview carrying just the path; the diff rows are irrelevant
-    /// to the pointer bookkeeping.
-    fn preview(path: &str) -> EditPreview {
-        EditPreview {
-            path: path.to_string(),
-            created: false,
-            added: 1,
-            removed: 0,
-            bytes: None,
-            rows: Vec::new(),
-        }
-    }
-
     #[test]
-    fn note_edited_takes_the_last_preview() {
-        let cwd = Path::new("/work");
+    fn note_written_takes_the_path_the_tool_resolved() {
         let mut last = None;
-        note_edited(&mut last, &[preview("a.rs"), preview("b.rs")], cwd);
+        note_written(&mut last, Some(PathBuf::from("/work/b.rs")));
         assert_eq!(last, Some(PathBuf::from("/work/b.rs")));
     }
 
     #[test]
-    fn note_edited_resolves_relative_paths_eagerly() {
-        // `EnterWorktree` moves the cwd mid-session, so a stored relative path
-        // would later resolve to the worktree copy — a different file than the
-        // one that was edited.
-        let mut last = None;
-        note_edited(&mut last, &[preview("src/ui.rs")], Path::new("/work"));
-        assert_eq!(last, Some(PathBuf::from("/work/src/ui.rs")));
-        note_edited(&mut last, &[preview("src/ui.rs")], Path::new("/work/.wt/x"));
-        assert_eq!(last, Some(PathBuf::from("/work/.wt/x/src/ui.rs")));
+    fn note_written_follows_a_newly_created_file() {
+        // The regression: `write` creating a file pushes no diff card, but the
+        // new file is precisely what a bare `/open` should open.
+        let mut last = Some(PathBuf::from("/work/old.rs"));
+        note_written(&mut last, Some(PathBuf::from("/work/status.md")));
+        assert_eq!(last, Some(PathBuf::from("/work/status.md")));
     }
 
     #[test]
-    fn note_edited_keeps_an_absolute_path_as_is() {
-        let mut last = None;
-        note_edited(&mut last, &[preview("/etc/hosts")], Path::new("/work"));
-        assert_eq!(last, Some(PathBuf::from("/etc/hosts")));
-    }
-
-    #[test]
-    fn note_edited_leaves_the_pointer_alone_when_nothing_changed() {
+    fn note_written_leaves_the_pointer_alone_when_nothing_was_written() {
         let mut last = Some(PathBuf::from("/work/a.rs"));
-        note_edited(&mut last, &[], Path::new("/work"));
+        note_written(&mut last, None);
         assert_eq!(last, Some(PathBuf::from("/work/a.rs")));
     }
 
