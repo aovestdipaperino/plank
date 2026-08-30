@@ -1,0 +1,16 @@
+[package]
+name = "plank-console"
+version = "0.1.0"
+description = "Turbo Vision monitor that renders a plank model-token stream over a socket"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+plank-stream = { path = "../plank-stream" }
+turbo-vision = "1.3"
+
+[lints]
+workspace = true
