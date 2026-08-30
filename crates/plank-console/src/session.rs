@@ -59,11 +59,26 @@ impl SessionState {
     /// Title text for this session's window.
     #[must_use]
     pub fn window_title(&self) -> String {
+        let base = format_title(&self.name, self.port);
         if self.connected {
-            format!("{} :{}", self.name, self.port)
+            base
         } else {
-            format!("{} :{} [disconnected]", self.name, self.port)
+            format!("{base} [disconnected]")
         }
+    }
+}
+
+/// The `name :port` half of a window title, shared between the initial
+/// title set when a window is created and `SessionState::window_title`'s
+/// later connect/disconnect updates. Port 0 is not a real port — anonymous
+/// sessions and opened captures use it as a sentinel — so it is omitted
+/// rather than displayed as `name :0`.
+#[must_use]
+pub fn format_title(name: &str, port: u16) -> String {
+    if port == 0 {
+        name.to_string()
+    } else {
+        format!("{name} :{port}")
     }
 }
 
@@ -198,6 +213,15 @@ mod tests {
             sessions.window_title(1).unwrap(),
             "demo :4242 [disconnected]"
         );
+    }
+
+    #[test]
+    fn window_title_omits_a_zero_port() {
+        let mut sessions = Sessions::default();
+        sessions.insert(1, "anon-1".into(), 0, view(), opts());
+        assert_eq!(sessions.window_title(1).unwrap(), "anon-1 [disconnected]");
+        sessions.mark_reconnected(1);
+        assert_eq!(sessions.window_title(1).unwrap(), "anon-1");
     }
 
     #[test]

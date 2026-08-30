@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use plank_console::cmd;
 use plank_console::registry::{Server, ServerEvent, SessionId};
-use plank_console::session::{Sessions, SharedStreamView};
+use plank_console::session::{Sessions, SharedStreamView, format_title};
 use plank_console::streamview::StreamView;
 use plank_stream::render::RenderOptions;
 use turbo_vision::app::Application;
@@ -18,12 +18,23 @@ use turbo_vision::core::command::{CM_CASCADE, CM_CLOSE, CM_NEXT, CM_QUIT, CM_TIL
 use turbo_vision::core::event::{EventType, KB_ALT_X, KB_F6, KB_F10};
 use turbo_vision::core::geometry::Rect;
 use turbo_vision::core::menu_data::{Menu, MenuItem};
+use turbo_vision::core::state::{SF_CLOSED, shadow_size};
 use turbo_vision::views::file_dialog::FileDialog;
 use turbo_vision::views::menu_bar::{MenuBar, SubMenu};
 use turbo_vision::views::msgbox;
 use turbo_vision::views::status_line::{StatusItem, StatusLine};
 use turbo_vision::views::view::ViewId;
 use turbo_vision::views::window::{Window, WindowBuilder};
+
+/// A bounded number of pending stream-server events drained per main-loop
+/// iteration. `Server::events()` is an unbounded channel, so a client
+/// streaming faster than the pipeline/draw can keep up (`cat bigfile | nc
+/// ...`) would otherwise spin this inner loop forever and never return to
+/// `app.get_event()` — starving keystrokes, redraws and Alt-X. A message
+/// count is a simpler, more predictable budget here than a time slice (no
+/// clock reads on a hot loop, and behavior does not depend on how fast the
+/// draw happens to be on the day it is run).
+const MAX_EVENTS_PER_TICK: usize = 64;
 
 fn main() -> turbo_vision::core::error::Result<()> {
     let control_port = parse_port_arg();
@@ -63,7 +74,10 @@ fn main() -> turbo_vision::core::error::Result<()> {
             }
         }
 
-        while let Ok(ev) = server.events().try_recv() {
+        for _ in 0..MAX_EVENTS_PER_TICK {
+            let Ok(ev) = server.events().try_recv() else {
+                break;
+            };
             dirty = true;
             console.handle_server_event(&mut app, ev);
         }
@@ -84,6 +98,10 @@ fn main() -> turbo_vision::core::error::Result<()> {
             app.draw();
             let _ = app.terminal.flush();
         }
+        // `Application::run()` calls this each iteration; the hand-rolled
+        // loop must too, or a moved window's move-tracking state is never
+        // cleared and `get_redraw_union()` returns stale data indefinitely.
+        app.desktop.handle_moved_windows(&mut app.terminal);
 
         if app.desktop.remove_closed_windows() {
             console.forget_closed_windows(&app);
@@ -114,6 +132,26 @@ struct Console {
     window_ids: HashMap<ViewId, SessionId>,
     session_windows: HashMap<SessionId, ViewId>,
     opts: RenderOptionsState,
+}
+
+/// What a decided [`ServerEvent`] means for the desktop: create a window for
+/// a session, retitle one, or close one. Carries no `Application` reference,
+/// so deciding which of these applies is testable without a TTY; only
+/// *applying* one touches the desktop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConsoleIntent {
+    CreateWindow {
+        id: SessionId,
+        name: String,
+        port: u16,
+    },
+    Retitle {
+        view_id: ViewId,
+        title: String,
+    },
+    CloseWindow {
+        view_id: ViewId,
+    },
 }
 
 /// `RenderOptions` doesn't implement `Default`; this does, so `Console` can.
@@ -164,34 +202,93 @@ impl Console {
         }
     }
 
+    /// Applies a live stream-server event to a desktop, via the pure
+    /// decision made by [`Self::decide_server_event`].
     fn handle_server_event(&mut self, app: &mut Application, ev: ServerEvent) {
+        let Some(intent) = self.decide_server_event(ev) else {
+            return;
+        };
+        self.apply_intent(app, intent);
+    }
+
+    /// Decides what a `ServerEvent` means for this console's bookkeeping and
+    /// what (if anything) the caller must do to the desktop. Pure decision
+    /// logic: it touches `self.sessions` / `self.window_ids` /
+    /// `self.session_windows` only, never an `Application`, so it is
+    /// unit-testable without a TTY.
+    fn decide_server_event(&mut self, ev: ServerEvent) -> Option<ConsoleIntent> {
         match ev {
             ServerEvent::Opened { id, name, port } => {
+                Some(ConsoleIntent::CreateWindow { id, name, port })
+            }
+            ServerEvent::Reconnected { id } => {
+                self.sessions.mark_reconnected(id);
+                self.retitle_intent(id)
+            }
+            ServerEvent::Bytes { id, data } => {
+                self.sessions.feed(id, &data);
+                None
+            }
+            ServerEvent::Disconnected { id } => {
+                self.sessions.mark_disconnected(id);
+                self.retitle_intent(id)
+            }
+            ServerEvent::Closed { id } => {
+                // The server sends this once per session, on its own
+                // 30-minute idle TTL (`Server::reap`) — invisible in a short
+                // manual test, but certain in a long-running session. Drop
+                // both bookkeeping maps here so a stale entry can never
+                // misattribute a later command, and hand back an intent so
+                // the caller actually removes the window: otherwise it sits
+                // on screen forever, frozen on its last frame.
+                self.sessions.remove(id);
+                let view_id = self.session_windows.remove(&id)?;
+                self.window_ids.remove(&view_id);
+                Some(ConsoleIntent::CloseWindow { view_id })
+            }
+        }
+    }
+
+    /// The retitle intent for a session's window, if it still has one and
+    /// still has a title to show (both `None` for e.g. a capture window,
+    /// which isn't tracked in `session_windows`).
+    fn retitle_intent(&self, id: SessionId) -> Option<ConsoleIntent> {
+        let view_id = *self.session_windows.get(&id)?;
+        let title = self.sessions.window_title(id)?;
+        Some(ConsoleIntent::Retitle { view_id, title })
+    }
+
+    /// Performs the turbo-vision side effects a decided [`ConsoleIntent`]
+    /// calls for.
+    fn apply_intent(&mut self, app: &mut Application, intent: ConsoleIntent) {
+        match intent {
+            ConsoleIntent::CreateWindow { id, name, port } => {
                 let view = Rc::new(RefCell::new(StreamView::new(app.get_tile_rect())));
                 self.sessions
                     .insert(id, name.clone(), port, Rc::clone(&view), self.opts.0);
                 let mut window = WindowBuilder::new()
-                    .bounds(app.get_tile_rect())
-                    .title(format!("{name} :{port}"))
+                    .bounds(tile_window_bounds(app))
+                    .title(format_title(&name, port))
                     .build();
                 window.add(Box::new(SharedStreamView(view)));
                 let view_id = app.desktop.add(Box::new(window));
                 self.window_ids.insert(view_id, id);
                 self.session_windows.insert(id, view_id);
             }
-            ServerEvent::Reconnected { id } => {
-                self.sessions.mark_reconnected(id);
-                self.retitle(app, id);
+            ConsoleIntent::Retitle { view_id, title } => {
+                if let Some(view) = app.desktop.child_by_id_mut(view_id)
+                    && let Some(window) = view.as_any_mut().downcast_mut::<Window>()
+                {
+                    window.set_title(&title);
+                }
             }
-            ServerEvent::Bytes { id, data } => self.sessions.feed(id, &data),
-            ServerEvent::Disconnected { id } => {
-                self.sessions.mark_disconnected(id);
-                self.retitle(app, id);
-            }
-            ServerEvent::Closed { id } => {
-                self.sessions.remove(id);
-                if let Some(view_id) = self.session_windows.remove(&id) {
-                    self.window_ids.remove(&view_id);
+            ConsoleIntent::CloseWindow { view_id } => {
+                // Mark the window SF_CLOSED so the desktop's normal
+                // `remove_closed_windows` sweep (already run each loop
+                // iteration) picks it up, exactly as a user-driven close
+                // does — no separate removal path to keep in sync.
+                if let Some(view) = app.desktop.child_by_id_mut(view_id) {
+                    view.set_state_flag(SF_CLOSED, true);
                 }
             }
         }
@@ -206,22 +303,6 @@ impl Console {
             .retain(|view_id, _| app.desktop.contains_id(*view_id));
         self.session_windows
             .retain(|_, view_id| app.desktop.contains_id(*view_id));
-    }
-
-    /// Looks up a session's window on the desktop and applies its current
-    /// title text (reflecting connected/disconnected state).
-    fn retitle(&self, app: &mut Application, id: SessionId) {
-        let Some(view_id) = self.session_windows.get(&id).copied() else {
-            return;
-        };
-        let Some(title) = self.sessions.window_title(id) else {
-            return;
-        };
-        if let Some(view) = app.desktop.child_by_id_mut(view_id)
-            && let Some(window) = view.as_any_mut().downcast_mut::<Window>()
-        {
-            window.set_title(&title);
-        }
     }
 
     fn save_as(&self, app: &mut Application, id: SessionId) {
@@ -264,13 +345,28 @@ impl Console {
         }
 
         let mut window = WindowBuilder::new()
-            .bounds(app.get_tile_rect())
+            .bounds(tile_window_bounds(app))
             .title(name)
             .build();
         window.add(Box::new(SharedStreamView(view)));
         let view_id = app.desktop.add(Box::new(window));
         self.window_ids.insert(view_id, id);
     }
+}
+
+/// Bounds for a new stream window: the full tile rect, shrunk on the
+/// bottom-right by the window shadow. Every window shows its shadow by
+/// default (`SF_SHADOW`), and a window placed at the *exact* desktop bounds
+/// gets pushed up-and-left by `constrain_to_limits` to make room for that
+/// shadow — hiding its entire top row (title bar included) above row 0 and
+/// off screen. Reserving that room up front keeps the window, title bar
+/// included, fully on screen.
+fn tile_window_bounds(app: &Application) -> Rect {
+    let mut bounds = app.get_tile_rect();
+    let (shadow_x, shadow_y) = shadow_size();
+    bounds.b.x -= shadow_x;
+    bounds.b.y -= shadow_y;
+    bounds
 }
 
 /// Reads `--port <n>` from argv; defaults to 7878.
@@ -366,3 +462,199 @@ fn basename(path: &std::path::Path) -> String {
 /// a fixed high band is a simple, adequate allocator here.
 static NEXT_CAPTURE_ID: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(u64::MAX / 2);
+
+#[cfg(test)]
+mod console_decision_tests {
+    use super::*;
+    use plank_console::registry::ServerEvent;
+
+    #[test]
+    fn opened_decides_to_create_a_window() {
+        let mut console = Console::default();
+        let intent = console.decide_server_event(ServerEvent::Opened {
+            id: 1,
+            name: "demo".into(),
+            port: 61278,
+        });
+        assert_eq!(
+            intent,
+            Some(ConsoleIntent::CreateWindow {
+                id: 1,
+                name: "demo".into(),
+                port: 61278,
+            })
+        );
+    }
+
+    #[test]
+    fn bytes_decides_nothing_but_still_feeds_the_session() {
+        let mut console = Console::default();
+        console
+            .sessions
+            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+        let intent = console.decide_server_event(ServerEvent::Bytes {
+            id: 1,
+            data: b"hello\n".to_vec(),
+        });
+        assert_eq!(intent, None);
+        assert!(console.sessions.plain_text(1).unwrap().contains("hello"));
+    }
+
+    #[test]
+    fn reconnected_decides_to_retitle_the_mapped_window() {
+        let mut console = Console::default();
+        console
+            .sessions
+            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+        let view_id = ViewId::from_u16(7);
+        console.session_windows.insert(1, view_id);
+        console.window_ids.insert(view_id, 1);
+
+        let intent = console.decide_server_event(ServerEvent::Reconnected { id: 1 });
+
+        assert_eq!(
+            intent,
+            Some(ConsoleIntent::Retitle {
+                view_id,
+                title: "demo :4242".into(),
+            })
+        );
+    }
+
+    /// Regression test for the "Closed leaks an orphan window" finding:
+    /// `Server::reap`'s 30-minute idle TTL sends `Closed` once per session,
+    /// and the decision must produce a close-the-window intent — not just
+    /// drop the bookkeeping maps and leave the window on screen forever.
+    #[test]
+    fn closed_decides_to_close_the_mapped_window_and_forgets_it() {
+        let mut console = Console::default();
+        console
+            .sessions
+            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+        let view_id = ViewId::from_u16(9);
+        console.session_windows.insert(1, view_id);
+        console.window_ids.insert(view_id, 1);
+
+        let intent = console.decide_server_event(ServerEvent::Closed { id: 1 });
+
+        assert_eq!(intent, Some(ConsoleIntent::CloseWindow { view_id }));
+        assert!(!console.session_windows.contains_key(&1));
+        assert!(!console.window_ids.contains_key(&view_id));
+        assert!(console.sessions.plain_text(1).is_none());
+    }
+
+    #[test]
+    fn closed_with_no_mapped_window_decides_nothing() {
+        let mut console = Console::default();
+        console
+            .sessions
+            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+        let intent = console.decide_server_event(ServerEvent::Closed { id: 1 });
+        assert_eq!(intent, None);
+    }
+
+    fn test_view() -> plank_console::session::SharedView {
+        std::rc::Rc::new(std::cell::RefCell::new(StreamView::new(Rect::new(
+            0, 0, 80, 24,
+        ))))
+    }
+}
+
+/// Headless regression test for the "window title bars render empty"
+/// finding. `Application::new()` needs a real TTY, so this exercises
+/// `tile_window_bounds` + `WindowBuilder` + `Desktop::add` + `Frame::draw`
+/// directly against a `Terminal` running a `NullBackend`, which is enough
+/// to reproduce and pin the bug: a window placed at the *exact* desktop
+/// bounds gets pushed up by `constrain_to_limits` to make room for its
+/// shadow, hiding the title bar off the top of the screen.
+#[cfg(test)]
+mod title_render_tests {
+    use std::io;
+    use std::time::Duration;
+
+    use turbo_vision::core::event::Event;
+    use turbo_vision::core::geometry::Rect;
+    use turbo_vision::terminal::{Backend, Terminal};
+    use turbo_vision::views::desktop::Desktop;
+    use turbo_vision::views::view::View;
+    use turbo_vision::views::window::WindowBuilder;
+
+    struct NullBackend;
+    impl Backend for NullBackend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn init(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn cleanup(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((80, 25))
+        }
+        fn poll_event(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(None)
+        }
+        fn write_raw(&mut self, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+        fn show_cursor(&mut self, _x: u16, _y: u16) -> io::Result<()> {
+            Ok(())
+        }
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A window whose bounds equal the tile rect returned by
+    /// `tile_window_bounds` (shadow-shrunk) renders its title on row 0 —
+    /// not pushed off screen.
+    #[test]
+    fn shadow_shrunk_bounds_keep_the_title_bar_on_screen() {
+        let mut terminal = Terminal::with_backend(Box::new(NullBackend)).unwrap();
+        let mut desktop = Desktop::new(Rect::new(0, 0, 80, 25));
+
+        let mut bounds = desktop.bounds();
+        let (shadow_x, shadow_y) = turbo_vision::core::state::shadow_size();
+        bounds.b.x -= shadow_x;
+        bounds.b.y -= shadow_y;
+
+        let window = WindowBuilder::new()
+            .bounds(bounds)
+            .title("demo :61278")
+            .build();
+        desktop.add(Box::new(window));
+        desktop.draw(&mut terminal);
+
+        let row0: String = terminal.buffer()[0].iter().map(|c| c.ch).collect();
+        assert!(row0.contains("demo :61278"), "title not on row 0: {row0:?}");
+    }
+
+    /// Without the shadow-shrink, the same window (bounds == full desktop)
+    /// gets constrained up by one row to make room for its shadow, and the
+    /// title bar (row 0 of the frame) scrolls off screen entirely. This
+    /// pins the actual root cause: not `Frame`/`set_title`, but window
+    /// sizing versus the shadow.
+    #[test]
+    fn unshrunk_bounds_push_the_title_bar_off_screen() {
+        let mut terminal = Terminal::with_backend(Box::new(NullBackend)).unwrap();
+        let mut desktop = Desktop::new(Rect::new(0, 0, 80, 25));
+
+        let window = WindowBuilder::new()
+            .bounds(desktop.bounds())
+            .title("demo :61278")
+            .build();
+        desktop.add(Box::new(window));
+        desktop.draw(&mut terminal);
+
+        let row0: String = terminal.buffer()[0].iter().map(|c| c.ch).collect();
+        assert!(
+            !row0.contains("demo :61278"),
+            "expected the unshrunk-bounds title to be scrolled off row 0, but found it: {row0:?}"
+        );
+    }
+}
