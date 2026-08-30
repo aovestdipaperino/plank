@@ -155,10 +155,15 @@ impl View for StreamView {
         self.bounds = bounds;
         if self.follow {
             self.scroll_to_bottom();
+        } else {
+            self.top = self.top.min(self.max_top());
         }
     }
 
     fn draw(&mut self, terminal: &mut Terminal) {
+        if self.bounds.height() <= 0 {
+            return;
+        }
         let width = usize::try_from(self.bounds.width()).unwrap_or(0);
         let page = self.page();
         let lines: Vec<&Vec<Cell>> = self.iter_lines().skip(self.top).take(page).collect();
@@ -173,8 +178,7 @@ impl View for StreamView {
                     buf.put_char(i, cell.ch, cell.attr);
                 }
             }
-            #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-            let y = self.bounds.a.y + row as i16;
+            let y = self.bounds.a.y + i16::try_from(row).unwrap_or(i16::MAX);
             write_line_to_terminal(terminal, self.bounds.a.x, y, &buf);
         }
     }
@@ -210,7 +214,10 @@ impl View for StreamView {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::time::Duration;
     use turbo_vision::core::palette::TvColor;
+    use turbo_vision::terminal::Backend;
 
     fn line(s: &str) -> Vec<Cell> {
         s.chars()
@@ -220,6 +227,58 @@ mod tests {
 
     fn view() -> StreamView {
         StreamView::new(Rect::new(0, 0, 40, 10))
+    }
+
+    /// An in-memory `Backend` for tests: no real TTY, fixed size, no I/O.
+    /// `Terminal::write_line`/`write_cell` write straight into `Terminal`'s
+    /// own in-memory buffer, so this stub only needs to satisfy
+    /// initialization and size queries for `Terminal::with_backend`.
+    struct FakeBackend {
+        width: u16,
+        height: u16,
+    }
+
+    impl Backend for FakeBackend {
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+
+        fn init(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn cleanup(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn size(&self) -> io::Result<(u16, u16)> {
+            Ok((self.width, self.height))
+        }
+
+        fn poll_event(&mut self, _timeout: Duration) -> io::Result<Option<Event>> {
+            Ok(None)
+        }
+
+        fn write_raw(&mut self, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self, _x: u16, _y: u16) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn fake_terminal(width: u16, height: u16) -> Terminal {
+        Terminal::with_backend(Box::new(FakeBackend { width, height }))
+            .expect("fake backend never fails to init")
     }
 
     #[test]
@@ -276,5 +335,90 @@ mod tests {
             Attr::new(TvColor::LightRed, TvColor::Blue),
         )]);
         assert_eq!(v.plain_text(), "x");
+    }
+
+    #[test]
+    fn resize_larger_while_scrolled_back_reclamps_top_to_show_a_full_page() {
+        let mut v = StreamView::new(Rect::new(0, 0, 40, 5));
+        for i in 0..50 {
+            v.push_line(line(&i.to_string()));
+        }
+        // Scroll back so `top` sits well below the current max_top()
+        // (line_count 50, page 5 -> max_top 45).
+        v.scroll_to_top();
+        v.scroll_down(40);
+        assert!(!v.is_at_bottom());
+        let old_top = v.top;
+        assert!(old_top < v.max_top());
+
+        // Grow the view a lot: max_top() shrinks to line_count - new_page
+        // (50 - 48 = 2), which is now well below the old `top` (40). Left
+        // unclamped, that would leave blank rows at the bottom of the
+        // viewport even though unshown history sits above.
+        v.set_bounds(Rect::new(0, 0, 40, 48));
+
+        assert!(
+            v.top <= v.max_top(),
+            "top ({}) must not exceed max_top ({}) after growing",
+            v.top,
+            v.max_top()
+        );
+        let lines: Vec<&Vec<Cell>> = v.iter_lines().skip(v.top).take(v.page()).collect();
+        assert_eq!(
+            lines.len(),
+            v.page().min(v.line_count()),
+            "a full page of content should be visible after growing"
+        );
+    }
+
+    #[test]
+    fn draw_clips_to_bounds_and_applies_horizontal_offset() {
+        let mut v = StreamView::new(Rect::new(2, 1, 8, 4));
+        v.push_line(line("abcdefghij")); // longer than the 6-wide view
+        v.push_line(line("short")); // shorter than the 6-wide view
+        v.left = 2; // horizontal scroll offset
+
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+
+        // Row 0 (bounds.a.y == 1): "abcdefghij" skipped by `left` 2, then
+        // clipped to width 6, drawn starting at bounds.a.x == 2.
+        for (i, expected) in "cdefgh".chars().enumerate() {
+            let cell = terminal
+                .read_cell(2 + i16::try_from(i).unwrap_or(i16::MAX), 1)
+                .expect("cell within terminal bounds");
+            assert_eq!(cell.ch, expected);
+        }
+        // Nothing is drawn past the view's width (x == 8 is out of bounds).
+        assert_eq!(terminal.read_cell(8, 1).unwrap().ch, ' ');
+
+        // Row 1 (bounds.a.y == 2): "short" skipped by `left` 2 -> "ort",
+        // padded with the fill space for the remaining 3 columns.
+        for (i, expected) in "ort   ".chars().enumerate() {
+            let cell = terminal
+                .read_cell(2 + i16::try_from(i).unwrap_or(i16::MAX), 2)
+                .expect("cell within terminal bounds");
+            assert_eq!(cell.ch, expected);
+        }
+
+        // Nothing above or below the view's rows was touched.
+        assert_eq!(terminal.read_cell(2, 0).unwrap().ch, ' ');
+    }
+
+    #[test]
+    fn draw_on_zero_height_view_writes_nothing() {
+        let mut v = StreamView::new(Rect::new(0, 0, 10, 0));
+        v.push_line(line("hello"));
+        let mut terminal = fake_terminal(20, 10);
+        v.draw(&mut terminal);
+        for y in 0..10 {
+            for x in 0..20 {
+                assert_eq!(
+                    terminal.read_cell(x, y).unwrap().ch,
+                    ' ',
+                    "zero-height view must not write any cell"
+                );
+            }
+        }
     }
 }
