@@ -10,7 +10,7 @@ repository.workspace = true
 
 [dependencies]
 plank-stream = { path = "../plank-stream" }
-turbo-vision = "1.3"
+turbo-vision = { path = "../../../turbo-vision-4-rust" }
 
 [lints]
 workspace = true
