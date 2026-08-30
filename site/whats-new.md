@@ -7,6 +7,14 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**The footer counts what you have changed.** The TUI's top row has always told
+you which tree you are in — directory and branch, held still while everything
+else churns. It now also tells you what you have done to it: `📄 3 · +128 -41`,
+files touched, then lines added in bright green and lines deleted in bright red.
+Staged and unstaged work are counted together and untracked files are included,
+so a file you edited and then added appears once, not twice. A clean tree shows
+nothing at all.
+
 **`/insights` now recommends the plank features you are not using.** The report
 already knew how you work; a new *Features to try* section turns that into two
 or three concrete suggestions — a skill for the routine you retype every week, a

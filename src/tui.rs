@@ -3616,10 +3616,29 @@ fn push_dir_prefix(
     };
     if let Some(gi) = segment.find(glyph) {
         let path = segment[..gi].trim_end();
-        let branch = segment[gi + glyph.len_utf8()..].trim();
+        let tail = segment[gi + glyph.len_utf8()..].trim();
+        // The git stat segment trails the branch; peel it so its counts keep
+        // their own colors instead of being painted as part of the name.
+        let mark = crate::status::GIT_STAT_MARK;
+        let (branch, stat) = match tail.find(mark) {
+            Some(si) => {
+                // Drop the bar-separator itself: it is pushed back below in the
+                // plain style, like the powerline glyph before it.
+                let head = tail[..si].trim_end();
+                (
+                    head.strip_suffix('|').map_or(head, str::trim_end),
+                    tail[si..].trim(),
+                )
+            }
+            None => (tail, ""),
+        };
         first.push(Span::styled(path.to_string(), theme));
         first.push(Span::styled(format!(" {glyph} "), base));
         first.push(Span::styled(branch.to_string(), theme));
+        if !stat.is_empty() {
+            first.push(Span::styled(" | ".to_string(), base));
+            push_git_stat(first, stat, base);
+        }
     } else {
         first.push(Span::styled(segment.trim_end().to_string(), theme));
     }
@@ -3635,6 +3654,29 @@ fn push_dir_prefix(
     let _ = sep;
     if !spans.is_empty() {
         spans.push(Span::styled(" | ".to_string(), base));
+    }
+}
+
+/// Pushes the git stat segment (`📄 3 · +12 -4`) with the added count in bright
+/// green and the deleted count in bright red; the glyph, file count and center
+/// dot stay in the bar's own style.
+fn push_git_stat(spans: &mut Vec<Span<'static>>, stat: &str, base: Style) {
+    let add = base
+        .fg(Color::Indexed(crate::status::GIT_ADD_COLOR))
+        .add_modifier(Modifier::BOLD);
+    let del = base
+        .fg(Color::Indexed(crate::status::GIT_DEL_COLOR))
+        .add_modifier(Modifier::BOLD);
+    for (i, word) in stat.split(' ').enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" ".to_string(), base));
+        }
+        let style = match word.chars().next() {
+            Some('+') => add,
+            Some('-') => del,
+            _ => base,
+        };
+        spans.push(Span::styled(word.to_string(), style));
     }
 }
 
@@ -5670,6 +5712,48 @@ mod tests {
     /// else, row two opens with the engine origin and carries everything
     /// volatile. The origin moved rows deliberately — row one has to hold still
     /// while the rest churns — so pin where each piece lands.
+    /// The git stat segment stays on row one with the location it describes,
+    /// and its counts keep their own colors rather than reading as branch name.
+    #[test]
+    fn git_stat_counts_are_colored_on_the_location_row() {
+        let base = Style::default();
+        let glyph = crate::status::POWERLINE_BRANCH;
+        let mark = crate::status::GIT_STAT_MARK;
+        let _guard = crate::status::origin_test_guard();
+        let origin = crate::status::engine_origin_label();
+        let text =
+            format!("~/Code/plank {glyph} main | {mark} 3 · +12 -4 | {origin} | ctx 12% | idle");
+        let rows = status_bar_lines(&text, 0, base, &TaskView::default());
+        let row: String = rows[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(
+            row,
+            format!("~/Code/plank {glyph} main | {mark} 3 · +12 -4")
+        );
+
+        let span = |t: &str| {
+            rows[0]
+                .spans
+                .iter()
+                .find(|s| s.content == t)
+                .unwrap_or_else(|| panic!("span {t}"))
+                .style
+        };
+        // The branch name stops at the glyph: the counts are not part of it.
+        assert_eq!(
+            span("main").fg,
+            Some(Color::Indexed(crate::status::THEME_COLOR))
+        );
+        assert_eq!(
+            span("+12").fg,
+            Some(Color::Indexed(crate::status::GIT_ADD_COLOR))
+        );
+        assert_eq!(
+            span("-4").fg,
+            Some(Color::Indexed(crate::status::GIT_DEL_COLOR))
+        );
+        assert_eq!(span("3").fg, None);
+    }
+
     #[test]
     fn status_bar_splits_location_from_everything_volatile() {
         let base = Style::default();

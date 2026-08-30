@@ -13,6 +13,15 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
+### 3.5.1
+
+📄 **The status footer counts what you have changed.** The TUI's location row
+already told you which tree you were in — path and branch. It now also tells you
+what you have done to it: `📄 3 · +128 -41`, files touched, then lines added in
+bright green and lines deleted in bright red. Staged and unstaged work count
+together, untracked files included, so a file you edited and then added shows up
+once. A clean tree shows nothing.
+
 ### 3.4.1
 
 Opens the new beta channel on the same code as 3.4.0.

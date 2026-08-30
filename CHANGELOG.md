@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **The status footer counts what you have changed.** Beside the directory and
+  branch — on the TUI's location row, which answers "which tree am I in" —
+  the footer now carries a working-tree summary: `📄 3 · +128 -41`, files
+  touched then lines added in bright green and lines deleted in bright red. It
+  is one `HEAD`-to-workdir-with-index diff, untracked files included, so a file
+  edited and then staged counts once rather than twice. A clean tree shows
+  nothing: a permanent `0 · +0 -0` is three columns of noise. The diff is
+  cached for a second, because the footer repaints several times a second and
+  walking the tree at that rate would cost more than the rest of the line put
+  together.
+
 ## [3.5.0] - 2026-08-30
 
 ### Added

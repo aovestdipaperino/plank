@@ -8,7 +8,7 @@ The TUI is three regions: **scrollback** (the conversation), the **prompt**, and
 
 Assistant replies render as markdown — headings, lists, tables, and fenced code blocks with tree-sitter syntax highlighting. The model's thinking appears dimmed above its answer (turn it off with `ui.showThinking`). File edits render as git-style **diff cards**: an `Update(path)` header, an added/removed summary, and red/green `@@` hunks. A brand-new file streams its contents dimmed as it is written.
 
-The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory and git branch, and nothing else. The bottom one carries everything that churns — where inference is running, the reasoning level, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
+The status bar is two rows. The top one answers "which tree am I in" and holds still: the working directory, the git branch, and a summary of what you have changed in that tree (`📄 3 · +128 -41` — files touched, then lines added in green and lines deleted in red, staged and unstaged together, untracked files included; a clean tree shows nothing). The bottom one carries everything that churns — where inference is running, the reasoning level, a context-usage gauge, an activity throbber, what the model is doing, generation stats, the task counter, and the remote marker. When a tool is running its name sits in the notification slot and blinks; otherwise a rotating tip appears there.
 
 **Where inference runs** is named on the second row, and there can be more than one answer:
 

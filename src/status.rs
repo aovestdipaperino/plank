@@ -48,6 +48,113 @@ pub const POWERLINE_BRANCH: char = '\u{e0a0}';
 /// `push_dir_prefix` mistake it for part of the branch name.
 pub const THINK_MARK: &str = "🧠";
 
+/// Leading glyph of the **git stat segment** (`📄 3 · +12 -4`), shown just
+/// after the branch name inside the dir prefix.
+///
+/// Like [`THINK_MARK`], it is also the anchor the TUI splits on: the segment
+/// rides between the branch and the engine origin, so `push_dir_prefix` peels
+/// it here rather than letting it be absorbed into the branch name.
+pub const GIT_STAT_MARK: &str = "📄";
+
+/// Bright green (256-color 10), the added-lines count in the git stat segment.
+pub const GIT_ADD_COLOR: u8 = 10;
+/// Bright red (256-color 9), the deleted-lines count in the git stat segment.
+pub const GIT_DEL_COLOR: u8 = 9;
+
+/// Working-tree change summary: files touched, lines added, lines deleted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GitStats {
+    /// Number of files differing from `HEAD` (staged and unstaged, deduped).
+    pub files: usize,
+    /// Lines added across those files.
+    pub added: usize,
+    /// Lines deleted across those files.
+    pub deleted: usize,
+}
+
+impl GitStats {
+    /// True when the tree is clean, in which case the footer shows nothing.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.files == 0 && self.added == 0 && self.deleted == 0
+    }
+}
+
+/// How long a computed [`GitStats`] is reused before the diff is walked again.
+///
+/// The footer repaints several times a second; diffing the whole working tree
+/// at that rate would cost more than everything else on the line put together.
+/// A second of staleness in a change counter nobody is watching frame-by-frame
+/// is not a defect.
+const GIT_STATS_TTL: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Cached result of the last working-tree diff, with the instant it was taken.
+static GIT_STATS_CACHE: std::sync::Mutex<Option<(std::time::Instant, Option<GitStats>)>> =
+    std::sync::Mutex::new(None);
+
+/// Working-tree change summary against `HEAD`, discovered from the cwd via
+/// `git2`. `None` outside a repo, or when the diff cannot be taken.
+///
+/// Cached for [`GIT_STATS_TTL`]; a poisoned cache falls through to a fresh
+/// computation rather than panicking on the render path.
+#[must_use]
+pub fn git_stats() -> Option<GitStats> {
+    let now = std::time::Instant::now();
+    if let Ok(cache) = GIT_STATS_CACHE.lock()
+        && let Some((taken, stats)) = *cache
+        && now.duration_since(taken) < GIT_STATS_TTL
+    {
+        return stats;
+    }
+    let stats = compute_git_stats();
+    if let Ok(mut cache) = GIT_STATS_CACHE.lock() {
+        *cache = Some((now, stats));
+    }
+    stats
+}
+
+/// Walks the `HEAD`-to-working-tree diff once. See [`git_stats`] for the
+/// cached entry point.
+fn compute_git_stats() -> Option<GitStats> {
+    let repo = git2::Repository::discover(".").ok()?;
+    // Tree-to-workdir-with-index: one diff covering both staged and unstaged
+    // work, so a file edited and then added is counted once, not twice.
+    let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+        .ok()?;
+    let stats = diff.stats().ok()?;
+    Some(GitStats {
+        files: stats.files_changed(),
+        added: stats.insertions(),
+        deleted: stats.deletions(),
+    })
+}
+
+/// The git stat segment text, `📄 3 · +12 -4`, or `None` for a clean tree or
+/// no repo. With `color`, the counts carry their own ANSI colors and return to
+/// the footer style.
+#[must_use]
+pub fn git_stat_segment(color: bool) -> Option<String> {
+    let st = git_stats()?;
+    if st.is_clean() {
+        return None;
+    }
+    if color {
+        Some(format!(
+            "{GIT_STAT_MARK} {} · \x1b[38;5;{GIT_ADD_COLOR};1m+{}{STATUS_STYLE_START} \x1b[38;5;{GIT_DEL_COLOR};1m-{}{STATUS_STYLE_START}",
+            st.files, st.added, st.deleted
+        ))
+    } else {
+        Some(format!(
+            "{GIT_STAT_MARK} {} · +{} -{}",
+            st.files, st.added, st.deleted
+        ))
+    }
+}
+
 /// The think segment's level name colored by *temperature*: the hotter the
 /// reasoning effort, the hotter the color. Red for `max`, white for `med`, blue
 /// for `low`, grey for `off` — so the level is legible at a glance, from a
@@ -1340,8 +1447,12 @@ fn build_status_text_with_cells(
     let dir = if cwd.is_empty() {
         origin
     } else if let Some(branch) = git_branch_label() {
+        // The git stat segment rides with the branch, inside the dir prefix:
+        // it answers "what have I changed in this tree", which is the same
+        // question the path and branch answer, one level down.
+        let stat = git_stat_segment(color).map_or(String::new(), |s| format!(" | {s}"));
         format!(
-            "{} {POWERLINE_BRANCH} {} | {origin}",
+            "{} {POWERLINE_BRANCH} {}{stat} | {origin}",
             theme(&cwd),
             theme(&branch)
         )
@@ -2113,6 +2224,68 @@ mod tests {
         assert!(mark < ctx, "{line}");
         // Nothing between the two but the separator.
         assert_eq!(&line[mark..ctx], format!("{THINK_MARK} med | "), "{line}");
+    }
+
+    /// The change counter belongs to the *location*, not the body: it describes
+    /// the tree named by the path and branch, so it sits inside the dir prefix,
+    /// after the branch and before the origin. (The TUI splits on
+    /// `GIT_STAT_MARK` for the same reason it splits on `THINK_MARK`.)
+    #[test]
+    fn git_stat_segment_sits_between_the_branch_and_the_body() {
+        let st = Status {
+            ctx_used: 1,
+            ctx_size: 100,
+            ..Status::default()
+        };
+        let line = build_status_text(&st, false, true);
+        // The repo under test may be clean, in which case the segment is absent
+        // by design and there is nothing to place.
+        let Some(mark) = line.find(GIT_STAT_MARK) else {
+            assert!(git_stats().is_none_or(|s| s.is_clean()), "{line}");
+            return;
+        };
+        let branch = line.find(POWERLINE_BRANCH).expect("branch glyph present");
+        let think = line.find(THINK_MARK).expect("think segment present");
+        assert!(branch < mark && mark < think, "{line}");
+    }
+
+    /// The counts are colored where they are read: bright green for additions,
+    /// bright red for deletions, with the footer style restored after each so
+    /// the bar's background survives.
+    #[test]
+    fn git_stat_counts_carry_their_own_colors() {
+        let Some(seg) = git_stat_segment(true) else {
+            return;
+        };
+        assert!(
+            seg.contains(&format!("\x1b[38;5;{GIT_ADD_COLOR};1m+")),
+            "{seg}"
+        );
+        assert!(
+            seg.contains(&format!("\x1b[38;5;{GIT_DEL_COLOR};1m-")),
+            "{seg}"
+        );
+        assert!(seg.ends_with(STATUS_STYLE_START), "{seg}");
+    }
+
+    /// A clean tree says nothing: the segment exists to report change, and a
+    /// permanent `0 · +0 -0` would be three columns of noise.
+    #[test]
+    fn a_clean_tree_shows_no_git_stat_segment() {
+        let clean = GitStats {
+            files: 0,
+            added: 0,
+            deleted: 0,
+        };
+        assert!(clean.is_clean());
+        assert!(
+            !GitStats {
+                files: 1,
+                added: 0,
+                deleted: 0
+            }
+            .is_clean()
+        );
     }
 
     /// The power cap rides with the local origin, not the bar's tail: it caps
