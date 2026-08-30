@@ -244,13 +244,20 @@ fn resolve_marketplace(
     let dir = staged.join(source.trim_start_matches("./"));
     // String prefix on the *cleaned* paths, not on the raw join: `..` in the
     // manifest is the case this exists to catch, and it only shows up after
-    // the path is resolved.
-    let (canon_dir, canon_staged) = (
-        dir.canonicalize().unwrap_or_else(|_| dir.clone()),
-        staged
-            .canonicalize()
-            .unwrap_or_else(|_| staged.to_path_buf()),
-    );
+    // the path is resolved. A `source` that fails to canonicalize is refused
+    // outright rather than falling back to the unresolved join: the fallback
+    // still starts with `staged`'s own path text, so it would pass the
+    // `starts_with` check below no matter how many `../` components `source`
+    // held. A `source` that does not resolve to a real directory is not a
+    // plugin we can install either way, so refusing it loses nothing.
+    let canon_staged = staged
+        .canonicalize()
+        .unwrap_or_else(|_| staged.to_path_buf());
+    let Ok(canon_dir) = dir.canonicalize() else {
+        return Err(format!(
+            "marketplace entry '{want}' points outside the repository, at {source}"
+        ));
+    };
     if !canon_dir.starts_with(&canon_staged) {
         return Err(format!(
             "marketplace entry '{want}' points outside the repository, at {source}"
@@ -507,6 +514,59 @@ mod tests {
             &staged,
             ".claude-plugin/marketplace.json",
             r#"{"plugins":[{"name":"evil","source":"../../etc"}]}"#,
+        );
+        let err = resolve_in_tree(&staged, Some("evil")).expect_err("rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    /// A fresh empty directory under the crate's own `target/` directory,
+    /// rather than the system temp dir.
+    ///
+    /// `std::env::temp_dir()` resolves through `/tmp` -> `/private/tmp` (and
+    /// similarly for `/var`) on macOS, so a path built under it canonicalizes
+    /// to a different string than the one the join produced even when nothing
+    /// escaped the tree — which would mask the exact "candidate does not
+    /// canonicalize" bypass this module's regression test exists to pin.
+    /// `target/` sits inside the repository checkout, which has no such
+    /// symlink hop.
+    fn tmpdir_in_repo(tag: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("tmp")
+            .join(format!(
+                "plank-claudeplugin-{tag}-{}-{seq}",
+                std::process::id()
+            ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
+
+    #[test]
+    fn a_marketplace_source_escaping_to_a_nonexistent_path_is_rejected() {
+        // Pins the branch that a bare `canonicalize().unwrap_or_else(|_| ..)`
+        // fallback missed: unlike `../../etc` (which exists), this target does
+        // not, so the old code fell back to the unresolved join, which still
+        // starts with `staged`'s own path text and slipped past `starts_with`.
+        let staged = tmpdir_in_repo("resolve-escape-missing");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"evil","source":"../../etc/nope-nonexistent"}]}"#,
+        );
+        let err = resolve_in_tree(&staged, Some("evil")).expect_err("rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn an_absolute_marketplace_source_may_not_escape_the_tree() {
+        let staged = tmpdir_in_repo("resolve-escape-absolute");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"evil","source":"/etc"}]}"#,
         );
         let err = resolve_in_tree(&staged, Some("evil")).expect_err("rejected");
         assert!(err.contains("outside"), "{err}");
