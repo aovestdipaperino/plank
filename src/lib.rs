@@ -96,7 +96,7 @@ pub mod tui;
 pub mod ui;
 pub mod uiremote;
 pub mod upgrade;
-pub mod viz;
+pub use plank_stream::viz;
 pub mod warp;
 pub mod wasmcaps;
 pub mod wasmevents;

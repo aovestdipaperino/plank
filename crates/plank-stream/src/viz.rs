@@ -18,6 +18,14 @@ use crate::dsml::{
     DsmlParser, DsmlState, MARKER_NAMES, ToolCall, tag_prefix_len, tag_prefix_partial,
 };
 
+/// Told to the model when it emitted a tool call inside `<think>`.
+///
+/// Lives here rather than in plank's system prompt module because the stream
+/// renderer is what detects the violation. `plank::sysprompt` re-exports it,
+/// and `tests/c_parity.rs` locks its text against `refs/ds4`.
+pub const IN_THINK_PROHIBITION: &str =
+    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
+
 /// The canonical DSML tool-call opening marker.
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 /// Canonical invoke opener, seeded when the model skips the outer wrapper.
@@ -88,7 +96,7 @@ fn log_tool_error(reason: &str, raw: &[u8]) {
 /// [`visible_text`](Self::visible_text).
 ///
 /// This trait is also the animation boundary. Motion is Ratatui-only: the
-/// Ratatui sink drives the [`crate::anim`] effects (throbber, shimmer, pulse,
+/// Ratatui sink drives `plank`'s animation module effects (throbber, shimmer, pulse,
 /// flash, stall-fade) off the shared 20 Hz clock, while the plain-stdout and
 /// `--non-interactive` sinks render the static/reduced-motion form. The stream
 /// renderer feeds bytes through here without knowing which sink animates, so the
@@ -554,7 +562,7 @@ pub struct Finished<'a> {
 /// # Examples
 ///
 /// ```no_run
-/// use plank::viz::{RenderSink, StreamRenderer};
+/// use plank_stream::viz::{RenderSink, StreamRenderer};
 ///
 /// struct Stdout;
 /// impl RenderSink for Stdout {
@@ -808,7 +816,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             .stream_error
             .as_deref()
             .filter(|_| !in_think)
-            .or_else(|| in_think.then_some(crate::sysprompt::IN_THINK_PROHIBITION))
+            .or_else(|| in_think.then_some(IN_THINK_PROHIBITION))
             .or_else(|| (self.parser.state() == DsmlState::Error).then(|| self.parser.error()))
             .or_else(|| {
                 matches!(
@@ -1941,7 +1949,7 @@ mod tests {
         ));
         sr.finish();
         let fin = sr.finished();
-        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert_eq!(fin.error, Some(IN_THINK_PROHIBITION));
         assert!(fin.in_think_rejected);
     }
 
@@ -2419,7 +2427,7 @@ mod tests {
         let fin = sr.finished();
         assert!(fin.calls.is_empty(), "{:?}", fin.calls);
         assert!(fin.in_think_rejected, "rejected for placement");
-        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert_eq!(fin.error, Some(IN_THINK_PROHIBITION));
         assert!(fin.ended_in_think);
     }
 
@@ -2508,7 +2516,7 @@ mod tests {
         let fin = sr.finished();
         assert!(fin.calls.is_empty(), "{:?}", fin.calls);
         assert!(fin.in_think_rejected);
-        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert_eq!(fin.error, Some(IN_THINK_PROHIBITION));
         assert!(
             !sr.sink().visible.contains("🛠️"),
             "no banner for a call that never happened: {:?}",
@@ -2570,7 +2578,7 @@ mod tests {
         let fin = sr.finished();
         assert!(fin.calls.is_empty(), "the call must not be dispatched");
         assert!(fin.in_think_rejected);
-        assert_eq!(fin.error, Some(crate::sysprompt::IN_THINK_PROHIBITION));
+        assert_eq!(fin.error, Some(IN_THINK_PROHIBITION));
     }
 
     /// With `engine.thinkingToolCalls` on, an in-think call is dispatched and

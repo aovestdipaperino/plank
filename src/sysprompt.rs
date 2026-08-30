@@ -16,8 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Removed from the built prompt when `engine.thinkingToolCalls` is on, so the
 /// prompt matches the behavior. The C constants themselves are never edited —
 /// `tests/c_parity.rs` locks them against `refs/ds4`.
-pub const IN_THINK_PROHIBITION: &str =
-    "Tool calls are not allowed inside <think></think>; finish thinking before emitting DSML.";
+pub use plank_stream::viz::IN_THINK_PROHIBITION;
 
 /// Introductory section of the tools prompt (verbatim from C).
 const TOOLS_PROMPT_INTRO: &str = "You are a coding agent running in a local workspace. Use tools for local file and system work. \

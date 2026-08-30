@@ -40,7 +40,7 @@ const DSML_BAR: &[u8] = "｜".as_bytes();
 /// prints raw, and the turn ends with no tool error for the model to retry
 /// from. The prompt tells the model SSML is unsupported so this stays a
 /// recovery path rather than a second syntax.
-pub const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
+pub(crate) const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
 
 /// Matches an opening or closing tag prefix for `name` under any accepted
 /// marker, returning the matched length.
@@ -49,8 +49,7 @@ pub const MARKER_NAMES: [&str; 2] = ["DSML", "SSML"];
 /// typo are accepted, mirroring the tolerance `dsml_start_match` has always
 /// had on the stanza opener. The two forms differ in length, so the matched
 /// length is taken from the form that actually matched.
-#[must_use]
-pub fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
+pub(crate) fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
     MARKER_NAMES.iter().find_map(|marker| {
         tag_prefix_forms(marker, closing, name)
             .into_iter()
@@ -60,8 +59,7 @@ pub fn tag_prefix_len(s: &[u8], closing: bool, name: &str) -> Option<usize> {
 
 /// True when `s` is a (possibly incomplete) prefix of a tag opener for `name`
 /// under any accepted marker, in either the canonical or dropped-bar form.
-#[must_use]
-pub fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
+pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
     MARKER_NAMES.iter().any(|marker| {
         tag_prefix_forms(marker, closing, name)
             .iter()
@@ -575,8 +573,7 @@ impl DsmlParser {
 /// the model nothing, and the recorded repro shows it guessing at the marker
 /// spelling for three turns and then emitting DSML inside `<think>`. Naming the
 /// rewrite gives it something to act on.
-#[must_use]
-pub fn element_name(tag: &str) -> Option<String> {
+pub(crate) fn element_name(tag: &str) -> Option<String> {
     let len = tag_prefix_len(tag.as_bytes(), false, "")?;
     let name: String = tag[len..]
         .chars()
