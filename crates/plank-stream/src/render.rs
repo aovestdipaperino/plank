@@ -1497,6 +1497,14 @@ impl<W: Write> TokenRenderer<W> {
         let _ = self.sink.flush();
     }
 
+    /// Consumes the renderer and returns the sink it was writing into.
+    ///
+    /// The Turbo Vision front end renders into a `Vec<u8>` and harvests the
+    /// ANSI, rather than writing it to a terminal.
+    pub fn into_sink(self) -> W {
+        self.sink
+    }
+
     /// Emits a raw color escape, tracking whether a manual color is open.
     pub fn color(&mut self, seq: &str) {
         self.markdown_emit_pending_literals();

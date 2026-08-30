@@ -16,4 +16,7 @@
 
 pub mod dsml;
 pub mod render;
+pub mod sink;
 pub mod viz;
+
+pub use sink::TerminalSink;

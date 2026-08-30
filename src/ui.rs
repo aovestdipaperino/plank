@@ -30,6 +30,7 @@ use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
 use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
+use plank_stream::TerminalSink;
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
@@ -395,35 +396,6 @@ impl Write for FlushingStdout {
     }
     fn flush(&mut self) -> std::io::Result<()> {
         std::io::stdout().flush()
-    }
-}
-
-/// Routes viz output into the markdown token renderer.
-struct TerminalSink<W: Write> {
-    renderer: TokenRenderer<W>,
-}
-
-impl<W: Write> RenderSink for TerminalSink<W> {
-    fn visible_text(&mut self, text: &str) {
-        self.renderer.set_in_think(false);
-        self.renderer.write(text);
-    }
-    fn think_text(&mut self, text: &str) {
-        self.renderer.set_in_think(true);
-        self.renderer.write(text);
-    }
-    fn tool_text(&mut self, text: &str) {
-        // Tool banners carry their own styling and must render verbatim; going
-        // through `write` would markdown-process them and eat `*`/`_`/backtick
-        // out of param values (e.g. `pattern=**/mod.rs`).
-        self.renderer.set_in_think(false);
-        self.renderer.plain(text);
-    }
-    fn error_text(&mut self, text: &str) {
-        self.renderer.set_in_think(false);
-        self.renderer.color("\x1b[1;31m");
-        self.renderer.plain(text);
-        self.renderer.color(ANSI_RESET);
     }
 }
 
@@ -1691,16 +1663,14 @@ impl Agent<'_> {
         ),
         String,
     > {
-        let sink = TerminalSink {
-            renderer: TokenRenderer::new(
-                FlushingStdout,
-                RenderOptions {
-                    use_color: self.color,
-                    format_thinking: true,
-                    format_markdown: true,
-                },
-            ),
-        };
+        let sink = TerminalSink::new(TokenRenderer::new(
+            FlushingStdout,
+            RenderOptions {
+                use_color: self.color,
+                format_thinking: true,
+                format_markdown: true,
+            },
+        ));
         // See the matching guard in `worker_generate_kind`: the plain REPL has
         // no blinking brain to drive, but the flag is process-global and a
         // remote client attached to this session renders off it.
@@ -2208,16 +2178,14 @@ impl Agent<'_> {
         match &self.sub_sink {
             SubSinkTarget::Null => Box::new(NullSink),
             SubSinkTarget::Events(tx) => Box::new(crate::worker::SubAgentSink(tx.clone())),
-            SubSinkTarget::Stdout => Box::new(TerminalSink {
-                renderer: TokenRenderer::new(
-                    FlushingStdout,
-                    RenderOptions {
-                        use_color: self.color,
-                        format_thinking: true,
-                        format_markdown: true,
-                    },
-                ),
-            }),
+            SubSinkTarget::Stdout => Box::new(TerminalSink::new(TokenRenderer::new(
+                FlushingStdout,
+                RenderOptions {
+                    use_color: self.color,
+                    format_thinking: true,
+                    format_markdown: true,
+                },
+            ))),
         }
     }
 }
@@ -2421,7 +2389,7 @@ impl Agent<'_> {
             };
             if real_interrupt {
                 crate::interrupt::clear();
-                let mut renderer = stream.into_sink().renderer;
+                let mut renderer = stream.into_sink().into_renderer();
                 renderer.finish();
                 if !renderer.last_output_newline() {
                     println!();
@@ -2452,7 +2420,7 @@ impl Agent<'_> {
                 let calls = finished.calls.to_vec();
                 let observations = self.run_tool_calls(&calls);
                 self.sync_tasks_after_dispatch();
-                let mut renderer = stream.into_sink().renderer;
+                let mut renderer = stream.into_sink().into_renderer();
                 renderer.finish();
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
@@ -2483,7 +2451,7 @@ impl Agent<'_> {
                 }
                 continue;
             }
-            let mut renderer = stream.into_sink().renderer;
+            let mut renderer = stream.into_sink().into_renderer();
             renderer.finish();
             if !renderer.last_output_newline() {
                 println!();
@@ -6150,7 +6118,7 @@ the original is frozen and listed in /tree"
         let saved_ctx = self.last_ctx_used;
         let (stream, _text, _stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let tried_tool = !stream.finished().calls.is_empty() || stream.finished().error.is_some();
-        let mut renderer = stream.into_sink().renderer;
+        let mut renderer = stream.into_sink().into_renderer();
         renderer.finish();
         if !renderer.last_output_newline() {
             println!();
@@ -12667,16 +12635,14 @@ mod tests {
     #[test]
     fn tool_banner_param_value_renders_metachars_verbatim() {
         let buf = Rc::new(RefCell::new(Vec::new()));
-        let sink = TerminalSink {
-            renderer: TokenRenderer::new(
-                SharedBuf(buf.clone()),
-                RenderOptions {
-                    use_color: false,
-                    format_thinking: true,
-                    format_markdown: true,
-                },
-            ),
-        };
+        let sink = TerminalSink::new(TokenRenderer::new(
+            SharedBuf(buf.clone()),
+            RenderOptions {
+                use_color: false,
+                format_thinking: true,
+                format_markdown: true,
+            },
+        ));
         let mut stream = StreamRenderer::new(sink);
         let stanza = concat!(
             "<｜DSML｜tool_calls>",
