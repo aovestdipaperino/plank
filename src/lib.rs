@@ -66,7 +66,7 @@ pub mod openfile;
 pub mod plugins;
 pub mod provenance;
 pub mod remote;
-pub mod render;
+pub use plank_stream::render;
 pub mod repro;
 pub mod resumepane;
 pub mod sandbox;

@@ -15,4 +15,5 @@
 //!   and syntax-highlighting renderer (the ds4 C parity path).
 
 pub mod dsml;
+pub mod render;
 pub mod viz;
