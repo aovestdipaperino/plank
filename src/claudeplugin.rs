@@ -377,9 +377,18 @@ fn staging_dir(home: &Path) -> Result<PathBuf, String> {
 fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
     // A local directory is checked before the URL forms: `git clone` takes a
     // path as happily as a URL, and it is how a plugin is tried before it is
-    // published.
+    // published. Not every directory is a repository, though — a plain tree
+    // assembled by hand or by a test has no `.git` and no bare-repo layout —
+    // so a clone failure falls back to a plain copy rather than refusing.
     if Path::new(arg).is_dir() {
-        return clone(arg, staging);
+        if let Ok(dest) = clone(arg, staging) {
+            return Ok(dest);
+        }
+        let dest = staging.join("tree");
+        crate::plugins::copy_tree(Path::new(arg), &dest)
+            .map_err(|e| format!("cannot copy {arg}: {e}"))?;
+        crate::plugins::reject_symlinks(&dest)?;
+        return Ok(dest);
     }
     match parse_source(arg)? {
         Source::Git { url } => clone(&url, staging),
@@ -440,6 +449,89 @@ fn plugin_name(root: &Path) -> Result<String, String> {
         return Err(format!("'{name}' is not a usable plugin name"));
     }
     Ok(name)
+}
+
+/// The whole `/install-claude-plugin` command: parses its argument line, runs
+/// the install, and renders the outcome — success or refusal — as the text
+/// both front ends print.
+///
+/// Rendering lives here rather than in `ui.rs` because the two front ends must
+/// say the same thing, and the plain and TUI paths in `ui.rs` are already two
+/// places a message can drift between.
+///
+/// `home` is `None` when there is no home directory, which is the one case
+/// where there is nowhere to install to at all.
+#[must_use]
+pub fn render_install(arg: &str, home: Option<&Path>) -> String {
+    const USAGE: &str = "usage: /install-claude-plugin <url|owner/repo> [plugin-name] [--force]\n\
+                         a url may be a git repository, a marketplace repository, or a .tar.gz\n";
+    let mut force = false;
+    let mut words: Vec<&str> = Vec::new();
+    for word in arg.split_whitespace() {
+        if word == "--force" {
+            force = true;
+        } else {
+            words.push(word);
+        }
+    }
+    let Some(target) = words.first() else {
+        return USAGE.to_string();
+    };
+    let Some(home) = home else {
+        return "no HOME, so there is nowhere to install a plugin\n".to_string();
+    };
+    match install(target, words.get(1).copied(), home, force) {
+        Ok(out) => render_installed(&out),
+        Err(e) => format!("{e}\n"),
+    }
+}
+
+/// The success half of [`render_install`], kept separate so the happy path
+/// reads as one list of what the user just granted.
+fn render_installed(out: &Installed) -> String {
+    use std::fmt::Write as _;
+    let mut s = format!("installed '{}' to {}\n", out.name, out.dest.display());
+    let parts = contributions(&out.dest);
+    if parts.is_empty() {
+        s.push_str("it contributes nothing plank recognizes\n");
+    } else {
+        let _ = writeln!(s, "it contributes: {}", parts.join(", "));
+    }
+    if !out.skipped_hook_events.is_empty() {
+        let _ = writeln!(
+            s,
+            "warning: it hooks {}, which plank does not implement; those hooks never fire",
+            out.skipped_hook_events.join(", ")
+        );
+    }
+    if out.rewrote_plugin_root {
+        s.push_str(
+            "CLAUDE_PLUGIN_ROOT was resolved to that path in its hooks and MCP config, so \
+             moving the directory breaks them\n",
+        );
+    }
+    s.push_str("it is loaded on the next start\n");
+    s
+}
+
+/// Human-readable labels for what an installed tree actually carries.
+///
+/// Read from the destination rather than from the manifest: a manifest can
+/// claim anything, and what matters to the user is which files are now on
+/// their disk.
+fn contributions(dest: &Path) -> Vec<&'static str> {
+    [
+        ("skills", "skills"),
+        ("commands", "commands"),
+        ("agents", "agents"),
+        ("hooks/hooks.json", "hooks"),
+        (".mcp.json", "MCP servers"),
+        ("settings.json", "settings"),
+    ]
+    .into_iter()
+    .filter(|(rel, _)| dest.join(rel).exists())
+    .map(|(_, label)| label)
+    .collect()
 }
 
 #[cfg(test)]
@@ -988,5 +1080,66 @@ mod tests {
             err.to_lowercase().contains("https") || err.to_lowercase().contains("tls"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn render_reports_what_was_installed() {
+        let staged = staged_plugin("render-ok", "demo");
+        write(&staged, "commands/note.md", "hi\n");
+        write(&staged, "skills/s/SKILL.md", "s\n");
+        let home = tmpdir("render-ok-home");
+        let out = render_install(staged.to_str().expect("utf8"), Some(&home));
+        assert!(out.contains("installed 'demo'"), "{out}");
+        assert!(out.contains("next start"), "{out}");
+        assert!(out.contains("commands"), "{out}");
+        assert!(out.contains("skills"), "{out}");
+    }
+
+    #[test]
+    fn render_reports_a_refusal_without_panicking() {
+        let staged = tmpdir("render-bad");
+        write(&staged, "README.md", "x\n");
+        let home = tmpdir("render-bad-home");
+        let out = render_install(staged.to_str().expect("utf8"), Some(&home));
+        assert!(out.contains(".claude-plugin"), "{out}");
+    }
+
+    #[test]
+    fn render_with_no_argument_prints_usage() {
+        let home = tmpdir("render-usage-home");
+        let out = render_install("", Some(&home));
+        assert!(out.contains("usage: /install-claude-plugin"), "{out}");
+    }
+
+    #[test]
+    fn render_parses_a_name_and_force_in_any_order() {
+        let staged = staged_plugin("render-force", "demo");
+        write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
+        let home = tmpdir("render-force-home");
+        let line = format!("--force {}", staged.to_str().expect("utf8"));
+        let out = render_install(&line, Some(&home));
+        assert!(out.contains("installed 'demo'"), "{out}");
+        assert!(out.contains("SubagentStop"), "{out}");
+        assert!(out.contains("never fire"), "{out}");
+    }
+
+    #[test]
+    fn render_says_when_the_plugin_root_was_rewritten() {
+        let staged = staged_plugin("render-rewrite", "demo");
+        write(
+            &staged,
+            ".mcp.json",
+            r#"{"mcpServers":{"s":{"command":"${CLAUDE_PLUGIN_ROOT}/s"}}}"#,
+        );
+        let home = tmpdir("render-rewrite-home");
+        let out = render_install(staged.to_str().expect("utf8"), Some(&home));
+        assert!(out.contains("CLAUDE_PLUGIN_ROOT"), "{out}");
+        assert!(out.contains("moving"), "{out}");
+    }
+
+    #[test]
+    fn render_without_a_home_says_so() {
+        let out = render_install("owner/repo", None);
+        assert!(out.contains("HOME"), "{out}");
     }
 }

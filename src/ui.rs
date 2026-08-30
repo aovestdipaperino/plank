@@ -4008,6 +4008,7 @@ impl Agent<'_> {
                 self.frame_command("")
             ),
             "/plugins" => print!("{}", self.plugins_command(arg)),
+            "/install-claude-plugin" => print!("{}", self.install_claude_plugin_command(arg)),
             "/templates" => print!("{}", crate::templates::render_list(&self.templates)),
             "/tasks" => print!(
                 "{}",
@@ -6260,6 +6261,19 @@ the original is frozen and listed in /tree"
             ),
             Err(e) => format!("{e}\n"),
         }
+    }
+
+    /// `/install-claude-plugin`, shared by both front ends. A thin wrapper: the
+    /// work and the wording both live in `claudeplugin`, so the two paths
+    /// cannot drift.
+    ///
+    /// Takes `&self` rather than being a free function to match the calling
+    /// convention of every other slash-command method on `Agent` (see
+    /// `plugins_command` just below), even though it only reads `HOME`.
+    #[allow(clippy::unused_self)]
+    fn install_claude_plugin_command(&self, arg: &str) -> String {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+        crate::claudeplugin::render_install(arg, home.as_deref())
     }
 
     fn plugins_command(&mut self, arg: &str) -> String {
@@ -10276,6 +10290,11 @@ impl Agent<'_> {
             }
             "/plugins" => {
                 for line in self.plugins_command(arg).lines() {
+                    log.push_plain(line.to_owned());
+                }
+            }
+            "/install-claude-plugin" => {
+                for line in self.install_claude_plugin_command(arg).lines() {
                     log.push_plain(line.to_owned());
                 }
             }

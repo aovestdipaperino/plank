@@ -770,6 +770,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "list, install, remove, inspect, disable, approve, or trust a key",
     },
     SlashCommand {
+        name: "/install-claude-plugin",
+        args: "<url|owner/repo> [plugin-name] [--force]",
+        desc: "install a Claude Code plugin from a repository or a tarball",
+    },
+    SlashCommand {
         name: "/frame",
         args: "[id]",
         desc: "open a wasm frame component, or list the openable ones",
@@ -917,6 +922,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/init"
             | "/skills"
             | "/plugins"
+            | "/install-claude-plugin"
             | "/frame"
             | "/templates"
             | "/tasks"
@@ -2076,6 +2082,7 @@ mod tests {
     #[test]
     fn plugins_is_a_known_slash_command() {
         assert!(slash_command_known("/plugins"));
+        assert!(slash_command_known("/install-claude-plugin"));
     }
 
     #[test]
