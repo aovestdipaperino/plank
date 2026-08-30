@@ -15,6 +15,3 @@
 [submodule "refs/edit"]
 	path = refs/edit
 	url = https://github.com/microsoft/edit
-[submodule "refs/turbo-vision"]
-	path = refs/turbo-vision
-	url = https://github.com/aovestdipaperino/turbo-vision-4-rust

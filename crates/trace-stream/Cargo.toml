@@ -1,0 +1,17 @@
+[package]
+name = "trace-stream"
+version = "0.1.0"
+description = "Streaming renderer for model token streams: tool-call parsing, thinking-text split, and markdown/syntax highlighting to ANSI"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords = ["llm", "streaming", "markdown", "ansi", "terminal"]
+categories = ["command-line-interface", "text-processing"]
+readme = "README.md"
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["refs/edit", "refs/obscura", "refs/ds4", "refs/turbo-vision"]
+exclude = ["refs/edit", "refs/obscura", "refs/ds4"]
 
 [workspace.package]
 edition = "2024"
@@ -74,7 +74,7 @@ docparse = ["dep:liteparse", "dep:tokio"]
 plugins = ["dep:extism"]
 
 [dependencies]
-plank-stream = { path = "crates/plank-stream" }
+trace-stream = { path = "crates/trace-stream" }
 libc = "0.2"
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap

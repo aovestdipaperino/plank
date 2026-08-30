@@ -38,7 +38,7 @@ use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
 use crate::worker::{self, BroadcastBus, ChannelSink, TurnShared, UiEvent};
-use plank_stream::TerminalSink;
+use trace_stream::TerminalSink;
 
 /// UI-thread state for `--ui-remote` remote control.
 ///

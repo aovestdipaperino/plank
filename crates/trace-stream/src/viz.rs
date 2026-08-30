@@ -562,7 +562,7 @@ pub struct Finished<'a> {
 /// # Examples
 ///
 /// ```no_run
-/// use plank_stream::viz::{RenderSink, StreamRenderer};
+/// use trace_stream::viz::{RenderSink, StreamRenderer};
 ///
 /// struct Stdout;
 /// impl RenderSink for Stdout {
