@@ -29,8 +29,8 @@
 
 use std::io::Write as _;
 use std::net::TcpStream;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Mutex, OnceLock};
 
 use turbo_debug_client::StreamKind;
 
@@ -41,23 +41,78 @@ static MIRROR: Mutex<Option<TcpStream>> = Mutex::new(None);
 // production code.
 static CONTROL_PORT: AtomicU16 = AtomicU16::new(turbo_debug_client::CONTROL_PORT);
 
-/// A name that identifies this plank instance in the console's window list.
+/// The session name to hand the console at the next connection, kept as
+/// `Option` so "no session minted yet" is distinguishable from "named the
+/// empty string" — the former falls back to [`FALLBACK_NAME`], deliberately,
+/// rather than refusing to connect.
+static CURRENT_SESSION_NAME: Mutex<Option<String>> = Mutex::new(None);
+
+/// Used to name the console window before any session id exists —
+/// `reconcile()` can run this early (see module docs: `settings::install` at
+/// startup, and the defensive per-turn call before the first turn's session
+/// rename lands). A window under this name is retired the moment a real
+/// session name is known, since [`set_session_id`] reconnects on change.
+const FALLBACK_NAME: &str = "plank-unnamed";
+
+/// Records plank's current session name (the `adjective-celebrity` slug from
+/// `SessionStore::mint_id`, or a rename) as the name to present at the next
+/// handshake, and — if it actually changed since the last call — tears down
+/// any live connection and reconciles immediately.
 ///
-/// Chosen as `<project-dir-name>-<pid>`: readable (shows which project the
-/// session belongs to) and unique per process, so two plank instances in
-/// different worktrees — or two runs in the same one — get distinct windows
-/// rather than fighting over one. The console reuses a window per name across
-/// reconnects, which is exactly what we want across a `/config` toggle that
-/// disconnects and reconnects the mirror within a single plank run.
-fn session_name() -> &'static str {
-    static NAME: OnceLock<String> = OnceLock::new();
-    NAME.get_or_init(|| {
-        let dir = std::env::current_dir()
-            .ok()
-            .and_then(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "plank".to_string());
-        format!("{dir}-{}", std::process::id())
-    })
+/// This is the "changing sessions" half of naming the console window: without
+/// it, starting a new session would keep mirroring into a window titled after
+/// the session that just ended, since the console reuses a window by name and
+/// a stale connection never re-sends `HELLO`. Called wherever `ui.rs` learns
+/// the session's id (session start, `/new`, `/rename`, `/resume`), it is cheap
+/// when the name is unchanged: a mutex lock and a string comparison.
+pub fn set_session_id(id: &str) {
+    let name = sanitize_name(id);
+    let mut cur = CURRENT_SESSION_NAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cur.as_deref() == Some(name.as_str()) {
+        return; // Same session as last time; no reconnect needed.
+    }
+    *cur = Some(name);
+    drop(cur);
+    // Drop any live connection under the old name so `reconcile` below dials a
+    // fresh one under the new name rather than treating "already connected" as
+    // done.
+    *MIRROR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    reconcile();
+}
+
+/// Constrains a candidate window name to what the console's handshake
+/// accepts: 1-64 bytes of printable ASCII, no whitespace. Session slugs
+/// (`adjective-celebrity`) already satisfy this, but a renamed session takes
+/// arbitrary user text (`crate::session::validate_name` only forbids path
+/// separators and a few reserved characters), so this does not trust that
+/// blindly — a name that would not survive the handshake falls back rather
+/// than silently losing the mirror.
+fn sanitize_name(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(char::is_ascii_graphic)
+        .take(64)
+        .collect();
+    if cleaned.is_empty() {
+        FALLBACK_NAME.to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// The name to present at the next handshake: the current session's name if
+/// one has been recorded via [`set_session_id`], else [`FALLBACK_NAME`] —
+/// covers `reconcile()` running before any session exists (see module docs).
+fn session_name() -> String {
+    CURRENT_SESSION_NAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .unwrap_or_else(|| FALLBACK_NAME.to_string())
 }
 
 /// Reconciles the mirror connection with the current `ui.showThinking`
@@ -91,9 +146,28 @@ pub fn reconcile() {
     // the overwhelmingly common case (no console running) and must be
     // silent: this is optional dev tooling, not a required dependency.
     let port = CONTROL_PORT.load(Ordering::Relaxed);
-    if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, session_name()) {
+    if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &session_name()) {
         *slot = Some(stream);
     }
+}
+
+/// Mirrors a synthetic opening `<think>` tag so the console's own
+/// `StreamRenderer` enters the thinking state before any bytes arrive.
+///
+/// This is not the mirror going verbatim: with a local model, the chat
+/// template pre-opens `<think>` in the prefill prefix without emitting the
+/// tag, so the raw stream has no marker to key off. plank compensates for its
+/// own rendering by calling `StreamRenderer::begin_in_think` directly (see the
+/// call site in `ui.rs`, guarded on thinking being enabled and the engine
+/// being local); the console gets no such direct call; it only ever sees
+/// bytes. So this injects the one tag the console needs to reach the same
+/// state, under the identical guard — call it only where plank's own renderer
+/// gets `begin_in_think()`, never unconditionally, or a provider engine's
+/// stream (which does emit real `<think>`/`</think>` tags) would be
+/// mis-colored from the first token. The model always emits the closing
+/// `</think>` itself, so the mirrored stream stays balanced.
+pub fn begin_in_think() {
+    push("<think>");
 }
 
 /// Mirrors one chunk of raw model bytes, exactly as fed to the local
@@ -141,7 +215,41 @@ mod tests {
 
     fn reset() {
         *MIRROR.lock().unwrap() = None;
+        *CURRENT_SESSION_NAME.lock().unwrap() = None;
         CONTROL_PORT.store(0, Ordering::Relaxed); // nothing listens on 0
+    }
+
+    /// Spins up a stand-in for `turbo-debug-console`'s control port that
+    /// accepts exactly one handshake, hands back the `HELLO` line it
+    /// received, and returns a connected data-port socket to the caller. Used
+    /// by every test that needs to inspect what name a connection presents.
+    fn fake_console() -> (u16, std::sync::mpsc::Receiver<String>) {
+        let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let data = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let data_port = data.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            loop {
+                let Ok((mut sock, _)) = control.accept() else {
+                    return;
+                };
+                let mut line = String::new();
+                if BufReader::new(sock.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = writeln!(sock, "PORT {data_port}");
+                let _ = data.accept();
+                if tx.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        (control_port, rx)
     }
 
     #[test]
@@ -231,6 +339,167 @@ mod tests {
             MIRROR.lock().unwrap().is_none(),
             "showThinking back on: mirror must be torn down"
         );
+
+        reset();
+    }
+
+    /// The handshake must carry plank's session name, not a pid-based
+    /// identity: that's the whole point of issue #1 — the window the user
+    /// sees has to match the name shown above their prompt.
+    #[test]
+    fn handshake_carries_the_session_name_not_a_pid() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        set_session_id("spunky-oppenheimer");
+        let line = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            line.contains("spunky-oppenheimer"),
+            "handshake should carry the session name: {line}"
+        );
+        assert!(
+            !line.contains(&std::process::id().to_string()),
+            "handshake should not fall back to a pid-based name: {line}"
+        );
+
+        reset();
+    }
+
+    /// Before any session id is known (`reconcile()` running from
+    /// `settings::install` at startup), the mirror must still connect rather
+    /// than refuse — under a sensible fallback name.
+    #[test]
+    fn reconcile_before_any_session_falls_back_to_a_sensible_name() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        reconcile();
+        let line = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            line.contains(FALLBACK_NAME),
+            "no session yet: should fall back to {FALLBACK_NAME}: {line}"
+        );
+
+        reset();
+    }
+
+    /// Minting a new session (or a rename) must reconnect the mirror so the
+    /// console's window follows the session the user is actually looking at,
+    /// instead of keeping the old name forever.
+    #[test]
+    fn a_session_name_change_reconnects_under_the_new_name() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        set_session_id("parser-hunt");
+        let first = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(first.contains("parser-hunt"), "{first}");
+
+        // Same name again: no reason to tear down and redial.
+        set_session_id("parser-hunt");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "an unchanged session name must not reconnect"
+        );
+
+        set_session_id("spunky-oppenheimer");
+        let second = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            second.contains("spunky-oppenheimer"),
+            "new session should reconnect under its own name: {second}"
+        );
+
+        reset();
+    }
+
+    /// The console rejects anything outside 1-64 printable-ASCII bytes with
+    /// no whitespace; a session name that would not survive the handshake
+    /// (e.g. a `/rename` with spaces) must fall back rather than silently
+    /// losing the mirror.
+    #[test]
+    fn an_unsafe_name_falls_back_instead_of_refusing_to_connect() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        // Sanitizing strips whitespace rather than refusing outright — a name
+        // that is nothing *but* whitespace is the case that must fall back.
+        set_session_id("   \t\t  ");
+        let line = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            line.contains(FALLBACK_NAME),
+            "all-whitespace name should fall back: {line}"
+        );
+
+        reset();
+    }
+
+    /// [`begin_in_think`] is a named wrapper over pushing the literal tag —
+    /// exercised directly since the guard itself lives in `ui.rs`, not here.
+    #[test]
+    fn begin_in_think_mirrors_a_synthetic_open_tag() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+
+        let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let data = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let data_port = data.local_addr().unwrap().port();
+        let accepted = std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            let (mut sock, _) = control.accept().unwrap();
+            let mut line = String::new();
+            BufReader::new(sock.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            writeln!(sock, "PORT {data_port}").unwrap();
+            data.accept().unwrap().0
+        });
+
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+        reconcile();
+        assert!(MIRROR.lock().unwrap().is_some());
+
+        begin_in_think();
+        flush();
+
+        let mut server_side = accepted.join().unwrap();
+        let mut buf = [0u8; 16];
+        let n = server_side.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"<think>");
 
         reset();
     }

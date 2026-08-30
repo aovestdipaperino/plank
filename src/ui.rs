@@ -1694,6 +1694,10 @@ impl Agent<'_> {
         // here would mis-color any output not preceded by a reasoning delta.
         if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
             stream.begin_in_think();
+            // The mirror gets no direct call into its own renderer, only raw
+            // bytes — so under the same guard, tell it the same thing we just
+            // told `stream`, and before any model bytes reach it.
+            crate::debugmirror::begin_in_think();
         }
         let mut assistant_text = String::new();
         let ctx_size = self.engine.ctx_size();
@@ -3646,6 +3650,7 @@ impl Agent<'_> {
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
                 self.session.id = self.store.mint_id();
+                crate::debugmirror::set_session_id(&self.session.id);
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 // Same merged roster the launch path advertises, so /clear
@@ -3750,6 +3755,7 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
                         "[session replaced — its history is on the local screen only]",
                     ));
@@ -3786,6 +3792,7 @@ impl Agent<'_> {
                         println!("{}", self.debug_line(&note));
                     }
                     self.session = s;
+                    crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
                         "[session replaced — its history is on the local screen only]",
                     ));
@@ -4278,6 +4285,7 @@ impl Agent<'_> {
         // prefill, which is the behavior this path had unconditionally.
         let note = self.load_session_payload(&session);
         self.session = session;
+        crate::debugmirror::set_session_id(&self.session.id);
         self.last_ctx_used = 0;
         if let Some(note) = note {
             println!("{note}");
@@ -4691,6 +4699,7 @@ the original is frozen and listed in /tree"
     fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
         let note = self.load_session_payload(&s);
         self.session = s;
+        crate::debugmirror::set_session_id(&self.session.id);
         self.broadcast_session_reset(Some(
             "[session replaced — its history is on the local screen only]",
         ));
@@ -5228,6 +5237,7 @@ the original is frozen and listed in /tree"
             return Err("rename cancelled".to_owned());
         }
         name.clone_into(&mut self.session.id);
+        crate::debugmirror::set_session_id(&self.session.id);
         self.session.dirty = true;
         let mut msg = format!("renamed to {name}");
         if self.store.path_for_id(&old).exists() {
@@ -9445,6 +9455,9 @@ impl Agent<'_> {
         // matching note in the plain-REPL path).
         if !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured() {
             stream.begin_in_think();
+            // See the matching comment in `stream_generation`: the mirror
+            // needs the same synthetic tag, under the same guard.
+            crate::debugmirror::begin_in_think();
         }
         // Set when a mid-stream preflight fails: stops the engine early, but
         // is not a user interrupt — the turn loop feeds the error to the model.
@@ -9986,6 +9999,7 @@ impl Agent<'_> {
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
                 self.session.id = self.store.mint_id();
+                crate::debugmirror::set_session_id(&self.session.id);
                 self.broadcast_session_reset(None);
                 self.reminder = SystemPromptReminder::new();
                 // Same merged roster the launch path advertises, so /clear
@@ -11656,6 +11670,7 @@ fn new_agent(
     // the rule above the prompt from the first frame, and the name it shows has
     // to be the one the file ends up under.
     session.id = store.mint_id();
+    crate::debugmirror::set_session_id(&session.id);
     // Loaded before the session context because the model-visible roster rides
     // in it: the roster the model sees has to be the same merged list
     // `set_roster` publishes and `/agent` lists, or a plugin-contributed agent
