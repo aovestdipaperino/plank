@@ -469,7 +469,10 @@ fn current_dir_tag() -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct History {
     entries: VecDeque<HistEntry>,
-    max: usize,
+    /// `Some` pins the cap to an explicit value (what every existing
+    /// constructor does, tests included). `None` means "consult
+    /// `ui.historySize` live" — see [`History::live`] and [`effective_max`].
+    max_override: Option<usize>,
     /// Directory new entries are tagged with, and the one navigation filters
     /// to. Defaults to the process working directory; overridable for tests.
     cwd: Option<String>,
@@ -484,13 +487,43 @@ impl Default for History {
 impl History {
     /// Creates an empty history bounded to `max` entries, tagging new entries
     /// with the process working directory.
+    ///
+    /// The cap is pinned at this value for the life of the `History`. The app
+    /// itself does not use this constructor for that reason — see
+    /// [`History::live`].
     #[must_use]
     pub fn new(max: usize) -> Self {
         Self {
             entries: VecDeque::new(),
-            max: max.max(1),
+            max_override: Some(max.max(1)),
             cwd: current_dir_tag(),
         }
+    }
+
+    /// Creates an empty history whose cap tracks `ui.historySize` live.
+    ///
+    /// A resize of an already-full `VecDeque` mid-session is more invasive
+    /// than it is worth (shrinking would mean deciding which live entries to
+    /// discard, right as the user might be scrolling them); consulting the
+    /// setting on every trim, the same way `complete::refresh_throttle`
+    /// consults `ui.indexRefreshSecs`, gets the live behaviour a user expects
+    /// — a smaller cap starts winning back entries immediately — without that
+    /// complexity.
+    #[must_use]
+    pub fn live() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            max_override: None,
+            cwd: current_dir_tag(),
+        }
+    }
+
+    /// The cap trimming enforces right now: the pinned value, or the live
+    /// `ui.historySize` setting.
+    fn effective_max(&self) -> usize {
+        self.max_override
+            .unwrap_or_else(|| crate::settings::active().ui.history_size)
+            .max(1)
     }
 
     /// Overrides the directory used for tagging and navigation filtering.
@@ -552,7 +585,10 @@ impl History {
         if entry.is_empty() || self.entries.back().is_some_and(|last| last.text == entry) {
             return;
         }
-        if self.entries.len() == self.max {
+        // `>=` rather than `==`: a live cap can drop between two calls (the
+        // user just lowered `ui.historySize`), and this must catch up on the
+        // very next add rather than only once length happens to re-cross it.
+        while self.entries.len() >= self.effective_max() {
             self.entries.pop_front();
         }
         self.entries.push_back(HistEntry {
@@ -1709,6 +1745,36 @@ mod tests {
         assert_eq!(h.len(), 3);
         assert_eq!(h.get(0), Some("b"));
         assert_eq!(h.get(2), Some("d"));
+    }
+
+    /// `History::live` must not capture `ui.historySize` at construction: a
+    /// change to the setting has to be observed on the very next trim, the
+    /// same live behaviour `complete::refresh_throttle` gives
+    /// `ui.indexRefreshSecs`.
+    #[test]
+    fn live_history_tracks_history_size_setting_changes() {
+        let mut s = crate::settings::Settings::default();
+        s.ui.history_size = 2;
+        crate::settings::install_for_test(s);
+
+        let mut h = History::live();
+        h.add("a");
+        h.add("b");
+        h.add("c"); // cap is 2: evicts "a"
+        assert_eq!(h.len(), 2);
+        assert_eq!(h.get(0), Some("b"));
+
+        // Lower the cap live, with no new `History` constructed.
+        let mut s = crate::settings::Settings::default();
+        s.ui.history_size = 1;
+        crate::settings::install_for_test(s);
+        h.add("d");
+        assert_eq!(
+            h.len(),
+            1,
+            "the next add catches up to the new, smaller cap"
+        );
+        assert_eq!(h.get(0), Some("d"));
     }
 
     #[test]

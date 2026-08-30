@@ -6486,7 +6486,7 @@ impl TuiInput {
     fn new() -> Self {
         Self {
             buf: LineBuffer::new(),
-            history: History::new(crate::settings::active().ui.history_size),
+            history: History::live(),
             hist_idx: None,
             hist_bang: false,
             stash: String::new(),
@@ -11893,10 +11893,8 @@ pub fn run_interactive(
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, true, local_engine, plugins)?;
 
-    // Seed the notification enable flag once, before either front-end loop
-    // starts (CLAUDE.md: TUI and plain REPL are parallel paths sharing this
-    // one entry point, so this covers both).
-    crate::notify::set_mode(crate::settings::active().ui.notifications);
+    // The notification mode is seeded (and kept live) by
+    // `settings::install`/`reinstall`, not here — see their doc comments.
 
     // Plain REPL: a headless sub-agent's output has nowhere else to go, so
     // print it inline on stdout alongside the parent turn's own stream. The
@@ -12184,9 +12182,8 @@ pub fn run_non_interactive(
     plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
     let mut agent = new_agent(engine, cfg, false, local_engine, plugins)?;
-    // Seed the notification enable flag once, mirroring `run_interactive`, so
-    // headless/non-interactive runs also honor `ui.notifications`.
-    crate::notify::set_mode(crate::settings::active().ui.notifications);
+    // The notification mode is seeded (and kept live) by
+    // `settings::install`/`reinstall`, not here — see their doc comments.
     agent.warm_plain()?;
     agent.fire_session_start("startup", &mut |w| eprintln!("{w}"));
     if let Some(prompt) = cfg.prompt.as_deref() {

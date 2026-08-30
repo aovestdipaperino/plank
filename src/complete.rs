@@ -277,6 +277,20 @@ pub struct FileIndex {
     /// Submodule roots, each with a trailing `/`; everything beneath one is
     /// demoted so vendored trees cannot bury the project's own files.
     submodules: Vec<String>,
+    /// `ui.respectGitignore` as it stood the last time this index was built,
+    /// so [`FileIndex::needs_refresh`] can notice a live change and force a
+    /// rebuild instead of waiting out the throttle. See [`respect_gitignore`].
+    built_with_gitignore: bool,
+}
+
+/// Whether `@` completion should honour `.gitignore`, read fresh on every use.
+///
+/// Mirrors `refresh_throttle`'s pattern for `ui.indexRefreshSecs`: the index
+/// worker thread has no way to be pushed a settings change, so it re-reads
+/// the live value instead of trusting whatever was captured at spawn time.
+#[must_use]
+fn respect_gitignore() -> bool {
+    crate::settings::active().ui.respect_gitignore
 }
 
 /// Reads submodule paths from `.gitmodules`, each returned with a trailing `/`.
@@ -326,6 +340,7 @@ impl FileIndex {
             last_git_mtime: None,
             is_git,
             submodules: submodule_prefixes(root),
+            built_with_gitignore: respect_gitignore,
         };
         idx.rebuild_candidates();
         idx
@@ -335,6 +350,7 @@ impl FileIndex {
     ///
     /// Honours `.gitignore` when `respect_gitignore` is set.
     pub fn fold_untracked(&mut self, root: &Path, respect_gitignore: bool) {
+        self.built_with_gitignore = respect_gitignore;
         if !self.is_git {
             return;
         }
@@ -393,11 +409,19 @@ impl FileIndex {
         self.signature
     }
 
-    /// True when the index may be rebuilt: the throttle has expired, or
-    /// `.git/index` moved since the last refresh.
+    /// True when the index may be rebuilt: the throttle has expired,
+    /// `.git/index` moved since the last refresh, or `ui.respectGitignore`
+    /// changed since this index was built.
+    ///
+    /// The gitignore check ignores the throttle deliberately: a user who
+    /// flips the setting expects ignored files to disappear from `@`
+    /// completion on the next query, not eventually.
     #[must_use]
     pub fn needs_refresh(&self, now: Instant, git_index_mtime: Option<SystemTime>) -> bool {
         if git_index_mtime.is_some() && git_index_mtime != self.last_git_mtime {
+            return true;
+        }
+        if respect_gitignore() != self.built_with_gitignore {
             return true;
         }
         self.last_refresh
@@ -461,16 +485,21 @@ pub struct IndexWorker {
 impl IndexWorker {
     /// Starts the worker for `root`, mixing `extra` (MCP resources) into every
     /// ranking pass.
+    ///
+    /// `respect_gitignore` seeds only the very first build; every rebuild
+    /// after that re-reads `ui.respectGitignore` live (see
+    /// [`FileIndex::needs_refresh`]) so a settings change takes effect
+    /// without a restart.
     #[must_use]
-    pub fn spawn(root: PathBuf, extra: Vec<Candidate>, respect_gitignore: bool) -> Self {
+    pub fn spawn(root: PathBuf, extra: Vec<Candidate>, initial_respect_gitignore: bool) -> Self {
         let (tx, qrx) = channel::<Req>();
         let (mrx_tx, rx) = channel::<IndexMsg>();
         std::thread::spawn(move || {
-            let mut index = FileIndex::build(&root, respect_gitignore);
+            let mut index = FileIndex::build(&root, initial_respect_gitignore);
             index.mark_refreshed(Instant::now(), git_index_mtime(&root));
             // Untracked files are slower to enumerate; fold them in once the
             // tracked set is already answerable.
-            index.fold_untracked(&root, respect_gitignore);
+            index.fold_untracked(&root, initial_respect_gitignore);
             if mrx_tx.send(IndexMsg::Refreshed).is_err() {
                 return;
             }
@@ -486,10 +515,16 @@ impl IndexWorker {
                 let now = Instant::now();
                 let mtime = git_index_mtime(&root);
                 if index.needs_refresh(now, mtime) {
+                    let respect_gitignore = respect_gitignore();
                     let fresh = FileIndex::build(&root, respect_gitignore);
                     // Equal signature means the rebuild is a no-op; keep the
                     // existing index (which already holds untracked files).
-                    if fresh.signature() == index.signature() {
+                    // A gitignore-setting change still forces the swap even
+                    // when the signature matches (an all-tracked repo, say),
+                    // so `built_with_gitignore` is never left stale.
+                    if fresh.signature() == index.signature()
+                        && respect_gitignore == index.built_with_gitignore
+                    {
                         index.mark_refreshed(now, mtime);
                     } else {
                         index = fresh;
@@ -1233,6 +1268,35 @@ mod tests {
         let mut off = FileIndex::build(&dir, false);
         off.fold_untracked(&dir, false);
         assert!(off.candidates().iter().any(|c| c.text == "ignored.txt"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `ui.respectGitignore` toggled live (no restart) must be observed by
+    /// `needs_refresh`, mirroring how `refresh_throttle` already reads
+    /// `ui.indexRefreshSecs` fresh on each use — this is the fix for the
+    /// setting being captured once at `IndexWatcher::spawn` and never
+    /// re-consulted.
+    #[test]
+    fn needs_refresh_reacts_to_a_live_gitignore_change() {
+        let dir = temp_repo(&["src/ui.rs"]);
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.respect_gitignore = true;
+        crate::settings::install_for_test(settings);
+
+        let mut index = FileIndex::build(&dir, true);
+        index.mark_refreshed(Instant::now(), None);
+        assert!(
+            !index.needs_refresh(Instant::now(), None),
+            "freshly built, throttle not yet expired, setting unchanged: no refresh needed"
+        );
+
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.respect_gitignore = false;
+        crate::settings::install_for_test(settings);
+        assert!(
+            index.needs_refresh(Instant::now(), None),
+            "the live setting no longer matches what the index was built with"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

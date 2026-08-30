@@ -39,6 +39,40 @@
 //!   "git":    { "signCommits": true }
 //! }
 //! ```
+//!
+//! ## Live vs. restart-bound
+//!
+//! Most fields here are read fresh at the point of use (`crate::settings::active()`
+//! has no caching layer), so a `/config` save that goes through [`reinstall`]
+//! takes effect on the very next read — no restart. But a setting captured once
+//! into some other long-lived value at startup stays stale until something
+//! re-pushes it; `install`/`reinstall` are the chosen choke point for that (see
+//! `ui.reducedMotion` → `crate::anim`, `ui.notifications` → `crate::notify`), and
+//! `crate::complete`/`crate::editor::History::live` show the alternative of simply
+//! reading `active()` again at the moment it matters (`ui.respectGitignore`,
+//! `ui.historySize`) instead of threading a push channel through.
+//!
+//! A few fields are restart-bound **by design** and are not worth chasing:
+//!
+//! - `engine.*` (`model`, `backend`, `threads`, `ctx`, `power`) — the `Engine`
+//!   is constructed once at startup from these; swapping it live would mean
+//!   tearing down and rebuilding the whole inference stack mid-session.
+//! - `safety.sandbox`, `safety.btwSuspend` — copied into `AgentConfig` once at
+//!   startup.
+//! - `tools.recall`, `tools.fanout`, `tools.runCode`, `git.signCommits` — these
+//!   feed the system prompt text, which is built once per session and then
+//!   KV-cached (see `docs/KV-CACHING.md`); applying a change live would silently
+//!   invalidate a cache the model's prefill is relying on to be exactly what it
+//!   was before.
+//!
+//! Do not try to make the settings above live — a restart (or, in the KV case,
+//! a fresh session) is the honest answer for them.
+//!
+//! `ui.historySize` sits in between: `History::live()` re-reads it on every
+//! trim rather than capturing it, so growing the cap live works and shrinking
+//! it evicts down to the new size on the next entry added — but it does not
+//! retroactively resize a history that already holds more than the new cap
+//! until that next add happens.
 
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
@@ -1158,6 +1192,10 @@ pub fn install(settings: Settings) {
     // Recover rather than panic on a poisoned lock: settings are advisory and a
     // stale guard is harmless here.
     crate::anim::set_reduced_motion(settings.ui.reduced_motion);
+    // Seeds the notification mode the same way `reducedMotion` seeds `anim`:
+    // this is the one choke point both front-ends now rely on instead of each
+    // calling `notify::set_mode` once at startup themselves.
+    crate::notify::set_mode(settings.ui.notifications);
     let mut slot = ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1175,6 +1213,9 @@ pub fn install(settings: Settings) {
 /// current session picks up the change on its next [`active`] read.
 pub fn reinstall(settings: Settings) {
     crate::anim::set_reduced_motion(settings.ui.reduced_motion);
+    // `ui.notifications` was previously seeded once at startup and never
+    // re-pushed, so changing it in `/config` had no effect until restart.
+    crate::notify::set_mode(settings.ui.notifications);
     *ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));
@@ -1554,6 +1595,33 @@ mod tests {
         assert_eq!(reloaded.engine.ctx, Some(8192));
         assert_eq!(reloaded.engine.backend, None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn install_and_reinstall_push_notification_mode() {
+        // Regression test: `ui.notifications` used to be seeded once at
+        // startup by two call sites in ui.rs and never re-pushed, so a
+        // `/config` change had no effect until restart. `install`/`reinstall`
+        // are now the one choke point, mirroring `reducedMotion`.
+        use crate::notify::{self, NotifyMode};
+
+        let mut s = Settings::default();
+        s.ui.notifications = NotifyMode::Never;
+        install(s);
+        assert_eq!(notify::mode(), NotifyMode::Never, "install seeds the mode");
+
+        let mut s = Settings::default();
+        s.ui.notifications = NotifyMode::Unfocused;
+        reinstall(s);
+        assert_eq!(
+            notify::mode(),
+            NotifyMode::Unfocused,
+            "reinstall re-seeds the mode live"
+        );
+
+        // `notify::MODE` is a process-wide global; leave it at the default so
+        // other tests in this process are not affected by test order.
+        notify::set_mode(NotifyMode::Always);
     }
 
     #[test]

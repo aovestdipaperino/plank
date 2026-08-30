@@ -2538,7 +2538,7 @@ pub fn draw_config(frame: &mut Frame, form: &crate::configform::ConfigForm) {
             Style::default().fg(Color::DarkGray),
         ),
         None => Span::styled(
-            "  ↑↓ move · ⏎/Space edit·toggle · Esc save & close · q cancel",
+            "  ↑↓ move · ⏎/Space edit·toggle · Ctrl-S save & close · Esc/q cancel",
             Style::default().fg(Color::DarkGray),
         ),
     };

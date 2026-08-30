@@ -868,8 +868,12 @@ impl ConfigForm {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Char('c') if ctrl => return Outcome::Cancel,
-            KeyCode::Char('q' | 'Q') => return Outcome::Cancel,
-            KeyCode::Esc => return Outcome::Save(Box::new(self.working.clone())),
+            // Escape means cancel everywhere else in plank; it must not be the
+            // one place that silently commits a half-typed value. Saving is an
+            // explicit act (Ctrl-S) so a reflexive "back out" keystroke never
+            // writes to disk.
+            KeyCode::Char('q' | 'Q') | KeyCode::Esc => return Outcome::Cancel,
+            KeyCode::Char('s') if ctrl => return Outcome::Save(Box::new(self.working.clone())),
             KeyCode::Up => {
                 self.status = None;
                 self.cursor = self.cursor.checked_sub(1).unwrap_or(self.field_count() - 1);
@@ -1498,14 +1502,43 @@ mod tests {
     }
 
     #[test]
-    fn esc_saves_and_q_cancels() {
+    fn esc_and_q_cancel_ctrl_s_saves() {
         let mut form = ConfigForm::new(Settings::default());
-        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Save(_)));
+        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Cancel));
         let mut form2 = ConfigForm::new(Settings::default());
         assert!(matches!(
             form2.handle_key(k(KeyCode::Char('q'))),
             Outcome::Cancel
         ));
+        let mut form3 = ConfigForm::new(Settings::default());
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(matches!(form3.handle_key(ctrl_s), Outcome::Save(_)));
+    }
+
+    /// Escape must discard an edited field rather than commit it: this is the
+    /// exact scenario that used to write a half-typed value to disk (a stray
+    /// sentence landing in `engine.model` because Escape saved instead of
+    /// cancelling).
+    #[test]
+    fn esc_discards_working_copy() {
+        let mut form = ConfigForm::new(Settings::default());
+        focus(&mut form, FieldId::EngineModel);
+        form.handle_key(k(KeyCode::Enter)); // open the inline editor
+        for c in "oops".chars() {
+            form.handle_key(k(KeyCode::Char(c)));
+        }
+        // Still mid-edit: Escape here only closes the inline editor (existing
+        // behaviour), so commit the typed value into the working copy first to
+        // simulate a value that made it in, then cancel the whole form.
+        form.handle_key(k(KeyCode::Enter));
+        assert_eq!(
+            form.working.engine.model.as_deref(),
+            Some(std::path::Path::new("oops"))
+        );
+        assert!(matches!(form.handle_key(k(KeyCode::Esc)), Outcome::Cancel));
+        // Outcome::Cancel carries no settings — the caller must drop
+        // `form.working` and leave `active()`/disk untouched, which is exactly
+        // what the ui.rs Cancel arm does (no write, no `settings::install`).
     }
 
     #[test]
