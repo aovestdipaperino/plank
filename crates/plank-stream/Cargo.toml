@@ -1,0 +1,14 @@
+[package]
+name = "plank-stream"
+version = "0.1.0"
+description = "plank's model-token stream renderer: DSML parsing, thinking split, and markdown/syntax terminal rendering"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

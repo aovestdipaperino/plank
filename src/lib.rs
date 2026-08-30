@@ -30,7 +30,7 @@ pub mod ds4engine;
 pub mod ds4tokens;
 #[cfg(ds4_engine)]
 pub mod ds4web;
-pub mod dsml;
+pub use plank_stream::dsml;
 pub mod editor;
 pub mod engine;
 pub mod errlog;

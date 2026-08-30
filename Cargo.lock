@@ -3801,6 +3801,7 @@ dependencies = [
  "notify-rust",
  "nucleo-matcher",
  "obscura",
+ "plank-stream",
  "ratatui",
  "ratatui-markdown",
  "ring",
@@ -3813,6 +3814,10 @@ dependencies = [
  "unicode-width 0.2.0",
  "ureq",
 ]
+
+[[package]]
+name = "plank-stream"
+version = "0.1.0"
 
 [[package]]
 name = "png"

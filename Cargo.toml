@@ -1,3 +1,23 @@
+[workspace]
+members = ["crates/*"]
+exclude = ["refs/edit", "refs/obscura", "refs/ds4"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.93"
+authors = ["Enzo Lombardi <enzinol@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/aovestdipaperino/plank"
+
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+
 [package]
 name = "plank"
 version = "3.4.1"
@@ -54,6 +74,7 @@ docparse = ["dep:liteparse", "dep:tokio"]
 plugins = ["dep:extism"]
 
 [dependencies]
+plank-stream = { path = "crates/plank-stream" }
 libc = "0.2"
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
@@ -117,14 +138,8 @@ extism = { version = "1.30", default-features = false, features = [
     "wasmtime-default-features",
 ], optional = true }
 
-[lints.rust]
-missing_debug_implementations = "warn"
-unsafe_op_in_unsafe_fn = "warn"
-unused_lifetimes = "warn"
-
-[lints.clippy]
-pedantic = { level = "warn", priority = -1 }
-perf = { level = "warn", priority = -1 }
+[lints]
+workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Native macOS notifications (NSUserNotification via an embedded ObjC helper,
