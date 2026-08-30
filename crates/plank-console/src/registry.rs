@@ -7,6 +7,11 @@
 //! listener per session. A session outlives its data socket, so a client that
 //! drops can reconnect to the same port and rejoin the same window with its
 //! transcript intact.
+//!
+//! Thread growth is unbounded by design at this scope: one thread per control
+//! connection, one per session's accept loop, and one per attached data
+//! connection. Acceptable given the expected session counts; not a resource
+//! pool.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -27,11 +32,6 @@ const READ_CHUNK: usize = 8192;
 pub type SessionId = u64;
 
 /// Something the UI needs to know about.
-///
-/// `Closed` is reserved for a future task (the reaper currently reports
-/// reaped ids to its caller via an out-parameter, since `reap` is called
-/// synchronously by the same loop that drains this channel — see
-/// [`Server::reap`]). No code constructs it yet.
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
     /// A new session exists; open a window for it.
@@ -46,7 +46,9 @@ pub enum ServerEvent {
     Bytes { id: SessionId, data: Vec<u8> },
     /// The data socket closed; the session and its port stay alive.
     Disconnected { id: SessionId },
-    /// The session was reaped; close its window.
+    /// The session's idle TTL expired and it was dropped; close its window.
+    /// Sent by [`Server::reap`], on the same channel as every other
+    /// lifecycle event.
     Closed { id: SessionId },
 }
 
@@ -61,14 +63,54 @@ struct Session {
     /// attaches — via a fresh `HELLO` reconnect or a new data-socket
     /// accept — so a session currently in use is never a reap candidate.
     idle_since: Option<Instant>,
+    /// Told to `true` by [`Server::reap`] to stop this session's data-port
+    /// accept loop (unused, always `false`, for an anonymous session, which
+    /// has no listener of its own — see the `NotHello` branch of
+    /// `handle_control`).
+    shutdown: Arc<AtomicBool>,
 }
 
-/// The listening server. Dropping it stops accepting; in-flight reader
-/// threads exit when their sockets close.
+/// Shared teardown for one attached data connection: whatever ends `pump`
+/// (clean EOF, read error, or a panic unwinding through the caller), the
+/// live flag must come back down and `idle_since` must be set — a stuck
+/// `true` would permanently refuse every future reconnect attempt for this
+/// session, which is the exact failure this design exists to prevent. A
+/// guard makes that unconditional, and is shared by the named-session
+/// accept loop and the anonymous raw-stream path so both age out the same
+/// way (see finding 3 in `.superpowers/sdd/task-9-report.md`).
+struct LiveGuard {
+    live: Arc<AtomicBool>,
+    sessions: Arc<Mutex<HashMap<String, Session>>>,
+    name: String,
+    tx: Sender<ServerEvent>,
+    id: SessionId,
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.live.store(false, Ordering::SeqCst);
+        if let Some(s) = self.sessions.lock().unwrap().get_mut(&self.name) {
+            s.idle_since = Some(Instant::now());
+        }
+        let _ = self.tx.send(ServerEvent::Disconnected { id: self.id });
+    }
+}
+
+/// The listening server.
+///
+/// `bind` spawns a background thread that owns the control [`TcpListener`]
+/// and accepts connections for the life of the process; dropping `Server`
+/// does **not** stop that thread or close the control port — there is
+/// currently no shutdown handshake for the control listener itself. Only
+/// per-session data listeners are torn down early, and only through
+/// [`Server::reap`]. This is a deliberate, narrower scope than "dropping it
+/// stops accepting" would suggest; widening it is future work, not a claim
+/// this code already makes good on.
 #[derive(Debug)]
 pub struct Server {
     control_port: u16,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    tx: Sender<ServerEvent>,
     rx: Receiver<ServerEvent>,
 }
 
@@ -96,6 +138,7 @@ impl Server {
         Ok(Self {
             control_port,
             sessions,
+            tx,
             rx,
         })
     }
@@ -126,28 +169,46 @@ impl Server {
             .count()
     }
 
-    /// Drops sessions that have been detached longer than `ttl`, pushing
-    /// each dropped id into `out` for the caller to close windows for.
+    /// Drops sessions that have been detached longer than `ttl`, sending a
+    /// [`ServerEvent::Closed`] for each one on the same channel as every
+    /// other lifecycle event — the coherent way for a caller draining
+    /// [`Server::events`] to learn what to close, whether it comes from a
+    /// live connection or from reaping.
+    ///
+    /// Each reaped session's data-port listener thread is told to stop and
+    /// its listener is dropped, releasing the port: a session's TCP port
+    /// does not outlive the session. Simply dropping a `TcpListener` while
+    /// another thread is blocked in `accept()` does not reliably wake that
+    /// thread (the behaviour is platform-dependent), so a shutdown flag is
+    /// set first and then a throwaway self-connect forces one more
+    /// iteration of the accept loop, which observes the flag and exits.
     ///
     /// A connected session, or one that has reconnected since it last
     /// detached, never expires: `idle_since` is `None` in both cases.
-    /// Nothing is sent on the event channel: `reap` is called by the same
-    /// loop that drains it, so the out-parameter is the coherent way to
-    /// hand back what was dropped.
     ///
     /// # Panics
     /// If the internal session-map mutex is poisoned.
-    pub fn reap(&mut self, ttl: Duration, out: &mut Vec<SessionId>) {
+    pub fn reap(&mut self, ttl: Duration) {
         let mut sessions = self.sessions.lock().unwrap();
+        let mut reaped: Vec<(SessionId, u16, Arc<AtomicBool>)> = Vec::new();
         sessions.retain(|_, s| {
             let expired = s
                 .idle_since
                 .is_some_and(|t| t.elapsed() > ttl && !s.live.load(Ordering::SeqCst));
             if expired {
-                out.push(s.id);
+                reaped.push((s.id, s.port, Arc::clone(&s.shutdown)));
             }
             !expired
         });
+        drop(sessions);
+
+        for (id, port, shutdown) in reaped {
+            shutdown.store(true, Ordering::SeqCst);
+            if port != 0 {
+                let _ = TcpStream::connect(("127.0.0.1", port));
+            }
+            let _ = self.tx.send(ServerEvent::Closed { id });
+        }
     }
 }
 
@@ -191,23 +252,38 @@ fn handle_control(
             let n = NEXT_ANON.fetch_add(1, Ordering::SeqCst);
             let name = format!("anon-{n}");
             let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+            let attached = Arc::new(AtomicBool::new(true));
             sessions.lock().unwrap().insert(
                 name.clone(),
                 Session {
                     id,
                     port: 0,
-                    live: Arc::new(AtomicBool::new(true)),
+                    live: Arc::clone(&attached),
                     idle_since: None,
+                    shutdown: Arc::new(AtomicBool::new(false)),
                 },
             );
-            let _ = tx.send(ServerEvent::Opened { id, name, port: 0 });
+            let _ = tx.send(ServerEvent::Opened {
+                id,
+                name: name.clone(),
+                port: 0,
+            });
             let _ = tx.send(ServerEvent::Bytes {
                 id,
                 data: line.into_bytes(),
             });
             let _ = writer.set_read_timeout(None);
+            // The guard's drop sends Disconnected and sets idle_since,
+            // giving this anonymous session the same reapable lifecycle as
+            // a named session's data socket (see finding 3).
+            let _guard = LiveGuard {
+                live: attached,
+                sessions: Arc::clone(sessions),
+                name,
+                tx: tx.clone(),
+                id,
+            };
             pump(reader, id, tx);
-            let _ = tx.send(ServerEvent::Disconnected { id });
         }
     }
 }
@@ -238,6 +314,7 @@ fn open_or_reuse(
     let port = listener.local_addr()?.port();
     let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
     let live = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
 
     sessions.lock().unwrap().insert(
         name.to_string(),
@@ -246,6 +323,7 @@ fn open_or_reuse(
             port,
             live: Arc::clone(&live),
             idle_since: Some(Instant::now()),
+            shutdown: Arc::clone(&shutdown),
         },
     );
     let _ = tx.send(ServerEvent::Opened {
@@ -265,6 +343,13 @@ fn open_or_reuse(
         // (or a reconnect after a clean disconnect) could never be
         // accepted at all.
         for stream in listener.incoming().flatten() {
+            if shutdown.load(Ordering::SeqCst) {
+                // Reaped: `Server::reap` set the flag and forced this wake
+                // with a throwaway self-connect. Stop accepting and drop
+                // `listener` (falling out of this closure), which releases
+                // the port. The stream that woke us is discarded.
+                break;
+            }
             if live.swap(true, Ordering::SeqCst) {
                 // Already streaming: one writer per session.
                 let mut s = stream;
@@ -281,29 +366,6 @@ fn open_or_reuse(
             let sessions = Arc::clone(&sessions);
             let name = name.clone();
             std::thread::spawn(move || {
-                // Whatever happens inside pump (clean EOF, read error, or a
-                // panic unwinding through this closure), the live flag must
-                // come back down and idle_since must be set — a stuck
-                // `true` would permanently refuse every future reconnect
-                // attempt for this session, which is the exact failure
-                // this design exists to prevent. A guard makes that
-                // unconditional.
-                struct LiveGuard {
-                    live: Arc<AtomicBool>,
-                    sessions: Arc<Mutex<HashMap<String, Session>>>,
-                    name: String,
-                    tx: Sender<ServerEvent>,
-                    id: SessionId,
-                }
-                impl Drop for LiveGuard {
-                    fn drop(&mut self) {
-                        self.live.store(false, Ordering::SeqCst);
-                        if let Some(s) = self.sessions.lock().unwrap().get_mut(&self.name) {
-                            s.idle_since = Some(Instant::now());
-                        }
-                        let _ = self.tx.send(ServerEvent::Disconnected { id: self.id });
-                    }
-                }
                 let _guard = LiveGuard {
                     live,
                     sessions,

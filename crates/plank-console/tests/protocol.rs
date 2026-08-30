@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::time::{Duration, Instant};
 
 use plank_console::registry::{Server, ServerEvent};
@@ -117,8 +117,8 @@ fn a_second_live_writer_is_refused() {
     let mut buf = Vec::new();
     second.read_to_end(&mut buf).unwrap();
     assert!(
-        buf.is_empty() || String::from_utf8_lossy(&buf).starts_with("ERR"),
-        "a duplicate writer must be closed, got {buf:?}"
+        String::from_utf8_lossy(&buf).starts_with("ERR"),
+        "a duplicate writer must be closed with a banner, got {buf:?}"
     );
 }
 
@@ -174,13 +174,20 @@ fn a_reconnect_clears_idle_since_so_the_session_never_reaps_while_reused() {
     });
 
     // A zero-duration TTL would reap anything with idle_since still set;
-    // since the reconnect cleared it, the session must survive.
-    let mut reaped = Vec::new();
-    server.reap(Duration::from_secs(0), &mut reaped);
-    assert!(
-        reaped.is_empty(),
-        "reconnected session must not be reaped: {reaped:?}"
-    );
+    // since the reconnect cleared it, the session must survive. Poll for a
+    // bounded window: since nothing should ever arrive, we can only prove
+    // absence by waiting out a deadline, not by asserting after one recv.
+    server.reap(Duration::from_secs(0));
+    let deadline = Instant::now() + Duration::from_millis(300);
+    while Instant::now() < deadline {
+        if let Ok(ev) = server.events().try_recv() {
+            assert!(
+                !matches!(ev, ServerEvent::Closed { .. }),
+                "reconnected session must not be reaped, got {ev:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
     // And the data port still works.
     let mut again = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -190,4 +197,64 @@ fn a_reconnect_clears_idle_since_so_the_session_never_reaps_while_reused() {
         _ => None,
     });
     assert_eq!(got, b"still-here");
+}
+
+#[test]
+fn reaping_sends_closed_and_releases_the_session_listener_port() {
+    let mut server = Server::bind(0).unwrap();
+    let reply = hello(server.control_port(), "HELLO zeta");
+    let port: u16 = reply.strip_prefix("PORT ").unwrap().parse().unwrap();
+
+    // Never attach a data socket; idle_since was set the instant the
+    // session was created, so a zero-duration TTL makes it reapable right
+    // away.
+    server.reap(Duration::from_secs(0));
+
+    let closed_id = wait_for(&server, |ev| match ev {
+        ServerEvent::Closed { id } => Some(*id),
+        _ => None,
+    });
+    assert!(closed_id > 0);
+
+    // The port must actually be free: a fresh bind on the same port must
+    // succeed. The listener thread may take a moment after `reap` returns
+    // to notice the shutdown flag and drop its `TcpListener`, so poll a
+    // real condition against a deadline rather than assuming it happened
+    // synchronously.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(_) => break,
+            Err(e) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+                let _ = e;
+            }
+            Err(e) => panic!("port {port} was not released after reap: {e}"),
+        }
+    }
+}
+
+#[test]
+fn an_anonymous_session_becomes_reapable_after_its_connection_ends() {
+    let mut server = Server::bind(0).unwrap();
+    let mut s = TcpStream::connect(("127.0.0.1", server.control_port())).unwrap();
+    s.write_all(b"raw bytes\n").unwrap();
+
+    let id = wait_for(&server, |ev| match ev {
+        ServerEvent::Opened { id, .. } => Some(*id),
+        _ => None,
+    });
+
+    drop(s);
+    wait_for(&server, |ev| {
+        matches!(ev, ServerEvent::Disconnected { id: eid } if *eid == id).then_some(())
+    });
+
+    // Now that the connection has ended, a zero-duration TTL must reap it.
+    server.reap(Duration::from_secs(0));
+    let closed_id = wait_for(&server, |ev| match ev {
+        ServerEvent::Closed { id } => Some(*id),
+        _ => None,
+    });
+    assert_eq!(closed_id, id);
 }
