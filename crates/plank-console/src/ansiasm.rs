@@ -62,7 +62,14 @@ pub fn attr_to_sgr(attr: Attr) -> String {
 /// ANSI bold becomes a brighter foreground (that is what `AnsiParser`
 /// already does) and italic is dropped entirely — plank's dim-italic
 /// thinking style arrives as its 256-color grey with the italic lost.
-/// Turbo Vision cells have no italic attribute.
+/// Turbo Vision cells have no italic attribute. Also deliberate: the
+/// `ERASE_LINE` repaint marker (`\r\x1b[0K`) is detected as a literal
+/// 4-byte match anywhere it appears in `pending`, with no surrounding
+/// context check. Content that happens to quote that exact byte sequence
+/// (a fenced code block showing raw ANSI, a pasted terminal transcript)
+/// would have everything before it on the line silently discarded, same as
+/// a real repaint. This mirrors `AnsiParser`'s own no-erase-in-line design
+/// and is not worth adding machinery to disambiguate.
 pub struct AnsiLineAssembler {
     parser: AnsiParser,
     /// Bytes received since the last newline.
@@ -101,11 +108,7 @@ impl AnsiLineAssembler {
         for &b in bytes {
             if b == b'\n' {
                 let line = self.parse_pending();
-                if let Some(last) = line.last() {
-                    self.carry = last.attr;
-                } else {
-                    self.carry = self.trailing_attr_of_pending();
-                }
+                self.carry = self.trailing_attr_of_pending();
                 self.ready.push(line);
                 self.pending.clear();
             } else {
@@ -148,9 +151,7 @@ impl AnsiLineAssembler {
             return None;
         }
         let line = self.parse_pending();
-        if let Some(last) = line.last() {
-            self.carry = last.attr;
-        }
+        self.carry = self.trailing_attr_of_pending();
         self.pending.clear();
         Some(line)
     }
@@ -302,6 +303,24 @@ mod tests {
             lines[0][0].attr.fg,
             TvColor::LightGray,
             "the repainted line must carry the highlight color, not the default"
+        );
+    }
+
+    #[test]
+    fn trailing_sgr_after_the_last_char_does_not_bleed_into_the_next_line() {
+        // `plank_stream` closes `<think>` with a reset that lands *after*
+        // the last visible character on the line, e.g. `...pondering\x1b[0m`.
+        // The old code took `carry` from the last cell's attribute, which
+        // predates that trailing reset — dropping it and letting the
+        // thinking color bleed onto the next line.
+        let mut a = AnsiLineAssembler::new();
+        a.push(b"\x1b[38;5;8mpondering\x1b[0m\nplain text\n");
+        let lines = a.take_complete_lines();
+        assert_eq!(
+            lines[1][0].attr.fg,
+            TvColor::LightGray,
+            "the reset after the last char of line 0 must carry into line 1, \
+             not line 0's last cell color"
         );
     }
 

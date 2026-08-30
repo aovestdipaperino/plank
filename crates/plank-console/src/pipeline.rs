@@ -112,7 +112,9 @@ impl Pipeline {
     /// screen keeps its old styling; only new bytes use the new options.
     pub fn set_options(&mut self, opts: RenderOptions, view: &mut StreamView) {
         self.finish(view);
+        let utf8_carry = std::mem::take(&mut self.utf8_carry);
         *self = Self::new(opts);
+        self.utf8_carry = utf8_carry;
     }
 
     /// The options currently in force, for a caller (the menu, a status
@@ -215,6 +217,27 @@ mod tests {
         assert!(
             attrs.iter().any(|c| *c != TvColor::LightGray),
             "a highlighted code block must not be uniformly default-colored"
+        );
+    }
+
+    #[test]
+    fn set_options_preserves_a_split_utf8_char() {
+        // An em-dash '—' is 3 bytes (0xE2 0x80 0x94). Split it across two
+        // `feed` calls with a `set_options` in between: the trailing bytes
+        // held in `utf8_carry` must survive the rebuild, not vanish.
+        let dash = "—".as_bytes();
+        assert_eq!(dash.len(), 3);
+        let mut p = Pipeline::new(opts());
+        let mut v = StreamView::new(Rect::new(0, 0, 80, 24));
+        p.feed(&dash[..1], &mut v);
+        p.set_options(opts(), &mut v);
+        p.feed(&dash[1..], &mut v);
+        p.feed(b"\n", &mut v);
+        p.finish(&mut v);
+        assert!(
+            v.plain_text().contains('—'),
+            "the split character must survive set_options intact: {:?}",
+            v.plain_text()
         );
     }
 
