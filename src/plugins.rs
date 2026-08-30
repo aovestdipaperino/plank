@@ -665,18 +665,46 @@ fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
 /// plugin needs exactly this and then a different notion of what counts as a
 /// plugin root.
 ///
+/// The download-and-extract step and the symlink scan are two separate
+/// functions ([`download_and_extract`] and this one) rather than one, because
+/// they answer to two different policies: this function's blanket refusal is
+/// exactly what [`fetch_and_stage`] (the native `/plugins install` path) needs
+/// and must keep, byte for byte, while [`crate::claudeplugin`]'s archive path
+/// needs the same bytes on disk but applies its own, narrower symlink policy
+/// (a contained link is fine; only an escaping one, or one to a directory, is
+/// refused). Folding the scan into the download would leave the Claude path no
+/// way to get the bytes without also inheriting the blanket refusal.
+///
 /// # Errors
 /// Returns a message when the URL is rejected by the remote policy, the
 /// download fails or exceeds the size cap, the archive will not extract, or it
 /// contains a symlink.
 pub(crate) fn fetch_archive(url: &str, dir: &Path) -> Result<(), String> {
+    download_and_extract(url, dir)?;
+    reject_symlinks(dir)
+}
+
+/// Downloads the `.tar.gz` at `url` and extracts it into `dir`, with no
+/// symlink scan of its own.
+///
+/// This is the part of [`fetch_archive`] that is genuinely policy-free: TLS
+/// enforcement, the size cap, and `tar` extraction apply no matter who called
+/// it. Callers that need a blanket symlink refusal get it by calling
+/// [`fetch_archive`] instead; callers with a different symlink policy (see
+/// [`fetch_archive`]'s doc comment) call this directly and scan the result
+/// themselves.
+///
+/// # Errors
+/// Returns a message when the URL is rejected by the remote policy, the
+/// download fails or exceeds the size cap, or the archive will not extract.
+pub(crate) fn download_and_extract(url: &str, dir: &Path) -> Result<(), String> {
     crate::remote::validate_remote_url(url, false)?;
     let archive = dir.join("plugin.tar.gz");
     download_to(url, &archive)?;
     let status = std::process::Command::new("tar")
         // No `-P`: tar then refuses absolute paths and `..` components itself,
-        // which is the first of the two lines of defence. The second is the
-        // symlink scan below, which does not depend on tar's behaviour.
+        // which is the first of the two lines of defence. The second is
+        // whichever symlink scan the caller runs afterwards.
         .arg("-xzf")
         .arg(&archive)
         .arg("-C")
@@ -687,7 +715,7 @@ pub(crate) fn fetch_archive(url: &str, dir: &Path) -> Result<(), String> {
         return Err(format!("{url} did not extract as a .tar.gz"));
     }
     let _ = std::fs::remove_file(&archive);
-    reject_symlinks(dir)
+    Ok(())
 }
 
 /// Streams `url` into `path`, refusing anything over [`MAX_ARCHIVE_BYTES`].

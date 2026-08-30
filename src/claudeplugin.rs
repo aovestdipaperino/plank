@@ -33,6 +33,24 @@ pub enum Source {
         /// The archive URL, checked against the remote policy at fetch time.
         url: String,
     },
+    /// A GitHub `/tree/<ref>/<path>` or `/blob/<ref>/<path>` URL: what a user
+    /// gets by browsing to a subdirectory on github.com and copying the
+    /// address bar, rather than the repository's own URL.
+    ///
+    /// This has to carry the ref and the subpath alongside the clone URL,
+    /// because none of the three is recoverable from the others: the clone
+    /// URL alone loses which commit the browser was looking at, and the
+    /// subpath is only meaningful once the repository is actually on disk.
+    GitSubpath {
+        /// The repository's clone URL, with the `/tree/`-or-`/blob/` suffix
+        /// stripped off.
+        url: String,
+        /// The branch, tag, or commit named after `tree`/`blob`.
+        refname: String,
+        /// The path within the repository the URL pointed at. Not
+        /// necessarily the plugin root itself — see [`resolve_subpath`].
+        subpath: String,
+    },
 }
 
 /// Classifies `arg` into the acquisition path it names.
@@ -57,6 +75,13 @@ pub fn parse_source(arg: &str) -> Result<Source, String> {
                 url: arg.to_string(),
             });
         }
+        if let Some((url, refname, subpath)) = parse_github_tree_url(arg) {
+            return Ok(Source::GitSubpath {
+                url,
+                refname,
+                subpath,
+            });
+        }
         return Ok(Source::Git {
             url: arg.to_string(),
         });
@@ -69,6 +94,38 @@ pub fn parse_source(arg: &str) -> Result<Source, String> {
     }
     Err(format!(
         "'{arg}' is neither a URL nor an owner/repo shorthand"
+    ))
+}
+
+/// Recognizes a GitHub `/tree/<ref>/<path>` or `/blob/<ref>/<path>` URL,
+/// returning the plain repository clone URL, the ref, and the subpath.
+///
+/// This exists because pasting a GitHub URL is the natural thing to do after
+/// browsing to a plugin's subdirectory in a browser, and github.com's own
+/// address bar puts exactly this shape there — `tree` for a directory,
+/// `blob` for a file. Sent straight to `git clone` (the pre-existing
+/// behaviour), it fails outright: neither form is a repository URL, and the
+/// path after the ref is not something `git clone` understands at all.
+fn parse_github_tree_url(arg: &str) -> Option<(String, String, String)> {
+    let rest = arg
+        .strip_prefix("https://github.com/")
+        .or_else(|| arg.strip_prefix("http://github.com/"))?;
+    let parts: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() < 5 {
+        return None;
+    }
+    let (owner, repo, kind, refname) = (parts[0], parts[1], parts[2], parts[3]);
+    if kind != "tree" && kind != "blob" {
+        return None;
+    }
+    let subpath = parts[4..].join("/");
+    if subpath.is_empty() {
+        return None;
+    }
+    Some((
+        format!("https://github.com/{owner}/{repo}"),
+        refname.to_string(),
+        subpath,
     ))
 }
 
@@ -313,8 +370,12 @@ pub fn install_staged(
     let root = resolve_in_tree(staged, want)?;
     // Scanned before the copy, not after: `copy_tree` follows links, so a
     // `wasm -> ~/.ssh` entry would put a private key inside a plugin directory
-    // and only then be noticed.
-    crate::plugins::reject_symlinks(&root)?;
+    // and only then be noticed. `reject_unsafe_symlinks`, not
+    // `plugins::reject_symlinks`: a Claude plugin like superpowers ships a
+    // contained `AGENTS.md -> CLAUDE.md` symlink as its ordinary
+    // "same file under two names" idiom, and only an escaping target (or a
+    // symlinked directory) is actually dangerous.
+    reject_unsafe_symlinks(&root)?;
     let skipped = unsupported_hook_events(&root)?;
     if !skipped.is_empty() && !force {
         return Err(format!(
@@ -394,7 +455,7 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
     // assembled by hand or by a test has no `.git` and no bare-repo layout —
     // so a clone failure falls back to a plain copy rather than refusing.
     if Path::new(arg).is_dir() {
-        if let Ok(dest) = clone(arg, staging) {
+        if let Ok(dest) = clone(arg, None, staging) {
             return Ok(dest);
         }
         // Scanned before the copy, not after: `copy_tree` follows links, so a
@@ -402,16 +463,30 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         // the private key's bytes by the time a check ran on the destination,
         // and the refusal would find nothing left to refuse. This is the same
         // inversion `install_staged` guards against for the staged tree.
-        crate::plugins::reject_symlinks(Path::new(arg))?;
+        reject_unsafe_symlinks(Path::new(arg))?;
         let dest = staging.join("tree");
         crate::plugins::copy_tree(Path::new(arg), &dest)
             .map_err(|e| format!("cannot copy {arg}: {e}"))?;
         return Ok(dest);
     }
     match parse_source(arg)? {
-        Source::Git { url } => clone(&url, staging),
+        Source::Git { url } => clone(&url, None, staging),
+        Source::GitSubpath {
+            url,
+            refname,
+            subpath,
+        } => {
+            let dest = clone(&url, Some(&refname), staging)?;
+            resolve_subpath(&dest, &subpath)
+        }
         Source::Archive { url } => {
-            crate::plugins::fetch_archive(&url, staging)?;
+            // `download_and_extract`, not `plugins::fetch_archive`: the latter
+            // runs the blanket symlink refusal that `/plugins install` needs,
+            // and a contained symlink like superpowers' `AGENTS.md ->
+            // CLAUDE.md` must survive here instead. The Claude path applies
+            // its own containment scan below.
+            crate::plugins::download_and_extract(&url, staging)?;
+            reject_unsafe_symlinks(staging)?;
             // Every conventionally produced tarball nests its contents under
             // one top-level directory — GitHub's codeload archives use
             // `repo-main/`, and a plain `tar czf x.tar.gz somedir` yields
@@ -468,27 +543,157 @@ fn find_claude_root(dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
-/// Shallow-clones `url` into `staging/repo` and drops its history.
-fn clone(url: &str, staging: &Path) -> Result<PathBuf, String> {
+/// Refuses a symlink that escapes `root`, or one that points at a directory,
+/// but allows one whose target resolves to a plain file inside `root`.
+///
+/// This is deliberately not [`crate::plugins::reject_symlinks`]'s blanket
+/// refusal. That function exists for plank's own `/plugins install`, where no
+/// plugin has ever needed a symlink and a blanket "no symlinks" is the
+/// simplest correct policy. A Claude Code plugin is a different animal:
+/// `obra/superpowers`, the flagship plugin this fix was written for, ships
+/// `AGENTS.md -> CLAUDE.md` — an ordinary "same file under two names" link
+/// that resolves inside the tree and is exactly the kind of thing the C
+/// reference agent's own conventions assume exist. Refusing that outright
+/// makes the flagship plugin uninstallable for no security reason: the danger
+/// this check exists to stop is a link that *escapes* the tree (`key ->
+/// ~/.ssh/id_rsa`, which would pull a private key into a plugin directory),
+/// not the ordinary alias.
+///
+/// A contained symlink to a *directory* is refused even though it is
+/// contained, for a narrower, structural reason: [`crate::plugins::copy_tree`]
+/// branches on `entry.file_type()?.is_dir()`, and for a symlink,
+/// `DirEntry::file_type` reports the symlink's own type (it does not follow
+/// the link), so a directory symlink falls into the *file* branch and
+/// `std::fs::copy` is called on a directory — which fails with a confusing
+/// I/O error instead of the clear refusal this check gives up front.
+///
+/// A contained symlink to a *file* is allowed. Note that `copy_tree` still
+/// follows it: `std::fs::copy` opens the source path, which the kernel
+/// transparently dereferences, so the installed plugin ends up with two
+/// real files rather than a link. That is not a bug — the bytes came from
+/// inside the tree either way — but it is worth writing down so a future
+/// reader does not mistake the flattening for one.
+///
+/// # Errors
+/// Returns a message naming the offending entry and its target when a
+/// symlink escapes `root` or resolves to a directory, or when `root` itself,
+/// or one of its entries, cannot be inspected.
+pub(crate) fn reject_unsafe_symlinks(root: &Path) -> Result<(), String> {
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot inspect {}: {e}", root.display()))?;
+    scan_unsafe_symlinks(root, &canon_root)
+}
+
+/// The recursive walk behind [`reject_unsafe_symlinks`], separated out so the
+/// public entry point only has to canonicalize `root` once rather than on
+/// every directory it descends into.
+fn scan_unsafe_symlinks(dir: &Path, canon_root: &Path) -> Result<(), String> {
+    let entries =
+        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `symlink_metadata`, not `metadata`: the latter follows the link and
+        // would report the target's type, which is the thing being checked.
+        let meta = path
+            .symlink_metadata()
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            let target = path.canonicalize().map_err(|e| {
+                format!(
+                    "refusing plugin: {} is a symlink that cannot be resolved: {e}",
+                    path.display()
+                )
+            })?;
+            if !target.starts_with(canon_root) {
+                return Err(format!(
+                    "refusing plugin: {} is a symlink to {}, which is outside the plugin \
+                     directory",
+                    path.display(),
+                    target.display()
+                ));
+            }
+            if target.is_dir() {
+                return Err(format!(
+                    "refusing plugin: {} is a symlink to the directory {}, which cannot be \
+                     installed",
+                    path.display(),
+                    target.display()
+                ));
+            }
+            continue;
+        }
+        if meta.is_dir() {
+            scan_unsafe_symlinks(&path, canon_root)?;
+        }
+    }
+    Ok(())
+}
+
+/// Shallow-clones `url` into `staging/repo`, optionally at `refname`, and
+/// drops its history.
+///
+/// `refname` is `None` for a plain repository URL and `Some` for a
+/// [`Source::GitSubpath`], where the browser URL named a specific branch,
+/// tag, or commit and cloning the default branch instead would silently show
+/// the wrong tree.
+fn clone(url: &str, refname: Option<&str>, staging: &Path) -> Result<PathBuf, String> {
     let dest = staging.join("repo");
-    let status = std::process::Command::new("git")
-        .arg("clone")
-        .arg("--quiet")
-        .arg("--depth")
-        .arg("1")
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("clone").arg("--quiet").arg("--depth").arg("1");
+    if let Some(refname) = refname {
+        cmd.arg("--branch").arg(refname);
+    }
+    let output = cmd
         .arg("--") // Separator ensures url is treated as a path, not an option
         .arg(url)
         .arg(&dest)
-        .status()
+        .output()
         .map_err(|e| format!("cannot run git: {e}"))?;
-    if !status.success() {
-        return Err(format!("cannot clone {url}"));
+    if !output.status.success() {
+        // `.output()` rather than `.status()`: git's stderr says *why* the
+        // clone failed (repository not found, ref not found, network
+        // unreachable), and a bare "cannot clone <url>" throws that away —
+        // exactly the useless message a pasted-but-wrong URL used to produce.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        return Err(if stderr.is_empty() {
+            format!("cannot clone {url}")
+        } else {
+            format!("cannot clone {url}: {stderr}")
+        });
     }
     // The history is not part of the plugin, and it is a tree of files that
     // would otherwise be scanned for symlinks and copied into the user's home.
     let _ = std::fs::remove_dir_all(dest.join(".git"));
-    crate::plugins::reject_symlinks(&dest)?;
+    reject_unsafe_symlinks(&dest)?;
     Ok(dest)
+}
+
+/// Finds the plugin root under `dest` named by `subpath`.
+///
+/// A GitHub tree URL's path is not always the plugin root itself: the real
+/// example this fix was written for pointed at `.claude-plugin`, which is the
+/// *manifest* directory, and the plugin root is its parent. So `subpath` is
+/// tried first, and failing that, its parent — the manifest-directory case
+/// covers both `.claude-plugin` and a bare `plugin.json` file (a `/blob/` URL
+/// resolves to a file, whose parent is the manifest directory, whose parent in
+/// turn is the plugin root; this function does one parent hop, which is
+/// enough for the directory case and named explicitly in the refusal when
+/// neither matches so the miss is legible rather than a raw filesystem error.
+fn resolve_subpath(dest: &Path, subpath: &str) -> Result<PathBuf, String> {
+    let candidate = dest.join(subpath);
+    if is_claude_manifest_root(&candidate) {
+        return Ok(candidate);
+    }
+    if let Some(parent) = candidate.parent()
+        && is_claude_manifest_root(parent)
+    {
+        return Ok(parent.to_path_buf());
+    }
+    Err(format!(
+        "no Claude Code plugin found at '{subpath}' or its parent directory in this repository"
+    ))
 }
 
 /// The plugin's name, from its manifest's `name` field, falling back to the
@@ -681,6 +886,82 @@ mod tests {
     fn a_local_path_is_rejected() {
         let err = parse_source("/Users/me/plugins/demo").expect_err("rejected");
         assert!(err.contains("owner/repo"), "{err}");
+    }
+
+    #[test]
+    fn a_github_tree_url_parses_to_repo_ref_and_subpath() {
+        let src = parse_source("https://github.com/obra/superpowers/tree/main/skills/foo")
+            .expect("parses");
+        assert_eq!(
+            src,
+            Source::GitSubpath {
+                url: "https://github.com/obra/superpowers".to_string(),
+                refname: "main".to_string(),
+                subpath: "skills/foo".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_github_blob_url_parses_too() {
+        let src = parse_source("https://github.com/obra/superpowers/blob/main/README.md")
+            .expect("parses");
+        assert!(matches!(
+            src,
+            Source::GitSubpath { ref refname, ref subpath, .. }
+                if refname == "main" && subpath == "README.md"
+        ));
+    }
+
+    #[test]
+    fn a_github_tree_url_at_the_manifest_directory_still_resolves_via_its_parent() {
+        // The real example this fix was written for: the user's browser URL
+        // pointed at `.claude-plugin`, the manifest directory, whose *parent*
+        // is the plugin root.
+        let src = parse_source("https://github.com/obra/superpowers/tree/main/.claude-plugin")
+            .expect("parses");
+        assert!(matches!(
+            src,
+            Source::GitSubpath { ref subpath, .. } if subpath == ".claude-plugin"
+        ));
+    }
+
+    #[test]
+    fn resolve_subpath_falls_back_to_the_parent_of_the_manifest_directory() {
+        let dest = tmpdir("resolve-subpath-parent");
+        write(&dest, ".claude-plugin/plugin.json", r#"{"name":"demo"}"#);
+        let root = resolve_subpath(&dest, ".claude-plugin").expect("resolves");
+        assert_eq!(root, dest);
+    }
+
+    #[test]
+    fn resolve_subpath_uses_the_subpath_itself_when_it_is_already_the_root() {
+        let dest = tmpdir("resolve-subpath-direct");
+        write(
+            &dest,
+            "plugin/.claude-plugin/plugin.json",
+            r#"{"name":"demo"}"#,
+        );
+        let root = resolve_subpath(&dest, "plugin").expect("resolves");
+        assert_eq!(root, dest.join("plugin"));
+    }
+
+    #[test]
+    fn resolve_subpath_names_what_it_looked_for_when_neither_matches() {
+        let dest = tmpdir("resolve-subpath-miss");
+        write(&dest, "README.md", "hi\n");
+        let err = resolve_subpath(&dest, "docs").expect_err("refused");
+        assert!(err.contains("docs"), "{err}");
+    }
+
+    #[test]
+    fn a_non_github_url_is_not_a_tree_url() {
+        assert!(parse_github_tree_url("https://example.com/o/r/tree/main/x").is_none());
+    }
+
+    #[test]
+    fn a_plain_github_repo_url_is_not_a_tree_url() {
+        assert!(parse_github_tree_url("https://github.com/owner/repo").is_none());
     }
 
     #[test]
@@ -976,6 +1257,87 @@ mod tests {
             !install_dir(&home).join("demo").exists(),
             "nothing installed"
         );
+    }
+
+    #[test]
+    fn a_contained_file_symlink_is_accepted_and_installs() {
+        // The `obra/superpowers` case: `AGENTS.md -> CLAUDE.md`, a relative
+        // link resolving inside the tree — the ordinary "same file under two
+        // names" idiom, not a private-key exfiltration attempt.
+        let staged = staged_plugin("install-contained-symlink", "demo");
+        write(&staged, "CLAUDE.md", "the real content\n");
+        std::os::unix::fs::symlink("CLAUDE.md", staged.join("AGENTS.md")).expect("symlink");
+        let home = tmpdir("install-contained-symlink-home");
+        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let installed = std::fs::read_to_string(out.dest.join("AGENTS.md")).expect("read");
+        assert_eq!(installed, "the real content\n");
+    }
+
+    #[test]
+    fn an_absolute_escaping_symlink_is_refused() {
+        let staged = staged_plugin("install-escape-absolute", "demo");
+        std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
+        let home = tmpdir("install-escape-absolute-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!install_dir(&home).join("demo").exists());
+    }
+
+    #[test]
+    fn a_relative_escaping_symlink_is_refused() {
+        let staged = staged_plugin("install-escape-relative", "demo");
+        let secret_dir = tmpdir("install-escape-relative-secret");
+        std::fs::write(secret_dir.join("secret.txt"), "sekrit-payload\n").expect("write");
+        // `../../<secret dir name>/secret.txt` walks out of `staged` itself.
+        let secret_name = secret_dir.file_name().expect("has a name");
+        let rel = Path::new("..")
+            .join("..")
+            .join(
+                secret_dir
+                    .parent()
+                    .expect("has a parent")
+                    .file_name()
+                    .expect("name"),
+            )
+            .join(secret_name)
+            .join("secret.txt");
+        std::os::unix::fs::symlink(&rel, staged.join("link")).expect("symlink");
+        let home = tmpdir("install-escape-relative-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(!install_dir(&home).join("demo").exists());
+        assert!(
+            !walk_for_secret(&install_dir(&home), "sekrit-payload"),
+            "the escaping target's contents must not reach the install root"
+        );
+    }
+
+    #[test]
+    fn removing_the_containment_check_would_let_the_escaping_symlink_through() {
+        // A direct regression pin on `scan_unsafe_symlinks`'s containment
+        // test, independent of `install_staged`'s plumbing: a symlink whose
+        // canonicalized target is outside `canon_root` must be refused, and
+        // this asserts the specific condition rather than just "something
+        // failed".
+        let root = tmpdir("scan-containment-root");
+        let outside = tmpdir("scan-containment-outside");
+        std::fs::write(outside.join("x"), "hi\n").expect("write");
+        std::os::unix::fs::symlink(outside.join("x"), root.join("link")).expect("symlink");
+        let err = reject_unsafe_symlinks(&root).expect_err("refused");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn a_contained_directory_symlink_is_refused_with_a_clear_message() {
+        let staged = staged_plugin("install-dir-symlink", "demo");
+        std::fs::create_dir_all(staged.join("real_dir")).expect("mkdir");
+        std::fs::write(staged.join("real_dir/f.txt"), "hi\n").expect("write");
+        std::os::unix::fs::symlink("real_dir", staged.join("link_dir")).expect("symlink");
+        let home = tmpdir("install-dir-symlink-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(err.contains("directory"), "{err}");
+        assert!(!install_dir(&home).join("demo").exists());
     }
 
     #[test]
