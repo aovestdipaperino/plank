@@ -275,6 +275,93 @@ fn resolve_marketplace(
     Ok(canon_dir)
 }
 
+/// What an install produced, for the command to report.
+#[derive(Debug, Clone)]
+pub struct Installed {
+    /// The plugin's name, from its manifest.
+    pub name: String,
+    /// Where it was copied to.
+    pub dest: PathBuf,
+    /// Whether a `${CLAUDE_PLUGIN_ROOT}` reference was rewritten, which the
+    /// user is told because it means the directory can no longer be moved.
+    pub rewrote_plugin_root: bool,
+    /// Hook events installed under `--force` that will never fire.
+    pub skipped_hook_events: Vec<String>,
+}
+
+/// Validates the staged tree and copies it into `~/.plank/plugins/claude/`.
+///
+/// The order matters: everything that can refuse happens before anything is
+/// written under `home`, so a refusal never leaves a partial install behind.
+///
+/// `force` waives only the unimplemented-hook refusal, in which case those
+/// hooks are installed and simply never fire. The structural refusals — no
+/// manifest, a symlink, an existing install — are not waivable, because none
+/// of them describes a plugin the user could still want as it is.
+///
+/// # Errors
+/// Returns a message when the tree is not a Claude Code plugin, contains a
+/// symlink, names a hook event plank does not implement (without `force`), is
+/// already installed, or cannot be copied.
+pub fn install_staged(
+    staged: &Path,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let root = resolve_in_tree(staged, want)?;
+    // Scanned before the copy, not after: `copy_tree` follows links, so a
+    // `wasm -> ~/.ssh` entry would put a private key inside a plugin directory
+    // and only then be noticed.
+    crate::plugins::reject_symlinks(&root)?;
+    let skipped = unsupported_hook_events(&root)?;
+    if !skipped.is_empty() && !force {
+        return Err(format!(
+            "this plugin hooks events plank does not implement: {}\nthose hooks would never \
+             fire; pass --force to install it anyway",
+            skipped.join(", ")
+        ));
+    }
+    let name = plugin_name(&root)?;
+    let dest = install_dir(home).join(&name);
+    if dest.exists() {
+        return Err(format!(
+            "'{name}' is already installed at {}; remove it first with /plugins remove {name}",
+            dest.display()
+        ));
+    }
+    crate::plugins::copy_tree(&root, &dest)
+        .map_err(|e| format!("cannot install into {}: {e}", dest.display()))?;
+    let rewrote = rewrite_plugin_root(&dest)?;
+    Ok(Installed {
+        name,
+        dest,
+        rewrote_plugin_root: rewrote,
+        skipped_hook_events: skipped,
+    })
+}
+
+/// The plugin's name, from its manifest's `name` field, falling back to the
+/// directory name. The name becomes a path component, so a value carrying a
+/// separator is refused rather than sanitized: a plugin calling itself `../x`
+/// is not a naming style to accommodate.
+fn plugin_name(root: &Path) -> Result<String, String> {
+    let manifest = root.join(".claude-plugin").join("plugin.json");
+    let text = std::fs::read_to_string(&manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let from_manifest = match json_parse(&text).as_ref().and_then(|j| j.get("name")) {
+        Some(Json::Str(s)) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    };
+    let name = from_manifest
+        .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .ok_or_else(|| "this plugin has no name".to_string())?;
+    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(format!("'{name}' is not a usable plugin name"));
+    }
+    Ok(name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,5 +665,123 @@ mod tests {
         write(&staged, "README.md", "hi\n");
         let err = resolve_in_tree(&staged, None).expect_err("rejected");
         assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
+    }
+
+    /// A minimal valid staged Claude plugin named `name`.
+    fn staged_plugin(tag: &str, name: &str) -> PathBuf {
+        let dir = tmpdir(tag);
+        write(
+            &dir,
+            ".claude-plugin/plugin.json",
+            &format!(r#"{{"name":"{name}","description":"d"}}"#),
+        );
+        dir
+    }
+
+    #[test]
+    fn a_valid_tree_installs_under_the_claude_root() {
+        let staged = staged_plugin("install-ok", "demo");
+        write(&staged, "commands/note.md", "hi\n");
+        let home = tmpdir("install-ok-home");
+        let out = install_staged(&staged, None, &home, false).expect("installs");
+        assert_eq!(out.name, "demo");
+        assert_eq!(out.dest, install_dir(&home).join("demo"));
+        assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
+        assert!(out.dest.join("commands/note.md").is_file());
+        assert!(out.skipped_hook_events.is_empty());
+        assert!(!out.rewrote_plugin_root);
+    }
+
+    #[test]
+    fn an_unimplemented_hook_event_refuses() {
+        let staged = staged_plugin("install-hook", "demo");
+        write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
+        let home = tmpdir("install-hook-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("SubagentStop"), "{err}");
+        assert!(err.contains("--force"), "{err}");
+        assert!(
+            !install_dir(&home).join("demo").exists(),
+            "nothing installed"
+        );
+    }
+
+    #[test]
+    fn force_installs_past_an_unimplemented_hook_event() {
+        let staged = staged_plugin("install-force", "demo");
+        write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
+        let home = tmpdir("install-force-home");
+        let out = install_staged(&staged, None, &home, true).expect("installs");
+        assert_eq!(out.skipped_hook_events, vec!["SubagentStop".to_string()]);
+        assert!(out.dest.join("hooks/hooks.json").is_file());
+    }
+
+    #[test]
+    fn a_symlink_refuses_even_with_force() {
+        let staged = staged_plugin("install-symlink", "demo");
+        std::os::unix::fs::symlink("/etc/hosts", staged.join("link")).expect("symlink");
+        let home = tmpdir("install-symlink-home");
+        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !install_dir(&home).join("demo").exists(),
+            "nothing installed"
+        );
+    }
+
+    #[test]
+    fn an_existing_install_refuses_even_with_force() {
+        let staged = staged_plugin("install-dup", "demo");
+        let home = tmpdir("install-dup-home");
+        write(
+            &install_dir(&home),
+            "demo/.claude-plugin/plugin.json",
+            r#"{"name":"demo","description":"the one already there"}"#,
+        );
+        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        assert!(err.contains("already installed"), "{err}");
+        let kept =
+            std::fs::read_to_string(install_dir(&home).join("demo/.claude-plugin/plugin.json"))
+                .expect("read");
+        assert!(kept.contains("already there"), "not overwritten");
+    }
+
+    #[test]
+    fn a_tree_with_no_claude_manifest_refuses() {
+        let staged = tmpdir("install-nomanifest");
+        write(&staged, ".plank-plugin/plugin.json", r#"{"name":"native"}"#);
+        let home = tmpdir("install-nomanifest-home");
+        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
+    }
+
+    #[test]
+    fn plugin_root_is_rewritten_to_the_final_destination() {
+        let staged = staged_plugin("install-rewrite", "demo");
+        write(
+            &staged,
+            ".mcp.json",
+            r#"{"mcpServers":{"s":{"command":"${CLAUDE_PLUGIN_ROOT}/bin/s"}}}"#,
+        );
+        let home = tmpdir("install-rewrite-home");
+        let out = install_staged(&staged, None, &home, false).expect("installs");
+        assert!(out.rewrote_plugin_root);
+        let mcp = std::fs::read_to_string(out.dest.join(".mcp.json")).expect("read");
+        assert!(mcp.contains(&out.dest.display().to_string()), "{mcp}");
+    }
+
+    #[test]
+    fn an_installed_plugin_is_found_by_the_loader() {
+        let staged = staged_plugin("install-loads", "demo");
+        let home = tmpdir("install-loads-home");
+        let out = install_staged(&staged, None, &home, false).expect("installs");
+        let set = crate::plugins::load_in(Some(&home), &tmpdir("install-loads-cwd"), &[]);
+        let found = set
+            .plugins
+            .iter()
+            .find(|p| p.name == "demo")
+            .expect("loaded");
+        assert_eq!(found.origin, crate::plugins::Origin::UserClaude);
+        assert!(out.dest.is_dir());
     }
 }

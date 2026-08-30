@@ -700,7 +700,7 @@ fn download_to(url: &str, path: &Path) -> Result<(), String> {
 }
 
 /// Fails when any entry under `dir` is a symlink.
-fn reject_symlinks(dir: &Path) -> Result<(), String> {
+pub(crate) fn reject_symlinks(dir: &Path) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     for entry in entries.flatten() {
@@ -772,7 +772,7 @@ pub fn uninstall(name: &str, home: &Path) -> Result<PathBuf, String> {
 /// Hand-rolled rather than shelling out to `cp`: a plugin install that depends
 /// on a shell is one that behaves differently under a sandbox, and this runs
 /// on the one path where the user is handing plank code to run.
-fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+pub(crate) fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
