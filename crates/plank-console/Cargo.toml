@@ -18,7 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 plank-stream = { path = "../plank-stream" }
-turbo-vision = { path = "../../../turbo-vision-4-rust" }
+turbo-vision = { path = "../../refs/turbo-vision" }
 
 [lints]
 workspace = true

@@ -1,6 +1,6 @@
 [workspace]
 members = ["crates/*"]
-exclude = ["refs/edit", "refs/obscura", "refs/ds4"]
+exclude = ["refs/edit", "refs/obscura", "refs/ds4", "refs/turbo-vision"]
 
 [workspace.package]
 edition = "2024"
