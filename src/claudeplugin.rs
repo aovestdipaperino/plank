@@ -13,7 +13,38 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::tools::mcp::{Json, json_parse};
+use crate::tools::mcp::{Json, json_parse, json_write};
+
+/// Unwraps Claude Code's nested `hooks/hooks.json` shape, if present.
+///
+/// plank's own hook runner (`src/hooks.rs`) reads event names from the TOP
+/// level of the file. Claude Code plugins instead nest every event under one
+/// outer `"hooks"` key, e.g. `{"hooks": {"SessionStart": [...]}}`. Left alone,
+/// plank would see a single top-level key named `"hooks"`, refuse the plugin
+/// as naming an event plank does not implement, and — worse, under `--force`
+/// — install a file whose hooks can never fire, because `parse_config` would
+/// never find `SessionStart` at the top level either.
+///
+/// Detection looks only at the outer shape: an object whose `"hooks"` member
+/// is itself an object. That object's own contents — matcher groups, each
+/// with its own inner `"hooks"` array of `{type, command, shell, async,
+/// timeout}` — are plank's native format one level down and must survive
+/// untouched; this function only ever removes the single outer wrapper, never
+/// recurses into the members it returns.
+///
+/// Returns `None` when the value is not shaped this way, so a file that
+/// already puts events at the top level (or an event named `hooks`, though
+/// none of plank's or Claude Code's do) is reported as needing no change and
+/// can be left byte-for-byte as it was written.
+fn unwrap_nested_hooks(v: &Json) -> Option<Json> {
+    let Json::Obj(members) = v else {
+        return None;
+    };
+    members
+        .iter()
+        .find(|(k, val)| k == "hooks" && matches!(val, Json::Obj(_)))
+        .map(|(_, inner)| inner.clone())
+}
 
 /// Where a plugin is being fetched from, chosen by the shape of the argument.
 ///
@@ -162,6 +193,17 @@ pub fn install_dir(home: &Path) -> PathBuf {
 /// commands are model-facing text, and rewriting a path into them would change
 /// what the model reads rather than what a subprocess runs.
 ///
+/// `hooks/hooks.json` gets one more treatment the other file does not:
+/// [`unwrap_nested_hooks`] flattens Claude Code's nested shape into plank's
+/// own, so the two rewrites compose on a file (like obra/superpowers') that
+/// needs both. This is done here, at install time, rather than by teaching
+/// `src/hooks.rs` to accept both shapes, for the same reason the variable
+/// substitution is: it keeps the hook runner — shared with every other hook
+/// source — ignorant of a quirk that belongs to one of its inputs. The
+/// returned bool reports only the variable substitution, matching its doc
+/// below; a flatten with no `${CLAUDE_PLUGIN_ROOT}` in the file still writes
+/// the flattened content but leaves that bool false.
+///
 /// # Errors
 /// Returns a message when a file exists but cannot be read or written.
 pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
@@ -178,14 +220,29 @@ pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
         // pattern `$CLAUDE_PLUGIN_ROOT`, and inside `${CLAUDE_PLUGIN_ROOT}`
         // the character after `$` is `{`, not `C`, so the bare pattern can
         // never match there. Both spellings are replaced either way.
-        let out = text
+        let substituted = text
             .replace("${CLAUDE_PLUGIN_ROOT}", &root)
             .replace("$CLAUDE_PLUGIN_ROOT", &root);
+        let var_changed = substituted != text;
+        let mut out = substituted;
+        if rel == "hooks/hooks.json" {
+            // A malformed file cannot be flattened; `unsupported_hook_events`
+            // (run before this, in `install_staged`) is what refuses those,
+            // so by the time this runs a parse failure just means "leave the
+            // substituted text as it was" rather than an error of its own.
+            if let Some(parsed) = json_parse(&out)
+                && let Some(unwrapped) = unwrap_nested_hooks(&parsed)
+            {
+                let mut rewritten = String::new();
+                json_write(&mut rewritten, &unwrapped);
+                out = rewritten;
+            }
+        }
         if out != text {
             std::fs::write(&path, &out)
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-            changed = true;
         }
+        changed |= var_changed;
     }
     Ok(changed)
 }
@@ -211,7 +268,17 @@ pub fn unsupported_hook_events(root: &Path) -> Result<Vec<String>, String> {
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let Some(Json::Obj(members)) = json_parse(&text) else {
+    let Some(parsed) = json_parse(&text) else {
+        return Err(format!(
+            "{} does not parse as a JSON object",
+            path.display()
+        ));
+    };
+    // Checked against the same unwrapped shape `rewrite_plugin_root` writes,
+    // so a nested file's refusal (or acceptance) names the events it will
+    // actually end up installed under, not the single outer "hooks" key.
+    let effective = unwrap_nested_hooks(&parsed).unwrap_or(parsed);
+    let Json::Obj(members) = effective else {
         return Err(format!(
             "{} does not parse as a JSON object",
             path.display()
@@ -1015,6 +1082,49 @@ mod tests {
         );
     }
 
+    /// The real `hooks/hooks.json` from obra/superpowers, nesting every event
+    /// under one outer `"hooks"` key and using `${CLAUDE_PLUGIN_ROOT}`. This
+    /// is the file that found the defect.
+    const SUPERPOWERS_HOOKS_JSON: &str = r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd\" session-start",
+            "shell": "bash",
+            "async": false
+          }
+        ]
+      }
+    ]
+  }
+}"#;
+
+    #[test]
+    fn a_nested_hooks_file_naming_only_known_events_is_supported() {
+        let root = tmpdir("hooks-nested-known");
+        write(&root, "hooks/hooks.json", SUPERPOWERS_HOOKS_JSON);
+        assert_eq!(
+            unsupported_hook_events(&root).expect("ok"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_nested_hooks_file_naming_an_unknown_event_is_still_refused() {
+        let root = tmpdir("hooks-nested-unknown");
+        write(
+            &root,
+            "hooks/hooks.json",
+            r#"{"hooks":{"SubagentStop":[{"hooks":[{"type":"command","command":"true"}]}]}}"#,
+        );
+        let got = unsupported_hook_events(&root).expect("ok");
+        assert_eq!(got, vec!["SubagentStop".to_string()]);
+    }
+
     #[test]
     fn a_malformed_hooks_file_is_an_error() {
         let root = tmpdir("hooks-malformed");
@@ -1051,6 +1161,94 @@ mod tests {
         let dest = tmpdir("rewrite-none");
         write(&dest, ".mcp.json", r#"{"mcpServers":{}}"#);
         assert!(!rewrite_plugin_root(&dest).expect("ok"));
+    }
+
+    #[test]
+    fn a_nested_hooks_file_is_flattened_and_still_parses_with_its_command_intact() {
+        // The end-to-end proof this task is about: install the real
+        // superpowers file, then hand the INSTALLED file to plank's own
+        // `hooks::parse_config` and check the event and command survived,
+        // not just that the text looks flat.
+        let dest = tmpdir("rewrite-flatten-parity");
+        write(&dest, "hooks/hooks.json", SUPERPOWERS_HOOKS_JSON);
+        rewrite_plugin_root(&dest).expect("ok");
+        let installed = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
+        assert!(!installed.contains("CLAUDE_PLUGIN_ROOT"), "{installed}");
+        let hooks = crate::hooks::parse_config(&installed);
+        assert!(hooks.warnings.is_empty(), "{:?}", hooks.warnings);
+        assert_eq!(hooks.session_start.len(), 1);
+        let group = &hooks.session_start[0];
+        assert_eq!(group.matcher, "startup|clear|compact");
+        assert_eq!(group.hooks.len(), 1);
+        let root = dest.display().to_string();
+        assert!(
+            group.hooks[0]
+                .command
+                .contains(&format!("{root}/hooks/run-hook.cmd")),
+            "{}",
+            group.hooks[0].command
+        );
+    }
+
+    #[test]
+    fn a_nested_file_with_claude_plugin_root_ends_up_both_flat_and_substituted() {
+        let dest = tmpdir("rewrite-flatten-and-substitute");
+        write(
+            &dest,
+            "hooks/hooks.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/g"}]}]}}"#,
+        );
+        assert!(rewrite_plugin_root(&dest).expect("ok"));
+        let installed = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
+        assert!(!installed.contains("CLAUDE_PLUGIN_ROOT"), "{installed}");
+        assert!(
+            !installed.trim_start().starts_with("{\"hooks\":{"),
+            "{installed}"
+        );
+        let root = dest.display().to_string();
+        let hooks = crate::hooks::parse_config(&installed);
+        assert_eq!(hooks.pre_tool_use.len(), 1);
+        assert!(
+            hooks.pre_tool_use[0].hooks[0]
+                .command
+                .contains(&format!("{root}/bin/g")),
+            "{}",
+            hooks.pre_tool_use[0].hooks[0].command
+        );
+    }
+
+    #[test]
+    fn an_already_flat_hooks_file_is_left_byte_for_byte_unchanged() {
+        let dest = tmpdir("rewrite-flat-unchanged");
+        let body =
+            r#"{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"true"}]}]}"#;
+        write(&dest, "hooks/hooks.json", body);
+        assert!(!rewrite_plugin_root(&dest).expect("ok"));
+        let installed = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
+        assert_eq!(installed, body);
+        let hooks = crate::hooks::parse_config(&installed);
+        assert_eq!(hooks.pre_tool_use.len(), 1);
+    }
+
+    #[test]
+    fn a_matcher_groups_inner_hooks_array_survives_the_unwrap_intact() {
+        // The subtlest part of the task: the outer `"hooks"` wrapper must be
+        // removed, but each matcher group's own `"hooks"` array — plank's
+        // native format one level down — must not be touched by the same
+        // name.
+        let dest = tmpdir("rewrite-inner-hooks-survive");
+        write(
+            &dest,
+            "hooks/hooks.json",
+            r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"one"},{"type":"command","command":"two"}]}]}}"#,
+        );
+        rewrite_plugin_root(&dest).expect("ok");
+        let installed = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
+        let hooks = crate::hooks::parse_config(&installed);
+        assert_eq!(hooks.pre_tool_use.len(), 1);
+        assert_eq!(hooks.pre_tool_use[0].hooks.len(), 2);
+        assert_eq!(hooks.pre_tool_use[0].hooks[0].command, "one");
+        assert_eq!(hooks.pre_tool_use[0].hooks[1].command, "two");
     }
 
     #[test]
