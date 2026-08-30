@@ -142,9 +142,34 @@ Long turns end with a native macOS notification — your prompt as the headline 
   <img src="assets/notification.png" alt="macOS desktop notification: a finished plank task with the prompt as headline and the answer tail as body" width="500">
 </p>
 
+### Watching the thinking in a debug console
+
+`ui.showThinking` controls whether the model's reasoning is rendered in the scrollback. It is **off by default**: the thinking is usually noise once you trust the answer, and hiding it keeps the transcript readable.
+
+Hiding it does not have to mean losing it. While `showThinking` is off, plank mirrors its whole raw model stream to [turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a text-mode viewer that renders it in its own window, so the reasoning is one glance away instead of gone:
+
+<p align="center">
+  <img src="assets/debug-console.png" alt="turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein" width="700">
+</p>
+
+Install it and leave it running; plank finds it on its own:
+
+```sh
+brew install aovestdipaperino/tap/turbo-debug-console
+turbo-debug-console
+```
+
+`cargo install turbo-debug-console` works too. It listens on port 7878, and each plank session gets its own window titled `plank:<session-name>`, matching the session name plank shows above the prompt. Sessions are reconnectable: the window and its scrollback survive plank exiting, so restarting plank appends the new run below a `-- reconnected --` rule instead of losing the old one.
+
+The console is entirely optional and plank never depends on it. If nothing is listening, plank connects to nothing, says nothing, and behaves exactly as it always has. If you close the console mid-turn, the mirror is dropped and the turn carries on. Turning `showThinking` back on disconnects it, since the reasoning is back in the scrollback where you can already see it.
+
+What arrives there is the *whole* stream, not just the hidden part: thinking, answer, and tool calls, rendered by the same renderer plank uses for its own output. That is deliberate. The console shares plank's streaming renderer as the [`trace-stream`](https://crates.io/crates/trace-stream) crate rather than reimplementing it, so the two cannot drift, and reasoning arrives in the context of the answer it produced rather than as disembodied fragments.
+
 ### Settings file
 
-Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works. Edit it in-session with `/config` (an interactive TUI form, or `/config <section>.<key> <value>` from the prompt, e.g. `/config ui.showThinking false`); changes write `./.plank/settings.json` and apply immediately.
+Preferences you'd otherwise retype every launch live in `settings.json`, hierarchical like the MCP configs: `~/.plank/settings.json` applies globally, `./.plank/settings.json` in the working directory overrides it key by key. Everything is optional — the file need not exist, and any subset of keys works. Edit it in-session with `/config` (an interactive TUI form, or `/config <section>.<key> <value>` from the prompt, e.g. `/config ui.showThinking false`); changes write `./.plank/settings.json` and apply immediately. In the interactive form, **Ctrl-S** saves and closes; **Esc** cancels and discards.
+
+A few keys cannot take effect until you restart, because what they configure is built once at startup: everything under `engine` (the model is already loaded), `safety.sandbox` and `safety.btwSuspend`, and the keys that shape the system prompt — `tools.recall`, `tools.fanout`, `tools.runCode` and `git.signCommits` — since the prompt is built once per session and KV-cached, and rewriting it mid-session would throw that cache away. Everything else is live.
 
 ```json
 {
@@ -153,7 +178,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
               "thinkingToolCalls": true },
   "ui":     { "respectGitignore": true, "popupRows": 15, "indexRefreshSecs": 5,
               "historySize": 512, "showToolCalls": false, "showToolResults": false,
-              "showThinking": true, "notifications": "always", "notifyAfterSecs": 10,
+              "showThinking": false, "notifications": "always", "notifyAfterSecs": 10,
               "screensaver": "1m", "screensaverFace": "matrix" },
   "safety": { "sandbox": true, "btwSuspend": true },
   "mcp":    { "timeoutSecs": 30 },
@@ -179,7 +204,7 @@ Preferences you'd otherwise retype every launch live in `settings.json`, hierarc
 | | `historySize` | 512 | Prompt history entries retained. |
 | | `showToolCalls` | `false` | Show the model's `🛠️` tool-call banners. Off keeps the UI uncluttered; the tools still run. |
 | | `showToolResults` | `false` | Echo tool result text into the scrollback. Off keeps the UI clean; the model still receives the results. |
-| | `showThinking` | `true` | Render the model's thinking (dimmed) in the scrollback. Off hides it from the display; the model still produces it. |
+| | `showThinking` | `false` | Render the model's thinking (dimmed) in the scrollback. Off hides it from the display; the model still produces it, and plank mirrors the stream to a [debug console](#watching-the-thinking-in-a-debug-console) if one is running. |
 | | `notifications` | `always` | When desktop notifications fire: `always`, `unfocused` (only while the terminal window isn't focused), or `never`. |
 | | `notifyAfterSecs` | 10 | Minimum turn duration before a turn-end notification; awaiting-input notifications ignore it. |
 | | `crtOff` | `true` | CRT power-off animation on clean TUI exit. |
