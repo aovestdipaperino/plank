@@ -16,6 +16,22 @@ description. It reads your installed skills, templates, subagents, hooks and MCP
 servers first, so it suggests what is missing instead of what you already have.
 See [Slash commands](/guide/04-slash-commands.html).
 
+**The thinking you hid is one glance away, in a second window.** With
+`showThinking` off the scrollback stays about the answer — but the reasoning is
+still worth watching while it happens, and a log file only tells you afterwards.
+plank mirrors its whole raw model stream to
+[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console), a
+text-mode viewer that renders it in its own window: thinking dimmed above the
+answer, code highlighted, tool calls as banners.
+
+![turbo-debug-console showing a plank session: the model's thinking in dim grey above its answer in white, in a text-mode window titled plank:sneezy-einstein](/assets/debug-console.png)
+
+Each session gets a window titled `plank:<session-name>`, matching the name above
+your prompt, and the window and its scrollback survive plank exiting — restart and
+the new run appends below a `-- reconnected --` rule. It is entirely optional:
+with nothing listening plank connects to nothing, says nothing, and behaves
+exactly as it always has. `brew install aovestdipaperino/tap/turbo-debug-console`.
+
 **plank tells you where every setting came from.** Settings arrive from five
 layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and
 CLI flags — and "I set that and nothing happened" used to mean reading code.
