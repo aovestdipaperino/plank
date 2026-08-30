@@ -7,4 +7,6 @@
 pub mod ansiasm;
 pub mod cmd;
 pub mod pipeline;
+pub mod proto;
+pub mod registry;
 pub mod streamview;
