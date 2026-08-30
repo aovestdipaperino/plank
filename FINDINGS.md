@@ -1682,15 +1682,15 @@ with M8/M9 so it happens once.
   (the staged tree in `install_staged`, the local-directory fallback in
   `fetch`, and the git-clone and archive branches of `fetch`/`clone`). This
   exact inversion — scanning the destination instead of the source — was
-  introduced and caught three times during this work: twice while
+  introduced and caught twice during this work, both while
   `reject_unsafe_symlinks` (now `plugins::reject_escaping_symlinks`, moved and
   renamed when its containment rule became the one policy shared by
   `/plugins install` and `/install-claude-plugin`) still lived in
-  `claudeplugin.rs`, and once in `plugins::install` itself, which shipped for
-  a time with *no* symlink scan at all on its `<directory>` argument — a
-  reviewer's reproduction (a plugin directory holding a symlink to
-  `~/.ssh/id_rsa`) landed the private key's contents, as a plain file, inside
-  `~/.plank/plugins/dev/`. If you are about to move a
+  `claudeplugin.rs`. A third, separate gap was pre-existing rather than an
+  inversion: `plugins::install` had *no* symlink scan at all on its
+  `<directory>` argument. A reviewer's reproduction of that one (a plugin
+  directory holding a symlink to `~/.ssh/id_rsa`) landed the private key's
+  contents, as a plain file, inside `~/.plank/plugins/dev/`. If you are about to move a
   `reject_escaping_symlinks` call, or write a similar check anywhere
   `copy_tree` is involved, put it before the copy and write a test that plants
   a symlink to a secret and asserts the secret's *contents* never appear
