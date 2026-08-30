@@ -652,6 +652,25 @@ fn staging_dir(home: &Path) -> Result<PathBuf, String> {
 
 /// Downloads, extracts and validates, returning the plugin root inside `dir`.
 fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
+    fetch_archive(url, dir)?;
+    find_plugin_root(dir)
+        .ok_or_else(|| format!("{url} contains no plugin (no .plank-plugin/plugin.json)"))
+}
+
+/// Downloads the `.tar.gz` at `url`, extracts it into `dir`, and refuses any
+/// symlink in the result.
+///
+/// Split out of [`fetch_and_stage`] because everything here is about getting
+/// bytes onto disk safely and none of it is plank-specific: a Claude Code
+/// plugin needs exactly this and then a different notion of what counts as a
+/// plugin root.
+///
+/// # Errors
+/// Returns a message when the URL is rejected by the remote policy, the
+/// download fails or exceeds the size cap, the archive will not extract, or it
+/// contains a symlink.
+pub(crate) fn fetch_archive(url: &str, dir: &Path) -> Result<(), String> {
+    crate::remote::validate_remote_url(url, false)?;
     let archive = dir.join("plugin.tar.gz");
     download_to(url, &archive)?;
     let status = std::process::Command::new("tar")
@@ -668,9 +687,7 @@ fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
         return Err(format!("{url} did not extract as a .tar.gz"));
     }
     let _ = std::fs::remove_file(&archive);
-    reject_symlinks(dir)?;
-    find_plugin_root(dir)
-        .ok_or_else(|| format!("{url} contains no plugin (no .plank-plugin/plugin.json)"))
+    reject_symlinks(dir)
 }
 
 /// Streams `url` into `path`, refusing anything over [`MAX_ARCHIVE_BYTES`].

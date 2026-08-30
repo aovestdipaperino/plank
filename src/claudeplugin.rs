@@ -341,6 +341,77 @@ pub fn install_staged(
     })
 }
 
+/// Fetches the plugin `arg` names, validates it, and installs it.
+///
+/// The one entry point the slash command calls. Everything it does happens in
+/// a staging directory under the install root, which is removed on every exit
+/// path: a half-fetched tree left behind would be found by the next scan as a
+/// plugin nobody asked for.
+///
+/// # Errors
+/// Returns a message when the argument names nothing fetchable, the fetch
+/// fails, or the tree does not pass [`install_staged`]'s checks.
+pub fn install(
+    arg: &str,
+    want: Option<&str>,
+    home: &Path,
+    force: bool,
+) -> Result<Installed, String> {
+    let staging = staging_dir(home)?;
+    let result = fetch(arg, &staging).and_then(|tree| install_staged(&tree, want, home, force));
+    let _ = std::fs::remove_dir_all(&staging);
+    result
+}
+
+/// A private, empty staging directory. Removed by [`install`] on every path.
+fn staging_dir(home: &Path) -> Result<PathBuf, String> {
+    let base = install_dir(home).join(".staging");
+    // Fresh every time: reusing it would mix a previous failed fetch into a new
+    // one, and the plugin root is found by looking at the tree.
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
+    Ok(base)
+}
+
+/// Puts the named plugin's tree inside `staging` and returns its root.
+fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
+    // A local directory is checked before the URL forms: `git clone` takes a
+    // path as happily as a URL, and it is how a plugin is tried before it is
+    // published.
+    if Path::new(arg).is_dir() {
+        return clone(arg, staging);
+    }
+    match parse_source(arg)? {
+        Source::Git { url } => clone(&url, staging),
+        Source::Archive { url } => {
+            crate::plugins::fetch_archive(&url, staging)?;
+            Ok(staging.to_path_buf())
+        }
+    }
+}
+
+/// Shallow-clones `url` into `staging/repo` and drops its history.
+fn clone(url: &str, staging: &Path) -> Result<PathBuf, String> {
+    let dest = staging.join("repo");
+    let status = std::process::Command::new("git")
+        .arg("clone")
+        .arg("--quiet")
+        .arg("--depth")
+        .arg("1")
+        .arg(url)
+        .arg(&dest)
+        .status()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !status.success() {
+        return Err(format!("cannot clone {url}"));
+    }
+    // The history is not part of the plugin, and it is a tree of files that
+    // would otherwise be scanned for symlinks and copied into the user's home.
+    let _ = std::fs::remove_dir_all(dest.join(".git"));
+    crate::plugins::reject_symlinks(&dest)?;
+    Ok(dest)
+}
+
 /// The plugin's name, from its manifest's `name` field, falling back to the
 /// directory name. The name becomes a path component under `install_dir`, so
 /// values that would not create a fresh subdirectory are refused rather than
@@ -819,5 +890,102 @@ mod tests {
         let home = tmpdir("install-whitespace-home");
         let err = install_staged(&staged, None, &home, false).expect_err("refused");
         assert!(err.contains("not a usable plugin name"), "{err}");
+    }
+
+    #[test]
+    fn a_git_source_clones_and_installs() {
+        // A local bare repository, so the test needs no network.
+        let root = tmpdir("git-install");
+        let work = root.join("work");
+        write(&work, ".claude-plugin/plugin.json", r#"{"name":"gitdemo"}"#);
+        let bare = root.join("bare.git");
+        for args in [
+            vec!["init", "-q", "-b", "main", work.to_str().expect("utf8")],
+            vec!["-C", work.to_str().expect("utf8"), "add", "-A"],
+            vec![
+                "-C",
+                work.to_str().expect("utf8"),
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+            vec![
+                "clone",
+                "-q",
+                "--bare",
+                work.to_str().expect("utf8"),
+                bare.to_str().expect("utf8"),
+            ],
+        ] {
+            let ok = std::process::Command::new("git")
+                .args(&args)
+                .status()
+                .expect("git runs")
+                .success();
+            assert!(ok, "git {args:?} failed");
+        }
+        let home = tmpdir("git-install-home");
+        let out = install(bare.to_str().expect("utf8"), None, &home, false).expect("installs");
+        assert_eq!(out.name, "gitdemo");
+        assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
+        // The clone's own history is not part of the plugin.
+        assert!(!out.dest.join(".git").exists(), ".git is not installed");
+    }
+
+    #[test]
+    fn a_failed_install_leaves_no_staging_behind() {
+        let root = tmpdir("staging-clean");
+        let work = root.join("work");
+        write(&work, "README.md", "not a plugin\n");
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main", work.to_str().expect("utf8")])
+            .status()
+            .expect("git runs")
+            .success();
+        assert!(ok);
+        for args in [
+            vec!["-C", work.to_str().expect("utf8"), "add", "-A"],
+            vec![
+                "-C",
+                work.to_str().expect("utf8"),
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            assert!(
+                std::process::Command::new("git")
+                    .args(&args)
+                    .status()
+                    .expect("git runs")
+                    .success()
+            );
+        }
+        let home = tmpdir("staging-clean-home");
+        let err = install(work.to_str().expect("utf8"), None, &home, false).expect_err("refused");
+        assert!(err.contains(".claude-plugin"), "{err}");
+        assert!(
+            !install_dir(&home).join(".staging").exists(),
+            "staging removed on the failure path"
+        );
+    }
+
+    #[test]
+    fn an_archive_over_plain_http_to_a_public_host_is_refused() {
+        let home = tmpdir("archive-tls");
+        let err = install("http://plugins.example.com/x.tar.gz", None, &home, false)
+            .expect_err("refused");
+        assert!(
+            err.to_lowercase().contains("https") || err.to_lowercase().contains("tls"),
+            "{err}"
+        );
     }
 }
