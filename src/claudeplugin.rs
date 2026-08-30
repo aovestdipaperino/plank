@@ -117,9 +117,10 @@ pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        // Braced form first: replacing the bare `$CLAUDE_PLUGIN_ROOT` first
-        // would turn `${CLAUDE_PLUGIN_ROOT}` into `${<path>}` and leave a
-        // stray brace behind.
+        // Order does not matter here: `str::replace` matches the literal
+        // pattern `$CLAUDE_PLUGIN_ROOT`, and inside `${CLAUDE_PLUGIN_ROOT}`
+        // the character after `$` is `{`, not `C`, so the bare pattern can
+        // never match there. Both spellings are replaced either way.
         let out = text
             .replace("${CLAUDE_PLUGIN_ROOT}", &root)
             .replace("$CLAUDE_PLUGIN_ROOT", &root);

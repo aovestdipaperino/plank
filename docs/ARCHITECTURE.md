@@ -249,6 +249,22 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
 
+### Plugins (`plugins.rs`, `claudeplugin.rs`)
+- `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
+  skills, agents, templates, hooks, an `.mcp.json` and a `settings.json`,
+  discovered under `~/.plank/plugins/dev/`, `~/.plank/plugins/claude/`,
+  `./.plank/plugins/`, or `--plugin-dir`, in that scan order. Both the plank
+  (`.plank-plugin/plugin.json`, `templates/`, `hooks.json`) and Claude Code
+  (`.claude-plugin/plugin.json`, `commands/`, `hooks/hooks.json`) spellings are
+  accepted.
+- `claudeplugin.rs` — the other half: fetching a Claude Code plugin from a git
+  repository, a marketplace repository, or a `.tar.gz`, validating it against
+  the hook events plank implements, and installing it into
+  `~/.plank/plugins/claude/`, the scan root `plugins.rs` checks between `dev/`
+  and the project root. It is a separate module because it owns a different
+  set of questions than `plugins.rs` — network, subprocess and trust decisions
+  that only matter once, at install time, not on every scan.
+
 ### Terminal front-ends (`tui.rs`, `status.rs`, `statusbar.rs`, `editor.rs`, `configform.rs`, `miniedit/`)
 - `tui.rs` — the Ratatui presentation layer: a styled scrollback `OutputLog`
   (a `RenderSink`), the frame layout, and the magenta-colored progress bar.

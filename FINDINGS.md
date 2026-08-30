@@ -1651,3 +1651,41 @@ with M8/M9 so it happens once.
   paying the propose; and llama.cpp's `p_min` defaults to 0 — never decline —
   which is only rational because its verify is cheap. Nothing here is
   actionable in plank: plank's side of the DSpark path is already correct.
+- **`/install-claude-plugin`: `${CLAUDE_PLUGIN_ROOT}` gets rewritten on disk,
+  not injected at exec time.** Claude Code hooks and MCP server commands
+  reference `${CLAUDE_PLUGIN_ROOT}` expecting the environment to supply it, but
+  plank's hook runner (`src/hooks.rs`) execs `/bin/sh` with no injected
+  environment at all, and `plugins.rs` flattens every source's hooks into one
+  list with no per-hook provenance to thread a root through. So
+  `claudeplugin::rewrite_plugin_root` substitutes the literal path into
+  `hooks/hooks.json` and `.mcp.json` at install time instead — the tradeoff
+  being that the installed tree stops matching upstream and breaks if the
+  directory is ever moved, which the install output says out loud.
+- **`plugins::find_plugin_root` is plank-only, hence `claudeplugin`'s own
+  `resolve_in_tree`.** `find_plugin_root` requires `.plank-plugin/plugin.json`
+  at the root — it has no notion of a Claude Code manifest, and no notion of a
+  marketplace repository holding several plugins. Rather than teach it a
+  second manifest spelling and a marketplace-resolution step it has no other
+  caller for, `claudeplugin::resolve_in_tree` is its own small function that
+  understands both `.claude-plugin/plugin.json` and
+  `.claude-plugin/marketplace.json`.
+- **`plugins::copy_tree` always follows symlinks — so `reject_symlinks` must
+  always scan the *source* tree, never the copy, or it will find nothing.**
+  `copy_tree`'s file branch is `std::fs::copy`, which reads through a symlink
+  and writes the target's bytes out as a plain file at the destination. Once
+  that copy has happened, the symlink is simply gone — there is no longer
+  anything at the destination for a symlink check to see, so a check run
+  *after* the copy always passes, no matter what the source contained. The fix
+  is checking the source before the copy ever runs, in both of
+  `claudeplugin.rs`'s copy sites (the staged tree in `install_staged`, and the
+  local-directory fallback in `fetch`). This exact inversion — scanning the
+  destination instead of the source — was introduced and caught twice during
+  this work, and once got far enough that a reviewer's reproduction (a
+  plugin directory holding a symlink to `~/.ssh/id_rsa`) landed the private
+  key's contents, as a plain file, inside `~/.plank/plugins/claude/`. If you
+  are about to move a `reject_symlinks` call in this file, or write a similar
+  check anywhere `copy_tree` is involved, put it before the copy and write a
+  test that plants a symlink to a secret and asserts the secret's *contents*
+  never appear anywhere under the destination — asserting the symlink itself
+  is absent is not enough, because by then it never existed there to begin
+  with.
