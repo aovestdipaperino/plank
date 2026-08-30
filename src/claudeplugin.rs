@@ -13,6 +13,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::tools::mcp::{Json, json_parse};
+
 /// Where a plugin is being fetched from, chosen by the shape of the argument.
 ///
 /// A two-variant enum rather than one per user-facing form: a marketplace repo
@@ -82,9 +84,59 @@ pub fn install_dir(home: &Path) -> PathBuf {
     home.join(".plank").join("plugins").join("claude")
 }
 
+/// Event names in `root/hooks/hooks.json` that plank does not implement.
+///
+/// Claude Code defines `Notification` and `SubagentStop`, which plank has no
+/// equivalent for, and a config may also carry a typo or an event from a
+/// newer release. A hook under any of those names would be installed and then
+/// never fire, which is the silent failure this check exists to turn into a
+/// loud one at install time.
+///
+/// A missing file is not a problem — most plugins contribute no hooks — but an
+/// unparseable one is, because a file that cannot be read cannot be cleared.
+///
+/// # Errors
+/// Returns a message when `hooks/hooks.json` exists but cannot be read or does
+/// not parse as a JSON object.
+pub fn unsupported_hook_events(root: &Path) -> Result<Vec<String>, String> {
+    let path = root.join("hooks").join("hooks.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let Some(Json::Obj(members)) = json_parse(&text) else {
+        return Err(format!(
+            "{} does not parse as a JSON object",
+            path.display()
+        ));
+    };
+    Ok(members
+        .iter()
+        .map(|(k, _)| k.clone())
+        .filter(|k| !crate::hooks::KNOWN_EVENTS.contains(&k.as_str()))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Writes `body` to `root/rel`, creating parent directories.
+    fn write(root: &Path, rel: &str, body: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("has a parent")).expect("mkdir");
+        std::fs::write(&path, body).expect("write");
+    }
+
+    /// A fresh empty directory under the system temp dir, named for the test.
+    fn tmpdir(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("plank-claudeplugin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        dir
+    }
 
     #[test]
     fn install_dir_is_under_the_plank_home() {
@@ -138,5 +190,53 @@ mod tests {
     #[test]
     fn an_empty_argument_is_rejected() {
         assert!(parse_source("").is_err());
+    }
+
+    #[test]
+    fn no_hooks_file_is_no_unsupported_events() {
+        let root = tmpdir("hooks-absent");
+        assert_eq!(
+            unsupported_hook_events(&root).expect("ok"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn known_events_are_supported() {
+        let root = tmpdir("hooks-known");
+        write(
+            &root,
+            "hooks/hooks.json",
+            r#"{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"true"}]}],
+                "SessionStart":[{"hooks":[{"type":"command","command":"true"}]}]}"#,
+        );
+        assert_eq!(
+            unsupported_hook_events(&root).expect("ok"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn claude_only_events_are_reported() {
+        let root = tmpdir("hooks-unknown");
+        write(
+            &root,
+            "hooks/hooks.json",
+            r#"{"PreToolUse":[],"SubagentStop":[],"Notification":[]}"#,
+        );
+        let mut got = unsupported_hook_events(&root).expect("ok");
+        got.sort();
+        assert_eq!(
+            got,
+            vec!["Notification".to_string(), "SubagentStop".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_malformed_hooks_file_is_an_error() {
+        let root = tmpdir("hooks-malformed");
+        write(&root, "hooks/hooks.json", "{not json");
+        let err = unsupported_hook_events(&root).expect_err("rejected");
+        assert!(err.contains("hooks.json"), "{err}");
     }
 }
