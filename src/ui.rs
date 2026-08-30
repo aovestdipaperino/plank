@@ -30,7 +30,6 @@ use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
 use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
-use plank_stream::TerminalSink;
 use crate::session::{Message, Session, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
@@ -39,6 +38,7 @@ use crate::trace::Trace;
 use crate::tui::{self, OutputLog};
 use crate::viz::{RenderSink, StreamRenderer};
 use crate::worker::{self, BroadcastBus, ChannelSink, TurnShared, UiEvent};
+use plank_stream::TerminalSink;
 
 /// UI-thread state for `--ui-remote` remote control.
 ///

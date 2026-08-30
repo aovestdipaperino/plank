@@ -205,7 +205,23 @@ impl Server {
         for (id, port, shutdown) in reaped {
             shutdown.store(true, Ordering::SeqCst);
             if port != 0 {
-                let _ = TcpStream::connect(("127.0.0.1", port));
+                // Dropping a TcpListener does not reliably wake a thread blocked in
+                // accept() on all platforms, so we force one more iteration of the
+                // accept loop with a self-connect. This wakes the blocked thread so
+                // it observes the shutdown flag and exits cleanly, releasing the port.
+                // Retry on transient failures (EMFILE, fd exhaustion, etc).
+                const MAX_ATTEMPTS: u32 = 3;
+                for attempt in 1..=MAX_ATTEMPTS {
+                    match TcpStream::connect(("127.0.0.1", port)) {
+                        Ok(_) => break,
+                        Err(e) if attempt == MAX_ATTEMPTS => {
+                            eprintln!("Failed to wake session {id} on port {port}: {e}");
+                        }
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
             }
             let _ = self.tx.send(ServerEvent::Closed { id });
         }

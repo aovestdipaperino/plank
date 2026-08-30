@@ -69,7 +69,8 @@ pub struct Pipeline {
 impl Pipeline {
     #[must_use]
     pub fn new(opts: RenderOptions) -> Self {
-        let mut stream = StreamRenderer::new(TerminalSink::new(TokenRenderer::new(Vec::new(), opts)));
+        let mut stream =
+            StreamRenderer::new(TerminalSink::new(TokenRenderer::new(Vec::new(), opts)));
         stream.set_tool_names(tool_names());
         Self {
             stream,
@@ -186,7 +187,10 @@ mod tests {
             !txt.contains("DSML"),
             "raw DSML must never reach the screen: {txt:?}"
         );
-        assert!(txt.contains("src/main.rs"), "banner should name the path: {txt:?}");
+        assert!(
+            txt.contains("src/main.rs"),
+            "banner should name the path: {txt:?}"
+        );
     }
 
     /// Invented, non-DSML markup (a bare `<read>` opening a line) must never
@@ -213,7 +217,12 @@ mod tests {
         let mut p = Pipeline::new(opts());
         let mut v = StreamView::new(Rect::new(0, 0, 80, 24));
         p.feed(b"```rust\nfn main() {}\n```\n", &mut v);
-        let attrs: Vec<TvColor> = v.styled_lines().iter().flatten().map(|c| c.attr.fg).collect();
+        let attrs: Vec<TvColor> = v
+            .styled_lines()
+            .iter()
+            .flatten()
+            .map(|c| c.attr.fg)
+            .collect();
         assert!(
             attrs.iter().any(|c| *c != TvColor::LightGray),
             "a highlighted code block must not be uniformly default-colored"
