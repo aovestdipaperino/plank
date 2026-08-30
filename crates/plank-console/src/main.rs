@@ -263,13 +263,17 @@ impl Console {
     fn apply_intent(&mut self, app: &mut Application, intent: ConsoleIntent) {
         match intent {
             ConsoleIntent::CreateWindow { id, name, port } => {
-                let view = Rc::new(RefCell::new(StreamView::new(app.get_tile_rect())));
+                let window_bounds = tile_window_bounds(app);
+                let view = Rc::new(RefCell::new(StreamView::new(session_view_bounds(
+                    window_bounds,
+                ))));
                 self.sessions
                     .insert(id, name.clone(), port, Rc::clone(&view), self.opts.0);
                 let mut window = WindowBuilder::new()
-                    .bounds(tile_window_bounds(app))
+                    .bounds(window_bounds)
                     .title(format_title(&name, port))
                     .build();
+                apply_session_window_palette(&mut window);
                 window.add(Box::new(SharedStreamView(view)));
                 let view_id = app.desktop.add(Box::new(window));
                 self.window_ids.insert(view_id, id);
@@ -333,7 +337,10 @@ impl Console {
         };
 
         let name = basename(&path);
-        let view = Rc::new(RefCell::new(StreamView::new(app.get_tile_rect())));
+        let window_bounds = tile_window_bounds(app);
+        let view = Rc::new(RefCell::new(StreamView::new(session_view_bounds(
+            window_bounds,
+        ))));
         let id = NEXT_CAPTURE_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         self.sessions
@@ -345,9 +352,10 @@ impl Console {
         }
 
         let mut window = WindowBuilder::new()
-            .bounds(tile_window_bounds(app))
+            .bounds(window_bounds)
             .title(name)
             .build();
+        apply_session_window_palette(&mut window);
         window.add(Box::new(SharedStreamView(view)));
         let view_id = app.desktop.add(Box::new(window));
         self.window_ids.insert(view_id, id);
@@ -367,6 +375,41 @@ fn tile_window_bounds(app: &Application) -> Rect {
     bounds.b.x -= shadow_x;
     bounds.b.y -= shadow_y;
     bounds
+}
+
+/// Bounds for a session's `StreamView`, given the *window's* outer bounds.
+///
+/// `Window::add` places children in the window's interior `Group`, whose
+/// children take bounds relative to the interior (starting at `(0, 0)`) —
+/// `Group::add` converts relative to absolute using the interior's own
+/// origin. The interior itself is the window bounds grown by `(-1, -1)`
+/// (one row/column inset for the frame on every side), so with `Rect::b`
+/// exclusive the interior is exactly two narrower and two shorter than the
+/// outer window. Passing the outer window bounds here (as before) drew the
+/// view over the frame instead of inside it. See
+/// `turbo-vision-4-rust/src/views/log_window.rs` for the same idiom.
+fn session_view_bounds(window_bounds: Rect) -> Rect {
+    Rect::new(0, 0, window_bounds.width() - 2, window_bounds.height() - 2)
+}
+
+/// Points a session window's palette at the app palette's "Black Window"
+/// region (`CP_APP_COLOR` entries 97-104) instead of the default Blue
+/// window colors, per the user's request for a black background.
+///
+/// Only the 8 window-palette entries (frame passive/active/icon, scrollbar
+/// page/arrows, normal/selected text, reserved) are overridden — matching
+/// `CP_BLUE_WINDOW`'s own first 8 entries and the `LogWindowBuilder`
+/// precedent in `log_window.rs`. `Palette::get` returns the error color 0
+/// (not a panic or garbage read) for any index beyond the slice's length,
+/// so the 11 trailing syntax-highlighting entries (9-19) that `CP_BLUE_WINDOW`
+/// carries are simply left unmapped here; `StreamView` paints its own
+/// `Cell`s with explicit `Attr`s from the ANSI parser, so those entries are
+/// never consulted for the stream text, and only the frame/scrollbar read
+/// the 8 entries we do provide. Frame passive/active (entries 1-2, mapped
+/// to app colors 97-98) keep the same layout as the Blue palette's own
+/// frame entries, so the title stays legible focused and unfocused.
+fn apply_session_window_palette(window: &mut Window) {
+    window.set_custom_palette(vec![97, 98, 99, 100, 101, 102, 103, 104]);
 }
 
 /// Reads `--port <n>` from argv; defaults to 7878.
@@ -655,6 +698,65 @@ mod title_render_tests {
         assert!(
             !row0.contains("demo :61278"),
             "expected the unshrunk-bounds title to be scrolled off row 0, but found it: {row0:?}"
+        );
+    }
+
+    /// Regression test for the "`StreamView` drawn over the frame" bug:
+    /// `StreamView::new(app.get_tile_rect())` handed the view the window's
+    /// *outer* bounds, so `Group::add` (relative -> absolute) placed it at
+    /// the window's own origin, on top of the frame. A view added to a
+    /// window's interior must be given bounds relative to the interior —
+    /// `(0, 0, w - 2, h - 2)` for a window of width `w`, height `h` — so
+    /// that after `Window::add` its absolute bounds land one row/column
+    /// inside the frame on every side.
+    #[test]
+    fn stream_view_bounds_land_inside_the_frame_not_over_it() {
+        use plank_console::streamview::StreamView;
+
+        let window_bounds = Rect::new(0, 0, 40, 20);
+        let view_bounds = super::session_view_bounds(window_bounds);
+        // Interior-relative: must start at the origin, not the window's.
+        assert_eq!(view_bounds, Rect::new(0, 0, 38, 18));
+
+        let mut window = WindowBuilder::new()
+            .bounds(window_bounds)
+            .title("demo")
+            .build();
+        window.add(Box::new(StreamView::new(view_bounds)));
+
+        // After Group::add's relative -> absolute conversion, the child's
+        // absolute bounds must be the window bounds inset by one cell of
+        // frame on every side (Rect::b is exclusive), not the window's
+        // outer bounds.
+        let absolute = window.child_at(0).bounds();
+        assert_eq!(absolute, Rect::new(1, 1, 39, 19));
+    }
+
+    /// Regression test for the actual pre-fix bug: passing the window's
+    /// *outer* bounds (unshrunk) as the child's relative bounds. `Group::add`
+    /// still offsets the child's top-left by the interior's own origin
+    /// (`(1, 1)` here), so the left/top edge lands correctly by
+    /// coincidence — the bug is that the child's bottom-right is then two
+    /// cells too large in each dimension, so it overlaps the frame's right
+    /// and bottom border instead of stopping at the interior's edge.
+    #[test]
+    fn outer_bounds_overflow_the_interior_by_the_frame_width() {
+        use plank_console::streamview::StreamView;
+
+        let window_bounds = Rect::new(0, 0, 40, 20);
+        let mut window = WindowBuilder::new()
+            .bounds(window_bounds)
+            .title("demo")
+            .build();
+        window.add(Box::new(StreamView::new(window_bounds)));
+
+        let absolute = window.child_at(0).bounds();
+        // The interior is (1, 1, 39, 19); the buggy child bounds instead
+        // reach to (41, 21) — two cells past the interior on each side.
+        assert_eq!(absolute, Rect::new(1, 1, 41, 21));
+        assert!(
+            absolute.b.x > 39 && absolute.b.y > 19,
+            "expected the unfixed bounds to overflow the interior (1,1,39,19), got {absolute:?}"
         );
     }
 }
