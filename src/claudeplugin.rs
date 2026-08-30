@@ -342,8 +342,10 @@ pub fn install_staged(
 }
 
 /// The plugin's name, from its manifest's `name` field, falling back to the
-/// directory name. The name becomes a path component, so a value carrying a
-/// separator is refused rather than sanitized: a plugin calling itself `../x`
+/// directory name. The name becomes a path component under `install_dir`, so
+/// values that would not create a fresh subdirectory are refused rather than
+/// sanitized. This includes path separators, `..`, `.` (which resolves to the
+/// parent), and whitespace-only strings. A plugin calling itself `../x` or `.`
 /// is not a naming style to accommodate.
 fn plugin_name(root: &Path) -> Result<String, String> {
     let manifest = root.join(".claude-plugin").join("plugin.json");
@@ -356,7 +358,13 @@ fn plugin_name(root: &Path) -> Result<String, String> {
     let name = from_manifest
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().into_owned()))
         .ok_or_else(|| "this plugin has no name".to_string())?;
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains("..")
+        || name == "."
+        || name.trim().is_empty()
+    {
         return Err(format!("'{name}' is not a usable plugin name"));
     }
     Ok(name)
@@ -783,5 +791,33 @@ mod tests {
             .expect("loaded");
         assert_eq!(found.origin, crate::plugins::Origin::UserClaude);
         assert!(out.dest.is_dir());
+    }
+
+    #[test]
+    fn plugin_named_dot_is_refused() {
+        let staged = staged_plugin("install-dot-name", ".");
+        let home = tmpdir("install-dot-name-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("not a usable plugin name"), "{err}");
+        assert!(
+            !install_dir(&home).exists(),
+            "claude root should not be created"
+        );
+    }
+
+    #[test]
+    fn plugin_named_dot_is_refused_with_force() {
+        let staged = staged_plugin("install-dot-force", ".");
+        let home = tmpdir("install-dot-force-home");
+        let err = install_staged(&staged, None, &home, true).expect_err("refused");
+        assert!(err.contains("not a usable plugin name"), "{err}");
+    }
+
+    #[test]
+    fn plugin_with_whitespace_only_name_is_refused() {
+        let staged = staged_plugin("install-whitespace", "   ");
+        let home = tmpdir("install-whitespace-home");
+        let err = install_staged(&staged, None, &home, false).expect_err("refused");
+        assert!(err.contains("not a usable plugin name"), "{err}");
     }
 }
