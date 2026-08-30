@@ -437,12 +437,11 @@ pub fn install_staged(
     let root = resolve_in_tree(staged, want)?;
     // Scanned before the copy, not after: `copy_tree` follows links, so a
     // `wasm -> ~/.ssh` entry would put a private key inside a plugin directory
-    // and only then be noticed. `reject_unsafe_symlinks`, not
-    // `plugins::reject_symlinks`: a Claude plugin like superpowers ships a
-    // contained `AGENTS.md -> CLAUDE.md` symlink as its ordinary
-    // "same file under two names" idiom, and only an escaping target (or a
-    // symlinked directory) is actually dangerous.
-    reject_unsafe_symlinks(&root)?;
+    // and only then be noticed. See `reject_escaping_symlinks`'s doc comment
+    // for why a contained symlink (Claude plugins like superpowers ship
+    // `AGENTS.md -> CLAUDE.md`) is fine while an escaping target (or a
+    // symlinked directory) is refused.
+    crate::plugins::reject_escaping_symlinks(&root)?;
     let skipped = unsupported_hook_events(&root)?;
     if !skipped.is_empty() && !force {
         return Err(format!(
@@ -530,7 +529,7 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         // the private key's bytes by the time a check ran on the destination,
         // and the refusal would find nothing left to refuse. This is the same
         // inversion `install_staged` guards against for the staged tree.
-        reject_unsafe_symlinks(Path::new(arg))?;
+        crate::plugins::reject_escaping_symlinks(Path::new(arg))?;
         let dest = staging.join("tree");
         crate::plugins::copy_tree(Path::new(arg), &dest)
             .map_err(|e| format!("cannot copy {arg}: {e}"))?;
@@ -548,12 +547,10 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         }
         Source::Archive { url } => {
             // `download_and_extract`, not `plugins::fetch_archive`: the latter
-            // runs the blanket symlink refusal that `/plugins install` needs,
-            // and a contained symlink like superpowers' `AGENTS.md ->
-            // CLAUDE.md` must survive here instead. The Claude path applies
-            // its own containment scan below.
+            // bundles in its own call to the same scan, and calling it here
+            // too would just scan the tree twice.
             crate::plugins::download_and_extract(&url, staging)?;
-            reject_unsafe_symlinks(staging)?;
+            crate::plugins::reject_escaping_symlinks(staging)?;
             // Every conventionally produced tarball nests its contents under
             // one top-level directory — GitHub's codeload archives use
             // `repo-main/`, and a plain `tar czf x.tar.gz somedir` yields
@@ -610,93 +607,6 @@ fn find_claude_root(dir: &Path) -> Option<PathBuf> {
     candidates.into_iter().next()
 }
 
-/// Refuses a symlink that escapes `root`, or one that points at a directory,
-/// but allows one whose target resolves to a plain file inside `root`.
-///
-/// This is deliberately not [`crate::plugins::reject_symlinks`]'s blanket
-/// refusal. That function exists for plank's own `/plugins install`, where no
-/// plugin has ever needed a symlink and a blanket "no symlinks" is the
-/// simplest correct policy. A Claude Code plugin is a different animal:
-/// `obra/superpowers`, the flagship plugin this fix was written for, ships
-/// `AGENTS.md -> CLAUDE.md` — an ordinary "same file under two names" link
-/// that resolves inside the tree and is exactly the kind of thing the C
-/// reference agent's own conventions assume exist. Refusing that outright
-/// makes the flagship plugin uninstallable for no security reason: the danger
-/// this check exists to stop is a link that *escapes* the tree (`key ->
-/// ~/.ssh/id_rsa`, which would pull a private key into a plugin directory),
-/// not the ordinary alias.
-///
-/// A contained symlink to a *directory* is refused even though it is
-/// contained, for a narrower, structural reason: [`crate::plugins::copy_tree`]
-/// branches on `entry.file_type()?.is_dir()`, and for a symlink,
-/// `DirEntry::file_type` reports the symlink's own type (it does not follow
-/// the link), so a directory symlink falls into the *file* branch and
-/// `std::fs::copy` is called on a directory — which fails with a confusing
-/// I/O error instead of the clear refusal this check gives up front.
-///
-/// A contained symlink to a *file* is allowed. Note that `copy_tree` still
-/// follows it: `std::fs::copy` opens the source path, which the kernel
-/// transparently dereferences, so the installed plugin ends up with two
-/// real files rather than a link. That is not a bug — the bytes came from
-/// inside the tree either way — but it is worth writing down so a future
-/// reader does not mistake the flattening for one.
-///
-/// # Errors
-/// Returns a message naming the offending entry and its target when a
-/// symlink escapes `root` or resolves to a directory, or when `root` itself,
-/// or one of its entries, cannot be inspected.
-pub(crate) fn reject_unsafe_symlinks(root: &Path) -> Result<(), String> {
-    let canon_root = root
-        .canonicalize()
-        .map_err(|e| format!("cannot inspect {}: {e}", root.display()))?;
-    scan_unsafe_symlinks(root, &canon_root)
-}
-
-/// The recursive walk behind [`reject_unsafe_symlinks`], separated out so the
-/// public entry point only has to canonicalize `root` once rather than on
-/// every directory it descends into.
-fn scan_unsafe_symlinks(dir: &Path, canon_root: &Path) -> Result<(), String> {
-    let entries =
-        std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // `symlink_metadata`, not `metadata`: the latter follows the link and
-        // would report the target's type, which is the thing being checked.
-        let meta = path
-            .symlink_metadata()
-            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
-        if meta.file_type().is_symlink() {
-            let target = path.canonicalize().map_err(|e| {
-                format!(
-                    "refusing plugin: {} is a symlink that cannot be resolved: {e}",
-                    path.display()
-                )
-            })?;
-            if !target.starts_with(canon_root) {
-                return Err(format!(
-                    "refusing plugin: {} is a symlink to {}, which is outside the plugin \
-                     directory",
-                    path.display(),
-                    target.display()
-                ));
-            }
-            if target.is_dir() {
-                return Err(format!(
-                    "refusing plugin: {} is a symlink to the directory {}, which cannot be \
-                     installed",
-                    path.display(),
-                    target.display()
-                ));
-            }
-            continue;
-        }
-        if meta.is_dir() {
-            scan_unsafe_symlinks(&path, canon_root)?;
-        }
-    }
-    Ok(())
-}
-
 /// Shallow-clones `url` into `staging/repo`, optionally at `refname`, and
 /// drops its history.
 ///
@@ -733,7 +643,7 @@ fn clone(url: &str, refname: Option<&str>, staging: &Path) -> Result<PathBuf, St
     // The history is not part of the plugin, and it is a tree of files that
     // would otherwise be scanned for symlinks and copied into the user's home.
     let _ = std::fs::remove_dir_all(dest.join(".git"));
-    reject_unsafe_symlinks(&dest)?;
+    crate::plugins::reject_escaping_symlinks(&dest)?;
     Ok(dest)
 }
 
@@ -1521,7 +1431,7 @@ mod tests {
         let outside = tmpdir("scan-containment-outside");
         std::fs::write(outside.join("x"), "hi\n").expect("write");
         std::os::unix::fs::symlink(outside.join("x"), root.join("link")).expect("symlink");
-        let err = reject_unsafe_symlinks(&root).expect_err("refused");
+        let err = crate::plugins::reject_escaping_symlinks(&root).expect_err("refused");
         assert!(err.contains("outside"), "{err}");
     }
 

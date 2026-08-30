@@ -280,7 +280,10 @@ overwrite: replacing an installed plugin is new bytes under an approved name, so
 it is remove-then-install.
 
 `/plugins install <url>` fetches a `.tar.gz` over https (or http to loopback).
-Archives containing a symlink are refused outright.
+Both forms — `<directory>` and `<url>` — scan the source tree for a symlink
+before copying it: one that escapes the tree, or that points at a directory,
+is refused; one whose target resolves to a plain file inside the tree (the
+ordinary "same file under two names" idiom) is allowed.
 
 To sign, with [minisign](https://jedisct1.github.io/minisign/):
 

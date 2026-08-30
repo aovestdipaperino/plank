@@ -1669,23 +1669,30 @@ with M8/M9 so it happens once.
   caller for, `claudeplugin::resolve_in_tree` is its own small function that
   understands both `.claude-plugin/plugin.json` and
   `.claude-plugin/marketplace.json`.
-- **`plugins::copy_tree` always follows symlinks — so `reject_symlinks` must
-  always scan the *source* tree, never the copy, or it will find nothing.**
-  `copy_tree`'s file branch is `std::fs::copy`, which reads through a symlink
-  and writes the target's bytes out as a plain file at the destination. Once
-  that copy has happened, the symlink is simply gone — there is no longer
-  anything at the destination for a symlink check to see, so a check run
-  *after* the copy always passes, no matter what the source contained. The fix
-  is checking the source before the copy ever runs, in both of
-  `claudeplugin.rs`'s copy sites (the staged tree in `install_staged`, and the
-  local-directory fallback in `fetch`). This exact inversion — scanning the
-  destination instead of the source — was introduced and caught twice during
-  this work, and once got far enough that a reviewer's reproduction (a
-  plugin directory holding a symlink to `~/.ssh/id_rsa`) landed the private
-  key's contents, as a plain file, inside `~/.plank/plugins/claude/`. If you
-  are about to move a `reject_symlinks` call in this file, or write a similar
-  check anywhere `copy_tree` is involved, put it before the copy and write a
-  test that plants a symlink to a secret and asserts the secret's *contents*
-  never appear anywhere under the destination — asserting the symlink itself
-  is absent is not enough, because by then it never existed there to begin
-  with.
+- **`plugins::copy_tree` always follows symlinks — so `plugins::reject_escaping_symlinks`
+  must always scan the *source* tree, never the copy, or it will find
+  nothing.** `copy_tree`'s file branch is `std::fs::copy`, which reads through
+  a symlink and writes the target's bytes out as a plain file at the
+  destination. Once that copy has happened, the symlink is simply gone — there
+  is no longer anything at the destination for a symlink check to see, so a
+  check run *after* the copy always passes, no matter what the source
+  contained. The fix is checking the source before the copy ever runs, at
+  every copy site: `plugins::install`'s local-directory source,
+  `plugins::fetch_archive`'s downloaded archive, and `claudeplugin.rs`'s three
+  (the staged tree in `install_staged`, the local-directory fallback in
+  `fetch`, and the git-clone and archive branches of `fetch`/`clone`). This
+  exact inversion — scanning the destination instead of the source — was
+  introduced and caught three times during this work: twice while
+  `reject_unsafe_symlinks` (now `plugins::reject_escaping_symlinks`, moved and
+  renamed when its containment rule became the one policy shared by
+  `/plugins install` and `/install-claude-plugin`) still lived in
+  `claudeplugin.rs`, and once in `plugins::install` itself, which shipped for
+  a time with *no* symlink scan at all on its `<directory>` argument — a
+  reviewer's reproduction (a plugin directory holding a symlink to
+  `~/.ssh/id_rsa`) landed the private key's contents, as a plain file, inside
+  `~/.plank/plugins/dev/`. If you are about to move a
+  `reject_escaping_symlinks` call, or write a similar check anywhere
+  `copy_tree` is involved, put it before the copy and write a test that plants
+  a symlink to a secret and asserts the secret's *contents* never appear
+  anywhere under the destination — asserting the symlink itself is absent is
+  not enough, because by then it never existed there to begin with.

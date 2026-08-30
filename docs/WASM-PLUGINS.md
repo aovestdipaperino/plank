@@ -707,10 +707,13 @@ not evidence of tampering, while a mismatch on the same toolchain is.
 
 Install accepts a `https://` (or loopback `http://`) URL as well as a local
 directory: it downloads the `.tar.gz`, extracts it into a staging directory it
-owns, and installs the plugin inside. The body is capped, and **any symlink in
-the extracted tree is refused** — the copy follows links, so an entry pointing
-at `~/.ssh` would otherwise be copied into the plugin directory and made
-readable by anything that reads plugins.
+owns, and installs the plugin inside. The body is capped, and both the local
+directory and the extracted tree are scanned before anything is copied: **a
+symlink that escapes the tree, or that points at a directory, is refused** —
+the copy follows links, so an entry pointing at `~/.ssh` would otherwise be
+copied into the plugin directory and made readable by anything that reads
+plugins. A symlink whose target resolves to a plain file inside the tree is
+allowed.
 
 Not yet: a registry or any notion of discovery. Finding a plugin is still
 "someone gave you a URL".

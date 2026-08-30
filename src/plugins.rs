@@ -582,9 +582,16 @@ pub fn user_plugin_dir(home: &Path) -> PathBuf {
 /// an approved name, which is exactly the case trust exists to catch, so it is
 /// a deliberate act (remove, then install) rather than a silent one.
 ///
+/// `src` is scanned for an escaping symlink before the copy, not after:
+/// `copy_tree`'s file branch is `std::fs::copy`, which follows a symlink and
+/// materializes its target's bytes as a plain file, so a `key -> ~/.ssh/id_rsa`
+/// entry in `src` would already be a private key's contents on disk by the
+/// time any check ran on the destination — there would be nothing left there
+/// for a check to find.
+///
 /// # Errors
-/// Returns a message when `src` is not a plugin, when the destination exists,
-/// or when the copy fails.
+/// Returns a message when `src` is not a plugin, contains an escaping
+/// symlink, the destination exists, or the copy fails.
 pub fn install(src: &Path, home: &Path) -> Result<PathBuf, String> {
     let plugin = load_plugin(src, Origin::CliDir)
         .ok_or_else(|| format!("{} is not a plugin directory", src.display()))?;
@@ -596,6 +603,7 @@ pub fn install(src: &Path, home: &Path) -> Result<PathBuf, String> {
             dest.display()
         ));
     }
+    reject_escaping_symlinks(src)?;
     copy_tree(src, &dest).map_err(|e| format!("cannot install into {}: {e}", dest.display()))?;
     Ok(dest)
 }
@@ -621,14 +629,17 @@ const MAX_ARCHIVE_BYTES: u64 = 64 * 1024 * 1024;
 /// - The response is capped at [`MAX_ARCHIVE_BYTES`].
 /// - Extraction goes to a directory this function created and owns, so a
 ///   traversal entry cannot land beside an existing plugin.
-/// - Any symlink in the extracted tree is a refusal. A plugin has no use for
-///   one, and `copy_tree` follows links: a `wasm -> /Users/x/.ssh` entry would
-///   otherwise copy a private key into the plugin directory and, worse, make it
-///   readable by anything that reads plugins.
+/// - Any symlink in the extracted tree that escapes it, or that points at a
+///   directory, is a refusal: `copy_tree` follows links, so a
+///   `wasm -> /Users/x/.ssh` entry would otherwise copy a private key into the
+///   plugin directory and, worse, make it readable by anything that reads
+///   plugins. A contained file symlink (the ordinary "same file under two
+///   names" idiom) is allowed — see [`reject_escaping_symlinks`].
 ///
 /// # Errors
 /// Returns a message when the URL is rejected, the download fails, the archive
-/// will not extract, it contains no plugin, or it contains a symlink.
+/// will not extract, it contains no plugin, or it contains an escaping or
+/// directory symlink.
 pub fn install_from_url(url: &str, home: &Path) -> Result<PathBuf, String> {
     crate::remote::validate_remote_url(url, false)?;
     let staging = staging_dir(home)?;
@@ -657,8 +668,8 @@ fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
         .ok_or_else(|| format!("{url} contains no plugin (no .plank-plugin/plugin.json)"))
 }
 
-/// Downloads the `.tar.gz` at `url`, extracts it into `dir`, and refuses any
-/// symlink in the result.
+/// Downloads the `.tar.gz` at `url`, extracts it into `dir`, and scans the
+/// result for an escaping or directory symlink.
 ///
 /// Split out of [`fetch_and_stage`] because everything here is about getting
 /// bytes onto disk safely and none of it is plank-specific: a Claude Code
@@ -666,22 +677,19 @@ fn fetch_and_stage(url: &str, dir: &Path) -> Result<PathBuf, String> {
 /// plugin root.
 ///
 /// The download-and-extract step and the symlink scan are two separate
-/// functions ([`download_and_extract`] and this one) rather than one, because
-/// they answer to two different policies: this function's blanket refusal is
-/// exactly what [`fetch_and_stage`] (the native `/plugins install` path) needs
-/// and must keep, byte for byte, while [`crate::claudeplugin`]'s archive path
-/// needs the same bytes on disk but applies its own, narrower symlink policy
-/// (a contained link is fine; only an escaping one, or one to a directory, is
-/// refused). Folding the scan into the download would leave the Claude path no
-/// way to get the bytes without also inheriting the blanket refusal.
+/// functions ([`download_and_extract`] and this one) so that a caller with a
+/// different notion of a plugin root — [`crate::claudeplugin`]'s archive path
+/// — can get the same bytes on disk without scanning them twice: both callers
+/// want [`reject_escaping_symlinks`]'s identical containment rule, so both
+/// call it, once each, on the tree they end up with.
 ///
 /// # Errors
 /// Returns a message when the URL is rejected by the remote policy, the
 /// download fails or exceeds the size cap, the archive will not extract, or it
-/// contains a symlink.
+/// contains an escaping or directory symlink.
 pub(crate) fn fetch_archive(url: &str, dir: &Path) -> Result<(), String> {
     download_and_extract(url, dir)?;
-    reject_symlinks(dir)
+    reject_escaping_symlinks(dir)
 }
 
 /// Downloads the `.tar.gz` at `url` and extracts it into `dir`, with no
@@ -689,10 +697,10 @@ pub(crate) fn fetch_archive(url: &str, dir: &Path) -> Result<(), String> {
 ///
 /// This is the part of [`fetch_archive`] that is genuinely policy-free: TLS
 /// enforcement, the size cap, and `tar` extraction apply no matter who called
-/// it. Callers that need a blanket symlink refusal get it by calling
-/// [`fetch_archive`] instead; callers with a different symlink policy (see
-/// [`fetch_archive`]'s doc comment) call this directly and scan the result
-/// themselves.
+/// it. Callers that want the symlink scan bundled in get it by calling
+/// [`fetch_archive`] instead; callers that need a different notion of a
+/// plugin root first (see [`fetch_archive`]'s doc comment) call this directly
+/// and scan the result themselves with [`reject_escaping_symlinks`].
 ///
 /// # Errors
 /// Returns a message when the URL is rejected by the remote policy, the
@@ -744,25 +752,92 @@ fn download_to(url: &str, path: &Path) -> Result<(), String> {
     std::fs::write(path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
-/// Fails when any entry under `dir` is a symlink.
-pub(crate) fn reject_symlinks(dir: &Path) -> Result<(), String> {
+/// Refuses a symlink that escapes `root`, or one that points at a directory,
+/// but allows one whose target resolves to a plain file inside `root`.
+///
+/// This is the one symlink policy shared by every path that copies a tree
+/// into a plugin directory: `install`'s local-directory source, the
+/// downloaded-archive path in [`fetch_archive`], and (via
+/// [`crate::claudeplugin`], which calls this function rather than keeping its
+/// own copy) that module's local-directory, git-clone and archive sources.
+/// It used to be two different rules — a blanket refusal here, a narrower
+/// containment check in `claudeplugin` — which meant `/plugins install`
+/// enforced a different policy depending on whether the user typed a
+/// directory or a URL. A Claude Code plugin like `obra/superpowers`, the
+/// flagship plugin the containment rule was written for, ships
+/// `AGENTS.md -> CLAUDE.md` — an ordinary "same file under two names" link
+/// that resolves inside the tree. Refusing that outright makes a real, popular
+/// plugin uninstallable for no security reason: the danger this check exists
+/// to stop is a link that *escapes* the tree (`key -> ~/.ssh/id_rsa`, which
+/// would pull a private key into a plugin directory), not the ordinary alias,
+/// so plank's own plugins get the same tolerance.
+///
+/// A contained symlink to a *directory* is refused even though it is
+/// contained, for a narrower, structural reason: [`copy_tree`] branches on
+/// `entry.file_type()?.is_dir()`, and for a symlink, `DirEntry::file_type`
+/// reports the symlink's own type (it does not follow the link), so a
+/// directory symlink falls into the *file* branch and `std::fs::copy` is
+/// called on a directory — which fails with a confusing I/O error instead of
+/// the clear refusal this check gives up front.
+///
+/// A contained symlink to a *file* is allowed. Note that `copy_tree` still
+/// follows it: `std::fs::copy` opens the source path, which the kernel
+/// transparently dereferences, so the installed plugin ends up with two real
+/// files rather than a link. That is not a bug — the bytes came from inside
+/// the tree either way — but it is worth writing down so a future reader does
+/// not mistake the flattening for one.
+///
+/// # Errors
+/// Returns a message naming the offending entry and its target when a
+/// symlink escapes `root` or resolves to a directory, or when `root` itself,
+/// or one of its entries, cannot be inspected.
+pub(crate) fn reject_escaping_symlinks(root: &Path) -> Result<(), String> {
+    let canon_root = root
+        .canonicalize()
+        .map_err(|e| format!("cannot inspect {}: {e}", root.display()))?;
+    scan_escaping_symlinks(root, &canon_root)
+}
+
+/// The recursive walk behind [`reject_escaping_symlinks`], separated out so
+/// the public entry point only has to canonicalize `root` once rather than on
+/// every directory it descends into.
+fn scan_escaping_symlinks(dir: &Path, canon_root: &Path) -> Result<(), String> {
     let entries =
         std::fs::read_dir(dir).map_err(|e| format!("cannot read {}: {e}", dir.display()))?;
     for entry in entries.flatten() {
+        let path = entry.path();
         // `symlink_metadata`, not `metadata`: the latter follows the link and
         // would report the target's type, which is the thing being checked.
-        let meta = entry
-            .path()
+        let meta = path
             .symlink_metadata()
-            .map_err(|e| format!("cannot inspect {}: {e}", entry.path().display()))?;
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
         if meta.file_type().is_symlink() {
-            return Err(format!(
-                "refusing archive: {} is a symlink, which a plugin never needs",
-                entry.file_name().to_string_lossy()
-            ));
+            let target = path.canonicalize().map_err(|e| {
+                format!(
+                    "refusing plugin: {} is a symlink that cannot be resolved: {e}",
+                    path.display()
+                )
+            })?;
+            if !target.starts_with(canon_root) {
+                return Err(format!(
+                    "refusing plugin: {} is a symlink to {}, which is outside the plugin \
+                     directory",
+                    path.display(),
+                    target.display()
+                ));
+            }
+            if target.is_dir() {
+                return Err(format!(
+                    "refusing plugin: {} is a symlink to the directory {}, which cannot be \
+                     installed",
+                    path.display(),
+                    target.display()
+                ));
+            }
+            continue;
         }
         if meta.is_dir() {
-            reject_symlinks(&entry.path())?;
+            scan_escaping_symlinks(&path, canon_root)?;
         }
     }
     Ok(())
@@ -1386,11 +1461,17 @@ mod tests {
         );
     }
 
-    /// A symlink in the archive is refused. `copy_tree` follows links, so an
-    /// entry pointing at `~/.ssh` would otherwise be copied into the plugin
-    /// directory and made readable by anything that reads plugins.
+    /// An escaping symlink in the archive is refused. `copy_tree` follows
+    /// links, so an entry pointing at `~/.ssh` would otherwise be copied into
+    /// the plugin directory and made readable by anything that reads plugins.
+    ///
+    /// This used to assert a blanket refusal (`reject_symlinks`, which
+    /// refused every symlink, contained or not); the shared scan now used
+    /// here ([`reject_escaping_symlinks`]) only refuses one that escapes the
+    /// tree or targets a directory, so this test plants an escaping target to
+    /// keep pinning the case it always meant to pin.
     #[test]
-    fn a_symlink_in_the_extracted_tree_is_refused() {
+    fn an_escaping_symlink_in_the_extracted_tree_is_refused() {
         let root = std::env::temp_dir().join(format!("plank-url-link-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let tree = root.join("tree");
@@ -1404,12 +1485,28 @@ mod tests {
         std::fs::write(&secret, b"private key").unwrap();
         std::os::unix::fs::symlink(&secret, tree.join("stolen")).unwrap();
 
-        let err = reject_symlinks(&tree).expect_err("a symlink must be refused");
+        let err = reject_escaping_symlinks(&tree).expect_err("an escaping symlink must be refused");
         assert!(err.contains("symlink"), "{err}");
         assert!(
             err.contains("stolen"),
             "the offending entry must be named: {err}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A symlink that resolves to a plain file *inside* the tree is fine — the
+    /// ordinary "same file under two names" idiom a real plugin uses, and the
+    /// case the old blanket refusal wrongly rejected.
+    #[test]
+    fn a_contained_symlink_in_the_extracted_tree_is_accepted() {
+        let root = std::env::temp_dir().join(format!("plank-url-contained-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let tree = root.join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("CLAUDE.md"), b"guidance").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", tree.join("AGENTS.md")).unwrap();
+
+        reject_escaping_symlinks(&tree).expect("a contained symlink must be accepted");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1490,6 +1587,91 @@ mod tests {
                 "'{bad}' was accepted as a plugin name"
             );
         }
+    }
+
+    /// A local source directory holding an escaping symlink is refused, and
+    /// the target's contents never reach the install root. This is the hole:
+    /// `install` used to call `copy_tree` on `src` with no symlink scan at
+    /// all, so a `key -> ~/.ssh/id_rsa` entry installed the private key's
+    /// *contents* as a plain file, readable by anything that reads plugins.
+    #[test]
+    fn install_refuses_a_source_directory_with_an_escaping_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("plank-install-escape-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let secret_dir = root.join("secret-home");
+        std::fs::create_dir_all(&secret_dir).unwrap();
+        let secret = secret_dir.join("id_rsa");
+        std::fs::write(&secret, b"-----BEGIN PRIVATE KEY-----").unwrap();
+
+        let src = root.join("src-plugin");
+        std::fs::create_dir_all(src.join(".plank-plugin")).unwrap();
+        std::fs::write(
+            src.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&secret, src.join("key")).unwrap();
+
+        let home = root.join("home");
+        let err = install(&src, &home).expect_err("an escaping symlink must be refused");
+        assert!(err.contains("symlink"), "{err}");
+
+        // The install root must not exist at all, and certainly must not hold
+        // the secret's bytes anywhere under it.
+        let install_root = user_plugin_dir(&home);
+        if install_root.exists() {
+            fn contains_secret(dir: &Path, needle: &[u8]) -> bool {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return false;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_symlink() {
+                        continue;
+                    }
+                    if path.is_dir() {
+                        if contains_secret(&path, needle) {
+                            return true;
+                        }
+                    } else if std::fs::read(&path).is_ok_and(|b| b == needle) {
+                        return true;
+                    }
+                }
+                false
+            }
+            assert!(
+                !contains_secret(&install_root, b"-----BEGIN PRIVATE KEY-----"),
+                "the escaping symlink's target contents leaked into the install root"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A local source directory holding a symlink whose target resolves
+    /// *inside* the tree still installs — the ordinary "same file under two
+    /// names" idiom a real plugin uses, same as the archive and Claude-plugin
+    /// paths.
+    #[test]
+    fn install_accepts_a_source_directory_with_a_contained_symlink() {
+        let root =
+            std::env::temp_dir().join(format!("plank-install-contained-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let src = root.join("src-plugin");
+        std::fs::create_dir_all(src.join(".plank-plugin")).unwrap();
+        std::fs::write(
+            src.join(".plank-plugin").join("plugin.json"),
+            r#"{"name": "demo"}"#,
+        )
+        .unwrap();
+        std::fs::write(src.join("CLAUDE.md"), b"guidance").unwrap();
+        std::os::unix::fs::symlink("CLAUDE.md", src.join("AGENTS.md")).unwrap();
+
+        let home = root.join("home");
+        let dest = install(&src, &home).expect("a contained symlink must install");
+        assert!(dest.join("AGENTS.md").is_file());
+        assert_eq!(std::fs::read(dest.join("AGENTS.md")).unwrap(), b"guidance");
+        let _ = std::fs::remove_dir_all(&root);
         assert!(
             uninstall("absent", &home)
                 .unwrap_err()
