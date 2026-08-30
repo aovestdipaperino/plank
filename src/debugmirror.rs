@@ -234,7 +234,10 @@ mod tests {
     fn a_name_that_sanitizes_to_nothing_falls_back_and_is_still_prefixed() {
         let name = sanitize_name("   ");
         assert_eq!(name, FALLBACK_NAME);
-        assert!(name.starts_with(NAME_PREFIX), "fallback must look like plank's");
+        assert!(
+            name.starts_with(NAME_PREFIX),
+            "fallback must look like plank's"
+        );
     }
 
     use super::*;
