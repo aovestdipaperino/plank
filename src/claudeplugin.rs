@@ -384,10 +384,15 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         if let Ok(dest) = clone(arg, staging) {
             return Ok(dest);
         }
+        // Scanned before the copy, not after: `copy_tree` follows links, so a
+        // `key -> ~/.ssh/id_rsa` entry would already be a plain file holding
+        // the private key's bytes by the time a check ran on the destination,
+        // and the refusal would find nothing left to refuse. This is the same
+        // inversion `install_staged` guards against for the staged tree.
+        crate::plugins::reject_symlinks(Path::new(arg))?;
         let dest = staging.join("tree");
         crate::plugins::copy_tree(Path::new(arg), &dest)
             .map_err(|e| format!("cannot copy {arg}: {e}"))?;
-        crate::plugins::reject_symlinks(&dest)?;
         return Ok(dest);
     }
     match parse_source(arg)? {
@@ -463,8 +468,13 @@ fn plugin_name(root: &Path) -> Result<String, String> {
 /// where there is nowhere to install to at all.
 #[must_use]
 pub fn render_install(arg: &str, home: Option<&Path>) -> String {
-    const USAGE: &str = "usage: /install-claude-plugin <url|owner/repo> [plugin-name] [--force]\n\
-                         a url may be a git repository, a marketplace repository, or a .tar.gz\n";
+    // `concat!`, not a `\`-continued literal: continuation strips the next
+    // line's leading whitespace, which is exactly the kind of invisible trap
+    // this project's text must not carry.
+    const USAGE: &str = concat!(
+        "usage: /install-claude-plugin <url|owner/repo> [plugin-name] [--force]\n",
+        "a url may be a git repository, a marketplace repository, or a .tar.gz\n"
+    );
     let mut force = false;
     let mut words: Vec<&str> = Vec::new();
     for word in arg.split_whitespace() {
@@ -505,10 +515,13 @@ fn render_installed(out: &Installed) -> String {
         );
     }
     if out.rewrote_plugin_root {
-        s.push_str(
-            "CLAUDE_PLUGIN_ROOT was resolved to that path in its hooks and MCP config, so \
-             moving the directory breaks them\n",
-        );
+        // `concat!`, not a `\`-continued literal: continuation strips the next
+        // line's leading whitespace, which is exactly the kind of invisible
+        // trap this project's text must not carry.
+        s.push_str(concat!(
+            "CLAUDE_PLUGIN_ROOT was resolved to that path in its hooks and MCP config, so ",
+            "moving the directory breaks them\n"
+        ));
     }
     s.push_str("it is loaded on the next start\n");
     s
@@ -899,6 +912,56 @@ mod tests {
             !install_dir(&home).join("demo").exists(),
             "nothing installed"
         );
+    }
+
+    #[test]
+    fn a_local_directory_with_a_symlink_is_refused_and_the_target_never_copied() {
+        // Exercises `fetch`'s local-directory fallback (a plain, non-git tree),
+        // not `install_staged` directly: `copy_tree` follows symlinks and
+        // materializes the target's bytes as a plain file, so a check run on
+        // the copy instead of the source would find nothing to refuse — the
+        // secret would already be sitting in the user's home.
+        let secret_dir = tmpdir("install-local-symlink-secret");
+        let secret = secret_dir.join("id_rsa");
+        std::fs::write(&secret, "-----BEGIN PRIVATE KEY-----\nsekrit\n").expect("write secret");
+        let staged = staged_plugin("install-local-symlink", "demo");
+        std::os::unix::fs::symlink(&secret, staged.join("key")).expect("symlink");
+        let home = tmpdir("install-local-symlink-home");
+        let err = install(staged.to_str().expect("utf8"), None, &home, false).expect_err("refused");
+        assert!(err.contains("symlink"), "{err}");
+        assert!(
+            !install_dir(&home).join("demo").exists(),
+            "nothing installed"
+        );
+        // Walk every file plank could have written and make sure none of them
+        // carry the secret's contents.
+        assert!(
+            !walk_for_secret(&install_dir(&home), "sekrit"),
+            "the linked file's contents must not reach the install root"
+        );
+    }
+
+    /// True if any non-symlink file under `dir` contains `needle`.
+    fn walk_for_secret(dir: &Path, needle: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_symlink() {
+                continue;
+            }
+            if path.is_dir() {
+                if walk_for_secret(&path, needle) {
+                    return true;
+                }
+            } else if let Ok(text) = std::fs::read_to_string(&path)
+                && text.contains(needle)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     #[test]
