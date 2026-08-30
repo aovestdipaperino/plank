@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 pub enum Origin {
     /// Auto-scanned from `~/.plank/plugins/dev/`.
     UserScan,
+    /// Auto-scanned from `~/.plank/plugins/claude/`, where
+    /// `/install-claude-plugin` puts a fetched Claude Code plugin.
+    UserClaude,
     /// Auto-scanned from `<cwd>/.plank/plugins/`.
     ProjectScan,
     /// Named explicitly by `--plugin-dir`.
@@ -23,6 +26,7 @@ impl Origin {
     pub fn label(self) -> &'static str {
         match self {
             Origin::UserScan => "user",
+            Origin::UserClaude => "claude",
             Origin::ProjectScan => "project",
             Origin::CliDir => "--plugin-dir",
         }
@@ -288,6 +292,13 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
     if let Some(home) = home {
         let root = home.join(".plank").join("plugins").join("dev");
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
+    }
+    if let Some(home) = home {
+        // After `dev/`: a plugin the user wrote themselves outranks one that
+        // arrived from a repository, which is the same precedence rule the
+        // rest of this list follows.
+        let root = crate::claudeplugin::install_dir(home);
+        candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserClaude)));
     }
     let project = cwd.join(".plank").join("plugins");
     candidates.extend(
@@ -745,10 +756,13 @@ pub fn uninstall(name: &str, home: &Path) -> Result<PathBuf, String> {
     if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
         return Err(format!("'{name}' is not a plugin name"));
     }
-    let dir = user_plugin_dir(home).join(name);
-    if !dir.is_dir() {
-        return Err(format!("'{name}' is not installed"));
-    }
+    let dir = [
+        user_plugin_dir(home).join(name),
+        crate::claudeplugin::install_dir(home).join(name),
+    ]
+    .into_iter()
+    .find(|d| d.is_dir())
+    .ok_or_else(|| format!("'{name}' is not installed"))?;
     std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     Ok(dir)
 }
@@ -1130,6 +1144,51 @@ fn duplicate_names_after_rename(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_root_is_scanned_after_dev() {
+        let root = scratch("claude-scan-order");
+        let home = root.join("home");
+        write(
+            &home,
+            ".plank/plugins/dev/dup/.plank-plugin/plugin.json",
+            r#"{"name":"dup"}"#,
+        );
+        write(
+            &home,
+            ".plank/plugins/claude/solo/.claude-plugin/plugin.json",
+            r#"{"name":"solo"}"#,
+        );
+        write(
+            &home,
+            ".plank/plugins/claude/dup/.claude-plugin/plugin.json",
+            r#"{"name":"dup"}"#,
+        );
+        let set = load_in(Some(&home), &root.join("cwd"), &[]);
+        let solo = set
+            .plugins
+            .iter()
+            .find(|p| p.name == "solo")
+            .expect("claude/ plugin is scanned");
+        assert_eq!(solo.origin, Origin::UserClaude);
+        // claude/ is scanned after dev/, so on a name collision it replaces the
+        // dev/ entry, exactly as project scan replaces user scan today.
+        let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
+        assert_eq!(dup.origin, Origin::UserClaude);
+    }
+
+    #[test]
+    fn uninstall_removes_from_the_claude_root() {
+        let root = scratch("claude-uninstall");
+        write(
+            &root,
+            ".plank/plugins/claude/demo/.claude-plugin/plugin.json",
+            r#"{"name":"demo"}"#,
+        );
+        let dir = uninstall("demo", &root).expect("removes a claude plugin");
+        assert!(!dir.exists());
+        assert!(dir.ends_with("plugins/claude/demo"));
+    }
 
     /// Installing copies the tree, skips build output, and refuses to
     /// overwrite — replacing an installed plugin is new bytes under an

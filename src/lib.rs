@@ -12,6 +12,7 @@ pub mod anim;
 pub mod arcade;
 pub mod branch;
 pub mod checkpoint;
+pub mod claudeplugin;
 pub mod compact;
 pub mod complete;
 pub mod config;
