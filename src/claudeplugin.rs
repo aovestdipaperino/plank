@@ -398,6 +398,7 @@ fn clone(url: &str, staging: &Path) -> Result<PathBuf, String> {
         .arg("--quiet")
         .arg("--depth")
         .arg("1")
+        .arg("--") // Separator ensures url is treated as a path, not an option
         .arg(url)
         .arg(&dest)
         .status()
