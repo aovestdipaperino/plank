@@ -52,7 +52,13 @@ static CURRENT_SESSION_NAME: Mutex<Option<String>> = Mutex::new(None);
 /// startup, and the defensive per-turn call before the first turn's session
 /// rename lands). A window under this name is retired the moment a real
 /// session name is known, since [`set_session_id`] reconnects on change.
-const FALLBACK_NAME: &str = "plank-unnamed";
+const FALLBACK_NAME: &str = "plank:unnamed";
+
+/// Prefixes every window name so a console shared by several tools shows at a
+/// glance which windows are plank's. `:` is printable, non-whitespace ASCII,
+/// so it satisfies the console's name rules (1-64 bytes, printable ASCII, no
+/// whitespace) and needs no protocol change.
+const NAME_PREFIX: &str = "plank:";
 
 /// Records plank's current session name (the `adjective-celebrity` slug from
 /// `SessionStore::mint_id`, or a rename) as the name to present at the next
@@ -92,15 +98,20 @@ pub fn set_session_id(id: &str) {
 /// blindly — a name that would not survive the handshake falls back rather
 /// than silently losing the mirror.
 fn sanitize_name(raw: &str) -> String {
+    // Budget the truncation against the prefix, not the raw id: taking 64
+    // first and prefixing after would push the wire name past the console's
+    // 64-byte limit and get the handshake refused, which shows up as a
+    // silently missing window rather than an error.
+    let budget = 64 - NAME_PREFIX.len();
     let cleaned: String = raw
         .chars()
         .filter(char::is_ascii_graphic)
-        .take(64)
+        .take(budget)
         .collect();
     if cleaned.is_empty() {
         FALLBACK_NAME.to_string()
     } else {
-        cleaned
+        format!("{NAME_PREFIX}{cleaned}")
     }
 }
 
@@ -200,6 +211,32 @@ pub fn flush() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_window_name_is_prefixed_so_plank_s_windows_are_identifiable() {
+        assert_eq!(sanitize_name("mellow-pauling"), "plank:mellow-pauling");
+    }
+
+    #[test]
+    fn a_long_session_id_still_fits_the_console_s_64_byte_name_limit() {
+        // Truncating to 64 and *then* prefixing would exceed the limit and get
+        // the handshake refused, which surfaces as a missing window rather
+        // than an error, so the budget has to account for the prefix.
+        let name = sanitize_name(&"x".repeat(200));
+        assert!(name.starts_with(NAME_PREFIX));
+        assert!(
+            name.len() <= 64,
+            "wire name must fit the console's limit, got {} bytes: {name}",
+            name.len()
+        );
+    }
+
+    #[test]
+    fn a_name_that_sanitizes_to_nothing_falls_back_and_is_still_prefixed() {
+        let name = sanitize_name("   ");
+        assert_eq!(name, FALLBACK_NAME);
+        assert!(name.starts_with(NAME_PREFIX), "fallback must look like plank's");
+    }
+
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
