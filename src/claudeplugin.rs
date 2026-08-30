@@ -166,6 +166,108 @@ pub fn unsupported_hook_events(root: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
+/// The directory inside `staged` holding the plugin to install.
+///
+/// A repository is one of two things and cannot be told apart before it is
+/// fetched: a single plugin, whose root carries `.claude-plugin/plugin.json`,
+/// or a marketplace, whose root carries `.claude-plugin/marketplace.json` and
+/// which needs `want` to say which of its plugins is meant. When `want` is
+/// missing or matches nothing, the error lists the names on offer, so the
+/// second attempt is informed rather than guessed.
+///
+/// A marketplace entry's `source` is resolved under `staged` and then checked
+/// to still be under it: `"../../etc"` in a fetched file must not become a
+/// directory outside the tree this function was handed.
+///
+/// # Errors
+/// Returns a message when the tree is neither a plugin nor a marketplace, when
+/// a marketplace name is missing or unknown, or when an entry's `source`
+/// escapes the tree or holds no plugin.
+pub fn resolve_in_tree(staged: &Path, want: Option<&str>) -> Result<PathBuf, String> {
+    let market = staged.join(".claude-plugin").join("marketplace.json");
+    if market.is_file() {
+        return resolve_marketplace(staged, &market, want);
+    }
+    if staged.join(".claude-plugin").join("plugin.json").is_file() {
+        return Ok(staged.to_path_buf());
+    }
+    Err(
+        "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
+         .claude-plugin/marketplace.json at its root"
+            .to_string(),
+    )
+}
+
+/// Picks `want` out of a marketplace manifest. Split out to keep
+/// [`resolve_in_tree`]'s two cases readable side by side.
+fn resolve_marketplace(
+    staged: &Path,
+    market: &Path,
+    want: Option<&str>,
+) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(market)
+        .map_err(|e| format!("cannot read {}: {e}", market.display()))?;
+    let Some(root) = json_parse(&text) else {
+        return Err(format!("{} does not parse as JSON", market.display()));
+    };
+    let Some(Json::Arr(entries)) = root.get("plugins") else {
+        return Err(format!("{} has no \"plugins\" array", market.display()));
+    };
+    let names: Vec<String> = entries
+        .iter()
+        .filter_map(|e| match e.get("name") {
+            Some(Json::Str(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    let Some(want) = want else {
+        return Err(format!(
+            "this is a marketplace of several plugins; name the one you want: {}",
+            names.join(", ")
+        ));
+    };
+    let Some(entry) = entries
+        .iter()
+        .find(|e| matches!(e.get("name"), Some(Json::Str(s)) if s == want))
+    else {
+        return Err(format!(
+            "this marketplace has no plugin '{want}'; it offers: {}",
+            names.join(", ")
+        ));
+    };
+    let source = match entry.get("source") {
+        Some(Json::Str(s)) => s.clone(),
+        // The documented default: a plugin lives in a directory named after
+        // itself.
+        _ => format!("./{want}"),
+    };
+    let dir = staged.join(source.trim_start_matches("./"));
+    // String prefix on the *cleaned* paths, not on the raw join: `..` in the
+    // manifest is the case this exists to catch, and it only shows up after
+    // the path is resolved.
+    let (canon_dir, canon_staged) = (
+        dir.canonicalize().unwrap_or_else(|_| dir.clone()),
+        staged
+            .canonicalize()
+            .unwrap_or_else(|_| staged.to_path_buf()),
+    );
+    if !canon_dir.starts_with(&canon_staged) {
+        return Err(format!(
+            "marketplace entry '{want}' points outside the repository, at {source}"
+        ));
+    }
+    if !canon_dir
+        .join(".claude-plugin")
+        .join("plugin.json")
+        .is_file()
+    {
+        return Err(format!(
+            "marketplace entry '{want}' has no .claude-plugin/plugin.json at {source}"
+        ));
+    }
+    Ok(canon_dir)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +438,85 @@ mod tests {
         assert!(!rewrite_plugin_root(&dest).expect("ok"));
         let body = std::fs::read_to_string(dest.join("skills/s/SKILL.md")).expect("read");
         assert!(body.contains("${CLAUDE_PLUGIN_ROOT}"), "{body}");
+    }
+
+    #[test]
+    fn a_plain_repo_resolves_to_itself() {
+        let staged = tmpdir("resolve-plain");
+        write(&staged, ".claude-plugin/plugin.json", r#"{"name":"demo"}"#);
+        assert_eq!(resolve_in_tree(&staged, None).expect("ok"), staged);
+    }
+
+    #[test]
+    fn a_marketplace_resolves_the_named_plugin() {
+        let staged = tmpdir("resolve-named");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"alpha"},{"name":"beta","source":"./pkgs/beta"}]}"#,
+        );
+        write(
+            &staged,
+            "alpha/.claude-plugin/plugin.json",
+            r#"{"name":"alpha"}"#,
+        );
+        write(
+            &staged,
+            "pkgs/beta/.claude-plugin/plugin.json",
+            r#"{"name":"beta"}"#,
+        );
+        assert_eq!(
+            resolve_in_tree(&staged, Some("alpha")).expect("ok"),
+            staged.join("alpha").canonicalize().expect("canon")
+        );
+        assert_eq!(
+            resolve_in_tree(&staged, Some("beta")).expect("ok"),
+            staged.join("pkgs/beta").canonicalize().expect("canon")
+        );
+    }
+
+    #[test]
+    fn a_marketplace_without_a_name_lists_what_it_offers() {
+        let staged = tmpdir("resolve-unnamed");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"alpha"},{"name":"beta"}]}"#,
+        );
+        let err = resolve_in_tree(&staged, None).expect_err("rejected");
+        assert!(err.contains("alpha"), "{err}");
+        assert!(err.contains("beta"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_marketplace_name_lists_what_it_offers() {
+        let staged = tmpdir("resolve-wrong");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"alpha"}]}"#,
+        );
+        let err = resolve_in_tree(&staged, Some("nope")).expect_err("rejected");
+        assert!(err.contains("alpha"), "{err}");
+    }
+
+    #[test]
+    fn a_marketplace_source_may_not_escape_the_tree() {
+        let staged = tmpdir("resolve-escape");
+        write(
+            &staged,
+            ".claude-plugin/marketplace.json",
+            r#"{"plugins":[{"name":"evil","source":"../../etc"}]}"#,
+        );
+        let err = resolve_in_tree(&staged, Some("evil")).expect_err("rejected");
+        assert!(err.contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn a_tree_with_no_manifest_is_not_a_claude_plugin() {
+        let staged = tmpdir("resolve-nomanifest");
+        write(&staged, "README.md", "hi\n");
+        let err = resolve_in_tree(&staged, None).expect_err("rejected");
+        assert!(err.contains(".claude-plugin/plugin.json"), "{err}");
     }
 }
