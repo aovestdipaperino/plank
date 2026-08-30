@@ -15,8 +15,16 @@ Riding the beta channel today, on top of the newest stable release. Install with
 
 ### 3.4.1
 
-Opens the new beta channel on the same code as 3.4.0. Nothing rides ahead of
-stable yet.
+Opens the new beta channel on the same code as 3.4.0.
+
+📦 **`/install-claude-plugin` fetches a Claude Code plugin and installs it.** Plank
+already knew how to *load* a Claude Code plugin; now it can also grab one from
+a GitHub repo, a `/tree/...` link copied straight out of the browser, a
+marketplace, a `.tar.gz`, or a local directory. It sorts out the format
+differences along the way — `${CLAUDE_PLUGIN_ROOT}` becomes a real path, and
+nested hook config gets unwrapped — so the plugin's hooks and MCP servers just
+work. Tried end to end with `obra/superpowers`: one command, all 14 skills
+showed up on the next start.
 
 ## Stable releases
 

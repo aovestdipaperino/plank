@@ -6,6 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/install-claude-plugin <url|owner/repo> [plugin-name] [--force]`.** Plank
+  already understood the Claude Code plugin layout (`.claude-plugin/plugin.json`,
+  `commands/`, `hooks/hooks.json`, `.mcp.json`, `settings.json`); this adds the
+  missing way to acquire one. Accepts a GitHub repo URL, an `owner/repo`
+  shorthand, a browser-copied `/tree/<ref>/<path>` or `/blob/<ref>/<path>` URL
+  (resolving the plugin at that path, walking up a level when it names the
+  `.claude-plugin` directory itself), a marketplace repository (asks for a
+  name, and lists what it offers, when one isn't given or doesn't match), a
+  `.tar.gz` over https, or a local directory — so a plugin can be tried before
+  it's published. Installs land in `~/.plank/plugins/claude/<name>/`, a third
+  scan root after `~/.plank/plugins/dev/*` and before `<cwd>/.plank/plugins/*`,
+  so a plugin you wrote yourself still wins a bare-name collision; `/plugins`
+  lists the origin as `claude` and `/plugins remove <name>` uninstalls it. It
+  refuses a tree with no `.claude-plugin/plugin.json`, a symlink escaping the
+  plugin tree, an unusable name, a name already installed, and a hook event
+  plank doesn't implement (Claude Code's `Notification` and `SubagentStop`
+  have no plank equivalent) — only that last refusal is waivable, with
+  `--force`, and those hooks are installed but will never fire. Two things are
+  rewritten at install time because the formats genuinely differ: Claude
+  Code's hook commands reference `${CLAUDE_PLUGIN_ROOT}`, but plank's hook
+  runner execs `/bin/sh` with no injected environment, so it's rewritten to
+  the actual install path in `hooks/hooks.json` and `.mcp.json` (and moving
+  the directory afterwards breaks those hooks, which the command warns about
+  when it happens); and Claude Code nests hook events under a top-level
+  `"hooks"` key, which is unwrapped so plank's flat-event reader actually
+  loads them. `.mcp.json` and `settings.json` need no translation — plank's
+  existing plugin loaders already merge them, with a plugin's settings
+  sitting below the user's own. Verified end to end against `obra/superpowers`
+  v6.3.0, installed from a `/tree/main/.claude-plugin` marketplace URL, with
+  all 14 of its skills loading on the next start.
+
 ## [3.4.0] - 2026-08-29
 
 ### Added
