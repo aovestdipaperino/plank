@@ -84,6 +84,54 @@ pub fn install_dir(home: &Path) -> PathBuf {
     home.join(".plank").join("plugins").join("claude")
 }
 
+/// Substitutes `${CLAUDE_PLUGIN_ROOT}` with `dest` in the two files whose
+/// contents become subprocess command lines, returning whether anything
+/// changed.
+///
+/// Claude Code hook and MCP commands reference the variable to find files
+/// inside their own plugin. Plank's hook runner execs `/bin/sh` with no
+/// injected environment, so left alone the variable expands to empty and the
+/// command silently misfires.
+///
+/// This is done at install time rather than by injecting the variable at exec
+/// time because [`crate::plugins`] flattens every source's hooks into one list
+/// with no per-hook provenance: injecting would mean threading an owning root
+/// through the hook types and the merge order, a change to load-bearing code
+/// for a problem the boundary can solve. The cost is that the installed tree
+/// differs from upstream and stops working if it is moved, which the install
+/// output says out loud.
+///
+/// Only `hooks/hooks.json` and `.mcp.json` are touched. Skills, agents and
+/// commands are model-facing text, and rewriting a path into them would change
+/// what the model reads rather than what a subprocess runs.
+///
+/// # Errors
+/// Returns a message when a file exists but cannot be read or written.
+pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
+    let root = dest.display().to_string();
+    let mut changed = false;
+    for rel in ["hooks/hooks.json", ".mcp.json"] {
+        let path = dest.join(rel);
+        if !path.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        // Braced form first: replacing the bare `$CLAUDE_PLUGIN_ROOT` first
+        // would turn `${CLAUDE_PLUGIN_ROOT}` into `${<path>}` and leave a
+        // stray brace behind.
+        let out = text
+            .replace("${CLAUDE_PLUGIN_ROOT}", &root)
+            .replace("$CLAUDE_PLUGIN_ROOT", &root);
+        if out != text {
+            std::fs::write(&path, &out)
+                .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 /// Event names in `root/hooks/hooks.json` that plank does not implement.
 ///
 /// Claude Code defines `Notification` and `SubagentStop`, which plank has no
@@ -121,6 +169,7 @@ pub fn unsupported_hook_events(root: &Path) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Writes `body` to `root/rel`, creating parent directories.
     fn write(root: &Path, rel: &str, body: &str) {
@@ -130,9 +179,17 @@ mod tests {
     }
 
     /// A fresh empty directory under the system temp dir, named for the test.
+    ///
+    /// An atomic counter appended to the directory name ensures uniqueness even
+    /// if a tag is duplicated across tests, preventing one test from removing
+    /// another's directory mid-run.
     fn tmpdir(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("plank-claudeplugin-{tag}-{}", std::process::id()));
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "plank-claudeplugin-{tag}-{}-{seq}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
         dir
@@ -238,5 +295,46 @@ mod tests {
         write(&root, "hooks/hooks.json", "{not json");
         let err = unsupported_hook_events(&root).expect_err("rejected");
         assert!(err.contains("hooks.json"), "{err}");
+    }
+
+    #[test]
+    fn plugin_root_is_substituted_in_hooks_and_mcp() {
+        let dest = tmpdir("rewrite-both");
+        write(
+            &dest,
+            "hooks/hooks.json",
+            r#"{"PreToolUse":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/g"}]}]}"#,
+        );
+        write(
+            &dest,
+            ".mcp.json",
+            r#"{"mcpServers":{"s":{"command":"$CLAUDE_PLUGIN_ROOT/bin/s"}}}"#,
+        );
+        assert!(rewrite_plugin_root(&dest).expect("ok"));
+        let root = dest.display().to_string();
+        let hooks = std::fs::read_to_string(dest.join("hooks/hooks.json")).expect("read");
+        assert!(hooks.contains(&format!("{root}/bin/g")), "{hooks}");
+        assert!(!hooks.contains("CLAUDE_PLUGIN_ROOT"), "{hooks}");
+        let mcp = std::fs::read_to_string(dest.join(".mcp.json")).expect("read");
+        assert!(mcp.contains(&format!("{root}/bin/s")), "{mcp}");
+        assert!(!mcp.contains("CLAUDE_PLUGIN_ROOT"), "{mcp}");
+    }
+
+    #[test]
+    fn nothing_to_substitute_reports_no_change() {
+        let dest = tmpdir("rewrite-none");
+        write(&dest, ".mcp.json", r#"{"mcpServers":{}}"#);
+        assert!(!rewrite_plugin_root(&dest).expect("ok"));
+    }
+
+    #[test]
+    fn other_files_are_left_alone() {
+        // A skill body is model-facing text; substituting a path into it would
+        // change what the model reads, not what a subprocess runs.
+        let dest = tmpdir("rewrite-scope");
+        write(&dest, "skills/s/SKILL.md", "run ${CLAUDE_PLUGIN_ROOT}/x\n");
+        assert!(!rewrite_plugin_root(&dest).expect("ok"));
+        let body = std::fs::read_to_string(dest.join("skills/s/SKILL.md")).expect("read");
+        assert!(body.contains("${CLAUDE_PLUGIN_ROOT}"), "{body}");
     }
 }
