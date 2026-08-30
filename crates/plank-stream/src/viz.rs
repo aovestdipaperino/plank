@@ -865,6 +865,11 @@ impl<S: RenderSink> StreamRenderer<S> {
         &self.sink
     }
 
+    /// Mutable access to the sink, for callers that must drain it mid-stream.
+    pub fn sink_mut(&mut self) -> &mut S {
+        &mut self.sink
+    }
+
     /// Consumes the renderer, returning the sink.
     pub fn into_sink(self) -> S {
         self.sink

@@ -133,6 +133,12 @@ impl StreamView {
         out
     }
 
+    /// The whole scrollback with attributes intact, for tests and golden files.
+    #[must_use]
+    pub fn styled_lines(&self) -> Vec<Vec<Cell>> {
+        self.iter_lines().cloned().collect()
+    }
+
     fn iter_lines(&self) -> impl Iterator<Item = &Vec<Cell>> {
         self.lines.iter().chain(self.partial.iter())
     }

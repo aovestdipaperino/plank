@@ -3,8 +3,7 @@
 
 //! `plank-console` — a Turbo Vision monitor for plank model-token streams.
 
-mod cmd;
-
+use plank_console::cmd;
 use turbo_vision::app::Application;
 use turbo_vision::core::command::{CM_CASCADE, CM_CLOSE, CM_NEXT, CM_QUIT, CM_TILE};
 use turbo_vision::core::event::{KB_ALT_X, KB_F6, KB_F10};

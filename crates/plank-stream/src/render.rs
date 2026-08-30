@@ -1401,6 +1401,12 @@ impl<W: Write> fmt::Debug for TokenRenderer<W> {
 }
 
 impl<W: Write> TokenRenderer<W> {
+    /// Borrows the sink, so a caller rendering into a buffer can harvest
+    /// bytes without consuming the renderer.
+    pub fn sink_mut(&mut self) -> &mut W {
+        &mut self.sink
+    }
+
     /// Creates a renderer writing to `sink` with the given options.
     pub fn new(sink: W, opts: RenderOptions) -> Self {
         Self {

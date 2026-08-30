@@ -7,6 +7,11 @@ use turbo_vision::core::ansi::AnsiParser;
 use turbo_vision::core::draw::Cell;
 use turbo_vision::core::palette::{Attr, TvColor};
 
+/// `\r\x1b[0K` — cursor to column 0, erase to end of line. `plank_stream`
+/// emits exactly this byte sequence when it repaints a fenced code block's
+/// first line once the language is known.
+const ERASE_LINE: &[u8] = b"\r\x1b[0K";
+
 /// The SGR sequence that reproduces `attr` from a fresh parser state.
 ///
 /// `AnsiParser::parse_sgr` is private, so attribute state cannot be handed
@@ -105,6 +110,19 @@ impl AnsiLineAssembler {
                 self.pending.clear();
             } else {
                 self.pending.push(b);
+                if self.pending.ends_with(ERASE_LINE) {
+                    // `plank_stream`'s fence highlighter repaints a line it
+                    // already wrote plain by moving the cursor home and
+                    // erasing to end of line, then rewriting it highlighted.
+                    // `AnsiParser` has no concept of cursor position or
+                    // erase-in-line — it only understands SGR — so without
+                    // this the erased text and the erase sequence itself
+                    // would be parsed as literal/garbage content ahead of
+                    // the repaint. Since the cursor is at column 0, "erase
+                    // to end of line" here means "discard the whole line so
+                    // far".
+                    self.pending.clear();
+                }
             }
         }
     }
@@ -259,6 +277,32 @@ mod tests {
         a.push(b"abc\r\n");
         let lines = a.take_complete_lines();
         assert_eq!(text(&lines[0]), "abc");
+    }
+
+    #[test]
+    fn fence_repaint_replaces_the_line_instead_of_appending_to_it() {
+        // `plank_stream`'s fence highlighter writes a code line plain, then
+        // once it learns the language, repaints it: `\r\x1b[0K` moves the
+        // cursor to column 0 and erases to end of line, followed by the
+        // syntax-highlighted rewrite. `AnsiParser` has no concept of cursor
+        // position or erase-in-line, so without special-casing this exact
+        // sequence its "invalid escape" fallback swallows the *next*
+        // escape's `m` terminator, silently eating the highlight colors —
+        // and without any special-casing at all, the plain and highlighted
+        // text would simply concatenate on one line.
+        let mut a = AnsiLineAssembler::new();
+        a.push(b"fn main() {}\x1b[0m\r\x1b[0K\x1b[38;5;214mfn\x1b[0m main() {}\n");
+        let lines = a.take_complete_lines();
+        assert_eq!(
+            text(&lines[0]),
+            "fn main() {}",
+            "the plain pre-repaint text must not survive alongside the repaint"
+        );
+        assert_ne!(
+            lines[0][0].attr.fg,
+            TvColor::LightGray,
+            "the repainted line must carry the highlight color, not the default"
+        );
     }
 
     #[test]
