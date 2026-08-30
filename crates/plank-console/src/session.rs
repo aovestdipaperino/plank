@@ -134,6 +134,19 @@ impl Sessions {
         }
     }
 
+    /// Reflects a `ServerEvent::Attached`: always marks the session
+    /// connected, but draws the "-- reconnected --" rule only for a
+    /// genuine reattach (`reattached`), never for a brand-new session's
+    /// first-ever attach — see defect 1 in
+    /// `.superpowers/sdd/lifecycle-fixes-report.md`.
+    pub fn mark_attached(&mut self, id: SessionId, reattached: bool) {
+        if reattached {
+            self.mark_reconnected(id);
+        } else if let Some(s) = self.inner.get_mut(&id) {
+            s.connected = true;
+        }
+    }
+
     pub fn mark_disconnected(&mut self, id: SessionId) {
         if let Some(s) = self.inner.get_mut(&id) {
             s.connected = false;
@@ -222,6 +235,31 @@ mod tests {
         assert_eq!(sessions.window_title(1).unwrap(), "anon-1 [disconnected]");
         sessions.mark_reconnected(1);
         assert_eq!(sessions.window_title(1).unwrap(), "anon-1");
+    }
+
+    /// Regression test for defect 1: a session's first-ever attach must
+    /// mark it connected (title stops reading `[disconnected]`) without
+    /// drawing the "-- reconnected --" rule — that rule announces a
+    /// genuine rejoin, and would be wrong above the very first line of a
+    /// brand-new session.
+    #[test]
+    fn mark_attached_first_attach_connects_without_a_rule() {
+        let mut sessions = Sessions::default();
+        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.mark_attached(1, false);
+        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
+        assert!(!sessions.plain_text(1).unwrap().contains("reconnected"));
+    }
+
+    /// A genuine reattach (`reattached: true`) both connects and draws the
+    /// rule, same as `mark_reconnected`.
+    #[test]
+    fn mark_attached_reattach_connects_and_draws_a_rule() {
+        let mut sessions = Sessions::default();
+        sessions.insert(1, "demo".into(), 4242, view(), opts());
+        sessions.mark_attached(1, true);
+        assert_eq!(sessions.window_title(1).unwrap(), "demo :4242");
+        assert!(sessions.plain_text(1).unwrap().contains("reconnected"));
     }
 
     #[test]

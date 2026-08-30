@@ -104,7 +104,7 @@ fn main() -> turbo_vision::core::error::Result<()> {
         app.desktop.handle_moved_windows(&mut app.terminal);
 
         if app.desktop.remove_closed_windows() {
-            console.forget_closed_windows(&app);
+            console.forget_closed_windows(&app, &mut server);
             app.draw();
             let _ = app.terminal.flush();
         }
@@ -221,8 +221,8 @@ impl Console {
             ServerEvent::Opened { id, name, port } => {
                 Some(ConsoleIntent::CreateWindow { id, name, port })
             }
-            ServerEvent::Reconnected { id } => {
-                self.sessions.mark_reconnected(id);
+            ServerEvent::Attached { id, reattached } => {
+                self.sessions.mark_attached(id, reattached);
                 self.retitle_intent(id)
             }
             ServerEvent::Bytes { id, data } => {
@@ -301,12 +301,40 @@ impl Console {
     /// A window may have been closed by the user (frame close box,
     /// Window > Close) rather than by the server. Drop any mapping whose
     /// `ViewId` is no longer on the desktop so a stale entry cannot
-    /// misattribute a later command to the wrong session.
-    fn forget_closed_windows(&mut self, app: &Application) {
+    /// misattribute a later command to the wrong session, drop the closed
+    /// window's `SessionState` so it does not leak (a 10,000-line
+    /// `StreamView` plus its `Pipeline`, kept alive with no window to show
+    /// it, for the rest of the process's life), and tear down the
+    /// server-side session so its port and accept thread are actually
+    /// released.
+    ///
+    /// **Semantics decision (defect 2):** closing a window tears the
+    /// server-side session down too, rather than leaving it running
+    /// headless for a later reconnect. A closed window is the user's
+    /// explicit signal that they are done watching this stream — plank
+    /// already has a distinct, weaker "went away" state (`Disconnected`,
+    /// idle-but-listening, reconnectable) for the case the user *hasn't*
+    /// asked to stop; reusing that for an explicit close would mean a
+    /// stream nobody can see keeps consuming a port and a thread
+    /// indefinitely, never reaped (a live session is never a reap
+    /// candidate) and never reachable again (no window to reopen it into).
+    /// If a later use case wants "detach but keep running", that is a
+    /// different, explicit command from Close — not the current default.
+    fn forget_closed_windows(&mut self, app: &Application, server: &mut Server) {
+        let closed: Vec<SessionId> = self
+            .window_ids
+            .iter()
+            .filter(|(view_id, _)| !app.desktop.contains_id(**view_id))
+            .map(|(_, id)| *id)
+            .collect();
         self.window_ids
             .retain(|view_id, _| app.desktop.contains_id(*view_id));
         self.session_windows
             .retain(|_, view_id| app.desktop.contains_id(*view_id));
+        for id in closed {
+            self.sessions.remove(id);
+            server.close_session(id);
+        }
     }
 
     fn save_as(&self, app: &mut Application, id: SessionId) {
@@ -544,7 +572,7 @@ mod console_decision_tests {
     }
 
     #[test]
-    fn reconnected_decides_to_retitle_the_mapped_window() {
+    fn attached_reattach_decides_to_retitle_the_mapped_window() {
         let mut console = Console::default();
         console
             .sessions
@@ -553,7 +581,38 @@ mod console_decision_tests {
         console.session_windows.insert(1, view_id);
         console.window_ids.insert(view_id, 1);
 
-        let intent = console.decide_server_event(ServerEvent::Reconnected { id: 1 });
+        let intent = console.decide_server_event(ServerEvent::Attached {
+            id: 1,
+            reattached: true,
+        });
+
+        assert_eq!(
+            intent,
+            Some(ConsoleIntent::Retitle {
+                view_id,
+                title: "demo :4242".into(),
+            })
+        );
+    }
+
+    /// Regression test for defect 1: the ordinary first-attach path (no
+    /// prior handshake reconnect) must also mark the session connected and
+    /// retitle its window — not stay stuck reading `[disconnected]` for the
+    /// entire first connection.
+    #[test]
+    fn attached_first_attach_also_decides_to_retitle_the_mapped_window() {
+        let mut console = Console::default();
+        console
+            .sessions
+            .insert(1, "demo".into(), 4242, test_view(), console.opts.0);
+        let view_id = ViewId::from_u16(8);
+        console.session_windows.insert(1, view_id);
+        console.window_ids.insert(view_id, 1);
+
+        let intent = console.decide_server_event(ServerEvent::Attached {
+            id: 1,
+            reattached: false,
+        });
 
         assert_eq!(
             intent,
