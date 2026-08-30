@@ -345,9 +345,11 @@ pub fn install_staged(
 /// Fetches the plugin `arg` names, validates it, and installs it.
 ///
 /// The one entry point the slash command calls. Everything it does happens in
-/// a staging directory under the install root, which is removed on every exit
-/// path: a half-fetched tree left behind would be found by the next scan as a
-/// plugin nobody asked for.
+/// a staging directory outside every root [`crate::plugins::load_in`] scans,
+/// which is removed on every exit path: a half-fetched or half-validated tree
+/// left behind would otherwise be found by the next scan as a plugin nobody
+/// asked for and never checked — including one that was about to be refused
+/// for a symlink or an unimplemented hook event.
 ///
 /// # Errors
 /// Returns a message when the argument names nothing fetchable, the fetch
@@ -365,8 +367,18 @@ pub fn install(
 }
 
 /// A private, empty staging directory. Removed by [`install`] on every path.
+///
+/// Deliberately not under [`install_dir`]: that directory is one of
+/// `load_in`'s scan roots (its subdirectories are loaded as installed
+/// plugins), so a tree extracted there is a tree the next start could load
+/// before it was ever validated, if plank were killed between extraction and
+/// checking, or the closing `remove_dir_all` failed. `~/.plank/.claude-staging`
+/// sits one level up, beside `plugins/` rather than inside it, so it is never
+/// a subdirectory of anything `load_in` scans — `dev/`, `install_dir`'s
+/// `plugins/claude/`, and the project's own `.plank/plugins/` are all rooted
+/// under a project or `plugins/`, never above it.
 fn staging_dir(home: &Path) -> Result<PathBuf, String> {
-    let base = install_dir(home).join(".staging");
+    let base = home.join(".plank").join(".claude-staging");
     // Fresh every time: reusing it would mix a previous failed fetch into a new
     // one, and the plugin root is found by looking at the tree.
     let _ = std::fs::remove_dir_all(&base);
@@ -400,9 +412,60 @@ fn fetch(arg: &str, staging: &Path) -> Result<PathBuf, String> {
         Source::Git { url } => clone(&url, staging),
         Source::Archive { url } => {
             crate::plugins::fetch_archive(&url, staging)?;
-            Ok(staging.to_path_buf())
+            // Every conventionally produced tarball nests its contents under
+            // one top-level directory — GitHub's codeload archives use
+            // `repo-main/`, and a plain `tar czf x.tar.gz somedir` yields
+            // `somedir/` — so the manifest is one level down more often than
+            // it is at the root. The descent lives here, in the archive
+            // branch only, rather than in `resolve_in_tree`: that function is
+            // also reached by the git-clone and local-directory paths, whose
+            // behaviour is already reviewed and correct, and it has no way to
+            // tell "the caller is an archive" from "the caller is a repo that
+            // happens to have no manifest at its root" — conflating the two
+            // would make a git clone of a directory-of-directories resolve
+            // somewhere it never has before.
+            find_claude_root(staging).ok_or_else(|| {
+                "this is not a Claude Code plugin: no .claude-plugin/plugin.json and no \
+                 .claude-plugin/marketplace.json at its root or one level in"
+                    .to_string()
+            })
         }
     }
+}
+
+/// Whether `dir` itself carries a Claude Code manifest — either spelling,
+/// since a tarball of a marketplace repository must resolve here too.
+fn is_claude_manifest_root(dir: &Path) -> bool {
+    dir.join(".claude-plugin").join("plugin.json").is_file()
+        || dir
+            .join(".claude-plugin")
+            .join("marketplace.json")
+            .is_file()
+}
+
+/// Finds the directory holding a Claude Code manifest, at `dir` itself or one
+/// level in.
+///
+/// Mirrors [`crate::plugins`]'s private `find_plugin_root`, which solves the
+/// identical problem for plank's own archive format: check the given
+/// directory, else collect subdirectories that qualify, sort them, and take
+/// the first. Kept as a separate copy rather than shared code because the two
+/// check different manifest spellings and `plugins`'s version is private —
+/// this module changes nothing outside itself.
+fn find_claude_root(dir: &Path) -> Option<PathBuf> {
+    if is_claude_manifest_root(dir) {
+        return Some(dir.to_path_buf());
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && is_claude_manifest_root(p))
+        .collect();
+    // Sorted so an archive holding two qualifying directories resolves the
+    // same way twice rather than depending on directory order.
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 /// Shallow-clones `url` into `staging/repo` and drops its history.
@@ -1130,7 +1193,7 @@ mod tests {
         let err = install(work.to_str().expect("utf8"), None, &home, false).expect_err("refused");
         assert!(err.contains(".claude-plugin"), "{err}");
         assert!(
-            !install_dir(&home).join(".staging").exists(),
+            !home.join(".plank").join(".claude-staging").exists(),
             "staging removed on the failure path"
         );
     }
@@ -1143,6 +1206,141 @@ mod tests {
         assert!(
             err.to_lowercase().contains("https") || err.to_lowercase().contains("tls"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn an_archive_nested_under_a_top_level_directory_installs() {
+        use std::io::{Read as _, Write as _};
+
+        let root = tmpdir("archive-nested");
+        let staged = root.join("stage").join("repo-main").join(".claude-plugin");
+        std::fs::create_dir_all(&staged).expect("mkdir");
+        std::fs::write(staged.join("plugin.json"), r#"{"name":"demo"}"#).expect("write");
+        write(
+            &root.join("stage").join("repo-main"),
+            "commands/note.md",
+            "hi\n",
+        );
+        let tarball = root.join("x.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(root.join("stage"))
+            .arg("repo-main")
+            .status()
+            .expect("tar runs")
+            .success();
+        assert!(ok, "could not build the fixture tarball");
+        let bytes = std::fs::read(&tarball).expect("read tarball");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(&bytes);
+            let _ = sock.flush();
+        });
+
+        let home = tmpdir("archive-nested-home");
+        let out = install(
+            &format!("http://127.0.0.1:{port}/x.tar.gz"),
+            None,
+            &home,
+            false,
+        )
+        .expect("installs the plugin nested one level down");
+        server.join().expect("server thread");
+
+        assert_eq!(out.name, "demo");
+        assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
+        assert!(out.dest.join("commands/note.md").is_file());
+    }
+
+    #[test]
+    fn an_archive_with_the_plugin_at_the_top_level_still_installs() {
+        // The nesting descent must not break the flat case: a hand-rolled
+        // archive that puts the manifest straight at the root is exactly what
+        // `resolve_in_tree` already handled before this fix, and it must keep
+        // working unchanged.
+        use std::io::{Read as _, Write as _};
+
+        let root = tmpdir("archive-flat");
+        write(
+            &root.join("stage"),
+            ".claude-plugin/plugin.json",
+            r#"{"name":"flatdemo"}"#,
+        );
+        let tarball = root.join("x.tar.gz");
+        let ok = std::process::Command::new("tar")
+            .arg("-czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(root.join("stage"))
+            .arg(".")
+            .status()
+            .expect("tar runs")
+            .success();
+        assert!(ok, "could not build the fixture tarball");
+        let bytes = std::fs::read(&tarball).expect("read tarball");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let server = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                )
+                .as_bytes(),
+            );
+            let _ = sock.write_all(&bytes);
+            let _ = sock.flush();
+        });
+
+        let home = tmpdir("archive-flat-home");
+        let out = install(
+            &format!("http://127.0.0.1:{port}/x.tar.gz"),
+            None,
+            &home,
+            false,
+        )
+        .expect("installs the plugin at the archive root");
+        server.join().expect("server thread");
+
+        assert_eq!(out.name, "flatdemo");
+        assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
+    }
+
+    #[test]
+    fn a_failed_install_leaves_nothing_loadable() {
+        // Staging must sit outside every root `plugins::load_in` scans: if it
+        // did not, a tree that was extracted but refused installation (here,
+        // an unimplemented hook event without `--force`) would still be found
+        // by the very next scan, under whatever name its manifest claims.
+        let staged = staged_plugin("staging-scope", "unwanted");
+        write(&staged, "hooks/hooks.json", r#"{"SubagentStop":[]}"#);
+        let home = tmpdir("staging-scope-home");
+        let err = install(staged.to_str().expect("utf8"), None, &home, false).expect_err("refused");
+        assert!(err.contains("SubagentStop"), "{err}");
+        let set = crate::plugins::load_in(Some(&home), &tmpdir("staging-scope-cwd"), &[]);
+        assert!(
+            set.plugins.iter().all(|p| p.name != "unwanted"),
+            "a refused install must not be loadable: {:?}",
+            set.plugins.iter().map(|p| &p.name).collect::<Vec<_>>()
         );
     }
 
