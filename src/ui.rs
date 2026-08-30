@@ -1681,6 +1681,11 @@ impl Agent<'_> {
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
+        // Defensive retry point: picks up a console that started after plank
+        // did, or a setting change that raced this turn's start. A settings
+        // change itself already reconciles immediately (`settings::reinstall`),
+        // so this is a cheap no-op in the common case.
+        crate::debugmirror::reconcile();
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
         // without a leading tag; start the renderer inside the think block so it
@@ -1739,6 +1744,10 @@ impl Agent<'_> {
                         bar.clear();
                         assistant_text.push_str(&t);
                         stream.push(&t);
+                        // Tee the exact bytes the local renderer sees to the
+                        // debug console; a no-op unless showThinking is off
+                        // and a console is connected.
+                        crate::debugmirror::push(&t);
                         greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                         if stream.preflight_error().is_some() {
                             preflight_stop.store(true, Ordering::Relaxed);
@@ -1779,6 +1788,7 @@ impl Agent<'_> {
             )
             .map_err(|e| e.to_string())?;
         stream.finish();
+        crate::debugmirror::flush();
         bar.clear();
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
@@ -9427,6 +9437,9 @@ impl Agent<'_> {
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
+        // See the matching comment in `stream_generation`: a defensive retry
+        // point, cheap when already reconciled.
+        crate::debugmirror::reconcile();
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
@@ -9473,6 +9486,8 @@ impl Agent<'_> {
                 EngineEvent::Text(t) => {
                     assistant_text.push_str(&t);
                     stream.push(&t);
+                    // See `stream_generation`: same tee, TUI side.
+                    crate::debugmirror::push(&t);
                     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                     if stream.preflight_error().is_some() {
                         preflight_stop.store(true, Ordering::Relaxed);
@@ -9611,6 +9626,7 @@ impl Agent<'_> {
         self.record_usage(&stats);
         self.last_ctx_used = stats.ctx_used;
         stream.finish();
+        crate::debugmirror::flush();
         let finished = stream.finished();
         let calls = finished.calls.to_vec();
         // A preflight stop reads as an engine interrupt, but it is a tool
@@ -14808,6 +14824,11 @@ mod tests {
 
     #[test]
     fn replay_history_renders_markdown_and_thinking_not_plain() {
+        // showThinking now defaults off; opt this thread in explicitly since
+        // the test is exercising the thinking-rendered case.
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = true;
+        crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay");
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
@@ -14876,8 +14897,11 @@ mod tests {
     #[test]
     fn replay_history_consumes_in_think_tool_call_instead_of_ignoring_it() {
         // Opt this thread into in-think dispatch; the shipped default is off.
+        // Also opt into showThinking (now off by default) since this test
+        // asserts the thinking text itself renders.
         let mut settings = crate::settings::Settings::default();
         settings.engine.thinking_tool_calls = true;
+        settings.ui.show_thinking = true;
         crate::settings::install_for_test(settings);
         let dir = scratch_dir("resume-replay-in-think");
         let cfg = test_cfg();

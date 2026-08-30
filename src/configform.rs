@@ -1438,9 +1438,9 @@ mod tests {
         for _ in 0..idx {
             form.handle_key(k(KeyCode::Down));
         }
-        assert!(form.working.ui.show_thinking, "default is on");
+        assert!(!form.working.ui.show_thinking, "default is off");
         form.handle_key(k(KeyCode::Enter));
-        assert!(!form.working.ui.show_thinking, "toggled off");
+        assert!(form.working.ui.show_thinking, "toggled on");
     }
 
     #[test]

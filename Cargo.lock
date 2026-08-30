@@ -3811,6 +3811,7 @@ dependencies = [
  "tokio",
  "trace-stream",
  "tungstenite",
+ "turbo-debug-client",
  "unicode-width 0.2.0",
  "ureq",
 ]
@@ -6346,6 +6347,12 @@ dependencies = [
  "thiserror 1.0.69",
  "utf-8",
 ]
+
+[[package]]
+name = "turbo-debug-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbc55aec361f750b1a9acdcc8c940f3db6b8c8ed54e62df144c03c43d57afa9c"
 
 [[package]]
 name = "typenum"

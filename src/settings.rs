@@ -106,9 +106,11 @@ pub struct UiSettings {
     /// Echo tool result text (observations) into the scrollback. Off by
     /// default; the model always receives the results either way.
     pub show_tool_results: bool,
-    /// Render the model's thinking text (dimmed) in the scrollback. On by
-    /// default; when off, thinking is hidden from the display but the model
-    /// still produces it.
+    /// Render the model's thinking text (dimmed) in the scrollback. Off by
+    /// default; when off, the raw model stream (thinking, answer, tool-call
+    /// markup) is instead mirrored to a `turbo-debug-console` listening on
+    /// port 7878, if one is up (see `debugmirror`), so the thinking is not
+    /// simply lost. When on, plank never connects to the console at all.
     pub show_thinking: bool,
     /// When native macOS desktop notifications fire at turn lifecycle points
     /// (turn complete/interrupted past the threshold, and awaiting input):
@@ -161,7 +163,7 @@ impl Default for UiSettings {
             history_size: DEFAULT_HISTORY_SIZE,
             show_tool_calls: false,
             show_tool_results: false,
-            show_thinking: true,
+            show_thinking: false,
             notifications: crate::notify::NotifyMode::Always,
             notify_after_secs: 10,
             crt_off: true,
@@ -1162,6 +1164,11 @@ pub fn install(settings: Settings) {
     if slot.is_none() {
         *slot = Some(Box::leak(Box::new(settings)));
     }
+    drop(slot);
+    // showThinking may already be off in the loaded config at startup (it is
+    // the new default), so the debug-console mirror must be reconciled here
+    // too, not only on a later `/config` change.
+    crate::debugmirror::reconcile();
 }
 
 /// Replaces the process-wide settings (used by `/config` after a save), so the
@@ -1171,6 +1178,11 @@ pub fn reinstall(settings: Settings) {
     *ACTIVE
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::leak(Box::new(settings)));
+    // The common choke point for both `/config showThinking <bool>` and the
+    // interactive config form save: reconciling here, rather than at each
+    // call site, is what makes the toggle take effect immediately instead of
+    // waiting for the next turn to notice.
+    crate::debugmirror::reconcile();
 }
 
 // Test-only settings override, scoped to the calling thread. The libtest
@@ -1397,16 +1409,16 @@ mod tests {
     }
 
     #[test]
-    fn show_thinking_defaults_on_and_can_be_turned_off() {
+    fn show_thinking_defaults_off_and_can_be_turned_on() {
         assert!(
-            Settings::default().ui.show_thinking,
-            "thinking shown by default"
+            !Settings::default().ui.show_thinking,
+            "thinking hidden (mirrored to the debug console) by default"
         );
-        let s = from_json(r#"{"ui":{"showThinking":false}}"#);
-        assert!(!s.ui.show_thinking);
-        // Only the non-default (off) value is surfaced in the startup note.
+        let s = from_json(r#"{"ui":{"showThinking":true}}"#);
+        assert!(s.ui.show_thinking);
+        // Only the non-default (on) value is surfaced in the startup note.
         let note = note_for(&s, &[]).expect("a note");
-        assert!(note.contains("showThinking=false"), "{note}");
+        assert!(note.contains("showThinking=true"), "{note}");
     }
 
     #[test]

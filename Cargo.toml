@@ -75,6 +75,7 @@ plugins = ["dep:extism"]
 
 [dependencies]
 trace-stream = { path = "crates/trace-stream" }
+turbo-debug-client = "0.1"
 libc = "0.2"
 # unstable-rendered-line-info exposes Paragraph::line_count for exact
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
