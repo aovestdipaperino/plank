@@ -4079,8 +4079,26 @@ impl Agent<'_> {
             },
             // miniedit needs the raw terminal and only the TUI can suspend
             // itself to hand it over; there is deliberately no $EDITOR
-            // fallback here.
-            "/open" => println!("/open requires the interactive TUI"),
+            // fallback here. Handing a file to the browser needs no terminal
+            // at all, though, so that branch works on this path too.
+            "/open" => match crate::openfile::resolve_open_target(
+                arg,
+                self.last_edited.as_deref(),
+                &self.tool_ctx.cwd,
+            ) {
+                Ok(path) if crate::openfile::is_browser_target(&path) => {
+                    let display = path.display().to_string();
+                    match crate::openfile::open_in_browser(&path) {
+                        Ok(()) => {
+                            println!("{}", crate::openfile::opened_in_browser_message(&display));
+                        }
+                        Err(e) => println!("{e}"),
+                    }
+                    self.last_edited = Some(path);
+                }
+                Ok(_) => println!("/open requires the interactive TUI"),
+                Err(e) => println!("{e}"),
+            },
             "/insights" => {
                 let color = self.color;
                 let mut note = |line: String| println!("{}", status::system_line(&line, color));
@@ -10527,15 +10545,13 @@ impl Agent<'_> {
         true
     }
 
-    /// Handles `/open [path]`: edits a file in the built-in editor and writes
-    /// it back on accept.
+    /// Handles `/open [path]`: resolves the target, then either shows it in the
+    /// browser or edits it in the built-in editor.
     ///
-    /// Every refusal is a log line and no editor launch, so a typo cannot
-    /// create a file and a binary file cannot be mangled by the `String`
-    /// buffer. Unlike the Ctrl-G prompt path this ignores
-    /// `settings.ui.builtin_editor`: `/open` *is* the built-in editor command,
-    /// and there is no `$EDITOR` fallback to fall back to.
-    #[cfg(feature = "builtin_editor")]
+    /// Every refusal is a log line and no launch, so a typo cannot create a
+    /// file. The browser branch sits above the editor branch and outside the
+    /// `builtin_editor` feature gate: rendering an HTML report needs no editor,
+    /// so it works in a build that has none compiled in.
     fn tui_open(
         &mut self,
         arg: &str,
@@ -10553,6 +10569,33 @@ impl Agent<'_> {
                 return;
             }
         };
+        if crate::openfile::is_browser_target(&path) {
+            let display = path.display().to_string();
+            match crate::openfile::open_in_browser(&path) {
+                Ok(()) => log.push_dim(crate::openfile::opened_in_browser_message(&display)),
+                Err(e) => log.push_plain(e),
+            }
+            // Same rule as the editor branch: this is the file the user was
+            // last looking at, so a bare `/open` reopens it.
+            self.last_edited = Some(path);
+            return;
+        }
+        self.tui_open_in_editor(path, log, terminal);
+    }
+
+    /// Edits `path` in the built-in editor and writes it back on accept.
+    ///
+    /// A binary file is refused rather than mangled by the `String` buffer.
+    /// Unlike the Ctrl-G prompt path this ignores `settings.ui.builtin_editor`:
+    /// `/open` *is* the built-in editor command, and there is no `$EDITOR`
+    /// fallback to fall back to.
+    #[cfg(feature = "builtin_editor")]
+    fn tui_open_in_editor(
+        &mut self,
+        path: std::path::PathBuf,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+    ) {
         let initial = match crate::openfile::load(&path) {
             Ok(text) => text,
             Err(e) => {
@@ -10598,12 +10641,13 @@ impl Agent<'_> {
         self.last_edited = Some(path);
     }
 
-    /// Without the built-in editor compiled in there is nothing for `/open` to
-    /// open: the command deliberately has no `$EDITOR` fallback.
+    /// Without the built-in editor compiled in there is nothing to edit with:
+    /// the command deliberately has no `$EDITOR` fallback. HTML still opens,
+    /// because that branch never reaches here.
     #[cfg(not(feature = "builtin_editor"))]
-    fn tui_open(
+    fn tui_open_in_editor(
         &mut self,
-        _arg: &str,
+        _path: std::path::PathBuf,
         log: &mut OutputLog,
         _terminal: &mut ratatui::DefaultTerminal,
     ) {

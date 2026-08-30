@@ -155,6 +155,78 @@ pub fn note_written(last: &mut Option<PathBuf>, written: Option<PathBuf>) {
     }
 }
 
+/// Extensions `/open` hands to the browser rather than the text editor.
+///
+/// Deliberately short: only markup a browser renders as a *document*. An
+/// `.svg` or `.json` opened from a coding agent is far more likely to be
+/// something the user wants to edit than to look at.
+const BROWSER_EXTENSIONS: [&str; 2] = ["html", "htm"];
+
+/// Whether `/open` should show `path` in the browser instead of miniedit.
+///
+/// Extension-based, and case-insensitive because `.HTML` is still HTML.
+#[must_use]
+pub fn is_browser_target(path: &Path) -> bool {
+    path.extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|ext| {
+            BROWSER_EXTENSIONS
+                .iter()
+                .any(|known| ext.eq_ignore_ascii_case(known))
+        })
+}
+
+/// The platform command that hands a path to the default browser.
+///
+/// Split out from [`open_in_browser`] so the platform choice is unit-testable
+/// without actually launching anything.
+#[must_use]
+fn browser_command(path: &Path) -> (&'static str, Vec<std::ffi::OsString>) {
+    let p = path.as_os_str().to_os_string();
+    if cfg!(target_os = "macos") {
+        ("open", vec![p])
+    } else if cfg!(target_os = "windows") {
+        // `start` is a cmd builtin, not an executable; the empty string is the
+        // window title `start` would otherwise eat the path as.
+        ("cmd", vec!["/C".into(), "start".into(), "".into(), p])
+    } else {
+        ("xdg-open", vec![p])
+    }
+}
+
+/// Opens `path` in the default browser.
+///
+/// The child is spawned and *not* waited on: the launcher exits immediately on
+/// macOS but `xdg-open` can outlive the browser it starts, and `/open` must not
+/// block the session either way. Output is silenced so a launcher's chatter
+/// cannot scribble over the TUI.
+///
+/// # Errors
+/// Returns a user-facing message when the launcher cannot be spawned — the
+/// common case being a headless Linux box with no `xdg-open` installed.
+pub fn open_in_browser(path: &Path) -> Result<(), String> {
+    let (program, args) = browser_command(path);
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            format!(
+                "cannot open {} in a browser ({program}: {e})",
+                path.display()
+            )
+        })
+}
+
+/// The log line for a file handed to the browser.
+#[must_use]
+pub fn opened_in_browser_message(display: &str) -> String {
+    format!("opened {display} in the default browser")
+}
+
 /// The log line for a successful write.
 #[must_use]
 pub fn wrote_message(display: &str, text: &str) -> String {
@@ -351,6 +423,64 @@ mod tests {
         assert_eq!(wrote_message("a.txt", "a\nb\n"), "wrote a.txt (2 lines)");
         assert_eq!(wrote_message("a.txt", "a\n"), "wrote a.txt (1 line)");
         assert_eq!(wrote_message("a.txt", ""), "wrote a.txt (0 lines)");
+    }
+
+    #[test]
+    fn html_files_go_to_the_browser() {
+        assert!(is_browser_target(Path::new("/work/report.html")));
+        assert!(is_browser_target(Path::new("/work/report.htm")));
+        // A browser renders it, but from a coding agent it is far more likely
+        // to be something the user wants to edit.
+        assert!(!is_browser_target(Path::new("/work/logo.svg")));
+        assert!(!is_browser_target(Path::new("/work/data.json")));
+        assert!(!is_browser_target(Path::new("/work/notes.md")));
+        assert!(!is_browser_target(Path::new("/work/src/ui.rs")));
+    }
+
+    #[test]
+    fn the_extension_match_is_case_insensitive() {
+        assert!(is_browser_target(Path::new("/work/REPORT.HTML")));
+        assert!(is_browser_target(Path::new("/work/Report.Htm")));
+    }
+
+    #[test]
+    fn an_extensionless_or_dotfile_name_is_not_html() {
+        // `.html` as the whole file name is an extensionless dotfile, not an
+        // HTML document; neither is a file that merely contains the word.
+        assert!(!is_browser_target(Path::new("/work/.html")));
+        assert!(!is_browser_target(Path::new("/work/README")));
+        assert!(!is_browser_target(Path::new("/work/html")));
+        assert!(!is_browser_target(Path::new("/work/index.html.bak")));
+    }
+
+    #[test]
+    fn the_browser_command_passes_the_path_as_one_argument() {
+        // A path with spaces must survive as a single argv entry rather than
+        // being re-split by a shell -- which is why this spawns a program
+        // directly instead of going through `sh -c`.
+        let path = Path::new("/work/my report.html");
+        let (program, args) = browser_command(path);
+        assert!(!program.is_empty());
+        assert_eq!(
+            args.last().map(std::ffi::OsString::as_os_str),
+            Some(path.as_os_str())
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uses_the_open_launcher() {
+        let (program, args) = browser_command(Path::new("/work/r.html"));
+        assert_eq!(program, "open");
+        assert_eq!(args.len(), 1);
+    }
+
+    #[test]
+    fn opened_in_browser_message_names_the_file() {
+        assert_eq!(
+            opened_in_browser_message("/work/r.html"),
+            "opened /work/r.html in the default browser"
+        );
     }
 
     #[test]
