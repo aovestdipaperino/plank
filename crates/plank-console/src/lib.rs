@@ -4,3 +4,4 @@
 //! `plank-console` — a Turbo Vision monitor for plank model-token streams.
 
 pub mod ansiasm;
+pub mod streamview;
