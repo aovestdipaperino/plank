@@ -97,7 +97,7 @@ None of `showToolCalls`, `showToolResults`, or `showThinking` change what the mo
 
 | Key | Default | What |
 |---|---|---|
-| `signCommits` | `true` | ask the model to end each commit message it writes with a blank line and `--with help from plank`. Set it to `false` and commit messages follow your repository's conventions and nothing else. |
+| `signCommits` | `true` | ask the model to end each commit message it writes with a blank line and `--Co-Authored by Plank (https://plank-agent.dev)`. Set it to `false` and commit messages follow your repository's conventions and nothing else. |
 
 ### `kvcache`
 

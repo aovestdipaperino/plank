@@ -137,6 +137,16 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong><code>/insights</code> now recommends the plank features you
+are not using.</strong> The report already knew how you work; a new
+<em>Features to try</em> section turns that into two or three concrete
+suggestions — a skill for the routine you retype every week, a
+<code>PostToolUse</code> hook for the lint you keep running by hand, a
+subagent for the sweeps you do serially — each with a ready-to-run
+snippet rather than a description. It reads your installed skills,
+templates, subagents, hooks and MCP servers first, so it suggests what
+is missing instead of what you already have. See <a
+href="/guide/04-slash-commands.html">Slash commands</a>.</p>
 <p><strong>plank tells you where every setting came from.</strong>
 Settings arrive from five layers — built-in defaults, plugins,
 <code>~/.plank</code>, the project's <code>./.plank</code>, and CLI
@@ -205,7 +215,8 @@ with <code>tools.recall</code>, <code>tools.fanout</code> or
 <code>tools.runCode</code>.</p>
 <p><strong>plank signs the commits it writes.</strong> When the model
 creates a git commit, the message now ends with a blank line and the
-single line <code>--with help from plank</code>, so a
+single line
+<code>--Co-Authored by Plank (https://plank-agent.dev)</code>, so a
 <code>git log</code> months from now still says which commits came out
 of a session rather than out of your fingers. It is a system-prompt
 instruction, not a hook, which means the model can be told to leave it

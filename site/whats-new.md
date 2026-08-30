@@ -7,6 +7,15 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**`/insights` now recommends the plank features you are not using.** The report
+already knew how you work; a new *Features to try* section turns that into two
+or three concrete suggestions — a skill for the routine you retype every week, a
+`PostToolUse` hook for the lint you keep running by hand, a subagent for the
+sweeps you do serially — each with a ready-to-run snippet rather than a
+description. It reads your installed skills, templates, subagents, hooks and MCP
+servers first, so it suggests what is missing instead of what you already have.
+See [Slash commands](/guide/04-slash-commands.html).
+
 **plank tells you where every setting came from.** Settings arrive from five
 layers — built-in defaults, plugins, `~/.plank`, the project's `./.plank`, and
 CLI flags — and "I set that and nothing happened" used to mean reading code.
@@ -68,7 +77,7 @@ your `PreToolUse` hooks apply exactly as they would to a bare call. Switch any
 of them off with `tools.recall`, `tools.fanout` or `tools.runCode`.
 
 **plank signs the commits it writes.** When the model creates a git commit, the
-message now ends with a blank line and the single line `--with help from plank`,
+message now ends with a blank line and the single line `--Co-Authored by Plank (https://plank-agent.dev)`,
 so a `git log` months from now still says which commits came out of a session
 rather than out of your fingers. It is a system-prompt instruction, not a hook,
 which means the model can be told to leave it off for one commit and your

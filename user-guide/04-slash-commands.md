@@ -97,6 +97,8 @@ See [Extending plank](09-extending.md).
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 
+Among the written sections is **Features to try**: two or three of plank's own [extension points](09-extending.md) — a skill, a template, a subagent, a hook, an MCP server — chosen from what your sessions actually show, each with a ready-to-run snippet that sets it up. The report knows what you already have installed (it reads the live skill, template, subagent, hook and MCP rosters), so it recommends what is missing rather than what is already there.
+
 ## Editing a file
 
 | Command | What it does |

@@ -5020,6 +5020,66 @@ the original is frozen and listed in /tree"
     /// The two halves are deliberately unequal in status: the statistics are
     /// the report, and every model call is allowed to fail without taking
     /// anything else down with it.
+    /// The `extensions_in_use` lines for the insights report: one per
+    /// extension point, naming what is installed there.
+    ///
+    /// Hooks are reported by event rather than by command: the command is a
+    /// shell line that may carry paths or secrets, and the event is what a
+    /// recommendation needs to know.
+    fn extension_inventory(&self) -> Vec<String> {
+        let hooks = &self.tool_ctx.hooks;
+        let events: Vec<String> = [
+            ("PreToolUse", &hooks.pre_tool_use),
+            ("PostToolUse", &hooks.post_tool_use),
+            ("UserPromptSubmit", &hooks.user_prompt_submit),
+            ("SessionStart", &hooks.session_start),
+            ("SessionEnd", &hooks.session_end),
+            ("Stop", &hooks.stop),
+            ("PreCompact", &hooks.pre_compact),
+            ("PostCompact", &hooks.post_compact),
+        ]
+        .into_iter()
+        .filter(|(_, list)| !list.is_empty())
+        .map(|(name, _)| name.to_owned())
+        .collect();
+        vec![
+            crate::insights::extension_line(
+                "skills",
+                &self
+                    .skills
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            crate::insights::extension_line(
+                "templates",
+                &self
+                    .templates
+                    .iter()
+                    .map(|t| t.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            crate::insights::extension_line(
+                "subagents",
+                &self
+                    .agents
+                    .iter()
+                    .map(|a| a.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            crate::insights::extension_line("hook events configured", &events),
+            crate::insights::extension_line(
+                "mcp servers",
+                &self
+                    .tool_ctx
+                    .mcp
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>(),
+            ),
+        ]
+    }
+
     // A long straight-line pipeline; the length is not complexity.
     #[allow(clippy::too_many_lines)]
     fn run_insights(
@@ -5079,6 +5139,11 @@ the original is frozen and listed in /tree"
             tz,
             &|session_id| self.store.load(session_id).ok().map(|s| s.transcript),
         );
+
+        // What this installation already extends plank with. Read from the live
+        // rosters rather than the transcripts, which cannot see a skill that
+        // was never invoked or a hook that never fired.
+        agg.extensions = self.extension_inventory();
 
         let mut narrative = insights::Narrative::new();
         if agg.sessions_counted == 0 {

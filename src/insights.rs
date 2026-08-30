@@ -743,6 +743,14 @@ pub struct Aggregated {
     /// One line per counted session, newest first, for the narrative prompt.
     pub highlights: Vec<String>,
 
+    /// What this installation already extends plank with, one line per
+    /// extension point ("skills: release, review", "hooks: none"). Filled in
+    /// by the caller from the live rosters, since none of it is derivable from
+    /// the transcripts, and left empty when it could not be determined. The
+    /// `features` section reads it so it recommends what is *missing* rather
+    /// than what is already installed.
+    pub extensions: Vec<String>,
+
     /// Feedback ratings (M2): total, positive, negative. These count only
     /// ratings that still have a subject; see `ratings_orphaned`.
     pub ratings_total: u32,
@@ -1075,6 +1083,43 @@ pub struct SectionSpec {
 pub const ANALYST_SYSTEM: &str = "You are a careful analyst. You answer with a single JSON \
 object and nothing else: no preamble, no explanation, no markdown fence, no tool calls.";
 
+/// plank's extension points, as the `features` section is told about them.
+///
+/// The model has no reliable knowledge of plank itself, so a recommendation to
+/// "add a skill" is only actionable if the prompt says what a skill *is* and
+/// where it goes. Kept in sync with `user-guide/09-extending.md`: paths that
+/// drift here produce snippets that write files plank never reads.
+///
+/// A macro rather than a plain `const` because the `features` prompt splices it
+/// with `concat!`, which takes literals only.
+macro_rules! feature_catalogue {
+    () => {
+        "\
+- Skills: a directory `~/.plank/skills/<name>/SKILL.md` (or `./.plank/skills/`) \
+holding a named procedure with `name`/`description`/`argument-hint` frontmatter \
+and `$ARGUMENTS` in the body. Runnable as `/<name>` and reachable by the model \
+itself. Best for a multi-step routine repeated across sessions.
+- Templates: one file `~/.plank/templates/<name>.md` whose body has `{{named}}` \
+holes. Lighter than a skill: it saves retyping a prompt shape, and the model \
+cannot invoke it.
+- Subagents: `~/.plank/agents/<name>.md`, dispatched with `/subagent:<name> \
+<task>`; only the final report enters the transcript. Frontmatter can add \
+`isolation: worktree` for its own checkout, or `provider:` to run it on another \
+engine. Best for delegated investigation and for fan-out over independent work.
+- Hooks: `~/.plank/hooks.json` or `./.plank/hooks.json`, shell commands bound to \
+events (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `SessionStart`, `Stop`) \
+with a tool-name matcher. Best for a check that should run every time rather \
+than when remembered — formatting, linting, a guard on a dangerous command.
+- MCP servers: `~/.plank/.mcp.json` or `./.mcp.json`, stdio servers whose tools \
+join the roster. Best for reaching a system plank has no built-in tool for.
+- AGENTS.md: project instructions read at session start. Best for facts and \
+conventions repeated to the model by hand.\n"
+    };
+}
+
+/// The catalogue as a string, for tests and for anything that wants to show it.
+pub const FEATURE_CATALOGUE: &str = feature_catalogue!();
+
 /// The prose sections, each one independent model call.
 ///
 /// Every prompt ends the same way — one JSON object, named keys, no prose
@@ -1119,6 +1164,24 @@ down in AGENTS.md once. `prompts` should hold ready-to-paste prompts that fit \
 work they actually do.\n\
 RESPOND WITH ONLY A VALID JSON OBJECT: {\"agents_md\": [\"instruction\"], \
 \"prompts\": [{\"title\": \"short title\", \"prompt\": \"the prompt to paste\"}]}",
+    },
+    SectionSpec {
+        key: "features",
+        heading: "Features to try",
+        prompt: concat!(
+            "Recommend two or three of plank's own extension points this person is not \
+using but clearly would benefit from, grounded in their sessions, tool mix and \
+errors. Skip anything `extensions_in_use` says they already have unless you are \
+recommending a specific new one of that kind. Here is the catalogue, with where \
+each one lives:\n",
+            feature_catalogue!(),
+            "\n`why` must name the evidence in their data. `snippet` must be a complete, \
+ready-to-run shell command or file body that sets the thing up for the work they \
+actually do — no placeholders like <your project>.\n\
+RESPOND WITH ONLY A VALID JSON OBJECT: {\"features\": [{\"name\": \"feature name\", \
+\"one_liner\": \"what it is, one sentence\", \"why\": \"why it fits this person\", \
+\"snippet\": \"the command or file body to set it up\"}]}",
+        ),
     },
     SectionSpec {
         key: "at_a_glance",
@@ -1175,6 +1238,11 @@ pub fn narrative_context(agg: &Aggregated) -> String {
     put("error_categories", top(&agg.errors, 8).into());
     put("failing_tools", top(&agg.error_tools, 8).into());
     put("recent_sessions", agg.highlights.clone().into());
+    // Only when the rosters were actually read: an empty list would read as
+    // "nothing installed" and invite recommending what is already there.
+    if !agg.extensions.is_empty() {
+        put("extensions_in_use", agg.extensions.clone().into());
+    }
 
     // Timing exists only for sessions recorded since per-message stamps, and
     // is sent only when enough of them carry it to mean anything.
@@ -1196,6 +1264,26 @@ pub fn narrative_context(agg: &Aggregated) -> String {
         put("projects", top(&agg.projects, 8).into());
     }
     serde_json::to_string_pretty(&serde_json::Value::Object(ctx)).unwrap_or_default()
+}
+
+/// One `extensions_in_use` line: what is installed at an extension point, or
+/// that nothing is.
+///
+/// "none" is said explicitly rather than by omission — an absent line reads as
+/// "not known", and the `features` section's whole job is to tell those two
+/// apart before it recommends anything.
+#[must_use]
+pub fn extension_line(kind: &str, names: &[String]) -> String {
+    if names.is_empty() {
+        return format!("{kind}: none");
+    }
+    let shown: Vec<&str> = names.iter().take(12).map(String::as_str).collect();
+    let more = names.len().saturating_sub(shown.len());
+    let mut line = format!("{kind}: {}", shown.join(", "));
+    if more > 0 {
+        let _ = write!(line, " (+{more} more)");
+    }
+    line
 }
 
 /// Builds the full prompt for one section.
@@ -1649,6 +1737,35 @@ fn narrative_html(narrative: &Narrative) -> String {
             }
             body.push_str("</div>");
         }
+        if let Some(features) = value.get("features").and_then(serde_json::Value::as_array) {
+            body.push_str(
+                "<p class=\"note\">Paste a snippet into plank and it will set it up.</p>",
+            );
+            for f in features {
+                let name = f.get("name").and_then(serde_json::Value::as_str);
+                let one_liner = f.get("one_liner").and_then(serde_json::Value::as_str);
+                let why = f.get("why").and_then(serde_json::Value::as_str);
+                let snippet = f.get("snippet").and_then(serde_json::Value::as_str);
+                body.push_str("<div class=\"card feature\">");
+                if let Some(n) = name {
+                    let _ = write!(body, "<h3>{}</h3>", html_escape(n));
+                }
+                if let Some(o) = one_liner {
+                    let _ = write!(body, "<p>{}</p>", html_escape(o));
+                }
+                if let Some(w) = why {
+                    let _ = write!(
+                        body,
+                        "<p class=\"fix\"><b>Why for you.</b> {}</p>",
+                        html_escape(w)
+                    );
+                }
+                if let Some(s) = snippet {
+                    let _ = write!(body, "<pre>{}</pre>", html_escape(s));
+                }
+                body.push_str("</div>");
+            }
+        }
         if let Some(lines) = value.get("agents_md").and_then(serde_json::Value::as_array) {
             body.push_str("<h3>Worth putting in AGENTS.md</h3><ul>");
             for l in lines.iter().filter_map(serde_json::Value::as_str) {
@@ -1706,6 +1823,7 @@ border-radius:.6rem;padding:1.25rem 1.4rem;margin:0 0 2.5rem}\
 .card{background:var(--card);border:1px solid var(--line);border-radius:.6rem;padding:1rem}\
 .card p{margin:0 0 .5rem}.card p:last-child{margin:0}\
 .fix{color:var(--accent)}\
+.feature{margin:0 0 .75rem}.feature pre{margin:.7rem 0 0}\
 .callout{border-left:3px solid var(--accent);padding-left:.9rem;color:var(--dim)}\
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);\
 border-radius:.4rem;padding:.7rem;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;margin:0}\
@@ -2485,6 +2603,63 @@ Tool result 3 (read):\nfine\n</tool_result>",
         // Self-contained: no network references of any kind.
         assert!(!html.contains("http://") && !html.contains("https://"));
         assert!(html.contains("2023-11-14"));
+    }
+
+    #[test]
+    fn the_features_section_renders_a_card_per_recommendation() {
+        let agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                tools: [("bash".to_owned(), 3)].into_iter().collect(),
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        let mut narrative = Narrative::new();
+        narrative.insert(
+            "features".to_owned(),
+            serde_json::json!({"features": [{
+                "name": "Hooks",
+                "one_liner": "Shell commands bound to events.",
+                "why": "You reran cargo fmt & clippy by hand every session.",
+                "snippet": "{\"PostToolUse\": []}",
+            }]}),
+        );
+        let html = render_html(&agg, &narrative, 0, 0);
+        assert!(html.contains("id=\"features\""), "section is emitted");
+        assert!(html.contains("Features to try"));
+        assert!(html.contains("Why for you."));
+        // Snippets are code, not markup: braces and quotes survive escaped.
+        assert!(html.contains("&quot;PostToolUse&quot;"));
+        assert!(!html.contains("<script>"));
+    }
+
+    #[test]
+    fn an_empty_extension_point_is_reported_as_none_rather_than_omitted() {
+        assert_eq!(extension_line("skills", &[]), "skills: none");
+        assert_eq!(
+            extension_line("skills", &["a".to_owned(), "b".to_owned()]),
+            "skills: a, b"
+        );
+        let many: Vec<String> = (0..15).map(|i| format!("s{i}")).collect();
+        assert!(extension_line("skills", &many).ends_with("(+3 more)"));
+    }
+
+    #[test]
+    fn the_inventory_reaches_the_narrative_context_only_when_it_was_read() {
+        let mut agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        assert!(!narrative_context(&agg).contains("extensions_in_use"));
+        agg.extensions = vec![extension_line("skills", &["release".to_owned()])];
+        let ctx = narrative_context(&agg);
+        assert!(ctx.contains("extensions_in_use") && ctx.contains("skills: release"));
     }
 
     #[test]

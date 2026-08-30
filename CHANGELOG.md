@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/insights` recommends plank features to adopt.** A new "Features to try"
+  section names two or three extension points — a skill, a template, a
+  subagent, a hook, an MCP server — grounded in the sessions, tool mix and
+  error categories the report already measured, each with a ready-to-run
+  snippet rather than a description. The prompt carries a catalogue of the
+  extension points and where their files live, because the model has no
+  reliable knowledge of plank itself, and the report passes it the live
+  skill/template/subagent/hook/MCP rosters as `extensions_in_use` so it
+  recommends what is missing instead of what is already installed. A point with
+  nothing installed is sent as `none` explicitly: an absent line would read as
+  "unknown", which is a different thing.
+
 - **`/install-claude-plugin <url|owner/repo> [plugin-name] [--force]`.** Plank
   already understood the Claude Code plugin layout (`.claude-plugin/plugin.json`,
   `commands/`, `hooks/hooks.json`, `.mcp.json`, `settings.json`); this adds the

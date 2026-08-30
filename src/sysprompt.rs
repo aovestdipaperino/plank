@@ -888,7 +888,7 @@ pub fn build_system_prompt_reminder(
 
 /// The attribution trailer plank asks the model to end its commit messages
 /// with, disabled by `git.signCommits` in `settings.json`.
-pub const COMMIT_SIGNATURE_TRAILER: &str = "--with help from plank";
+pub const COMMIT_SIGNATURE_TRAILER: &str = "--Co-Authored by Plank (https://plank-agent.dev)";
 
 /// Instruction that puts [`COMMIT_SIGNATURE_TRAILER`] on the commits the model
 /// makes.
@@ -901,7 +901,7 @@ pub const COMMIT_SIGNATURE_TRAILER: &str = "--with help from plank";
 pub const COMMIT_SIGNATURE_INSTRUCTION: &str = concat!(
     "## Commits\n\n",
     "When you create a git commit, end its message with a blank line followed by the",
-    " single line `--with help from plank`. Leave the trailer out only if the user",
+    " single line `--Co-Authored by Plank (https://plank-agent.dev)`. Leave the trailer out only if the user",
     " asks you to, or if the message already ends with it.\n"
 );
 
@@ -1236,9 +1236,18 @@ mod tests {
         // Default settings sign commits, and the trailer must land outside the
         // trusted control-text span.
         let parts = build_system_prompt_parts("", &[], true);
-        assert!(parts.text.contains("--with help from plank"));
-        assert!(!parts.text[..parts.trusted_len].contains("--with help from plank"));
-        assert!(provider_system_prompt("").contains("--with help from plank"));
+        assert!(
+            parts
+                .text
+                .contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
+        assert!(
+            !parts.text[..parts.trusted_len]
+                .contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
+        assert!(
+            provider_system_prompt("").contains("--Co-Authored by Plank (https://plank-agent.dev)")
+        );
     }
 
     #[test]
