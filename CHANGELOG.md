@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.5.4] - 2026-08-31
+
 ### Changed
 
 - **The status-bar spinner verb now follows the phase of the turn.** The single
