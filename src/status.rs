@@ -224,6 +224,9 @@ pub struct Status {
     pub generated: i32,
     /// Generation throughput, tokens per second.
     pub gen_tps: f64,
+    /// True while the stream is inside a `<think>` block, so the spinner verb
+    /// can say so. Set from the renderer alongside `greedy_sampling`.
+    pub thinking: bool,
     /// True when sampling greedily (shown as a snowflake).
     pub greedy_sampling: bool,
     /// Context tokens in use.
@@ -555,220 +558,304 @@ pub fn format_ctx_size(ctx_size: i32) -> String {
     }
 }
 
-/// Claude-Code-style playful gerunds shown next to the spinner. One is picked
-/// per turn (keyed by `Status::prefill_label`) so the footer does not visually
-/// churn while progress updates stream in.
-pub const SPINNER_VERBS: [&str; 200] = [
-    "Accomplishing",
-    "Actualizing",
-    "Baking",
-    "Bamboozling",
-    "Beaming",
-    "Befriending",
-    "Bewitching",
-    "Bloviating",
-    "Boiling",
-    "Boondoggling",
-    "Bootstrapping",
+/// The five kinds of work the spinner verb can describe. The footer shows one
+/// verb per turn, but *which pool* it is drawn from follows what the agent is
+/// actually doing at that instant, so "Chiseling" never shows up while the
+/// model is still reading the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerbPhase {
+    /// Sampling inside a `<think>` block: reasoning, not answering yet.
+    Thinking,
+    /// Sampling ordinary assistant output.
+    Generating,
+    /// A tool dispatch is in flight — the model has stopped, the machine works.
+    Tool,
+    /// Prefilling the prompt: taking the context in, producing nothing yet.
+    Prefill,
+    /// The 1-in-[`FUN_ODDS`] escape hatch, drawn regardless of phase.
+    Fun,
+}
+
+/// Reasoning verbs, shown while the stream is inside a `<think>` block.
+pub const THINKING_VERBS: [&str; 45] = [
     "Brainstorming",
-    "Braising",
-    "Brewing",
-    "Burrowing",
-    "Buzzing",
-    "Calculating",
-    "Calibrating",
-    "Canoodling",
-    "Caramelizing",
     "Cerebrating",
-    "Channelling",
-    "Churning",
-    "Clauding",
-    "Coalescing",
     "Cogitating",
-    "Combobulating",
-    "Composing",
-    "Computing",
-    "Concocting",
-    "Conjuring",
     "Contemplating",
-    "Cooking",
-    "Crafting",
-    "Creating",
-    "Crunching",
-    "Crystallizing",
-    "Curating",
     "Deciphering",
     "Decoding",
+    "Deducing",
     "Deliberating",
-    "Discombobulating",
-    "Distilling",
+    "Digesting",
     "Divining",
-    "Doodling",
     "Dreaming",
-    "Effervescing",
-    "Elaborating",
     "Elucidating",
-    "Embellishing",
-    "Enchanting",
+    "Elucubrating",
     "Envisioning",
     "Extrapolating",
-    "Fermenting",
-    "Fiddling",
-    "Finagling",
-    "Flambéing",
-    "Flourishing",
-    "Fluttering",
-    "Forging",
-    "Formulating",
-    "Frolicking",
-    "Galloping",
-    "Galvanizing",
-    "Germinating",
-    "Gesticulating",
-    "Gitifying",
+    "Fathoming",
     "Grokking",
     "Guessing",
-    "Gusting",
-    "Hatching",
-    "Herding",
-    "Honking",
-    "Hustling",
-    "Hyperventilating",
     "Hypothesizing",
     "Ideating",
     "Illuminating",
     "Imagining",
-    "Improvising",
     "Incubating",
     "Inferring",
     "Intuiting",
-    "Jitterbugging",
-    "Jiving",
-    "Juggling",
-    "Kerfuffling",
-    "Kindling",
-    "Kneading",
-    "Levitating",
-    "Lollygagging",
-    "Macerating",
-    "Manifesting",
-    "Marinating",
-    "Meandering",
     "Meditating",
-    "Metabolizing",
-    "Mind-melding",
-    "Mixing",
-    "Moseying",
     "Mulling",
     "Musing",
-    "Mustering",
-    "Mutating",
-    "Nesting",
     "Noodling",
-    "Normalizing",
-    "Orbiting",
-    "Orchestrating",
     "Osmosing",
-    "Oxidizing",
     "Percolating",
-    "Perusing",
     "Philosophising",
-    "Photosynthesizing",
-    "Pirouetting",
-    "Polishing",
-    "Pontificating",
     "Pondering",
+    "Pontificating",
     "Prognosticating",
-    "Puttering",
     "Puzzling",
-    "Quibbling",
-    "Reticulating",
-    "Riffing",
+    "Reasoning",
+    "Reflecting",
     "Ruminating",
-    "Rustling",
-    "Sautéing",
     "Scheming",
-    "Schlepping",
-    "Sculpting",
-    "Searing",
-    "Seasoning",
-    "Shimmering",
-    "Shimmying",
-    "Shucking",
-    "Simmering",
-    "Sizzling",
-    "Sketching",
-    "Skedaddling",
-    "Smooshing",
-    "Snoozing",
-    "Sparkling",
-    "Spelunking",
-    "Spinning",
-    "Sprouting",
-    "Squishing",
-    "Steeping",
-    "Stewing",
-    "Stirring",
+    "Speculating",
     "Strategizing",
-    "Strutting",
-    "Sublimating",
-    "Summoning",
-    "Swirling",
-    "Swooshing",
-    "Synthesizing",
-    "Tinkering",
-    "Toasting",
-    "Transmuting",
-    "Twirling",
-    "Unfurling",
-    "Unravelling",
-    "Vibing",
-    "Wandering",
-    "Weaving",
-    "Whirring",
-    "Whisking",
-    "Wibbling",
-    "Wizarding",
-    "Wobbling",
+    "Theorizing",
+    "Untangling",
     "Wondering",
-    "Wrangling",
-    "Zesting",
-    "Zigzagging",
-    "Zooming",
-    "Alchemizing",
-    "Amalgamating",
-    "Annealing",
-    "Blossoming",
-    "Bubbling",
-    "Cascading",
-    "Catalyzing",
-    "Chiseling",
-    "Deducing",
-    "Digesting",
-    "Dovetailing",
-    "Etching",
-    "Excavating",
-    "Fathoming",
-    "Gilding",
-    "Harmonizing",
-    "Infusing",
-    "Interpolating",
-    "Lassoing",
-    "Navigating",
-    "Quenching",
-    "Scintillating",
-    "Tessellating",
-    "Vortexing",
 ];
 
-/// Keep each operation on a single playful verb so the footer does not
-/// visually churn while progress updates stream in.
+/// Producing verbs, shown while sampling ordinary (non-thinking) output.
+pub const GENERATING_VERBS: [&str; 45] = [
+    "Arranging",
+    "Articulating",
+    "Assembling",
+    "Authoring",
+    "Composing",
+    "Conjuring",
+    "Crafting",
+    "Creating",
+    "Curating",
+    "Describing",
+    "Detailing",
+    "Dictating",
+    "Distilling",
+    "Doodling",
+    "Drafting",
+    "Elaborating",
+    "Emitting",
+    "Explaining",
+    "Expounding",
+    "Formulating",
+    "Framing",
+    "Generating",
+    "Improvising",
+    "Manifesting",
+    "Narrating",
+    "Orchestrating",
+    "Outlining",
+    "Penning",
+    "Phrasing",
+    "Producing",
+    "Rendering",
+    "Riffing",
+    "Scribing",
+    "Sketching",
+    "Spinning",
+    "Summoning",
+    "Synthesizing",
+    "Transcribing",
+    "Unfurling",
+    "Voicing",
+    "Weaving",
+    "Wording",
+    "Wordsmithing",
+    "Writing",
+    "Yarning",
+];
+
+/// Hands-on verbs, shown while a tool dispatch is running — the phase where
+/// something in the world actually changes.
+pub const TOOL_VERBS: [&str; 45] = [
+    "Bolting",
+    "Bulldozing",
+    "Carving",
+    "Cementing",
+    "Chiseling",
+    "Chopping",
+    "Drilling",
+    "Etching",
+    "Excavating",
+    "Fanning",
+    "Forging",
+    "Gilding",
+    "Grafting",
+    "Grinding",
+    "Hacking",
+    "Hammering",
+    "Kneading",
+    "Lathing",
+    "Milling",
+    "Mortaring",
+    "Nailing",
+    "Painting",
+    "Patching",
+    "Planing",
+    "Plumbing",
+    "Polishing",
+    "Prestidigitizing",
+    "Rewiring",
+    "Riveting",
+    "Sanding",
+    "Sawing",
+    "Scaffolding",
+    "Sculpting",
+    "Smooshing",
+    "Soldering",
+    "Splicing",
+    "Squishing",
+    "Stitching",
+    "Tinkering",
+    "Trowelling",
+    "Welding",
+    "Whittling",
+    "Wiring",
+    "Wrangling",
+    "Wrenching",
+];
+
+/// Taking-it-in verbs, shown while prefilling — reading the context, not yet
+/// producing anything from it.
+pub const PREFILL_VERBS: [&str; 45] = [
+    "Absorbing",
+    "Appraising",
+    "Assessing",
+    "Assimilating",
+    "Auditing",
+    "Cataloguing",
+    "Charting",
+    "Checking",
+    "Collating",
+    "Combing",
+    "Confirming",
+    "Consuming",
+    "Correlating",
+    "Devouring",
+    "Examining",
+    "Gauging",
+    "Indexing",
+    "Ingesting",
+    "Inspecting",
+    "Mapping",
+    "Measuring",
+    "Monitoring",
+    "Noting",
+    "Observing",
+    "Parsing",
+    "Perusing",
+    "Poring",
+    "Probing",
+    "Reading",
+    "Registering",
+    "Reviewing",
+    "Sampling",
+    "Scanning",
+    "Screening",
+    "Scrutinizing",
+    "Sifting",
+    "Skimming",
+    "Studying",
+    "Surveying",
+    "Tallying",
+    "Tracing",
+    "Tracking",
+    "Verifying",
+    "Watching",
+    "Weighing",
+];
+
+/// The rare ones: whatever the agent is doing, roughly one turn in
+/// [`FUN_ODDS`] claims to be doing this instead.
+pub const FUN_VERBS: [&str; 20] = [
+    "Racing 🏎",
+    "Fishing 🐟",
+    "Traveling ✈",
+    "Eating 🍜",
+    "Watching 📺",
+    "Napping 😴",
+    "Surfing 🏄",
+    "Juggling 🤹",
+    "Dancing 💃",
+    "Bowling 🎳",
+    "Gardening 🌱",
+    "Skateboarding 🛹",
+    "Rocketing 🚀",
+    "Sailing ⛵",
+    "Camping 🏕",
+    "Grilling 🍖",
+    "Skiing 🎿",
+    "Yodeling 🎤",
+    "Unicycling 🚲",
+    "Moonwalking 🌙",
+];
+
+/// One turn in this many draws from [`FUN_VERBS`] instead of the phase pool.
+/// Rare enough to stay a surprise, common enough to actually be seen.
+pub const FUN_ODDS: u32 = 20;
+
+/// Every pool in phase order — used by the tests and by anything that wants to
+/// enumerate the whole vocabulary.
 #[must_use]
-pub fn prefill_label(st: &Status) -> &'static str {
-    SPINNER_VERBS[st.prefill_label as usize % SPINNER_VERBS.len()]
+pub fn verbs_for(phase: VerbPhase) -> &'static [&'static str] {
+    match phase {
+        VerbPhase::Thinking => &THINKING_VERBS,
+        VerbPhase::Generating => &GENERATING_VERBS,
+        VerbPhase::Tool => &TOOL_VERBS,
+        VerbPhase::Prefill => &PREFILL_VERBS,
+        VerbPhase::Fun => &FUN_VERBS,
+    }
 }
 
-/// Picks a stable random verb index for a new turn, seeded from wall-clock.
+/// Which pool this status draws from.
+///
+/// The fun pool wins first and is decided by the turn's own seed, so a turn
+/// that drew a fun verb keeps it across every phase it passes through rather
+/// than flipping back to shop tools the moment a tool runs. Otherwise the
+/// phase follows the live state: prefill beats everything (nothing else is
+/// happening yet), then a running tool dispatch — which outlives the last
+/// `Status` the engine published, so it is read from the process-global tool
+/// activity rather than from `st` — then thinking, then plain generation.
+#[must_use]
+pub fn verb_phase(st: &Status) -> VerbPhase {
+    if st.prefill_label.is_multiple_of(FUN_ODDS) {
+        return VerbPhase::Fun;
+    }
+    if st.state == WorkerState::Prefill {
+        return VerbPhase::Prefill;
+    }
+    if tools_running() {
+        return VerbPhase::Tool;
+    }
+    if st.thinking {
+        VerbPhase::Thinking
+    } else {
+        VerbPhase::Generating
+    }
+}
+
+/// Keep each operation on a single playful verb so the footer does not
+/// visually churn while progress updates stream in. The verb index is fixed
+/// for the turn; only the pool it indexes moves with the phase.
+#[must_use]
+pub fn prefill_label(st: &Status) -> &'static str {
+    let pool = verbs_for(verb_phase(st));
+    pool[st.prefill_label as usize % pool.len()]
+}
+
+/// Picks a stable random verb seed for a new turn, seeded from wall-clock.
+///
+/// Deliberately *not* reduced modulo a pool length: the raw seed also decides
+/// the [`FUN_ODDS`] roll, and each pool takes its own modulo at lookup time.
 #[must_use]
 pub fn random_verb_index() -> u32 {
     let ms = std::time::SystemTime::now()
@@ -776,7 +863,7 @@ pub fn random_verb_index() -> u32 {
         .map_or(0, |d| d.as_millis());
     #[allow(clippy::cast_possible_truncation)]
     let seed = (ms ^ (ms >> 17)) as u32;
-    seed % u32::try_from(SPINNER_VERBS.len()).unwrap_or(1)
+    seed
 }
 
 /// Formats elapsed seconds Claude-Code style: `12s`, `1m 2s`, `1h 4m`.
@@ -945,6 +1032,19 @@ pub fn clear_tool_activity() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *guard = None;
+}
+
+/// Whether a tool dispatch is *running right now* — as opposed to
+/// [`tool_activity`], which keeps returning a label through the linger window
+/// after the tools finished. The spinner verb needs the strict answer: once
+/// the model is sampling again, a lingering label must not keep it on shop
+/// verbs.
+#[must_use]
+pub fn tools_running() -> bool {
+    let guard = TOOL_ACTIVITY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    matches!(guard.as_ref(), Some((_, None)))
 }
 
 /// The tool label to show: present while tools run and for [`TOOL_LINGER_MS`]
@@ -2027,11 +2127,122 @@ mod tests {
         assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
     }
 
+    /// Every pool, in phase order. Kept here rather than in the module so the
+    /// production code never invites a caller to iterate all phases blindly.
+    const ALL_PHASES: [VerbPhase; 5] = [
+        VerbPhase::Thinking,
+        VerbPhase::Generating,
+        VerbPhase::Tool,
+        VerbPhase::Prefill,
+        VerbPhase::Fun,
+    ];
+
     #[test]
-    fn spinner_verbs_are_200_and_unique() {
-        assert_eq!(SPINNER_VERBS.len(), 200);
-        let set: std::collections::HashSet<_> = SPINNER_VERBS.iter().collect();
-        assert_eq!(set.len(), 200);
+    fn spinner_verbs_are_200_and_unique_across_pools() {
+        let all: Vec<&str> = ALL_PHASES
+            .iter()
+            .flat_map(|p| verbs_for(*p).iter().copied())
+            .collect();
+        assert_eq!(all.len(), 200);
+        let set: std::collections::HashSet<_> = all.iter().collect();
+        assert_eq!(set.len(), 200, "duplicate verb across pools");
+    }
+
+    #[test]
+    fn every_pool_is_non_empty_so_the_modulo_cannot_divide_by_zero() {
+        for phase in ALL_PHASES {
+            assert!(!verbs_for(phase).is_empty(), "{phase:?}");
+        }
+    }
+
+    #[test]
+    fn verb_phase_follows_the_live_state() {
+        clear_tool_activity();
+        // 1 is coprime-ish with FUN_ODDS: any seed not divisible by it works.
+        let base = Status {
+            prefill_label: 1,
+            ..Status::default()
+        };
+        assert_eq!(
+            verb_phase(&Status {
+                state: WorkerState::Prefill,
+                ..base.clone()
+            }),
+            VerbPhase::Prefill
+        );
+        assert_eq!(
+            verb_phase(&Status {
+                state: WorkerState::Generating,
+                thinking: true,
+                ..base.clone()
+            }),
+            VerbPhase::Thinking
+        );
+        assert_eq!(
+            verb_phase(&Status {
+                state: WorkerState::Generating,
+                ..base.clone()
+            }),
+            VerbPhase::Generating
+        );
+        {
+            let _running = ToolActivity::begin("🔧 bash".to_owned());
+            assert_eq!(
+                verb_phase(&Status {
+                    state: WorkerState::Generating,
+                    thinking: true,
+                    ..base.clone()
+                }),
+                VerbPhase::Tool,
+                "a live tool dispatch outranks the last published sampling state"
+            );
+        }
+        // Dropped: the linger window keeps the *label* up, but not the phase.
+        assert!(tool_activity().is_some());
+        assert_eq!(
+            verb_phase(&Status {
+                state: WorkerState::Generating,
+                ..base
+            }),
+            VerbPhase::Generating
+        );
+        clear_tool_activity();
+    }
+
+    #[test]
+    fn fun_verbs_win_regardless_of_phase() {
+        clear_tool_activity();
+        let st = Status {
+            state: WorkerState::Prefill,
+            prefill_label: 4 * FUN_ODDS,
+            ..Status::default()
+        };
+        assert_eq!(verb_phase(&st), VerbPhase::Fun);
+        assert!(FUN_VERBS.contains(&prefill_label(&st)));
+    }
+
+    #[test]
+    fn the_verb_index_is_stable_while_the_phase_moves() {
+        clear_tool_activity();
+        let seed = 7;
+        let thinking = Status {
+            state: WorkerState::Generating,
+            thinking: true,
+            prefill_label: seed,
+            ..Status::default()
+        };
+        let generating = Status {
+            thinking: false,
+            ..thinking.clone()
+        };
+        assert_eq!(
+            prefill_label(&thinking),
+            THINKING_VERBS[seed as usize % THINKING_VERBS.len()]
+        );
+        assert_eq!(
+            prefill_label(&generating),
+            GENERATING_VERBS[seed as usize % GENERATING_VERBS.len()]
+        );
     }
 
     #[test]

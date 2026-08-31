@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The status-bar spinner verb now follows the phase of the turn.** The single
+  flat list of 200 playful gerunds is five pools, and the footer draws from the
+  one that matches what the agent is doing at that instant: reasoning verbs
+  (`Pondering`, `Elucubrating`) inside a `<think>` block, producing verbs
+  (`Composing`, `Wordsmithing`) while it samples the answer, workshop verbs
+  (`Hammering`, `Chiseling`, `Prestidigitizing`) while a tool dispatch is
+  actually running, and taking-it-in verbs (`Absorbing`, `Perusing`, `Sifting`)
+  while the prompt is still prefilling. The verb index is fixed for the turn and
+  only the pool it indexes moves, so the word tracks the phase without churning.
+  The tool phase is read from the live dispatch rather than from the last status
+  the engine published — a dispatch outlives that status — and strictly, so the
+  4s label linger window keeps `🔧 bash` in the bar without holding the verb on
+  shop tools after the model has resumed. Roughly one turn in twenty ignores the
+  phase entirely and reports `Fishing 🐟`, `Napping 😴` or `Moonwalking 🌙`; the
+  roll is made once from the turn's own seed, so such a turn stays fun across
+  every phase instead of flipping back mid-stream.
+
 ## [3.5.3] - 2026-08-31
 
 ### Added

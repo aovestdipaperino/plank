@@ -798,6 +798,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.in_think = true;
     }
 
+    /// Whether the stream is currently inside a `<think>` block.
+    ///
+    /// Read live, mid-generation, so the status bar can say the model is
+    /// reasoning rather than answering; it is not a parse result and says
+    /// nothing about whether the block will close cleanly.
+    #[must_use]
+    pub fn in_think(&self) -> bool {
+        self.in_think
+    }
+
     /// Feeds one streamed chunk of model output.
     pub fn push(&mut self, text: impl AsRef<str>) {
         self.stream_text(text.as_ref().as_bytes(), false);
