@@ -63,6 +63,9 @@ pub struct AgentConfig {
     pub ui_remote: Option<u16>,
     /// True when `-h`/`--help` was given; caller should print [`usage`] and exit.
     pub show_help: bool,
+    /// True when `-V`/`--version` was given; caller should print
+    /// [`crate::logo::version_line`] and exit.
+    pub show_version: bool,
     /// Optional help topic following `-h`/`--help`.
     pub help_topic: Option<String>,
     /// Model file supplied with `-m`/`--model`; enables the real ds4 engine.
@@ -313,6 +316,7 @@ impl Default for AgentConfig {
             minimal_prompt: false,
             ui_remote: None,
             show_help: false,
+            show_version: false,
             help_topic: None,
             model_path: None,
             backend: None,
@@ -404,6 +408,7 @@ Usage: plank [options]
 
 Options:
   -h, --help [topic]       show this help and exit
+  -V, --version            show the version and commit id, then exit
   -m, --model PATH         load a ds4 GGUF model (real inference)
   -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
@@ -1104,6 +1109,10 @@ pub fn parse_options_with(
             Ok(args[*i].as_str())
         };
         match arg {
+            "-V" | "--version" => {
+                c.show_version = true;
+                return Ok(c);
+            }
             "-h" | "--help" => {
                 c.show_help = true;
                 if let Some(topic) = args.get(i + 1)
@@ -1786,6 +1795,16 @@ mod tests {
         ]))
         .unwrap();
         assert!(e.minimal_prompt && e.non_interactive);
+    }
+
+    #[test]
+    fn version_flag() {
+        for a in ["--version", "-V"] {
+            let c = parse_options(&args(&[a])).unwrap();
+            assert!(c.show_version, "{a}");
+            assert!(!c.show_help, "{a}");
+        }
+        assert!(!parse_options(&args(&[])).unwrap().show_version);
     }
 
     #[test]

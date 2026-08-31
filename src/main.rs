@@ -73,6 +73,13 @@ fn main() -> ExitCode {
         print!("{}", usage());
         return ExitCode::SUCCESS;
     }
+    // Same reasoning as `--help`: answer from the provisional parse, before
+    // `--chdir` and the plugin scan can print anything ahead of the one line
+    // a caller scraping `plank --version` expects.
+    if provisional.show_version {
+        println!("{}", plank::logo::version_line());
+        return ExitCode::SUCCESS;
+    }
     // `--chdir` has to happen before the plugin scan (and therefore before
     // project settings, which are also cwd-scoped) rather than after, or the
     // plugin set built here would reflect the launch directory instead of the
@@ -114,6 +121,10 @@ fn main() -> ExitCode {
     // real parse is the one that decides with the layered settings in hand.
     if cfg.show_help {
         print!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
+    if cfg.show_version {
+        println!("{}", plank::logo::version_line());
         return ExitCode::SUCCESS;
     }
     // `--dump-config` prints the resolved configuration (every effective key

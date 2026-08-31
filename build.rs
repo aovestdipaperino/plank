@@ -16,6 +16,7 @@ use std::process::Command;
 /// piece of code rather than two that agree today.
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(ds4_engine)");
+    emit_git_commit();
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
@@ -85,5 +86,37 @@ fn main() {
         "ds4_web.h",
     ] {
         println!("cargo:rerun-if-changed={}", ds4.join(f).display());
+    }
+}
+
+/// Emits `PLANK_GIT_COMMIT` for `--version`: the short HEAD hash, with a `-dirty`
+/// suffix when the working tree has uncommitted changes. A source tree with no
+/// git (a crates.io/tarball build) gets `unknown`, so the env var always exists
+/// and `env!` in the crate never fails to compile.
+fn emit_git_commit() {
+    let commit = Command::new("git")
+        .args(["rev-parse", "--short=12", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let commit = match commit {
+        Some(c) => {
+            let dirty = Command::new("git")
+                .args(["status", "--porcelain", "--untracked-files=no"])
+                .output()
+                .is_ok_and(|o| o.status.success() && !o.stdout.is_empty());
+            if dirty { format!("{c}-dirty") } else { c }
+        }
+        None => "unknown".to_owned(),
+    };
+    println!("cargo:rustc-env=PLANK_GIT_COMMIT={commit}");
+    // Rebuild when HEAD moves (branch switch, new commit) so the stamp is not
+    // frozen at whatever the first build saw.
+    for p in [".git/HEAD", ".git/logs/HEAD"] {
+        if Path::new(p).exists() {
+            println!("cargo:rerun-if-changed={p}");
+        }
     }
 }

@@ -105,6 +105,19 @@ pub fn version_label() -> String {
     }
 }
 
+/// The git commit plank was built from: a short hash, `-dirty` when the build
+/// had uncommitted changes, or `unknown` when the source tree had no git.
+#[must_use]
+pub fn commit_id() -> &'static str {
+    env!("PLANK_GIT_COMMIT")
+}
+
+/// One-line `--version` output: `plank v2.5.0 (abc123def456)`.
+#[must_use]
+pub fn version_line() -> String {
+    format!("plank {} ({})", version_label(), commit_id())
+}
+
 fn is_beta(version: &str, patch: &str) -> bool {
     patch != "0" || version.contains("beta")
 }
@@ -117,6 +130,16 @@ pub fn banner() -> String {
 
 #[cfg(test)]
 mod tests {
+    // The commit stamp always exists (build.rs falls back to "unknown"), and
+    // the line carries both the version and the commit.
+    #[test]
+    fn version_line_has_version_and_commit() {
+        let line = super::version_line();
+        assert!(line.contains(env!("CARGO_PKG_VERSION")), "{line}");
+        assert!(!super::commit_id().is_empty());
+        assert!(line.contains(super::commit_id()), "{line}");
+    }
+
     #[test]
     fn art_renders_ansi() {
         let art = super::art(24);
