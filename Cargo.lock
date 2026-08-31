@@ -5852,7 +5852,7 @@ checksum = "8df9b6e13f2d32c91b9bd719c00d1958837bc7dec474d94952798cc8e69eeec3"
 
 [[package]]
 name = "trace-stream"
-version = "0.1.1"
+version = "0.1.2"
 
 [[package]]
 name = "tracing"
