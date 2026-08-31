@@ -740,6 +740,86 @@ implement. The guest-language design (a small interpreted language compiled to
 the WASM host, `src/wasmhost.rs`) is a follow-up. Batch the fingerprint churn
 with M8/M9 so it happens once.
 
+## The KV snapshot ladder (M11) — restoring a prefix that predates the edit
+
+Micro-compaction rewrites old tool-result bodies to a stub *in place*, and
+`ds4_session_sync` reuses the live KV only when the prompt **extends** its
+live end (see the tier-boundary finding above) — a rewrite behind that end
+forces a full re-prefill, even though most of the transcript is unchanged. A
+measured 18-turn session paid **72,769 still-valid tokens** re-prefilled this
+way across five full rebuilds (`docs/superpowers/specs/2026-08-31-kv-snapshot-ladder-design.md`).
+The fix keeps up to `LADDER_MAX_RUNGS` (3) KV snapshots ("rungs") at
+increasing transcript depths (`src/kvladder.rs`) and restores the deepest one
+that predates a known edit point, so the engine extends forward from it
+instead of rebuilding from zero. Several things about it were not obvious:
+
+- **A rung must be looked up under the fingerprint of the transcript
+  *truncated to its own `spans`*, not the full current transcript.** A rung is
+  stored under the fingerprint of its prefix *as it stood at capture time*
+  (`spans == session.transcript.len()` at that moment). By restore time the
+  transcript has grown further, so fingerprinting it whole would never match
+  what the rung was signed with — `kv_load` would miss on every call, silently,
+  while the feature looked implemented. This works only because
+  `render_transcript` reads *only* `session.transcript` plus the system
+  prompt and has no length-dependent formatting (pinned by
+  `render_transcript_never_injects_the_task_list_mid_transcript`), which is
+  what makes a truncated clone's render byte-identical to the capture-time
+  render.
+- **A fingerprint match does not imply the blob's spans match the current
+  transcript.** The fingerprint is computed *over* the truncated transcript, so
+  a match only ever tells you the truncated prefix is unchanged since capture
+  — it says nothing about what comes after `rung.spans`, which is exactly the
+  part that is about to be rewritten.
+- **The edit point is monotone non-decreasing across a session, and that is
+  load-bearing.** `microcompact` rewrites bodies in place — no insert or
+  remove, so transcript indices never shift — and a cleared body becomes a
+  stub below `MICROCOMPACT_MIN_BYTES`, so it never re-enters `clear_set`.
+  Every later rewrite therefore lands past any existing rung's span window,
+  which is what makes "restore the deepest rung `<= edit`" always correct
+  rather than merely usually correct.
+- **CRITICAL bug caught in review: restoring a rung *before* deciding whether
+  to compact rewinds the engine's KV for nothing on the refusal path.**
+  `set_kv` replaces the engine's live KV *and* its token span buffer with the
+  rung's shorter prefix. If the gate then refuses (not enough reclaimed to be
+  worth it), the transcript is never rewritten, but the engine has already
+  been rewound — so the very next turn re-prefills exactly the tail the gate
+  just declined to spend, and since the reclaimable total only grows, it
+  refuses **again** every subsequent turn. Strictly worse than not having the
+  feature. Fixed by asking `KvLadder::select` for the token count the restore
+  *would* cover, gating on that, and only calling `set_kv` after the decision
+  is made — never before.
+- **`KvLadder` names rung slots from a monotonic counter, not a vector
+  position**, so a session's fourth capture is `rung-3`, its fifth `rung-4`,
+  and so on — a long session's three *live* rungs all have indices past the
+  ladder's own width. Cleanup code that iterates `0..LADDER_MAX_RUNGS` finds
+  none of them and leaves gigabytes of blobs on disk; the fix is to match
+  rung files by name pattern (`{id}.rung-` prefix, `.kv_raw` suffix) at any
+  index, not by a bounded range.
+- **A rung must NOT be parented to its session in the GC.** `plan_sweep`
+  spares any node whose fingerprint appears in `parents`/`survivor_parents`,
+  so parenting a rung to its session would make the single most disposable
+  blob in the cache the thing protecting the session payload — and the tier
+  checkpoint above *that* — from ever being collected. Rungs are recorded
+  with `parent: None` and rely on `evict_rank` (first-to-evict under the
+  byte budget) and a dedicated one-day `RUNG_BACKSTOP_SECS` TTL instead.
+- **In-memory ladder state must be discarded whenever the session it
+  describes is discarded**, not just its on-disk blobs. `/new`, `/clear`,
+  `/switch`, `/resume` and a full compaction all replace or rewrite
+  `self.session`; leaving `Agent::ladder` pointed at the old session's rungs
+  means `wants_rung` keeps comparing fresh, smaller token counts against a
+  stale deepest rung (yielding a negative delta and no capture, ever, until
+  the new session outgrows the old one), and `select` hands back rungs whose
+  prefix no longer exists on the live transcript at all. `discard_ladder`
+  must run before every one of those reassignments, using the *old* session's
+  id to find and delete the blobs.
+- **A metadata sidecar that fails to load must not fall back to
+  `KvRole::Session`.** `kv_node_at` synthesizes a role from the file name when
+  the sidecar is missing, truncated, or written under an older
+  `META_VERSION` — exactly the crash-orphan case the rung backstop TTL exists
+  for. Falling through to `Session` there gives an orphaned rung the 14-day
+  session TTL and sorts it last under the byte budget instead of first; the
+  fallback needs its own `.rung-` branch.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

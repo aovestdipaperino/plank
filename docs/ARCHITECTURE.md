@@ -65,7 +65,10 @@ flowchart TD
 
 A "turn" is one user prompt driven to a settled answer. The agent generates,
 runs any tool calls the model emitted, feeds the results back, and repeats until
-a generation produces no tool calls.
+a generation produces no tool calls. At the end of a turn (and on interrupt,
+once the transcript is consistent with the engine state) the agent flushes KV
+state to disk: the session payload when the transcript changed, and a new
+ladder rung when one is due — see **Per-session KV payloads** below.
 
 ```mermaid
 sequenceDiagram
@@ -248,6 +251,16 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   *bytes* and *counts*, and only the engine boundary measures tokens.
 - `sysprompt.rs` — the verbatim tools/system prompt, datetime context, and the
   token-distance policy for re-injecting the system-prompt reminder.
+- `kvladder.rs` — a depth-indexed ladder of KV snapshots ("rungs") at
+  increasing transcript depths, pure logic over span/token counts (no engine
+  dependency). Micro-compaction rewrites old tool-result bodies *in place*,
+  which the engine can only ever prefill again from token zero unless a
+  snapshot exists that predates the rewrite; `Agent` (`ui.rs`) captures a rung
+  at end of turn when the ladder wants one (`refresh_ladder` /
+  `flush_kv_end_of_turn`) and restores the deepest usable one immediately
+  before a compaction pass mutates the transcript (`restore_rung_below`), so
+  the engine extends forward from the rung instead of rebuilding. See
+  `docs/KV-CACHING.md` and `docs/KV-CACHE.md` for the full mechanics.
 
 ### Plugins (`plugins.rs`, `claudeplugin.rs`)
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
@@ -481,6 +494,13 @@ only the new user/assistant suffix is evaluated.
 
 ### Per-session KV payloads
 
+The payload is no longer only written by `/save`: the agent now saves it at
+the end of every turn that changed the transcript, and on interrupt once the
+transcript is consistent with the engine (a `payload_dirty` flag tracks
+whether anything actually needs saving, so a quiet turn costs nothing). This
+turns a crash or `Ctrl-C` mid-session into something `/resume` can still skip
+re-prefilling, rather than only a clean `/save`.
+
 `/save` also snapshots the live engine KV to a sidecar next to the transcript
 (`~/.plank/kvcache/<sha>.payload`). The raw KV bytes come from the shared
 `Engine::snapshot_kv` / `restore_kv` primitive (the same one `/checkpoint`
@@ -495,6 +515,25 @@ bytes. The fingerprint is `SHA-1(model_name + "\0" + system_prompt + "\0" +
 rendered_transcript)`, so *any* drift — different model, changed system prompt,
 or a transcript that gained turns or was compacted since the save — makes the
 payload stale.
+
+### The KV snapshot ladder
+
+The payload is a snapshot of the *whole* live transcript, and it only helps a
+`/resume`. Micro-compaction rewrites tool-result bodies *in place* mid-session,
+which invalidates the live KV from the rewrite point on — the engine can only
+extend its live end, never roll it back — so absent a snapshot of the
+prefix as it stood *before* the rewrite, every pass forces a full re-prefill.
+`kvladder.rs` keeps up to three such snapshots ("rungs"), one per session,
+recorded at increasing transcript depths as end-of-turn allows
+(`Agent::refresh_ladder`); `Agent::restore_rung_below` restores the deepest
+rung that predates a compaction pass's known edit point immediately before
+the rewrite happens, so the next generation extends forward from the rung
+rather than from token zero. Rungs live on disk beside the session
+(`<id>.rung-<n>.kv_raw`), trusted only by the signature embedded in the blob
+— never by filename — and are discarded whenever the session they describe
+is replaced or rewritten (`/new`, `/clear`, `/switch`, `/resume`, full
+compaction, exit). See `docs/KV-CACHING.md`/`docs/KV-CACHE.md` for the full
+mechanics, and `FINDINGS.md` for the gotchas that made this hard to get right.
 
 `/switch` and `/resume` try to restore the payload; on a fingerprint match the
 resumed session skips re-prefilling the transcript entirely. A stale, missing,

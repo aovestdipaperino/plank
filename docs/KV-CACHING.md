@@ -153,6 +153,17 @@ there through a multi-thousand-token prefill with no feedback. To anyone
 watching, that is a hang. So the reusable length is reported as zero unless the
 whole live state is being kept.
 
+This constraint bites in a second, less obvious place: micro-compaction
+clears old tool-result bodies by rewriting their text *in place*, mid-session.
+That is not appending or removing a message — it is exactly the "roll back
+behind the live end" case the engine cannot do, at whatever point the
+rewritten message sits. Absent a mitigation, every micro-compaction pass costs
+a full re-prefill of everything from that point on, including the large
+stretch of the transcript that did not change. A measured 18-turn session paid
+72,769 tokens re-prefilled this way across five full rebuilds — see
+`docs/superpowers/specs/2026-08-31-kv-snapshot-ladder-design.md` for the numbers
+and Part 3 below for the fix.
+
 ### A cache boundary has to fall on a message boundary
 
 You might reasonably want to snapshot the KV in the middle of a long block of
@@ -279,6 +290,42 @@ tokens in every project you work in. So the local schemas are folded into tier
 subtlety for global MCP servers: their schemas are rendered from a cached
 advertisement rather than from a live handshake, so a server that fails to start
 this morning cannot invalidate the most expensive tier in the system.
+
+### A depth-indexed ladder resolves the in-place-rewrite case
+
+The tier hierarchy above solves reuse for the *stable* parts of the prompt.
+It does nothing for micro-compaction's in-place rewrite, because a tier
+boundary sits at a fixed depth and a rewrite can land anywhere past it in the
+conversation. What that case needs instead is a snapshot that can be taken
+*anywhere* a rewrite might later occur, so the restore can pick whichever one
+predates the actual edit.
+
+The shape of the fix follows directly from two facts about micro-compaction's
+own behaviour. First, it walks the transcript oldest-to-newest, and a cleared
+body becomes a stub too small to be a candidate again — so the point past
+which it rewrites next only ever moves forward, never back. Second, a
+snapshot only helps when it predates the edit; one at the live end is useless,
+since the live end is exactly where the next edit already isn't. Together
+these mean a single rolling snapshot cannot work (it always postdates the
+next edit), but a small **ladder of snapshots at increasing depths** does:
+whichever rewrite comes next, some rung on the ladder already sits behind it.
+
+`kvladder.rs` implements this as pure logic — spans and token counts only, no
+engine dependency — with the ladder capped at three rungs (measured snapshot
+economics make more possible, but each rung is 200-400 MB on disk, and the
+cache already runs to tens of gigabytes) and a minimum spacing between
+consecutive rungs, so captures spread out rather than clustering uselessly
+near the live end. `Agent` (`ui.rs`) owns the two moments that make this
+correct: it captures a rung once per turn when the ladder wants one, timed
+*after* any compaction that turn already ran (so the rung's prefix is stable
+when it is signed), and it restores a rung strictly *before* micro-compaction
+mutates the transcript, using the already-known edit point to pick the
+deepest usable one. Restoring after the mutation would fingerprint the wrong
+prefix; deciding whether to restore only *after* calling `set_kv` — an actual
+review finding on this branch — throws away the live KV for nothing on the
+turn the pass declines to fire, and then does so again every turn after,
+since the reclaimable total only grows. The decision and the restore must use
+the exact same selection call, made before either one touches the engine.
 
 ### Some key material does not change the text
 
@@ -688,3 +735,14 @@ quietly costs a rebuild per project.
 **Retention decisions are pure functions of their inputs**, including the clock
 reading. A policy that reads the filesystem while deciding is a policy nobody can
 test.
+
+**A ladder rung is looked up under the fingerprint of the transcript
+truncated to its own recorded depth, never the current transcript.** Get this
+backwards and every rung misses forever, silently, while the feature looks
+fully wired up — nothing short-circuits, nothing errors, the code path simply
+never hits.
+
+**Nothing that mutates the engine's live KV runs before the decision that
+justifies it.** A `set_kv` restore is only valid to perform once the caller
+already knows it will use the result; performing it speculatively and then
+declining leaves the engine worse off than doing nothing.

@@ -312,6 +312,71 @@ Two configuration requirements, both silent when missed:
   another: a disagreement between the key and the tokens, which no fingerprint
   can catch.
 
+## Layer 7: the snapshot ladder
+
+Micro-compaction rewrites old tool-result bodies to a stub *in place*
+(`compact::microcompact`). That is exactly the case Layer 1 rules out reuse
+for: the engine can only extend its live end, never roll back behind it, so a
+rewrite anywhere in the transcript forces a full re-prefill from token zero —
+even though everything before the rewrite is still correct. A snapshot taken
+*before* the rewrite point is a legitimate restore target: restoring it makes
+the engine's live end equal to the snapshot's, and the next sync genuinely
+extends forward from there.
+
+`kvladder.rs` keeps a small, depth-indexed ladder of such snapshots ("rungs")
+per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
+
+- **Naming and location.** A rung's blob is `<id>.rung-<n>.kv_raw`, next to the
+  session's own `<id>.kv_raw` payload and `<id>.kv` transcript, where `<n>` is
+  a *monotonically increasing* slot index minted by `KvLadder::push` — not a
+  vector position. A session's fourth rung is `rung-3`, its fifth `rung-4`,
+  and so on for the life of the process; nothing ever reuses a lower index.
+- **Trust rule.** Identical to every other KV blob in this system: a rung is
+  read back through `SessionStore::kv_load`, which trusts only the signature
+  embedded in the body, never the filename or its sidecar. The signature is
+  `payload_fingerprint` computed over the transcript *as it stood at capture
+  time* — i.e. truncated to the rung's own `spans` — because that is what
+  `render_transcript` produced when the blob was written, and
+  `render_transcript` has no length-dependent formatting, so replaying that
+  same truncation later reproduces the byte-identical render to fingerprint
+  against.
+- **Spacing.** `KvLadder::wants_rung` only calls for a new capture once the
+  live transcript is at least `LADDER_MIN_SPACING_TOKENS` (4096) tokens past
+  the deepest existing rung — otherwise every turn would push a near-duplicate
+  and the ladder would cluster uselessly at the live end, where a rung can
+  never predate an edit.
+- **Eviction.** At most `LADDER_MAX_RUNGS` (3) rungs are held per session.
+  Pushing a fourth evicts whichever interior rung's removal least widens the
+  largest remaining gap — never the shallowest rung (the only one that can
+  cover an edit near the start of the transcript) and never the newest.
+- **Selection.** `KvLadder::select(edit, already_reused)` returns the deepest
+  rung with `spans <= edit` that covers more tokens than the engine would
+  reuse unaided — so a restore is only performed when it is a genuine
+  improvement, never a regression.
+- **Lifecycle.** Rungs are a live-session accelerator, not history: they are
+  deleted outright when the session they belong to is replaced or rewritten
+  (`/new`, `/clear`, `/switch`, `/resume`, a full compaction, or a clean exit —
+  `Agent::discard_ladder`, `SessionStore::remove_rungs`), and swept as a
+  backstop by GC (below) for the case where none of those exit paths ran — a
+  crash, a `SIGKILL`, or a machine losing power mid-session.
+- **GC treatment.** A rung gets its own role, `KvRole::Rung`, with a dedicated
+  one-day TTL (`RUNG_BACKSTOP_SECS`) independent of `kvcache.ttlSessionDays` —
+  a rung is worthless the instant its process is gone, unlike a saved session
+  payload, so there is no reason to let a crash-orphaned one survive as long
+  as one. Phase 2's budget pass also always evicts rungs first
+  (`evict_rank(KvRole::Rung) == 0`, everything else `1`), since a rung is the
+  cheapest thing in the cache to recreate and the one role that is *never*
+  history a later run would miss. And a rung is never parented to its
+  session in the metadata graph: `plan_sweep`'s "has a surviving child" rule
+  (Phase 1, item 3) would otherwise make the single most disposable blob in
+  the cache the thing keeping the session payload — and the tier checkpoint
+  above it — alive.
+
+A rung restore is a performance mechanism only: on a miss (stale fingerprint,
+missing blob, or no rung shallow enough) the code path is identical to having
+no ladder at all — the transcript rewrite proceeds and the next turn simply
+re-prefills, exactly as it always did.
+
 ## Garbage collection
 
 Checkpoints run to hundreds of megabytes, and a plank upgrade, an MCP server
@@ -360,6 +425,10 @@ Settings, read from `settings.json`:
 | `kvcache.ttlSessionDays` | 14 | idle days a session payload survives |
 | `kvcache.ttlTierDays` | 30 | idle days a system or project checkpoint survives |
 | `kvcache.maxBytes` | 21474836480 (20 GB) | ceiling for the budget pass; `0` disables it |
+
+There is no separate user-facing setting for the rung TTL: it is derived as
+`min(ttlSessionDays, 1 day)` (`RUNG_BACKSTOP_SECS`), so a stricter session TTL
+can only tighten it, never loosen it.
 
 `maxBytes = 0` means **unbounded**, never "evict everything". The inverse
 reading would wipe the cache on every launch for anyone who never set the key.
