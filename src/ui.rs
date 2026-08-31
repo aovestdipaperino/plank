@@ -2527,6 +2527,7 @@ impl Agent<'_> {
         let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let finished = stream.finished();
         self.session.push(Message::assistant(text.clone()));
+        self.payload_dirty = true;
         // The flag handling here is exactly `run_turn`'s for a cut-off turn:
         // record it on `last_turn_interrupted` and clear the
         // process-wide SIGINT flag here. Leaving that flag raised would return
@@ -2620,9 +2621,19 @@ impl Agent<'_> {
             // cost the user another whole iteration — and read as `Cap` rather
             // than `Interrupted` if that was the last one.
             if self.last_turn_interrupted || crate::interrupt::pending() {
+                // The adjudication prompt+reply just pushed onto `self.session`
+                // is the last thing this exit reaches: `drive_goal_loop`
+                // returns straight to `run_goal_loop`, with no later
+                // `run_turn` call to save it. Persist it here, at the one
+                // point where the transcript and the engine's live KV agree.
+                self.save_payload_if_dirty();
                 return Ok((crate::goal::Outcome::Interrupted, iter, String::new()));
             }
             if let Some(o) = crate::goal::Outcome::from_verdict(adj.verdict) {
+                // Same reasoning as above: a settled verdict ends the loop
+                // right after the adjudication exchange, with no further
+                // `run_turn` to catch the dirty payload.
+                self.save_payload_if_dirty();
                 return Ok((o, iter, adj.reason));
             }
             if self
@@ -2631,6 +2642,7 @@ impl Agent<'_> {
                 .expect("goal is live inside its own loop")
                 .at_cap()
             {
+                self.save_payload_if_dirty();
                 return Ok((crate::goal::Outcome::Cap, iter, adj.reason));
             }
         }
@@ -9092,6 +9104,14 @@ impl Agent<'_> {
                     };
                     if let Some((outcome, reason)) = settled {
                         self.goal = None;
+                        // Mirrors the plain path's save at each
+                        // `drive_goal_loop` exit: the adjudication exchange
+                        // just pushed into `self.session` (or, on the
+                        // interrupted branch, the last turn's) is the last
+                        // thing to land before this loop stops running turns,
+                        // and no later `run_turn`/`tui_turn_inner` save site
+                        // is reached from here.
+                        self.save_payload_if_dirty();
                         log.push_dim(crate::goal::closing(outcome, iters, &reason));
                     } else {
                         let (iter, max) = {
@@ -9575,6 +9595,7 @@ impl Agent<'_> {
         let out = self.worker_generate(tx, shared, &prompt, Instant::now(), false)?;
         self.session
             .push(Message::assistant(out.assistant_text.clone()));
+        self.payload_dirty = true;
         // Work instead of a verdict, or a cut-off pass: neither settles a goal.
         if out.interrupted || !out.calls.is_empty() {
             return Ok(crate::goal::Adjudication::keep_going());
@@ -13925,6 +13946,125 @@ mod tests {
         // but the flag clears so a failed capture does not retry forever.
         assert_eq!(agent.save_payload_if_dirty(), None);
         assert!(!agent.payload_dirty);
+    }
+
+    /// `adjudicate_plain` pushes both the adjudication prompt and the verdict
+    /// reply straight into `self.session`, bypassing every other
+    /// transcript-moving call site that sets `payload_dirty`. Pins the fix for
+    /// the Important finding on commit 23d1a15: before it, this assertion
+    /// fails because nothing in `adjudicate_plain` touches the flag.
+    #[test]
+    fn adjudicate_plain_marks_the_payload_dirty() {
+        let dir = scratch_dir("adjudicate-plain-dirty");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("do the thing"));
+        agent.session.push(Message::assistant("done"));
+        // A real session id: a save against an empty id short-circuits before
+        // it ever looks at the flag, which would pass this test for the wrong
+        // reason.
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.payload_dirty = false;
+        agent
+            .adjudicate_plain()
+            .expect("scripted engine always replies");
+        assert!(
+            agent.payload_dirty,
+            "adjudicate_plain pushes a user+assistant exchange into the \
+             transcript and must mark the payload dirty like every other \
+             transcript-moving call site"
+        );
+    }
+
+    /// The TUI analogue of the test above: `adjudicate_worker` pushes the same
+    /// two messages on a worker thread and must set the flag identically.
+    #[test]
+    fn adjudicate_worker_marks_the_payload_dirty() {
+        let dir = scratch_dir("adjudicate-worker-dirty");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("do the thing"));
+        agent.session.push(Message::assistant("done"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let shared = TurnShared::default();
+        agent.payload_dirty = false;
+        agent
+            .adjudicate_worker(&tx, &shared)
+            .expect("scripted engine always replies");
+        assert!(
+            agent.payload_dirty,
+            "adjudicate_worker must mark the payload dirty, mirroring \
+             adjudicate_plain"
+        );
+    }
+
+    /// Pins the second half of the finding: even once `adjudicate_plain` marks
+    /// the flag, `drive_goal_loop` must actually reach a save before it
+    /// returns — on every exit, not just the ordinary `run_turn` path. Drives
+    /// a full goal loop to a settled verdict (`ATTAINED`) and asserts the
+    /// payload was saved, using `kv_events` as the real, only-if-actually-
+    /// captured witness that `save_session_payload` ran (a session with an
+    /// empty id would let a broken save silently no-op and pass anyway, which
+    /// is why `store.save` runs first below).
+    #[test]
+    fn drive_goal_loop_saves_the_payload_on_a_settled_verdict() {
+        let dir = scratch_dir("goal-loop-saves-on-verdict");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            // Turn one: the model's tool-free reply. Turn two: the
+            // adjudication verdict that settles the goal.
+            replies: vec![
+                "all done\n".to_string(),
+                "GOAL_VERDICT: ATTAINED\n".to_string(),
+            ],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("start the goal"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.goal = Some(crate::goal::GoalLoop::new("finish the thing", 5));
+        agent.session.goal = Some(crate::goal::GoalState {
+            objective: "finish the thing".to_owned(),
+            max_iters: 5,
+            iter: 0,
+            status: crate::goal::GoalStatus::Active,
+        });
+
+        let (outcome, _iters, _reason) = agent
+            .drive_goal_loop()
+            .expect("scripted engine always replies, so the loop settles");
+        assert_eq!(outcome, crate::goal::Outcome::Attained);
+        // `run_turn`'s own end-of-turn handling already produces TWO captures
+        // for the main pass's tool-free reply: one from `refresh_ladder`'s own
+        // `get_kv` snapshot, one from its end-of-turn `save_payload_if_dirty`
+        // (dirtied by the ordinary transcript push — unrelated to this
+        // finding). So the discriminating check is a THIRD capture, produced
+        // only by a save covering the adjudication exchange that
+        // `adjudicate_plain` pushes. Asserting merely "any capture happened",
+        // or even "two captures happened", would pass even without the fix,
+        // since `run_turn` alone already supplies exactly two.
+        let captures = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "capture")
+            .count();
+        assert_eq!(
+            captures,
+            3,
+            "drive_goal_loop must save the payload a THIRD time before \
+             returning on a settled verdict — the first two captures are \
+             `run_turn`'s own ladder refresh and end-of-turn save for the \
+             main pass; the third must cover the adjudication exchange, or \
+             it is transcript-only forever: events were {:?}",
+            events.lock().unwrap()
+        );
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
