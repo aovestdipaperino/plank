@@ -27,7 +27,7 @@ pub struct Rung {
 }
 
 /// Depth-indexed ladder of KV snapshots, ordered shallowest-first.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct KvLadder {
     rungs: Vec<Rung>,
     next_index: usize,

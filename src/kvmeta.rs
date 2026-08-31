@@ -99,8 +99,16 @@ pub enum KvLabel {
     },
     /// No detail recorded — a synthesized or partially written sidecar.
     Unknown,
-    /// Ladder rung detail, so `/kvcache` shows it under its session rather
-    /// than as an unattributed root.
+    /// Ladder rung detail: which session the blob belongs to and how much of
+    /// it the blob covers.
+    ///
+    /// The rung's `KvMeta::parent` is deliberately `None`, so `/kvcache` lists
+    /// it as a root rather than nesting it under its session. Naming the
+    /// session payload as parent would be worse than cosmetic: the GC spares
+    /// any node with a surviving child, so a rung would keep its session's
+    /// payload — and, transitively, the tier checkpoints above it — alive under
+    /// the byte budget, which is precisely backwards for the most disposable
+    /// blob in the cache. The session id below is what attributes the row.
     Rung {
         /// Session id this rung belongs to.
         session: String,

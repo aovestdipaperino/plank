@@ -2504,8 +2504,7 @@ impl Agent<'_> {
                     ))
                 );
             }
-            self.refresh_ladder();
-            self.save_payload_if_dirty();
+            self.flush_kv_end_of_turn();
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
@@ -4572,6 +4571,18 @@ the original is frozen and listed in /tree"
         }
         // No KV support (echo stub) or nothing prefilled yet: nothing to save.
         let cache = self.engine.get_kv()?;
+        self.store_payload(&cache)
+    }
+
+    /// Writes an already-captured KV as the session payload. Split out of
+    /// [`Agent::save_session_payload`] so the end-of-turn flush can serve both
+    /// the ladder rung and the payload from a single `get_kv` — the two ran back
+    /// to back over identical state, paying ~0.8s and ~800 MB of writes per
+    /// rung turn for two copies of the same bytes.
+    fn store_payload(&mut self, cache: &crate::kvcache::KVCache) -> Option<String> {
+        if self.session.id.is_empty() {
+            return None;
+        }
         let key = crate::session::KvKey::Session {
             id: self.session.id.clone(),
             fp: self.payload_fingerprint_for(&self.session),
@@ -4597,7 +4608,7 @@ the original is frozen and listed in /tree"
         };
         match self
             .store
-            .kv_store_labeled(&key, &cache, parent, &self.engine.model_name(), &label)
+            .kv_store_labeled(&key, cache, parent, &self.engine.model_name(), &label)
         {
             Ok(()) => Some(format!(
                 "saved KV payload ({:.2} MB)",
@@ -4622,6 +4633,36 @@ the original is frozen and listed in /tree"
         self.save_session_payload()
     }
 
+    /// End-of-turn KV persistence: at most one `get_kv`, feeding both the
+    /// ladder rung and the session payload.
+    ///
+    /// `refresh_ladder` and `save_payload_if_dirty` used to run back to back
+    /// and each capture the KV over identical state — ~0.8s and ~800 MB of
+    /// writes per rung turn for two copies of the same bytes. Both halves stay
+    /// best-effort: the dirty flag clears regardless of outcome, so a backend
+    /// with no KV does not retry every turn.
+    fn flush_kv_end_of_turn(&mut self) {
+        let wanted = self.ladder_capture_wanted();
+        // The flag clears either way, as it always did: a backend with no KV
+        // must not retry every turn.
+        let dirty = std::mem::take(&mut self.payload_dirty);
+        // An unnamed session has nowhere to write a payload, so capturing for
+        // one would be pure cost.
+        let save = dirty && !self.session.id.is_empty();
+        if wanted.is_none() && !save {
+            return;
+        }
+        let Some(cache) = self.engine.get_kv() else {
+            return;
+        };
+        if let Some(tokens) = wanted {
+            self.push_rung(&cache, tokens);
+        }
+        if save {
+            self.store_payload(&cache);
+        }
+    }
+
     /// Forgets the live session's ladder and deletes its blobs.
     ///
     /// Every rung is a snapshot of *this* session's KV prefix, so anything that
@@ -4639,24 +4680,40 @@ the original is frozen and listed in /tree"
         self.ladder = crate::kvladder::KvLadder::new();
     }
 
-    /// At end of turn, captures a ladder rung when the transcript has moved far
-    /// enough past the deepest existing one.
-    ///
-    /// Capture is a full copy of the KV prefix (~0.4s for 400 MB), so the
-    /// spacing rule in [`crate::kvladder::KvLadder::wants_rung`] is what keeps
-    /// this from running every turn. Best-effort throughout: a failed capture
-    /// or write leaves the ladder as it was and the turn is correct either way.
-    fn refresh_ladder(&mut self) -> Option<crate::kvladder::Rung> {
+    /// The token depth a rung would be captured at, or `None` when the ladder
+    /// does not want one. Split out of [`Agent::refresh_ladder`] so the
+    /// end-of-turn flush can decide whether a capture is needed *before*
+    /// paying for `get_kv`.
+    fn ladder_capture_wanted(&mut self) -> Option<i32> {
         if self.session.id.is_empty() {
             return None;
         }
         let rendered = render_transcript(&self.session, &self.system);
         let tokens = self.engine.count_tokens(&rendered);
-        if !self.ladder.wants_rung(tokens) {
+        self.ladder.wants_rung(tokens).then_some(tokens)
+    }
+
+    /// Records a rung for an already-captured KV, writing its blob and
+    /// deleting whatever it displaced. Best-effort throughout.
+    ///
+    /// Note on the signature: a rung captured on a turn where the
+    /// opportunistic microcompact fired is signed with the POST-rewrite
+    /// transcript's fingerprint while the engine's spans are still the
+    /// PRE-rewrite ones. That is not a correctness problem — reuse is decided
+    /// by a real token comparison in `ds4_session_common_prefix`, and `set_kv`
+    /// restores the blob's own span buffer — but it does mean `rung.tokens` can
+    /// overstate what the blob covers, and that number feeds
+    /// `KvLadder::select`. Recorded rather than restructured: the overstatement
+    /// is bounded by one pass's rewrite and only ever makes the ladder look
+    /// slightly better than it is.
+    fn push_rung(
+        &mut self,
+        cache: &crate::kvcache::KVCache,
+        tokens: i32,
+    ) -> Option<crate::kvladder::Rung> {
+        if self.session.id.is_empty() {
             return None;
         }
-        // No KV backend (echo stub) or nothing prefilled yet: nothing to store.
-        let cache = self.engine.get_kv()?;
         let spans = self.session.transcript.len();
         let (rung, evicted) = self.ladder.push(spans, tokens);
         let key = crate::session::KvKey::Rung {
@@ -4671,7 +4728,7 @@ the original is frozen and listed in /tree"
         };
         let _ = self
             .store
-            .kv_store_labeled(&key, &cache, None, &self.engine.model_name(), &label);
+            .kv_store_labeled(&key, cache, None, &self.engine.model_name(), &label);
         if let Some(old) = evicted {
             let _ = std::fs::remove_file(self.store.rung_path(&self.session.id, old.index));
             let _ = std::fs::remove_file(
@@ -9216,8 +9273,7 @@ impl Agent<'_> {
                         "microcompacted: cleared {cleared} old tool result(s)"
                     ));
                 }
-                self.refresh_ladder();
-                self.save_payload_if_dirty();
+                self.flush_kv_end_of_turn();
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
@@ -13851,6 +13907,20 @@ mod tests {
         }
     }
 
+    impl Agent<'_> {
+        /// Drives the real end-of-turn flush and returns the rung it captured.
+        /// The empty ladder always wants its first rung, so this is a genuine
+        /// capture through the production path.
+        fn capture_first_rung(&mut self) -> crate::kvladder::Rung {
+            self.flush_kv_end_of_turn();
+            *self
+                .ladder
+                .rungs()
+                .last()
+                .expect("the empty ladder always wants its first rung")
+        }
+    }
+
     fn test_cfg() -> crate::config::AgentConfig {
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
@@ -13901,7 +13971,8 @@ mod tests {
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
         agent.session.push(Message::user("hello"));
         agent.store.save(&mut agent.session).unwrap();
-        assert_eq!(agent.refresh_ladder(), None);
+        agent.payload_dirty = true;
+        agent.flush_kv_end_of_turn();
         assert!(agent.ladder.rungs().is_empty());
     }
 
@@ -13954,7 +14025,7 @@ mod tests {
         // scripted engine's `get_kv` hands back a real (if tiny) payload, and
         // `refresh_ladder` writes a real blob keyed by the fingerprint of the
         // transcript exactly as it stands right now.
-        let rung = agent.refresh_ladder().expect("first rung always captures");
+        let rung = agent.capture_first_rung();
         assert_eq!(rung.spans, agent.session.transcript.len());
         assert!(
             events.lock().unwrap().iter().any(|e| e == "capture"),
@@ -14016,7 +14087,7 @@ mod tests {
         agent.store.save(&mut agent.session).unwrap();
 
         // A real rung at spans == 2, so a restore would genuinely fire.
-        let rung = agent.refresh_ladder().expect("first rung always captures");
+        let rung = agent.capture_first_rung();
         assert_eq!(rung.spans, 2);
 
         // Four tool results: only the first is a clearing candidate (the newest
@@ -14082,7 +14153,7 @@ mod tests {
         agent.store.save(&mut agent.session).unwrap();
         let old_id = agent.session.id.clone();
 
-        let rung = agent.refresh_ladder().expect("first rung always captures");
+        let rung = agent.capture_first_rung();
         assert!(agent.store.rung_path(&old_id, rung.index).exists());
 
         // A real replacement path, not the helper: `/clear` is the site the
@@ -14116,7 +14187,7 @@ mod tests {
         agent.store.save(&mut agent.session).unwrap();
         let id = agent.session.id.clone();
 
-        let rung = agent.refresh_ladder().expect("first rung always captures");
+        let rung = agent.capture_first_rung();
         assert!(agent.store.rung_path(&id, rung.index).exists());
 
         agent.rebuild_after_compact("<summary>everything so far</summary>");
@@ -14244,15 +14315,13 @@ mod tests {
             .drive_goal_loop()
             .expect("scripted engine always replies, so the loop settles");
         assert_eq!(outcome, crate::goal::Outcome::Attained);
-        // `run_turn`'s own end-of-turn handling already produces TWO captures
-        // for the main pass's tool-free reply: one from `refresh_ladder`'s own
-        // `get_kv` snapshot, one from its end-of-turn `save_payload_if_dirty`
-        // (dirtied by the ordinary transcript push — unrelated to this
-        // finding). So the discriminating check is a THIRD capture, produced
-        // only by a save covering the adjudication exchange that
-        // `adjudicate_plain` pushes. Asserting merely "any capture happened",
-        // or even "two captures happened", would pass even without the fix,
-        // since `run_turn` alone already supplies exactly two.
+        // `run_turn`'s own end-of-turn handling produces ONE capture for the
+        // main pass's tool-free reply: `flush_kv_end_of_turn` serves both the
+        // ladder rung and the payload write from a single `get_kv`. So the
+        // discriminating check is a SECOND capture, produced only by a save
+        // covering the adjudication exchange that `adjudicate_plain` pushes.
+        // Asserting merely "any capture happened" would pass even without the
+        // fix, since `run_turn` alone already supplies exactly one.
         let captures = events
             .lock()
             .unwrap()
@@ -14261,12 +14330,8 @@ mod tests {
             .count();
         assert_eq!(
             captures,
-            3,
-            "drive_goal_loop must save the payload a THIRD time before \
-             returning on a settled verdict — the first two captures are \
-             `run_turn`'s own ladder refresh and end-of-turn save for the \
-             main pass; the third must cover the adjudication exchange, or \
-             it is transcript-only forever: events were {:?}",
+            2,
+            "drive_goal_loop must save the payload a SECOND time before returning on a settled verdict; the first capture is run_turn's own end-of-turn flush for the main pass, and the second must cover the adjudication exchange or it is transcript-only forever: events were {:?}",
             events.lock().unwrap()
         );
     }
