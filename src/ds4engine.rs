@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use crate::ds4tokens::{self, SectionKey, SpanRole, TokenTranscript};
 use crate::engine::{
     Engine, EngineError, EngineEvent, GenerationOptions, GenerationStats, PrefillProgress,
-    ThinkMode,
+    ThinkMode, kv_debug,
 };
 use crate::ffi;
 use crate::host::{HostSession, ModelHandle};
@@ -2158,27 +2158,6 @@ fn strip_legacy(bytes: &[u8]) -> &[u8] {
         // Malformed legacy header: fall back to treating the whole payload as
         // raw KV (best effort; a load failure just forces a cold prefill).
         None => bytes,
-    }
-}
-
-/// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
-///
-/// KV prefix reuse is the one part of the engine whose failures are silent and
-/// expensive: a mismatch costs a full re-prefill and looks exactly like "the
-/// model is slow today". The closure is only called when the variable is set,
-/// so this costs an env lookup per turn otherwise. Diagnostic only — nothing
-/// reads these files back.
-fn kv_debug(f: impl FnOnce() -> String) {
-    use std::io::Write as _;
-    let Ok(path) = std::env::var("PLANK_KV_DEBUG") else {
-        return;
-    };
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(file, "{}", f());
     }
 }
 

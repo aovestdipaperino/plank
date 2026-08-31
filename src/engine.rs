@@ -311,6 +311,31 @@ pub fn reusable_prefix(pos: i32, common: i32) -> i32 {
     if pos > 0 && common == pos { pos } else { 0 }
 }
 
+/// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
+///
+/// KV prefix reuse is the one part of the engine whose failures are silent and
+/// expensive: a mismatch costs a full re-prefill and looks exactly like "the
+/// model is slow today". The closure is only called when the variable is set,
+/// so this costs an env lookup per turn otherwise. Diagnostic only — nothing
+/// reads these files back.
+///
+/// Lives here rather than in the cfg-gated `ds4engine` because the KV ladder
+/// (capture, selection, restore) is decided in always-compiled code and is
+/// exactly as silent when it goes wrong.
+pub fn kv_debug(f: impl FnOnce() -> String) {
+    use std::io::Write as _;
+    let Ok(path) = std::env::var("PLANK_KV_DEBUG") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{}", f());
+    }
+}
+
 /// Which of two interleaved streams an event belongs to, so a front-end can
 /// route the main task and a concurrent aside to different places.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

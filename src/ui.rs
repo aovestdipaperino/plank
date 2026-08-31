@@ -2993,11 +2993,25 @@ impl Agent<'_> {
         let edit = compact::microcompact_first_index(&self.session.transcript)?;
         let rendered = render_transcript(&self.session, &self.system);
         let total = self.engine.count_tokens(&rendered);
-        let covered = self.restore_rung_below(edit).unwrap_or(0);
+        // Decide BEFORE touching the engine. `restore_rung_below` calls
+        // `set_kv`, which replaces the engine's KV rows *and* its token span
+        // buffer with the rung's shorter prefix — so restoring and then
+        // refusing throws away a cache covering the whole live transcript for
+        // a rewrite that never happens, and the next turn re-prefills exactly
+        // the tail the gate just declined to spend. Ask the ladder what a
+        // restore would cover, gate on that, and only then restore.
+        let covered = self.ladder.select(edit, 0).map_or(0, |r| r.tokens);
         // Whatever the rung does not cover is re-prefilled next turn.
         if !compact::microcompact_is_worth_it(reclaimable, total - covered) {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "microcompact gate refused: reclaimable={reclaimable}B total={total} rung_covers={covered} reprefill={}",
+                    total - covered
+                )
+            });
             return None;
         }
+        self.restore_rung_below(edit);
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         self.last_ctx_used = 0;
         Some(cleared)
@@ -4636,6 +4650,13 @@ the original is frozen and listed in /tree"
                     .with_extension("json"),
             );
         }
+        crate::engine::kv_debug(|| {
+            format!(
+                "ladder capture: rung {} at spans={spans} tokens={tokens}{}",
+                rung.index,
+                evicted.map_or_else(String::new, |e| format!(" (evicted rung {})", e.index))
+            )
+        });
         Some(rung)
     }
 
@@ -4675,6 +4696,12 @@ the original is frozen and listed in /tree"
         // A stale or unloadable rung just means the rebuild happens anyway.
         let cache = self.store.kv_load(&key)?;
         self.engine.set_kv(&cache).ok()?;
+        crate::engine::kv_debug(|| {
+            format!(
+                "ladder restore: rung {} (spans={} tokens={}) for edit at span {edit_index}",
+                rung.index, rung.spans, rung.tokens
+            )
+        });
         Some(rung.tokens)
     }
 
@@ -13925,6 +13952,74 @@ mod tests {
                 .iter()
                 .any(|e| e.starts_with("restore:")),
             "a real hit must run the restore, not just select the rung: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// A REFUSED opportunistic microcompact must leave the engine's KV alone.
+    ///
+    /// The pass used to restore a rung *before* consulting the gate, so on the
+    /// refusal path the transcript was never rewritten and nothing needed
+    /// rewinding — yet `set_kv` had already replaced the engine's rows and its
+    /// token span buffer with the rung's shorter prefix, throwing away a cache
+    /// that covered the whole live transcript. The gate then refused the very
+    /// prefill it had just made inevitable, and refused again every turn.
+    #[test]
+    fn a_refused_opportunistic_microcompact_does_not_rewind_the_engine() {
+        let dir = scratch_dir("ladder-refuse-no-rewind");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // A real rung at spans == 2, so a restore would genuinely fire.
+        let rung = agent.refresh_ladder().expect("first rung always captures");
+        assert_eq!(rung.spans, 2);
+
+        // Four tool results: only the first is a clearing candidate (the newest
+        // three are kept), and the kept three are bulky enough that the bytes
+        // the pass would reclaim are far below the floor per re-prefilled
+        // token, so the gate must refuse.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(5_000)
+        )));
+        for _ in 0..3 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(20_000)
+            )));
+        }
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        assert!(reclaimable >= compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
+        let edit = compact::microcompact_first_index(&agent.session.transcript).unwrap();
+        assert!(edit >= rung.spans, "the rung must predate the edit");
+
+        events.lock().unwrap().clear();
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact_opportunistic(),
+            None,
+            "the gate must refuse: too few bytes per re-prefilled token"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "a refused pass rewrites nothing"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a refused pass must not rewind the engine's KV: {:?}",
             events.lock().unwrap()
         );
     }
