@@ -8,6 +8,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`/insights` suggestions are one click from being used.** Every suggestion
+  the report makes now carries a Copy button, and the AGENTS.md instructions
+  come as a checklist: untick the ones you disagree with, hit "Copy all
+  checked", and paste the rest into plank. Feature snippets and suggested
+  prompts copy individually. The handler is inlined like the stylesheet — the
+  report is still one self-contained local file with no network references,
+  and it falls back to a hidden textarea because `navigator.clipboard` is
+  unavailable on `file://`, which is exactly where the report is opened.
+
 - **The status footer counts what you have changed.** Beside the directory and
   branch — on the TUI's location row, which answers "which tree am I in" —
   the footer now carries a working-tree summary: `📄 3 · +128 -41`, files
@@ -18,6 +27,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cached for a second, because the footer repaints several times a second and
   walking the tree at that rate would cost more than the rest of the line put
   together.
+
+### Fixed
+
+- **A generation no longer opens with a blank line.** The model separates its
+  answer from the thinking it just closed with a newline; on the plain path
+  that is invisible, but the TUI committed it as an empty row above every
+  answer. A visible segment's leading newlines are now dropped.
+- **`/insights` stops a section that falls into a repetition loop.** A model
+  that runs out of things to say sometimes repeats one clause until the token
+  budget runs out — minutes of visible nonsense per section. The stream is
+  watched for a cyclic tail and the pass stopped; that section is dropped and
+  the rest of the report is written as normal.
 
 ## [3.5.0] - 2026-08-30
 

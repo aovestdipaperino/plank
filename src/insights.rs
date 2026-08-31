@@ -1764,6 +1764,34 @@ fn section(out: &mut String, id: &str, heading: &str, body: &str) {
     );
 }
 
+/// Writes one copyable block: the text itself, a Copy button, and — when
+/// `pick` — a checkbox the section's "Copy all checked" button collects.
+///
+/// The report is a file, not a terminal, so a suggestion is only as useful as
+/// it is easy to act on: everything the model proposes is something you paste
+/// back into plank, and a paste starts with a copy. `tag` is the element the
+/// text lives in (`pre` for a snippet, `p` for a sentence of prose).
+fn copy_row(out: &mut String, tag: &str, class: &str, text: &str, pick: bool) {
+    out.push_str("<div class=\"copyrow\">");
+    if pick {
+        out.push_str("<input type=\"checkbox\" class=\"pick\" checked>");
+    }
+    let _ = write!(
+        out,
+        "<{tag} class=\"{class}\" data-copy>{}</{tag}>\
+<button type=\"button\" class=\"copy\">Copy</button></div>",
+        html_escape(text)
+    );
+}
+
+/// The "Copy all checked" control for a section of picked suggestions.
+fn copy_all_row(out: &mut String) {
+    out.push_str(
+        "<div class=\"copyall\"><button type=\"button\" class=\"copy-all\">\
+Copy all checked</button></div>",
+    );
+}
+
 /// Renders the narrative sections that came back, in [`SECTIONS`] order and
 /// skipping `at_a_glance` (which the header already shows).
 fn narrative_html(narrative: &Narrative) -> String {
@@ -1831,17 +1859,24 @@ fn narrative_html(narrative: &Narrative) -> String {
                     );
                 }
                 if let Some(s) = snippet {
-                    let _ = write!(body, "<pre>{}</pre>", html_escape(s));
+                    copy_row(&mut body, "pre", "snippet", s, false);
                 }
                 body.push_str("</div>");
             }
         }
         if let Some(lines) = value.get("agents_md").and_then(serde_json::Value::as_array) {
-            body.push_str("<h3>Worth putting in AGENTS.md</h3><ul>");
+            // A checklist rather than a bullet list: these are instructions
+            // meant to end up in a file, so the report hands them over ready
+            // to paste — untick the ones you disagree with, copy the rest.
+            body.push_str(
+                "<h3>Worth putting in AGENTS.md</h3>\
+<p class=\"note\">Untick anything you disagree with, then paste the rest into \
+plank and ask it to add them to AGENTS.md.</p>",
+            );
+            copy_all_row(&mut body);
             for l in lines.iter().filter_map(serde_json::Value::as_str) {
-                let _ = write!(body, "<li>{}</li>", html_escape(l));
+                copy_row(&mut body, "p", "instruction", l, true);
             }
-            body.push_str("</ul>");
         }
         if let Some(prompts) = value.get("prompts").and_then(serde_json::Value::as_array) {
             body.push_str("<h3>Prompts to try</h3><div class=\"cards\">");
@@ -1853,7 +1888,7 @@ fn narrative_html(narrative: &Narrative) -> String {
                     let _ = write!(body, "<h3>{}</h3>", html_escape(t));
                 }
                 if let Some(t) = text {
-                    let _ = write!(body, "<pre>{}</pre>", html_escape(t));
+                    copy_row(&mut body, "pre", "snippet", t, false);
                 }
                 body.push_str("</div>");
             }
@@ -1900,7 +1935,51 @@ border-radius:.4rem;padding:.7rem;font:13px/1.5 ui-monospace,SFMono-Regular,Menl
 ul{margin:0;padding-left:1.2rem}li{margin:0 0 .4rem}\
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(18rem,1fr));gap:2rem}\
 .note{color:var(--dim);font-size:.85rem}\
+.copyrow{display:flex;align-items:flex-start;gap:.55rem;margin:0 0 .55rem}\
+.copyrow>[data-copy]{flex:1;margin:0}\
+.copyrow p[data-copy]{background:var(--card);border:1px solid var(--line);border-radius:.4rem;padding:.55rem .7rem}\
+.copyrow input.pick{margin:.75rem 0 0;accent-color:var(--accent)}\
+.copy,.copy-all{flex:none;background:var(--card);color:var(--fg);border:1px solid var(--line);\
+border-radius:.4rem;padding:.35rem .7rem;font:inherit;font-size:.8rem;cursor:pointer}\
+.copy:hover,.copy-all:hover{border-color:var(--accent);color:var(--accent)}\
+.copy.ok,.copy-all.ok{border-color:var(--accent);color:var(--accent)}\
+.copyall{margin:0 0 .75rem}\
 footer{color:var(--dim);font-size:.8rem;border-top:1px solid var(--line);padding-top:1rem}\
+";
+
+/// Clipboard behaviour for the copy controls, inlined for the same reason the
+/// stylesheet is: the report is a private local file and must work with no
+/// network and no assets beside it.
+///
+/// `navigator.clipboard` is unavailable on `file://` in most browsers (not a
+/// secure context), which is exactly where this report is opened, so the
+/// hidden-textarea `execCommand` path is the one that usually runs — it is the
+/// fallback in name only.
+const REPORT_JS: &str = "\
+(function(){\
+function flash(b){var t=b.textContent;b.textContent='Copied';b.classList.add('ok');\
+setTimeout(function(){b.textContent=t;b.classList.remove('ok');},1200);}\
+function legacy(text,b){var ta=document.createElement('textarea');ta.value=text;\
+ta.setAttribute('readonly','');ta.style.position='fixed';ta.style.opacity='0';\
+document.body.appendChild(ta);ta.select();\
+try{if(document.execCommand('copy')){flash(b);}}catch(e){}\
+document.body.removeChild(ta);}\
+function copy(text,b){\
+if(navigator.clipboard&&navigator.clipboard.writeText){\
+navigator.clipboard.writeText(text).then(function(){flash(b);},function(){legacy(text,b);});}\
+else{legacy(text,b);}}\
+function textOf(el){return el?el.innerText:'';}\
+document.addEventListener('click',function(ev){\
+var b=ev.target.closest&&ev.target.closest('button.copy');\
+if(b){var row=b.closest('.copyrow');copy(textOf(row&&row.querySelector('[data-copy]')),b);return;}\
+b=ev.target.closest&&ev.target.closest('button.copy-all');\
+if(!b){return;}\
+var parts=[];\
+b.closest('section').querySelectorAll('.copyrow').forEach(function(r){\
+var pick=r.querySelector('input.pick');\
+if(!pick||pick.checked){parts.push(textOf(r.querySelector('[data-copy]')));}});\
+copy(parts.join('\\n\\n'),b);});\
+})();\
 ";
 
 /// Renders the full HTML report.
@@ -2153,7 +2232,9 @@ prompts.</p><ul>",
         "<footer>Generated locally by plank on {}. Nothing here left this machine.</footer>",
         datetime_str(generated_at, tz_offset)
     );
-    out.push_str("\n</main>\n</body>\n</html>\n");
+    out.push_str("\n</main>\n<script>");
+    out.push_str(REPORT_JS);
+    out.push_str("</script>\n</body>\n</html>\n");
     Some(out)
 }
 
@@ -2708,11 +2789,50 @@ Tool result 3 (read):\nfine\n</tool_result>",
             serde_json::json!({"working": "<script>alert(1)</script>"}),
         );
         let html = render_html(&agg, &narrative, 0, 0);
-        assert!(!html.contains("<script>"), "narrative must be escaped");
+        // The report carries exactly one script — its own copy-button
+        // handler — and narrative text can never become a second one.
+        assert!(!html.contains("<script>alert"), "narrative must be escaped");
+        assert_eq!(html.matches("<script>").count(), 1, "only the report's own");
         assert!(html.contains("&lt;script&gt;"));
         // Self-contained: no network references of any kind.
         assert!(!html.contains("http://") && !html.contains("https://"));
         assert!(html.contains("2023-11-14"));
+    }
+
+    #[test]
+    fn agents_md_suggestions_are_a_copyable_checklist() {
+        let agg = aggregate(
+            &[SessionMeta {
+                id: "a".to_owned(),
+                human_messages: 4,
+                tools: [("bash".to_owned(), 3)].into_iter().collect(),
+                ..SessionMeta::default()
+            }],
+            0,
+        );
+        let mut narrative = Narrative::new();
+        narrative.insert(
+            "suggestions".to_owned(),
+            serde_json::json!({
+                "agents_md": ["Always run cargo fmt & clippy before committing."],
+                "prompts": [{"title": "Release", "prompt": "cut a beta release"}],
+            }),
+        );
+        let html = render_html(&agg, &narrative, 0, 0);
+        // Each instruction is picked by default, copyable on its own, and
+        // collected by the section's copy-all control.
+        assert!(html.contains("class=\"pick\" checked"), "{html}");
+        assert!(html.contains("class=\"copy-all\""), "{html}");
+        assert_eq!(html.matches("class=\"copyrow\"").count(), 2, "{html}");
+        // Ampersands in an instruction are escaped, not markup.
+        assert!(html.contains("cargo fmt &amp; clippy"), "{html}");
+        // The handler that makes the buttons work ships with the file, and
+        // nothing it needs is fetched.
+        assert!(
+            html.contains("execCommand"),
+            "clipboard fallback is inlined"
+        );
+        assert!(!html.contains("http://") && !html.contains("https://"));
     }
 
     #[test]
@@ -2742,7 +2862,8 @@ Tool result 3 (read):\nfine\n</tool_result>",
         assert!(html.contains("Why for you."));
         // Snippets are code, not markup: braces and quotes survive escaped.
         assert!(html.contains("&quot;PostToolUse&quot;"));
-        assert!(!html.contains("<script>"));
+        // And it is copyable with one click, like every other suggestion.
+        assert!(html.contains("class=\"copy\""), "{html}");
     }
 
     #[test]

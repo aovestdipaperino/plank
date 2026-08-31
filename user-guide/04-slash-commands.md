@@ -97,6 +97,8 @@ See [Extending plank](09-extending.md).
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
 
+Suggestions are made to be used, not read: every snippet, prompt and instruction in the report has a **Copy** button, and the **Worth putting in AGENTS.md** list arrives as a checklist — untick what you disagree with, press **Copy all checked**, and paste the rest into plank. The report stays a single self-contained local file: the clipboard handler is inlined next to the stylesheet, with a fallback for `file://`, where the browser clipboard API is unavailable.
+
 Among the written sections is **Features to try**: two or three of plank's own [extension points](09-extending.md) — a skill, a template, a subagent, a hook, an MCP server — chosen from what your sessions actually show, each with a ready-to-run snippet that sets it up. The report knows what you already have installed (it reads the live skill, template, subagent, hook and MCP rosters), so it recommends what is missing rather than what is already there.
 
 ## Editing a file
