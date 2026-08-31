@@ -78,6 +78,18 @@ pub fn microcompact_reclaimable(transcript: &[Message]) -> usize {
         .sum()
 }
 
+/// The earliest transcript index [`microcompact`] would rewrite, or `None`
+/// when it would clear nothing.
+///
+/// This is the KV divergence point: rewriting a body in place makes every
+/// token from here on diverge from the live KV, and `ds4_session_sync` cannot
+/// rewrite behind its live end, so the whole prefix is otherwise rebuilt from
+/// zero. The agent uses this to pick a snapshot rung at or below the edit.
+#[must_use]
+pub fn microcompact_first_index(transcript: &[Message]) -> Option<usize> {
+    clear_set(transcript).into_iter().min()
+}
+
 /// Clears the bodies of old tool results in place, keeping the newest
 /// [`MICROCOMPACT_KEEP_RESULTS`] intact plus anything belonging to the current
 /// task; returns `(cleared, bytes_reclaimed)`.
@@ -522,5 +534,23 @@ mod tests {
             build_reinjection(&reads, 0, &mut |s| i32::try_from(s.len()).unwrap_or(0)).is_none()
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn first_index_is_the_earliest_body_microcompact_would_clear() {
+        let big = "<tool_result>".to_owned() + &"x".repeat(600) + "</tool_result>";
+        let mut t = Vec::new();
+        t.push(Message::user("hello"));
+        for _ in 0..6 {
+            t.push(Message::assistant("ok"));
+            t.push(Message::user(big.clone()));
+        }
+        // The newest MICROCOMPACT_KEEP_RESULTS results survive, so the earliest
+        // cleared body is the first tool result in the transcript, at index 2.
+        assert_eq!(microcompact_first_index(&t), Some(2));
+
+        // Nothing clearable => nothing to report.
+        let short = vec![Message::user("hi")];
+        assert_eq!(microcompact_first_index(&short), None);
     }
 }
