@@ -1650,11 +1650,26 @@ impl Engine for Ds4Session {
         // drop; we copy the payload out for the caller to persist. The token
         // transcript rides in the value so a restore reconstructs the exact
         // token buffer the KV was captured with.
+        let t0 = std::time::Instant::now();
         let snap = SessionSnapshot::capture(self.session).ok()?;
-        Some(crate::kvcache::KVCache::new(
-            snap.as_bytes().to_vec(),
-            self.transcript.clone(),
-        ))
+        let captured = t0.elapsed();
+        let bytes = snap.as_bytes().len();
+        let t1 = std::time::Instant::now();
+        let out = crate::kvcache::KVCache::new(snap.as_bytes().to_vec(), self.transcript.clone());
+        let copied = t1.elapsed();
+        // Capture is a full copy of the KV prefix out of the backend, so its
+        // cost scales with the conversation, not with the turn. Anything that
+        // wants to snapshot more often than once a turn has to justify itself
+        // against these two numbers.
+        kv_debug(|| {
+            format!(
+                "get_kv: {:.1} MB captured in {:.0} ms (+{:.0} ms to copy out)",
+                crate::session::to_mb(bytes as u64),
+                captured.as_secs_f64() * 1e3,
+                copied.as_secs_f64() * 1e3,
+            )
+        });
+        Some(out)
     }
 
     fn set_kv(&mut self, cache: &crate::kvcache::KVCache) -> Result<(), EngineError> {
@@ -1662,7 +1677,17 @@ impl Engine for Ds4Session {
         // Persisted bytes go through the non-owning restore path: the engine
         // copies from a transient struct and never frees it (snapshot.rs,
         // FINDINGS.md).
+        let t0 = std::time::Instant::now();
         SessionSnapshot::restore_bytes(session, cache.kv())?;
+        // The other half of the trade: restoring here is what a forced rebuild
+        // would otherwise pay as a prefill from token zero.
+        kv_debug(|| {
+            format!(
+                "set_kv: {:.1} MB restored in {:.0} ms",
+                crate::session::to_mb(cache.kv().len() as u64),
+                t0.elapsed().as_secs_f64() * 1e3,
+            )
+        });
         self.transcript = cache.transcript().clone();
         Ok(())
     }
