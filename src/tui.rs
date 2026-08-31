@@ -906,6 +906,21 @@ impl OutputLog {
 
 impl RenderSink for OutputLog {
     fn visible_text(&mut self, text: &str) {
+        // A generation's visible text almost always opens with a newline —
+        // the model separates the answer from the think block it just closed,
+        // and the plain renderer swallows that because it is already sitting
+        // at column zero. Here it would commit a blank row above every
+        // answer, so a segment's leading newlines are dropped: the blank line
+        // between the last output and this one is `end_line`'s job, not the
+        // model's.
+        let text = if self.md_buf.is_empty() {
+            text.trim_start_matches('\n')
+        } else {
+            text
+        };
+        if text.is_empty() {
+            return;
+        }
         if self.md_start.is_none() {
             self.end_line();
             self.md_start = Some(self.lines.len());
@@ -3916,6 +3931,37 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
 mod tests {
     use super::SubPane;
     use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn a_generation_does_not_open_with_a_blank_row() {
+        use super::{Line, OutputLog};
+        use crate::viz::RenderSink;
+        // The observed bug: every generation after a prefill committed an
+        // empty line above its first word, because the model opens its answer
+        // with the newline that ended its thinking.
+        let rows = |log: &OutputLog| -> Vec<String> {
+            log.to_text().lines.iter().map(Line::to_string).collect()
+        };
+        let mut log = OutputLog::new();
+        log.push_plain("previous line");
+        log.visible_text("\n\nHello");
+        log.visible_text(" world");
+        log.flush_md();
+        assert_eq!(rows(&log), vec!["previous line", "Hello world"]);
+
+        // Newlines *within* a segment are the model's paragraphing and stay.
+        let mut log = OutputLog::new();
+        log.visible_text("one\n\ntwo");
+        log.flush_md();
+        let r = rows(&log);
+        assert!(r.len() > 1 && r[0] == "one", "{r:?}");
+
+        // A chunk that is nothing but newlines opens no segment at all.
+        let mut log = OutputLog::new();
+        log.visible_text("\n");
+        log.flush_md();
+        assert!(log.to_text().lines.is_empty());
+    }
 
     #[test]
     fn frame_mouse_events_map_and_clamp() {
