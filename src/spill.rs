@@ -324,6 +324,7 @@ mod tests {
         let sweep_policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 3600,
             ttl_tier_secs: 3600,
+            ttl_rung_secs: 3600,
             max_bytes: 0,
         };
         assert_eq!(sweep_in(root.path(), &sweep_policy, now), 0);
@@ -331,6 +332,7 @@ mod tests {
         let tight = crate::kvgc::SweepPolicy {
             ttl_session_secs: 3600,
             ttl_tier_secs: 3600,
+            ttl_rung_secs: 3600,
             max_bytes: 4,
         };
         let freed = sweep_in(root.path(), &tight, now);

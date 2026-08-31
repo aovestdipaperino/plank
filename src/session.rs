@@ -493,6 +493,20 @@ impl SessionStore {
         self.dir.join(format!("{id}.rung-{index}.kv_raw"))
     }
 
+    /// Deletes every ladder rung blob and sidecar for `id`, returning how many
+    /// blobs were removed. Rungs are a live-session accelerator, not history:
+    /// the saved payload is what a later `/resume` restores from.
+    #[must_use]
+    pub fn remove_rungs(&self, id: &str) -> usize {
+        (0..crate::kvladder::LADDER_MAX_RUNGS)
+            .filter(|&i| {
+                let path = self.rung_path(id, i);
+                let _ = fs::remove_file(path.with_extension("json"));
+                fs::remove_file(&path).is_ok()
+            })
+            .count()
+    }
+
     /// Size in bytes of a session's KV payload sidecar; 0 when absent.
     #[must_use]
     pub fn payload_bytes(&self, id: &str) -> u64 {
@@ -959,6 +973,7 @@ impl SessionStore {
             fs::remove_file(&payload)?;
             let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
         }
+        let _ = self.remove_rungs(&id);
         Ok((id, had_payload))
     }
 
@@ -2903,6 +2918,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         // `now` an hour and a bit on: everything written just now reads as past
@@ -2987,6 +3003,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         // Two Tier 1 fingerprints are live, not one: a session can hold two
@@ -3068,6 +3085,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3118,6 +3136,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 14 * 86_400,
             ttl_tier_secs: 30 * 86_400,
+            ttl_rung_secs: 14 * 86_400,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3145,6 +3164,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         assert_eq!(store.sweep(&[], &policy, crate::kvmeta::now_secs()), 5);
@@ -3252,6 +3272,7 @@ hello\n";
                 let policy = crate::kvgc::SweepPolicy {
                     ttl_session_secs: 0,
                     ttl_tier_secs: 0,
+                    ttl_rung_secs: 0,
                     max_bytes: 0,
                 };
                 let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -3291,6 +3312,7 @@ hello\n";
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
@@ -4202,6 +4224,33 @@ hello\n";
         );
         assert_eq!(kv_role(&key), crate::kvmeta::KvRole::Rung);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_rungs_clears_every_slot_and_its_sidecar() {
+        let dir = temp_dir("remove-rungs");
+        let store = SessionStore::open(&dir).unwrap();
+        for i in 0..crate::kvladder::LADDER_MAX_RUNGS {
+            std::fs::write(store.rung_path("zany-turing", i), b"blob").unwrap();
+            std::fs::write(
+                store.rung_path("zany-turing", i).with_extension("json"),
+                b"{}",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.remove_rungs("zany-turing"),
+            crate::kvladder::LADDER_MAX_RUNGS
+        );
+        assert!(!store.rung_path("zany-turing", 0).exists());
+        assert!(
+            !store
+                .rung_path("zany-turing", 0)
+                .with_extension("json")
+                .exists()
+        );
+        // A second sweep finds nothing left.
+        assert_eq!(store.remove_rungs("zany-turing"), 0);
     }
 
     #[test]

@@ -49,6 +49,20 @@ use crate::kvmeta::{KvMeta, KvRole};
 /// Seconds in a day, for turning the day-valued settings into TTLs.
 const SECS_PER_DAY: u64 = 86_400;
 
+/// Backstop TTL for [`KvRole::Rung`], independent of `ttl_session_secs`.
+///
+/// Deterministic cleanup (`SessionStore::remove_rungs`, called from
+/// `save_for_exit` and `/strip`) is what's supposed to delete rungs — this
+/// TTL only catches what that cannot: a crash, a `SIGKILL`, or a machine
+/// losing power mid-session, where the exit path never runs. A rung is a
+/// live-session accelerator, not history, so a crashed session's rungs are
+/// dead weight the moment the process is gone; there's no reason to let them
+/// survive as long as a saved session payload (`ttl_session_secs`, which
+/// defaults to 14 days) at hundreds of MB apiece. One day is generous
+/// headroom for a session merely idle overnight while still bounding
+/// crash-orphaned rungs to a single day's worth of dead sessions.
+const RUNG_BACKSTOP_SECS: u64 = SECS_PER_DAY;
+
 /// How long each role survives after its last use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SweepPolicy {
@@ -57,6 +71,9 @@ pub struct SweepPolicy {
     /// TTL for [`KvRole::System`] and [`KvRole::Project`] checkpoints, in
     /// seconds.
     pub ttl_tier_secs: u64,
+    /// TTL for [`KvRole::Rung`] blobs, in seconds. A backstop for crashes and
+    /// kills, not the primary cleanup path — see [`RUNG_BACKSTOP_SECS`].
+    pub ttl_rung_secs: u64,
     /// Hard ceiling on total cache bytes, enforced after the TTL pass. `0`
     /// disables the budget pass entirely — it means "unbounded", never
     /// "evict everything".
@@ -67,9 +84,11 @@ impl SweepPolicy {
     /// The policy the `kvcache` settings block describes.
     #[must_use]
     pub fn from_settings(s: &crate::settings::KvCacheSettings) -> Self {
+        let ttl_session_secs = s.ttl_session_days.saturating_mul(SECS_PER_DAY);
         Self {
-            ttl_session_secs: s.ttl_session_days.saturating_mul(SECS_PER_DAY),
+            ttl_session_secs,
             ttl_tier_secs: s.ttl_tier_days.saturating_mul(SECS_PER_DAY),
+            ttl_rung_secs: ttl_session_secs.min(RUNG_BACKSTOP_SECS),
             max_bytes: s.max_bytes,
         }
     }
@@ -77,7 +96,8 @@ impl SweepPolicy {
     /// TTL for `role`.
     fn ttl(&self, role: KvRole) -> u64 {
         match role {
-            KvRole::Session | KvRole::Rung => self.ttl_session_secs,
+            KvRole::Session => self.ttl_session_secs,
+            KvRole::Rung => self.ttl_rung_secs,
             KvRole::System | KvRole::Project => self.ttl_tier_secs,
         }
     }
@@ -220,6 +240,7 @@ mod tests {
         SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            ttl_rung_secs: DAY,
             max_bytes: 0,
         }
     }
@@ -230,6 +251,7 @@ mod tests {
         SweepPolicy {
             ttl_session_secs: 9_999 * DAY,
             ttl_tier_secs: 9_999 * DAY,
+            ttl_rung_secs: 9_999 * DAY,
             max_bytes,
         }
     }
@@ -268,6 +290,29 @@ mod tests {
             node(KvRole::Project, "proj", None, 20),
         ];
         assert_eq!(doomed(&nodes, &[]), vec!["sess".to_owned()]);
+    }
+
+    #[test]
+    fn a_rung_expires_on_its_own_shorter_backstop_ttl() {
+        // 2 days idle: past the 1-day rung backstop, inside the 14-day
+        // session TTL a rung used to (wrongly) share.
+        let nodes = vec![
+            node(KvRole::Rung, "rung", None, 2),
+            node(KvRole::Session, "sess", None, 2),
+        ];
+        assert_eq!(doomed(&nodes, &[]), vec!["rung".to_owned()]);
+    }
+
+    #[test]
+    fn from_settings_bounds_the_rung_backstop_by_the_session_ttl() {
+        // A session TTL shorter than the one-day backstop must not widen the
+        // rung TTL past it: `min` keeps whichever policy is stricter.
+        let settings = crate::settings::KvCacheSettings {
+            ttl_session_days: 0,
+            ttl_tier_days: 30,
+            max_bytes: 0,
+        };
+        assert_eq!(SweepPolicy::from_settings(&settings).ttl_rung_secs, 0);
     }
 
     #[test]
@@ -349,6 +394,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 0,
             ttl_tier_secs: 0,
+            ttl_rung_secs: 0,
             max_bytes: 0,
         };
         let mut pinned = node(KvRole::Session, "pin", None, 0);
@@ -434,6 +480,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 30 * DAY,
+            ttl_rung_secs: 14 * DAY,
             max_bytes: 150,
         };
         let nodes = vec![
@@ -454,6 +501,7 @@ mod tests {
         let p = SweepPolicy {
             ttl_session_secs: 14 * DAY,
             ttl_tier_secs: 9_999 * DAY,
+            ttl_rung_secs: 14 * DAY,
             max_bytes: 1,
         };
         let nodes = vec![

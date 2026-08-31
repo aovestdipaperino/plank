@@ -5569,6 +5569,9 @@ the original is frozen and listed in /tree"
         // at local prefill speeds. `/save` has always captured the payload; the
         // exit path is where sessions actually get saved.
         let _ = self.save_session_payload();
+        // The exit payload supersedes the ladder; leaving rungs behind would
+        // hold hundreds of MB per session against the cache byte budget.
+        let _ = self.store.remove_rungs(&id);
         let path = self
             .store
             .find(&id)
@@ -16963,6 +16966,7 @@ mod tests {
         let policy = crate::kvgc::SweepPolicy {
             ttl_session_secs: 1,
             ttl_tier_secs: 1,
+            ttl_rung_secs: 1,
             max_bytes: 0,
         };
         let future = crate::kvmeta::now_secs() + 400 * 86_400;
