@@ -127,3 +127,114 @@ fn render_lines(mut reader: std::fs::File, out: RawFd) {
     }
     write_all(out, b"\r\x1b[K");
 }
+
+/// Known ds4 chatter: lines the C library prints on every session creation
+/// that say nothing a user of plank can act on.
+///
+/// Matched by prefix against a whole line. Kept deliberately short — anything
+/// not listed here is passed through, because a diagnostic swallowed is worse
+/// than a diagnostic repeated.
+const DS4_CHATTER: &[&str] = &["ds4: DSpark target-hidden capture enabled:"];
+
+/// Serializes the fd-2 swap in [`without_ds4_chatter`], so two threads
+/// creating sessions at once cannot restore each other's stderr.
+static CAPTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Runs `f` with stderr captured, then re-emits everything it printed except
+/// the [`DS4_CHATTER`] lines.
+///
+/// The C engine announces its `DSpark` capture configuration on stderr every
+/// time a session is created — at startup, on `/clear`, for every aside and
+/// sub-agent — and that lands in the middle of the user's screen. The line is
+/// a build detail, not news, so plank drops it here while the upstream print
+/// is still unconditional. Nothing else is dropped: whatever else `f` wrote,
+/// including the failure messages that matter, is written straight back out.
+pub fn without_ds4_chatter<T>(f: impl FnOnce() -> T) -> T {
+    let Ok(_guard) = CAPTURE_LOCK.lock() else {
+        // A poisoned lock means some other capture panicked mid-swap; leaving
+        // stderr alone is the safe response, chatter and all.
+        return f();
+    };
+    // SAFETY: dup/pipe/dup2 on process-owned fds; every fd opened here is
+    // closed on both the success and the early-return paths.
+    let saved_and_pipe = unsafe {
+        let saved = libc::dup(libc::STDERR_FILENO);
+        if saved < 0 {
+            None
+        } else {
+            let mut fds = [0_i32; 2];
+            if libc::pipe(fds.as_mut_ptr()) != 0 || libc::dup2(fds[1], libc::STDERR_FILENO) < 0 {
+                libc::close(saved);
+                None
+            } else {
+                libc::close(fds[1]);
+                Some((saved, fds[0]))
+            }
+        }
+    };
+    let Some((saved, read_fd)) = saved_and_pipe else {
+        return f();
+    };
+    // Drained on a thread: `f` writing more than the pipe buffer holds would
+    // otherwise block forever on a pipe nobody is reading yet.
+    let reader = std::thread::spawn(move || {
+        // SAFETY: read_fd is owned here and closed by the File's drop.
+        let mut file = unsafe { std::fs::File::from_raw_fd(read_fd) };
+        let mut buf = Vec::new();
+        let _ = file.read_to_end(&mut buf);
+        buf
+    });
+    let out = f();
+    // SAFETY: restoring the real stderr closes the pipe's last write end, so
+    // the reader above sees EOF.
+    unsafe {
+        libc::dup2(saved, libc::STDERR_FILENO);
+        libc::close(saved);
+    }
+    if let Ok(buf) = reader.join() {
+        let text = String::from_utf8_lossy(&buf);
+        for line in text.lines() {
+            if is_ds4_chatter(line) {
+                continue;
+            }
+            eprintln!("{line}");
+        }
+    }
+    out
+}
+
+/// Whether a captured stderr line is chatter plank drops. See [`DS4_CHATTER`].
+fn is_ds4_chatter(line: &str) -> bool {
+    DS4_CHATTER.iter().any(|p| line.starts_with(p))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_listed_chatter_is_dropped() {
+        assert!(is_ds4_chatter(
+            "ds4: DSpark target-hidden capture enabled: layers=40,41,42"
+        ));
+        // A failure from the same code path reads almost the same and must
+        // still reach the user.
+        assert!(!is_ds4_chatter(
+            "ds4: failed to configure DSpark target-hidden capture"
+        ));
+        assert!(!is_ds4_chatter("ds4: out of memory"));
+        assert!(!is_ds4_chatter(""));
+    }
+
+    #[test]
+    fn the_capture_returns_the_value_and_leaves_stderr_usable() {
+        let out = without_ds4_chatter(|| {
+            eprintln!("ds4: DSpark target-hidden capture enabled: layers=1");
+            41 + 1
+        });
+        assert_eq!(out, 42);
+        // Restored: the harness's own stderr still works afterwards, which is
+        // the failure this would otherwise cause everywhere at once.
+        eprint!("");
+    }
+}

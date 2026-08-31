@@ -266,7 +266,14 @@ impl Ds4Model {
         let ctx_size = ctx_size.clamp(1, self.ctx_size.max(1));
         let mut session: *mut ffi::Ds4Session = std::ptr::null_mut();
         // SAFETY: engine valid; session is a valid out-ptr.
-        let rc = unsafe { ffi::ds4_session_create(&raw mut session, self.engine, ctx_size) };
+        //
+        // Wrapped because the C announces its DSpark capture configuration on
+        // stderr on every session creation — startup, `/clear`, each aside and
+        // sub-agent — which lands in the middle of the user's screen. Only that
+        // line is dropped; anything else the call prints still comes through.
+        let rc = crate::stderrline::without_ds4_chatter(|| unsafe {
+            ffi::ds4_session_create(&raw mut session, self.engine, ctx_size)
+        });
         if rc != 0 || session.is_null() {
             return Err(EngineError::new("failed to create session"));
         }
