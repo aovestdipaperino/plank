@@ -2100,7 +2100,15 @@ impl Agent<'_> {
             }
             SubSinkTarget::Null | SubSinkTarget::Stdout => None,
         };
-        let result = self.run_subagent_rounds();
+        // Its own console window, on the same restore-on-every-exit-path
+        // discipline as the status sink above. The guard is scoped to the
+        // rounds, so nesting works for free: guards stack LIFO, matching
+        // `fork_kv`.
+        let mirror = crate::debugmirror::open_subagent();
+        let result = {
+            let _active = mirror.activate();
+            self.run_subagent_rounds()
+        };
         self.tool_ctx.status_sink = parent_sink;
         result
     }
@@ -18976,6 +18984,22 @@ mod tests {
             "the cached engine served every dispatch"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// A serial sidechain must leave the thread routed back at the parent
+    /// window when it returns, however it returns — the parent's next turn
+    /// streams on this same thread.
+    #[test]
+    fn a_serial_sidechain_restores_the_parent_mirror_target() {
+        let sub = crate::debugmirror::open_subagent();
+        assert_ne!(sub.id(), crate::debugmirror::MirrorId::PARENT);
+        {
+            let _active = sub.activate();
+        }
+        assert_eq!(
+            crate::debugmirror::current_for_test(),
+            crate::debugmirror::MirrorId::PARENT
+        );
     }
 
     #[test]

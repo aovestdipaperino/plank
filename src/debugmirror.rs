@@ -74,7 +74,17 @@ static NEXT_ORDINAL: AtomicUsize = AtomicUsize::new(1);
 // Overridable only by tests, so they can point `reconcile` at a console
 // listening on an ephemeral port instead of the real 7878. Never touched by
 // production code.
-static CONTROL_PORT: AtomicU16 = AtomicU16::new(turbo_debug_client::CONTROL_PORT);
+// Zero under `cfg(test)`: nothing listens on port 0, so no test can dial out
+// to a console the developer has running for real work. Without this, any test
+// reaching `open_subagent` (every sub-agent sidechain test does, via
+// `run_subagent_loop`) would open junk windows in that live console on every
+// `cargo test` run. Tests that *want* a connection point this at their own
+// `fake_console` listener.
+static CONTROL_PORT: AtomicU16 = AtomicU16::new(if cfg!(test) {
+    0
+} else {
+    turbo_debug_client::CONTROL_PORT
+});
 
 /// The session name to hand the console at the next connection, kept as
 /// `Option` so "no session minted yet" is distinguishable from "named the
