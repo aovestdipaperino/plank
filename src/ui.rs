@@ -2256,6 +2256,10 @@ fn generate_pass(
     stream.set_tool_names(ctx.tool_names.clone());
     if !ctx.think_off && !engine.wants_structured() {
         stream.begin_in_think();
+        // Same guard as the parent paths: the local chat template pre-opens
+        // `<think>` without emitting the tag, and the console only ever sees
+        // bytes, so it needs the tag injected to reach the same state.
+        crate::debugmirror::begin_in_think();
     }
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
@@ -2283,6 +2287,10 @@ fn generate_pass(
                 if let EngineEvent::Text(t) = ev {
                     assistant_text.push_str(&t);
                     stream.push(&t);
+                    // Tee to whichever console window this thread is routed to
+                    // — a sub-agent's when a `SubagentMirror` guard is active,
+                    // the parent's otherwise.
+                    crate::debugmirror::push(&t);
                     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                     if stream.preflight_error().is_some() {
                         preflight_stop.store(true, Ordering::Relaxed);
@@ -2292,6 +2300,7 @@ fn generate_pass(
         )
         .map_err(|e| e.to_string())?;
     stream.finish();
+    crate::debugmirror::flush();
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stats.interrupted && preflight_error.is_none() {
         crate::interrupt::clear();
