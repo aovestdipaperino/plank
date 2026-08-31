@@ -1679,6 +1679,7 @@ impl Agent<'_> {
         // remote client attached to this session renders off it.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(sink);
+        stream.set_freeze_on_error(true);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
@@ -2249,6 +2250,7 @@ fn generate_pass(
     // this reports the engine actually generating rather than the session's.
     let _local = engine.is_local().then(crate::status::LocalPass::begin);
     let mut stream = StreamRenderer::new(sink);
+    stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
     stream.set_tool_names(ctx.tool_names.clone());
@@ -9979,6 +9981,7 @@ impl Agent<'_> {
         // every `/subagent` sidechain) actually runs through.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
+        stream.set_freeze_on_error(true);
         stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
         stream.set_show_thinking(crate::settings::active().ui.show_thinking);
         stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
@@ -10129,6 +10132,7 @@ impl Agent<'_> {
             // from its answer the way any other generation's is. Tool calls are
             // denied for an aside, so it needs none of the dispatch machinery.
             let mut aside_renderer = StreamRenderer::new(crate::worker::BtwSink(tx.clone()));
+            aside_renderer.set_freeze_on_error(true);
             aside_renderer.set_show_thinking(crate::settings::active().ui.show_thinking);
             if !matches!(self.think, crate::engine::ThinkMode::Off) {
                 aside_renderer.begin_in_think();

@@ -616,8 +616,12 @@ pub struct StreamRenderer<S> {
     /// inventing markup after `</think>`, not calling a tool inside it.
     pseudo_tool_fired: bool,
     post_think_gap: bool,
-    /// Error from DSML markup outside a valid stanza; freezes further output.
+    /// Error from DSML markup outside a valid stanza. Freezes further output
+    /// only when [`Self::set_freeze_on_error`] opted in.
     stream_error: Option<String>,
+    /// Whether an error freezes all further output (default false). See
+    /// [`Self::set_freeze_on_error`].
+    freeze_on_error: bool,
     last_output_newline: bool,
     /// Calls snapshotted at parser `Done`, surviving later parser resets.
     calls: Vec<ToolCall>,
@@ -682,6 +686,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             viz: ToolViz::default(),
             scan: DsmlScan::Between,
             in_think: false,
+            freeze_on_error: false,
             dsml_active: false,
             dsml_ignored: false,
             pending: Vec::new(),
@@ -741,6 +746,25 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// emitted to the sink.
     pub fn set_show_thinking(&mut self, show: bool) {
         self.show_thinking = show;
+    }
+
+    /// Sets whether a DSML error freezes all further output (default false).
+    ///
+    /// Opt-in, and deliberately so: freezing is only correct for a renderer
+    /// whose life is one generation pass. plank builds one per pass, so the
+    /// freeze keeps raw tool-call markup off the user's screen for the rest of
+    /// a doomed stanza and ends with the pass. A renderer that outlives a pass
+    /// -- the debug-console mirror keeps one per *connection*, fed a raw byte
+    /// tee with no pass boundaries in it -- would instead discard every byte of
+    /// every later pass, and the console window went dead after the first bad
+    /// stanza while plank itself recovered normally. Defaulting to false means
+    /// a consumer gets the safe behaviour without knowing this flag exists; the
+    /// one consumer that wants the freeze asks for it.
+    ///
+    /// Independent of error *reporting*: [`Self::finished`]'s `error` is set
+    /// either way.
+    pub fn set_freeze_on_error(&mut self, freeze: bool) {
+        self.freeze_on_error = freeze;
     }
 
     /// Sets whether tool calls emitted inside `<think></think>` are dispatched
@@ -1577,7 +1601,8 @@ impl<S: RenderSink> StreamRenderer<S> {
     }
 
     fn output_frozen(&self) -> bool {
-        self.stream_error.is_some() || self.parser.state() == DsmlState::Error
+        self.freeze_on_error
+            && (self.stream_error.is_some() || self.parser.state() == DsmlState::Error)
     }
 
     fn note_thinking_dsml_byte(&mut self, c: u8) {
@@ -2759,6 +2784,52 @@ mod tests {
         // ...but the raw stanza bytes never reach the screen.
         assert!(!vis.contains("tool_calls"), "{vis:?}");
         assert!(sr.finished().error.is_some());
+    }
+
+    /// A long-lived renderer -- the debug-console mirror, which keeps one
+    /// renderer per connection rather than one per generation pass -- must not
+    /// be killed by a DSML error. plank's own renderer is built fresh per pass,
+    /// so freezing output there is scoped and correct; the console's spans the
+    /// whole session, so the same freeze silently discarded every byte of every
+    /// later pass and the window went dead after the first bad stanza. Freezing
+    /// is therefore opt-in: the consumer that wants it asks for it.
+    #[test]
+    fn a_dsml_error_does_not_freeze_a_renderer_that_did_not_opt_in() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("junk \u{ff5c}DSML\u{ff5c} junk");
+        // What the next pass over the same connection looks like to the console.
+        sr.push("<think>reconsidering</think>Here is the corrected answer.");
+        sr.finish();
+        let vis = &sr.sink().visible;
+        assert!(
+            vis.contains("[invalid tool call: DSML markup outside a valid tool_calls block]"),
+            "the error line must still render: {vis:?}"
+        );
+        assert!(
+            vis.contains("Here is the corrected answer."),
+            "output after the error must still render: {vis:?}"
+        );
+        // The error is still reported -- only the output freeze is opt-in.
+        assert_eq!(
+            sr.finished().error,
+            Some("DSML markup outside a valid tool_calls block")
+        );
+    }
+
+    /// The freeze itself, opted in, still works: this is what plank relies on
+    /// so raw tool-call markup never spills to the user after a bad stanza.
+    #[test]
+    fn an_opted_in_renderer_still_freezes_on_a_dsml_error() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_freeze_on_error(true);
+        sr.push("junk \u{ff5c}DSML\u{ff5c} junk");
+        sr.push("<think>reconsidering</think>Here is the corrected answer.");
+        sr.finish();
+        let vis = &sr.sink().visible;
+        assert!(
+            !vis.contains("Here is the corrected answer."),
+            "frozen output must stay frozen: {vis:?}"
+        );
     }
 
     #[test]
