@@ -142,6 +142,15 @@ impl Drop for Scoped {
     }
 }
 
+/// Serializes every test that asserts on, or writes, the process-global
+/// `LAST`. It lives at module scope rather than inside `mod tests` because the
+/// compaction tests in [`crate::ui`] drive `Scoped` through the real
+/// `do_compact_notify`, so they write this global too and must serialize
+/// against the title tests — otherwise a compaction test landing between a
+/// title test's `set_text` and its read flakes it.
+#[cfg(test)]
+pub(crate) static TITLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,10 +211,6 @@ mod tests {
             .clone();
         assert_eq!(restored.as_deref(), Some("sentinel-title"));
     }
-
-    /// Serializes the tests in this module that assert on the process-global
-    /// `LAST`.
-    static TITLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn blank_busy_prompt_falls_back_to_loading() {

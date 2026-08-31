@@ -16856,6 +16856,9 @@ mod tests {
     // "Compaction interrupted; keeping the previous conversation state.").
     #[test]
     fn interrupted_compaction_keeps_the_previous_transcript() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-interrupt");
         let engine = ScriptedEngine {
             replies: vec!["a partial summ".to_string()],
@@ -16903,6 +16906,9 @@ mod tests {
     // swallowing normal compaction.
     #[test]
     fn uninterrupted_compaction_still_rebuilds() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-ok");
         let engine = ScriptedEngine {
             replies: vec!["durable state: the user asked about X".to_string()],
@@ -16942,6 +16948,9 @@ mod tests {
     // Both orchestrators must dispatch both events.
     #[test]
     fn compaction_hooks_fire_on_the_tui_path() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-hooks-tui");
         let engine = ScriptedEngine {
             replies: vec!["<summary>durable state</summary>".to_string()],
@@ -16986,6 +16995,9 @@ mod tests {
     // a failure that leaves the conversation alone.
     #[test]
     fn a_compaction_with_no_usable_summary_keeps_the_transcript() {
+        let _title_lock = crate::title::TITLE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = scratch_dir("compact-empty");
         // A reply that is *only* a discarded <analysis> block extracts to
         // nothing — the realistic shape of this failure, not just an empty
