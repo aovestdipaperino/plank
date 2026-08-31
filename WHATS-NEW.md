@@ -13,6 +13,28 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
+### 3.5.3
+
+🪟 **Every sub-agent streams into a console window of its own.** The debug-console
+mirror showed you the main session; a sub-agent's reasoning went nowhere. Now each
+one gets its own window, `plank:<session>:subagent-<n>`, numbered in the order they
+start. A fan-out's slots are readable side by side instead of interleaved into a
+single stream, and each window retires when its sub-agent finishes. Both shapes are
+covered: the serial sidechain a single `agent` call runs, and the concurrent
+fan-out of a whole block. Needs turbo-debug-console 0.2.1 or newer.
+
+🧊 **A malformed tool call no longer freezes the debug console.** One bad DSML
+stanza used to kill the window for the rest of the session: it rendered nothing
+further while plank itself recovered, fed the error back to the model and carried
+on. The freeze was right for plank, whose renderer lives for one pass, and wrong
+for a console window, whose renderer lives for the whole session — it is now
+opt-in, so the window keeps rendering after the error line.
+
+🔖 **`--version` reports the commit it was built from.** `plank --version` prints
+`plank v3.5.3 BETA (971c5fba3178)`, with `-dirty` appended when the build had
+uncommitted changes, so a bug report names an exact build rather than a version
+that shipped many times.
+
 ### 3.5.1
 
 📄 **The status footer counts what you have changed.** The TUI's location row

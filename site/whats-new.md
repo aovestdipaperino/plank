@@ -7,6 +7,28 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**Every sub-agent gets a console window of its own.** Delegating work to
+sub-agents made plank quieter and less legible at the same time: the parent
+told you it had handed off, and everything after that happened somewhere you
+could not see. The debug console now gives each sub-agent its own window,
+titled `plank:<session>:subagent-<n>` and numbered in the order they start.
+
+![Four turbo-debug-console windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer](/assets/subagent-consoles.png)
+
+When a block of `agent` calls fans out, the slots run concurrently and you can
+read them side by side — above, two sub-agents working the same question in
+different formats, each with its own code and its own conclusion, while the
+parent window collects both into one answer. Each window retires when its
+sub-agent finishes. A single `agent` call gets a window too, so the serial case
+is no darker than the parallel one.
+
+While fixing that, one long-standing annoyance went with it: a malformed tool
+call used to freeze a console window for the rest of the session, so it sat
+there showing nothing while plank quietly recovered and carried on. It now
+prints the error and keeps going. Both need
+[turbo-debug-console](https://github.com/aovestdipaperino/turbo-debug-console)
+0.2.1 or newer.
+
 **The footer counts what you have changed.** The TUI's top row has always told
 you which tree you are in — directory and branch, held still while everything
 else churns. It now also tells you what you have done to it: `📄 3 · +128 -41`,

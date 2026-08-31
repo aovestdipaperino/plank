@@ -138,6 +138,28 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>Every sub-agent gets a console window of its own.</strong>
+Delegating work to sub-agents made plank quieter and less legible at the
+same time: the parent told you it had handed off, and everything after
+that happened somewhere you could not see. The debug console now gives
+each sub-agent its own window, titled
+<code>plank:&lt;session&gt;:subagent-&lt;n&gt;</code> and numbered in
+the order they start.</p>
+<p><img src="/assets/subagent-consoles.png"
+alt="Four turbo-debug-console windows tiled: the parent session plank:sassy-washington bottom-left summarising both results, and subagent-1 and subagent-2 on the right, each streaming its own Python and its own answer" /></p>
+<p>When a block of <code>agent</code> calls fans out, the slots run
+concurrently and you can read them side by side — above, two sub-agents
+working the same question in different formats, each with its own code
+and its own conclusion, while the parent window collects both into one
+answer. Each window retires when its sub-agent finishes. A single
+<code>agent</code> call gets a window too, so the serial case is no
+darker than the parallel one.</p>
+<p>While fixing that, one long-standing annoyance went with it: a
+malformed tool call used to freeze a console window for the rest of the
+session, so it sat there showing nothing while plank quietly recovered
+and carried on. It now prints the error and keeps going. Both need <a
+href="https://github.com/aovestdipaperino/turbo-debug-console">turbo-debug-console</a>
+0.2.1 or newer.</p>
 <p><strong>The footer counts what you have changed.</strong> The TUI's
 top row has always told you which tree you are in — directory and
 branch, held still while everything else churns. It now also tells you
