@@ -56,10 +56,17 @@ pub const THINK_MARK: &str = "🧠";
 /// it here rather than letting it be absorbed into the branch name.
 pub const GIT_STAT_MARK: &str = "📄";
 
-/// Bright green (256-color 10), the added-lines count in the git stat segment.
-pub const GIT_ADD_COLOR: u8 = 10;
-/// Bright red (256-color 9), the deleted-lines count in the git stat segment.
-pub const GIT_DEL_COLOR: u8 = 9;
+/// The added-lines count in the git stat segment: pale mint.
+///
+/// 256-color 158 (`#afffd7`), the nearest palette entry to the chosen
+/// `#c3f8e8` — a palette index rather than truecolor so the segment matches
+/// the rest of the bar, which is indexed throughout. Indices 16 and up are
+/// fixed by the xterm cube, so unlike 0-15 they are not repainted by the
+/// user's theme.
+pub const GIT_ADD_COLOR: u8 = 158;
+/// The deleted-lines count: pale magenta, 256-color 212 (`#ff87d7`), the
+/// nearest entry to the chosen `#ee88db`. See [`GIT_ADD_COLOR`].
+pub const GIT_DEL_COLOR: u8 = 212;
 
 /// Working-tree change summary: files touched, lines added, lines deleted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

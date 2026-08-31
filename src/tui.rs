@@ -3672,9 +3672,9 @@ fn push_dir_prefix(
     }
 }
 
-/// Pushes the git stat segment (`📄 3 · +12 -4`) with the added count in bright
-/// green and the deleted count in bright red; the glyph, file count and center
-/// dot stay in the bar's own style.
+/// Pushes the git stat segment (`📄 3 · +12 -4`) with the added count in mint
+/// and the deleted count in magenta; the glyph, file count and center dot stay
+/// in the bar's own style.
 fn push_git_stat(spans: &mut Vec<Span<'static>>, stat: &str, base: Style) {
     let add = base
         .fg(Color::Indexed(crate::status::GIT_ADD_COLOR))
