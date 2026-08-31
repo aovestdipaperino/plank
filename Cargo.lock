@@ -1181,7 +1181,7 @@ checksum = "de654785b3d88c9d41972491d8bc7379d1d0e32ecd3e0ecc1baa106910477acf"
 dependencies = [
  "crossterm",
  "image",
- "logo-art",
+ "logo-art 0.2.1",
 ]
 
 [[package]]
@@ -2934,6 +2934,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "logo-art"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ded0f0a7ac58f2ad7ae44edabbce6969c28963cc00cdc71adf59e17342d12e9e"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "loop9"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3797,7 +3806,7 @@ dependencies = [
  "image",
  "libc",
  "liteparse",
- "logo-art",
+ "logo-art 0.3.0",
  "notify-rust",
  "nucleo-matcher",
  "obscura",

@@ -7136,7 +7136,7 @@ impl Agent<'_> {
             crate::logo::version_label(),
             status::format_ctx_size(self.engine.ctx_size())
         );
-        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH * 3 / 4));
+        let art = tui::ansi_to_lines(&crate::logo::art(crate::logo::DEFAULT_WIDTH));
         for line in Self::masthead(art, version) {
             log.push_spans(line.spans);
         }

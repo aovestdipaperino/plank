@@ -93,7 +93,7 @@ ring = "0.17"
 # reference tool produces by default. Same RustCrypto family as `sha2`, already
 # present.
 blake2 = "0.10"
-logo-art = "0.2"
+logo-art = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Fork of ratatui-markdown v0.3.6 (MIT OR Apache-2.0, cut at tag v0.3.6 before
 # the project relicensed to SySL-1.0) carrying one parser fix: a fenced code

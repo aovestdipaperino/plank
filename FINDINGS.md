@@ -1696,3 +1696,20 @@ with M8/M9 so it happens once.
   a symlink to a secret and asserts the secret's *contents* never appear
   anywhere under the destination — asserting the symlink itself is absent is
   not enough, because by then it never existed there to begin with.
+- **The startup logo's pixel is the terminal cell, and a cell can hold more than
+  two pixels.** `logo-art` half-blocks encode 1x2 samples per cell, so 36
+  columns of banner cost 27 rows and there is no way to shrink it without
+  losing the picture. The other Unicode block-element families subdivide the
+  same two-color cell further — quadrants 2x2, sextants 2x3, octants 2x4 — and
+  because a cell is about twice as tall as it is wide, the octant grid is
+  square: `logo-art` 0.3's `Cell::Octant` at 18 columns is *the same sample
+  count* as half-blocks at 36, in a quarter of the screen area. That is why
+  `logo::DEFAULT_WIDTH` is 18 and the TUI masthead no longer scales it down.
+  Two traps. The dedicated Unicode ranges (`U+1FB00` sextants, `U+1CD00`
+  octants) deliberately omit every mask an older character already draws, so a
+  table indexed by coverage mask has to fall back to `▀▄▌▐` and friends at 26
+  of 256 octant slots — including `U+1FBE6`/`U+1FBE7` for the two middle-half
+  masks, which are easy to miss. And octants are Unicode 16 (2024): Kitty and
+  Ghostty rasterize the block ranges themselves and are exact, but a terminal
+  that defers to the font draws tofu, so `logo::cell()` only hands octants to
+  terminals known to draw them and takes `PLANK_LOGO_CELL` as an escape hatch.
