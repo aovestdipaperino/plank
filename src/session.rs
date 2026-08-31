@@ -589,6 +589,17 @@ impl SessionStore {
                 crate::kvmeta::KvRole::System
             } else if name.starts_with(&format!("{PROJECT_STEM}-")) {
                 crate::kvmeta::KvRole::Project
+            } else if name.contains(".rung-") {
+                // A rung is `{id}.rung-{N}.kv_raw`; the session payload
+                // `{id}.kv_raw` never contains `.rung-`, so this cannot
+                // misclassify a plain session body. A missing or stale
+                // sidecar is exactly the crash-orphan case the rung
+                // backstop TTL and first-to-evict ordering exist for
+                // (see `RUNG_BACKSTOP_SECS`); falling through to
+                // `Session` here would give an orphaned rung the 14-day
+                // session TTL and sort it last under the byte budget
+                // instead of first.
+                crate::kvmeta::KvRole::Rung
             } else {
                 crate::kvmeta::KvRole::Session
             };
@@ -2576,6 +2587,56 @@ mod tests {
             ],
             "one node per .kv_raw body, role and fingerprint inferred from the name"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rung_with_no_sidecar_still_classifies_as_rung() {
+        // The crash-orphan case: a process killed mid-session leaves a
+        // `.rung-N.kv_raw` body with no sidecar (or a stale one from an
+        // older `META_VERSION`). `kv_node_at` must still recognise it as
+        // `KvRole::Rung` from its file name alone, so it gets the 1-day
+        // rung backstop TTL and evicts before a session payload rather
+        // than inheriting the 14-day session TTL and sorting last.
+        let dir = temp_dir("rung-no-sidecar");
+        let store = SessionStore::open(&dir).unwrap();
+        std::fs::write(store.rung_path("zany-turing", 3), vec![0u8; 300]).unwrap();
+        // No sidecar written for the rung: this is the exact scenario a
+        // crash or a `META_VERSION` bump leaves behind.
+
+        let nodes = store.kv_nodes();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(
+            nodes[0].role,
+            crate::kvmeta::KvRole::Rung,
+            "a sidecar-less rung must classify as Rung, not fall through to Session"
+        );
+
+        // It must also win the TTL and eviction-order consequences that
+        // follow from that role: rung TTL, not session TTL, and
+        // evict_rank first, not last, under the byte budget.
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 14 * 86_400,
+            ttl_tier_secs: 14 * 86_400,
+            ttl_rung_secs: 86_400,
+            max_bytes: 300, // exactly the session payload's size: evicting the rung alone must satisfy it
+        };
+        let mut older_session = crate::kvmeta::KvMeta::synthesized(
+            crate::kvmeta::KvRole::Session,
+            "cheeky-bell",
+            300,
+            0,
+        );
+        older_session.last_used = 0;
+        let mut rung_node = nodes[0].clone();
+        rung_node.last_used = 1_000; // more recently touched than the session payload
+        let plan = crate::kvgc::plan_sweep(&[older_session, rung_node], &[], &policy, 2_000);
+        assert_eq!(
+            plan.doomed,
+            vec![1],
+            "the rung must be evicted ahead of the older session payload, not after it"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

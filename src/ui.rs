@@ -3016,7 +3016,14 @@ impl Agent<'_> {
             });
             return None;
         }
-        self.restore_rung_below(edit);
+        let restored = self.restore_rung_below(edit);
+        if restored.is_none() && covered > 0 {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "microcompact rung restore MISSED: expected rung to cover {covered} tokens at edit span {edit}, restore did not happen"
+                )
+            });
+        }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         self.last_ctx_used = 0;
         Some(cleared)
@@ -4589,6 +4596,15 @@ the original is frozen and listed in /tree"
         if self.session.id.is_empty() {
             return None;
         }
+        // Same ordering note as `push_rung`, on the payload side: on a turn
+        // where the opportunistic microcompact fired, `cache` here is the
+        // engine's KV for the RESTORED rung's shorter prefix, but the
+        // fingerprint below is computed from `self.session`, i.e. the
+        // POST-rewrite transcript. So the blob's bytes and its signature
+        // describe two different token spans. Safe on read-back for the same
+        // reason: `set_kv` restores the blob's own span buffer, and
+        // `ds4_session_common_prefix` decides reuse by real token comparison,
+        // not by trusting the fingerprint's span. Recorded, not restructured.
         let key = crate::session::KvKey::Session {
             id: self.session.id.clone(),
             fp: self.payload_fingerprint_for(&self.session),
