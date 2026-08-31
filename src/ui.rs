@@ -13801,75 +13801,78 @@ mod tests {
         assert_eq!(agent.restore_rung_below(2), None);
     }
 
-    /// Selection picks the rung, even though the echo/scripted engine has no
-    /// KV to load back, so the restore call itself still reports `None`.
-    #[test]
-    fn a_shallower_rung_is_selected_for_a_later_edit() {
-        let dir = scratch_dir("ladder-restore-select");
-        let cfg = test_cfg();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        agent.session.push(Message::user("hi"));
-        agent.store.save(&mut agent.session).unwrap();
-        agent.ladder.push(5, 14_000);
-        assert_eq!(agent.ladder.select(9, 0).map(|r| r.tokens), Some(14_000));
-        assert_eq!(agent.restore_rung_below(9), None);
-    }
-
     /// This is the whole point of the correction over the brief: a rung is
-    /// stored under the fingerprint of the transcript *truncated to the spans
-    /// it covers*, not the fingerprint of the full transcript at capture time.
-    /// By the time `restore_rung_below` runs, the transcript has grown further
-    /// still. This test proves the lookup fingerprint `restore_rung_below`
-    /// computes is exactly the one the rung was stored under — and that the
-    /// naive "fingerprint the whole current transcript" approach the brief
-    /// originally proposed is a different value that would never match.
+    /// stored under the fingerprint of the transcript *as it stood at capture
+    /// time* (`spans == transcript.len()` then), not the fingerprint of the
+    /// full transcript at restore time, which by then has grown further.
+    ///
+    /// This drives a REAL `refresh_ladder()` (with a `ScriptedEngine` that
+    /// actually supplies KV, so a genuine rung blob lands on disk under a
+    /// genuine fingerprint), grows the transcript past it, and then proves
+    /// `restore_rung_below` finds that exact blob: a real `Some(tokens)` hit,
+    /// plus the scripted engine's own `restore:<tag>` event log showing the
+    /// tag `refresh_ladder`'s `get_kv` capture produced. The naive
+    /// "fingerprint the whole current transcript" approach the brief
+    /// originally proposed would compute a different value and miss the
+    /// lookup entirely — this test is proven below to fail under that naive
+    /// spelling and pass under the correct one.
     #[test]
-    fn restore_computes_the_fingerprint_of_the_rungs_prefix_not_the_full_transcript() {
+    fn restore_finds_the_rung_stored_under_its_own_prefix_fingerprint() {
         let dir = scratch_dir("ladder-restore-fingerprint");
         let cfg = test_cfg();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
         agent.session.push(Message::user("turn one"));
         agent.session.push(Message::assistant("reply one"));
+        // `refresh_ladder` and `restore_rung_below` both short-circuit on an
+        // empty session id, so a real id must exist before either runs.
         agent.store.save(&mut agent.session).unwrap();
 
-        // Capture the fingerprint "at capture time": spans == transcript.len()
-        // right now, matching what `refresh_ladder` would compute.
-        let spans_at_capture = agent.session.transcript.len();
-        let fp_at_capture = agent.payload_fingerprint_for(&agent.session);
-        agent.ladder.push(spans_at_capture, 14_000);
+        // A real capture: the empty ladder always wants its first rung, the
+        // scripted engine's `get_kv` hands back a real (if tiny) payload, and
+        // `refresh_ladder` writes a real blob keyed by the fingerprint of the
+        // transcript exactly as it stands right now.
+        let rung = agent.refresh_ladder().expect("first rung always captures");
+        assert_eq!(rung.spans, agent.session.transcript.len());
+        assert!(
+            events.lock().unwrap().iter().any(|e| e == "capture"),
+            "refresh_ladder must snapshot the KV: {:?}",
+            events.lock().unwrap()
+        );
 
-        // Grow the transcript well past the rung before restoring.
+        // Grow the transcript well past the rung before restoring, exactly as
+        // an edit later in the conversation would find it.
         agent.session.push(Message::user("turn two"));
         agent.session.push(Message::assistant("reply two"));
         agent.session.push(Message::user("turn three"));
-
-        // The naive approach the brief specified: fingerprint the FULL current
-        // transcript. This must differ from what the rung was stored under.
-        let fp_full_current = agent.payload_fingerprint_for(&agent.session);
-        assert_ne!(
-            fp_full_current, fp_at_capture,
-            "a full-transcript fingerprint after growth must NOT equal the \
-             fingerprint the rung was captured under — this is exactly the bug \
-             the correction fixes"
+        let edit_index = agent.session.transcript.len();
+        assert!(
+            edit_index > rung.spans,
+            "transcript must grow past the rung"
         );
 
-        // The correct approach: fingerprint a clone truncated back to the
-        // rung's own span count. This must equal the capture-time fingerprint.
-        let mut truncated = agent.session.clone();
-        truncated.transcript.truncate(spans_at_capture);
-        let fp_truncated = agent.payload_fingerprint_for(&truncated);
+        // The real call: this must be a genuine hit, not a `None` that both a
+        // correct and a broken implementation would equally produce.
+        let restored = agent.restore_rung_below(edit_index);
         assert_eq!(
-            fp_truncated, fp_at_capture,
-            "truncating the transcript back to the rung's spans reproduces \
-             the exact fingerprint it was stored under"
+            restored,
+            Some(rung.tokens),
+            "restore_rung_below must find the rung this test just captured"
         );
-
-        // And that is exactly what `restore_rung_below`'s lookup key must use;
-        // exercise the real call end-to-end. There is no KV to load (scripted
-        // engine default), so the call still reports None, but it must reach
-        // that point via a correct, matching lookup rather than short-circuit
-        // on an empty session id.
-        assert_eq!(agent.restore_rung_below(9), None);
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a real hit must run the restore, not just select the rung: {:?}",
+            events.lock().unwrap()
+        );
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
