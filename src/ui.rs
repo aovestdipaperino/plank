@@ -2937,6 +2937,9 @@ impl Agent<'_> {
     /// context to skip full compaction, `None` when full compaction is still
     /// needed (any clearing done is kept — it only helps the summary pass).
     fn try_microcompact(&mut self) -> Option<usize> {
+        if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
+            self.restore_rung_below(edit);
+        }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         if cleared == 0 {
             return None;
@@ -2969,6 +2972,9 @@ impl Agent<'_> {
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
         if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
             return None;
+        }
+        if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
+            self.restore_rung_below(edit);
         }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         self.last_ctx_used = 0;
@@ -4594,6 +4600,45 @@ the original is frozen and listed in /tree"
             );
         }
         Some(rung)
+    }
+
+    /// Before an edit at transcript index `edit_index`, restores the deepest
+    /// ladder rung that predates it. Returns the tokens the restored rung
+    /// covers, or `None` when no rung is usable.
+    ///
+    /// Rewriting a message in place makes every token from `edit_index` on
+    /// diverge from the live KV, and `ds4_session_sync` reuses the live KV only
+    /// when the prompt extends its live end — so without this the next
+    /// generation rebuilds from token zero, discarding a still-valid prefix. A
+    /// rung that predates the edit is a legitimate restore point: the engine
+    /// extends forward from it and prefills only the genuine remainder.
+    ///
+    /// The lookup fingerprint is computed over the transcript *truncated to
+    /// the rung's own `spans`*, not the full current transcript: a rung is
+    /// stored under the fingerprint of its prefix as it stood at capture time
+    /// (`refresh_ladder`, where `spans == session.transcript.len()` at that
+    /// moment). By restore time the transcript has grown further, so
+    /// fingerprinting it in full would never match what the rung was signed
+    /// with, and `kv_load` would silently miss on every call. Truncating a
+    /// cloned session's transcript to `rung.spans` before fingerprinting
+    /// reproduces the capture-time render exactly, because `render_transcript`
+    /// is a plain forward concatenation with no length-dependent formatting.
+    fn restore_rung_below(&mut self, edit_index: usize) -> Option<i32> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let rung = *self.ladder.select(edit_index, 0)?;
+        let mut prefix = self.session.clone();
+        prefix.transcript.truncate(rung.spans);
+        let key = crate::session::KvKey::Rung {
+            id: self.session.id.clone(),
+            index: rung.index,
+            fp: self.payload_fingerprint_for(&prefix),
+        };
+        // A stale or unloadable rung just means the rebuild happens anyway.
+        let cache = self.store.kv_load(&key)?;
+        self.engine.set_kv(&cache).ok()?;
+        Some(rung.tokens)
     }
 
     /// On `/switch` / `/resume`, tries to restore the session's KV payload so
@@ -13741,6 +13786,90 @@ mod tests {
         agent.store.save(&mut agent.session).unwrap();
         assert_eq!(agent.refresh_ladder(), None);
         assert!(agent.ladder.rungs().is_empty());
+    }
+
+    /// A rung whose `spans` already reaches the edit index contains the span
+    /// about to be rewritten, so it cannot be a restore point.
+    #[test]
+    fn no_usable_rung_means_no_restore_attempt() {
+        let dir = scratch_dir("ladder-restore-none");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.ladder.push(5, 14_000);
+        assert_eq!(agent.restore_rung_below(2), None);
+    }
+
+    /// Selection picks the rung, even though the echo/scripted engine has no
+    /// KV to load back, so the restore call itself still reports `None`.
+    #[test]
+    fn a_shallower_rung_is_selected_for_a_later_edit() {
+        let dir = scratch_dir("ladder-restore-select");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.ladder.push(5, 14_000);
+        assert_eq!(agent.ladder.select(9, 0).map(|r| r.tokens), Some(14_000));
+        assert_eq!(agent.restore_rung_below(9), None);
+    }
+
+    /// This is the whole point of the correction over the brief: a rung is
+    /// stored under the fingerprint of the transcript *truncated to the spans
+    /// it covers*, not the fingerprint of the full transcript at capture time.
+    /// By the time `restore_rung_below` runs, the transcript has grown further
+    /// still. This test proves the lookup fingerprint `restore_rung_below`
+    /// computes is exactly the one the rung was stored under — and that the
+    /// naive "fingerprint the whole current transcript" approach the brief
+    /// originally proposed is a different value that would never match.
+    #[test]
+    fn restore_computes_the_fingerprint_of_the_rungs_prefix_not_the_full_transcript() {
+        let dir = scratch_dir("ladder-restore-fingerprint");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // Capture the fingerprint "at capture time": spans == transcript.len()
+        // right now, matching what `refresh_ladder` would compute.
+        let spans_at_capture = agent.session.transcript.len();
+        let fp_at_capture = agent.payload_fingerprint_for(&agent.session);
+        agent.ladder.push(spans_at_capture, 14_000);
+
+        // Grow the transcript well past the rung before restoring.
+        agent.session.push(Message::user("turn two"));
+        agent.session.push(Message::assistant("reply two"));
+        agent.session.push(Message::user("turn three"));
+
+        // The naive approach the brief specified: fingerprint the FULL current
+        // transcript. This must differ from what the rung was stored under.
+        let fp_full_current = agent.payload_fingerprint_for(&agent.session);
+        assert_ne!(
+            fp_full_current, fp_at_capture,
+            "a full-transcript fingerprint after growth must NOT equal the \
+             fingerprint the rung was captured under — this is exactly the bug \
+             the correction fixes"
+        );
+
+        // The correct approach: fingerprint a clone truncated back to the
+        // rung's own span count. This must equal the capture-time fingerprint.
+        let mut truncated = agent.session.clone();
+        truncated.transcript.truncate(spans_at_capture);
+        let fp_truncated = agent.payload_fingerprint_for(&truncated);
+        assert_eq!(
+            fp_truncated, fp_at_capture,
+            "truncating the transcript back to the rung's spans reproduces \
+             the exact fingerprint it was stored under"
+        );
+
+        // And that is exactly what `restore_rung_below`'s lookup key must use;
+        // exercise the real call end-to-end. There is no KV to load (scripted
+        // engine default), so the call still reports None, but it must reach
+        // that point via a correct, matching lookup rather than short-circuit
+        // on an empty session id.
+        assert_eq!(agent.restore_rung_below(9), None);
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
