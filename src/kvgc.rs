@@ -103,6 +103,18 @@ impl SweepPolicy {
     }
 }
 
+/// Phase-2 eviction priority: lower goes first.
+///
+/// Rungs are the one role that is cheap to recreate and dead the moment its
+/// session's process is gone, so they are always evicted before anything a
+/// later run would actually miss.
+fn evict_rank(role: KvRole) -> u8 {
+    match role {
+        KvRole::Rung => 0,
+        KvRole::System | KvRole::Project | KvRole::Session => 1,
+    }
+}
+
 /// What a sweep would remove.
 #[derive(Debug, Clone, Default)]
 pub struct SweepPlan {
@@ -193,12 +205,21 @@ pub fn plan_sweep(nodes: &[KvMeta], active: &[&str], policy: &SweepPolicy, now: 
         })
         .map(|(i, _)| i)
         .collect();
-    // Least-recently-used first, ties broken by fingerprint so the order is
-    // total and reproducible.
+    // Rungs first, then least-recently-used, ties broken by fingerprint so the
+    // order is total and reproducible.
+    //
+    // Role leads because `last_used` alone gets this exactly backwards: a rung
+    // is written at end of turn, so it sorts to the *end* of an LRU order and
+    // the sweep deletes older session payloads and other projects' tier
+    // checkpoints first, keeping up to `LADDER_MAX_RUNGS` blobs belonging to a
+    // session that may no longer exist. A rung is the most disposable blob in
+    // the cache: recapturable in ~0.4s and worthless once its process is gone,
+    // where a payload is a session's only resume point and a tier checkpoint is
+    // shared by every session of a project.
     candidates.sort_by(|&a, &b| {
-        nodes[a]
-            .last_used
-            .cmp(&nodes[b].last_used)
+        evict_rank(nodes[a].role)
+            .cmp(&evict_rank(nodes[b].role))
+            .then_with(|| nodes[a].last_used.cmp(&nodes[b].last_used))
             .then_with(|| nodes[a].fingerprint.cmp(&nodes[b].fingerprint))
     });
     for i in candidates {
@@ -511,6 +532,37 @@ mod tests {
         let plan = plan_sweep(&nodes, &[], &p, NOW);
         let gone = doomed_fps(&plan, &nodes);
         assert_eq!(gone, vec!["dead-child".to_owned(), "parent".to_owned()]);
+    }
+
+    /// Under a byte budget a rung goes before anything else, no matter how
+    /// recently it was written.
+    ///
+    /// `last_used` alone got this exactly backwards: a rung is captured at end
+    /// of turn, so it sorted to the end of the LRU order and the sweep deleted
+    /// older session payloads (a session's only resume point) and other
+    /// projects' tier checkpoints first, while keeping up to three rungs
+    /// belonging to a session that may no longer exist.
+    #[test]
+    fn a_rung_is_evicted_before_an_older_session_payload() {
+        // 200 bytes against a 100-byte budget: exactly one node goes.
+        let nodes = vec![
+            node(KvRole::Session, "old-payload", None, 50),
+            node(KvRole::Rung, "fresh-rung", None, 0),
+        ];
+        let plan = plan_sweep(&nodes, &[], &budget_only(100), NOW);
+        assert_eq!(doomed_fps(&plan, &nodes), vec!["fresh-rung".to_owned()]);
+    }
+
+    /// Within a role the order is still least-recently-used, so two rungs are
+    /// ranked against each other exactly as before.
+    #[test]
+    fn last_used_still_orders_rungs_against_each_other() {
+        let nodes = vec![
+            node(KvRole::Rung, "newer-rung", None, 0),
+            node(KvRole::Rung, "older-rung", None, 30),
+        ];
+        let plan = plan_sweep(&nodes, &[], &budget_only(100), NOW);
+        assert_eq!(doomed_fps(&plan, &nodes), vec!["older-rung".to_owned()]);
     }
 
     #[test]
