@@ -55,6 +55,7 @@ pub enum FieldId {
     ToolsRecall,
     ToolsFanout,
     ToolsRunCode,
+    ContextMicrocompact,
 }
 
 /// The editing shape of a field, which decides how a key press mutates it.
@@ -334,6 +335,13 @@ pub static FIELDS: &[Field] = &[
         "offer the run_code tool to the model",
         Kind::Bool,
     ),
+    f(
+        FieldId::ContextMicrocompact,
+        "context",
+        "microcompact",
+        "clear old tool-result bodies to reclaim context",
+        Kind::Bool,
+    ),
 ];
 
 const fn f(
@@ -410,6 +418,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::ToolsRecall => s.tools.recall.to_string(),
         FieldId::ToolsFanout => s.tools.fanout.to_string(),
         FieldId::ToolsRunCode => s.tools.run_code.to_string(),
+        FieldId::ContextMicrocompact => s.context.microcompact.to_string(),
     }
 }
 
@@ -446,6 +455,7 @@ fn toggle(s: &mut Settings, id: FieldId) {
         FieldId::UiReducedMotion => s.ui.reduced_motion = !s.ui.reduced_motion,
         FieldId::UiEasterEggs => s.ui.easter_eggs = !s.ui.easter_eggs,
         FieldId::UiBuiltinEditor => s.ui.builtin_editor = !s.ui.builtin_editor,
+        FieldId::ContextMicrocompact => s.context.microcompact = !s.context.microcompact,
         FieldId::SafetySandbox => s.safety.sandbox = cycle_tri(s.safety.sandbox),
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = cycle_tri(s.safety.btw_suspend),
         // `UiScreensaverFace` lands here deliberately: its cycle spans the
@@ -573,7 +583,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         | FieldId::ToolsRepeatAdvisory
         | FieldId::ToolsRecall
         | FieldId::ToolsFanout
-        | FieldId::ToolsRunCode => {
+        | FieldId::ToolsRunCode
+        | FieldId::ContextMicrocompact => {
             let b = parse_bool(raw)?;
             set_bool(s, id, b);
         }
@@ -600,6 +611,7 @@ fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
         FieldId::ToolsRecall => s.tools.recall = b,
         FieldId::ToolsFanout => s.tools.fanout = b,
         FieldId::ToolsRunCode => s.tools.run_code = b,
+        FieldId::ContextMicrocompact => s.context.microcompact = b,
         _ => {}
     }
 }
@@ -1554,6 +1566,15 @@ mod tests {
     }
 
     #[test]
+    fn context_microcompact_is_a_known_config_key() {
+        let mut s = Settings::default();
+        assert!(s.context.microcompact, "on by default");
+        let field = set_from_path(&mut s, "context.microcompact", "false").unwrap();
+        assert_eq!(field.id, FieldId::ContextMicrocompact);
+        assert!(!s.context.microcompact);
+    }
+
+    #[test]
     fn crt_off_field_toggles() {
         let mut form = ConfigForm::new(Settings::default());
         // Cursor starts at engine.model; walk to ui.crtOff.
@@ -1581,7 +1602,7 @@ mod tests {
         assert_eq!(
             headers,
             [
-                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools"
+                "engine", "ui", "safety", "mcp", "ask", "agents", "git", "tools", "context"
             ]
         );
         assert_eq!(rows.iter().filter(|r| !r.header).count(), FIELDS.len());

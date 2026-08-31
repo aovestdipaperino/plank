@@ -36,7 +36,8 @@
 //!   "mcp":    { "timeoutSecs": 30 },
 //!   "ask":    { "maxOptions": 7 },
 //!   "agents": { "autoRoute": true, "maxParallel": 4 },
-//!   "git":    { "signCommits": true }
+//!   "git":    { "signCommits": true },
+//!   "context": { "microcompact": true }
 //! }
 //! ```
 //!
@@ -383,6 +384,8 @@ pub struct Settings {
     pub worktree: WorktreeSettings,
     /// KV-cache retention.
     pub kvcache: KvCacheSettings,
+    /// Transcript-shrinking behaviour short of full compaction.
+    pub context: ContextSettings,
     /// Git conventions the model is told to follow.
     pub git: GitSettings,
     /// Tool-dispatch tuning: loop guards and call deadlines.
@@ -415,6 +418,24 @@ pub struct WorktreeSettings {
     /// cannot overwrite each other's edits. Off by default: it costs a checkout
     /// per agent, and the agent's work then has to be merged back.
     pub isolate_agents: bool,
+}
+
+/// `context` block: transcript-shrinking behaviour short of full compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSettings {
+    /// Whether micro-compaction (clearing old tool-result bodies in place)
+    /// runs at all. On by default. Because it rewrites transcript text in
+    /// place, it invalidates the engine's KV cache from that point on, which
+    /// a snapshot ladder mitigates but cannot eliminate; turning this off
+    /// stops every in-place rewrite, at the cost of relying on full
+    /// summary-based compaction alone to reclaim context under pressure.
+    pub microcompact: bool,
+}
+
+impl Default for ContextSettings {
+    fn default() -> Self {
+        Self { microcompact: true }
+    }
 }
 
 /// `kvcache` block: retention for persisted KV blobs.
@@ -733,6 +754,11 @@ impl Settings {
         if let Some(v) = num::<u64>(kvcache, "maxBytes") {
             self.kvcache.max_bytes = v;
             self.note("kvcache.maxBytes", origin);
+        }
+
+        if let Some(v) = boolean(root.get("context"), "microcompact") {
+            self.context.microcompact = v;
+            self.note("context.microcompact", origin);
         }
 
         if let Some(v) = boolean(root.get("git"), "signCommits") {
@@ -1165,6 +1191,11 @@ impl Settings {
             section(&mut root, "git"),
             "signCommits",
             Json::Bool(self.git.sign_commits),
+        );
+        upsert(
+            section(&mut root, "context"),
+            "microcompact",
+            Json::Bool(self.context.microcompact),
         );
 
         let mut out = String::new();
@@ -1806,6 +1837,39 @@ mod tests {
         let mut s2 = Settings::default();
         s2.overlay(r#"{"engine":{"thinkingToolCalls":"nope"}}"#);
         assert!(!s2.engine.thinking_tool_calls);
+    }
+
+    #[test]
+    fn microcompact_defaults_true_and_overlays_false() {
+        let s = Settings::default();
+        assert!(s.context.microcompact, "on by default");
+        let mut s2 = Settings::default();
+        s2.overlay(r#"{"context":{"microcompact":false}}"#);
+        assert!(!s2.context.microcompact);
+        // A non-boolean value is ignored rather than flipping the default.
+        let mut s3 = Settings::default();
+        s3.overlay(r#"{"context":{"microcompact":"nope"}}"#);
+        assert!(s3.context.microcompact);
+    }
+
+    #[test]
+    fn microcompact_round_trips_through_save_to() {
+        let dir = std::env::temp_dir().join(format!("plank-microcompact-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        let mut s = Settings::default();
+        s.context.microcompact = false;
+        s.save_to(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"microcompact\": false"), "{text}");
+
+        let mut reloaded = Settings::default();
+        reloaded.overlay(&text);
+        assert!(!reloaded.context.microcompact);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

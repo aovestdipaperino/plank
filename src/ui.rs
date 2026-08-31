@@ -2953,6 +2953,9 @@ impl Agent<'_> {
     /// context to skip full compaction, `None` when full compaction is still
     /// needed (any clearing done is kept — it only helps the summary pass).
     fn try_microcompact(&mut self) -> Option<usize> {
+        if !crate::settings::active().context.microcompact {
+            return None;
+        }
         if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
             self.restore_rung_below(edit);
         }
@@ -2985,6 +2988,9 @@ impl Agent<'_> {
     /// eager pass that reclaims little costs more than it saves — only fire
     /// when the cleared results are worth the prefix rebuild.
     fn try_microcompact_opportunistic(&mut self) -> Option<usize> {
+        if !crate::settings::active().context.microcompact {
+            return None;
+        }
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
         if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
             return None;
@@ -14129,6 +14135,122 @@ mod tests {
             "a refused pass must not rewind the engine's KV: {:?}",
             events.lock().unwrap()
         );
+    }
+
+    /// With `context.microcompact` off, `try_microcompact` must decline
+    /// without touching the transcript at all — not merely return a count
+    /// that happens to be zero, but genuinely never rewrite anything, so the
+    /// caller (`maybe_compact`) falls through to full compaction instead.
+    #[test]
+    fn microcompact_off_leaves_try_microcompact_untouched() {
+        let dir = scratch_dir("microcompact-off-cheap");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+
+        // Four old-enough tool results: with microcompact on, the oldest
+        // (outside the newest-3 keep window) is a genuine clearing candidate.
+        for _ in 0..4 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "a".repeat(1_000)
+            )));
+        }
+
+        // Control: with the setting at its default (on), this exact transcript
+        // really would be rewritten — proving the test below is not simply
+        // vacuous (e.g. a `None` any implementation would produce).
+        let mut control = agent.session.transcript.clone();
+        assert_eq!(
+            compact::microcompact(&mut control).0,
+            1,
+            "sanity: the setup does have a clearing candidate"
+        );
+
+        let mut off = crate::settings::Settings::default();
+        off.context.microcompact = false;
+        crate::settings::install_for_test(off);
+
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact(),
+            None,
+            "declines rather than reporting a full clear"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "transcript must be byte-identical: no in-place rewrite at all"
+        );
+
+        crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// With `context.microcompact` off, the opportunistic end-of-turn pass
+    /// must decline without touching the transcript or the engine's KV — the
+    /// same setup that a default-on setting would genuinely clear and restore
+    /// a rung for (proving the guard, not a vacuous `None`).
+    #[test]
+    fn microcompact_off_leaves_opportunistic_pass_untouched() {
+        let dir = scratch_dir("microcompact-off-opportunistic");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // A real rung at spans == 2, so an unguarded pass really would restore.
+        let rung = agent.capture_first_rung();
+        assert_eq!(rung.spans, 2);
+
+        // One old, big tool result (well past the opportunistic byte floor)
+        // and nothing else added after the rung, so the reprefill cost is
+        // negligible and an unguarded pass would find it worth clearing.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(10_000)
+        )));
+        // Three more candidates (>256 bytes) so the big one falls outside the
+        // newest-3 keep window instead of being kept alive by it.
+        for _ in 0..3 {
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(300)
+            )));
+        }
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        assert!(reclaimable >= compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
+
+        let mut off = crate::settings::Settings::default();
+        off.context.microcompact = false;
+        crate::settings::install_for_test(off);
+
+        events.lock().unwrap().clear();
+        let before = agent.session.transcript.clone();
+        assert_eq!(
+            agent.try_microcompact_opportunistic(),
+            None,
+            "declines outright with the setting off"
+        );
+        assert_eq!(
+            agent.session.transcript, before,
+            "a declined pass rewrites nothing"
+        );
+        assert!(
+            !events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a declined pass must not touch the engine's KV: {:?}",
+            events.lock().unwrap()
+        );
+
+        crate::settings::install_for_test(crate::settings::Settings::default());
     }
 
     /// Replacing the session must clear the ladder and take its blobs with it.
