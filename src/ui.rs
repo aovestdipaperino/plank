@@ -1215,6 +1215,8 @@ struct Agent<'a> {
     /// is empty, which would wipe the restored token transcript and rewind the
     /// KV to the session-context boundary, re-prefilling the conversation.
     payload_restored: bool,
+    /// Set by any turn that moved the transcript; cleared by a payload save.
+    payload_dirty: bool,
     /// Depth-indexed KV snapshots for this session, newest turn last.
     ladder: crate::kvladder::KvLadder,
     /// Byte length of `system`'s trusted control-text prefix, handed to the
@@ -2379,6 +2381,7 @@ impl Agent<'_> {
                 finished.ended_in_think && turn_continues,
             );
             self.session.push(Message::assistant(assistant_text));
+            self.payload_dirty = true;
             let st = Status {
                 state: if stats.interrupted {
                     WorkerState::Stopped
@@ -2408,6 +2411,7 @@ impl Agent<'_> {
                     print_footer(&st, self.color);
                 }
                 self.last_turn_interrupted = true;
+                self.save_payload_if_dirty();
                 if crate::notify::should_notify_complete(
                     turn_start.elapsed(),
                     crate::settings::active().ui.notify_after_secs,
@@ -2501,6 +2505,7 @@ impl Agent<'_> {
                 );
             }
             self.refresh_ladder();
+            self.save_payload_if_dirty();
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
@@ -4561,6 +4566,21 @@ the original is frozen and listed in /tree"
             )),
             Err(e) => Some(format!("KV payload save failed: {e}")),
         }
+    }
+
+    /// Persists the session KV payload when the transcript has moved since the
+    /// last save. Called at end of turn and after an interrupt, so a crash or
+    /// kill leaves a resumable payload rather than a transcript alone.
+    ///
+    /// Capture measured at ~0.4s for 400 MB, against turns that spend minutes
+    /// in prefill. The flag clears regardless of outcome: a backend with no KV
+    /// must not retry every turn.
+    fn save_payload_if_dirty(&mut self) -> Option<String> {
+        if !self.payload_dirty {
+            return None;
+        }
+        self.payload_dirty = false;
+        self.save_session_payload()
     }
 
     /// At end of turn, captures a ladder rung when the transcript has moved far
@@ -9112,6 +9132,7 @@ impl Agent<'_> {
                     ));
                 }
                 self.refresh_ladder();
+                self.save_payload_if_dirty();
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
@@ -9456,10 +9477,12 @@ impl Agent<'_> {
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             self.session.push(Message::assistant(assistant_text));
+            self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
             if out.interrupted {
                 crate::interrupt::clear();
                 self.last_turn_interrupted = true;
+                self.save_payload_if_dirty();
                 let _ = tx.send(UiEvent::Dim("[interrupted]".to_owned()));
                 // Drain point 3 (BTW-DESIGN §4.4): the user asked mid-turn;
                 // answer even though the main turn was interrupted.
@@ -12142,6 +12165,7 @@ fn new_agent(
         reminder: SystemPromptReminder::new(),
         power_percent: 0,
         payload_restored: false,
+        payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
         trusted_system_len,
         think: cfg.generation.think_mode,
@@ -13707,6 +13731,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -13878,6 +13903,28 @@ mod tests {
             "a real hit must run the restore, not just select the rung: {:?}",
             events.lock().unwrap()
         );
+    }
+
+    /// A save is only worth doing when the transcript has moved since the
+    /// last one; the flag clears regardless of outcome (best-effort), so a
+    /// KV-less backend does not retry every turn.
+    #[test]
+    fn a_payload_save_is_skipped_when_the_transcript_has_not_moved() {
+        let dir = scratch_dir("payload-dirty-flag");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hi"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.payload_dirty = false;
+        assert_eq!(agent.save_payload_if_dirty(), None);
+
+        // A turn that changed the transcript arms the next save.
+        agent.payload_dirty = true;
+        // ScriptedEngine::default() has no KV, so the save itself is inert,
+        // but the flag clears so a failed capture does not retry forever.
+        assert_eq!(agent.save_payload_if_dirty(), None);
+        assert!(!agent.payload_dirty);
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
@@ -16192,6 +16239,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -16296,6 +16344,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -16999,6 +17048,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17183,6 +17233,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17272,6 +17323,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17348,6 +17400,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17447,6 +17500,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18959,6 +19013,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -19052,6 +19107,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -19204,6 +19260,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -19278,6 +19335,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
