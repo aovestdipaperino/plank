@@ -384,6 +384,31 @@ per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
   the cache the thing keeping the session payload — and the tier checkpoint
   above it — alive.
 
+- **The gate, and why it depends on context pressure.** An opportunistic pass
+  is only taken when `compact::microcompact_is_worth_it(reclaimable,
+  reprefill_tokens, ctx_size, ctx_used)` agrees, where `reprefill_tokens` is
+  the rendered transcript's token count minus whatever the selected rung
+  covers. The comparison is bytes reclaimed per token re-prefilled against a
+  floor, and that floor is **not fixed**: it is
+  `MICROCOMPACT_BYTES_PER_TOKEN_FLOOR` (2.0) while used context sits at or
+  below half of `compact::compaction_trigger_used(ctx_size)`, then relaxes
+  linearly to zero at that trigger — the exact point `should_compact` starts
+  firing, so the cheap decision and the expensive one are anchored to the same
+  threshold and cannot contradict each other (`compact::microcompact_floor`).
+  The reason is that the value of reclaiming context is not constant. A
+  measured run offered 12,344 bytes for 10,674 re-prefilled tokens — a ratio of
+  1.16 — in a window 2% full, where the right answer is no: ~3,300 tokens of
+  context are not worth ~98 s of prefill when nothing is short. The same trade
+  at 60-80% of the window is clearly worth taking, because there the
+  alternative is a full compaction: a model round-trip *plus* a total KV
+  rebuild. At or past the trigger the floor is zero and the opportunistic pass
+  can never be the blocker — full compaction is imminent and will rebuild the
+  KV regardless, so refusing a cheap pass there is strictly worse. The
+  decision is monotone in each input: more bytes reclaimed or more pressure
+  makes it more willing, more tokens re-prefilled less. The
+  `microcompact gate refused:` debug line reports `ctx_used`, `ctx_size` and
+  the effective `floor` alongside the bytes and tokens.
+
 A rung restore is a performance mechanism only: on a miss (stale fingerprint,
 missing blob, or no rung shallow enough) the code path is identical to having
 no ladder at all — the transcript rewrite proceeds and the next turn simply

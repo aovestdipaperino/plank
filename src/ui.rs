@@ -3011,11 +3011,13 @@ impl Agent<'_> {
         // restore would cover, gate on that, and only then restore.
         let covered = self.ladder.select(edit, 0).map_or(0, |r| r.tokens);
         // Whatever the rung does not cover is re-prefilled next turn.
-        if !compact::microcompact_is_worth_it(reclaimable, total - covered) {
+        let ctx_size = self.engine.ctx_size();
+        if !compact::microcompact_is_worth_it(reclaimable, total - covered, ctx_size, total) {
             crate::engine::kv_debug(|| {
                 format!(
-                    "microcompact gate refused: reclaimable={reclaimable}B total={total} rung_covers={covered} reprefill={}",
-                    total - covered
+                    "microcompact gate refused: reclaimable={reclaimable}B total={total} rung_covers={covered} reprefill={} ctx_used={total} ctx_size={ctx_size} floor={:.2}",
+                    total - covered,
+                    compact::microcompact_floor(ctx_size, total)
                 )
             });
             return None;
@@ -14212,6 +14214,82 @@ mod tests {
                 .iter()
                 .any(|e| e.starts_with("restore:")),
             "a real hit runs set_kv, not just select: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Small enough that the synthetic transcript below sits under real
+    /// context pressure without needing a huge one.
+    const E2E_CTX_SIZE: i32 = 20_000;
+
+    /// THE end-to-end test the whole feature lacked: nothing anywhere proved a
+    /// rung is ever actually USED in the real path. This drives
+    /// `try_microcompact_opportunistic` itself — the gate, the ladder select,
+    /// the fingerprint lookup and `set_kv` — on an agent whose engine supplies
+    /// KV, with a small `ctx_size` (via `ScriptedEngine::ctx_override`) so the
+    /// synthetic context pressure is high. The measured trade (~1.2 bytes per
+    /// token) is below the strict floor, so before the pressure term this pass
+    /// was refused at every pressure and the restore never ran.
+    #[test]
+    fn under_pressure_the_opportunistic_pass_fires_and_restores_a_rung() {
+        let dir = scratch_dir("ladder-pressure-e2e");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ctx_override: Some(E2E_CTX_SIZE),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        // Without a real id every capture/restore path short-circuits and the
+        // test would prove nothing.
+        agent.store.save(&mut agent.session).unwrap();
+
+        let big = "a".repeat(12_000);
+        agent.anchor_rung_before_tool_result(big.len());
+        let rung = *agent.ladder.rungs().last().expect("anchored");
+        agent
+            .session
+            .push(Message::user(format!("<tool_result>{big}</tool_result>")));
+        for _ in 0..3 {
+            agent.session.push(Message::assistant("more"));
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(6_000)
+            )));
+        }
+
+        let rendered = render_transcript(&agent.session, &agent.system);
+        let total = agent.engine.count_tokens(&rendered);
+        let reclaimable = compact::microcompact_reclaimable(&agent.session.transcript);
+        let reprefill = total - rung.tokens;
+        // The trade must be one the STRICT floor refuses, or the test would
+        // pass without the pressure term at all.
+        assert!(
+            !compact::microcompact_is_worth_it(reclaimable, reprefill, 1_000_000, total),
+            "the trade must be strictly refusable at low pressure"
+        );
+        // ... and the window must be under pressure but NOT yet at the
+        // full-compaction trigger: this is the pre-emption window.
+        assert!(
+            !compact::should_compact(E2E_CTX_SIZE, total),
+            "full compaction must not already be due"
+        );
+
+        events.lock().unwrap().clear();
+        let cleared = agent
+            .try_microcompact_opportunistic()
+            .expect("the pass must fire under pressure");
+        assert!(cleared > 0, "the pass must clear a tool result");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "the pass must actually restore the rung via set_kv: {:?}",
             events.lock().unwrap()
         );
     }

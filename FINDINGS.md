@@ -686,6 +686,31 @@ and still fixtured. A real-engine measurement of the prefix-stability win
 (earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
 the conservative default until then.
 
+### The gate is context-pressure-dependent, and had to become so
+
+Three successive gates, each fixing the previous one's blindness:
+
+1. Bytes only (`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES`) — could not see the
+   token cost. A measured session took five passes, each reclaiming ~12 KB and
+   paying ~14,000 tokens of re-prefill: 72,769 wasted tokens, 26:38 of a 29:05
+   session in prefill.
+2. Bytes per token re-prefilled, floor 2.0 (`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`)
+   — killed the regression outright (0 rebuilds, session 29:05 -> 16:31) but
+   refused *every* pass, so context was never reclaimed on this path.
+3. The same ratio against a **pressure-dependent floor**
+   (`compact::microcompact_floor`): flat 2.0 up to half of
+   `compaction_trigger_used(ctx_size)`, then linear to 0.0 at that trigger.
+
+The insight behind (3) is that a byte of context is not worth a fixed number of
+prefill tokens — its worth depends on how close the window is to full. The
+logged trade `reclaimable=12344B ... reprefill=10674` (ratio 1.16) is a bad deal
+at 2% of a 1M window and a good one at 70%, because the alternative under
+pressure is a full compaction (model round-trip plus total KV rebuild) rather
+than nothing. The relaxation is anchored to the *same* threshold
+`should_compact` uses, deliberately: two independent notions of "under
+pressure" would eventually disagree, and the cheap pass would end up blocking
+right where the expensive one was about to fire anyway.
+
 ## Durable goal state (M7) — model-facing text, fixtures
 
 The goal statement is now durable session state (`Session.goal`), pinned

@@ -327,6 +327,20 @@ turn the pass declines to fire, and then does so again every turn after,
 since the reclaimable total only grows. The decision and the restore must use
 the exact same selection call, made before either one touches the engine.
 
+The decision itself is the last piece, and it is not a property of the ladder
+at all. Whether an opportunistic pass is worth its prefill cost is a question
+about *the value of context*, and that value is not constant: reclaiming a few
+thousand tokens is worthless when the window is 2% full and valuable when it is
+nearly full, because in the second case the alternative is not "do nothing" but
+a full compaction — a model round-trip plus a total KV rebuild. A fixed
+bytes-per-token ratio cannot express that, and a measured run showed exactly
+the failure mode: a ratio of 1.16 refused at every turn, correctly at 2%, and
+with no mechanism to ever accept it. So the floor is a function of context
+pressure — strict while the window is roomy, relaxing linearly to nothing at
+the point full compaction fires. It is anchored to *the same* threshold
+`should_compact` uses rather than a second one of its own, so the cheap
+decision can never sit blocking in front of the expensive one.
+
 ### Some key material does not change the text
 
 Tier 1's key includes two inputs that do not alter a single byte of the prompt,
