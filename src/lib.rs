@@ -50,6 +50,7 @@ pub mod insights;
 pub mod interrupt;
 pub mod kvcache;
 pub mod kvgc;
+pub mod kvladder;
 pub mod kvmeta;
 pub mod kvpane;
 /// Volatility-tiered KV cache planning (issues #60, #64). FFI-free and always
