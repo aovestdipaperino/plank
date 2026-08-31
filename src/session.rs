@@ -496,12 +496,34 @@ impl SessionStore {
     /// Deletes every ladder rung blob and sidecar for `id`, returning how many
     /// blobs were removed. Rungs are a live-session accelerator, not history:
     /// the saved payload is what a later `/resume` restores from.
+    ///
+    /// Enumerates the store directory rather than probing `0..LADDER_MAX_RUNGS`:
+    /// [`crate::kvladder::KvLadder::push`] names slots from a MONOTONIC
+    /// counter, so a session's fourth capture is `rung-3` and a long session's
+    /// three live rungs all have indices past the ladder's width. A fixed-range
+    /// probe found none of them and left gigabytes on disk.
+    ///
+    /// The prefix is `{id}.rung-`, which the session's own payload (`{id}.kv_raw`)
+    /// cannot match, and the suffix pins the blob extension so a sibling session
+    /// id that merely starts with `{id}` is excluded too (`{id}-two.rung-3.kv_raw`
+    /// does not begin with `{id}.rung-`). Best-effort throughout: a failed
+    /// delete must never fail an exit or a `/strip`.
     #[must_use]
     pub fn remove_rungs(&self, id: &str) -> usize {
-        (0..crate::kvladder::LADDER_MAX_RUNGS)
-            .filter(|&i| {
-                let path = self.rung_path(id, i);
-                let _ = fs::remove_file(path.with_extension("json"));
+        let prefix = format!("{id}.rung-");
+        let Ok(entries) = fs::read_dir(&self.dir) else {
+            return 0;
+        };
+        entries
+            .filter_map(std::result::Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(crate::kvmeta::BLOB_EXT))
+            })
+            .filter(|e| {
+                let path = e.path();
+                let _ = fs::remove_file(crate::kvmeta::sidecar_path(&path));
                 fs::remove_file(&path).is_ok()
             })
             .count()
@@ -4230,7 +4252,13 @@ hello\n";
     fn removing_rungs_clears_every_slot_and_its_sidecar() {
         let dir = temp_dir("remove-rungs");
         let store = SessionStore::open(&dir).unwrap();
-        for i in 0..crate::kvladder::LADDER_MAX_RUNGS {
+        // Slot numbers come from `KvLadder`'s MONOTONIC counter, not from
+        // `0..LADDER_MAX_RUNGS`: a session's fourth capture is `rung-3`, its
+        // fifth `rung-4`. In the long sessions this feature targets every live
+        // rung has an index well past the ladder's width, so the sweep must
+        // enumerate the directory rather than probe a fixed range.
+        let indices = [3usize, 7, 12];
+        for i in indices {
             std::fs::write(store.rung_path("zany-turing", i), b"blob").unwrap();
             std::fs::write(
                 store.rung_path("zany-turing", i).with_extension("json"),
@@ -4238,17 +4266,23 @@ hello\n";
             )
             .unwrap();
         }
-        assert_eq!(
-            store.remove_rungs("zany-turing"),
-            crate::kvladder::LADDER_MAX_RUNGS
-        );
-        assert!(!store.rung_path("zany-turing", 0).exists());
-        assert!(
-            !store
-                .rung_path("zany-turing", 0)
-                .with_extension("json")
-                .exists()
-        );
+        // Neither another session's rungs nor this session's own payload may be
+        // caught by the prefix match.
+        std::fs::write(store.rung_path("zany-turing-two", 3), b"other").unwrap();
+        std::fs::write(store.payload_path("zany-turing"), b"payload").unwrap();
+
+        assert_eq!(store.remove_rungs("zany-turing"), indices.len());
+        for i in indices {
+            assert!(!store.rung_path("zany-turing", i).exists());
+            assert!(
+                !store
+                    .rung_path("zany-turing", i)
+                    .with_extension("json")
+                    .exists()
+            );
+        }
+        assert!(store.rung_path("zany-turing-two", 3).exists());
+        assert!(store.payload_path("zany-turing").exists());
         // A second sweep finds nothing left.
         assert_eq!(store.remove_rungs("zany-turing"), 0);
     }

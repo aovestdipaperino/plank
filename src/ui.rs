@@ -3061,6 +3061,15 @@ impl Agent<'_> {
             self.session.push(Message::user(block));
         }
         self.last_ctx_used = 0;
+        // Every rung snapshots a prefix of the transcript just replaced, so all
+        // of them died with it. Left in place they would freeze the ladder for
+        // the rest of the session: post-compaction token counts are by
+        // construction far below the pre-compaction deepest rung, so
+        // `wants_rung` would refuse every new capture, and `select` would keep
+        // returning rungs whose truncated render can no longer be fingerprinted
+        // — the ladder would be permanently dead from the first full compaction
+        // onward, the moment it is most needed.
+        self.discard_ladder();
     }
 
     /// The `trigger` value compaction hooks receive: `manual` for a user-driven
@@ -3685,6 +3694,7 @@ impl Agent<'_> {
             }
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
+                self.discard_ladder();
                 self.session = Session::new();
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -3793,6 +3803,7 @@ impl Agent<'_> {
                     if let Some(note) = self.load_session_payload(&s) {
                         println!("{}", self.debug_line(&note));
                     }
+                    self.discard_ladder();
                     self.session = s;
                     crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
@@ -3830,6 +3841,7 @@ impl Agent<'_> {
                     if let Some(note) = self.load_session_payload(&s) {
                         println!("{}", self.debug_line(&note));
                     }
+                    self.discard_ladder();
                     self.session = s;
                     crate::debugmirror::set_session_id(&self.session.id);
                     self.broadcast_session_reset(Some(
@@ -4324,6 +4336,7 @@ impl Agent<'_> {
         // avoids that. Best-effort — a stale or absent one just falls back to
         // prefill, which is the behavior this path had unconditionally.
         let note = self.load_session_payload(&session);
+        self.discard_ladder();
         self.session = session;
         crate::debugmirror::set_session_id(&self.session.id);
         self.last_ctx_used = 0;
@@ -4609,6 +4622,23 @@ the original is frozen and listed in /tree"
         self.save_session_payload()
     }
 
+    /// Forgets the live session's ladder and deletes its blobs.
+    ///
+    /// Every rung is a snapshot of *this* session's KV prefix, so anything that
+    /// replaces or rewrites the transcript — `/new`, `/clear`, `/switch`,
+    /// `/resume`, a full compaction, exit — invalidates all of them at once.
+    /// Leaving the ladder in place is worse than useless: `wants_rung` keeps
+    /// comparing against the stale deepest rung's token count, so a smaller
+    /// fresh transcript yields a negative delta and no capture ever happens
+    /// again, while `select` hands back rungs whose prefix no longer exists.
+    /// Best-effort: a failed delete must never fail a turn or an exit.
+    fn discard_ladder(&mut self) {
+        if !self.session.id.is_empty() {
+            let _ = self.store.remove_rungs(&self.session.id);
+        }
+        self.ladder = crate::kvladder::KvLadder::new();
+    }
+
     /// At end of turn, captures a ladder rung when the transcript has moved far
     /// enough past the deepest existing one.
     ///
@@ -4849,6 +4879,7 @@ the original is frozen and listed in /tree"
     /// picker), so the three cannot drift on what "replace the session" clears.
     fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
         let note = self.load_session_payload(&s);
+        self.discard_ladder();
         self.session = s;
         crate::debugmirror::set_session_id(&self.session.id);
         self.broadcast_session_reset(Some(
@@ -5587,6 +5618,10 @@ the original is frozen and listed in /tree"
         // every transcript push, task update, and tag, and cleared on save and
         // load.
         if !self.session.dirty {
+            // Rungs are process-scoped and hundreds of MB each, so they must go
+            // even when there is no transcript worth rewriting — a clean exit
+            // used to return here and leave the whole ladder on disk.
+            self.discard_ladder();
             return None;
         }
         let id = self.save_session().ok()?;
@@ -5598,7 +5633,7 @@ the original is frozen and listed in /tree"
         let _ = self.save_session_payload();
         // The exit payload supersedes the ladder; leaving rungs behind would
         // hold hundreds of MB per session against the cache byte budget.
-        let _ = self.store.remove_rungs(&id);
+        self.discard_ladder();
         let path = self
             .store
             .find(&id)
@@ -10350,6 +10385,7 @@ impl Agent<'_> {
                 }
             }
             "/new" | "/clear" => {
+                self.discard_ladder();
                 self.session = Session::new();
                 // A new session, a new name — minted here for the same reason
                 // `new_agent` mints one at launch (see `SessionStore::mint_id`).
@@ -14021,6 +14057,76 @@ mod tests {
                 .any(|e| e.starts_with("restore:")),
             "a refused pass must not rewind the engine's KV: {:?}",
             events.lock().unwrap()
+        );
+    }
+
+    /// Replacing the session must clear the ladder and take its blobs with it.
+    ///
+    /// `/new`, `/clear`, `/switch`, both `/resume` paths and `resume_by_id`
+    /// reset `checkpoints`, `usage` and `last_ctx_used` but used to leave
+    /// `self.ladder` alone. That orphaned the old session's blobs on disk and,
+    /// worse, left `wants_rung` comparing a fresh, smaller transcript against
+    /// the old deepest rung's token count — a negative delta, so no capture
+    /// ever happened again and the feature silently stopped working.
+    #[test]
+    fn replacing_the_session_discards_the_ladder_and_its_blobs() {
+        let dir = scratch_dir("ladder-session-swap");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("turn one"));
+        agent.store.save(&mut agent.session).unwrap();
+        let old_id = agent.session.id.clone();
+
+        let rung = agent.refresh_ladder().expect("first rung always captures");
+        assert!(agent.store.rung_path(&old_id, rung.index).exists());
+
+        // A real replacement path, not the helper: `/clear` is the site the
+        // bug lived at.
+        assert!(agent.slash("/clear").unwrap());
+        assert!(agent.ladder.rungs().is_empty(), "the ladder must be reset");
+        assert!(
+            !agent.store.rung_path(&old_id, rung.index).exists(),
+            "the old session's blob must go with it"
+        );
+        // The reset is what lets a smaller fresh transcript capture again.
+        assert!(agent.ladder.wants_rung(10));
+    }
+
+    /// A full compaction replaces the transcript, so every rung's prefix ceases
+    /// to exist. Leaving them behind freezes the ladder for the rest of the
+    /// session (`wants_rung` refuses, `select` misses) exactly when the feature
+    /// matters most, so `rebuild_after_compact` must clear it.
+    #[test]
+    fn a_full_compaction_clears_the_ladder() {
+        let dir = scratch_dir("ladder-after-compact");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("turn one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+        let id = agent.session.id.clone();
+
+        let rung = agent.refresh_ladder().expect("first rung always captures");
+        assert!(agent.store.rung_path(&id, rung.index).exists());
+
+        agent.rebuild_after_compact("<summary>everything so far</summary>");
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "the rebuilt transcript invalidates every rung"
+        );
+        assert!(
+            !agent.store.rung_path(&id, rung.index).exists(),
+            "the blobs must go too"
         );
     }
 
