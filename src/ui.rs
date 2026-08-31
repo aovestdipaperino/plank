@@ -1215,6 +1215,8 @@ struct Agent<'a> {
     /// is empty, which would wipe the restored token transcript and rewind the
     /// KV to the session-context boundary, re-prefilling the conversation.
     payload_restored: bool,
+    /// Depth-indexed KV snapshots for this session, newest turn last.
+    ladder: crate::kvladder::KvLadder,
     /// Byte length of `system`'s trusted control-text prefix, handed to the
     /// engine so it tokenizes that span as rendered chat, and folded into the
     /// Tier 1 KV key so a checkpoint written under a different split is never
@@ -2498,6 +2500,7 @@ impl Agent<'_> {
                     ))
                 );
             }
+            self.refresh_ladder();
             crate::title::set(crate::title::State::Idle);
             crate::warp::emit("stop", &self.session.id);
             self.fire_turn_end(stats.generated, turn_start.elapsed());
@@ -4547,6 +4550,50 @@ the original is frozen and listed in /tree"
             )),
             Err(e) => Some(format!("KV payload save failed: {e}")),
         }
+    }
+
+    /// At end of turn, captures a ladder rung when the transcript has moved far
+    /// enough past the deepest existing one.
+    ///
+    /// Capture is a full copy of the KV prefix (~0.4s for 400 MB), so the
+    /// spacing rule in [`crate::kvladder::KvLadder::wants_rung`] is what keeps
+    /// this from running every turn. Best-effort throughout: a failed capture
+    /// or write leaves the ladder as it was and the turn is correct either way.
+    fn refresh_ladder(&mut self) -> Option<crate::kvladder::Rung> {
+        if self.session.id.is_empty() {
+            return None;
+        }
+        let rendered = render_transcript(&self.session, &self.system);
+        let tokens = self.engine.count_tokens(&rendered);
+        if !self.ladder.wants_rung(tokens) {
+            return None;
+        }
+        // No KV backend (echo stub) or nothing prefilled yet: nothing to store.
+        let cache = self.engine.get_kv()?;
+        let spans = self.session.transcript.len();
+        let (rung, evicted) = self.ladder.push(spans, tokens);
+        let key = crate::session::KvKey::Rung {
+            id: self.session.id.clone(),
+            index: rung.index,
+            fp: self.payload_fingerprint_for(&self.session),
+        };
+        let label = crate::kvmeta::KvLabel::Rung {
+            session: self.session.id.clone(),
+            spans,
+            tokens,
+        };
+        let _ = self
+            .store
+            .kv_store_labeled(&key, &cache, None, &self.engine.model_name(), &label);
+        if let Some(old) = evicted {
+            let _ = std::fs::remove_file(self.store.rung_path(&self.session.id, old.index));
+            let _ = std::fs::remove_file(
+                self.store
+                    .rung_path(&self.session.id, old.index)
+                    .with_extension("json"),
+            );
+        }
+        Some(rung)
     }
 
     /// On `/switch` / `/resume`, tries to restore the session's KV payload so
@@ -9014,6 +9061,7 @@ impl Agent<'_> {
                         "microcompacted: cleared {cleared} old tool result(s)"
                     ));
                 }
+                self.refresh_ladder();
                 crate::title::set(crate::title::State::Idle);
                 crate::warp::emit("stop", &self.session.id);
                 // Mirrored from the plain path: a component must not observe a
@@ -12044,6 +12092,7 @@ fn new_agent(
         reminder: SystemPromptReminder::new(),
         power_percent: 0,
         payload_restored: false,
+        ladder: crate::kvladder::KvLadder::new(),
         trusted_system_len,
         think: cfg.generation.think_mode,
         trace,
@@ -13608,6 +13657,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -13676,6 +13726,21 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-ui-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `ScriptedEngine::default()` leaves `kv_events` unset, so `get_kv`
+    /// returns `None` — the same "no KV backend" behaviour as the echo stub.
+    /// With nothing to snapshot, every ladder path must be inert rather than
+    /// recording a phantom rung.
+    #[test]
+    fn the_scripted_engine_default_never_grows_a_ladder() {
+        let dir = scratch_dir("ladder-no-kv");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello"));
+        agent.store.save(&mut agent.session).unwrap();
+        assert_eq!(agent.refresh_ladder(), None);
+        assert!(agent.ladder.rungs().is_empty());
     }
 
     /// `remote_on` installs a live bridge on an already-running agent and
@@ -15990,6 +16055,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16093,6 +16159,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16795,6 +16862,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -16978,6 +17046,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17066,6 +17135,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17141,6 +17211,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17239,6 +17310,7 @@ mod tests {
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18750,6 +18822,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18842,6 +18915,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18993,6 +19067,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -19066,6 +19141,7 @@ or the user's next message aborts before its first token"
             reminder: SystemPromptReminder::new(),
             power_percent: 0,
             payload_restored: false,
+            ladder: crate::kvladder::KvLadder::new(),
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
