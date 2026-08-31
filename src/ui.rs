@@ -11541,6 +11541,10 @@ const FORCE_QUIT_GRACE: Duration = Duration::from_secs(2);
 /// reached in the network-drop case that motivated it.
 fn force_quit() -> ! {
     ratatui::restore();
+    // No destructor here can run (see above), so the mirror gets its farewell
+    // explicitly or not at all — and this is the exit where a console left
+    // hanging mid-stream most needs to be told what happened.
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_FORCE_QUIT);
     eprintln!("plank: force quit — the turn was abandoned and not saved.");
     std::process::exit(130);
 }
@@ -12522,6 +12526,9 @@ pub fn run_interactive(
     // Whatever happened, fire SessionEnd, save the session, and tell the user
     // how to resume it.
     agent.fire_session_end("exit", &mut |w| println!("{w}"));
+    // Say goodbye in the debug console before the socket goes: a window left
+    // on screen should say why its stream stopped.
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     agent.report_session_on_exit();
     agent.report_run_stats();
     result
@@ -12788,6 +12795,7 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt));
         let r = agent.run_turn();
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
+        crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
         return r;
     }
     // Stdin protocol, like the C: announce readiness on stderr, collect bytes
@@ -12807,6 +12815,7 @@ pub fn run_non_interactive(
         agent.run_turn()?;
     }
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
+    crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())
 }
 

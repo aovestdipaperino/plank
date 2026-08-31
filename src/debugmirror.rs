@@ -293,6 +293,51 @@ pub fn flush() {
     }
 }
 
+/// Text written into every live console window when plank exits, so a window
+/// left on screen says why its stream stopped instead of just going quiet.
+///
+/// Deliberately ordinary stream bytes rather than a protocol frame: the
+/// handshake is the console's only control exchange, and the window outlives
+/// the socket by design (reconnecting under the same name rejoins it below a
+/// `-- reconnected --` rule). This is the closing half of that idiom, written
+/// in the same shape, and the console renders it with its own copy of
+/// `trace-stream` like everything else plank sends.
+fn farewell(reason: &str) -> String {
+    format!("\n\n---\n\n_plank disconnected: {reason}_\n")
+}
+
+/// The reason string for an ordinary quit.
+pub const REASON_EXIT: &str = "session ended";
+
+/// The reason string for a force quit, where the in-flight turn is lost.
+pub const REASON_FORCE_QUIT: &str = "force quit, the turn was abandoned";
+
+/// Announces plank's exit in every live console window — the parent's and any
+/// sub-agent's — then drops every connection.
+///
+/// Best-effort to exactly the standard [`push`] holds itself to: a console
+/// that has already gone away just fails the write, and quitting must never
+/// be delayed, blocked, or made noisy by optional dev tooling. Idempotent,
+/// since the registry is emptied: a second call, or a `push` racing in from a
+/// worker thread that has not noticed the exit yet, writes nothing.
+///
+/// One thing it does not attempt: closing a `<think>` block that happens to be
+/// open. The mirror does not track that state — [`begin_in_think`] only
+/// injects, it does not remember — so a farewell after a force quit mid-think
+/// renders in the console's thinking style. Guessing would mis-color the far
+/// more common clean exit, which is never inside a block.
+pub fn disconnect(reason: &str) {
+    let bye = farewell(reason);
+    let mut reg = MIRRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for stream in reg.values_mut() {
+        let _ = stream.write_all(bye.as_bytes());
+        let _ = stream.flush();
+    }
+    reg.clear();
+}
+
 /// A console window belonging to one sub-agent, held for that sub-agent's
 /// lifetime.
 ///
@@ -563,6 +608,73 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = sock.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"parent bytes");
+
+        reset();
+    }
+
+    /// Quitting must leave a note in the window rather than going silent, and
+    /// must reach the sub-agent windows too, not just the parent's.
+    #[test]
+    fn quitting_writes_a_farewell_to_every_window_and_drops_the_sockets() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console_keeping_sockets();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        reconcile();
+        let sub = open_subagent();
+        assert_eq!(MIRRORS.lock().unwrap().len(), 2);
+
+        disconnect(REASON_EXIT);
+        assert!(
+            MIRRORS.lock().unwrap().is_empty(),
+            "the farewell is the last thing on the socket; the connection goes with it"
+        );
+
+        for _ in 0..2 {
+            let (_hello, mut sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            let mut buf = String::new();
+            sock.read_to_string(&mut buf).unwrap();
+            assert!(buf.contains(REASON_EXIT), "{buf:?}");
+        }
+
+        // Dropping the guard after the registry was cleared must not panic or
+        // resurrect anything: a force quit unwinds in exactly this order.
+        drop(sub);
+        assert!(MIRRORS.lock().unwrap().is_empty());
+        reset();
+    }
+
+    /// A second `disconnect` (or a `push` from a worker thread that has not
+    /// noticed the exit) must be a silent no-op, not a second farewell.
+    #[test]
+    fn disconnecting_twice_writes_one_farewell() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console_keeping_sockets();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        reconcile();
+        disconnect(REASON_EXIT);
+        push("bytes after the goodbye");
+        disconnect(REASON_FORCE_QUIT);
+
+        let (_hello, mut sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let mut buf = String::new();
+        sock.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains(REASON_EXIT), "{buf:?}");
+        assert!(!buf.contains(REASON_FORCE_QUIT), "{buf:?}");
+        assert!(!buf.contains("bytes after the goodbye"), "{buf:?}");
 
         reset();
     }

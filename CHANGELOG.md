@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Quitting plank now signs off in the debug console.** A window whose stream
+  simply stopped was indistinguishable from a wedged plank, so every live
+  console connection — the session's own window and any sub-agent's — gets a
+  closing `_plank disconnected: session ended_` rule before the socket goes.
+  It is written as ordinary stream bytes rather than a protocol frame, matching
+  the console's existing `-- reconnected --` idiom, because the handshake is the
+  console's only control exchange and the window is meant to outlive the socket.
+  A force quit says so in the reason, since that is the exit where the in-flight
+  turn is lost; it is also the exit where no destructor runs, so the farewell is
+  sent explicitly there. Best-effort throughout, to the same standard as the
+  mirror itself: a console that already went away just fails the write, and
+  quitting is never delayed or made noisy by optional dev tooling.
+
 ## [3.5.4] - 2026-08-31
 
 ### Changed
