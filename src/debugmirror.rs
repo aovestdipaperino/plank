@@ -5,10 +5,14 @@
 //! running: nothing here may ever block a turn, panic, or spam retries. The
 //! design is deliberately dumb:
 //!
-//! - One process-wide connection slot. plank has exactly one live session at
-//!   a time (per the TUI and plain-REPL front ends this ships), so a single
-//!   slot is enough; a second `Agent` in the same process (tests) shares it,
-//!   which is harmless since [`reconcile`] is idempotent.
+//! - A registry of connections keyed by [`MirrorId`], with
+//!   [`MirrorId::PARENT`] for the session's own window and one entry per live
+//!   sub-agent. Which one [`push`] writes to is a thread-local, defaulting to
+//!   the parent, so code that knows nothing about sub-agents is unaffected.
+//!   Sub-agents need this because a fan-out generates several at once
+//!   (`generate_fanout_round` spawns a thread per slot) and each wants its own
+//!   named window: `plank:<session>:subagent-<ordinal>`, ordinal monotonic
+//!   within a session and reset when the session changes.
 //! - [`reconcile`] is the only thing that ever dials out, and it makes at most
 //!   one connection attempt per call — never a retry loop. It is called (a)
 //!   whenever the settings are swapped in (`settings::install`/`reinstall`),
