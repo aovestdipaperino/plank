@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.5.2] - 2026-08-31
+
 ### Added
 
 - **`/insights` suggestions are one click from being used.** Every suggestion
