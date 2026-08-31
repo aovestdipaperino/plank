@@ -153,4 +153,14 @@ mod tests {
         assert_eq!(l.select(9, 6_000), None);
         assert_eq!(l.select(9, 4_000).map(|r| r.tokens), Some(5_000));
     }
+
+    #[test]
+    fn select_returns_rung_when_spans_exactly_equal_max_spans() {
+        let mut l = KvLadder::new();
+        l.push(5, 10_000);
+        // Query at exactly the rung's spans: should return the rung (5 <= 5).
+        assert_eq!(l.select(5, 0).map(|r| r.tokens), Some(10_000));
+        // Query just below: should return None (no rung at or below 4).
+        assert_eq!(l.select(4, 0), None);
+    }
 }
