@@ -3899,6 +3899,16 @@ fn status_bar_lines(text: &str, tick_ms: u64, base: Style, tasks: &TaskView) -> 
     // confirmation) takes over for its window; otherwise the rotating yellow
     // tip shows, changing every few seconds off the animation clock. On a
     // narrow terminal the line truncates and drops whichever tip is last.
+    // Its own cell, ahead of the tool label: a spill happens *during* a tool
+    // call, so anything that shares the tip's slot would be hidden behind the
+    // running-tool label for exactly as long as it had to be visible.
+    if let Some(mark) = crate::status::spill_segment() {
+        spans.push(Span::styled(" | ".to_string(), base));
+        spans.push(Span::styled(
+            mark.to_string(),
+            base.add_modifier(Modifier::BOLD),
+        ));
+    }
     if let Some(running) = crate::status::tool_activity() {
         spans.push(Span::styled(" | ".to_string(), base));
         if crate::status::tool_blink_on(tick_ms) {

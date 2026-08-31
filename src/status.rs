@@ -1153,6 +1153,63 @@ pub fn set_flash_tip_for(msg: String, window_ms: u64) {
     *guard = Some((msg, std::time::Instant::now(), window_ms));
 }
 
+/// How long the spill splash stays in the status line.
+///
+/// A spill is over in milliseconds — the file is written and the turn carries
+/// on — so without a window of its own the indicator would flash for one
+/// frame and be gone. Three seconds is long enough to be read by someone who
+/// was not already looking at the footer.
+pub const SPILL_FLASH_MS: u64 = 3_000;
+
+/// When output was last spilled to a file, for [`spill_active`].
+static SPILL_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Marks output as just spilled, starting the [`SPILL_FLASH_MS`] window.
+pub fn note_spill() {
+    let mut guard = SPILL_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = Some(std::time::Instant::now());
+}
+
+/// Whether the spill splash should be shown. Expired marks are dropped on
+/// read, the way [`flash_tip`] drops expired tips.
+#[must_use]
+pub fn spill_active() -> bool {
+    let mut guard = SPILL_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match guard.as_ref() {
+        Some(at) if flash_active(at.elapsed(), SPILL_FLASH_MS) => true,
+        Some(_) => {
+            *guard = None;
+            false
+        }
+        None => false,
+    }
+}
+
+/// Clears the spill splash immediately (tests, and `/clear`).
+pub fn clear_spill() {
+    let mut guard = SPILL_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *guard = None;
+}
+
+/// The spill splash as a bar segment, when one is due.
+///
+/// Read by the TUI footer, which is the only front end painting while tools
+/// run — and deliberately not by [`build_status_text`], which stays a pure
+/// function of its [`Status`] rather than of when output was last spilled.
+#[must_use]
+pub fn spill_segment() -> Option<&'static str> {
+    spill_active().then_some(SPILL_MARK)
+}
+
+/// Glyph shown while output is being spilled to a file.
+pub const SPILL_MARK: &str = "💦";
+
 /// Clears any active flash tip immediately.
 pub fn clear_flash_tip() {
     let mut guard = FLASH_TIP
@@ -2127,6 +2184,20 @@ mod tests {
         assert!(!tool_blink_on(TOOL_BLINK_MS / 2));
         assert!(!tool_blink_on(TOOL_BLINK_MS - 1));
         assert!(tool_blink_on(TOOL_BLINK_MS));
+    }
+
+    #[test]
+    fn the_spill_splash_lasts_long_enough_to_be_read() {
+        clear_spill();
+        assert!(spill_segment().is_none(), "nothing spilled yet");
+        note_spill();
+        assert_eq!(spill_segment(), Some(SPILL_MARK));
+        // Three seconds, so a spill that is over in milliseconds is still
+        // seen by someone who was not watching the footer at the time.
+        const { assert!(SPILL_FLASH_MS >= 3_000) };
+        // Leave the process-global clean for other tests in this binary.
+        clear_spill();
+        assert!(spill_segment().is_none());
     }
 
     #[test]

@@ -8,6 +8,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Softer colours for the working-tree counts.** The footer's `+`/`-` line
+  counts move off bright green and red onto a pale mint (256-colour 158) and
+  pale magenta (212), the nearest palette entries to `#c3f8e8` and `#ee88db` —
+  indexed like the rest of the bar rather than truecolor, and above 15 so the
+  user's theme cannot repaint them.
+
+- **A splash while output spills.** Spilling a large tool result to disk is
+  over in milliseconds, so it used to leave no trace in the footer at all. A
+  💦 now sits in the status line for three seconds after a spill, in its own
+  cell ahead of the running-tool label — the tip slot would have been hidden
+  behind that label for exactly as long as the splash needed to be visible.
+
 - **`/insights` is differential.** The scan has always been incremental; the
   six model calls were not, and they are what takes minutes. plank now keeps
   the last report beside it in `usage-data/last-report.json` — its sections,
@@ -24,6 +36,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not there last time.
 
 ### Fixed
+
+- **The engine's DSpark notice no longer lands in the middle of the screen.**
+  The C library announces `ds4: DSpark target-hidden capture enabled:
+  layers=...` on stderr every time a session is created — at startup, on
+  `/clear`, for every aside and sub-agent — and it reports a build and weights
+  decision nobody can act on. plank now captures stderr around session
+  creation and drops that one line, re-emitting everything else, so the
+  near-identical failure message on the same code path still gets through.
+  Sent upstream as well, gated behind `DS4_DSPARK_VERBOSE`.
 
 - **`/insights` writes the two sections it had always dropped.** "Try this
   next" and "Features to try" were missing from every report ever generated:

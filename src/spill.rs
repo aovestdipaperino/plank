@@ -59,7 +59,14 @@ pub fn apply(
     tool: &str,
     result: String,
 ) -> (String, Option<Spilled>) {
-    apply_in(&spill_dir(), policy, session_id, tool, result)
+    let (preview, spilled) = apply_in(&spill_dir(), policy, session_id, tool, result);
+    // Only here, not in `apply_in`: the splash is a real-installation effect,
+    // and the tests that drive `apply_in` against a scratch root must not
+    // reach into the process-wide status line to do it.
+    if spilled.is_some() {
+        crate::status::note_spill();
+    }
+    (preview, spilled)
 }
 
 /// [`apply`], against an explicit spill root. Production callers use `apply`,
