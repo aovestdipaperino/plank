@@ -8,6 +8,50 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A session's KV cache is saved at the end of every turn, and when you
+  interrupt one.** It used to be written only by `/save` and on a clean exit, so
+  a crash, a `kill`, or a closed terminal left the transcript behind with no KV
+  next to it and the next `/resume` re-prefilled the whole conversation — at
+  local prefill speeds, minutes of it. The capture costs about four tenths of a
+  second on a turn that spends far longer than that in prefill. The interrupt
+  save waits until the partial reply is in the transcript, so what lands on disk
+  always matches what the engine held; the goal loop's adjudication exchange,
+  which returned from four of its exits without ever reaching a save, is
+  included now.
+
+- **KV snapshot rungs.** plank keeps up to three KV snapshots per live session,
+  each recorded with the transcript depth it covers, so a pass that has to
+  rewrite an old message can restore a snapshot from *before* that point and
+  prefill only the remainder instead of rebuilding from token zero. A snapshot
+  is taken immediately before a large tool result is appended, which is the only
+  moment early enough to be useful — the rewrite always lands on the oldest
+  large result, and by any turn boundary the transcript has already moved past
+  it. Snapshots are trusted by their embedded signature alone, are the first
+  thing the cache GC evicts under its byte budget, and are deleted when the
+  session ends, is replaced, or is fully compacted. This is a mitigation whose
+  accepting path only engages under real context pressure; see below.
+
+- **`context.microcompact`**, default `true`. Set it to `false` (or
+  `/config context.microcompact false`) to switch micro-compaction off
+  altogether. Context is then reclaimed by full compaction alone, which is
+  slower but never rewrites transcript text in place — also the cleanest way to
+  measure what micro-compaction costs you.
+
+### Fixed
+
+- **Micro-compaction no longer throws away a valid KV cache to save a few
+  kilobytes.** Clearing an old tool result rewrites transcript text in place,
+  and the engine cannot rewrite behind the live end of its KV — it re-prefills
+  from token zero. The pass was gated on *bytes reclaimed* (4 KB), which cannot
+  see that cost: one measured pass reclaimed 12 KB of text and paid 14,047
+  tokens of prefill, and because it clears one result at a time it re-trips a
+  few turns later and pays again. Over an 18-turn session that was five full
+  rebuilds and 72,769 still-valid tokens re-prefilled, with prefill taking 26:38
+  of 29:05. The gate now weighs bytes reclaimed against the tokens actually
+  re-prefilled, and relaxes as the context window fills so cheap relief still
+  pre-empts a full compaction. The same session now does no full rebuilds at
+  all, with prefill down to 4:24 of 14:56.
+
 - **Softer colours for the working-tree counts.** The footer's `+`/`-` line
   counts move off bright green and red onto a pale mint (256-colour 158) and
   pale magenta (212), the nearest palette entries to `#c3f8e8` and `#ee88db` —
