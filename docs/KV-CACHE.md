@@ -326,6 +326,14 @@ extends forward from there.
 `kvladder.rs` keeps a small, depth-indexed ladder of such snapshots ("rungs")
 per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
 
+**Not yet proven in production.** The accepting path — a pass that actually
+fires and a rung that is actually restored — has only ever been exercised by
+unit tests with a synthetic small `ctx_size`. It needs the window around 42%
+full before the pressure-dependent floor relaxes far enough, and no benchmark
+run to date has come close to filling a 1M-token window (measured sessions
+reach 2-3%). What *has* been measured live is the refusing path; see
+`FINDINGS.md`.
+
 - **Naming and location.** A rung's blob is `<id>.rung-<n>.kv_raw`, next to the
   session's own `<id>.kv_raw` payload and `<id>.kv` transcript, where `<n>` is
   a *monotonically increasing* slot index minted by `KvLadder::push` — not a
@@ -392,9 +400,15 @@ per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
   floor, and that floor is **not fixed**: it is
   `MICROCOMPACT_BYTES_PER_TOKEN_FLOOR` (2.0) while used context sits at or
   below half of `compact::compaction_trigger_used(ctx_size)`, then relaxes
-  linearly to zero at that trigger — the exact point `should_compact` starts
-  firing, so the cheap decision and the expensive one are anchored to the same
-  threshold and cannot contradict each other (`compact::microcompact_floor`).
+  linearly to a small epsilon (`MICROCOMPACT_FLOOR_EPSILON`, 0.05) at that
+  trigger — the exact point `should_compact` starts firing, so the cheap
+  decision and the expensive one are anchored to the same threshold and cannot
+  contradict each other (`compact::microcompact_floor`). The floor bottoms out
+  at an epsilon rather than at zero because zero means "accept any pass at
+  all", and the opportunistic pass runs at the end of a turn while
+  `should_compact` is consulted at the start of the next: a pass barely
+  clearing the minimum could spend a `set_kv` and a rewrite immediately before
+  a full compaction discarded the ladder and rebuilt anyway.
   The reason is that the value of reclaiming context is not constant. A
   measured run offered 12,344 bytes for 10,674 re-prefilled tokens — a ratio of
   1.16 — in a window 2% full, where the right answer is no: ~3,300 tokens of

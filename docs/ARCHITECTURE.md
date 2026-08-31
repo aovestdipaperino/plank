@@ -525,11 +525,15 @@ which invalidates the live KV from the rewrite point on — the engine can only
 extend its live end, never roll it back — so absent a snapshot of the
 prefix as it stood *before* the rewrite, every pass forces a full re-prefill.
 `kvladder.rs` keeps up to three such snapshots ("rungs"), one per session,
-recorded at increasing transcript depths as end-of-turn allows
-(`Agent::refresh_ladder`); `Agent::restore_rung_below` restores the deepest
-rung that predates a compaction pass's known edit point immediately before
-the rewrite happens, so the next generation extends forward from the rung
-rather than from token zero. Rungs live on disk beside the session
+recorded as anchors immediately before a large tool result is appended
+(`Agent::anchor_rung_before_tool_result`), which is exactly the index
+micro-compaction later rewrites; `Agent::restore_rung_below` restores the
+deepest rung that predates a compaction pass's known edit point immediately
+before the rewrite happens, so the next generation extends forward from the
+rung rather than from token zero. The restoring path has so far only been
+exercised in unit tests with a synthetic small `ctx_size`: no live session has
+reached the context pressure the opportunistic gate needs before it accepts a
+pass. Rungs live on disk beside the session
 (`<id>.rung-<n>.kv_raw`), trusted only by the signature embedded in the blob
 — never by filename — and are discarded whenever the session they describe
 is replaced or rewritten (`/new`, `/clear`, `/switch`, `/resume`, full

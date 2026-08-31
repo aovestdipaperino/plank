@@ -1219,6 +1219,11 @@ struct Agent<'a> {
     payload_dirty: bool,
     /// Depth-indexed KV snapshots for this session, newest turn last.
     ladder: crate::kvladder::KvLadder,
+    /// Set when a `/btw` aside answered on the *live* engine has pushed the
+    /// engine's end past the transcript an anchor would be signed against, and
+    /// consumed by the next anchor point. See
+    /// [`Agent::anchor_rung_before_tool_result`].
+    btw_diverged_engine: bool,
     /// Byte length of `system`'s trusted control-text prefix, handed to the
     /// engine so it tokenizes that span as rendered chat, and folded into the
     /// Tier 1 KV key so a checkpoint written under a different split is never
@@ -4594,10 +4599,12 @@ the original is frozen and listed in /tree"
     }
 
     /// Writes an already-captured KV as the session payload. Split out of
-    /// [`Agent::save_session_payload`] so the end-of-turn flush can serve both
-    /// the ladder rung and the payload from a single `get_kv` — the two ran back
-    /// to back over identical state, paying ~0.8s and ~800 MB of writes per
-    /// rung turn for two copies of the same bytes.
+    /// [`Agent::save_session_payload`] so a caller that already holds a `get_kv`
+    /// can store it without paying for a second capture of the same bytes. (It
+    /// was originally split so the end-of-turn flush could serve both the
+    /// payload and a ladder rung from one capture; turn-end rung capture is
+    /// gone — rungs are anchored before a tool result instead — but the
+    /// already-captured entry point stays useful.)
     fn store_payload(&mut self, cache: &crate::kvcache::KVCache) -> Option<String> {
         if self.session.id.is_empty() {
             return None;
@@ -4731,6 +4738,17 @@ the original is frozen and listed in /tree"
     ///
     /// Best-effort throughout: no failure here may fail a turn.
     fn anchor_rung_before_tool_result(&mut self, body_len: usize) {
+        // A `/btw` answered on the live engine since the last main generation
+        // left the engine's end beyond this transcript; a rung signed here would
+        // be a false claim of coverage (see `drain_btw_inner`). Consume the mark
+        // rather than only reading it: the next main generation re-syncs the
+        // engine to the transcript, so exactly one anchor point is unsafe.
+        if std::mem::take(&mut self.btw_diverged_engine) {
+            crate::engine::kv_debug(|| {
+                "ladder capture: skipped — a /btw aside ran on the live engine".to_owned()
+            });
+            return;
+        }
         if body_len <= compact::MICROCOMPACT_MIN_BYTES || self.session.id.is_empty() {
             return;
         }
@@ -9847,6 +9865,20 @@ impl Agent<'_> {
                 }
                 let _ = write!(prompt, "[user]\n{}\n", btw_user_message(&question));
             }
+            // This generation runs on the live engine, so from here the
+            // engine's end is `transcript + question + answer`: strictly beyond
+            // the transcript an anchor rung would be fingerprinted against. A
+            // rung captured in that state claims coverage it does not have and,
+            // once restored, hands the next prompt a KV it cannot extend —
+            // `engine::reusable_prefix` then takes the reset branch and
+            // re-prefills from zero, the exact pathology the ladder exists to
+            // avoid. Mark it; the next anchor point consumes the mark and skips.
+            //
+            // Set for the aside path too, which *is* documented to snapshot and
+            // restore around itself (`Engine::generate_aside`): a restore that
+            // silently no-ops leaves the same divergence, and the only cost of
+            // being wrong here is one skipped anchor.
+            self.btw_diverged_engine = true;
             match self.worker_generate_kind(tx, shared, &prompt, Instant::now(), false, aside) {
                 Ok(out) => {
                     let _ = tx.send(UiEvent::EndLine);
@@ -12369,6 +12401,7 @@ fn new_agent(
         payload_restored: false,
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
+        btw_diverged_engine: false,
         trusted_system_len,
         think: cfg.generation.think_mode,
         trace,
@@ -13935,6 +13968,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -14159,6 +14193,57 @@ mod tests {
             events.lock().unwrap().iter().any(|e| e == "capture"),
             "the anchor must really snapshot the KV: {:?}",
             events.lock().unwrap()
+        );
+    }
+
+    /// A `/btw` aside answered on the LIVE engine pushes the engine's end past
+    /// the transcript a rung is fingerprinted against, so a rung captured after
+    /// it claims coverage it does not have and, once restored, hands the next
+    /// prompt a KV it cannot extend — `reusable_prefix` then re-prefills from
+    /// token zero, which is the pathology the ladder exists to prevent. No
+    /// anchor may be captured on such a pass.
+    #[test]
+    fn no_anchor_is_captured_on_a_pass_that_answered_a_btw() {
+        let dir = scratch_dir("ladder-anchor-btw");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            replies: vec!["It is 42.\n".to_string()],
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        // The aside: answered on `self.engine`, with no fork snapshot and no
+        // restore afterwards (unlike the plain-REPL path's
+        // `begin_subagent_fork`/`restore_fork_kv`).
+        let shared = TurnShared::default();
+        shared.push_btw("what was the answer?".to_owned());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        agent.drain_btw(&tx, &shared);
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a /btw answered on the live engine must suppress the anchor: {:?}",
+            agent.ladder.rungs()
+        );
+        assert!(
+            !events.lock().unwrap().iter().any(|e| e == "capture"),
+            "the suppressed anchor must not even pay a get_kv: {:?}",
+            events.lock().unwrap()
+        );
+
+        // And only that one anchor point: the next main generation re-syncs the
+        // engine to the transcript, so the following anchor is captured again.
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            1,
+            "the suppression must be consumed, not sticky"
         );
     }
 
@@ -17084,6 +17169,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17189,6 +17275,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -17894,6 +17981,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18079,6 +18167,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18169,6 +18258,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18246,6 +18336,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -18346,6 +18437,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -19859,6 +19951,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -19953,6 +20046,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -20106,6 +20200,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),
@@ -20181,6 +20276,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
             trace: Trace::open(None).unwrap(),

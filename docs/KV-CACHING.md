@@ -336,10 +336,18 @@ a full compaction — a model round-trip plus a total KV rebuild. A fixed
 bytes-per-token ratio cannot express that, and a measured run showed exactly
 the failure mode: a ratio of 1.16 refused at every turn, correctly at 2%, and
 with no mechanism to ever accept it. So the floor is a function of context
-pressure — strict while the window is roomy, relaxing linearly to nothing at
-the point full compaction fires. It is anchored to *the same* threshold
-`should_compact` uses rather than a second one of its own, so the cheap
-decision can never sit blocking in front of the expensive one.
+pressure — strict while the window is roomy, relaxing linearly at the point
+full compaction fires to a small epsilon (`MICROCOMPACT_FLOOR_EPSILON`, 0.05)
+rather than to nothing, since "accept anything" would let a marginal pass spend
+a rewrite moments before a full compaction threw the result away. It is
+anchored to *the same* threshold `should_compact` uses rather than a second one
+of its own, so the cheap decision can never sit blocking in front of the
+expensive one.
+
+One caveat a reader should carry away: this accepting branch has never fired in
+a live session. It has only ever run in unit tests with a synthetic small
+`ctx_size`, because no benchmark yet built fills enough of a 1M-token window to
+relax the floor. The refusals are measured; the acceptance is designed.
 
 ### Some key material does not change the text
 

@@ -39,6 +39,10 @@ pub const MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES: usize = 4096;
 /// re-prefilled is far more expensive than a byte reclaimed; this floor is
 /// deliberately conservative rather than tuned.
 pub const MICROCOMPACT_BYTES_PER_TOKEN_FLOOR: f64 = 2.0;
+
+/// The floor [`microcompact_floor`] relaxes *to* at the full-compaction
+/// trigger. Deliberately not zero: see that function.
+pub const MICROCOMPACT_FLOOR_EPSILON: f64 = 0.05;
 /// Maximum files re-injected after a full compaction.
 pub const REINJECT_MAX_FILES: usize = 5;
 /// Hard cap on the post-compaction re-injection budget, in tokens.
@@ -115,9 +119,21 @@ pub fn compaction_trigger_used(ctx_size: i32) -> i32 {
 /// context pressure.
 ///
 /// Flat [`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`] until the window is half way to
-/// the full-compaction trigger, then a clamped linear relaxation down to zero
-/// at the trigger itself: at that point full compaction is imminent and will
-/// rebuild the KV anyway, so a cheap pass must never be the blocker.
+/// the full-compaction trigger, then a clamped linear relaxation down to
+/// [`MICROCOMPACT_FLOOR_EPSILON`] at the trigger itself: at that point full
+/// compaction is imminent and will rebuild the KV anyway, so a cheap pass must
+/// never be the blocker.
+///
+/// The floor bottoms out at a small epsilon rather than at zero, which would
+/// mean "accept any pass at all". The opportunistic pass runs at the *end* of a
+/// turn while `should_compact` is consulted at the *start* of the next, so a
+/// pass barely clearing [`MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES`] could spend a
+/// `set_kv` and an in-place rewrite moments before a full compaction discards
+/// the ladder and rebuilds anyway. The waste was bounded but pointless. The
+/// epsilon keeps every property the function had: strict at low pressure,
+/// monotone non-increasing in pressure, monotone in bytes and tokens through
+/// [`microcompact_is_worth_it`], and far too small to be the blocker at high
+/// pressure.
 #[must_use]
 pub fn microcompact_floor(ctx_size: i32, ctx_used: i32) -> f64 {
     let trigger = compaction_trigger_used(ctx_size);
@@ -125,14 +141,16 @@ pub fn microcompact_floor(ctx_size: i32, ctx_used: i32) -> f64 {
         return MICROCOMPACT_BYTES_PER_TOKEN_FLOOR;
     }
     if ctx_used >= trigger {
-        return 0.0;
+        return MICROCOMPACT_FLOOR_EPSILON;
     }
     let relax_start = trigger / 2;
     if ctx_used <= relax_start {
         return MICROCOMPACT_BYTES_PER_TOKEN_FLOOR;
     }
-    MICROCOMPACT_BYTES_PER_TOKEN_FLOOR * f64::from(trigger - ctx_used)
-        / f64::from(trigger - relax_start)
+    let span = f64::from(trigger - relax_start);
+    let remaining = f64::from(trigger - ctx_used) / span;
+    MICROCOMPACT_FLOOR_EPSILON
+        + (MICROCOMPACT_BYTES_PER_TOKEN_FLOOR - MICROCOMPACT_FLOOR_EPSILON) * remaining
 }
 
 /// Whether clearing `reclaimable` bytes justifies `reprefill_tokens` of
@@ -657,12 +675,25 @@ mod tests {
     }
 
     /// At or past the point full compaction fires, the KV is going to be
-    /// rebuilt regardless, so the opportunistic pass must never be the blocker.
+    /// rebuilt regardless, so the opportunistic pass must never be the blocker
+    /// for any pass that reclaims a real amount of context. Only a degenerate
+    /// pass — near-zero yield for a whole rebuild, which a full compaction is
+    /// about to perform anyway — is still refused, by
+    /// [`MICROCOMPACT_FLOOR_EPSILON`].
     #[test]
     fn at_the_full_compaction_threshold_the_gate_never_blocks() {
         let (size, used) = (30_000, 23_000);
         assert!(should_compact(size, used));
-        assert!(microcompact_is_worth_it(1, 100_000, size, used));
+        // The smallest pass the opportunistic path will even attempt, against a
+        // full-window re-prefill: accepted.
+        assert!(microcompact_is_worth_it(
+            MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES,
+            size,
+            size,
+            used
+        ));
+        // A whole rebuild for one byte: still refused, and rightly.
+        assert!(!microcompact_is_worth_it(1, 100_000, size, used));
     }
 
     /// Monotone in each input, in the obvious direction.
@@ -694,8 +725,19 @@ mod tests {
             let trigger = compaction_trigger_used(size);
             assert!(should_compact(size, trigger), "size={size}");
             assert!(!should_compact(size, trigger - 1), "size={size}");
-            assert!(microcompact_floor(size, trigger) == 0.0, "size={size}");
-            assert!(microcompact_floor(size, trigger / 2) > 0.0, "size={size}");
+            // Bottoms out at the epsilon, never at zero: "accept anything"
+            // would let a marginal pass fire immediately before a full
+            // compaction throws the work away.
+            let bottom = microcompact_floor(size, trigger);
+            assert!(bottom > 0.0, "size={size}");
+            assert!(
+                (bottom - MICROCOMPACT_FLOOR_EPSILON).abs() < 1e-9,
+                "size={size} bottom={bottom}"
+            );
+            assert!(
+                microcompact_floor(size, trigger / 2) > MICROCOMPACT_FLOOR_EPSILON,
+                "size={size}"
+            );
         }
     }
 }

@@ -695,13 +695,36 @@ Three successive gates, each fixing the previous one's blindness:
    paying ~14,000 tokens of re-prefill: 72,769 wasted tokens, 26:38 of a 29:05
    session in prefill.
 2. Bytes per token re-prefilled, floor 2.0 (`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`)
-   — killed the regression outright (0 rebuilds, session 29:05 -> 16:31) but
-   refused *every* pass, so context was never reclaimed on this path.
-3. The same ratio against a **pressure-dependent floor**
+   — killed the regression outright: **0 full rebuilds, session 29:05 -> 14:56
+   with 4:24 in prefill** (run 2). It refused *every* pass, so context was
+   never reclaimed on this path; the whole win is the refusal.
+3. Anchor rungs (`Agent::anchor_rung_before_tool_result`) on top of that gate.
+   Measured (run 3): still 0 rebuilds, all six gate refusals now report
+   `rung_covers=14284` instead of 0 — the rung really is found and really
+   would cover 57% of the re-prefill — but **0 restores happened**, because
+   the gate refuses at 1.16 bytes/token, and session time went 14:56 -> 16:31
+   with prefill 4:24 -> 6:16. Stated plainly: in the only session shape anyone
+   can currently benchmark, the anchor change **cost about 1.5 minutes and
+   delivered no realized benefit**, the cost being the anchor captures
+   themselves. It is kept because it is the precondition for (4) — without a
+   rung at the edit index there is nothing for an accepting gate to restore —
+   not because it has been measured to pay.
+4. The same ratio against a **pressure-dependent floor**
    (`compact::microcompact_floor`): flat 2.0 up to half of
-   `compaction_trigger_used(ctx_size)`, then linear to 0.0 at that trigger.
+   `compaction_trigger_used(ctx_size)`, then linear to a small epsilon (0.05,
+   `MICROCOMPACT_FLOOR_EPSILON`) at that trigger. The epsilon rather than 0.0
+   because 0.0 means "accept any pass at all", and the opportunistic pass runs
+   at the end of a turn while `should_compact` is consulted at the start of the
+   next: a marginal pass could spend a `set_kv` and a rewrite moments before a
+   full compaction discarded the ladder anyway.
 
-The insight behind (3) is that a byte of context is not worth a fixed number of
+   The accepting branch of this gate has **never fired in a live session**. It
+   needs roughly 42% of the context window used (half of
+   `compaction_trigger_used`), and a benchmark of file-reading turns reaches
+   2-3% of a 1M-token window; the only evidence that a pass fires and a rung is
+   restored comes from unit tests with a synthetic small `ctx_size`.
+
+The insight behind (4) is that a byte of context is not worth a fixed number of
 prefill tokens — its worth depends on how close the window is to full. The
 logged trade `reclaimable=12344B ... reprefill=10674` (ratio 1.16) is a bad deal
 at 2% of a 1M window and a good one at 70%, because the alternative under
