@@ -5179,6 +5179,11 @@ the original is frozen and listed in /tree"
                 // Stream the reasoning as it arrives, the way an ordinary
                 // turn does, so the wait is legible rather than blank.
                 let mut ticker = insights::ThinkTicker::new();
+                // A degenerate reply repeats one clause until the budget runs
+                // out; stopping it early is the difference between a dropped
+                // section and minutes of visible nonsense.
+                let mut guard = insights::RepeatGuard::new();
+                let mut looped = false;
                 // A section is a paragraph or a short list, and the section
                 // budget is what stops one wandering reply from making the
                 // whole report take minutes. The session's own generation
@@ -5205,6 +5210,10 @@ the original is frozen and listed in /tree"
                             for line in ticker.feed(&t) {
                                 tick(line);
                             }
+                            if guard.feed(&t) {
+                                looped = true;
+                                stop.store(true, Ordering::Relaxed);
+                            }
                             // `tick` is where the TUI reads the keyboard, so
                             // polling here is what turns an Esc pressed
                             // mid-sentence into a stopped generation rather
@@ -5218,6 +5227,16 @@ the original is frozen and listed in /tree"
                 // A section the user stopped is not a section that failed:
                 // say nothing about it and leave the loop, rather than
                 // reporting it "unavailable" and trying the next one.
+                // A section the model looped in is stopped the same way a
+                // user stop is, so it is separated out first: the loop is this
+                // section's failure, not a reason to abandon the rest.
+                if looped {
+                    note(format!(
+                        "[\u{201c}{}\u{201d} unavailable: the model looped]",
+                        spec.heading
+                    ));
+                    continue;
+                }
                 if generated.as_ref().is_ok_and(|s| s.interrupted) {
                     note("[stopped; writing the report as it stands]".to_owned());
                     break;

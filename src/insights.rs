@@ -1378,6 +1378,76 @@ impl ThinkTicker {
     }
 }
 
+/// Watches a section's stream for the model falling into a repetition loop.
+///
+/// The recommendation sections ask for a list of objects, and a small model
+/// that runs out of things to say sometimes keeps emitting the same clause or
+/// the same list entry until the token budget runs out. That is minutes of
+/// visible nonsense per section on a real engine, so the stream is watched and
+/// the pass stopped as soon as the tail is provably cyclic. A false positive
+/// costs one section of prose; the statistics and every other section are
+/// untouched.
+#[derive(Debug, Default)]
+pub struct RepeatGuard {
+    tail: String,
+    since_check: usize,
+}
+
+/// Bytes of trailing output examined for a cycle.
+const REPEAT_WINDOW: usize = 1024;
+/// Shortest cycle treated as a loop. Below this, ordinary prose repeats
+/// itself legitimately — "the the", a run of list punctuation.
+const REPEAT_MIN_PERIOD: usize = 12;
+/// Consecutive identical blocks needed before the pass is stopped.
+const REPEAT_CYCLES: usize = 4;
+/// Bytes generated between checks. Scanning every chunk would be wasted work;
+/// a loop is not urgent enough to catch within one token.
+const REPEAT_CHECK_EVERY: usize = 64;
+
+impl RepeatGuard {
+    /// A guard positioned at the start of a reply.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Feeds one streamed chunk. Returns true once the output has been
+    /// repeating itself for [`REPEAT_CYCLES`] cycles.
+    pub fn feed(&mut self, chunk: &str) -> bool {
+        self.tail.push_str(chunk);
+        if self.tail.len() > REPEAT_WINDOW {
+            // Trim from the front to a char boundary: the window is a byte
+            // budget, and slicing mid-character would panic.
+            let mut cut = self.tail.len() - REPEAT_WINDOW;
+            while cut < self.tail.len() && !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail.drain(..cut);
+        }
+        self.since_check += chunk.len();
+        if self.since_check < REPEAT_CHECK_EVERY {
+            return false;
+        }
+        self.since_check = 0;
+        self.is_cyclic()
+    }
+
+    /// Whether the tail ends in the same block repeated back to back.
+    fn is_cyclic(&self) -> bool {
+        let bytes = self.tail.as_bytes();
+        let len = bytes.len();
+        for period in REPEAT_MIN_PERIOD..=len / REPEAT_CYCLES {
+            let block = &bytes[len - period..];
+            if (1..REPEAT_CYCLES)
+                .all(|back| &bytes[len - period * (back + 1)..len - period * back] == block)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Pulls the answer object out of a model reply.
 ///
 /// A reply that never yields valid JSON is a dropped section rather than an
@@ -2426,6 +2496,46 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let total: u32 = agg.response_histogram.iter().map(|r| r.1).sum();
         assert_eq!(total, 4, "{:?}", agg.response_histogram);
         assert_eq!(agg.response_median, 700);
+    }
+
+    #[test]
+    fn the_repeat_guard_stops_a_repeating_reply_but_not_ordinary_prose() {
+        // The observed failure: a recommendation section that keeps emitting
+        // the same list entry until the token budget runs out.
+        let mut guard = RepeatGuard::new();
+        let mut tripped = false;
+        for _ in 0..20 {
+            if guard.feed("{\"name\": \"Skills\", \"why\": \"you repeat steps\"}, ") {
+                tripped = true;
+                break;
+            }
+        }
+        assert!(tripped, "a repeating list entry must stop the pass");
+
+        // A run of blank lines is the other shape the same failure takes.
+        let mut guard = RepeatGuard::new();
+        assert!(
+            (0..40).any(|_| guard.feed("\n\n\n\n\n\n\n\n")),
+            "a newline run must stop the pass"
+        );
+
+        // Ordinary varied prose, well past the window, must not trip it.
+        let mut guard = RepeatGuard::new();
+        for i in 0..200 {
+            assert!(
+                !guard.feed(&format!(
+                    "sentence {i} says something different about how they work, at length. "
+                )),
+                "varied prose tripped the guard at chunk {i}"
+            );
+        }
+
+        // Neither must a reply full of multi-byte characters: the window is a
+        // byte budget and trimming it must land on a char boundary.
+        let mut guard = RepeatGuard::new();
+        for i in 0..200 {
+            let _ = guard.feed(&format!("\u{2014} r\u{e9}sum\u{e9} {i} \u{2014} "));
+        }
     }
 
     #[test]
