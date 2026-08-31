@@ -2298,7 +2298,10 @@ mod tests {
         // Repaint replaces the streamed line with highlighted text.
         assert!(out.contains("\r\x1b[0K"), "repaint missing: {out:?}");
         assert!(out.contains("\x1b[1;38;5;214mfn"), "kw1 'fn' bold: {out:?}");
-        assert!(out.contains("\x1b[1;38;5;214mlet"), "kw1 'let' bold: {out:?}");
+        assert!(
+            out.contains("\x1b[1;38;5;214mlet"),
+            "kw1 'let' bold: {out:?}"
+        );
         assert!(out.contains("\x1b[38;5;203m42"), "number: {out:?}");
         // As in the C, code streams plain first; the fence markers stay visible.
         assert!(
