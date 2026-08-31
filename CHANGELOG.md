@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.5.5] - 2026-08-31
+
 ### Added
 
 - **Quitting plank now signs off in the debug console.** A window whose stream
