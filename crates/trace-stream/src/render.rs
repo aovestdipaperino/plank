@@ -1242,6 +1242,17 @@ fn syntax_color(hl: Highlight) -> u16 {
     }
 }
 
+/// The SGR style parameter (with trailing `;`) that precedes a category's
+/// color, or `""` for none. Keywords render bold, comments italic; the rest
+/// carry color only. Terminals that do not support a style ignore its code.
+fn syntax_style(hl: Highlight) -> &'static str {
+    match hl {
+        Highlight::Keyword1 | Highlight::Keyword2 => "1;",
+        Highlight::Comment => "3;",
+        Highlight::String | Highlight::Number | Highlight::Normal => "",
+    }
+}
+
 fn keyword_len(kw: &str) -> (usize, bool) {
     if let Some(stripped) = kw.strip_suffix('|') {
         (stripped.len(), true)
@@ -1719,7 +1730,7 @@ impl<W: Write> TokenRenderer<W> {
             return;
         }
         if self.opts.use_color && hl != Highlight::Normal {
-            let seq = format!("\x1b[38;5;{}m", syntax_color(hl));
+            let seq = format!("\x1b[{}38;5;{}m", syntax_style(hl), syntax_color(hl));
             self.out_str(&seq);
         }
         self.out(s);
@@ -2286,13 +2297,31 @@ mod tests {
         let out = output(r);
         // Repaint replaces the streamed line with highlighted text.
         assert!(out.contains("\r\x1b[0K"), "repaint missing: {out:?}");
-        assert!(out.contains("\x1b[38;5;214mfn"), "kw1 'fn': {out:?}");
-        assert!(out.contains("\x1b[38;5;214mlet"), "kw1 'let': {out:?}");
+        assert!(out.contains("\x1b[1;38;5;214mfn"), "kw1 'fn' bold: {out:?}");
+        assert!(out.contains("\x1b[1;38;5;214mlet"), "kw1 'let' bold: {out:?}");
         assert!(out.contains("\x1b[38;5;203m42"), "number: {out:?}");
         // As in the C, code streams plain first; the fence markers stay visible.
         assert!(
             out.contains("```") && out.contains("rust\n"),
             "fence line: {out:?}"
+        );
+    }
+
+    #[test]
+    fn fenced_block_bolds_keywords_and_italicizes_comments() {
+        let mut r = renderer(COLOR_MD);
+        r.write("```rust\nfn main() {} // note\n```\n");
+        r.finish();
+        let out = output(r);
+        // Keywords carry the bold flag alongside their color (kw1 = 214).
+        assert!(
+            out.contains("\x1b[1;38;5;214mfn"),
+            "keyword must be bold: {out:?}"
+        );
+        // Comments carry the italic flag alongside their color (244).
+        assert!(
+            out.contains("\x1b[3;38;5;244m"),
+            "comment must be italic: {out:?}"
         );
     }
 

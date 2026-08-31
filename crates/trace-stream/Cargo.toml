@@ -1,6 +1,6 @@
 [package]
 name = "trace-stream"
-version = "0.1.0"
+version = "0.1.1"
 description = "Streaming renderer for model token streams: tool-call parsing, thinking-text split, and markdown/syntax highlighting to ANSI"
 edition.workspace = true
 rust-version.workspace = true
