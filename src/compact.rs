@@ -33,6 +33,12 @@ pub const MICROCOMPACT_STUB: &str =
 /// place, which invalidates the KV prefix from that point, so an eager pass
 /// that reclaims little costs more than it saves.
 pub const MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES: usize = 4096;
+/// Bytes a pass must reclaim per token it forces back through prefill.
+///
+/// Prefill measured at ~88 tok/s against a buffered write at GB/s, so a token
+/// re-prefilled is far more expensive than a byte reclaimed; this floor is
+/// deliberately conservative rather than tuned.
+pub const MICROCOMPACT_BYTES_PER_TOKEN_FLOOR: f64 = 2.0;
 /// Maximum files re-injected after a full compaction.
 pub const REINJECT_MAX_FILES: usize = 5;
 /// Hard cap on the post-compaction re-injection budget, in tokens.
@@ -88,6 +94,20 @@ pub fn microcompact_reclaimable(transcript: &[Message]) -> usize {
 #[must_use]
 pub fn microcompact_first_index(transcript: &[Message]) -> Option<usize> {
     clear_set(transcript).into_iter().min()
+}
+
+/// Whether clearing `reclaimable` bytes justifies `reprefill_tokens` of prefill.
+///
+/// The old gate compared bytes against a flat threshold and could not see the
+/// token cost at all: one measured pass reclaimed ~12 KB and paid ~14,000
+/// tokens, because rewriting a body in place forces a rebuild from zero.
+#[must_use]
+pub fn microcompact_is_worth_it(reclaimable: usize, reprefill_tokens: i32) -> bool {
+    if reprefill_tokens <= 0 {
+        return true;
+    }
+    let reclaimable = u32::try_from(reclaimable).unwrap_or(u32::MAX);
+    f64::from(reclaimable) / f64::from(reprefill_tokens) >= MICROCOMPACT_BYTES_PER_TOKEN_FLOOR
 }
 
 /// Clears the bodies of old tool results in place, keeping the newest
@@ -552,5 +572,15 @@ mod tests {
         // Nothing clearable => nothing to report.
         let short = vec![Message::user("hi")];
         assert_eq!(microcompact_first_index(&short), None);
+    }
+
+    #[test]
+    fn the_gate_weighs_bytes_reclaimed_against_tokens_reprefilled() {
+        // The measured regression: ~12 KB reclaimed for ~14,000 tokens of prefill.
+        assert!(!microcompact_is_worth_it(12_000, 14_000));
+        // With a usable rung the remainder is small and the pass is clearly worth it.
+        assert!(microcompact_is_worth_it(12_000, 500));
+        // Nothing to re-prefill: always worth it.
+        assert!(microcompact_is_worth_it(5_000, 0));
     }
 }

@@ -2973,8 +2973,13 @@ impl Agent<'_> {
         if reclaimable < compact::MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES {
             return None;
         }
-        if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
-            self.restore_rung_below(edit);
+        let edit = compact::microcompact_first_index(&self.session.transcript)?;
+        let rendered = render_transcript(&self.session, &self.system);
+        let total = self.engine.count_tokens(&rendered);
+        let covered = self.restore_rung_below(edit).unwrap_or(0);
+        // Whatever the rung does not cover is re-prefilled next turn.
+        if !compact::microcompact_is_worth_it(reclaimable, total - covered) {
+            return None;
         }
         let (cleared, _) = compact::microcompact(&mut self.session.transcript);
         self.last_ctx_used = 0;
