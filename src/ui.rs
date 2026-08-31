@@ -682,6 +682,9 @@ struct FanoutSlot {
     pending_calls: Vec<ToolCall>,
     done: bool,
     error: Option<String>,
+    /// This slot's console window. Opened on the main thread so ordinals
+    /// follow block order, then borrowed by the slot's generation thread.
+    mirror: crate::debugmirror::SubagentMirror,
 }
 
 /// Parses a `/btw <question>` line, returning the question. Accepts a
@@ -925,11 +928,20 @@ fn generate_fanout_round(
                 let collected = sink.clone();
                 // `edit_preflight` is not `Clone`, so build one per slot.
                 let preflight = edit_preflight_cwd(cwd);
-                let engine = slot.engine.as_mut();
+                // Split the slot's two borrows apart explicitly: `engine` is
+                // taken mutably while `mirror` is only read, and destructuring
+                // is what lets the borrow checker see they are disjoint fields.
+                let FanoutSlot { engine, mirror, .. } = slot;
+                let engine = engine.as_mut();
                 handles.push((
                     i,
                     collected,
                     scope.spawn(move || {
+                        // First statement in the thread: everything this slot
+                        // generates goes to its own window. The guard's life is
+                        // exactly the thread's, and the thread is exactly one
+                        // slot.
+                        let _active = mirror.activate();
                         generate_pass(
                             engine,
                             prompt,
@@ -6156,6 +6168,7 @@ the original is frozen and listed in /tree"
                         pending_calls: Vec::new(),
                         done: false,
                         error: None,
+                        mirror: crate::debugmirror::open_subagent(),
                     });
                 }
                 Ok((key, engine)) => {
@@ -18984,6 +18997,19 @@ mod tests {
             "the cached engine served every dispatch"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// Fan-out ordinals are handed out on the main thread while slots are
+    /// built, so they follow block order deterministically rather than
+    /// whichever thread happens to start first.
+    #[test]
+    fn fanout_slots_take_distinct_ordinals_in_block_order() {
+        let a = crate::debugmirror::open_subagent();
+        let b = crate::debugmirror::open_subagent();
+        let c = crate::debugmirror::open_subagent();
+        let mut ids = vec![a.id(), b.id(), c.id()];
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "every slot needs its own window");
     }
 
     /// A serial sidechain must leave the thread routed back at the parent
