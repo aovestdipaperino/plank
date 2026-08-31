@@ -1,0 +1,26 @@
+# Deploy config for plank-agent.dev.
+#
+# The site is a static-assets-only Cloudflare Worker: no script, just the
+# contents of `site/`. Build the pages first if the guide or What's new
+# changed (`python3 site/build-guide.py`), then:
+#
+#     npx wrangler deploy
+#
+# Everything below used to have to be passed as flags on every deploy, which
+# is why this file exists. Two of them are not conveniences:
+#
+#   name  The Worker's generated name, not something descriptive. Omit it and
+#         wrangler creates a *new* Worker from the directory name instead of
+#         updating this one, and plank-agent.dev keeps serving the old copy.
+#
+#   compatibility_date  Required on every upload. Passed on the command line it
+#         defaults to today's date, so each deploy would silently move the
+#         runtime forward; pinned here it only changes when someone changes it.
+#
+# The custom domain (plank-agent.dev) is attached to the Worker in the
+# Cloudflare dashboard, not declared here — deploys leave it alone.
+name = "broken-dust-379b"
+compatibility_date = "2026-08-28"
+
+[assets]
+directory = "site"
