@@ -682,6 +682,9 @@ struct FanoutSlot {
     pending_calls: Vec<ToolCall>,
     done: bool,
     error: Option<String>,
+    /// This slot's console window. Opened on the main thread so ordinals
+    /// follow block order, then borrowed by the slot's generation thread.
+    mirror: crate::debugmirror::SubagentMirror,
 }
 
 /// Parses a `/btw <question>` line, returning the question. Accepts a
@@ -925,11 +928,20 @@ fn generate_fanout_round(
                 let collected = sink.clone();
                 // `edit_preflight` is not `Clone`, so build one per slot.
                 let preflight = edit_preflight_cwd(cwd);
-                let engine = slot.engine.as_mut();
+                // Split the slot's two borrows apart explicitly: `engine` is
+                // taken mutably while `mirror` is only read, and destructuring
+                // is what lets the borrow checker see they are disjoint fields.
+                let FanoutSlot { engine, mirror, .. } = slot;
+                let engine = engine.as_mut();
                 handles.push((
                     i,
                     collected,
                     scope.spawn(move || {
+                        // First statement in the thread: everything this slot
+                        // generates goes to its own window. The guard's life is
+                        // exactly the thread's, and the thread is exactly one
+                        // slot.
+                        let _active = mirror.activate();
                         generate_pass(
                             engine,
                             prompt,
@@ -2100,7 +2112,15 @@ impl Agent<'_> {
             }
             SubSinkTarget::Null | SubSinkTarget::Stdout => None,
         };
-        let result = self.run_subagent_rounds();
+        // Its own console window, on the same restore-on-every-exit-path
+        // discipline as the status sink above. The guard is scoped to the
+        // rounds, so nesting works for free: guards stack LIFO, matching
+        // `fork_kv`.
+        let mirror = crate::debugmirror::open_subagent();
+        let result = {
+            let _active = mirror.activate();
+            self.run_subagent_rounds()
+        };
         self.tool_ctx.status_sink = parent_sink;
         result
     }
@@ -2256,6 +2276,10 @@ fn generate_pass(
     stream.set_tool_names(ctx.tool_names.clone());
     if !ctx.think_off && !engine.wants_structured() {
         stream.begin_in_think();
+        // Same guard as the parent paths: the local chat template pre-opens
+        // `<think>` without emitting the tag, and the console only ever sees
+        // bytes, so it needs the tag injected to reach the same state.
+        crate::debugmirror::begin_in_think();
     }
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
@@ -2283,6 +2307,10 @@ fn generate_pass(
                 if let EngineEvent::Text(t) = ev {
                     assistant_text.push_str(&t);
                     stream.push(&t);
+                    // Tee to whichever console window this thread is routed to
+                    // — a sub-agent's when a `SubagentMirror` guard is active,
+                    // the parent's otherwise.
+                    crate::debugmirror::push(&t);
                     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
                     if stream.preflight_error().is_some() {
                         preflight_stop.store(true, Ordering::Relaxed);
@@ -2292,6 +2320,7 @@ fn generate_pass(
         )
         .map_err(|e| e.to_string())?;
     stream.finish();
+    crate::debugmirror::flush();
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stats.interrupted && preflight_error.is_none() {
         crate::interrupt::clear();
@@ -6139,6 +6168,7 @@ the original is frozen and listed in /tree"
                         pending_calls: Vec::new(),
                         done: false,
                         error: None,
+                        mirror: crate::debugmirror::open_subagent(),
                     });
                 }
                 Ok((key, engine)) => {
@@ -18967,6 +18997,35 @@ mod tests {
             "the cached engine served every dispatch"
         );
         unsafe { std::env::remove_var(KEY) };
+    }
+
+    /// Fan-out ordinals are handed out on the main thread while slots are
+    /// built, so they follow block order deterministically rather than
+    /// whichever thread happens to start first.
+    #[test]
+    fn fanout_slots_take_distinct_ordinals_in_block_order() {
+        let a = crate::debugmirror::open_subagent();
+        let b = crate::debugmirror::open_subagent();
+        let c = crate::debugmirror::open_subagent();
+        let mut ids = vec![a.id(), b.id(), c.id()];
+        ids.dedup();
+        assert_eq!(ids.len(), 3, "every slot needs its own window");
+    }
+
+    /// A serial sidechain must leave the thread routed back at the parent
+    /// window when it returns, however it returns — the parent's next turn
+    /// streams on this same thread.
+    #[test]
+    fn a_serial_sidechain_restores_the_parent_mirror_target() {
+        let sub = crate::debugmirror::open_subagent();
+        assert_ne!(sub.id(), crate::debugmirror::MirrorId::PARENT);
+        {
+            let _active = sub.activate();
+        }
+        assert_eq!(
+            crate::debugmirror::current_for_test(),
+            crate::debugmirror::MirrorId::PARENT
+        );
     }
 
     #[test]
