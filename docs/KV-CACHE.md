@@ -340,11 +340,23 @@ per live session, in memory (`Agent::ladder`) plus one blob per rung on disk.
   `render_transcript` has no length-dependent formatting, so replaying that
   same truncation later reproduces the byte-identical render to fingerprint
   against.
-- **Spacing.** `KvLadder::wants_rung` only calls for a new capture once the
-  live transcript is at least `LADDER_MIN_SPACING_TOKENS` (4096) tokens past
-  the deepest existing rung — otherwise every turn would push a near-duplicate
-  and the ladder would cluster uselessly at the live end, where a rung can
-  never predate an edit.
+- **Placement.** A rung is captured as an *anchor*, immediately before a tool
+  result larger than `MICROCOMPACT_MIN_BYTES` is appended to the transcript
+  (`Agent::anchor_rung_before_tool_result`). At that instant
+  `transcript.len()` is exactly the index that result will occupy, which is
+  exactly the index `microcompact_first_index` later reports as the edit point,
+  so `select`'s `spans <= edit` holds with equality. Capturing at *turn ends*
+  instead — the original design — can never work: micro-compaction clears
+  oldest-first, so the edit sits near the start of the transcript, while within
+  a single turn the transcript jumps from 1 span to 6 and no turn boundary
+  exists at a usable depth. A measured 18-turn session captured 11 turn-end
+  rungs and used none of them.
+- **Spacing.** `KvLadder::wants_anchor` suppresses a capture when the ladder
+  already holds a rung shallow enough to cover this index (the same test
+  `select` applies), unless the new anchor is at least
+  `LADDER_ANCHOR_MIN_SPACING_TOKENS` (8192) tokens deeper. Since
+  `microcompact_first_index` is monotone non-decreasing, only a handful of
+  anchors per session are ever useful.
 - **Eviction.** At most `LADDER_MAX_RUNGS` (3) rungs are held per session.
   Pushing a fourth evicts whichever interior rung's removal least widens the
   largest remaining gap — never the shallowest rung (the only one that can

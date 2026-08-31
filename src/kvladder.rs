@@ -8,11 +8,19 @@
 /// ~0.1s, against the minutes of prefill a rebuild costs.
 pub const LADDER_MAX_RUNGS: usize = 3;
 
-/// A new rung must sit at least this far past the deepest existing one.
-/// Without it every turn would push a near-duplicate and the rungs would
-/// cluster at the live end, where they are useless: a rung only helps when it
-/// *predates* the edit that invalidates the KV.
-pub const LADDER_MIN_SPACING_TOKENS: i32 = 4096;
+/// A new anchor must cover at least this many tokens more than the best rung
+/// that already predates the same edit point, or it is not worth capturing.
+///
+/// Anchors are taken at the transcript index a large tool result is about to
+/// occupy, so the *first* one for a given index is free of competition and
+/// always taken. This constant governs only the follow-ups: as
+/// `microcompact_first_index` marches forward, a deeper anchor covers more
+/// tokens and so leaves less to re-prefill, but each capture is a certain cost
+/// (~0.3s and a few hundred MB written) against a probabilistic gain. At the
+/// measured ~100 tok/s prefill, 8192 tokens is ~80s of prefill saved *if* the
+/// pass fires — three orders of magnitude above the capture cost — while
+/// halving the capture rate the old blind turn-end spacing (4096) produced.
+pub const LADDER_ANCHOR_MIN_SPACING_TOKENS: i32 = 8192;
 
 /// One stored snapshot, identified by how much of the transcript it covers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,13 +53,21 @@ impl KvLadder {
         &self.rungs
     }
 
-    /// Whether a snapshot at `tokens` is far enough past the deepest rung to
-    /// be worth capturing.
+    /// Whether an anchor for an edit at transcript index `spans`, covering
+    /// `tokens`, is worth capturing.
+    ///
+    /// Two rules, in this order:
+    /// 1. **Redundancy.** If the ladder already holds a rung shallow enough to
+    ///    cover an edit at `spans` (exactly [`Self::select`]'s test, so the
+    ///    answer matches what a restore would actually find), a new capture
+    ///    buys nothing but depth.
+    /// 2. **Spacing.** Extra depth is only bought when it is worth at least
+    ///    [`LADDER_ANCHOR_MIN_SPACING_TOKENS`], so anchors cannot be taken back
+    ///    to back across a run of tool calls in one turn.
     #[must_use]
-    pub fn wants_rung(&self, tokens: i32) -> bool {
-        self.rungs
-            .last()
-            .is_none_or(|deepest| tokens - deepest.tokens >= LADDER_MIN_SPACING_TOKENS)
+    pub fn wants_anchor(&self, spans: usize, tokens: i32) -> bool {
+        self.select(spans, 0)
+            .is_none_or(|best| tokens - best.tokens >= LADDER_ANCHOR_MIN_SPACING_TOKENS)
     }
 
     /// Records a rung at `spans`/`tokens`, evicting one when full. Returns the
@@ -101,14 +117,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_rung_is_only_wanted_once_it_is_far_enough_past_the_deepest() {
+    fn an_anchor_is_only_wanted_when_it_is_uncovered_or_materially_deeper() {
         let mut l = KvLadder::new();
-        // An empty ladder always wants its first rung.
-        assert!(l.wants_rung(1000));
+        // An empty ladder always wants its first anchor.
+        assert!(l.wants_anchor(5, 1000));
         l.push(5, 14_000);
-        // Too close to the deepest rung to be worth 0.4s of capture.
-        assert!(!l.wants_rung(14_000 + LADDER_MIN_SPACING_TOKENS - 1));
-        assert!(l.wants_rung(14_000 + LADDER_MIN_SPACING_TOKENS));
+        // An edit at span 5 or later is already covered by that rung, so a new
+        // anchor must buy real depth.
+        assert!(!l.wants_anchor(9, 14_000 + LADDER_ANCHOR_MIN_SPACING_TOKENS - 1));
+        assert!(l.wants_anchor(9, 14_000 + LADDER_ANCHOR_MIN_SPACING_TOKENS));
+        // An edit *before* the rung is not covered by it at all: the spacing
+        // rule must not suppress the only anchor that could ever help.
+        assert!(l.wants_anchor(4, 100));
     }
 
     #[test]

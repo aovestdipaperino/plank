@@ -256,8 +256,9 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   dependency). Micro-compaction rewrites old tool-result bodies *in place*,
   which the engine can only ever prefill again from token zero unless a
   snapshot exists that predates the rewrite; `Agent` (`ui.rs`) captures a rung
-  at end of turn when the ladder wants one (`refresh_ladder` /
-  `flush_kv_end_of_turn`) and restores the deepest usable one immediately
+  just before a large tool result is appended to the transcript
+  (`anchor_rung_before_tool_result`, at exactly the index micro-compaction will
+  later rewrite) and restores the deepest usable one immediately
   before a compaction pass mutates the transcript (`restore_rung_below`), so
   the engine extends forward from the rung instead of rebuilding. See
   `docs/KV-CACHING.md` and `docs/KV-CACHE.md` for the full mechanics.

@@ -2455,6 +2455,10 @@ impl Agent<'_> {
                     };
                     println!("{line}");
                 }
+                // The KV snapshot that makes micro-compaction cheap: taken
+                // here, the rung sits at exactly the index this result will
+                // occupy, which is the index microcompact will later rewrite.
+                self.anchor_rung_before_tool_result(observations.len());
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -3077,7 +3081,7 @@ impl Agent<'_> {
         // of them died with it. Left in place they would freeze the ladder for
         // the rest of the session: post-compaction token counts are by
         // construction far below the pre-compaction deepest rung, so
-        // `wants_rung` would refuse every new capture, and `select` would keep
+        // `wants_anchor` would refuse every new capture, and `select` would keep
         // returning rungs whose truncated render can no longer be fingerprinted
         // — the ladder would be permanently dead from the first full compaction
         // onward, the moment it is most needed.
@@ -4655,34 +4659,27 @@ the original is frozen and listed in /tree"
         self.save_session_payload()
     }
 
-    /// End-of-turn KV persistence: at most one `get_kv`, feeding both the
-    /// ladder rung and the session payload.
+    /// End-of-turn KV persistence: the session payload, when the transcript
+    /// has moved.
     ///
-    /// `refresh_ladder` and `save_payload_if_dirty` used to run back to back
-    /// and each capture the KV over identical state — ~0.8s and ~800 MB of
-    /// writes per rung turn for two copies of the same bytes. Both halves stay
-    /// best-effort: the dirty flag clears regardless of outcome, so a backend
-    /// with no KV does not retry every turn.
+    /// This used to also push a ladder rung, sharing the one `get_kv`. It no
+    /// longer does. A turn-end rung lands at `spans == transcript.len()` after
+    /// a whole turn of tool traffic, and `microcompact` clears OLDEST-first, so
+    /// the edit index it must predate sits *near the start* of the transcript —
+    /// in the measured 18-turn run the shallowest turn-end rung was at spans=6
+    /// against an edit at index 5, missing by one span, and the ladder was
+    /// never used once. Turn ends are simply the wrong instant: within one turn
+    /// the transcript jumps from 1 span to 6, so no turn boundary exists at a
+    /// usable depth. Rungs now come from [`Agent::anchor_rung_before_tool_result`],
+    /// which captures at exactly the index a large tool result will occupy.
+    /// Keeping both would also have turn-end rungs competing for the three
+    /// [`crate::kvladder::LADDER_MAX_RUNGS`] slots and evicting anchors that
+    /// can actually be selected.
+    ///
+    /// Best-effort as before: the dirty flag clears regardless of outcome, so a
+    /// backend with no KV does not retry every turn.
     fn flush_kv_end_of_turn(&mut self) {
-        let wanted = self.ladder_capture_wanted();
-        // The flag clears either way, as it always did: a backend with no KV
-        // must not retry every turn.
-        let dirty = std::mem::take(&mut self.payload_dirty);
-        // An unnamed session has nowhere to write a payload, so capturing for
-        // one would be pure cost.
-        let save = dirty && !self.session.id.is_empty();
-        if wanted.is_none() && !save {
-            return;
-        }
-        let Some(cache) = self.engine.get_kv() else {
-            return;
-        };
-        if let Some(tokens) = wanted {
-            self.push_rung(&cache, tokens);
-        }
-        if save {
-            self.store_payload(&cache);
-        }
+        self.save_payload_if_dirty();
     }
 
     /// Forgets the live session's ladder and deletes its blobs.
@@ -4690,10 +4687,10 @@ the original is frozen and listed in /tree"
     /// Every rung is a snapshot of *this* session's KV prefix, so anything that
     /// replaces or rewrites the transcript — `/new`, `/clear`, `/switch`,
     /// `/resume`, a full compaction, exit — invalidates all of them at once.
-    /// Leaving the ladder in place is worse than useless: `wants_rung` keeps
-    /// comparing against the stale deepest rung's token count, so a smaller
-    /// fresh transcript yields a negative delta and no capture ever happens
-    /// again, while `select` hands back rungs whose prefix no longer exists.
+    /// Leaving the ladder in place is worse than useless: `wants_anchor` keeps
+    /// comparing against a stale rung's token count, so a smaller fresh
+    /// transcript looks already covered and no capture ever happens again,
+    /// while `select` hands back rungs whose prefix no longer exists.
     /// Best-effort: a failed delete must never fail a turn or an exit.
     fn discard_ladder(&mut self) {
         if !self.session.id.is_empty() {
@@ -4702,17 +4699,52 @@ the original is frozen and listed in /tree"
         self.ladder = crate::kvladder::KvLadder::new();
     }
 
-    /// The token depth a rung would be captured at, or `None` when the ladder
-    /// does not want one. Split out of [`Agent::refresh_ladder`] so the
-    /// end-of-turn flush can decide whether a capture is needed *before*
-    /// paying for `get_kv`.
-    fn ladder_capture_wanted(&mut self) -> Option<i32> {
-        if self.session.id.is_empty() {
-            return None;
+    /// Captures an *anchor* rung immediately before a tool result of
+    /// `body_len` bytes is appended to the transcript.
+    ///
+    /// This is the rung placement that makes the ladder usable at all. At this
+    /// instant `session.transcript.len()` is exactly the index that result will
+    /// occupy, which is exactly the index [`compact::microcompact_first_index`]
+    /// will later report as the edit point when that body is cleared — so
+    /// [`crate::kvladder::KvLadder::select`]'s `spans <= edit` holds with
+    /// equality, the best a rung can do. Only bodies over
+    /// [`compact::MICROCOMPACT_MIN_BYTES`] can ever enter the clear set, so
+    /// nothing smaller is worth anchoring.
+    ///
+    /// The KV/transcript invariant holds here: the caller has already pushed
+    /// the assistant message carrying the tool call
+    /// (`session.push(Message::assistant(...))` runs before the dispatch), and
+    /// the engine's KV covers the prompt it was given plus the tokens it just
+    /// generated — i.e. the transcript exactly as it now stands. The rung is
+    /// signed with `payload_fingerprint_for(&self.session)` over that same
+    /// state, and [`Agent::restore_rung_below`] reproduces it by truncating to
+    /// `rung.spans`, which is a no-op here since `spans == transcript.len()`.
+    ///
+    /// Cost control, in order: an unnamed session has nowhere to store a rung;
+    /// with `context.microcompact` off nothing will ever rewrite the transcript
+    /// so there is nothing to anchor for; and
+    /// [`crate::kvladder::KvLadder::wants_anchor`] suppresses an anchor the
+    /// ladder already covers or that buys too little depth. `count_tokens` is
+    /// cheap and runs before `get_kv`, so a suppressed anchor pays no capture.
+    ///
+    /// Best-effort throughout: no failure here may fail a turn.
+    fn anchor_rung_before_tool_result(&mut self, body_len: usize) {
+        if body_len <= compact::MICROCOMPACT_MIN_BYTES || self.session.id.is_empty() {
+            return;
         }
+        if !crate::settings::active().context.microcompact {
+            return;
+        }
+        let spans = self.session.transcript.len();
         let rendered = render_transcript(&self.session, &self.system);
         let tokens = self.engine.count_tokens(&rendered);
-        self.ladder.wants_rung(tokens).then_some(tokens)
+        if !self.ladder.wants_anchor(spans, tokens) {
+            return;
+        }
+        let Some(cache) = self.engine.get_kv() else {
+            return;
+        };
+        self.push_rung(&cache, tokens);
     }
 
     /// Records a rung for an already-captured KV, writing its blob and
@@ -4761,7 +4793,7 @@ the original is frozen and listed in /tree"
         }
         crate::engine::kv_debug(|| {
             format!(
-                "ladder capture: rung {} at spans={spans} tokens={tokens}{}",
+                "ladder capture: anchor rung {} at spans={spans} tokens={tokens}{}",
                 rung.index,
                 evicted.map_or_else(String::new, |e| format!(" (evicted rung {})", e.index))
             )
@@ -9680,6 +9712,9 @@ impl Agent<'_> {
                 for warning in self.tool_ctx.hook_warnings.drain(..) {
                     let _ = tx.send(UiEvent::Dim(warning));
                 }
+                // Mirror of the plain-stdout path: anchor the rung at the
+                // index this result will occupy, before it is appended.
+                self.anchor_rung_before_tool_result(observations.len());
                 self.session.push(Message::user(format!(
                     "<tool_result>{observations}</tool_result>"
                 )));
@@ -13930,11 +13965,11 @@ mod tests {
     }
 
     impl Agent<'_> {
-        /// Drives the real end-of-turn flush and returns the rung it captured.
-        /// The empty ladder always wants its first rung, so this is a genuine
+        /// Drives the real anchor capture and returns the rung it produced.
+        /// The empty ladder always wants its first anchor, so this is a genuine
         /// capture through the production path.
         fn capture_first_rung(&mut self) -> crate::kvladder::Rung {
-            self.flush_kv_end_of_turn();
+            self.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
             *self
                 .ladder
                 .rungs()
@@ -13995,6 +14030,7 @@ mod tests {
         agent.store.save(&mut agent.session).unwrap();
         agent.payload_dirty = true;
         agent.flush_kv_end_of_turn();
+        agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
         assert!(agent.ladder.rungs().is_empty());
     }
 
@@ -14082,6 +14118,188 @@ mod tests {
                 .any(|e| e.starts_with("restore:")),
             "a real hit must run the restore, not just select the rung: {:?}",
             events.lock().unwrap()
+        );
+    }
+
+    /// THE defect this whole feature turned on: rungs were captured at TURN
+    /// ENDS, and `microcompact` clears OLDEST-first, so the edit index sits
+    /// near the start of the transcript where no turn boundary exists. An
+    /// anchor is captured at the instant `transcript.len()` equals the index
+    /// the tool result is about to occupy — the exact index
+    /// `microcompact_first_index` later reports.
+    #[test]
+    fn an_anchor_rung_lands_at_the_index_the_tool_result_will_occupy() {
+        let dir = scratch_dir("ladder-anchor-index");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        // Without a real id every capture/restore path short-circuits.
+        agent.store.save(&mut agent.session).unwrap();
+
+        let will_occupy = agent.session.transcript.len();
+        agent.anchor_rung_before_tool_result(20_000);
+        let rung = *agent
+            .ladder
+            .rungs()
+            .last()
+            .expect("a large tool result must be anchored");
+        assert_eq!(
+            rung.spans, will_occupy,
+            "the anchor must sit at the index the result will occupy"
+        );
+        assert!(
+            events.lock().unwrap().iter().any(|e| e == "capture"),
+            "the anchor must really snapshot the KV: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// The end-to-end assertion the feature exists for: after an anchor, a
+    /// real `restore_rung_below` at the real `microcompact_first_index` is a
+    /// genuine hit, through the real fingerprint lookup and a real `set_kv`.
+    /// With turn-end capture only, the shallowest rung sat one span PAST the
+    /// edit and this returned `None` on every session.
+    #[test]
+    fn an_anchor_makes_the_restore_at_the_real_edit_index_hit() {
+        let dir = scratch_dir("ladder-anchor-restore");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        let big = "a".repeat(20_000);
+        agent.anchor_rung_before_tool_result(big.len());
+        let rung = *agent.ladder.rungs().last().expect("anchored");
+        agent
+            .session
+            .push(Message::user(format!("<tool_result>{big}</tool_result>")));
+        // Three newer results, so the anchored one falls outside the
+        // newest-`MICROCOMPACT_KEEP_RESULTS` keep window and becomes the
+        // clearing candidate.
+        for _ in 0..3 {
+            agent.session.push(Message::assistant("more"));
+            agent.session.push(Message::user(format!(
+                "<tool_result>{}</tool_result>",
+                "b".repeat(1_000)
+            )));
+        }
+        let edit = compact::microcompact_first_index(&agent.session.transcript)
+            .expect("the anchored result must be the clearing candidate");
+        assert_eq!(edit, rung.spans, "the anchor must sit exactly at the edit");
+
+        events.lock().unwrap().clear();
+        assert_eq!(
+            agent.restore_rung_below(edit),
+            Some(rung.tokens),
+            "the anchored rung must be found and restored for its own edit"
+        );
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.starts_with("restore:")),
+            "a real hit runs set_kv, not just select: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Only bodies over `MICROCOMPACT_MIN_BYTES` can ever enter the clear set,
+    /// so a small result has nothing to anchor for and must not pay ~0.3s and
+    /// hundreds of MB for a rung.
+    #[test]
+    fn a_small_tool_result_is_never_anchored() {
+        let dir = scratch_dir("ladder-anchor-small");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "a body that can never be cleared must not be anchored"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "and it must not even reach get_kv: {:?}",
+            events.lock().unwrap()
+        );
+    }
+
+    /// Cost control: a tool-heavy turn fires several large results back to
+    /// back. Once a rung predates them all, another capture buys only depth,
+    /// and depth under `LADDER_ANCHOR_MIN_SPACING_TOKENS` is not worth the
+    /// write. The guard runs before `get_kv`, so a suppressed anchor is free.
+    #[test]
+    fn a_redundant_anchor_is_suppressed_until_it_buys_real_depth() {
+        let dir = scratch_dir("ladder-anchor-spacing");
+        let cfg = test_cfg();
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do a thing"));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.store.save(&mut agent.session).unwrap();
+
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(agent.ladder.rungs().len(), 1);
+
+        // A second large result a few hundred bytes later: the first rung
+        // already predates it, and the extra depth is far under the spacing
+        // floor.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(600)
+        )));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        events.lock().unwrap().clear();
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            1,
+            "a redundant anchor must be suppressed"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "and suppression must happen before get_kv: {:?}",
+            events.lock().unwrap()
+        );
+
+        // Now a genuinely deeper point: the default `count_tokens` is ~4 bytes
+        // per token, so this pushes well past the spacing floor and the anchor
+        // is worth taking.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "c".repeat(4 * crate::kvladder::LADDER_ANCHOR_MIN_SPACING_TOKENS as usize)
+        )));
+        agent.session.push(Message::assistant("<tool>bash</tool>"));
+        agent.anchor_rung_before_tool_result(20_000);
+        assert_eq!(
+            agent.ladder.rungs().len(),
+            2,
+            "an anchor that buys real depth must still be taken"
         );
     }
 
@@ -14274,7 +14492,7 @@ mod tests {
     /// `/new`, `/clear`, `/switch`, both `/resume` paths and `resume_by_id`
     /// reset `checkpoints`, `usage` and `last_ctx_used` but used to leave
     /// `self.ladder` alone. That orphaned the old session's blobs on disk and,
-    /// worse, left `wants_rung` comparing a fresh, smaller transcript against
+    /// worse, left `wants_anchor` comparing a fresh, smaller transcript against
     /// the old deepest rung's token count — a negative delta, so no capture
     /// ever happened again and the feature silently stopped working.
     #[test]
@@ -14303,12 +14521,12 @@ mod tests {
             "the old session's blob must go with it"
         );
         // The reset is what lets a smaller fresh transcript capture again.
-        assert!(agent.ladder.wants_rung(10));
+        assert!(agent.ladder.wants_anchor(0, 10));
     }
 
     /// A full compaction replaces the transcript, so every rung's prefix ceases
     /// to exist. Leaving them behind freezes the ladder for the rest of the
-    /// session (`wants_rung` refuses, `select` misses) exactly when the feature
+    /// session (`wants_anchor` refuses, `select` misses) exactly when the feature
     /// matters most, so `rebuild_after_compact` must clear it.
     #[test]
     fn a_full_compaction_clears_the_ladder() {
