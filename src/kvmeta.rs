@@ -47,6 +47,8 @@ pub enum KvRole {
     Project,
     /// Tier 4: one conversation's KV payload.
     Session,
+    /// One rung of a session's snapshot ladder.
+    Rung,
 }
 
 impl KvRole {
@@ -57,6 +59,7 @@ impl KvRole {
             Self::System => "system",
             Self::Project => "project",
             Self::Session => "session",
+            Self::Rung => "rung",
         }
     }
 }
@@ -96,6 +99,16 @@ pub enum KvLabel {
     },
     /// No detail recorded — a synthesized or partially written sidecar.
     Unknown,
+    /// Ladder rung detail, so `/kvcache` shows it under its session rather
+    /// than as an unattributed root.
+    Rung {
+        /// Session id this rung belongs to.
+        session: String,
+        /// Transcript spans the blob covers.
+        spans: usize,
+        /// Tokens the blob covers.
+        tokens: i32,
+    },
 }
 
 /// Advisory metadata for one persisted KV blob.

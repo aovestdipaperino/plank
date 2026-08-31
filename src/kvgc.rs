@@ -77,7 +77,7 @@ impl SweepPolicy {
     /// TTL for `role`.
     fn ttl(&self, role: KvRole) -> u64 {
         match role {
-            KvRole::Session => self.ttl_session_secs,
+            KvRole::Session | KvRole::Rung => self.ttl_session_secs,
             KvRole::System | KvRole::Project => self.ttl_tier_secs,
         }
     }

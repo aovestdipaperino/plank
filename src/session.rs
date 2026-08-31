@@ -409,6 +409,20 @@ pub enum KvKey {
     /// prompt, and rendered transcript. Keying on the id alone would make a
     /// payload captured under a different model or system prompt a hit.
     Session { id: String, fp: String },
+    /// One rung of a session's KV snapshot ladder. `<id>.rung-<n>.kv_raw`.
+    ///
+    /// Same trust rule as [`KvKey::Session`]: named by session id and slot so
+    /// it can be found and replaced, but only used when its stored signature
+    /// equals `fp`. A rung captured under a different model, system prompt, or
+    /// transcript prefix reads back as a miss and is rebuilt.
+    Rung {
+        /// Session this rung belongs to.
+        id: String,
+        /// Slot number within the ladder.
+        index: usize,
+        /// Payload fingerprint the blob must carry to be trusted.
+        fp: String,
+    },
 }
 
 impl KvKey {
@@ -417,7 +431,10 @@ impl KvKey {
     #[must_use]
     pub fn signature(&self) -> &str {
         match self {
-            Self::System { fp } | Self::Project { fp, .. } | Self::Session { fp, .. } => fp,
+            Self::System { fp }
+            | Self::Project { fp, .. }
+            | Self::Session { fp, .. }
+            | Self::Rung { fp, .. } => fp,
         }
     }
 }
@@ -467,6 +484,13 @@ impl SessionStore {
     #[must_use]
     pub fn payload_path(&self, id: &str) -> PathBuf {
         self.dir.join(format!("{id}{PAYLOAD_EXT}"))
+    }
+
+    /// Path of one ladder rung's blob. Named by session id and slot so a
+    /// refresh overwrites in place rather than accumulating files.
+    #[must_use]
+    pub fn rung_path(&self, id: &str, index: usize) -> PathBuf {
+        self.dir.join(format!("{id}.rung-{index}.kv_raw"))
     }
 
     /// Size in bytes of a session's KV payload sidecar; 0 when absent.
@@ -751,6 +775,7 @@ impl SessionStore {
             KvKey::System { fp } => self.dir.join(sysprompt_checkpoint_name(fp)),
             KvKey::Project { dir, fp } => self.project_checkpoint_path(dir, fp),
             KvKey::Session { id, .. } => self.payload_path(id),
+            KvKey::Rung { id, index, .. } => self.rung_path(id, *index),
         }
     }
 
@@ -1432,6 +1457,7 @@ pub fn kv_role(key: &KvKey) -> crate::kvmeta::KvRole {
         KvKey::System { .. } => crate::kvmeta::KvRole::System,
         KvKey::Project { .. } => crate::kvmeta::KvRole::Project,
         KvKey::Session { .. } => crate::kvmeta::KvRole::Session,
+        KvKey::Rung { .. } => crate::kvmeta::KvRole::Rung,
     }
 }
 
@@ -4158,6 +4184,27 @@ hello\n";
     }
 
     #[test]
+    fn a_rung_is_named_by_session_and_slot_and_signed_by_fingerprint() {
+        let dir = temp_dir("rung");
+        let store = SessionStore::open(&dir).unwrap();
+        let key = KvKey::Rung {
+            id: "zany-turing".to_owned(),
+            index: 2,
+            fp: "deadbeef".to_owned(),
+        };
+        assert_eq!(key.signature(), "deadbeef");
+        assert_eq!(store.kv_path(&key), store.rung_path("zany-turing", 2));
+        assert!(
+            store
+                .kv_path(&key)
+                .to_string_lossy()
+                .ends_with("zany-turing.rung-2.kv_raw")
+        );
+        assert_eq!(kv_role(&key), crate::kvmeta::KvRole::Rung);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn kv_role_maps_each_key_variant() {
         use crate::kvmeta::KvRole;
         assert_eq!(kv_role(&KvKey::System { fp: "a".into() }), KvRole::System);
@@ -4174,6 +4221,14 @@ hello\n";
                 fp: "c".into()
             }),
             KvRole::Session
+        );
+        assert_eq!(
+            kv_role(&KvKey::Rung {
+                id: "i".into(),
+                index: 0,
+                fp: "d".into()
+            }),
+            KvRole::Rung
         );
     }
 }

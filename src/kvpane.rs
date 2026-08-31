@@ -493,6 +493,7 @@ fn detail_of(m: &KvMeta) -> String {
             }
         }
         KvLabel::Unknown => String::new(),
+        KvLabel::Rung { session, spans, .. } => format!("{session} · {spans} spans"),
     }
 }
 
