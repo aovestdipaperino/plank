@@ -98,20 +98,37 @@ pub fn set_session_id(id: &str) {
 /// blindly — a name that would not survive the handshake falls back rather
 /// than silently losing the mirror.
 fn sanitize_name(raw: &str) -> String {
-    // Budget the truncation against the prefix, not the raw id: taking 64
-    // first and prefixing after would push the wire name past the console's
-    // 64-byte limit and get the handshake refused, which shows up as a
-    // silently missing window rather than an error.
-    let budget = 64 - NAME_PREFIX.len();
+    name_with_suffix(raw, "")
+}
+
+/// The window name for one sub-agent: the parent's name plus `:subagent-<n>`.
+///
+/// The suffix is budgeted *before* the session is truncated, for the same
+/// reason the prefix is (see [`name_with_suffix`]): a wire name over 64 bytes
+/// gets the handshake refused, which shows up as a missing window rather than
+/// an error.
+fn subagent_name(raw: &str, ordinal: usize) -> String {
+    name_with_suffix(raw, &format!(":subagent-{ordinal}"))
+}
+
+/// Builds `<prefix><session><suffix>`, truncating only the session part so the
+/// whole thing fits the console's 64-byte limit. An empty session falls back to
+/// [`FALLBACK_NAME`], suffix still applied.
+fn name_with_suffix(raw: &str, suffix: &str) -> String {
+    // Budget the truncation against the prefix *and* the suffix, not the raw
+    // id: taking 64 first and decorating after would push the wire name past
+    // the console's 64-byte limit and get the handshake refused, which shows
+    // up as a silently missing window rather than an error.
+    let budget = 64 - NAME_PREFIX.len() - suffix.len();
     let cleaned: String = raw
         .chars()
         .filter(char::is_ascii_graphic)
         .take(budget)
         .collect();
     if cleaned.is_empty() {
-        FALLBACK_NAME.to_string()
+        format!("{FALLBACK_NAME}{suffix}")
     } else {
-        format!("{NAME_PREFIX}{cleaned}")
+        format!("{NAME_PREFIX}{cleaned}{suffix}")
     }
 }
 
@@ -228,6 +245,38 @@ mod tests {
             "wire name must fit the console's limit, got {} bytes: {name}",
             name.len()
         );
+    }
+
+    #[test]
+    fn a_subagent_name_carries_the_session_and_the_ordinal() {
+        assert_eq!(
+            subagent_name("mellow-pauling", 3),
+            "plank:mellow-pauling:subagent-3"
+        );
+    }
+
+    /// The suffix has to come out of the same 64-byte budget as the prefix.
+    /// Truncating the session to 58 and *then* appending `:subagent-12` would
+    /// push the wire name past the console's limit and get the handshake
+    /// refused -- a silently missing window rather than an error.
+    #[test]
+    fn a_long_session_id_still_fits_once_the_subagent_suffix_is_added() {
+        let name = subagent_name(&"x".repeat(200), 12);
+        assert!(name.starts_with(NAME_PREFIX), "{name}");
+        assert!(name.ends_with(":subagent-12"), "{name}");
+        assert!(
+            name.len() <= 64,
+            "wire name must fit the console's limit, got {} bytes: {name}",
+            name.len()
+        );
+    }
+
+    /// A session whose id sanitizes to nothing still gets a usable, distinct
+    /// window per sub-agent rather than collapsing onto the parent's fallback.
+    #[test]
+    fn a_subagent_of_an_unnamed_session_still_gets_its_own_name() {
+        let name = subagent_name("   ", 1);
+        assert_eq!(name, "plank:unnamed:subagent-1");
     }
 
     #[test]
