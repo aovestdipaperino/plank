@@ -6,6 +6,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/insights` is differential.** The scan has always been incremental; the
+  six model calls were not, and they are what takes minutes. plank now keeps
+  the last report beside it in `usage-data/last-report.json` — its sections,
+  its statistics and the mtime of every session it covered — and reuses the
+  written sections until ten sessions, or a tenth of the history (whichever is
+  smaller), are new or have been written to since. Counted per session rather
+  than by subtracting totals, so a session that grew by twenty turns counts as
+  changed even though the session count did not move. A section the previous
+  run dropped is never reused, so it is written on the next run instead of
+  staying missing; `/insights fresh` rewrites everything regardless, and
+  `fast` neither reads nor writes the state. When there is a previous report,
+  the new one opens with a computed **Since** strip: sessions new or updated,
+  prompts, lines, files, commits, and any tool or friction category that was
+  not there last time.
+
+### Fixed
+
+- **`/insights` writes the two sections it had always dropped.** "Try this
+  next" and "Features to try" were missing from every report ever generated:
+  both reason about what to write and then write it — prompts, an AGENTS.md
+  line, a ready-to-run snippet — and the shared per-section token budget ran
+  out before the JSON object closed, so the answer was never parseable and the
+  section was silently skipped. Those two now get twice the budget, any
+  section that comes back unusable is retried once with thinking off (the
+  whole budget then goes to the answer), and a section that is dropped after
+  both attempts is recorded in `~/.plank/errors.log` — a dropped section
+  leaves no trace in the finished report, which is how two of them stayed
+  missing for as long as they did.
+
 ## [3.5.2] - 2026-08-31
 
 ### Added

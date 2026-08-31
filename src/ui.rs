@@ -1590,12 +1590,6 @@ impl Drop for TitleRestore {
     }
 }
 
-/// Token budget for one `/insights` narrative section, covering the model's
-/// reasoning and the JSON answer that follows it.
-///
-/// Generous enough to think and then answer, bounded so one wandering reply
-/// costs that section rather than the user's afternoon.
-const INSIGHTS_SECTION_TOKENS: i32 = 3000;
 /// Maximum user turns `/history` accepts.
 const HISTORY_MAX_TURNS: usize = 200;
 /// Name of the auto-checkpoint saved before a `/rollback`, so a rollback is
@@ -4109,7 +4103,7 @@ impl Agent<'_> {
                         self.last_edited = Some(path);
                     }
                     Ok(Insights::Cancelled) => println!("insights cancelled"),
-                    Err(e) => println!("insights failed: {e}\nusage: /insights [fast]"),
+                    Err(e) => println!("insights failed: {e}\nusage: /insights [fast|fresh]"),
                 }
             }
             "/repro" => match self.write_repro(arg) {
@@ -5091,6 +5085,10 @@ the original is frozen and listed in /tree"
         use crate::insights;
 
         let fast = matches!(arg.trim(), "fast" | "--fast" | "quick");
+        // `fresh` overrides the reuse below: the prose is written again even
+        // when nothing much has changed, for when the last answer was wrong
+        // rather than stale.
+        let fresh = matches!(arg.trim(), "fresh" | "--fresh" | "full");
         let root = insights::usage_dir();
         let tz = insights::local_utc_offset();
 
@@ -5145,7 +5143,40 @@ the original is frozen and listed in /tree"
         // was never invoked or a hook that never fired.
         agg.extensions = self.extension_inventory();
 
+        // What the last report knew. Two uses: how much is genuinely new
+        // (below), and what the report subtracts from for its "since" strip.
+        let previous = insights::load_state(&root);
+        let changed = previous
+            .as_ref()
+            .map_or(metas.len(), |st| insights::changed_since(st, &metas));
+        if let Some(st) = previous.as_ref() {
+            let d = insights::delta(st, &agg, changed);
+            if !d.is_empty() {
+                agg.delta = Some(d);
+            }
+        }
+
         let mut narrative = insights::Narrative::new();
+        // Reuse the prose while the picture behind it has barely moved. The
+        // sections describe habits, and habits do not change because two more
+        // sessions exist — but writing them costs minutes, every run. A
+        // section the previous run *dropped* is absent from what is reused and
+        // so is written now, which is how a report recovers from a bad night.
+        let reusing = !fast
+            && !fresh
+            && previous.as_ref().is_some_and(|st| {
+                // Both sides count session *files*: the numerator is any
+                // session written to since, so the denominator is all of
+                // them, not the subset substantive enough to report on.
+                !st.narrative.is_empty() && !insights::should_rewrite(changed, metas.len())
+            });
+        if reusing && let Some(st) = previous.as_ref() {
+            narrative.clone_from(&st.narrative);
+            note(format!(
+                "[reusing the written sections from {} · {changed} sessions new or updated]",
+                crate::insights::datetime_str(st.at, tz)
+            ));
+        }
         if agg.sessions_counted == 0 {
             note("[no sessions substantial enough to report on]".to_owned());
         } else if fast {
@@ -5158,6 +5189,10 @@ the original is frozen and listed in /tree"
         } else {
             let context = insights::narrative_context(&agg);
             for spec in insights::SECTIONS {
+                // Already reused from the previous report.
+                if narrative.contains_key(spec.key) {
+                    continue;
+                }
                 if crate::interrupt::pending() {
                     note("[interrupted; writing what is ready]".to_owned());
                     break;
@@ -5175,81 +5210,111 @@ the original is frozen and listed in /tree"
                     insights::ANALYST_SYSTEM,
                     insights::section_prompt(spec, &context)
                 );
-                let mut reply = String::new();
-                // Stream the reasoning as it arrives, the way an ordinary
-                // turn does, so the wait is legible rather than blank.
-                let mut ticker = insights::ThinkTicker::new();
-                // A degenerate reply repeats one clause until the budget runs
-                // out; stopping it early is the difference between a dropped
-                // section and minutes of visible nonsense.
-                let mut guard = insights::RepeatGuard::new();
-                let mut looped = false;
-                // A section is a paragraph or a short list, and the section
-                // budget is what stops one wandering reply from making the
-                // whole report take minutes. The session's own generation
-                // limit is meant for a coding turn and is far too generous
-                // here.
-                let opts = crate::engine::GenerationOptions {
-                    n_predict: INSIGHTS_SECTION_TOKENS,
-                    // Thinking stays on so there is something to show while
-                    // the section is written: a couple of silent minutes per
-                    // section reads as a hang. The budget below covers the
-                    // reasoning and the answer together, and `extract_json`
-                    // takes the answer from after the think block.
-                    think_mode: crate::engine::ThinkMode::Medium,
-                    ..self.cfg.generation.clone()
-                };
-                let stop = AtomicBool::new(false);
-                let generated = self.generate_aside_best(
-                    &prompt,
-                    &opts,
-                    &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-                    &mut |ev| {
-                        if let crate::engine::EngineEvent::Text(t) = ev {
-                            reply.push_str(&t);
-                            for line in ticker.feed(&t) {
-                                tick(line);
+                // Two attempts. The first thinks, because a couple of silent
+                // minutes per section reads as a hang and the streamed
+                // reasoning is what fills the wait. If it yields no JSON —
+                // the budget went on reasoning, or the reply went in circles
+                // — the retry turns thinking off and spends the whole budget
+                // on the answer. That retry is what the two authoring
+                // sections needed: they were absent from every report ever
+                // generated, and nothing said so but a dim line that
+                // scrolled past.
+                let mut value = None;
+                let mut failure = String::new();
+                let mut stopped = false;
+                for think_mode in [
+                    crate::engine::ThinkMode::Medium,
+                    crate::engine::ThinkMode::Off,
+                ] {
+                    let mut reply = String::new();
+                    // Stream the reasoning as it arrives, the way an ordinary
+                    // turn does, so the wait is legible rather than blank.
+                    let mut ticker = insights::ThinkTicker::new();
+                    // A degenerate reply repeats one clause until the budget
+                    // runs out; stopping it early is the difference between a
+                    // dropped section and minutes of visible nonsense.
+                    let mut guard = insights::RepeatGuard::new();
+                    let mut looped = false;
+                    let opts = crate::engine::GenerationOptions {
+                        // Per section: the two that must *write* something to
+                        // paste get more, because they reason about what to
+                        // write and then write it.
+                        n_predict: spec.budget,
+                        think_mode,
+                        ..self.cfg.generation.clone()
+                    };
+                    let stop = AtomicBool::new(false);
+                    let generated = self.generate_aside_best(
+                        &prompt,
+                        &opts,
+                        &|| stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+                        &mut |ev| {
+                            if let crate::engine::EngineEvent::Text(t) = ev {
+                                reply.push_str(&t);
+                                for line in ticker.feed(&t) {
+                                    tick(line);
+                                }
+                                if guard.feed(&t) {
+                                    looped = true;
+                                    stop.store(true, Ordering::Relaxed);
+                                }
+                                // `tick` is where the TUI reads the keyboard,
+                                // so polling here is what turns an Esc pressed
+                                // mid-sentence into a stopped generation rather
+                                // than one noticed at the next section
+                                // boundary.
+                                if crate::interrupt::pending() {
+                                    stop.store(true, Ordering::Relaxed);
+                                }
                             }
-                            if guard.feed(&t) {
-                                looped = true;
-                                stop.store(true, Ordering::Relaxed);
-                            }
-                            // `tick` is where the TUI reads the keyboard, so
-                            // polling here is what turns an Esc pressed
-                            // mid-sentence into a stopped generation rather
-                            // than one noticed at the next section boundary.
-                            if crate::interrupt::pending() {
-                                stop.store(true, Ordering::Relaxed);
-                            }
+                        },
+                    );
+                    // A section the user stopped is not a section that failed:
+                    // say nothing about it and leave, rather than reporting it
+                    // "unavailable" and trying the next one. The model's own
+                    // loop raises the same flag, so it is ruled out first.
+                    if !looped && generated.as_ref().is_ok_and(|s| s.interrupted) {
+                        stopped = true;
+                        break;
+                    }
+                    match generated.map_err(|e| e.to_string()).and_then(|_| {
+                        if looped {
+                            return Err("the model looped".to_owned());
                         }
-                    },
-                );
-                // A section the user stopped is not a section that failed:
-                // say nothing about it and leave the loop, rather than
-                // reporting it "unavailable" and trying the next one.
-                // A section the model looped in is stopped the same way a
-                // user stop is, so it is separated out first: the loop is this
-                // section's failure, not a reason to abandon the rest.
-                if looped {
+                        insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
+                    }) {
+                        Ok(v) => {
+                            value = Some(v);
+                            break;
+                        }
+                        Err(e) => failure = e,
+                    }
+                    if crate::interrupt::pending() {
+                        stopped = true;
+                        break;
+                    }
                     note(format!(
-                        "[\u{201c}{}\u{201d} unavailable: the model looped]",
+                        "[“{}” came back unusable ({failure}); retrying without thinking]",
                         spec.heading
                     ));
-                    continue;
                 }
-                if generated.as_ref().is_ok_and(|s| s.interrupted) {
+                if stopped {
                     note("[stopped; writing the report as it stands]".to_owned());
                     break;
                 }
-                match generated.map_err(|e| e.to_string()).and_then(|_| {
-                    insights::extract_json(&reply).ok_or_else(|| "no JSON in reply".to_owned())
-                }) {
-                    Ok(value) => {
-                        narrative.insert(spec.key.to_owned(), value);
-                    }
+                if let Some(value) = value {
+                    narrative.insert(spec.key.to_owned(), value);
+                } else {
                     // A section that fails is a section the report goes
-                    // without; it never costs the statistics.
-                    Err(e) => note(format!("[“{}” unavailable: {e}]", spec.heading)),
+                    // without; it never costs the statistics. It is written to
+                    // the error log as well, because a dropped section leaves
+                    // no trace in the finished report — which is how two of
+                    // them stayed missing for as long as they did.
+                    crate::errlog::log_error(
+                        "insights",
+                        &format!("section \"{}\" dropped: {failure}", spec.key),
+                    );
+                    note(format!("[“{}” unavailable: {failure}]", spec.heading));
                 }
             }
             crate::interrupt::clear();
@@ -5273,6 +5338,26 @@ the original is frozen and listed in /tree"
             return Ok(Insights::Cancelled);
         };
         let path = insights::write_report(&root, &html, tz, at)?;
+        // Only after the report is on disk: a state file describing a report
+        // that was never written would make the next run reuse prose the user
+        // has never seen, and skip the sessions it claims to have covered.
+        // A failure here costs the next run its shortcut, nothing more.
+        //
+        // Never from a `fast` run: it has no prose to remember, and recording
+        // its scan as "covered" would leave the next full run comparing
+        // against a report that never had sections to reuse.
+        if !fast {
+            let _ = insights::save_state(
+                &root,
+                &insights::ReportState {
+                    version: insights::STATE_VERSION,
+                    at,
+                    snapshot: insights::Snapshot::of(&agg),
+                    narrative: narrative.clone(),
+                    seen: insights::seen_map(&metas),
+                },
+            );
+        }
         Ok(Insights::Done {
             path,
             summary: insights::render_summary(&agg, &narrative, tz, at),
@@ -10525,7 +10610,7 @@ impl Agent<'_> {
                     Ok(Insights::Cancelled) => log.push_dim("insights cancelled".to_owned()),
                     Err(e) => {
                         log.push_plain(format!("insights failed: {e}"));
-                        log.push_dim("usage: /insights [fast]".to_owned());
+                        log.push_dim("usage: /insights [fast|fresh]".to_owned());
                     }
                 }
             }

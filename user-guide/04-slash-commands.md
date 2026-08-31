@@ -90,12 +90,16 @@ See [Extending plank](09-extending.md).
 | `/export [md\|html] [path]` | write the transcript to a shareable file (markdown by default, auto-named; HTML is standalone) |
 | `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
 | `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
-| `/insights [fast]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose) |
+| `/insights [fast\|fresh]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose, `fresh` forces it to be written again) |
 | `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report |
 
 `/repro` is the one to reach for when you want to report a problem: it captures the rendered prompt the engine would see plus the model, backend, context size, sampling settings and think mode, in a single self-contained file. It never touches the live session.
 
 `/insights` computes **every number in code** and uses the model only for prose it cannot replace — a failed or skipped model call costs the report its narrative, never its statistics.
+
+The report is **differential**. Per-session statistics have always been cached and recomputed only for sessions that changed; the written sections now work the same way. plank remembers the last report in `~/.plank/usage-data/last-report.json` and reuses its prose until ten sessions — or a tenth of your history, whichever is smaller — are new or have been written to since. A section the previous run failed to produce is not reused, so it gets written on the next run rather than staying missing. `/insights fresh` writes everything again regardless, for when the last answer was wrong rather than stale.
+
+When there is a previous report to compare against, the new one opens with a **Since** strip: sessions new or updated, prompts, lines, files, commits, and any tool or friction category that was not there last time. It is subtraction of two deterministic aggregates, so it costs nothing and cannot be wrong the way a written summary could.
 
 Suggestions are made to be used, not read: every snippet, prompt and instruction in the report has a **Copy** button, and the **Worth putting in AGENTS.md** list arrives as a checklist — untick what you disagree with, press **Copy all checked**, and paste the rest into plank. The report stays a single self-contained local file: the clipboard handler is inlined next to the stylesheet, with a fallback for `file://`, where the browser clipboard API is unavailable.
 

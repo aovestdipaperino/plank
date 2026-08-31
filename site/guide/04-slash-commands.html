@@ -405,10 +405,11 @@ built on, its size, how often it has been used, and when it expires</td>
 fingerprint prefix</td>
 </tr>
 <tr>
-<td><code>/insights [fast]</code></td>
+<td><code>/insights [fast|fresh]</code></td>
 <td>a usage report computed from every saved session, written to
 <code>~/.plank/usage-data/report.html</code> (<code>fast</code> skips
-the model-written prose)</td>
+the model-written prose, <code>fresh</code> forces it to be written
+again)</td>
 </tr>
 <tr>
 <td><code>/repro [note]</code></td>
@@ -425,6 +426,22 @@ single self-contained file. It never touches the live session.</p>
 and uses the model only for prose it cannot replace — a failed or
 skipped model call costs the report its narrative, never its
 statistics.</p>
+<p>The report is <strong>differential</strong>. Per-session statistics
+have always been cached and recomputed only for sessions that changed;
+the written sections now work the same way. plank remembers the last
+report in <code>~/.plank/usage-data/last-report.json</code> and reuses
+its prose until ten sessions — or a tenth of your history, whichever is
+smaller — are new or have been written to since. A section the previous
+run failed to produce is not reused, so it gets written on the next run
+rather than staying missing. <code>/insights fresh</code> writes
+everything again regardless, for when the last answer was wrong rather
+than stale.</p>
+<p>When there is a previous report to compare against, the new one opens
+with a <strong>Since</strong> strip: sessions new or updated, prompts,
+lines, files, commits, and any tool or friction category that was not
+there last time. It is subtraction of two deterministic aggregates, so
+it costs nothing and cannot be wrong the way a written summary
+could.</p>
 <p>Suggestions are made to be used, not read: every snippet, prompt and
 instruction in the report has a <strong>Copy</strong> button, and the
 <strong>Worth putting in AGENTS.md</strong> list arrives as a checklist
