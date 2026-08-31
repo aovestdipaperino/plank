@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.5.3] - 2026-08-31
+
 ### Added
 
 - **A session's KV cache is saved at the end of every turn, and when you
