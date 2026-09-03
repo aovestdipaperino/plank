@@ -164,6 +164,28 @@ stretch of the transcript that did not change. A measured 18-turn session paid
 `docs/superpowers/specs/2026-08-31-kv-snapshot-ladder-design.md` for the numbers
 and Part 3 below for the fix.
 
+The two outcomes side by side, for a rewrite at span 3 of a 12-span transcript:
+
+```mermaid
+flowchart LR
+    subgraph T["Transcript, 12 spans"]
+        direction LR
+        S0["0 user"] --> S1["1 assistant"] --> S2["2 user"] --> S3["3 tool result<br/>(large body)"] --> S4["4 ..."] --> S11["11 live end"]
+    end
+    S3 -. "micro-compaction rewrites<br/>this body to a stub" .-> EDIT["edit point = 3"]
+    EDIT --> Q{"can the live KV<br/>be reused?"}
+    Q -->|"engine can only extend<br/>past its live end (11)"| FULL["full re-prefill<br/>spans 0..11 from token zero"]
+    Q -->|"a rung captured at<br/>spans = 3 exists"| RESTORE["set_kv(rung)<br/>live end becomes 3"]
+    RESTORE --> EXT["sync extends forward<br/>only spans 3..11"]
+    style FULL fill:#f8d7da,stroke:#b02a37,color:#000
+    style EXT fill:#d1e7dd,stroke:#0f5132,color:#000
+```
+
+And the same thing as it unfolds turn by turn, with and without a rung
+(`docs/img/kv-microcompact-ladder.gif`):
+
+![Micro-compaction with and without a ladder rung](img/kv-microcompact-ladder.gif)
+
 ### A cache boundary has to fall on a message boundary
 
 You might reasonably want to snapshot the KV in the middle of a long block of
@@ -327,6 +349,43 @@ turn the pass declines to fire, and then does so again every turn after,
 since the reclaimable total only grows. The decision and the restore must use
 the exact same selection call, made before either one touches the engine.
 
+The capture and the restore, as one sequence across two turns:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Agent (ui.rs)
+    participant L as KvLadder
+    participant E as Engine
+    participant D as Disk (kvcache)
+
+    Note over A,D: Turn N: a large tool result is about to be appended at index k
+    A->>L: wants_anchor(k, tokens)?
+    L-->>A: yes (no rung covers k, spacing ok)
+    A->>E: get_kv()
+    E-->>A: KV bytes for spans 0..k
+    A->>D: write <id>.rung-n.kv_raw, signed with fingerprint(transcript[..k])
+    A->>L: push(k, tokens)
+    A->>A: append tool result at index k
+
+    Note over A,D: Turn N+m: micro-compaction wants to stub the body at index k
+    A->>A: edit = microcompact_first_index() = k
+    A->>L: select(edit, already_reused)
+    L-->>A: deepest rung with spans <= edit (here spans = k)
+    A->>A: microcompact_is_worth_it(reclaimable, reprefill, ctx)?
+    alt gate refuses
+        A->>A: do nothing (engine untouched)
+    else gate accepts
+        A->>D: kv_load(fingerprint(transcript[..k]))
+        D-->>A: rung bytes (signature matches)
+        A->>E: set_kv(rung)
+        Note right of E: live end is now k
+        A->>A: rewrite body at k in place
+        A->>E: sync(prompt)
+        Note right of E: extends forward from k, not from zero
+    end
+```
+
 The ladder also has to follow the transcript through every edit that is not a
 plain append, because a rung describing a prefix that no longer exists is worse
 than no rung: `wants_anchor` keeps reporting the depth as covered while `select`
@@ -340,6 +399,39 @@ removes its `<id>.rung-N.kv_raw` blobs, and renaming the live one drops its
 in-memory ladder as well. On the retention side, the keep set handed to the sweep
 includes the live rungs, each fingerprinted over the transcript truncated to its
 own depth, which is the same rule the lookup uses.
+
+Every transcript operation and what it does to the ladder:
+
+```mermaid
+flowchart TD
+    subgraph EDITS["Transcript operations"]
+        APP["append (normal turn)"]
+        MC["micro-compaction<br/>rewrite in place"]
+        RB["rollback_to"]
+        FK["fork_branch"]
+        SC["sidechain<br/>(/subagent, agent tool)"]
+        RN["rename live session"]
+        DEL["delete / delete_all"]
+        NEW["/new /clear /switch<br/>/resume, full compaction"]
+    end
+
+    APP --> A1["maybe anchor a rung<br/>(wants_anchor)"]
+    MC --> A2["restore deepest rung<br/>spans <= edit, then rewrite"]
+    RB --> A3["discard_ladder<br/>payload_dirty = true"]
+    FK --> A4["truncate_to(kept prefix)<br/>drop rungs past the cut"]
+    SC --> A5["in_sidechain(): no payload store,<br/>no rung push, no micro-compaction"]
+    A5 --> A6["end_subagent_fork:<br/>truncate transcript to fork_at,<br/>truncate_to(fork_at)"]
+    RN --> A7["remove_rungs(old id)<br/>discard in-memory ladder"]
+    DEL --> A8["remove_rungs(id)"]
+    NEW --> A9["discard_ladder"]
+
+    GC["GC sweep keep set"] -. "includes fingerprint(transcript[..rung.spans])<br/>for every live rung" .-> A1
+```
+
+The ladder's life across a session, including eviction, rollback, fork and a
+sidechain (`docs/img/kv-ladder-lifecycle.gif`):
+
+![Ladder lifecycle: capture, spacing, eviction, rollback, fork, sidechain](img/kv-ladder-lifecycle.gif)
 
 The decision itself is the last piece, and it is not a property of the ladder
 at all. Whether an opportunistic pass is worth its prefill cost is a question
