@@ -473,6 +473,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model)?;
+        // Vision is always on: the encoder GGUF sits beside the main model and
+        // is fetched on demand when missing, the same as the main model.
+        plank::download::ensure_vision_encoder()?;
         // DSpark is on by default; without `--mtp` it resolves to the default
         // support model, fetched on demand (`--dspark-off` skips this). Kept
         // local rather than written back into `cfg`: only the engine open
@@ -698,6 +701,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
             .clone()
             .unwrap_or_else(plank::download::default_model_path);
         plank::download::ensure_model(&model_path)?;
+        // Vision is always on: the encoder GGUF sits beside the main model and
+        // is fetched on demand when missing, the same as the main model.
+        plank::download::ensure_vision_encoder()?;
         // See the local-engine path: resolved into a local copy, not `cfg`.
         let mut tuning = cfg.engine.clone();
         plank::download::ensure_dspark_support(&mut tuning)?;

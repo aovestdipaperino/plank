@@ -191,6 +191,10 @@ pub struct Message {
     /// message built outside [`Session::push`]). Consumed by
     /// [`crate::insights`]; a zero is written to disk as an absent field.
     pub at: u64,
+    /// Image embeddings carried by this message (empty for text-only turns).
+    /// Populated when a `view_image` tool result is appended; the engine
+    /// appends the image tokens alongside the text during `reconcile`.
+    pub images: Vec<crate::engine::VisionImage>,
 }
 
 impl Message {
@@ -200,6 +204,7 @@ impl Message {
             role: Role::User,
             text: text.into(),
             at: 0,
+            images: Vec::new(),
         }
     }
 
@@ -209,6 +214,7 @@ impl Message {
             role: Role::Assistant,
             text: text.into(),
             at: 0,
+            images: Vec::new(),
         }
     }
 
@@ -216,6 +222,14 @@ impl Message {
     #[must_use]
     pub fn at(mut self, at: u64) -> Self {
         self.at = at;
+        self
+    }
+
+    /// Attaches image embeddings to this message, for a `view_image` tool
+    /// result the engine must append as multimodal tokens.
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<crate::engine::VisionImage>) -> Self {
+        self.images = images;
         self
     }
 
@@ -1035,9 +1049,18 @@ impl SessionStore {
     ///
     /// Returns "nothing to save" for a transcript with no user turn, or an
     /// I/O error if the file cannot be written.
+    #[allow(clippy::too_many_lines)]
     pub fn save(&self, session: &mut Session) -> Result<String> {
         if !session.transcript.iter().any(|m| m.role == Role::User) {
             return Err(SessionError::new("nothing to save"));
+        }
+        // C parity: "sessions containing images cannot be saved yet". The
+        // transcript format carries no image identity, so a restored session
+        // would serve a different image's tokens as a cache hit.
+        if session.transcript.iter().any(|m| !m.images.is_empty()) {
+            return Err(SessionError::new(
+                "sessions containing images cannot be saved yet",
+            ));
         }
         fs::create_dir_all(&self.dir)
             .map_err(|_| SessionError::new(format!("failed to create {}", self.dir.display())))?;
@@ -2179,7 +2202,12 @@ fn parse_node_record(
     Ok(crate::branch::OffNode {
         id,
         parent,
-        message: Message { role, text, at },
+        message: Message {
+            role,
+            text,
+            at,
+            images: Vec::new(),
+        },
     })
 }
 
@@ -2303,7 +2331,12 @@ fn read_session_file(path: &Path) -> Result<Session> {
         // Optional trailing timestamp; absent in every pre-`/insights` file.
         let at: u64 = it.next().and_then(|v| v.parse().ok()).unwrap_or(0);
         let text = take(&data, &mut pos, len)?;
-        transcript.push(Message { role, text, at });
+        transcript.push(Message {
+            role,
+            text,
+            at,
+            images: Vec::new(),
+        });
     }
 
     // Off-path nodes are a cache of structure, never trusted blindly: any
@@ -4595,5 +4628,38 @@ hello\n";
             }),
             KvRole::Rung
         );
+    }
+
+    #[test]
+    fn save_refuses_sessions_containing_images() {
+        let dir = temp_dir("save-images");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hello"));
+        s.push(
+            Message::user("<tool_result>img</tool_result>").with_images(vec![
+                crate::engine::VisionImage {
+                    path: "img.png".to_string(),
+                    embedding: crate::engine::VisionEmbedding {
+                        data: vec![0.0; 4],
+                        token_count: 1,
+                        layout: 0,
+                        grid_width: 1,
+                        grid_height: 1,
+                        width: 8,
+                        height: 8,
+                        content_width: 8,
+                        content_height: 8,
+                        fingerprint: [1; 32],
+                    },
+                },
+            ]),
+        );
+        let err = store.save(&mut s).expect_err("must refuse");
+        assert!(
+            err.to_string().contains("images cannot be saved"),
+            "wrong error: {err}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -221,6 +221,52 @@ pub struct Ds4Session {
     _private: [u8; 0],
 }
 
+/// Vision embedding, mirroring `ds4_vision_embedding`.
+///
+/// The `data` pointer owns `token_count × embd_dim` `float` values and is freed
+/// by [`ds4_vision_embedding_free`]. Ownership transfers to the caller on
+/// success from `ds4_engine_vision_encode_file` / `_memory`.
+#[repr(C)]
+#[derive(Debug)]
+pub struct Ds4VisionEmbedding {
+    pub data: *mut f32,
+    pub token_count: u32,
+    pub layout: u32,
+    pub grid_width: u32,
+    pub grid_height: u32,
+    pub width: u32,
+    pub height: u32,
+    pub content_width: u32,
+    pub content_height: u32,
+    pub fingerprint: [u8; 32],
+}
+
+impl Default for Ds4VisionEmbedding {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null_mut(),
+            token_count: 0,
+            layout: 0,
+            grid_width: 0,
+            grid_height: 0,
+            width: 0,
+            height: 0,
+            content_width: 0,
+            content_height: 0,
+            fingerprint: [0; 32],
+        }
+    }
+}
+
+/// A vision span recording where image tokens sit in the token transcript,
+/// mirroring `ds4_vision_span`.
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct Ds4VisionSpan {
+    pub token_start: u32,
+    pub embedding: Ds4VisionEmbedding,
+}
+
 unsafe extern "C" {
     pub fn ds4_engine_open(out: *mut *mut Ds4Engine, opt: *const Ds4EngineOptions) -> c_int;
     pub fn ds4_engine_close(e: *mut Ds4Engine);
@@ -349,6 +395,67 @@ unsafe extern "C" {
         errlen: usize,
     ) -> c_int;
     pub fn ds4_session_snapshot_free(snap: *mut Ds4SessionSnapshot);
+
+    // ── Vision ───────────────────────────────────────────────────────────
+
+    /// Returns `true` when the engine was opened with a `vision_path`.
+    pub fn ds4_engine_has_vision(e: *mut Ds4Engine) -> bool;
+    /// Embedding dimension of the loaded model; needed to size the float copy
+    /// when appending image observations.
+    pub fn ds4_engine_embd_dim(e: *mut Ds4Engine) -> c_int;
+    /// Encodes an image file into `out`. On success, ownership of `out.data`
+    /// transfers to the caller and must be freed with
+    /// [`ds4_vision_embedding_free`].
+    pub fn ds4_engine_vision_encode_file(
+        e: *mut Ds4Engine,
+        path: *const c_char,
+        out: *mut Ds4VisionEmbedding,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+    /// Encodes in-memory image bytes (PNG/JPEG) into `out`.
+    pub fn ds4_engine_vision_encode_memory(
+        e: *mut Ds4Engine,
+        encoded: *const u8,
+        encoded_len: usize,
+        out: *mut Ds4VisionEmbedding,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+    /// Frees the `data` buffer inside an embedding. Safe to call on a
+    /// zeroed struct.
+    pub fn ds4_vision_embedding_free(embedding: *mut Ds4VisionEmbedding);
+
+    /// Appends one user or tool message whose text parts alternate with images.
+    /// `text_parts` must contain `image_count + 1` entries. On success,
+    /// ownership of each embedding transfers to the corresponding output span.
+    pub fn ds4_chat_append_multimodal_message(
+        e: *mut Ds4Engine,
+        tokens: *mut Ds4Tokens,
+        role: *const c_char,
+        text_parts: *const *const c_char,
+        embeddings: *mut Ds4VisionEmbedding,
+        image_count: usize,
+        spans: *mut Ds4VisionSpan,
+        error: *mut c_char,
+        error_cap: usize,
+    ) -> c_int;
+
+    /// Synchronizes the live session to a prompt that contains image tokens.
+    /// The `images` spans tell the backend where image blocks sit so SWA
+    /// windows are computed correctly.
+    pub fn ds4_session_sync_multimodal(
+        s: *mut Ds4Session,
+        prompt: *const Ds4Tokens,
+        images: *const Ds4VisionSpan,
+        image_count: usize,
+        err: *mut c_char,
+        errlen: usize,
+    ) -> c_int;
+
+    /// True while a session contains, or is actively syncing, image-conditioned
+    /// state. Such state must not be written to the text-keyed disk KV cache.
+    pub fn ds4_session_has_vision_state(s: *const Ds4Session) -> bool;
 }
 
 /// Confirm callback type, mirroring `ds4_web_confirm_fn`.
@@ -633,5 +740,53 @@ mod tests {
             ),
             ("tp", offset_of!(Ds4EngineOptions, tp), 216),
         ]);
+    }
+
+    /// The C `ds4_vision_embedding` layout: a `float *` data pointer followed
+    /// by eight `uint32_t` metadata fields and a 32-byte fingerprint.
+    #[test]
+    fn vision_embedding_layout_matches_the_c() {
+        assert_eq!(size_of::<Ds4VisionEmbedding>(), 72, "struct size");
+        assert_offsets(&[
+            ("data", offset_of!(Ds4VisionEmbedding, data), 0),
+            (
+                "token_count",
+                offset_of!(Ds4VisionEmbedding, token_count),
+                8,
+            ),
+            ("layout", offset_of!(Ds4VisionEmbedding, layout), 12),
+            ("grid_width", offset_of!(Ds4VisionEmbedding, grid_width), 16),
+            (
+                "grid_height",
+                offset_of!(Ds4VisionEmbedding, grid_height),
+                20,
+            ),
+            ("width", offset_of!(Ds4VisionEmbedding, width), 24),
+            ("height", offset_of!(Ds4VisionEmbedding, height), 28),
+            (
+                "content_width",
+                offset_of!(Ds4VisionEmbedding, content_width),
+                32,
+            ),
+            (
+                "content_height",
+                offset_of!(Ds4VisionEmbedding, content_height),
+                36,
+            ),
+            (
+                "fingerprint",
+                offset_of!(Ds4VisionEmbedding, fingerprint),
+                40,
+            ),
+        ]);
+    }
+
+    /// `ds4_vision_span` is a `uint32_t token_start` followed by 4 bytes of
+    /// padding (the embedding starts with a pointer) and then the embedding.
+    #[test]
+    fn vision_span_layout_matches_the_c() {
+        assert_eq!(size_of::<Ds4VisionSpan>(), 80, "struct size");
+        assert_eq!(offset_of!(Ds4VisionSpan, token_start), 0);
+        assert_eq!(offset_of!(Ds4VisionSpan, embedding), 8);
     }
 }

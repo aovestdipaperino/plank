@@ -711,17 +711,13 @@ pub fn parse_bool_default(s: Option<&str>, def: bool) -> bool {
 /// tool result.
 /// `view_image` — parity stub for the C's visual-observation tool.
 ///
-/// The C advertises `view_image` unconditionally in the frozen tool table
-/// (`agent_tools_prompt_intro`, between `read` and `more`), but only serves it
-/// when the engine was given a vision encoder via `ds4-agent --vision FILE`.
-/// plank passes a null `vision_path`, so it is always in the second case and
-/// returns the C's own refusal byte-for-byte. This is parity behavior, not a
-/// placeholder: an agent run without `--vision` gets exactly this string.
-///
-/// Wiring the real path means giving the engine a `vision_path`, encoding the
-/// image with `ds4_engine_vision_encode_file`, and appending it through
-/// `ds4_chat_append_multimodal_message` — which also drags in the rule that
-/// image-conditioned KV must never reach the text-keyed disk cache.
+/// This is only reached when `view_image` is dispatched through the generic
+/// `dispatch` path (which has no engine access). The agent's `run_tool_calls`
+/// intercepts `view_image` and routes it through [`Agent::run_view_image`],
+/// which has the engine and can encode the image. This stub remains as a
+/// safety net for any path that calls `dispatch` directly, returning the C's
+/// own refusal byte-for-byte — the same string `ds4-agent` prints when run
+/// without `--vision`.
 fn tool_view_image(call: &ToolCall) -> String {
     let path = call.arg_value("path").unwrap_or("").trim();
     if path.is_empty() {

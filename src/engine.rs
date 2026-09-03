@@ -951,7 +951,93 @@ pub trait Engine: Debug + Send {
     fn is_local(&self) -> bool {
         false
     }
+
+    // ── Vision ───────────────────────────────────────────────────────────
+
+    /// Whether this engine has a loaded vision encoder (`--vision FILE`).
+    ///
+    /// The `view_image` tool is advertised unconditionally in the frozen prompt
+    /// (C parity), but only served when this returns `true`. Without a vision
+    /// encoder, `view_image` returns the C's refusal string at call time.
+    fn has_vision(&self) -> bool {
+        false
+    }
+
+    /// Encodes an image file into a [`VisionEmbedding`] the engine can append
+    /// to the token transcript via [`set_pending_images`](Self::set_pending_images).
+    ///
+    /// # Errors
+    /// Returns [`EngineError`] when the engine has no vision encoder or the
+    /// image cannot be decoded. The default implementation reports lack of
+    /// support, so [`EchoEngine`] and remote engines need no change.
+    fn vision_encode_file(&mut self, _path: &str) -> Result<VisionEmbedding, EngineError> {
+        Err(EngineError::unsupported())
+    }
+
+    /// Hands the engine the image embeddings carried by the current transcript,
+    /// each paired with the section text it belongs to, so the engine can append
+    /// image tokens via `ds4_chat_append_multimodal_message` during the next
+    /// [`generate`](Self::generate) call.
+    ///
+    /// Called before every `generate` that follows a `view_image` tool result.
+    /// Engines that do not support vision ignore it.
+    fn set_pending_images(&mut self, _images: Vec<(String, VisionImage)>) {}
 }
+
+/// An encoded image ready to append to the token transcript.
+///
+/// Owned, FFI-free counterpart of the C `ds4_vision_embedding`. The float
+/// `data` is a flat `[token_count × embd_dim]` row-major layout; the rest is
+/// metadata the chat template needs to place the image tokens.
+///
+/// Identity is by `fingerprint` (a 32-byte hash of the decoded pixels), matching
+/// the C's `ds4_session_vision_state_matches` — two embeddings with the same
+/// fingerprint are the same image regardless of quantization drift in `data`.
+#[derive(Debug, Clone)]
+pub struct VisionEmbedding {
+    /// Flat embedding vectors, `[token_count × embd_dim]` row-major.
+    pub data: Vec<f32>,
+    /// Number of visual tokens (rows in `data`).
+    pub token_count: u32,
+    /// Layout enum (GLM vs `DeepSeek` image token arrangement).
+    pub layout: u32,
+    /// Token grid dimensions the chat template uses to interleave image tokens.
+    pub grid_width: u32,
+    pub grid_height: u32,
+    /// Original image dimensions.
+    pub width: u32,
+    pub height: u32,
+    /// Content dimensions before padding.
+    pub content_width: u32,
+    pub content_height: u32,
+    /// 32-byte fingerprint of the decoded pixels (the C's identity key).
+    pub fingerprint: [u8; 32],
+}
+
+impl PartialEq for VisionEmbedding {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+    }
+}
+
+impl Eq for VisionEmbedding {}
+
+/// An image file's encoding paired with its path, carried by [`Message`].
+#[derive(Debug, Clone)]
+pub struct VisionImage {
+    /// The path the model spelled in the `view_image` call.
+    pub path: String,
+    /// The encoded embedding.
+    pub embedding: VisionEmbedding,
+}
+
+impl PartialEq for VisionImage {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.embedding == other.embedding
+    }
+}
+
+impl Eq for VisionImage {}
 
 /// Text force-fed to close an unclosed `<think>` before the model retries a
 /// tool call. Matches the C server's injection byte for byte.
@@ -1696,5 +1782,65 @@ mod tests {
         assert!(events.is_empty(), "the default impl streams nothing");
         // The caller's transcript is untouched — the aside never ran.
         assert_eq!(transcript, "[user]\nmain task\n");
+    }
+
+    // ── Vision ───────────────────────────────────────────────────────────
+
+    fn dummy_embedding(fingerprint: [u8; 32]) -> super::VisionEmbedding {
+        super::VisionEmbedding {
+            data: vec![0.0; 4],
+            token_count: 1,
+            layout: 0,
+            grid_width: 1,
+            grid_height: 1,
+            width: 8,
+            height: 8,
+            content_width: 8,
+            content_height: 8,
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn echo_engine_has_no_vision_by_default() {
+        let engine = EchoEngine::new(4096);
+        assert!(!engine.has_vision());
+    }
+
+    #[test]
+    fn echo_engine_vision_encode_returns_unsupported() {
+        let mut engine = EchoEngine::new(4096);
+        let err = engine
+            .vision_encode_file("/tmp/test.png")
+            .expect_err("must fail");
+        assert!(err.is_unsupported());
+    }
+
+    #[test]
+    fn vision_embedding_equality_is_by_fingerprint() {
+        let a = dummy_embedding([1; 32]);
+        let b = dummy_embedding([1; 32]);
+        let c = dummy_embedding([2; 32]);
+        assert_eq!(a, b, "same fingerprint => equal");
+        assert_ne!(a, c, "different fingerprint => not equal");
+    }
+
+    #[test]
+    fn vision_image_equality_includes_path() {
+        let emb = dummy_embedding([1; 32]);
+        let a = super::VisionImage {
+            path: "a.png".to_string(),
+            embedding: emb.clone(),
+        };
+        let b = super::VisionImage {
+            path: "a.png".to_string(),
+            embedding: emb.clone(),
+        };
+        let c = super::VisionImage {
+            path: "b.png".to_string(),
+            embedding: emb,
+        };
+        assert_eq!(a, b, "same path + embedding => equal");
+        assert_ne!(a, c, "different path => not equal");
     }
 }

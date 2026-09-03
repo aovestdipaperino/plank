@@ -1237,6 +1237,10 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// Image embeddings collected by `view_image` during the current
+    /// `run_tool_calls` dispatch, drained by the caller when it pushes the
+    /// tool-result message so they ride on that message into the transcript.
+    pending_images: Vec<crate::engine::VisionImage>,
     /// Set when a `/btw` aside answered on the *live* engine has pushed the
     /// engine's end past the transcript an anchor would be signed against, and
     /// consumed by the next anchor point. See
@@ -1669,6 +1673,28 @@ impl Agent<'_> {
         }
     }
 
+    /// Collects image embeddings from the transcript and hands them to the
+    /// engine via [`Engine::set_pending_images`], so the engine can append
+    /// image tokens alongside the matching section text during `reconcile`.
+    ///
+    /// Each image is keyed by the exact section text (`[user]\n{text}\n`) the
+    /// engine will tokenize, so `reconcile` can match it structurally. Called
+    /// before every `generate` so a resumed or forked session's images reach
+    /// the engine the same way a fresh turn's do.
+    fn sync_engine_images(&mut self) {
+        if !self.engine.has_vision() {
+            return;
+        }
+        let mut images: Vec<(String, crate::engine::VisionImage)> = Vec::new();
+        for m in &self.session.transcript {
+            for img in &m.images {
+                let section = format!("[user]\n{}\n", m.text);
+                images.push((section, img.clone()));
+            }
+        }
+        self.engine.set_pending_images(images);
+    }
+
     /// Streams one generation pass: paints the live status bar for prefill and
     /// generation, and routes model text through the viz + markdown pipeline.
     #[allow(clippy::type_complexity)]
@@ -1756,6 +1782,7 @@ impl Agent<'_> {
             }
             None => crate::engine::Prompt::Flat(prompt_text),
         };
+        self.sync_engine_images();
         let stats = self
             .engine
             .generate(
@@ -1855,10 +1882,12 @@ impl Agent<'_> {
                 .join(", ");
             crate::status::ToolActivity::begin(format!("🔧 {names}"))
         });
-        let observations = if !calls
-            .iter()
-            .any(|c| c.name == "agent" || c.name == "fanout")
-        {
+        // `view_image` needs the engine to encode the image, which `dispatch`
+        // (taking only `&mut ToolContext`) cannot reach. Route it through the
+        // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
+        let needs_engine =
+            |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
+        let observations = if !calls.iter().any(needs_engine) {
             dispatch_all(calls, &mut self.tool_ctx)
         } else if calls.is_empty() {
             "Tool error: empty tool call block\n".to_string()
@@ -1873,6 +1902,8 @@ impl Agent<'_> {
                     self.run_agent_tool(call)
                 } else if call.name == "fanout" {
                     self.run_fanout_tool(call)
+                } else if call.name == "view_image" {
+                    self.run_view_image(call)
                 } else {
                     dispatch(call, &mut self.tool_ctx).output
                 };
@@ -1881,6 +1912,48 @@ impl Agent<'_> {
             format_tool_results(&results)
         };
         apply_loop_guard(&mut self.loop_guard, calls, observations)
+    }
+
+    /// Runs the model-invocable `view_image` tool: encodes the image through
+    /// the engine's vision encoder and returns the C's observation text
+    /// byte-for-byte. The encoded [`VisionImage`] is stashed on
+    /// `self.pending_images` for the caller to attach to the tool-result
+    /// message.
+    ///
+    /// Mirrors `agent_tool_view_image` in the C reference. When the engine has
+    /// no vision encoder (`EchoEngine`, or a text-only model), returns the C's
+    /// refusal string — but since plank assumes vision is always on, the real
+    /// engine always has one.
+    fn run_view_image(&mut self, call: &ToolCall) -> String {
+        let path = call.arg_value("path").unwrap_or("").trim();
+        if path.is_empty() {
+            return "Tool error: view_image requires path\n".to_string();
+        }
+        if !self.engine.has_vision() {
+            return "Tool error: view_image requires ds4-agent --vision FILE\n".to_string();
+        }
+        match self.engine.vision_encode_file(path) {
+            Ok(emb) => {
+                let meta = format!(
+                    "\nImage observation attached ({}x{}, {} visual tokens).\n",
+                    emb.width, emb.height, emb.token_count
+                );
+                self.pending_images.push(crate::engine::VisionImage {
+                    path: path.to_string(),
+                    embedding: emb,
+                });
+                format!("\n[tool:view_image] {path}\n{meta}")
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                let detail = if msg.is_empty() {
+                    "unable to decode image"
+                } else {
+                    &msg
+                };
+                format!("Tool error: view_image failed: {detail}\n")
+            }
+        }
     }
 
     /// Sends an event on the worker→UI channel when the front end is listening.
@@ -2169,9 +2242,11 @@ impl Agent<'_> {
             self.tool_ctx.edit_previews.clear();
             self.tool_ctx.task_completions.clear();
             self.tool_ctx.hook_warnings.clear();
-            self.session.push(Message::user(format!(
-                "<tool_result>{observations}</tool_result>"
-            )));
+            let images = std::mem::take(&mut self.pending_images);
+            self.session.push(
+                Message::user(format!("<tool_result>{observations}</tool_result>"))
+                    .with_images(images),
+            );
         }
         // Unreachable: the final iteration always returns above. `MAX_ROUNDS` is
         // a non-zero constant, so the loop cannot fall through without it.
@@ -2202,6 +2277,7 @@ impl Agent<'_> {
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
         };
         let preflight = edit_preflight(&self.tool_ctx);
+        self.sync_engine_images();
         let pass = generate_pass(
             self.engine.as_mut(),
             prompt_text,
@@ -2500,9 +2576,11 @@ impl Agent<'_> {
                 // here, the rung sits at exactly the index this result will
                 // occupy, which is the index microcompact will later rewrite.
                 self.anchor_rung_before_tool_result(observations.len());
-                self.session.push(Message::user(format!(
-                    "<tool_result>{observations}</tool_result>"
-                )));
+                let images = std::mem::take(&mut self.pending_images);
+                self.session.push(
+                    Message::user(format!("<tool_result>{observations}</tool_result>"))
+                        .with_images(images),
+                );
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
                     println!("{}", self.debug_line(&format!("halted: {reason}")));
@@ -6438,9 +6516,11 @@ the original is frozen and listed in /tree"
                 self.tool_ctx.edit_previews.clear();
                 self.tool_ctx.task_completions.clear();
                 self.tool_ctx.hook_warnings.clear();
-                slots[i].session.push(Message::user(format!(
-                    "<tool_result>{observations}</tool_result>"
-                )));
+                let images = std::mem::take(&mut self.pending_images);
+                slots[i].session.push(
+                    Message::user(format!("<tool_result>{observations}</tool_result>"))
+                        .with_images(images),
+                );
             }
         }
         // Only an interrupt leaves a slot unfinished. Its text, if any, still
@@ -9876,9 +9956,11 @@ impl Agent<'_> {
                 // Mirror of the plain-stdout path: anchor the rung at the
                 // index this result will occupy, before it is appended.
                 self.anchor_rung_before_tool_result(observations.len());
-                self.session.push(Message::user(format!(
-                    "<tool_result>{observations}</tool_result>"
-                )));
+                let images = std::mem::take(&mut self.pending_images);
+                self.session.push(
+                    Message::user(format!("<tool_result>{observations}</tool_result>"))
+                        .with_images(images),
+                );
                 if crate::settings::active().ui.show_tool_results {
                     for line in observations.lines() {
                         let _ = tx.send(UiEvent::Dim(line.to_owned()));
@@ -10257,6 +10339,7 @@ impl Agent<'_> {
             }
             None => crate::engine::Prompt::Flat(prompt),
         };
+        self.sync_engine_images();
         let result = if aside {
             // The aside keeps the main KV intact itself — by forking it, or by
             // snapshot/restore — and forces greedy off internally, so no
@@ -12613,6 +12696,7 @@ fn new_agent(
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
         sidechain_depth: 0,
+        pending_images: Vec::new(),
         btw_diverged_engine: false,
         trusted_system_len,
         think: cfg.generation.think_mode,
@@ -14186,6 +14270,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17466,6 +17551,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17573,6 +17659,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18576,6 +18663,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18763,6 +18851,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18855,6 +18944,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18934,6 +19024,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -19036,6 +19127,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20581,6 +20673,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20677,6 +20770,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20832,6 +20926,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20909,6 +21004,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,

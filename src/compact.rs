@@ -64,6 +64,10 @@ fn clear_set(transcript: &[Message]) -> Vec<usize> {
             m.role == Role::User
                 && m.text.starts_with("<tool_result>")
                 && m.text.len() > MICROCOMPACT_MIN_BYTES
+                // Image-bearing tool results are exempt: the image tokens
+                // cannot be stubbed, and clearing the text would orphan them
+                // from their observation context (C parity).
+                && m.images.is_empty()
         })
         .map(|(i, _)| i)
         .collect();
@@ -739,5 +743,43 @@ mod tests {
                 "size={size}"
             );
         }
+    }
+
+    #[test]
+    fn microcompact_exempts_image_bearing_tool_results() {
+        // A large old tool result carrying an image must survive microcompact:
+        // the image tokens cannot be stubbed, and clearing the text would
+        // orphan them from their observation context.
+        let big = "<tool_result>".to_owned() + &"x".repeat(600) + "</tool_result>";
+        let mut t = vec![
+            Message::user("do the thing"),
+            Message::user(big.clone()).with_images(vec![crate::engine::VisionImage {
+                path: "img.png".to_string(),
+                embedding: crate::engine::VisionEmbedding {
+                    data: vec![0.0; 4],
+                    token_count: 1,
+                    layout: 0,
+                    grid_width: 1,
+                    grid_height: 1,
+                    width: 8,
+                    height: 8,
+                    content_width: 8,
+                    content_height: 8,
+                    fingerprint: [1; 32],
+                },
+            }]),
+        ];
+        for _ in 0..4 {
+            t.push(Message::user(big.clone()));
+        }
+        let (cleared, _) = microcompact(&mut t);
+        // The image-bearing result at index 1 is exempt; only the text-only
+        // old results are candidates.
+        assert!(
+            !t[1].text.contains(MICROCOMPACT_STUB),
+            "image-bearing result must not be cleared"
+        );
+        // At least one text-only old result was cleared.
+        assert!(cleared > 0, "text-only old results should still be cleared");
     }
 }

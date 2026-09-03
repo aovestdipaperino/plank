@@ -33,20 +33,29 @@ use crate::arcade::breakout::Breakout;
 
 /// Hugging Face repository hosting the GGUF files.
 const REPO: &str = "antirez/deepseek-v4-gguf";
-/// The recommended Flash quant (~87 GB) for 96–128 GB machines.
+/// The recommended Vision-Experimental Flash quant (~81 GB) for 96–128 GB
+/// machines.
 ///
-/// `-0731` is the official (non-preview) `DeepSeek` V4 Flash of 2026-07-31. The
-/// architecture is unchanged from the April preview — the gains are all
-/// post-training — so the tensor layout the engine expects is the same.
-const FILE: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
+/// The 0731 language checkpoint has been superseded by the Vision-Experimental
+/// build, which carries the same routed-expert layout plus native image-token
+/// support. plank assumes vision is always on, so this is the default model.
+const FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf";
 
-/// The `DSpark` speculative-decoding support GGUF (~5.6 GB) for Flash `-0731`.
+/// The `DSpark` speculative-decoding support GGUF (~5.6 GB) for the
+/// Vision-Experimental checkpoint.
 ///
 /// Not a standalone model: it is the auxiliary drafter, and it is
-/// checkpoint-specific — pairing it with an older Flash is a load error, not a
-/// quality question, which is why it carries the same `-0731` suffix as
-/// [`FILE`] and is fetched from the same repository.
-const DSPARK_FILE: &str = "DeepSeek-V4-Flash-DSpark-support-0731.gguf";
+/// checkpoint-specific — pairing it with the older 0731 language checkpoint is
+/// a load error, not a quality question, which is why it is fetched from the
+/// same repository as [`FILE`].
+const DSPARK_FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf";
+
+/// The vision-encoder GGUF that pairs with the Vision-Experimental checkpoint.
+///
+/// A standalone encoder (~0.9 GB) loaded alongside the main model so the
+/// `view_image` tool can decode images. plank assumes vision is always on, so
+/// this is fetched at startup when absent, the same as the main model.
+const VISION_ENCODER_FILE: &str = "DeepSeek-V4-Flash-Vision-Encoder.gguf";
 
 /// Records which `FILE` produced the local model, alongside it.
 ///
@@ -457,6 +466,16 @@ pub fn default_dspark_path() -> PathBuf {
     home.join(".plank").join("ds4flash.dspark.gguf")
 }
 
+/// Default vision-encoder location. plank assumes vision is always on, so this
+/// is loaded alongside the main model whenever the native engine is used.
+///
+/// Sits beside the main model: `ds4flash.gguf` and `ds4flash.vision.gguf`.
+#[must_use]
+pub fn default_vision_path() -> PathBuf {
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from);
+    home.join(".plank").join("ds4flash.vision.gguf")
+}
+
 /// Hugging Face download URL for the default Flash GGUF.
 #[must_use]
 pub fn model_url() -> String {
@@ -467,6 +486,12 @@ pub fn model_url() -> String {
 #[must_use]
 pub fn dspark_url() -> String {
     file_url(DSPARK_FILE)
+}
+
+/// Hugging Face download URL for the vision-encoder GGUF.
+#[must_use]
+pub fn vision_url() -> String {
+    file_url(VISION_ENCODER_FILE)
 }
 
 /// Ensures the `DSpark` support model exists at `path`, offering to download it
@@ -539,6 +564,56 @@ pub fn ensure_dspark_support(engine: &mut crate::config::EngineTuning) -> Result
     ensure_dspark(&path)?;
     engine.mtp_path = Some(path);
     Ok(())
+}
+
+/// Ensures the vision-encoder GGUF exists at its default path, offering to
+/// download it if missing.
+///
+/// plank assumes vision is always on, so this runs on every native-engine
+/// startup alongside [`ensure_model`]. A missing encoder is a hard error: the
+/// `view_image` tool would refuse at call time, and the model was trained to
+/// expect image tokens.
+///
+/// # Errors
+/// Returns an error string when the user declines, when stdin is not a
+/// terminal (so no prompt is possible), or when the download fails.
+pub fn ensure_vision_encoder() -> Result<(), String> {
+    let path = default_vision_path();
+    if path.exists() {
+        return Ok(());
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(format!(
+            "no vision encoder at {}; pass --vision <path> or download it first",
+            path.display()
+        ));
+    }
+    let resuming = partial_bytes(&path) > 0;
+    eprintln!("No vision encoder found at {}.", path.display());
+    if resuming {
+        eprintln!(
+            "A partial download exists ({:.1} GB); plank can resume it from Hugging Face:",
+            gb(partial_bytes(&path))
+        );
+    } else {
+        eprintln!("plank can download the vision encoder (~0.9 GB) from Hugging Face:");
+    }
+    eprintln!("  {}", vision_url());
+    eprint!(
+        "{} it now? [Y/n] ",
+        if resuming { "Resume" } else { "Download" }
+    );
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    if matches!(answer.trim(), "n" | "N" | "no") {
+        return Err(
+            "no vision encoder available; the view_image tool will refuse at call time".to_string(),
+        );
+    }
+    download(&vision_url(), &path)
 }
 
 /// Ensures a model file exists at `path`, offering to download it if missing.
@@ -1484,7 +1559,12 @@ mod tests {
             family,
             "the untagged build is the same family"
         );
-        assert_eq!(family_of(FILE), family, "the pinned default too");
+        // The Vision-Exp default is its own family — no 4-digit tag to strip.
+        assert_eq!(
+            family_of(FILE),
+            "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8",
+            "the pinned default too"
+        );
         // A recipe ending in digits is not a release tag.
         assert_eq!(family_of("Model-MXFP4.gguf"), "Model-MXFP4");
         assert_eq!(family_of("Model-Q4K-12345.gguf"), "Model-Q4K-12345");
@@ -1610,7 +1690,10 @@ mod tests {
     fn dspark_url_points_at_the_support_gguf() {
         let url = dspark_url();
         assert!(url.contains(DSPARK_FILE));
-        assert!(url.contains("0731"), "must be checkpoint-specific: {url}");
+        assert!(
+            url.contains("Vision-Exp"),
+            "must be the vision-experimental support: {url}"
+        );
     }
 
     #[test]
