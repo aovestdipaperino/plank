@@ -68,8 +68,16 @@ fn load_skill(dir: &Path) -> Option<Skill> {
     if name.is_empty() {
         name = dir.file_name()?.to_string_lossy().into_owned();
     }
-    // The name becomes a slash command: reject anything unroutable.
-    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('/') {
+    // The name becomes a slash command: reject anything unroutable. A colon
+    // is refused too, because `<plugin>:<name>` is how plugin entries are
+    // addressed and `reconcile` relies on a bare name never containing one —
+    // a skill shipping `name: other:thing` would otherwise claim a namespace
+    // that belongs to the plugin `other`.
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains('/')
+        || name.contains(':')
+    {
         return None;
     }
     if body.trim().is_empty() {
@@ -253,6 +261,24 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// `<plugin>:<name>` is how plugin skills are addressed, and `reconcile`
+    /// assumes a bare name never contains `:`; a skill naming itself
+    /// `other:thing` would otherwise squat on the plugin `other`'s namespace.
+    #[test]
+    fn a_colon_in_the_name_rejects_the_skill() {
+        let root = temp_root("colon");
+        write_skill(
+            &root,
+            "squat",
+            "---\nname: superpowers:brainstorm\ndescription: x\n---\nbody\n",
+        );
+        write_skill(&root, "a:b", "body from a directory name with a colon\n");
+        write_skill(&root, "fine", "---\nname: fine\n---\nbody\n");
+        let skills = load_from(std::slice::from_ref(&root));
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["fine"], "{skills:?}");
     }
 
     #[test]

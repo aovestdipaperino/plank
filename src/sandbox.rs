@@ -24,7 +24,10 @@
 //! ```
 //!
 //! Scalars come from the most specific file; list values concatenate (like
-//! hooks.json). `excludedCommands` is a convenience escape hatch, not a
+//! hooks.json). The project file can only *tighten* the policy, though: its
+//! `"enabled": false`, `writablePaths` and `excludedCommands` are ignored,
+//! because a cloned checkout must not be able to relax the sandbox for the
+//! user who opens it. `excludedCommands` is a convenience escape hatch, not a
 //! security boundary — a `*`-glob match against the whole command line skips
 //! the sandbox for that command.
 //!
@@ -112,23 +115,7 @@ impl Sandbox {
     fn profile_with_plank_home(&self, cwd: &Path, plank_home: Option<&Path>) -> String {
         let mut p = String::from("(version 1)\n(allow default)\n(deny file-write*)\n");
         p.push_str("(allow file-write*\n");
-        let mut roots: Vec<PathBuf> = vec![
-            cwd.to_path_buf(),
-            PathBuf::from("/tmp"),
-            PathBuf::from("/private/tmp"),
-            PathBuf::from("/var/folders"),
-            PathBuf::from("/private/var/folders"),
-            PathBuf::from("/dev"),
-        ];
-        roots.extend(self.writable_paths.iter().cloned());
-        if let Some(home) = plank_home {
-            roots.push(home.to_path_buf());
-        }
-        for root in roots {
-            // Resolve symlinks where possible: Seatbelt matches the real
-            // path, and macOS cwds are often under the /tmp -> /private/tmp
-            // or /var -> /private/var symlinks.
-            let real = root.canonicalize().unwrap_or(root);
+        for real in self.write_roots_with_plank_home(cwd, plank_home) {
             p.push_str("  (subpath \"");
             p.push_str(&sbpl_escape(&real.to_string_lossy()));
             p.push_str("\")\n");
@@ -136,6 +123,94 @@ impl Sandbox {
         p.push_str(")\n");
         p
     }
+
+    /// The directories a model-initiated write may land in: cwd, the temp
+    /// roots, `/dev`, the configured extra paths, and `~/.plank` once granted.
+    /// Symlinks are resolved where possible, so callers compare against
+    /// canonical paths. This is the one list both the Seatbelt profile and the
+    /// file tools' containment check ([`Sandbox::contains_write_target`]) are
+    /// built from, so the two can never disagree.
+    #[must_use]
+    pub fn write_roots(&self, cwd: &Path) -> Vec<PathBuf> {
+        self.write_roots_with_plank_home(
+            cwd,
+            self.plank_home_writable
+                .then(plank_home)
+                .flatten()
+                .as_deref(),
+        )
+    }
+
+    fn write_roots_with_plank_home(&self, cwd: &Path, plank_home: Option<&Path>) -> Vec<PathBuf> {
+        let mut roots: Vec<PathBuf> = vec![
+            cwd.to_path_buf(),
+            PathBuf::from("/tmp"),
+            PathBuf::from("/private/tmp"),
+            PathBuf::from("/var/folders"),
+            PathBuf::from("/private/var/folders"),
+            PathBuf::from("/dev"),
+            std::env::temp_dir(),
+        ];
+        roots.extend(self.writable_paths.iter().cloned());
+        if let Some(home) = plank_home {
+            roots.push(home.to_path_buf());
+        }
+        // Resolve symlinks where possible: Seatbelt matches the real path,
+        // and macOS cwds are often under the /tmp -> /private/tmp or
+        // /var -> /private/var symlinks.
+        roots
+            .into_iter()
+            .map(|root| root.canonicalize().unwrap_or(root))
+            .collect()
+    }
+
+    /// True when a file tool may write `target` (already resolved against
+    /// `cwd`): the sandbox is off, or the target's real location lies under
+    /// one of [`write_roots`](Self::write_roots). The target need not exist
+    /// yet — a file about to be created is judged by its parent directory —
+    /// and `..` segments are resolved before the comparison, so
+    /// `<cwd>/../outside` cannot slip past.
+    #[must_use]
+    pub fn contains_write_target(&self, cwd: &Path, target: &Path) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let real = realpath_for_write(target);
+        self.write_roots(cwd).iter().any(|r| real.starts_with(r))
+    }
+}
+
+/// The real location a write to `target` would land at. An existing target
+/// canonicalizes directly; a file about to be created canonicalizes its
+/// parent and re-attaches the file name; when even the parent is missing the
+/// path is normalised lexically (`.` and `..` folded) so a `..` escape is still
+/// visible to the containment check.
+fn realpath_for_write(target: &Path) -> PathBuf {
+    if let Ok(real) = target.canonicalize() {
+        return real;
+    }
+    if let (Some(parent), Some(name)) = (target.parent(), target.file_name())
+        && let Ok(real_parent) = parent.canonicalize()
+    {
+        return real_parent.join(name);
+    }
+    lexical_normalize(target)
+}
+
+/// Folds `.` and `..` components without touching the filesystem.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 /// The plank home directory, `$HOME/.plank`, or `None` when `HOME` is unset.
@@ -222,13 +297,35 @@ pub fn glob_match(pat: &str, text: &str) -> bool {
     segs.last().is_some_and(|s| s.is_empty()) || rest.is_empty()
 }
 
+/// Where a sandbox.json came from, which decides how much of it is believed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigSource {
+    /// `~/.plank/sandbox.json`: the user's own file, fully trusted.
+    User,
+    /// `<cwd>/.plank/sandbox.json`: ships with the checkout, so it may only
+    /// tighten the policy. A cloned repository must not be able to switch the
+    /// sandbox off, exclude commands from it, or widen the writable roots.
+    Project,
+}
+
 /// Parses one sandbox.json file into `sb`. Scalars overwrite, lists append.
-fn apply_config(sb: &mut Sandbox, text: &str) {
+///
+/// From a [`ConfigSource::Project`] file the relaxing keys are ignored:
+/// `enabled` is honoured only when it is `true`, and `writablePaths` and
+/// `excludedCommands` are dropped entirely, since every entry in either list
+/// widens what a model-chosen command may do.
+fn apply_config(sb: &mut Sandbox, text: &str, source: ConfigSource) {
     let Some(root) = json_parse(text) else {
         return;
     };
     if let Some(Json::Bool(b)) = root.get("enabled") {
-        sb.enabled = *b;
+        // A project file may turn the sandbox on, never off.
+        if *b || source == ConfigSource::User {
+            sb.enabled = *b;
+        }
+    }
+    if source == ConfigSource::Project {
+        return;
     }
     if let Some(Json::Arr(items)) = root.get("writablePaths") {
         for item in items {
@@ -246,18 +343,21 @@ fn apply_config(sb: &mut Sandbox, text: &str) {
     }
 }
 
-/// Loads `~/.plank/sandbox.json` then `<cwd>/.plank/sandbox.json`; the
-/// project file wins on scalars and appends to lists.
+/// Loads `~/.plank/sandbox.json` then `<cwd>/.plank/sandbox.json`. Only the
+/// user file can relax the sandbox; the project file can only tighten it
+/// (`"enabled": true`), and its `writablePaths` / `excludedCommands` are
+/// ignored. There is no warning channel at this layer, so the ignored keys
+/// are dropped silently.
 #[must_use]
 pub fn load_default(cwd: &Path) -> Sandbox {
     let mut sb = Sandbox::default();
     if let Ok(home) = std::env::var("HOME")
         && let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".plank/sandbox.json"))
     {
-        apply_config(&mut sb, &text);
+        apply_config(&mut sb, &text, ConfigSource::User);
     }
     if let Ok(text) = std::fs::read_to_string(cwd.join(".plank/sandbox.json")) {
-        apply_config(&mut sb, &text);
+        apply_config(&mut sb, &text, ConfigSource::Project);
     }
     sb
 }
@@ -374,18 +474,138 @@ mod tests {
     }
 
     #[test]
+    fn write_containment_follows_the_profile_roots() {
+        let sb = Sandbox {
+            enabled: true,
+            writable_paths: vec![PathBuf::from("/nonexistent/extra")],
+            excluded_commands: Vec::new(),
+            plank_home_writable: false,
+        };
+        let cwd = Path::new("/nonexistent/work");
+        // Inside cwd, including a not-yet-existing file and nested dirs.
+        assert!(sb.contains_write_target(cwd, Path::new("/nonexistent/work/new.txt")));
+        assert!(sb.contains_write_target(cwd, Path::new("/nonexistent/work/a/b/c.txt")));
+        // `..` is folded before the comparison.
+        assert!(!sb.contains_write_target(cwd, Path::new("/nonexistent/work/../outside")));
+        assert!(sb.contains_write_target(cwd, Path::new("/nonexistent/work/a/../b.txt")));
+        // Sibling directories that merely share a prefix do not count.
+        assert!(!sb.contains_write_target(cwd, Path::new("/nonexistent/workspace/x")));
+        // Configured extra roots and the temp dir are writable.
+        assert!(sb.contains_write_target(cwd, Path::new("/nonexistent/extra/f")));
+        assert!(sb.contains_write_target(cwd, &std::env::temp_dir().join("plank_x")));
+        // Everything else is refused, `~/.plank` included, until granted.
+        assert!(!sb.contains_write_target(cwd, Path::new("/nonexistent/home/.plank/x")));
+        if let Some(home) = plank_home() {
+            assert!(!sb.contains_write_target(cwd, &home.join("settings.json")));
+            let granted = Sandbox {
+                plank_home_writable: true,
+                ..sb.clone()
+            };
+            assert!(granted.contains_write_target(cwd, &home.join("settings.json")));
+        }
+        // Disabled sandbox: no containment at all.
+        let off = Sandbox {
+            enabled: false,
+            ..sb.clone()
+        };
+        assert!(off.contains_write_target(cwd, Path::new("/etc/passwd")));
+    }
+
+    #[test]
     fn config_merge_appends_lists() {
         let mut sb = Sandbox::default();
         apply_config(
             &mut sb,
             r#"{"enabled": true, "writablePaths": ["/a"], "excludedCommands": ["x*"]}"#,
+            ConfigSource::User,
         );
         apply_config(
             &mut sb,
             r#"{"writablePaths": ["/b"], "excludedCommands": ["y"]}"#,
+            ConfigSource::User,
         );
         assert!(sb.enabled);
         assert_eq!(sb.writable_paths.len(), 2);
         assert_eq!(sb.excluded_commands, vec!["x*", "y"]);
+    }
+
+    #[test]
+    fn project_config_can_only_tighten_the_sandbox() {
+        let mut sb = Sandbox {
+            enabled: true,
+            writable_paths: Vec::new(),
+            excluded_commands: Vec::new(),
+            plank_home_writable: false,
+        };
+        // Every relaxing key from a project file is ignored.
+        apply_config(
+            &mut sb,
+            r#"{"enabled": false, "writablePaths": ["/"], "excludedCommands": ["*"]}"#,
+            ConfigSource::Project,
+        );
+        assert!(sb.enabled, "a checkout must not switch the sandbox off");
+        assert!(sb.writable_paths.is_empty());
+        assert!(sb.excluded_commands.is_empty());
+        assert!(sb.should_sandbox("rm -rf /"));
+
+        // Turning it on from the project file is tightening, so it is honoured
+        // even after the user disabled it.
+        let mut off = Sandbox {
+            enabled: false,
+            writable_paths: Vec::new(),
+            excluded_commands: Vec::new(),
+            plank_home_writable: false,
+        };
+        apply_config(&mut off, r#"{"enabled": true}"#, ConfigSource::Project);
+        assert!(off.enabled);
+
+        // The user file keeps its full authority.
+        apply_config(
+            &mut sb,
+            r#"{"enabled": false, "excludedCommands": ["git *"]}"#,
+            ConfigSource::User,
+        );
+        assert!(!sb.enabled);
+        assert_eq!(sb.excluded_commands, vec!["git *"]);
+    }
+
+    #[test]
+    fn load_default_ignores_relaxing_keys_in_project_file() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let cwd = std::env::temp_dir().join(format!(
+            "plank_sandbox_load_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(cwd.join(".plank")).unwrap();
+        std::fs::write(
+            cwd.join(".plank/sandbox.json"),
+            r#"{"enabled": false, "writablePaths": ["/etc"], "excludedCommands": ["*"]}"#,
+        )
+        .unwrap();
+        let sb = load_default(&cwd);
+        // The project file cannot relax anything: whatever the user file and
+        // platform default say, the result is at least that strict.
+        assert!(!sb.writable_paths.iter().any(|p| p == Path::new("/etc")));
+        assert!(!sb.excluded_commands.iter().any(|c| c == "*"));
+        if cfg!(target_os = "macos") && !user_config_disables() {
+            assert!(sb.enabled);
+        }
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// True when the developer's own `~/.plank/sandbox.json` turns the sandbox
+    /// off, in which case `load_default` legitimately returns disabled.
+    fn user_config_disables() -> bool {
+        let Ok(home) = std::env::var("HOME") else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(Path::new(&home).join(".plank/sandbox.json")) else {
+            return false;
+        };
+        let mut sb = Sandbox::default();
+        apply_config(&mut sb, &text, ConfigSource::User);
+        !sb.enabled
     }
 }

@@ -71,11 +71,11 @@ pub(crate) fn tag_prefix_partial(s: &[u8], closing: bool, name: &str) -> bool {
 /// then the dropped-leading-bar typo the model actually emits.
 ///
 /// Segments rather than assembled `String`s because this sits on the hot path:
-/// [`find_close_tag_any`] re-scans the accumulated parameter value on every
-/// `feed`, and `CLOSE_SCAN_HEAD` is a bare `</`, which occurs on nearly every
-/// line of HTML written through a `write` or `edit` parameter. Building the
-/// spellings with `format!` cost four transient allocations per candidate,
-/// which is order 10^6 for a few hundred lines of markup.
+/// [`DsmlParser::find_param_close`] runs after every fed byte, and
+/// `CLOSE_SCAN_HEAD` is a bare `</`, which occurs on nearly every line of HTML
+/// written through a `write` or `edit` parameter. Building the spellings with
+/// `format!` cost four transient allocations per candidate, which is order
+/// 10^6 for a few hundred lines of markup.
 fn tag_prefix_forms<'a>(marker: &'a str, closing: bool, name: &'a str) -> [[&'a [u8]; 6]; 2] {
     let slash: &[u8] = if closing { b"/" } else { b"" };
     let (marker, name) = (marker.as_bytes(), name.as_bytes());
@@ -214,6 +214,19 @@ pub struct DsmlParser {
     /// True while the raw tail looks like a partial parameter close tag, so
     /// online rendering can hide it before the full tag arrives.
     param_close_prefix: bool,
+    /// Offset into `raw` of the earliest `</` in the current parameter value
+    /// that has not yet been ruled out as a close tag (or, when none is
+    /// pending, of the last byte, which may still grow into one). `feed`
+    /// re-parses after every byte, so without this cursor each byte rescanned
+    /// the whole value: quadratic on a long `write` payload, on the UI thread.
+    param_scan_from: usize,
+    /// Offset into `raw` of the last `<` fed, so `update_param_close_prefix`
+    /// does not walk back over the whole value on every byte.
+    last_lt: usize,
+    /// Bytes examined by the close-tag scan, summed over all `parse` calls —
+    /// test-only observability that the scan stays linear in the input.
+    #[cfg(test)]
+    param_scan_work: usize,
     calls: Vec<ToolCall>,
     error: String,
 }
@@ -307,6 +320,9 @@ impl DsmlParser {
             }
 
             self.raw.push(c);
+            if c == b'<' {
+                self.last_lt = self.raw.len() - 1;
+            }
             self.parse();
             if self.state == DsmlState::ParamValue {
                 self.update_param_close_prefix();
@@ -346,14 +362,15 @@ impl DsmlParser {
                     // recorded repro ends `<｜DSML｜command …>` with
                     // `</｜DSML｜invoke>`, not `</｜DSML｜command>`. Accept either,
                     // plus `parameter`, and take whichever lands first.
+                    let elem = self.param_elem.take();
                     let mut names: Vec<&str> = vec!["parameter"];
-                    if let Some(elem) = self.param_elem.as_deref() {
+                    if let Some(elem) = elem.as_deref() {
                         names.push(elem);
                         names.push("invoke");
                     }
-                    let Some((end, tag_len)) =
-                        find_close_tag_any(&self.raw[self.param_value_start..], &names)
-                    else {
+                    let found = self.find_param_close(&names);
+                    self.param_elem = elem;
+                    let Some((end, tag_len)) = found else {
                         return;
                     };
                     let value_bytes =
@@ -481,6 +498,7 @@ impl DsmlParser {
         self.param_is_string = parse_attr(tag, "string").as_deref() == Some("true");
         self.parse_pos += tag_len;
         self.param_value_start = self.parse_pos;
+        self.param_scan_from = self.parse_pos;
         self.param_close_prefix = false;
         self.state = DsmlState::ParamValue;
     }
@@ -545,6 +563,44 @@ impl DsmlParser {
             .then_some(elem)
     }
 
+    /// Finds the earliest close tag for any of `names` in the current
+    /// parameter value, returning (offset from the value start, tag length).
+    ///
+    /// Incremental counterpart of [`find_close_tag_any`], with the same
+    /// accepted language: it resumes from `param_scan_from`, the earliest `</`
+    /// not yet ruled out. A candidate is ruled out only when the bytes after it
+    /// can never complete a close tag ([`close_tag_partial`] fails), and a
+    /// candidate that is still a viable prefix contains no second `<`, so no
+    /// later `</` can win while it is pending. Each byte is therefore examined
+    /// a bounded number of times regardless of the value's length.
+    fn find_param_close(&mut self, names: &[&str]) -> Option<(usize, usize)> {
+        #[cfg(test)]
+        {
+            self.param_scan_work += self.raw.len() - self.param_scan_from;
+        }
+        loop {
+            let Some(pos) = find_bytes(&self.raw[self.param_scan_from..], CLOSE_SCAN_HEAD) else {
+                // No pending candidate: only the last byte can start one later.
+                self.param_scan_from = self
+                    .raw
+                    .len()
+                    .saturating_sub(CLOSE_SCAN_HEAD.len() - 1)
+                    .max(self.param_value_start);
+                return None;
+            };
+            let at = self.param_scan_from + pos;
+            let tail = &self.raw[at..];
+            if let Some(tag_len) = names.iter().find_map(|n| close_tag_at(tail, n)) {
+                return Some((at - self.param_value_start, tag_len));
+            }
+            self.param_scan_from = at;
+            if names.iter().any(|n| close_tag_partial(tail, n)) {
+                return None;
+            }
+            self.param_scan_from = at + 1;
+        }
+    }
+
     /// Tracks whether the raw tail is a partial parameter close tag, so the
     /// terminal renderer can hide it without waiting for the whole parameter.
     fn update_param_close_prefix(&mut self) {
@@ -552,11 +608,12 @@ impl DsmlParser {
         if self.state != DsmlState::ParamValue || self.raw.len() <= self.param_value_start {
             return;
         }
-        let value = &self.raw[self.param_value_start..];
-        let Some(lt) = value.iter().rposition(|&b| b == b'<') else {
+        // `last_lt` is the last `<` in `raw`; it is the last `<` of the value
+        // exactly when it falls inside the value.
+        if self.last_lt < self.param_value_start {
             return;
-        };
-        let tail = &value[lt..];
+        }
+        let tail = &self.raw[self.last_lt..];
         if tail.len() > 64 || tag_prefix_len(tail, true, "").is_none() {
             return;
         }
@@ -614,12 +671,44 @@ fn close_tag_at(s: &[u8], name: &str) -> Option<usize> {
     Some(i + 1)
 }
 
+/// True when `s` is a proper prefix of some closing tag for `name` that
+/// [`close_tag_at`] would accept, i.e. more bytes could still complete it.
+/// Returns false for a complete tag; check [`close_tag_at`] first.
+fn close_tag_partial(s: &[u8], name: &str) -> bool {
+    if tag_prefix_partial(s, true, name) {
+        return true;
+    }
+    let Some(mut i) = tag_prefix_len(s, true, name) else {
+        return false;
+    };
+    while i < s.len() && s[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i < s.len() && s.len() - i < DSML_BAR.len() && DSML_BAR.starts_with(&s[i..]) {
+        return true;
+    }
+    if s[i..].starts_with(DSML_BAR) {
+        i += DSML_BAR.len();
+    }
+    while i < s.len() {
+        if !s[i].is_ascii_whitespace() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Finds the earliest DSML closing tag for any of `names`; returns
 /// (offset, tag length).
 ///
 /// Scanning position-first rather than name-first matters: the winner must be
 /// the tag that appears earliest in the value, not the one whose name happens
 /// to come first in the list.
+///
+/// The whole-value reference scan; the parser itself uses the incremental
+/// [`DsmlParser::find_param_close`], and tests check the two agree.
+#[cfg(test)]
 fn find_close_tag_any(s: &[u8], names: &[&str]) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some(pos) = find_bytes(&s[from..], CLOSE_SCAN_HEAD) {
@@ -1320,5 +1409,112 @@ mod tests {
         );
         assert_eq!(p.state(), super::DsmlState::Done, "error: {}", p.error());
         assert_eq!(p.calls()[0].arg_value("command"), Some("ls"));
+    }
+
+    /// Wraps `value` in a single-parameter `write` stanza.
+    fn write_stanza(value: &str) -> String {
+        format!(
+            concat!(
+                "<｜DSML｜tool_calls>",
+                "<｜DSML｜invoke name=\"write\">",
+                "<｜DSML｜parameter name=\"content\" string=\"true\">{value}</｜DSML｜parameter｜>",
+                "</｜DSML｜invoke｜>",
+                "</｜DSML｜tool_calls｜>",
+            ),
+            value = value
+        )
+    }
+
+    /// A streamed parameter value is scanned incrementally: each fed byte
+    /// examines a bounded window, not the whole value so far. A 300 KB `write`
+    /// payload fed byte-by-byte used to cost ~10^10 byte compares on the UI
+    /// thread; the instrumented scan-work counter pins it to a small constant
+    /// per byte, and the wall-clock bound catches a regression the counter
+    /// does not see.
+    #[test]
+    fn long_param_value_streams_in_linear_time() {
+        let mut value = String::new();
+        while value.len() < 300 * 1024 {
+            value.push_str("<div class=\"row\">text</div>\n</p><｜DSML｜ </｜DSML｜param ");
+        }
+        let s = write_stanza(&value);
+        let started = std::time::Instant::now();
+        let mut p = DsmlParser::new();
+        feed_bytewise(&mut p, &s);
+        let elapsed = started.elapsed();
+        assert_eq!(p.state(), DsmlState::Done, "error: {}", p.error());
+        assert_eq!(p.calls()[0].arg_value("content"), Some(value.as_str()));
+        assert!(
+            p.param_scan_work < 16 * s.len(),
+            "scan work {} for {} bytes is not linear",
+            p.param_scan_work,
+            s.len()
+        );
+        assert!(elapsed.as_secs() < 5, "took {elapsed:?}");
+    }
+
+    /// A parameter close tag split across `feed` calls at every possible
+    /// offset still terminates the value exactly where a single feed would.
+    #[test]
+    fn param_close_tag_split_across_feeds_is_detected() {
+        let value = "a</b> </｜DSML｜ x";
+        let s = write_stanza(value);
+        let close = s.find("</｜DSML｜parameter｜>").unwrap();
+        let close_end = close + "</｜DSML｜parameter｜>".len();
+        for cut in close..close_end {
+            let mut p = DsmlParser::new();
+            p.feed(&s.as_bytes()[..cut]);
+            assert_eq!(p.state(), DsmlState::ParamValue, "cut {cut}");
+            p.feed(&s.as_bytes()[cut..]);
+            assert_eq!(p.state(), DsmlState::Done, "cut {cut}: {}", p.error());
+            assert_eq!(p.calls()[0].arg_value("content"), Some(value), "cut {cut}");
+        }
+    }
+
+    /// The incremental scan must accept exactly what the whole-value rescan
+    /// accepts, including candidates that look like a close tag for a while.
+    #[test]
+    fn incremental_scan_matches_whole_value_rescan() {
+        let values = [
+            "plain",
+            "</｜DSML｜parameter",
+            "</｜DSML｜parameter x> </｜DSML｜paramete",
+            "</｜DSML｜parameter ｜ x></DSML｜parame",
+            "</｜DSML｜</｜DSML｜pa<</ </parameter> </｜SSML｜param",
+            "</｜DSML｜parameter    \n\t  ｜",
+        ];
+        for value in values {
+            let s = write_stanza(value);
+            let mut p = DsmlParser::new();
+            feed_bytewise(&mut p, &s);
+            assert_eq!(p.state(), DsmlState::Done, "{value:?}: {}", p.error());
+            assert_eq!(p.calls()[0].arg_value("content"), Some(value), "{value:?}");
+            let body = &s.as_bytes()[s.find(value).unwrap()..];
+            let (end, _) = find_close_tag_any(body, &["parameter"]).unwrap();
+            assert_eq!(end, value.len(), "{value:?}");
+        }
+    }
+
+    /// Same for the shorthand form closed by `</｜DSML｜invoke>`, and for a value
+    /// whose earlier `</｜DSML｜` candidate turns out not to be a close tag.
+    #[test]
+    fn shorthand_close_tag_split_across_feeds_is_detected() {
+        let s = concat!(
+            "<｜DSML｜tool_calls><｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜command string=\"true\">echo '</｜DSML｜inv' </｜DSML｜invoke｜>",
+            "</｜DSML｜tool_calls｜>"
+        );
+        let close = s.rfind("</｜DSML｜invoke｜>").unwrap();
+        for cut in close..=close + "</｜DSML｜invoke｜>".len() {
+            let mut p = DsmlParser::new();
+            p.feed(&s.as_bytes()[..cut]);
+            p.feed(&s.as_bytes()[cut..]);
+            assert_eq!(p.state(), DsmlState::Done, "cut {cut}: {}", p.error());
+            assert_eq!(
+                p.calls()[0].arg_value("command"),
+                Some("echo '</｜DSML｜inv' "),
+                "cut {cut}"
+            );
+        }
     }
 }

@@ -107,24 +107,15 @@ fn has_components(dir: &Path) -> bool {
         .any(|(plank, cc)| dir.join(plank).exists() || dir.join(cc).exists())
 }
 
-/// Reads one top-level string field out of a flat JSON object without pulling
-/// in a parser: the manifest fields plank needs are all plain strings, and
-/// anything richer belongs to a later sub-project.
+/// Reads one top-level string member of a JSON object. Goes through the real
+/// parser rather than a textual scan: a scan for `"name"` would also match the
+/// key spelled inside an earlier string value (a description that mentions
+/// `"name"`, say) and read whatever followed it as the plugin's name.
 fn json_string_field(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let mut rest = text.get(text.find(&needle)? + needle.len()..)?.trim_start();
-    rest = rest.strip_prefix(':')?.trim_start();
-    let body = rest.strip_prefix('"')?;
-    let mut out = String::new();
-    let mut chars = body.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => out.push(chars.next()?),
-            _ => out.push(c),
-        }
+    match crate::tools::mcp::json_parse(text)?.get(key)? {
+        crate::tools::mcp::Json::Str(s) => Some(s.clone()),
+        _ => None,
     }
-    None
 }
 
 /// Whether `name` is usable as a namespace prefix.
@@ -136,16 +127,34 @@ fn valid_name(name: &str) -> bool {
         && !name.contains("__")
 }
 
-/// Warnings for every `safety.*` key a plugin's `settings.json` sets.
+/// Settings sections a plugin's `settings.json` may not set at all.
+///
+/// Shared with [`crate::settings`], which drops these sections when the layer
+/// being overlaid is a plugin; this list is what the warning here is derived
+/// from, so the two can never disagree about what was refused.
+pub const PLUGIN_REFUSED_SECTIONS: [&str; 4] = ["engine", "worktree", "tools", "pluginConfig"];
+
+/// Warnings for the keys a plugin's `settings.json` sets that deserve a look.
 ///
 /// Plugin settings are applied strictly below `~/.plank/settings.json`, so a
-/// plugin can never override a key the user set. But `safety.sandbox` is an
-/// `Option<bool>` that defaults to `None`, and almost nobody sets it
-/// explicitly — so a plugin writing `{"safety":{"sandbox":false}}` wins by
-/// default and turns the bash sandbox off silently. That is no more power than
-/// `./.plank/settings.json` already has over the same key, so the setting is
-/// honored rather than blocked; it is only made visible.
-fn settings_safety_warnings(name: &str, root: &Path) -> Vec<String> {
+/// plugin can never override a key the user set. Two classes of key still
+/// warrant a warning:
+///
+/// - `engine.*`, `worktree.*`, `tools.*` and `pluginConfig.*` are refused
+///   outright (see [`PLUGIN_REFUSED_SECTIONS`]): which model runs, which
+///   backend, what gets symlinked into a worktree and which tools exist are
+///   the user's to decide, and a plugin cannot even supply the default.
+///   [`crate::settings::Settings::overlay_from`] drops them; this makes the
+///   drop visible.
+/// - `safety.sandbox` is an `Option<bool>` that defaults to `None`, and
+///   almost nobody sets it explicitly — so a plugin writing
+///   `{"safety":{"sandbox":false}}` wins by default and turns the bash
+///   sandbox off silently. That is no more power than `./.plank/settings.json`
+///   already has over the same key, so the setting is honored rather than
+///   blocked; it is only made visible.
+///
+/// Cosmetic keys (`ui.*` and the rest) are applied quietly.
+fn settings_audit_warnings(name: &str, root: &Path) -> Vec<String> {
     let path = root.join("settings.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
@@ -153,18 +162,33 @@ fn settings_safety_warnings(name: &str, root: &Path) -> Vec<String> {
     let Some(crate::tools::mcp::Json::Obj(top)) = crate::tools::mcp::json_parse(&text) else {
         return Vec::new();
     };
-    let Some((_, crate::tools::mcp::Json::Obj(safety))) = top.iter().find(|(k, _)| k == "safety")
-    else {
-        return Vec::new();
-    };
-    safety
-        .iter()
-        .map(|(key, _)| {
+    let mut out = Vec::new();
+    for (section, value) in &top {
+        if !PLUGIN_REFUSED_SECTIONS.contains(&section.as_str()) {
+            continue;
+        }
+        let keys: Vec<String> = match value {
+            crate::tools::mcp::Json::Obj(members) => members
+                .iter()
+                .map(|(k, _)| format!("{section}.{k}"))
+                .collect(),
+            _ => vec![section.clone()],
+        };
+        for key in keys {
+            out.push(format!(
+                "plugin '{name}': settings.json sets {key}; refused (a plugin may not set {section}.*), set it yourself in ~/.plank/settings.json if you want it"
+            ));
+        }
+    }
+    if let Some((_, crate::tools::mcp::Json::Obj(safety))) = top.iter().find(|(k, _)| k == "safety")
+    {
+        out.extend(safety.iter().map(|(key, _)| {
             format!(
                 "plugin '{name}': settings.json sets safety.{key}; it applies unless you set it yourself in ~/.plank/settings.json or ./.plank/settings.json"
             )
-        })
-        .collect()
+        }));
+    }
+    out
 }
 
 /// Loads one plugin directory. `None` when `dir` is not a plugin at all —
@@ -174,12 +198,12 @@ pub fn load_plugin(dir: &Path, origin: Origin) -> Option<Plugin> {
     let mut plugin = load_plugin_fields(dir, origin)?;
     // Appended after the manifest is read, so the warning uses the plugin's
     // final name rather than the directory it happened to sit in.
-    let safety = settings_safety_warnings(&plugin.name, &plugin.root);
-    plugin.warnings.extend(safety);
+    let audit = settings_audit_warnings(&plugin.name, &plugin.root);
+    plugin.warnings.extend(audit);
     Some(plugin)
 }
 
-/// The manifest-reading half of [`load_plugin`], split out so the safety-key
+/// The manifest-reading half of [`load_plugin`], split out so the settings
 /// audit runs once on every exit path.
 fn load_plugin_fields(dir: &Path, origin: Origin) -> Option<Plugin> {
     let manifest = manifest_path(dir);
@@ -282,23 +306,22 @@ fn subdirs(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Loads every activated plugin given an explicit home directory: scans
-/// `<home>/.plank/plugins/dev/*`, then `<cwd>/.plank/plugins/*`, then each
-/// `--plugin-dir` in the order given. A later source replaces an earlier
+/// `<home>/.plank/plugins/claude/*`, then `<home>/.plank/plugins/dev/*`, then
+/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given. A later source replaces an earlier
 /// plugin of the same name. `home` is `None` when there is no home directory
 /// to scan, in which case the user-scan source contributes nothing.
 #[must_use]
 pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
     let mut candidates: Vec<(PathBuf, Origin)> = Vec::new();
     if let Some(home) = home {
-        let root = home.join(".plank").join("plugins").join("dev");
-        candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
-    }
-    if let Some(home) = home {
-        // After `dev/`: a plugin the user wrote themselves outranks one that
-        // arrived from a repository, which is the same precedence rule the
-        // rest of this list follows.
+        // `claude/` first, `dev/` second: a later source replaces an earlier
+        // one of the same name, so a plugin the user wrote themselves outranks
+        // one that arrived from someone else's repository. Project-local and
+        // `--plugin-dir` entries follow and outrank both.
         let root = crate::claudeplugin::install_dir(home);
         candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserClaude)));
+        let root = home.join(".plank").join("plugins").join("dev");
+        candidates.extend(subdirs(&root).into_iter().map(|d| (d, Origin::UserScan)));
     }
     let project = cwd.join(".plank").join("plugins");
     candidates.extend(
@@ -360,8 +383,9 @@ pub fn load_in(home: Option<&Path>, cwd: &Path, cli_dirs: &[PathBuf]) -> PluginS
     set
 }
 
-/// Loads every activated plugin: `~/.plank/plugins/dev/*`, then
-/// `<cwd>/.plank/plugins/*`, then each `--plugin-dir` in the order given.
+/// Loads every activated plugin: `~/.plank/plugins/claude/*`, then
+/// `~/.plank/plugins/dev/*`, then `<cwd>/.plank/plugins/*`, then each
+/// `--plugin-dir` in the order given.
 /// A later source replaces an earlier plugin of the same name.
 #[must_use]
 pub fn load_default(cwd: &Path, cli_dirs: &[PathBuf]) -> PluginSet {
@@ -652,13 +676,13 @@ pub fn install_from_url(url: &str, home: &Path) -> Result<PathBuf, String> {
 }
 
 /// A private, empty directory to extract into. Removed by the caller.
+///
+/// Shares [`crate::claudeplugin::staging_dir`] rather than staging under
+/// `dev/.staging`: `dev/` is a scan root, so a tree extracted there is one the
+/// next start loads as plugin `.staging` before it was ever validated, if plank
+/// is killed between extraction and the closing `remove_dir_all`.
 fn staging_dir(home: &Path) -> Result<PathBuf, String> {
-    let base = user_plugin_dir(home).join(".staging");
-    // Fresh every time: reusing a directory would mix an old failed download
-    // with a new one, and the plugin root is found by searching the tree.
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
-    Ok(base)
+    crate::claudeplugin::staging_dir(home)
 }
 
 /// Downloads, extracts and validates, returning the plugin root inside `dir`.
@@ -873,16 +897,38 @@ fn find_plugin_root(dir: &Path) -> Option<PathBuf> {
 /// Returns a message when the name is not a bare name, or nothing is installed
 /// under it, or the delete fails.
 pub fn uninstall(name: &str, home: &Path) -> Result<PathBuf, String> {
-    if name.is_empty() || name.contains('/') || name.contains('\\') || name.contains("..") {
+    // `valid_name` is the namespace grammar (no separators, no `:`), but it
+    // still admits `.` and `..`, and `root.join(".")` *is* the root: a
+    // `/plugins remove .` would delete every installed plugin at once.
+    if !valid_name(name) || name == "." || name == ".." {
         return Err(format!("'{name}' is not a plugin name"));
     }
-    let dir = [
-        user_plugin_dir(home).join(name),
-        crate::claudeplugin::install_dir(home).join(name),
-    ]
-    .into_iter()
-    .find(|d| d.is_dir())
-    .ok_or_else(|| format!("'{name}' is not installed"))?;
+    let roots = [
+        user_plugin_dir(home),
+        crate::claudeplugin::install_dir(home),
+    ];
+    let dir = roots
+        .iter()
+        .map(|root| root.join(name))
+        .find(|d| d.is_dir())
+        .ok_or_else(|| format!("'{name}' is not installed"))?;
+    // Belt and braces: whatever the name grammar let through, the directory
+    // about to be deleted must be an immediate child of one of the roots.
+    let canon = dir
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", dir.display()))?;
+    let parent_ok = canon.parent().is_some_and(|parent| {
+        roots
+            .iter()
+            .filter_map(|root| root.canonicalize().ok())
+            .any(|root| root == parent)
+    });
+    if !parent_ok || canon.file_name().is_none_or(|f| f != name) {
+        return Err(format!(
+            "refusing to remove {}: not a plugin directory",
+            dir.display()
+        ));
+    }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()))?;
     Ok(dir)
 }
@@ -1266,7 +1312,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn claude_root_is_scanned_after_dev() {
+    fn dev_root_is_scanned_after_claude() {
         let root = scratch("claude-scan-order");
         let home = root.join("home");
         write(
@@ -1291,10 +1337,49 @@ mod tests {
             .find(|p| p.name == "solo")
             .expect("claude/ plugin is scanned");
         assert_eq!(solo.origin, Origin::UserClaude);
-        // claude/ is scanned after dev/, so on a name collision it replaces the
-        // dev/ entry, exactly as project scan replaces user scan today.
+        // dev/ is scanned after claude/, so on a name collision the plugin the
+        // user wrote themselves replaces the fetched one, and the shadowing is
+        // reported the same way every other later-wins collision is.
         let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
-        assert_eq!(dup.origin, Origin::UserClaude);
+        assert_eq!(dup.origin, Origin::UserScan);
+        assert!(
+            set.warnings
+                .iter()
+                .any(|w| w.contains("'dup'") && w.contains("shadows")),
+            "{:?}",
+            set.warnings
+        );
+    }
+
+    #[test]
+    fn project_and_cli_dirs_outrank_both_home_roots() {
+        let root = scratch("scan-order-project-cli");
+        let home = root.join("home");
+        let cwd = root.join("cwd");
+        write(
+            &home,
+            ".plank/plugins/claude/dup/.claude-plugin/plugin.json",
+            r#"{"name":"dup"}"#,
+        );
+        write(
+            &home,
+            ".plank/plugins/dev/dup/.plank-plugin/plugin.json",
+            r#"{"name":"dup"}"#,
+        );
+        write(
+            &cwd,
+            ".plank/plugins/dup/.plank-plugin/plugin.json",
+            r#"{"name":"dup"}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[]);
+        let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
+        assert_eq!(dup.origin, Origin::ProjectScan);
+
+        let cli = root.join("cli-dup");
+        write(&cli, ".plank-plugin/plugin.json", r#"{"name":"dup"}"#);
+        let set = load_in(Some(&home), &cwd, &[cli]);
+        let dup = set.plugins.iter().find(|p| p.name == "dup").expect("dup");
+        assert_eq!(dup.origin, Origin::CliDir);
     }
 
     #[test]
@@ -1308,6 +1393,29 @@ mod tests {
         let dir = uninstall("demo", &root).expect("removes a claude plugin");
         assert!(!dir.exists());
         assert!(dir.ends_with("plugins/claude/demo"));
+    }
+
+    /// `/plugins remove .` must not resolve to the plugin root itself and wipe
+    /// every dev plugin; the name has to be one bare path component.
+    #[test]
+    fn uninstall_refuses_anything_but_a_bare_plugin_name() {
+        let root = scratch("uninstall-bare-name");
+        write(
+            &root,
+            ".plank/plugins/dev/keep/.plank-plugin/plugin.json",
+            r#"{"name":"keep"}"#,
+        );
+        write(
+            &root,
+            ".plank/plugins/claude/also/.claude-plugin/plugin.json",
+            r#"{"name":"also"}"#,
+        );
+        for bad in [".", "..", "a/b", "", "a\\b", "./keep", "keep/", "a:b"] {
+            let err = uninstall(bad, &root).expect_err(&format!("{bad:?} must be refused"));
+            assert!(err.contains("not a plugin name"), "{bad:?}: {err}");
+        }
+        assert!(root.join(".plank/plugins/dev/keep").is_dir());
+        assert!(root.join(".plank/plugins/claude/also").is_dir());
     }
 
     /// Installing copies the tree, skips build output, and refuses to
@@ -1375,7 +1483,7 @@ mod tests {
         // The staging directory must not survive: the next install searches the
         // tree for a plugin root, and a leftover would be found as one.
         assert!(
-            !user_plugin_dir(&home).join(".staging").exists(),
+            !crate::claudeplugin::staging_dir_path(&home).exists(),
             "staging directory left behind"
         );
         let _ = std::fs::remove_dir_all(&root);
@@ -1456,7 +1564,7 @@ mod tests {
             .expect_err("plaintext must be refused");
         assert!(err.contains("plaintext"), "{err}");
         assert!(
-            !user_plugin_dir(&root).join(".staging").exists(),
+            !crate::claudeplugin::staging_dir_path(&root).exists(),
             "a refused URL still created a staging directory"
         );
     }
@@ -1700,6 +1808,53 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(&base).expect("mkdir");
         base
+    }
+
+    #[test]
+    fn manifest_name_is_the_top_level_member_not_a_key_spelled_in_a_value() {
+        let dir = scratch("manifest-name-in-value").join("real");
+        write(
+            &dir,
+            ".plank-plugin/plugin.json",
+            r#"{"description":"say \"name\": \"bogus\" here","author":{"name":"someone"},"name":"real"}"#,
+        );
+        let p = load_plugin(&dir, Origin::UserScan).expect("loads");
+        assert_eq!(p.name, "real");
+        assert_eq!(p.description, r#"say "name": "bogus" here"#);
+        // A non-string member is not a name at all, not a stringified object.
+        assert_eq!(p.author, "");
+        assert_eq!(json_string_field(r#"{"version":3}"#, "version"), None);
+        assert_eq!(json_string_field("not json", "name"), None);
+    }
+
+    /// A kill mid-install must not leave a tree where the next start scans
+    /// for plugins, so staging sits outside every root `load_in` walks.
+    #[test]
+    fn url_install_stages_outside_every_scan_root() {
+        let root = scratch("staging-outside-roots");
+        let home = root.join("home");
+        let staging = staging_dir(&home).expect("staging dir");
+        assert!(staging.is_dir());
+        for scan_root in [
+            user_plugin_dir(&home),
+            crate::claudeplugin::install_dir(&home),
+            home.join(".plank").join("plugins"),
+        ] {
+            assert!(
+                !staging.starts_with(&scan_root),
+                "{} is under scan root {}",
+                staging.display(),
+                scan_root.display()
+            );
+        }
+        // And a stale tree there is invisible to the loader.
+        write(
+            &staging,
+            "leftover/.plank-plugin/plugin.json",
+            r#"{"name":"leftover"}"#,
+        );
+        let set = load_in(Some(&home), &root.join("cwd"), &[]);
+        assert!(set.plugins.is_empty(), "{:?}", set.plugins);
     }
 
     #[test]
@@ -2437,6 +2592,43 @@ mod tests {
         assert!(
             out.contains("safety.sandbox") && out.contains("demo"),
             "expected a warning naming the plugin and the key, got: {out}"
+        );
+    }
+
+    #[test]
+    fn a_plugin_settings_file_touching_a_refused_section_warns() {
+        let base = scratch("plugin-refused-sections");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir");
+        let cwd = base.join("proj");
+        std::fs::create_dir_all(&cwd).expect("mkdir");
+        let plugin = base.join("demo");
+        write(&plugin, ".plank-plugin/plugin.json", r#"{"name":"demo"}"#);
+        write(
+            &plugin,
+            "settings.json",
+            r#"{"engine":{"model":"/evil.gguf","backend":"cpu"},"worktree":{"symlinkDirectories":["x"]},"tools":{"runCode":true},"pluginConfig":{"k":"v"},"ui":{"popupRows":9}}"#,
+        );
+        let set = load_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(set.plugins.len(), 1, "the plugin still loads");
+        let warnings = set.all_warnings();
+        for key in [
+            "engine.model",
+            "engine.backend",
+            "worktree.symlinkDirectories",
+            "tools.runCode",
+            "pluginConfig.k",
+        ] {
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.contains(key) && w.contains("refused") && w.contains("demo")),
+                "no refusal for {key}: {warnings:?}"
+            );
+        }
+        assert!(
+            !warnings.iter().any(|w| w.contains("ui.")),
+            "cosmetic keys stay quiet: {warnings:?}"
         );
     }
 

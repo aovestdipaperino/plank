@@ -216,28 +216,25 @@ pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        // Order does not matter here: `str::replace` matches the literal
-        // pattern `$CLAUDE_PLUGIN_ROOT`, and inside `${CLAUDE_PLUGIN_ROOT}`
-        // the character after `$` is `{`, not `C`, so the bare pattern can
-        // never match there. Both spellings are replaced either way.
-        let substituted = text
-            .replace("${CLAUDE_PLUGIN_ROOT}", &root)
-            .replace("$CLAUDE_PLUGIN_ROOT", &root);
-        let var_changed = substituted != text;
-        let mut out = substituted;
-        if rel == "hooks/hooks.json" {
-            // A malformed file cannot be flattened; `unsupported_hook_events`
-            // (run before this, in `install_staged`) is what refuses those,
-            // so by the time this runs a parse failure just means "leave the
-            // substituted text as it was" rather than an error of its own.
-            if let Some(parsed) = json_parse(&out)
-                && let Some(unwrapped) = unwrap_nested_hooks(&parsed)
-            {
-                let mut rewritten = String::new();
-                json_write(&mut rewritten, &unwrapped);
-                out = rewritten;
-            }
+        // The substitution runs on the parsed tree's string values, never on
+        // the JSON text: a root containing `"` or `\` spliced into the text
+        // would leave an unparseable file, and the hooks would vanish without
+        // a word. Rewriting the value and re-serializing lets the writer
+        // escape it. A file that does not parse is left exactly as it was;
+        // `unsupported_hook_events` (run before this, in `install_staged`) is
+        // what refuses a malformed hooks file, and a malformed `.mcp.json`
+        // is the MCP loader's to report.
+        let Some(mut parsed) = json_parse(&text) else {
+            continue;
+        };
+        let var_changed = substitute_plugin_root(&mut parsed, &root);
+        if rel == "hooks/hooks.json"
+            && let Some(unwrapped) = unwrap_nested_hooks(&parsed)
+        {
+            parsed = unwrapped;
         }
+        let mut out = String::new();
+        json_write(&mut out, &parsed);
         if out != text {
             std::fs::write(&path, &out)
                 .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
@@ -245,6 +242,35 @@ pub fn rewrite_plugin_root(dest: &Path) -> Result<bool, String> {
         changed |= var_changed;
     }
     Ok(changed)
+}
+
+/// Replaces `${CLAUDE_PLUGIN_ROOT}` and `$CLAUDE_PLUGIN_ROOT` with `root` in
+/// every string value of `v`, recursively, returning whether anything changed.
+///
+/// Order does not matter: `str::replace` matches the literal pattern
+/// `$CLAUDE_PLUGIN_ROOT`, and inside `${CLAUDE_PLUGIN_ROOT}` the character
+/// after `$` is `{`, not `C`, so the bare pattern can never match there.
+fn substitute_plugin_root(v: &mut Json, root: &str) -> bool {
+    match v {
+        Json::Str(s) => {
+            let out = s
+                .replace("${CLAUDE_PLUGIN_ROOT}", root)
+                .replace("$CLAUDE_PLUGIN_ROOT", root);
+            if out == *s {
+                false
+            } else {
+                *s = out;
+                true
+            }
+        }
+        Json::Arr(items) => items
+            .iter_mut()
+            .fold(false, |acc, item| substitute_plugin_root(item, root) | acc),
+        Json::Obj(members) => members.iter_mut().fold(false, |acc, (_, val)| {
+            substitute_plugin_root(val, root) | acc
+        }),
+        Json::Null | Json::Bool(_) | Json::Num(_) => false,
+    }
 }
 
 /// Event names in `root/hooks/hooks.json` that plank does not implement.
@@ -493,7 +519,8 @@ pub fn install(
     result
 }
 
-/// A private, empty staging directory. Removed by [`install`] on every path.
+/// A private, empty staging directory. Removed by [`install`] (and by
+/// [`crate::plugins::install_from_url`], which stages here too) on every path.
 ///
 /// Deliberately not under [`install_dir`]: that directory is one of
 /// `load_in`'s scan roots (its subdirectories are loaded as installed
@@ -504,13 +531,20 @@ pub fn install(
 /// a subdirectory of anything `load_in` scans — `dev/`, `install_dir`'s
 /// `plugins/claude/`, and the project's own `.plank/plugins/` are all rooted
 /// under a project or `plugins/`, never above it.
-fn staging_dir(home: &Path) -> Result<PathBuf, String> {
-    let base = home.join(".plank").join(".claude-staging");
+pub(crate) fn staging_dir(home: &Path) -> Result<PathBuf, String> {
+    let base = staging_dir_path(home);
     // Fresh every time: reusing it would mix a previous failed fetch into a new
     // one, and the plugin root is found by looking at the tree.
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
     Ok(base)
+}
+
+/// Where [`staging_dir`] lives, without creating it; for tests that check it
+/// was cleaned up.
+#[must_use]
+pub(crate) fn staging_dir_path(home: &Path) -> PathBuf {
+    home.join(".plank").join(".claude-staging")
 }
 
 /// Puts the named plugin's tree inside `staging` and returns its root.
@@ -1624,6 +1658,60 @@ mod tests {
         assert!(out.dest.join(".claude-plugin/plugin.json").is_file());
         // The clone's own history is not part of the plugin.
         assert!(!out.dest.join(".git").exists(), ".git is not installed");
+    }
+
+    /// A root with a `"` or `\` in it spliced into the JSON text would leave
+    /// an unparseable file; the rewrite goes through the tree so the writer
+    /// escapes it.
+    #[test]
+    fn rewrite_escapes_a_root_containing_a_quote() {
+        let base = tmpdir("rewrite-quote");
+        let dest = base.join(r#"odd"name\dir"#);
+        write(
+            &dest,
+            "hooks/hooks.json",
+            r#"{"PreToolUse":[{"hooks":[{"type":"command","command":"${CLAUDE_PLUGIN_ROOT}/bin/g"}]}]}"#,
+        );
+        write(
+            &dest,
+            ".mcp.json",
+            r#"{"mcpServers":{"s":{"command":"$CLAUDE_PLUGIN_ROOT/bin/s","args":["${CLAUDE_PLUGIN_ROOT}/a"]}}}"#,
+        );
+        assert!(rewrite_plugin_root(&dest).expect("rewrite"));
+        let root = dest.display().to_string();
+
+        let hooks = std::fs::read_to_string(dest.join("hooks/hooks.json")).unwrap();
+        let parsed = json_parse(&hooks).expect("hooks.json still parses");
+        let cmd = parsed
+            .get("PreToolUse")
+            .and_then(|v| match v {
+                Json::Arr(items) => items.first(),
+                _ => None,
+            })
+            .and_then(|e| e.get("hooks"))
+            .and_then(|v| match v {
+                Json::Arr(items) => items.first(),
+                _ => None,
+            })
+            .and_then(|h| h.get("command"));
+        assert_eq!(cmd, Some(&Json::Str(format!("{root}/bin/g"))), "{hooks}");
+
+        let mcp = std::fs::read_to_string(dest.join(".mcp.json")).unwrap();
+        let parsed = json_parse(&mcp).expect(".mcp.json still parses");
+        let server = parsed
+            .get("mcpServers")
+            .and_then(|v| v.get("s"))
+            .expect("server");
+        assert_eq!(
+            server.get("command"),
+            Some(&Json::Str(format!("{root}/bin/s"))),
+            "{mcp}"
+        );
+        assert_eq!(
+            server.get("args"),
+            Some(&Json::Arr(vec![Json::Str(format!("{root}/a"))])),
+            "{mcp}"
+        );
     }
 
     #[test]

@@ -680,6 +680,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "rename this session (the saved copy keeps its old name)",
     },
     SlashCommand {
+        name: "/rate",
+        args: "[+|-] [note]",
+        desc: "rate the last turn (thumbs up by default) with an optional note",
+    },
+    SlashCommand {
         name: "/list",
         args: "",
         desc: "list saved sessions",
@@ -973,6 +978,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/resume")
         || slash_command_with_args(cmd, "/tag")
         || slash_command_with_args(cmd, "/rename")
+        || slash_command_with_args(cmd, "/rate")
         || slash_command_with_args(cmd, "/power")
         || slash_command_with_args(cmd, "/think")
         || slash_command_with_args(cmd, "/switch")
@@ -2176,6 +2182,13 @@ mod tests {
         assert_eq!(c.generation.think_mode, ThinkMode::Off);
         // Not given at all.
         assert!(parse_options(&args(&[])).unwrap().resume.is_none());
+    }
+
+    #[test]
+    fn rate_is_a_known_slash_command_with_and_without_args() {
+        assert!(slash_command_known("/rate"));
+        assert!(slash_command_known("/rate + good"));
+        assert!(slash_command_known("/rate - wrong answer"));
     }
 
     #[test]

@@ -273,7 +273,10 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         return "Tool error: edit requires new text\n".to_string();
     };
 
-    let full_path = ctx.resolve(path);
+    let full_path = match ctx.resolve_for_write("edit", path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     let data = match read_file_bytes(&full_path, path) {
         Ok(d) => d,
         Err(err) => return format!("Tool error: {err}\n"),
@@ -747,6 +750,74 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
 mod tests {
     use super::*;
     use crate::tools::{test_call, test_ctx};
+    use std::path::PathBuf;
+
+    #[test]
+    fn sandboxed_edit_refuses_paths_outside_the_workspace() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let home = PathBuf::from(home);
+        // A cwd under $HOME (not the always-writable temp dir), so `..` really
+        // leaves every writable root.
+        let dir = home.join(format!(".plank_tools_test_edit_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.join("../plank_edit_outside_test.txt");
+        std::fs::write(&outside, "one\n").unwrap();
+        let mut ctx = ToolContext::new(&dir);
+        ctx.sandbox.enabled = true;
+
+        // `~/.plank/...` is refused even though the file may exist.
+        let target = home.join(".plank/plank_edit_containment_test.txt");
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[
+                    ("path", &target.to_string_lossy()),
+                    ("old", "one"),
+                    ("new", "two"),
+                ],
+            ),
+        );
+        assert_eq!(
+            out,
+            format!(
+                "Tool error: edit path escapes workspace: {}\n",
+                target.display()
+            )
+        );
+        // `../outside` is refused and the file is untouched.
+        let out = tool_edit(
+            &mut ctx,
+            &test_call(
+                "edit",
+                &[
+                    ("path", "../plank_edit_outside_test.txt"),
+                    ("old", "one"),
+                    ("new", "two"),
+                ],
+            ),
+        );
+        assert_eq!(
+            out,
+            "Tool error: edit path escapes workspace: ../plank_edit_outside_test.txt\n"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "one\n");
+        assert!(ctx.edit_previews.is_empty());
+        // Inside cwd still works.
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        let out = tool_edit(
+            &mut ctx,
+            &test_call("edit", &[("path", "f.txt"), ("old", "one"), ("new", "two")]),
+        );
+        assert!(
+            out.starts_with("Edited f.txt using old/new replacement\n"),
+            "{out}"
+        );
+        std::fs::remove_file(&outside).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn edit_replaces_unique_old_text() {

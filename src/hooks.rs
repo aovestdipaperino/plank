@@ -48,6 +48,7 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -503,6 +504,9 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own process group: the timeout must take down `sleep 600; echo ok`
+        // whole, not just the shell that forked the sleep.
+        .process_group(0)
         .spawn();
     let mut child = match child {
         Ok(c) => c,
@@ -525,14 +529,17 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
             Err(_) => break None,
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::tools::bash::kill_process_group(&mut child);
             break None;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let stdout_text = out_reader.join().unwrap_or_default();
-    let stderr_text = err_reader.join().unwrap_or_default();
+    // The readers end when the last pipe writer is gone. After a group kill
+    // that is prompt, but a descendant that escaped the group (setsid) could
+    // hold the pipe open forever, so the join is bounded: past the grace the
+    // partial output is abandoned along with its reader thread.
+    let stdout_text = join_bounded(out_reader, Duration::from_secs(2));
+    let stderr_text = join_bounded(err_reader, Duration::from_secs(2));
     match status {
         Some(s) => (s.code().unwrap_or(1), stdout_text, stderr_text),
         None => (
@@ -541,6 +548,18 @@ fn run_hook(def: &HookDef, input: &str, cwd: &Path) -> (i32, String, String) {
             format!("hook timed out after {}s", def.timeout_sec),
         ),
     }
+}
+
+/// Joins a reader thread, giving up (with empty output) after `limit`.
+fn join_bounded(handle: std::thread::JoinHandle<String>, limit: Duration) -> String {
+    let deadline = Instant::now() + limit;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            return String::new();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    handle.join().unwrap_or_default()
 }
 
 /// Reads a child pipe to end as a lossy UTF-8 string.
@@ -1048,6 +1067,32 @@ mod tests {
             &cwd,
         );
         assert!(out.block.is_none(), "{out:?}");
+    }
+
+    #[test]
+    fn timeout_kills_a_compound_command_and_its_children() {
+        // `sh -c "sleep 30"` execs sleep directly, so killing the shell was
+        // enough; a compound command forks sleep as a grandchild that kept the
+        // stdout pipe open and the reader join blocked for the full 30s.
+        let cwd = std::env::temp_dir();
+        let groups = vec![HookMatcher {
+            matcher: String::new(),
+            hooks: vec![HookDef {
+                command: "sleep 30; echo ok".to_string(),
+                timeout_sec: 1,
+                is_async: false,
+                prompt: None,
+            }],
+        }];
+        let start = Instant::now();
+        let out = run_event(&groups, "bash", "{}", &cwd);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "hook took {:?}",
+            start.elapsed()
+        );
+        assert_eq!(out.warnings.len(), 1);
+        assert!(out.warnings[0].contains("timed out"));
     }
 
     #[test]

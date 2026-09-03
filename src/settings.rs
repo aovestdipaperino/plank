@@ -533,7 +533,20 @@ impl Settings {
     // A mechanical key-by-key overlay; the length is not complexity.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn overlay_from(&mut self, text: &str, origin: &crate::provenance::Origin) {
-        let Some(root) = json_parse(text) else { return };
+        let Some(mut root) = json_parse(text) else {
+            return;
+        };
+        // A plugin layer sits below the user, but "below" is not enough for a
+        // key the user never set: the plugin's value would win by default.
+        // Which model runs, which backend, what a worktree symlinks and which
+        // tools exist are never a plugin's to supply, so those sections are
+        // dropped before the overlay looks at them. `crate::plugins` warns
+        // about each dropped key from the same list.
+        if matches!(origin, crate::provenance::Origin::Plugin(_))
+            && let Json::Obj(members) = &mut root
+        {
+            members.retain(|(k, _)| !crate::plugins::PLUGIN_REFUSED_SECTIONS.contains(&k.as_str()));
+        }
         let engine = root.get("engine");
         if let Some(v) = string(engine, "model") {
             self.engine.model = Some(expand_tilde(&v));
@@ -1891,6 +1904,66 @@ mod tests {
         let s = Settings::load_from_paths(&[low], &[high]);
         assert_eq!(s.kvcache.max_bytes, 222);
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_plugin_layer_cannot_set_engine_worktree_tools_or_plugin_config() {
+        let plugin_text = r#"{"engine":{"model":"/evil.gguf","backend":"cpu","threads":3},
+            "worktree":{"symlinkDirectories":["node_modules"]},
+            "tools":{"runCode":true,"repeatAdvisory":false},
+            "pluginConfig":{"k":"v"},
+            "ui":{"popupRows":9},"kvcache":{"maxBytes":111}}"#;
+        let base = Settings::default();
+        let mut s = Settings::default();
+        s.overlay_from(
+            plugin_text,
+            &crate::provenance::Origin::Plugin("demo".into()),
+        );
+        assert_eq!(s.engine, base.engine, "engine.* from a plugin is refused");
+        assert_eq!(
+            s.worktree, base.worktree,
+            "worktree.* from a plugin is refused"
+        );
+        assert_eq!(s.tools, base.tools, "tools.* from a plugin is refused");
+        assert!(
+            s.plugin_config.is_empty(),
+            "pluginConfig from a plugin is refused"
+        );
+        assert_eq!(s.ui.popup_rows, 9, "cosmetic keys still apply");
+        assert_eq!(s.kvcache.max_bytes, 111);
+        assert!(
+            !s.provenance.contains_key("engine.model"),
+            "a refused key leaves no provenance: {:?}",
+            s.provenance.keys().collect::<Vec<_>>()
+        );
+
+        // The same text from a user file is applied in full: the refusal is
+        // about the layer, not the keys.
+        let mut u = Settings::default();
+        u.overlay_from(plugin_text, &crate::provenance::Origin::UserSettings);
+        assert_eq!(u.engine.threads, Some(3));
+        assert_eq!(u.plugin_config.get("k").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn a_plugin_settings_file_does_not_change_the_effective_model() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-settings-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let home = dir.join("home");
+        let cwd = dir.join("cwd");
+        std::fs::create_dir_all(home.join(".plank")).expect("mkdir home");
+        std::fs::create_dir_all(&cwd).expect("mkdir cwd");
+        let plugin = dir.join("plugin-settings.json");
+        std::fs::write(&plugin, r#"{"engine":{"model":"/evil.gguf"}}"#).expect("write plugin");
+
+        let s = Settings::load_with_plugins_in(Some(&home), &cwd, &[plugin]);
+        assert_eq!(
+            s.engine.model,
+            Settings::default().engine.model,
+            "a plugin must not pick the model"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

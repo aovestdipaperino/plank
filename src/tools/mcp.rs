@@ -85,9 +85,16 @@ impl Json {
     }
 }
 
+/// Deepest array/object nesting the parser accepts. Every level is one
+/// recursive `parse_value` frame, so an unbounded `[[[[...` from a misbehaving
+/// server would otherwise overflow the stack.
+const JSON_MAX_DEPTH: usize = 256;
+
 struct JsonParser<'a> {
     bytes: &'a [u8],
     pos: usize,
+    /// Current array/object nesting depth, bounded by [`JSON_MAX_DEPTH`].
+    depth: usize,
 }
 
 impl JsonParser<'_> {
@@ -186,10 +193,15 @@ impl JsonParser<'_> {
             }
             b'[' => {
                 self.pos += 1;
+                self.depth += 1;
+                if self.depth > JSON_MAX_DEPTH {
+                    return None;
+                }
                 let mut items = Vec::new();
                 self.skip_ws();
                 if self.peek() == b']' {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Some(Json::Arr(items));
                 }
                 loop {
@@ -197,17 +209,25 @@ impl JsonParser<'_> {
                     self.skip_ws();
                     match self.bump() {
                         b',' => {}
-                        b']' => return Some(Json::Arr(items)),
+                        b']' => {
+                            self.depth -= 1;
+                            return Some(Json::Arr(items));
+                        }
                         _ => return None,
                     }
                 }
             }
             b'{' => {
                 self.pos += 1;
+                self.depth += 1;
+                if self.depth > JSON_MAX_DEPTH {
+                    return None;
+                }
                 let mut members = Vec::new();
                 self.skip_ws();
                 if self.peek() == b'}' {
                     self.pos += 1;
+                    self.depth -= 1;
                     return Some(Json::Obj(members));
                 }
                 loop {
@@ -222,7 +242,10 @@ impl JsonParser<'_> {
                     self.skip_ws();
                     match self.bump() {
                         b',' => {}
-                        b'}' => return Some(Json::Obj(members)),
+                        b'}' => {
+                            self.depth -= 1;
+                            return Some(Json::Obj(members));
+                        }
                         _ => return None,
                     }
                 }
@@ -247,6 +270,7 @@ pub fn json_parse(text: &str) -> Option<Json> {
     JsonParser {
         bytes: text.as_bytes(),
         pos: 0,
+        depth: 0,
     }
     .parse_value()
 }
@@ -471,23 +495,16 @@ impl Drop for McpServer {
     fn drop(&mut self) {
         // Mirror agent_mcp_server_close: SIGTERM, up to 1s grace, then SIGKILL.
         // HTTP servers are remote — nothing to reap.
+        //
+        // Unconditional on `alive`: a server marked dead because a request
+        // timed out is usually still running, and with `process_group(0)` it
+        // would outlive plank; a server that really crashed still needs its
+        // `wait()` or it lingers as a zombie. Signals to a gone pid are
+        // ignored, so the dead case costs nothing.
         let Transport::Stdio(t) = &mut self.transport else {
             return;
         };
-        if self.alive {
-            #[allow(clippy::cast_possible_wrap)]
-            let pid = t.child.id() as libc::pid_t;
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let start = Instant::now();
-            while start.elapsed() < Duration::from_secs(1) {
-                if matches!(t.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            let _ = t.child.kill();
-            let _ = t.child.wait();
-        }
+        crate::tools::bash::kill_process_group(&mut t.child);
     }
 }
 
@@ -1790,6 +1807,28 @@ mod tests {
     use super::*;
     use crate::dsml::ToolArg;
 
+    #[test]
+    fn json_parse_refuses_pathological_nesting_without_overflowing() {
+        // 10_000 nested arrays: must come back `None` from the depth guard, not
+        // blow the stack. Run on a thread with the default test-thread stack
+        // (2 MiB) so the check is independent of how the harness is invoked.
+        let deep = "[".repeat(10_000);
+        let handle = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || json_parse(&deep).is_none())
+            .unwrap();
+        assert!(handle.join().expect("parser thread must not crash"));
+        // Objects hit the same guard.
+        let deep_obj = "{\"a\":".repeat(10_000);
+        assert!(json_parse(&deep_obj).is_none());
+        // Nesting under the limit still parses, and the depth is released on
+        // the way back out so siblings do not accumulate it.
+        let ok = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        assert!(json_parse(&ok).is_some());
+        let siblings = format!("[{}]", vec!["[[]]"; 300].join(","));
+        assert!(json_parse(&siblings).is_some());
+    }
+
     fn write_temp_config(contents: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -2635,6 +2674,39 @@ done
         };
         let out = tool_mcp_call(&mut servers, &call);
         assert_eq!(out, "echoed: hi\n");
+    }
+
+    #[test]
+    fn dropping_a_server_marked_dead_still_kills_its_process_group() {
+        // A request timeout marks the server dead while it keeps running.
+        // Drop must kill it and its children anyway, or they outlive plank.
+        let cfg = McpServerConfig {
+            command: "/bin/sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 30 & echo $!; wait".to_string()],
+            ..cfg_named("hang")
+        };
+        let mut server = McpServer::spawn(&cfg).expect("spawn sh");
+        let (leader, grandchild) = {
+            let Transport::Stdio(t) = &mut server.transport else {
+                panic!("stdio transport expected");
+            };
+            let line = t
+                .read_line(Instant::now() + Duration::from_secs(5))
+                .expect("grandchild pid line");
+            let grandchild: libc::pid_t = line.trim().parse().expect("pid");
+            #[allow(clippy::cast_possible_wrap)]
+            let leader = t.child.id() as libc::pid_t;
+            (leader, grandchild)
+        };
+        server.alive = false;
+        drop(server);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let gone = |pid: libc::pid_t| unsafe { libc::kill(pid, 0) } != 0;
+        while Instant::now() < deadline && !(gone(leader) && gone(grandchild)) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(gone(leader), "server shell {leader} survived Drop");
+        assert!(gone(grandchild), "server child {grandchild} survived Drop");
     }
 
     #[test]

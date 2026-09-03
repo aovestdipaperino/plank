@@ -299,7 +299,10 @@ pub fn tool_write(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let Some(content) = call.arg_value("content") else {
         return "Tool error: write requires content\n".to_string();
     };
-    let full = ctx.resolve(path);
+    let full = match ctx.resolve_for_write("write", path) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
     // Prior content (for the diff card); absent means this write creates it.
     let prior = std::fs::read(&full).ok();
     let mut file = match std::fs::File::create(&full) {
@@ -539,6 +542,105 @@ mod tests {
             }
             std::fs::write(&p, "x").unwrap();
         }
+    }
+
+    /// A scratch cwd that is *not* under the temp dir (which the sandbox
+    /// always allows), so `..` escapes from it are genuinely outside every
+    /// writable root. Lives under `$HOME`; `None` when there is no HOME.
+    fn home_ctx(tag: &str) -> Option<(ToolContext, PathBuf)> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let home = std::env::var_os("HOME")?;
+        let dir = PathBuf::from(home).join(format!(
+            ".plank_tools_test_{tag}_{}_{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        let mut ctx = ToolContext::new(&dir);
+        ctx.sandbox.enabled = true;
+        Some((ctx, dir))
+    }
+
+    #[test]
+    fn sandboxed_write_refuses_plank_home() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let (mut ctx, dir) = test_ctx();
+        ctx.sandbox.enabled = true;
+        let target = PathBuf::from(home).join(".plank/plank_write_containment_test.txt");
+        let out = tool_write(
+            &mut ctx,
+            &test_call(
+                "write",
+                &[("path", &target.to_string_lossy()), ("content", "x")],
+            ),
+        );
+        assert_eq!(
+            out,
+            format!(
+                "Tool error: write path escapes workspace: {}\n",
+                target.display()
+            )
+        );
+        assert!(!target.exists(), "refused write must not create the file");
+        assert!(ctx.last_written.is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sandboxed_write_refuses_dotdot_escape_but_allows_cwd_and_temp() {
+        let Some((mut ctx, dir)) = home_ctx("write") else {
+            return;
+        };
+        // `../outside` resolves beside the cwd, under $HOME: refused.
+        let out = tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "../outside"), ("content", "x")]),
+        );
+        assert_eq!(
+            out,
+            "Tool error: write path escapes workspace: ../outside\n"
+        );
+        assert!(!dir.join("../outside").exists());
+        // Inside cwd (a new file in a new subdir): allowed.
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let out = tool_write(
+            &mut ctx,
+            &test_call("write", &[("path", "sub/inner.txt"), ("content", "hi")]),
+        );
+        assert_eq!(out, "Wrote 2 bytes to sub/inner.txt\n");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/inner.txt")).unwrap(),
+            "hi"
+        );
+        // Into the temp dir by absolute path: allowed.
+        let tmp =
+            std::env::temp_dir().join(format!("plank_write_temp_ok_{}.txt", std::process::id()));
+        let out = tool_write(
+            &mut ctx,
+            &test_call(
+                "write",
+                &[("path", &tmp.to_string_lossy()), ("content", "tmp")],
+            ),
+        );
+        assert!(out.starts_with("Wrote 3 bytes to "), "{out}");
+        assert!(tmp.exists());
+        std::fs::remove_file(&tmp).ok();
+        // With the sandbox off, the same escape goes through (and is cleaned
+        // up) — containment is a sandbox policy, not a tool limitation.
+        ctx.sandbox.enabled = false;
+        let out = tool_write(
+            &mut ctx,
+            &test_call(
+                "write",
+                &[("path", "../outside_unsandboxed"), ("content", "x")],
+            ),
+        );
+        assert_eq!(out, "Wrote 1 bytes to ../outside_unsandboxed\n");
+        std::fs::remove_file(dir.join("../outside_unsandboxed")).ok();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

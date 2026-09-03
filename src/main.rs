@@ -564,7 +564,8 @@ fn run_remote_client(args: &[String]) -> ExitCode {
 
 /// Parses `plank serve` arguments and runs the host. Model/backend flags are
 /// forwarded to `make_engine` via a normal [`AgentConfig`]; `--listen`/`--token`
-/// are serve-specific.
+/// /`--insecure` are serve-specific (`--insecure` waives the refusal to serve a
+/// non-loopback address without a token).
 fn run_serve(args: &[String]) -> ExitCode {
     use plank::serve::ServeConfig;
 
@@ -572,6 +573,7 @@ fn run_serve(args: &[String]) -> ExitCode {
     let mut token = std::env::var("PLANK_REMOTE_TOKEN")
         .ok()
         .filter(|t| !t.is_empty());
+    let mut insecure = false;
     let mut passthrough: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -584,11 +586,24 @@ fn run_serve(args: &[String]) -> ExitCode {
                 token = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--insecure" => {
+                insecure = true;
+                i += 1;
+            }
             other => {
                 passthrough.push(other.to_string());
                 i += 1;
             }
         }
+    }
+    // A token-less bind off loopback exposes the model to the network; refuse
+    // unless the operator opted in explicitly.
+    if let Err(msg) = plank::serve::check_exposure(&listen, token.is_some(), insecure) {
+        eprintln!("plank serve: {msg}");
+        eprintln!(
+            "usage: plank serve [--listen ADDR] [--token TOKEN] [--insecure] [engine options]"
+        );
+        return ExitCode::from(2);
     }
     // See the `main` provisional-parse comment: the plugin set must be built
     // from `--plugin-dir` before settings are read, but `--plugin-dir` is

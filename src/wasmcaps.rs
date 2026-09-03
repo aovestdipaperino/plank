@@ -152,14 +152,61 @@ pub fn state_get(grants: &Grants, key: &str) -> Result<Vec<u8>, String> {
     Ok(std::fs::read(dir.join(state_file_name(key))).unwrap_or_default())
 }
 
+/// Largest single `state` value a component may store, in bytes.
+///
+/// `state` is for a component's own small persistent facts — a high score, a
+/// cursor, a settings blob — not a cache. A megabyte is a generous ceiling for
+/// any of those and small enough that no single write can fill a disk.
+pub const STATE_MAX_VALUE_BYTES: usize = 1024 * 1024;
+
+/// Longest `state` key, in bytes.
+///
+/// A key becomes a file name, and file systems have their own opinion about
+/// long ones: `NAME_MAX` is 255 on APFS, ext4 and most everything else. The
+/// cap sits exactly there so a key the quota accepts is a key the disk accepts
+/// too, rather than one that passes here and dies with "file name too long".
+pub const STATE_MAX_KEY_BYTES: usize = 255;
+
+/// Most keys one component may hold at once.
+pub const STATE_MAX_KEYS: usize = 256;
+
+/// Combined size of everything one component has stored, in bytes.
+///
+/// The per-value cap bounds one write; this bounds the component. Sixteen
+/// megabytes is sixteen maximal values, which is more than any plugin has
+/// asked for and far less than the model file sitting next to it.
+pub const STATE_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+
 /// Stores `value` under `key` for this component.
+///
+/// Every quota is checked before anything touches the disk, so a refused write
+/// leaves the component's state exactly as it was — including the value the
+/// key held before, which an over-quota rewrite must not destroy.
 ///
 /// # Errors
 /// Returns a message when `state` was not granted, when there is nowhere to
-/// store it, or when the write fails.
+/// store it, when the key or value exceeds [`STATE_MAX_KEY_BYTES`] or
+/// [`STATE_MAX_VALUE_BYTES`], when the component already holds
+/// [`STATE_MAX_KEYS`] keys or would exceed [`STATE_MAX_TOTAL_BYTES`], or when
+/// the write fails.
 pub fn state_set(grants: &Grants, key: &str, value: &[u8]) -> Result<(), String> {
     if !grants.allows("state") {
         return Err(grants.refusal("state"));
+    }
+    if key.len() > STATE_MAX_KEY_BYTES {
+        return Err(format!(
+            "'{}' state key is {} bytes, more than the {STATE_MAX_KEY_BYTES}-byte limit",
+            grants.id,
+            key.len()
+        ));
+    }
+    if value.len() > STATE_MAX_VALUE_BYTES {
+        return Err(format!(
+            "'{}' state value for '{key}' is {} bytes, more than the \
+             {STATE_MAX_VALUE_BYTES}-byte limit",
+            grants.id,
+            value.len()
+        ));
     }
     let dir = state_dir(grants).ok_or_else(|| {
         format!(
@@ -167,8 +214,43 @@ pub fn state_set(grants: &Grants, key: &str, value: &[u8]) -> Result<(), String>
             grants.id
         )
     })?;
+    let file = dir.join(state_file_name(key));
+    let (keys, total) = state_usage(&dir, &file);
+    if keys >= STATE_MAX_KEYS {
+        return Err(format!(
+            "'{}' already holds {STATE_MAX_KEYS} state keys, the limit; '{key}' was not stored",
+            grants.id
+        ));
+    }
+    if total + value.len() as u64 > STATE_MAX_TOTAL_BYTES {
+        return Err(format!(
+            "'{}' state would grow to {} bytes, more than the {STATE_MAX_TOTAL_BYTES}-byte \
+             limit; '{key}' was not stored",
+            grants.id,
+            total + value.len() as u64
+        ));
+    }
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    std::fs::write(dir.join(state_file_name(key)), value).map_err(|e| e.to_string())
+    std::fs::write(file, value).map_err(|e| e.to_string())
+}
+
+/// How many keys a component holds and how many bytes they add up to,
+/// *excluding* the file at `except` — the key about to be rewritten, whose old
+/// value is being replaced rather than added to.
+///
+/// A scan rather than a running count: the directory is the truth, it is
+/// small by construction (at most [`STATE_MAX_KEYS`] entries), and a counter
+/// would drift the first time a user deleted a file by hand.
+fn state_usage(dir: &Path, except: &Path) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (0, 0);
+    };
+    entries
+        .flatten()
+        .filter(|e| e.path() != except)
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .fold((0, 0), |(n, bytes), m| (n + 1, bytes + m.len()))
 }
 
 /// A component's private state directory: `<state_root>/<id>/state`.
@@ -442,5 +524,81 @@ mod tests {
         assert_eq!(state_get(&g, "k").unwrap(), Vec::<u8>::new());
         let err = state_set(&g, "k", b"v").unwrap_err();
         assert!(err.contains("nowhere to store state"), "{err}");
+    }
+
+    /// A value over the per-value cap is refused, by size, and nothing lands.
+    #[test]
+    fn state_refuses_an_oversized_value() {
+        let home = temp_dir("state-big-value");
+        let g = grants_for("dev.plank.demo", &["state"], Some(&home));
+        let big = vec![0u8; STATE_MAX_VALUE_BYTES + 1];
+        let err = state_set(&g, "blob", &big).unwrap_err();
+        assert!(err.contains("dev.plank.demo"), "{err}");
+        assert!(err.contains("value"), "{err}");
+        assert_eq!(state_get(&g, "blob").unwrap(), Vec::<u8>::new());
+        // Exactly at the cap is fine.
+        state_set(&g, "blob", &big[..STATE_MAX_VALUE_BYTES]).unwrap();
+        assert_eq!(state_get(&g, "blob").unwrap().len(), STATE_MAX_VALUE_BYTES);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A key longer than the cap is refused, by length, and nothing lands.
+    #[test]
+    fn state_refuses_an_overlong_key() {
+        let home = temp_dir("state-long-key");
+        let g = grants_for("dev.plank.demo", &["state"], Some(&home));
+        let long = "k".repeat(STATE_MAX_KEY_BYTES + 1);
+        let err = state_set(&g, &long, b"v").unwrap_err();
+        assert!(err.contains("key"), "{err}");
+        assert!(
+            !home
+                .join("plugins")
+                .join("dev.plank.demo")
+                .join("state")
+                .join(&long)
+                .exists()
+        );
+        state_set(&g, &"k".repeat(STATE_MAX_KEY_BYTES), b"v").unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A component may hold only so many keys. Overwriting one it already
+    /// holds does not count as a new one.
+    #[test]
+    fn state_caps_the_number_of_keys() {
+        let home = temp_dir("state-key-count");
+        let g = grants_for("dev.plank.demo", &["state"], Some(&home));
+        for i in 0..STATE_MAX_KEYS {
+            state_set(&g, &format!("k{i}"), b"v").unwrap();
+        }
+        let err = state_set(&g, "one-too-many", b"v").unwrap_err();
+        assert!(err.contains("keys"), "{err}");
+        assert_eq!(state_get(&g, "one-too-many").unwrap(), Vec::<u8>::new());
+        // An existing key still updates.
+        state_set(&g, "k0", b"updated").unwrap();
+        assert_eq!(state_get(&g, "k0").unwrap(), b"updated");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// The combined size of everything stored is bounded. Replacing a key
+    /// counts the new value in place of the old, not on top of it.
+    #[test]
+    fn state_caps_the_combined_size() {
+        let home = temp_dir("state-total");
+        let g = grants_for("dev.plank.demo", &["state"], Some(&home));
+        let chunk = vec![0u8; STATE_MAX_VALUE_BYTES];
+        let fill = usize::try_from(STATE_MAX_TOTAL_BYTES).unwrap() / STATE_MAX_VALUE_BYTES;
+        for i in 0..fill {
+            state_set(&g, &format!("c{i}"), &chunk).unwrap();
+        }
+        let err = state_set(&g, "spill", b"x").unwrap_err();
+        assert!(err.contains("bytes"), "{err}");
+        assert_eq!(state_get(&g, "spill").unwrap(), Vec::<u8>::new());
+        // Shrinking an existing key frees room, and rewriting one at the same
+        // size is not double-counted.
+        state_set(&g, "c0", &chunk).unwrap();
+        state_set(&g, "c0", b"tiny").unwrap();
+        state_set(&g, "spill", b"x").unwrap();
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

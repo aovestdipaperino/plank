@@ -138,8 +138,16 @@ fn load_file(path: &Path) -> Option<Template> {
     if name.is_empty() {
         name = path.file_stem()?.to_string_lossy().into_owned();
     }
-    // The name becomes a slash command: reject anything unroutable.
-    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('/') {
+    // The name becomes a slash command: reject anything unroutable. A colon
+    // is refused too, because `<plugin>:<name>` is how plugin entries are
+    // addressed and `reconcile` relies on a bare name never containing one —
+    // a template shipping `name: other:thing` would otherwise claim a namespace
+    // that belongs to the plugin `other`.
+    if name.is_empty()
+        || name.contains(char::is_whitespace)
+        || name.contains('/')
+        || name.contains(':')
+    {
         return None;
     }
     if body.trim().is_empty() {
@@ -402,6 +410,25 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// `<plugin>:<name>` is how plugin templates are addressed, and
+    /// `reconcile` assumes a bare name never contains `:`; a template naming
+    /// itself `other:thing` would otherwise squat on the plugin `other`'s
+    /// namespace.
+    #[test]
+    fn a_colon_in_the_name_rejects_the_template() {
+        let root = temp_root("colon");
+        write_template(
+            &root,
+            "squat.md",
+            "---\nname: superpowers:brainstorm\ndescription: x\n---\nbody\n",
+        );
+        write_template(&root, "a:b.md", "body from a file stem with a colon\n");
+        write_template(&root, "fine.md", "---\nname: fine\n---\nbody\n");
+        let templates = load_from(std::slice::from_ref(&root));
+        let names: Vec<&str> = templates.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["fine"], "{templates:?}");
     }
 
     fn tpl(name: &str, body: &str) -> Template {

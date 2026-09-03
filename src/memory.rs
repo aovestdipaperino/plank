@@ -95,7 +95,8 @@ fn load_scope(scope: Scope, cwd: &Path) -> Option<String> {
         return Some(text.to_string());
     }
     // Keep the newest tail, starting at a line boundary.
-    let tail = &text[text.len() - MEMORY_INJECT_MAX_BYTES..];
+    let cut = crate::session::ceil_char_boundary(text, text.len() - MEMORY_INJECT_MAX_BYTES);
+    let tail = &text[cut..];
     let tail = tail.find('\n').map_or(tail, |nl| &tail[nl + 1..]);
     Some(format!("(older entries truncated)\n{tail}"))
 }
@@ -180,6 +181,32 @@ mod tests {
         assert!(out.starts_with("(older entries truncated)\n- "));
         assert!(out.contains("entry number 1999"));
         assert!(!out.contains("entry number 0 "));
+        std::fs::remove_dir_all(&cwd).ok();
+    }
+
+    /// The tail cut lands on a byte offset; when that byte is inside a
+    /// multibyte character the slice must snap forward rather than panic.
+    #[test]
+    fn oversized_multibyte_memory_is_truncated_on_a_char_boundary() {
+        let cwd = scratch("trunc-multibyte");
+        let path = path_for(Scope::Project, &cwd).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // One long line of em dashes (3 bytes each) so every offset that is not
+        // a multiple of three falls inside a character, with no newline to
+        // rescue the slice.
+        let mut big = String::new();
+        for _ in 0..(MEMORY_INJECT_MAX_BYTES / 3 + 500) {
+            big.push('\u{2014}');
+        }
+        // Make `len - MAX` land mid-character: the cap is 1 mod 3, so two
+        // trailing ASCII bytes put the cut one byte into an em dash.
+        big.push_str("xy");
+        assert_eq!((big.len() - MEMORY_INJECT_MAX_BYTES) % 3, 1);
+        std::fs::write(&path, &big).unwrap();
+        let out = load_scope(Scope::Project, &cwd).unwrap();
+        assert!(out.starts_with("(older entries truncated)\n"));
+        assert!(out.ends_with("xy"));
+        assert!(out.len() <= MEMORY_INJECT_MAX_BYTES + 64);
         std::fs::remove_dir_all(&cwd).ok();
     }
 }

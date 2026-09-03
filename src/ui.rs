@@ -1231,6 +1231,12 @@ struct Agent<'a> {
     payload_dirty: bool,
     /// Depth-indexed KV snapshots for this session, newest turn last.
     ladder: crate::kvladder::KvLadder,
+    /// How many sub-agent forks are open on the live transcript (see
+    /// [`Agent::begin_subagent_fork`]). While it is non-zero the transcript
+    /// carries a sidechain that `end_subagent_fork` will truncate back out,
+    /// so nothing captured against it — payload, rung, micro-compaction — may
+    /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
+    sidechain_depth: usize,
     /// Set when a `/btw` aside answered on the *live* engine has pushed the
     /// engine's end past the transcript an anchor would be signed against, and
     /// consumed by the next anchor point. See
@@ -1980,9 +1986,7 @@ impl Agent<'_> {
         let isolation_note = self.end_agent_isolation(isolation);
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
-        let report = last_assistant_text(&self.session.transcript[fork_at..]);
-        self.session.transcript.truncate(fork_at);
-        self.restore_fork_kv();
+        let report = self.end_subagent_fork(fork_at);
         match result {
             Err(e) => format!("Tool error: sub-agent failed: {e}\n"),
             Ok(()) => match report {
@@ -3029,7 +3033,10 @@ impl Agent<'_> {
     /// eager pass that reclaims little costs more than it saves — only fire
     /// when the cleared results are worth the prefix rebuild.
     fn try_microcompact_opportunistic(&mut self) -> Option<usize> {
-        if !crate::settings::active().context.microcompact {
+        // Never inside a sidechain: the rewrite would land on messages about
+        // to be truncated out, and the rung restore would touch an engine
+        // that may not even be the session's.
+        if !crate::settings::active().context.microcompact || self.in_sidechain() {
             return None;
         }
         let reclaimable = compact::microcompact_reclaimable(&self.session.transcript);
@@ -3871,7 +3878,7 @@ impl Agent<'_> {
                 Err(e) => println!("switch failed: {e}"),
             },
             "/del" => match self.store.delete(arg) {
-                Ok(id) => println!("deleted session {}", &id[..8]),
+                Ok(id) => println!("deleted session {}", crate::session::display_id(&id)),
                 Err(e) => println!("delete failed: {e}"),
             },
             "/retitle" => println!("{}", self.retitle_sessions()),
@@ -3985,7 +3992,10 @@ impl Agent<'_> {
                 } else {
                     match self.strip_session(arg) {
                         Ok((sha, tokens)) => {
-                            println!("stripped session {} ({tokens} tokens)", &sha[..8]);
+                            println!(
+                                "stripped session {} ({tokens} tokens)",
+                                crate::session::display_id(&sha)
+                            );
                         }
                         Err(e) => println!("strip failed: {e}"),
                     }
@@ -4013,61 +4023,7 @@ impl Agent<'_> {
                         )
                     );
                 } else {
-                    let mut p = arg.splitn(2, char::is_whitespace);
-                    let key = p.next().unwrap_or("");
-                    let val = p.next().unwrap_or("").trim();
-                    let mut working = crate::settings::active().clone();
-                    // Plugin options are addressed `pluginConfig.<id>.<option>`
-                    // and validated against the component's own declaration, so
-                    // they cannot go through the `FieldId` setter.
-                    if key.starts_with("pluginConfig.") {
-                        let declared = self.tool_ctx.wasm.registry.declared_config();
-                        match crate::configform::set_plugin_option(
-                            &mut working,
-                            key,
-                            val,
-                            &declared,
-                        ) {
-                            Ok(written) => match crate::settings::project_path() {
-                                Some(path) => match working.save_to(&path) {
-                                    Ok(()) => {
-                                        crate::settings::reinstall(working);
-                                        println!(
-                                            "set pluginConfig.{written} = {val} (saved to {})",
-                                            path.display()
-                                        );
-                                    }
-                                    Err(e) => println!("config save failed: {e}"),
-                                },
-                                None => println!("no project settings file to save to"),
-                            },
-                            Err(e) => println!("{e}"),
-                        }
-                        return Ok(true);
-                    }
-                    match crate::configform::set_from_path(&mut working, key, val) {
-                        Ok(field) => {
-                            let (section, fkey) = (field.section, field.key);
-                            match crate::settings::project_path() {
-                                Some(path) => match working.save_to(&path) {
-                                    Ok(()) => {
-                                        crate::settings::reinstall(working);
-                                        println!(
-                                            "set {section}.{fkey} = {} (saved to {})",
-                                            crate::configform::display(
-                                                crate::settings::active(),
-                                                field.id
-                                            ),
-                                            path.display()
-                                        );
-                                    }
-                                    Err(e) => println!("config save failed: {e}"),
-                                },
-                                None => println!("config: no working directory"),
-                            }
-                        }
-                        Err(e) => println!("{e}"),
-                    }
+                    println!("{}", self.config_set_command(arg));
                 }
             }
             "/mcp" => print!("{}", render_mcp_report(&self.tool_ctx.mcp, self.color)),
@@ -4148,13 +4104,7 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
-            "/rate" => match self.rate_last_turn(arg) {
-                Ok(path) => println!(
-                    "{}",
-                    self.debug_line(&format!("[rating saved to {}]", path.display()))
-                ),
-                Err(e) => println!("{e}\nusage: /rate [+|-] [note]"),
-            },
+            "/rate" => println!("{}", self.rate_command(arg)),
             "/search" => {
                 if arg.trim().is_empty() {
                     println!("usage: /search <query> [--all]");
@@ -4520,6 +4470,11 @@ impl Agent<'_> {
         let tail_kv = self.engine.get_kv();
         self.checkpoints
             .save(PRE_ROLLBACK_CHECKPOINT, &self.session, tail_kv);
+        // The restored transcript is a different history: every rung was a
+        // snapshot of the one being discarded, and the payload on disk no
+        // longer matches (same as `/clear` and `/switch`).
+        self.discard_ladder();
+        self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
         self.last_ctx_used = 0;
         let note = match &cp.kv {
@@ -4574,6 +4529,11 @@ impl Agent<'_> {
         self.session.set_tree(&tree);
         self.last_ctx_used = 0;
         let kept = self.session.transcript.len();
+        // The kept prefix is intact, so rungs at or below it stay valid; the
+        // deeper ones describe spans that are gone. The saved payload was
+        // signed over the full old transcript and must be rewritten.
+        self.truncate_ladder_to(kept);
+        self.payload_dirty = true;
         Ok(format!(
             "forked at fork point {n}: {kept} of {before} messages kept (cached prefix reused); \
 the previous branch is still in /tree"
@@ -4638,7 +4598,7 @@ the original is frozen and listed in /tree"
     /// gone — rungs are anchored before a tool result instead — but the
     /// already-captured entry point stays useful.)
     fn store_payload(&mut self, cache: &crate::kvcache::KVCache) -> Option<String> {
-        if self.session.id.is_empty() {
+        if self.session.id.is_empty() || self.in_sidechain() {
             return None;
         }
         // Same ordering note as `push_rung`, on the payload side: on a turn
@@ -4693,7 +4653,9 @@ the original is frozen and listed in /tree"
     /// in prefill. The flag clears regardless of outcome: a backend with no KV
     /// must not retry every turn.
     fn save_payload_if_dirty(&mut self) -> Option<String> {
-        if !self.payload_dirty {
+        // Inside a sidechain the flag is left set, not consumed: the parent
+        // turn that folds the fork back out saves the session's own state.
+        if !self.payload_dirty || self.in_sidechain() {
             return None;
         }
         self.payload_dirty = false;
@@ -4740,6 +4702,39 @@ the original is frozen and listed in /tree"
         self.ladder = crate::kvladder::KvLadder::new();
     }
 
+    /// Forgets every rung deeper than `spans` and deletes its blobs, after the
+    /// transcript was cut back to `spans` entries (a sub-agent fork folded out,
+    /// `/fork`). Rungs at or below the cut still describe an intact prefix and
+    /// stay usable. Best-effort, like [`Agent::discard_ladder`].
+    fn truncate_ladder_to(&mut self, spans: usize) {
+        for rung in self.ladder.truncate_to(spans) {
+            if self.session.id.is_empty() {
+                continue;
+            }
+            let path = self.store.rung_path(&self.session.id, rung.index);
+            let _ = std::fs::remove_file(crate::kvmeta::sidecar_path(&path));
+            let _ = std::fs::remove_file(&path);
+            crate::engine::kv_debug(|| {
+                format!(
+                    "ladder truncate: dropped rung {} at spans={} (transcript cut to {spans})",
+                    rung.index, rung.spans
+                )
+            });
+        }
+    }
+
+    /// True while the live transcript carries a sub-agent sidechain (an
+    /// `agent` tool call or a `/subagent`, on the live engine or on an
+    /// alternate one). The sidechain's messages are truncated back out when it
+    /// ends, and on an alternate engine `self.engine` is not even the session's
+    /// engine, so during it no payload may be stored, no rung anchored, and no
+    /// opportunistic micro-compaction run: each would sign the *sidechain's*
+    /// state as the session's, and a rung anchored past the fork point would
+    /// survive the truncate and miss forever.
+    fn in_sidechain(&self) -> bool {
+        self.sidechain_depth > 0 || self.tool_ctx.subagent_depth > 0
+    }
+
     /// Captures an *anchor* rung immediately before a tool result of
     /// `body_len` bytes is appended to the transcript.
     ///
@@ -4784,7 +4779,7 @@ the original is frozen and listed in /tree"
         if body_len <= compact::MICROCOMPACT_MIN_BYTES || self.session.id.is_empty() {
             return;
         }
-        if !crate::settings::active().context.microcompact {
+        if !crate::settings::active().context.microcompact || self.in_sidechain() {
             return;
         }
         let spans = self.session.transcript.len();
@@ -5080,6 +5075,15 @@ the original is frozen and listed in /tree"
         // is the *payload* fingerprint, not the session id: pushing the id here
         // matched nothing at all, so the payload survived only on recency.
         keep.push(self.payload_fingerprint_for(&self.session));
+        // The live ladder's rungs are just as live, and would otherwise be the
+        // first thing a tight `/kvcache gc` budget takes (rungs sort first in
+        // the budget pass). Each is signed over the transcript truncated to its
+        // own depth — the same fingerprint `restore_rung_below` looks it up by.
+        for rung in self.ladder.rungs() {
+            let mut prefix = self.session.clone();
+            prefix.transcript.truncate(rung.spans);
+            keep.push(self.payload_fingerprint_for(&prefix));
+        }
         keep
     }
 
@@ -5756,6 +5760,11 @@ the original is frozen and listed in /tree"
         {
             return Err("rename cancelled".to_owned());
         }
+        // Rungs are stored under the old id and the store does not carry them
+        // across a rename; drop them (and their blobs) while the ladder still
+        // knows the name they were written under, or it keys on the new id
+        // while the blobs are gone.
+        self.discard_ladder();
         name.clone_into(&mut self.session.id);
         crate::debugmirror::set_session_id(&self.session.id);
         self.session.dirty = true;
@@ -5986,6 +5995,16 @@ the original is frozen and listed in /tree"
     /// the feedback sidecar. The rating never touches the transcript, model
     /// context, or KV — see `crate::feedback`.
     fn rate_last_turn(&self, arg: &str) -> Result<std::path::PathBuf, String> {
+        self.rate_last_turn_at(arg, &crate::insights::usage_dir())
+    }
+
+    /// [`rate_last_turn`](Self::rate_last_turn) against an explicit usage
+    /// root, so a test never writes under `$HOME`.
+    fn rate_last_turn_at(
+        &self,
+        arg: &str,
+        root: &std::path::Path,
+    ) -> Result<std::path::PathBuf, String> {
         let mut parts = arg.trim().splitn(2, char::is_whitespace);
         let sign = parts.next().unwrap_or("").trim();
         let note = parts.next().unwrap_or("").trim();
@@ -6014,14 +6033,90 @@ the original is frozen and listed in /tree"
             note: note.to_string(),
             at: now_secs(),
         };
-        let root = crate::insights::usage_dir();
-        crate::feedback::record(&root, &self.session.id, &rating).map_err(|e| {
+        crate::feedback::record(root, &self.session.id, &rating).map_err(|e| {
             format!(
                 "{}: {e}",
-                crate::feedback::feedback_path(&root, &self.session.id).display()
+                crate::feedback::feedback_path(root, &self.session.id).display()
             )
         })?;
-        Ok(crate::feedback::feedback_path(&root, &self.session.id))
+        Ok(crate::feedback::feedback_path(root, &self.session.id))
+    }
+
+    /// `/rate [+|-] [note]` as one printable string, shared by both front ends
+    /// so a rating cannot be reported differently depending on the screen.
+    fn rate_command(&self, arg: &str) -> String {
+        self.rate_command_at(arg, &crate::insights::usage_dir())
+    }
+
+    /// [`rate_command`](Self::rate_command) against an explicit usage root.
+    fn rate_command_at(&self, arg: &str, root: &std::path::Path) -> String {
+        match self.rate_last_turn_at(arg, root) {
+            Ok(path) => self.debug_line(&format!("[rating saved to {}]", path.display())),
+            Err(e) => format!("{e}\nusage: /rate [+|-] [note]"),
+        }
+    }
+
+    /// `/config <key> <value>`: sets one setting, persists it to the project
+    /// settings file and reinstalls the process-wide settings so the change is
+    /// live at once. Returns the line to show the user. Shared by both front
+    /// ends; the TUI used to drop the argument and open the modal on the old
+    /// value instead.
+    fn config_set_command(&mut self, arg: &str) -> String {
+        self.config_set_command_at(arg, crate::settings::project_path())
+    }
+
+    /// [`config_set_command`](Self::config_set_command) with the destination
+    /// file passed in, so a test can point it at a scratch directory instead
+    /// of the working directory's `.plank/settings.json`.
+    fn config_set_command_at(&mut self, arg: &str, dest: Option<std::path::PathBuf>) -> String {
+        let mut p = arg.splitn(2, char::is_whitespace);
+        let key = p.next().unwrap_or("");
+        let val = p.next().unwrap_or("").trim();
+        let mut working = crate::settings::active().clone();
+        // Plugin options are addressed `pluginConfig.<id>.<option>` and
+        // validated against the component's own declaration, so they cannot
+        // go through the `FieldId` setter.
+        if key.starts_with("pluginConfig.") {
+            let declared = self.tool_ctx.wasm.registry.declared_config();
+            return match crate::configform::set_plugin_option(&mut working, key, val, &declared) {
+                Ok(written) => match dest {
+                    Some(path) => match working.save_to(&path) {
+                        Ok(()) => {
+                            crate::settings::reinstall(working);
+                            format!(
+                                "set pluginConfig.{written} = {val} (saved to {})",
+                                path.display()
+                            )
+                        }
+                        Err(e) => format!("config save failed: {e}"),
+                    },
+                    None => "no project settings file to save to".to_owned(),
+                },
+                Err(e) => e,
+            };
+        }
+        match crate::configform::set_from_path(&mut working, key, val) {
+            Ok(field) => {
+                let (section, fkey) = (field.section, field.key);
+                match dest {
+                    Some(path) => match working.save_to(&path) {
+                        Ok(()) => {
+                            // Rendered from the settings just written, which
+                            // is what `reinstall` installs next.
+                            let shown = crate::configform::display(&working, field.id);
+                            crate::settings::reinstall(working);
+                            format!(
+                                "set {section}.{fkey} = {shown} (saved to {})",
+                                path.display()
+                            )
+                        }
+                        Err(e) => format!("config save failed: {e}"),
+                    },
+                    None => "config: no working directory".to_owned(),
+                }
+            }
+            Err(e) => e,
+        }
     }
 
     /// `/search <query> [--all]`: builds the session index, searches it scoped
@@ -6104,12 +6199,28 @@ the original is frozen and listed in /tree"
         } else {
             None
         });
+        self.sidechain_depth += 1;
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
             self.active_goal(),
         )));
         fork_at
+    }
+
+    /// Folds a sub-agent fork back out of the transcript: truncates to
+    /// `fork_at`, drops every ladder rung anchored past it, and rolls the
+    /// engine KV back to the parent prefix. Returns the sidechain's final
+    /// report, extracted before the truncate. Every fork-end path goes
+    /// through here so the depth counter opened by
+    /// [`begin_subagent_fork`](Self::begin_subagent_fork) always closes.
+    fn end_subagent_fork(&mut self, fork_at: usize) -> Option<String> {
+        let report = last_assistant_text(&self.session.transcript[fork_at..]);
+        self.session.transcript.truncate(fork_at);
+        self.truncate_ladder_to(fork_at);
+        self.sidechain_depth = self.sidechain_depth.saturating_sub(1);
+        self.restore_fork_kv();
+        report
     }
 
     /// Runs a whole block of remote-backed `agent` calls concurrently, or returns
@@ -6644,10 +6755,7 @@ the original is frozen and listed in /tree"
     /// the sidechain produced no report (e.g. interrupted before any output);
     /// the transcript is still restored.
     fn finish_subagent_fork(&mut self, fork_at: usize, task: &str) -> bool {
-        let report = last_assistant_text(&self.session.transcript[fork_at..]);
-        self.session.transcript.truncate(fork_at);
-        self.restore_fork_kv();
-        match report {
+        match self.end_subagent_fork(fork_at) {
             Some(report) => {
                 self.session
                     .push(Message::user(crate::agents::report_message(task, &report)));
@@ -10450,6 +10558,51 @@ impl Agent<'_> {
     }
 
     /// Handles a slash command in the TUI; returns false to quit.
+    /// The TUI's `/config` arm. `--resolved` prints the provenance dump and
+    /// `<key> <value>` sets and persists through the same setter as the plain
+    /// path; only a bare `/config` opens the modal form. Split out of
+    /// [`tui_slash`](Self::tui_slash) because it needs no terminal, so a test
+    /// can drive it with an [`OutputLog`] alone.
+    fn tui_config_command(
+        &mut self,
+        arg: &str,
+        log: &mut OutputLog,
+        config_form: &mut Option<crate::configform::ConfigForm>,
+    ) {
+        if arg == "--resolved" {
+            log.push_ansi(&crate::provenance::render_resolved(
+                crate::settings::active(),
+                self.cfg,
+            ));
+        } else if arg.is_empty() {
+            // Open the interactive modal; the run loop drives it and persists
+            // on close. The form cycles through contributed faces as well as
+            // the built-ins, so it is handed what this session actually loaded.
+            let faces = self
+                .tool_ctx
+                .wasm
+                .screensaver_faces()
+                .into_iter()
+                .map(|f| f.address)
+                .collect();
+            let plugin_fields = self
+                .tool_ctx
+                .wasm
+                .registry
+                .declared_config()
+                .into_iter()
+                .map(|(id, option)| crate::configform::PluginField { id, option })
+                .collect();
+            *config_form = Some(crate::configform::ConfigForm::with_contributions(
+                crate::settings::active().clone(),
+                faces,
+                plugin_fields,
+            ));
+        } else {
+            log.push_dim(self.config_set_command(arg));
+        }
+    }
+
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     fn tui_slash(
         &mut self,
@@ -10533,41 +10686,8 @@ impl Agent<'_> {
                     }
                 }
             }
-            "/config" => {
-                // `--resolved` prints the provenance dump instead of opening the
-                // modal, mirroring the plain-stdout path.
-                if arg == "--resolved" {
-                    log.push_ansi(&crate::provenance::render_resolved(
-                        crate::settings::active(),
-                        self.cfg,
-                    ));
-                } else {
-                    // Open the interactive modal; the run loop drives it and
-                    // persists on close. `arg` is ignored (the form edits everything).
-                    // The form cycles through contributed faces as well as the
-                    // built-ins, so it is handed what this session actually loaded.
-                    let faces = self
-                        .tool_ctx
-                        .wasm
-                        .screensaver_faces()
-                        .into_iter()
-                        .map(|f| f.address)
-                        .collect();
-                    let plugin_fields = self
-                        .tool_ctx
-                        .wasm
-                        .registry
-                        .declared_config()
-                        .into_iter()
-                        .map(|(id, option)| crate::configform::PluginField { id, option })
-                        .collect();
-                    *config_form = Some(crate::configform::ConfigForm::with_contributions(
-                        crate::settings::active().clone(),
-                        faces,
-                        plugin_fields,
-                    ));
-                }
-            }
+            "/config" => self.tui_config_command(arg, log, config_form),
+            "/rate" => log.push_dim(self.rate_command(arg)),
             "/new" | "/clear" => {
                 self.discard_ladder();
                 self.session = Session::new();
@@ -10728,7 +10848,10 @@ impl Agent<'_> {
                 Err(e) => log.push_plain(format!("switch failed: {e}")),
             },
             "/del" => match self.store.delete(arg) {
-                Ok(id) => log.push_plain(format!("deleted session {}", &id[..8])),
+                Ok(id) => log.push_plain(format!(
+                    "deleted session {}",
+                    crate::session::display_id(&id)
+                )),
                 Err(e) => log.push_plain(format!("delete failed: {e}")),
             },
             "/retitle" => log.push_plain(self.retitle_sessions()),
@@ -10822,7 +10945,7 @@ impl Agent<'_> {
                         Ok((sha, tokens)) => {
                             log.push_plain(format!(
                                 "stripped session {} ({tokens} tokens)",
-                                &sha[..8]
+                                crate::session::display_id(&sha)
                             ));
                         }
                         Err(e) => log.push_plain(format!("strip failed: {e}")),
@@ -11356,7 +11479,7 @@ fn run_ask_panel(
                 return Ok(());
             }
             KeyCode::Char('c') if ctrl => {
-                shared.interrupt.store(true, Ordering::Relaxed);
+                raise_worker_interrupt(shared);
                 bridge.respond(AskOutcome::Interrupted);
                 return Ok(());
             }
@@ -11563,12 +11686,46 @@ fn close_or_interrupt(
     close_panel_on_end: &mut bool,
 ) {
     if btw_active {
-        shared.interrupt.store(true, Ordering::Relaxed);
+        raise_worker_interrupt(shared);
         *close_panel_on_end = true;
     } else if btw.is_some() {
         *btw = None;
     } else {
-        shared.interrupt.store(true, Ordering::Relaxed);
+        raise_worker_interrupt(shared);
+    }
+}
+
+/// Raises the worker interrupt on *both* routes a generation can poll.
+///
+/// The main pass watches `shared.interrupt`, but a sub-agent or fan-out pass
+/// (`generate_pass`, `run_fanout_rounds`) runs on a context built without the
+/// turn's `TurnShared` and polls only the process-wide
+/// [`crate::interrupt::pending`] flag — the same one Ctrl-C at the shell raises.
+/// Setting only the shared flag therefore left Esc powerless while a sidechain
+/// generated. Raising both is the least invasive fix: the sub-agent stops at its
+/// next token, `generate_pass` clears the process flag as it reports
+/// `interrupted`, and the parent pass then sees `shared.interrupt` at its own
+/// end. The worker clears the process flag wherever it consumes the shared one.
+fn raise_worker_interrupt(shared: &TurnShared) {
+    shared.interrupt.store(true, Ordering::Relaxed);
+    crate::interrupt::request();
+}
+
+/// Advances `busy_ui_loop`'s force-quit escalation clock.
+///
+/// Arms it (`now`) the first time an interrupt is seen outstanding, keeps the
+/// original instant while it stays outstanding, and disarms it the moment the
+/// worker has consumed the interrupt — so only an interrupt the worker never
+/// acknowledges can age past `FORCE_QUIT_GRACE`.
+fn escalation_clock(
+    armed_at: Option<Instant>,
+    interrupt_outstanding: bool,
+    now: Instant,
+) -> Option<Instant> {
+    if interrupt_outstanding {
+        armed_at.or(Some(now))
+    } else {
+        None
     }
 }
 
@@ -11623,14 +11780,23 @@ fn busy_ui_loop(
     // cleared exactly once when the pass ends.
     let mut compacting_line = false;
     // When the main-task interrupt was raised, so an interrupt the worker never
-    // acknowledges can escalate to a force quit. `None` whenever no interrupt
-    // is outstanding.
+    // acknowledges can escalate to a force quit. Invariant: `Some` only while
+    // `shared.interrupt` is still raised. The worker clears that flag when it
+    // honours the interrupt and carries on (a cancelled `/btw` answer resuming
+    // the main task, an aborted compaction), and `escalation_clock` at the top
+    // of every iteration disarms this with it — otherwise a long-consumed
+    // interrupt would turn the *next* Ctrl-C into a force quit.
     let mut interrupt_at: Option<Instant> = None;
     // Wall-clock pacing for an easter egg opened mid-turn, same as the idle
     // loop: render events arrive irregularly, so the frame delta has to be
     // measured rather than inferred from the poll timeout.
     let mut arcade_last = Instant::now();
     loop {
+        interrupt_at = escalation_clock(
+            interrupt_at,
+            shared.interrupt.load(Ordering::Relaxed),
+            Instant::now(),
+        );
         if arcade.is_open() {
             let dt = arcade_last.elapsed();
             arcade_last = Instant::now();
@@ -11967,9 +12133,11 @@ fn busy_ui_loop(
                         close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
                         // Arms the escalation the same way Ctrl-C does, so an
                         // interrupt raised with Esc can still be escaped from.
-                        if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
-                            interrupt_at = Some(Instant::now());
-                        }
+                        interrupt_at = escalation_clock(
+                            interrupt_at,
+                            shared.interrupt.load(Ordering::Relaxed),
+                            Instant::now(),
+                        );
                     }
                     KeyCode::Char('c') if ctrl => {
                         // Ctrl-C clears a partly-typed line first; on an empty
@@ -11990,9 +12158,11 @@ fn busy_ui_loop(
                                 force_quit();
                             }
                             close_or_interrupt(shared, btw, btw_active, &mut close_panel_on_end);
-                            if interrupt_at.is_none() && shared.interrupt.load(Ordering::Relaxed) {
-                                interrupt_at = Some(Instant::now());
-                            }
+                            interrupt_at = escalation_clock(
+                                interrupt_at,
+                                shared.interrupt.load(Ordering::Relaxed),
+                                Instant::now(),
+                            );
                         } else {
                             input.buf.clear();
                         }
@@ -12442,6 +12612,7 @@ fn new_agent(
         payload_restored: false,
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
+        sidechain_depth: 0,
         btw_diverged_engine: false,
         trusted_system_len,
         think: cfg.generation.think_mode,
@@ -14014,6 +14185,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -16686,6 +16858,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // `/del` used to slice the returned id to eight bytes for display, which
+    // panics on a user-named session shorter than that (`/rename ab`).
+    #[test]
+    fn del_of_a_short_named_session_does_not_panic() {
+        let dir = scratch_dir("del-short-name");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("hello there"));
+        let (id, _) = agent.save_for_exit().expect("used session should save");
+        assert_eq!(agent.store.rename(&id, "ab").unwrap(), "ab");
+        assert_eq!(crate::session::display_id("ab"), "ab", "printed in full");
+        agent.slash("/del ab").expect("/del runs");
+        assert!(agent.store.find("ab").is_err(), "session gone");
+        // The same shortening feeds `/strip`; a short name must survive it too.
+        agent.session.push(Message::user("again"));
+        agent.session.dirty = true;
+        let (id, _) = agent.save_for_exit().expect("saves again");
+        assert_eq!(agent.store.rename(&id, "cd").unwrap(), "cd");
+        agent.slash("/strip cd").expect("/strip runs");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // Tier 2 and Tier 3 must be distinct KV spans, so the session-start context
     // enters as two user messages — but the concatenation must still be exactly
     // the old single block, in the same stable-then-volatile order (#60, #64).
@@ -16895,6 +17089,50 @@ mod tests {
         close_or_interrupt(&shared, &mut p, false, &mut close_pending);
         assert!(shared.interrupt.load(Ordering::Relaxed));
         assert!(p.is_none());
+    }
+
+    // A sub-agent or fan-out pass polls only the process-wide flag, so an Esc
+    // that raised just `shared.interrupt` could never stop one.
+    #[test]
+    fn esc_reaches_the_process_flag_a_sub_agent_pass_polls() {
+        crate::interrupt::clear();
+        let shared = TurnShared::default();
+        let mut p: BtwPanel = None;
+        let mut close_pending = false;
+        close_or_interrupt(&shared, &mut p, false, &mut close_pending);
+        let seen_by_sidechain = crate::interrupt::clear();
+        assert!(shared.interrupt.load(Ordering::Relaxed), "main pass route");
+        assert!(
+            seen_by_sidechain,
+            "generate_pass polls crate::interrupt::pending"
+        );
+    }
+
+    // The force-quit clock must follow the interrupt it was armed for: once
+    // the worker consumes the flag and carries on, a later Ctrl-C is a fresh
+    // interrupt, not the second press of an escalation.
+    #[test]
+    fn escalation_clock_disarms_when_the_worker_consumes_the_interrupt() {
+        let t0 = Instant::now();
+        assert_eq!(escalation_clock(None, false, t0), None, "idle stays idle");
+        let armed = escalation_clock(None, true, t0);
+        assert_eq!(armed, Some(t0), "arms at the first outstanding sighting");
+        let later = t0 + Duration::from_secs(5);
+        assert_eq!(
+            escalation_clock(armed, true, later),
+            Some(t0),
+            "keeps the original instant while still outstanding"
+        );
+        assert_eq!(
+            escalation_clock(armed, false, later),
+            None,
+            "a consumed interrupt must not leave a stale clock behind"
+        );
+        assert_eq!(
+            escalation_clock(None, true, later),
+            Some(later),
+            "the next interrupt starts its own grace period"
+        );
     }
 
     // Ctrl-C during the summary pass must leave the conversation exactly as
@@ -17227,6 +17465,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17333,6 +17572,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -17769,6 +18009,302 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Files named `<id>.rung-*` in the store directory, sorted.
+    fn rung_files(agent: &Agent<'_>) -> Vec<String> {
+        let prefix = format!("{}.rung-", agent.session.id);
+        let mut v: Vec<String> = std::fs::read_dir(agent.store.dir())
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// A `ScriptedEngine` that pretends to hold KV, so rung captures produce
+    /// real blobs on disk.
+    fn kv_engine() -> ScriptedEngine {
+        ScriptedEngine {
+            kv_events: Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new()))),
+            ..ScriptedEngine::default()
+        }
+    }
+
+    /// `/rollback` replaces the transcript with a checkpoint's: every rung was
+    /// a snapshot of the history being discarded, and the payload on disk no
+    /// longer matches — the same housekeeping `/clear` and `/switch` do.
+    #[test]
+    fn rollback_discards_the_ladder_and_dirties_the_payload() {
+        let dir = scratch_dir("rollback-ladder");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, kv_engine(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.checkpoints.save("cp", &agent.session, None);
+        agent.session.push(Message::user("two"));
+        agent.session.push(Message::assistant("reply two"));
+        agent.capture_first_rung();
+        assert!(!rung_files(&agent).is_empty(), "a rung blob is on disk");
+        agent.payload_dirty = false;
+
+        let msg = agent.rollback_to("cp").unwrap();
+        assert!(msg.contains("rolled back to cp"), "{msg}");
+        assert_eq!(agent.session.transcript.len(), 2);
+        assert!(agent.ladder.rungs().is_empty(), "the ladder is forgotten");
+        assert!(rung_files(&agent).is_empty(), "and its blobs are gone");
+        assert!(agent.payload_dirty, "the saved payload must be rewritten");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/fork` keeps a strict prefix of the transcript: rungs at or below the
+    /// cut still describe an intact prefix and stay; deeper ones go, blobs
+    /// included.
+    #[test]
+    fn fork_truncates_the_ladder_to_the_kept_prefix() {
+        let dir = scratch_dir("fork-ladder");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, kv_engine(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply one"));
+        agent.store.save(&mut agent.session).unwrap();
+        // A rung at spans=2 (before the second prompt) and one at spans=4.
+        let shallow = agent.capture_first_rung();
+        assert_eq!(shallow.spans, 2);
+        agent.session.push(Message::user("two"));
+        agent.session.push(Message::assistant("reply two"));
+        agent.session.push(Message::user("three"));
+        agent.session.push(Message::assistant("reply three"));
+        // Force a second, deeper anchor regardless of the spacing rule.
+        let cache = agent.engine.get_kv().unwrap();
+        let deep = agent.push_rung(&cache, 50_000).unwrap();
+        assert_eq!(deep.spans, 6);
+        assert_eq!(rung_files(&agent).len(), 4, "two blobs, two sidecars");
+        agent.payload_dirty = false;
+
+        // Fork at the third prompt: the first two exchanges are kept.
+        let msg = agent.fork_branch("3", false).unwrap();
+        assert!(msg.contains("4 of 6 messages kept"), "{msg}");
+        let spans: Vec<usize> = agent.ladder.rungs().iter().map(|r| r.spans).collect();
+        assert_eq!(spans, vec![2], "only the rung inside the kept prefix stays");
+        let files = rung_files(&agent);
+        assert_eq!(
+            files.len(),
+            2,
+            "the deep rung's blob and sidecar are gone: {files:?}"
+        );
+        assert!(
+            files
+                .iter()
+                .all(|f| f.contains(&format!(".rung-{}.", shallow.index)))
+        );
+        assert!(agent.payload_dirty);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// While a sub-agent fork is open the transcript carries a sidechain that
+    /// will be truncated back out, so no payload is stored (and the dirty flag
+    /// is left for the parent turn), no rung is anchored and no opportunistic
+    /// micro-compaction runs. Folding the fork out drops any rung that was
+    /// anchored past the fork point.
+    #[test]
+    fn a_sidechain_never_writes_the_sessions_kv_and_its_rungs_die_with_it() {
+        let dir = scratch_dir("sidechain-kv");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, kv_engine(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        assert!(!agent.in_sidechain());
+
+        let fork_at = agent.begin_subagent_fork(None, "delegated task", true);
+        assert_eq!(fork_at, 2);
+        assert!(agent.in_sidechain());
+        agent.session.push(Message::assistant("sidechain reply"));
+
+        agent.payload_dirty = true;
+        agent.flush_kv_end_of_turn();
+        assert!(agent.payload_dirty, "the flag is left for the parent turn");
+        assert!(
+            !agent.store.payload_path(&agent.session.id).exists(),
+            "no payload is written from inside a sidechain"
+        );
+        assert_eq!(agent.save_session_payload(), None);
+        agent.anchor_rung_before_tool_result(compact::MICROCOMPACT_MIN_BYTES + 1);
+        assert!(
+            agent.ladder.rungs().is_empty(),
+            "no anchor inside a sidechain"
+        );
+        assert_eq!(agent.try_microcompact_opportunistic(), None);
+
+        // A rung that somehow landed past the fork point (here: planted
+        // directly) must not survive the truncate.
+        let cache = agent.engine.get_kv().unwrap();
+        let stray = agent.push_rung(&cache, 1_000).unwrap();
+        assert_eq!(stray.spans, 4, "task message plus the sidechain reply");
+        assert_eq!(rung_files(&agent).len(), 2);
+
+        assert_eq!(
+            agent.end_subagent_fork(fork_at).as_deref(),
+            Some("sidechain reply")
+        );
+        assert_eq!(agent.session.transcript.len(), fork_at);
+        assert!(!agent.in_sidechain());
+        assert!(agent.ladder.rungs().is_empty(), "the stray rung is dropped");
+        assert!(rung_files(&agent).is_empty(), "and its blob deleted");
+
+        // Back in the parent, the same calls write again.
+        agent.flush_kv_end_of_turn();
+        assert!(!agent.payload_dirty);
+        assert!(agent.store.payload_path(&agent.session.id).exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `agent` tool's nesting counter is the other sidechain marker: a
+    /// `/subagent` opens no fork of its own on that counter, and an `agent`
+    /// call opens both.
+    #[test]
+    fn the_agent_tools_depth_counter_also_marks_a_sidechain() {
+        let dir = scratch_dir("sidechain-depth");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.tool_ctx.subagent_depth = 1;
+        assert!(agent.in_sidechain());
+        agent.tool_ctx.subagent_depth = 0;
+        assert!(!agent.in_sidechain());
+    }
+
+    /// Rungs are stored under the session id and the store drops them on a
+    /// rename; the live ladder must forget them at the same time, or it keys
+    /// on the new id while the blobs are gone.
+    #[test]
+    fn renaming_the_live_session_discards_its_ladder() {
+        let dir = scratch_dir("rename-ladder");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, kv_engine(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let old = agent.session.id.clone();
+        agent.capture_first_rung();
+        assert_eq!(rung_files(&agent).len(), 2);
+
+        let mut never = |_q: &str| -> bool { panic!("nothing to overwrite") };
+        agent.rename_session("renamed-one", &mut never).unwrap();
+        assert_eq!(agent.session.id, "renamed-one");
+        assert!(agent.ladder.rungs().is_empty());
+        assert!(rung_files(&agent).is_empty(), "nothing under the new id");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+            .filter(|n| n.starts_with(&format!("{old}.rung-")))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "nothing under the old id: {leftovers:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The live ladder's rungs are active by definition, like the payload: a
+    /// `/kvcache gc` under a tight budget must not take the running session's
+    /// own accelerators. Their fingerprints are over the transcript truncated
+    /// to each rung's depth, exactly as `restore_rung_below` looks them up.
+    #[test]
+    fn the_live_ladders_rungs_survive_a_sweep_under_a_zero_budget() {
+        let dir = scratch_dir("kvcache-live-rungs");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, kv_engine(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        // The transcript grows past the rung before the sweep, so a full-
+        // transcript fingerprint would not match the rung's.
+        agent.session.push(Message::user("two"));
+        let rung_path = agent.store.rung_path(&agent.session.id, rung.index);
+        assert!(rung_path.exists());
+
+        let keep = agent.active_kv_fingerprints(&agent.kv_tiers());
+        let mut prefix = agent.session.clone();
+        prefix.transcript.truncate(rung.spans);
+        assert!(keep.contains(&agent.payload_fingerprint_for(&prefix)));
+        let refs: Vec<&str> = keep.iter().map(String::as_str).collect();
+        let policy = crate::kvgc::SweepPolicy {
+            ttl_session_secs: 1,
+            ttl_tier_secs: 1,
+            ttl_rung_secs: 1,
+            max_bytes: 0,
+        };
+        let future = crate::kvmeta::now_secs() + 400 * 86_400;
+        assert_eq!(agent.store.sweep(&refs, &policy, future), 0);
+        assert!(rung_path.exists(), "the live rung is active");
+        // Only the keep set spares it.
+        assert!(agent.store.sweep(&[], &policy, future) > 0);
+        assert!(!rung_path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The TUI's `/rate` arm pushes the same line the plain path prints, for
+    /// both the failure and the success shape.
+    #[test]
+    fn tui_rate_reports_like_the_plain_path() {
+        let dir = scratch_dir("tui-rate");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = "rated-session".to_owned();
+        let mut log = OutputLog::new();
+        log.push_dim(agent.rate_command_at("x", &dir));
+        let text = log.to_text().to_string();
+        assert!(text.contains("expected + or -"), "{text}");
+        assert!(text.contains("usage: /rate [+|-] [note]"), "{text}");
+
+        agent.session.push(Message::user("hi"));
+        agent.session.push(Message::assistant("an answer"));
+        let mut log = OutputLog::new();
+        log.push_dim(agent.rate_command_at("- too terse", &dir));
+        let text = log.to_text().to_string();
+        assert!(text.contains("[rating saved to"), "{text}");
+        let saved =
+            std::fs::read_to_string(crate::feedback::feedback_path(&dir, "rated-session")).unwrap();
+        assert!(saved.contains("too terse"), "{saved}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/config <key> <value>` on the TUI sets and persists like the plain
+    /// path; only a bare `/config` opens the modal form.
+    #[test]
+    fn tui_config_with_an_argument_sets_the_value_instead_of_opening_the_form() {
+        let dir = scratch_dir("tui-config-set");
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = true;
+        crate::settings::install_for_test(settings);
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let dest = dir.join("settings.json");
+
+        // The shared setter, aimed at a scratch file rather than `./.plank`.
+        let msg = agent.config_set_command_at("ui.showThinking false", Some(dest.clone()));
+        assert!(msg.starts_with("set ui.showThinking = false"), "{msg}");
+        let written = std::fs::read_to_string(&dest).unwrap();
+        assert!(written.contains("showThinking"), "{written}");
+        assert!(written.contains("false"), "{written}");
+
+        // The TUI arm: a bare `/config` opens the form, an argument does not.
+        let mut log = OutputLog::new();
+        let mut form = None;
+        agent.tui_config_command("", &mut log, &mut form);
+        assert!(form.is_some(), "a bare /config opens the modal");
+        let mut form = None;
+        agent.tui_config_command("ui.showThinking nonsense", &mut log, &mut form);
+        assert!(form.is_none(), "an argument never opens the form");
+        let text = log.to_text().to_string();
+        assert!(!text.is_empty(), "the setter's verdict is logged: {text}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The live session's payload is protected by being *active*, not by
     /// recency. Its node's fingerprint is the payload fingerprint, so pushing
     /// the session id into the keep set — as the launch sweep used to — matched
@@ -18039,6 +18575,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18225,6 +18762,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18316,6 +18854,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18394,6 +18933,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -18495,6 +19035,7 @@ mod tests {
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -19991,6 +20532,7 @@ or the user's next message aborts before its first token"
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn agent_tool_delegates_and_returns_only_the_report() {
         let dir = std::env::temp_dir().join(format!("plank-ui-agenttool-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -20038,6 +20580,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20133,6 +20676,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20287,6 +20831,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,
@@ -20363,6 +20908,7 @@ or the user's next message aborts before its first token"
             payload_restored: false,
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
+            sidechain_depth: 0,
             btw_diverged_engine: false,
             trusted_system_len: 0,
             think: cfg.generation.think_mode,

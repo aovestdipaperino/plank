@@ -101,6 +101,22 @@ impl KvLadder {
         self.rungs.remove(best)
     }
 
+    /// Forgets every rung deeper than `spans` transcript entries and returns
+    /// them, so the caller can delete their blobs.
+    ///
+    /// The truncation counterpart of [`Self::push`]: when the transcript is cut
+    /// back to `spans` (a sub-agent fork being folded out, `/fork`), a rung at
+    /// `r.spans <= spans` still describes an intact prefix and stays; anything
+    /// deeper was captured on a span that no longer exists and, left in place,
+    /// would keep `wants_anchor` reporting the depth as covered while `select`
+    /// hands back a prefix that is gone.
+    pub fn truncate_to(&mut self, spans: usize) -> Vec<Rung> {
+        let (keep, dropped): (Vec<Rung>, Vec<Rung>) =
+            self.rungs.iter().copied().partition(|r| r.spans <= spans);
+        self.rungs = keep;
+        dropped
+    }
+
     /// The deepest rung that predates an edit at span `max_spans` and covers
     /// more tokens than the engine would reuse unaided.
     #[must_use]
@@ -172,6 +188,31 @@ mod tests {
         // 5_000-token rung would make the turn worse, not better.
         assert_eq!(l.select(9, 6_000), None);
         assert_eq!(l.select(9, 4_000).map(|r| r.tokens), Some(5_000));
+    }
+
+    #[test]
+    fn truncate_to_drops_only_the_rungs_past_the_cut_and_hands_them_back() {
+        let mut l = KvLadder::new();
+        l.push(2, 5_000);
+        l.push(6, 14_000);
+        l.push(10, 25_000);
+        // A cut at span 6 keeps the rung *at* the cut: its prefix is intact.
+        let dropped = l.truncate_to(6);
+        assert_eq!(
+            dropped.iter().map(|r| r.spans).collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(
+            l.rungs().iter().map(|r| r.spans).collect::<Vec<_>>(),
+            vec![2, 6]
+        );
+        // The dropped depth is no longer "covered": a fresh anchor there is
+        // wanted again, which is exactly the stale-rung failure this prevents.
+        assert!(l.wants_anchor(10, 25_000));
+        // A cut in front of everything empties the ladder; nothing to cut is a no-op.
+        assert_eq!(l.truncate_to(1).len(), 2);
+        assert!(l.rungs().is_empty());
+        assert!(l.truncate_to(0).is_empty());
     }
 
     #[test]

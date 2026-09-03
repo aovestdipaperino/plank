@@ -274,6 +274,32 @@ impl ToolContext {
             self.cwd.join(path)
         }
     }
+
+    /// [`resolve`](Self::resolve) for a tool that is about to *write* the
+    /// path. When the sandbox is enabled the target must lie under one of the
+    /// sandbox's writable roots (cwd, the temp dirs, configured
+    /// `writablePaths`, and `~/.plank` once granted); anything else — an
+    /// absolute path elsewhere, or a `..` escape — is refused with the
+    /// model-visible error text. Reads are deliberately not contained: the
+    /// model legitimately reads system files, and the bash sandbox itself
+    /// allows reads everywhere.
+    ///
+    /// # Errors
+    ///
+    /// The complete model-visible `Tool error: <tool> path escapes
+    /// workspace: <path>\n` line when the sandbox refuses the target.
+    pub fn resolve_for_write(&self, tool: &str, path: impl AsRef<Path>) -> Result<PathBuf, String> {
+        let path = path.as_ref();
+        let full = self.resolve(path);
+        if self.sandbox.contains_write_target(&self.cwd, &full) {
+            Ok(full)
+        } else {
+            Err(format!(
+                "Tool error: {tool} path escapes workspace: {}\n",
+                path.display()
+            ))
+        }
+    }
 }
 
 /// Executes one parsed tool call and returns the model-visible result.
@@ -285,6 +311,10 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
     if call.name.is_empty() {
         return ToolResult::from_output("Tool error: missing tool name\n".to_string());
     }
+    // Reap timed-out async bash jobs on every dispatch, not only when the
+    // model polls them, so an abandoned `refresh_sec` job cannot outlive its
+    // own deadline.
+    ctx.bash.sweep();
     // Argument values feed argument matchers like `bash(git *)`.
     let arg_values: Vec<&str> = call.args.iter().map(|a| a.value.as_str()).collect();
     // PreToolUse hooks: exit 2 blocks the tool, its stderr becomes the
@@ -732,8 +762,17 @@ fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let mut current: Vec<(String, String)> = Vec::new();
     for m in &ctx.current_transcript {
         if let Some(pos) = m.text.find(&query) {
-            let start = pos.saturating_sub(40);
-            let end = (pos + query.len() + 40).min(m.text.len());
+            // Snap the byte window outward to char boundaries: a multi-byte
+            // character within 40 bytes of the match would otherwise panic
+            // the slice below.
+            let mut start = pos.saturating_sub(40);
+            while !m.text.is_char_boundary(start) {
+                start -= 1;
+            }
+            let mut end = (pos + query.len() + 40).min(m.text.len());
+            while !m.text.is_char_boundary(end) {
+                end += 1;
+            }
             let mut snippet = String::new();
             if start > 0 {
                 snippet.push('…');
@@ -1113,6 +1152,26 @@ mod tests {
         assert!(res.output.contains("current session"), "{}", res.output);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn recall_snippet_window_snaps_to_char_boundaries() {
+        // An em dash and an emoji sit inside the 40-byte context window on
+        // both sides of the match; the snippet must not slice mid-character.
+        crate::settings::install_for_test(crate::settings::Settings::default());
+        let (mut ctx, dir) = test_ctx();
+        let text = format!(
+            "{}\u{2014}\u{1F600}{}needle{}\u{2014}\u{1F600}{}",
+            "a".repeat(30),
+            "b".repeat(8),
+            "c".repeat(37),
+            "d".repeat(30)
+        );
+        ctx.current_transcript = vec![crate::session::Message::user(&text)];
+        let res = dispatch(&test_call("recall", &[("query", "needle")]), &mut ctx);
+        assert!(!res.is_error, "{}", res.output);
+        assert!(res.output.contains("needle"), "{}", res.output);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

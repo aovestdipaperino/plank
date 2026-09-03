@@ -11,6 +11,7 @@
 
 use std::fmt::Write as _;
 use std::io::Read as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -112,6 +113,49 @@ fn make_output_file(id: u64) -> Result<(PathBuf, std::fs::File), String> {
     Err("failed to create temporary output file: too many collisions".to_string())
 }
 
+/// How long a process group gets to exit after SIGTERM before SIGKILL.
+const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// Terminates `child` together with every process in its process group and
+/// reaps it.
+///
+/// Only meaningful for children spawned with `process_group(0)`, which makes
+/// the child the leader of a group of its own (its pgid equals its pid, and
+/// `sandbox-exec` keeps that pid because it execs the shell in place). A plain
+/// `Child::kill` reaches only the shell, orphaning `sleep 9999 & wait` or
+/// `cmd | tee` pipelines, which then outlive plank. SIGTERM goes first so
+/// well-behaved tools can clean up; after [`GROUP_KILL_GRACE`] the group gets
+/// SIGKILL. `wait()` always runs so nothing is left as a zombie. Signalling a
+/// group that has already gone is harmless (ESRCH is ignored).
+pub(crate) fn kill_process_group(child: &mut Child) -> Option<std::process::ExitStatus> {
+    #[allow(clippy::cast_possible_wrap)]
+    let pgid = child.id() as libc::pid_t;
+    if pgid <= 0 {
+        return child.try_wait().ok().flatten();
+    }
+    // SAFETY: kill(2) with a negative pid signals a process group; it has no
+    // memory-safety preconditions and any error (ESRCH, EPERM) is ignored.
+    unsafe { libc::kill(-pgid, libc::SIGTERM) };
+    let deadline = Instant::now() + GROUP_KILL_GRACE;
+    let mut status = None;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                status = Some(st);
+                break;
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break,
+        }
+    }
+    // Even when the leader exited on SIGTERM, a grandchild may have ignored
+    // it: SIGKILL the group unconditionally. The group id stays valid until
+    // its last member is gone, so this is safe after the leader's reap.
+    // SAFETY: as above.
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    status.or_else(|| child.wait().ok())
+}
+
 impl BashJob {
     fn stats(&self) -> (u64, u64, u8) {
         let sink = self.shared.sink.lock().expect("bash output sink poisoned");
@@ -168,13 +212,20 @@ impl BashJob {
         }
         if self.start.elapsed() >= self.timeout {
             self.timed_out = true;
-            let _ = self.child.kill();
-            if let Ok(status) = self.child.wait() {
-                self.finalize(status);
-            } else {
-                self.exit_status = -1;
-                self.running = false;
-            }
+            self.terminate();
+        }
+    }
+
+    /// Kills the job's whole process group and records its exit.
+    fn terminate(&mut self) {
+        if !self.running {
+            return;
+        }
+        if let Some(status) = kill_process_group(&mut self.child) {
+            self.finalize(status);
+        } else {
+            self.exit_status = -1;
+            self.running = false;
         }
     }
 
@@ -352,11 +403,21 @@ impl BashJob {
     }
 
     /// Waits up to `refresh_sec` for the job to finish, polling as it goes.
+    ///
+    /// A pending user interrupt (Ctrl-C in the REPL, Esc in the TUI) kills
+    /// the job instead of waiting the refresh out: the shell runs in its own
+    /// process group, so the terminal's SIGINT no longer reaches it and plank
+    /// has to forward the intent itself. The flag is left set for the turn
+    /// loop, which is what stops the generation.
     fn refresh_for(&mut self, refresh_sec: u64) {
         let deadline = Instant::now() + Duration::from_secs(refresh_sec);
         while self.running && Instant::now() < deadline {
             self.poll();
             if !self.running {
+                break;
+            }
+            if crate::interrupt::pending() {
+                self.terminate();
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -367,10 +428,8 @@ impl BashJob {
 
 impl Drop for BashJob {
     fn drop(&mut self) {
-        if self.running {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
+        // Kill the group, not just the shell, so nothing outlives plank.
+        self.terminate();
         // The temp output file is intentionally kept: its path was shown to
         // the model as output_path and may be read with the file tools.
     }
@@ -414,6 +473,9 @@ impl BashJobs {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Own process group: stop/timeout/Drop kill every descendant, and
+            // the terminal's Ctrl-C reaches plank alone (see refresh_for).
+            .process_group(0)
             .spawn()
             .map_err(|e| {
                 std::fs::remove_file(&path).ok();
@@ -448,6 +510,18 @@ impl BashJobs {
         Ok(id)
     }
 
+    /// Polls every job once, so timeouts are enforced even for jobs the model
+    /// never asks about again.
+    ///
+    /// The per-job timeout used to run only inside that job's own poll: a
+    /// `refresh_sec` job that was never revisited ran until session drop.
+    /// Every bash-family tool call sweeps the whole table first.
+    pub fn sweep(&mut self) {
+        for job in &mut self.jobs {
+            job.poll();
+        }
+    }
+
     fn find(&self, id: i64, pid: u32) -> Option<usize> {
         self.jobs
             .iter()
@@ -466,16 +540,8 @@ impl BashJobs {
         remove_if_done: bool,
     ) -> String {
         let job = &mut self.jobs[idx];
-        if stop && job.running {
-            let _ = job.child.kill();
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while job.running && Instant::now() < deadline {
-                job.poll();
-                if !job.running {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
+        if stop {
+            job.terminate();
         }
         if wait || stop {
             job.refresh_for(refresh_sec);
@@ -585,6 +651,7 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
         .sandbox
         .should_sandbox(cmd)
         .then(|| once_policy.as_ref().unwrap_or(&ctx.sandbox));
+    ctx.bash.sweep();
     if let Err(err) = ctx.bash.start(&ctx.cwd.clone(), cmd, timeout, sandbox) {
         return format!("Tool error: bash failed to start: {err}\n");
     }
@@ -602,6 +669,7 @@ pub fn tool_bash_status_or_stop(ctx: &mut ToolContext, call: &ToolCall, stop: bo
         i64::from(u32::MAX),
     ))
     .unwrap_or(0);
+    ctx.bash.sweep();
     let Some(idx) = ctx.bash.find(job_id, pid) else {
         return format!("Tool error: bash job not found: job={job_id} pid={pid}\n");
     };
@@ -739,6 +807,9 @@ pub fn run_immediate(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        // Own group so an interrupt kills pipelines and backgrounded
+        // grandchildren, not just the shell.
+        .process_group(0)
         .spawn()
         .map_err(|e| format!("failed to start: {e}"))?;
 
@@ -776,8 +847,7 @@ pub fn run_immediate(
         }
         if sink.tick() {
             interrupted = true;
-            let _ = child.kill();
-            break child.wait().ok();
+            break kill_process_group(&mut child);
         }
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -1064,6 +1134,108 @@ mod tests {
         .unwrap();
         assert!(out.interrupted);
         assert!(start.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Extracts the first all-digit line from an observation: the pid a test
+    /// command echoed with `$!`.
+    fn echoed_pid(obs: &str) -> libc::pid_t {
+        obs.lines()
+            .find_map(|l| l.trim().parse::<libc::pid_t>().ok())
+            .unwrap_or_else(|| panic!("no pid line in: {obs}"))
+    }
+
+    /// Waits up to two seconds for `pid` to disappear (kill(pid, 0) fails).
+    fn wait_gone(pid: libc::pid_t) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn stopping_a_job_kills_its_grandchildren() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(
+            &mut ctx,
+            &test_call(
+                "bash",
+                &[
+                    ("command", "sleep 30 & echo $!; wait"),
+                    ("refresh_sec", "1"),
+                ],
+            ),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+        let grandchild = echoed_pid(&out);
+        assert_eq!(unsafe { libc::kill(grandchild, 0) }, 0, "sleep not running");
+
+        let out = tool_bash_status_or_stop(
+            &mut ctx,
+            &test_call("bash_stop", &[("job", "1"), ("refresh_sec", "1")]),
+            true,
+        );
+        assert!(out.contains("status=done"), "got: {out}");
+        assert!(
+            wait_gone(grandchild),
+            "sleep {grandchild} outlived bash_stop"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_unpolled_timed_out_job_is_swept_by_the_next_bash_call() {
+        let (mut ctx, dir) = test_ctx();
+        let out = tool_bash(
+            &mut ctx,
+            &test_call(
+                "bash",
+                &[
+                    ("command", "sleep 30 & echo $!; wait"),
+                    ("timeout_sec", "2"),
+                    ("refresh_sec", "1"),
+                ],
+            ),
+        );
+        assert!(out.contains("status=running"), "got: {out}");
+        let grandchild = echoed_pid(&out);
+        std::thread::sleep(Duration::from_millis(1500));
+        // Never poll job 1 again; an unrelated bash call must reap it.
+        let other = tool_bash(&mut ctx, &test_call("bash", &[("command", "echo other")]));
+        assert!(other.contains("status=done"), "got: {other}");
+        let stale = &ctx.bash.jobs[0];
+        assert_eq!(stale.id, 1);
+        assert!(!stale.running, "timed-out job still marked running");
+        assert!(stale.timed_out);
+        assert!(
+            wait_gone(grandchild),
+            "sleep {grandchild} outlived the timeout"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn interrupting_an_immediate_command_kills_its_grandchildren() {
+        // Give the shell a few ticks to echo the pid before interrupting.
+        let mut polls = 0;
+        let out = run_immediate(
+            std::path::Path::new("/tmp"),
+            "sleep 30 & echo $!; wait",
+            &mut InterruptOnly(|| {
+                polls += 1;
+                polls > 8
+            }),
+        )
+        .unwrap();
+        assert!(out.interrupted);
+        let grandchild = echoed_pid(&out.stdout);
+        assert!(
+            wait_gone(grandchild),
+            "sleep {grandchild} outlived the interrupt"
+        );
     }
 
     #[test]

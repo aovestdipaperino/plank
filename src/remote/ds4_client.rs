@@ -41,6 +41,38 @@ use crate::remote::proto::{
 /// Monotonic per-turn id source, so a `DELETE` cancel targets the right stream.
 static TURN_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Header carrying the stable per-engine client id (see [`new_client_id`]).
+/// Mirrors `crate::serve::CLIENT_ID_HEADER`, spelled here in wire case.
+const CLIENT_ID_HEADER: &str = "X-Plank-Client-Id";
+
+/// Mints a random client id: 16 bytes from the OS CSPRNG as 32 hex chars. The
+/// id is generated once per [`RemoteDs4Engine`] and sent on every request so a
+/// shared-engine server keeps exactly one host session per client, no matter
+/// how many turns run (each turn still has its own `turn-N` cancel id). Falls
+/// back to time + pid + a counter should `/dev/urandom` be unavailable, so the
+/// id is never a constant that two clients could collide on.
+fn new_client_id() -> String {
+    use std::fmt::Write as _;
+    use std::io::Read as _;
+    let mut bytes = [0u8; 16];
+    let ok = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .is_ok();
+    if !ok {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0u128, |d| d.as_nanos());
+        let mix = t
+            ^ (u128::from(std::process::id()) << 64)
+            ^ u128::from(TURN_SEQ.fetch_add(1, Ordering::Relaxed)) << 96;
+        bytes = mix.to_le_bytes();
+    }
+    bytes.iter().fold(String::with_capacity(32), |mut out, b| {
+        let _ = write!(out, "{b:02x}");
+        out
+    })
+}
+
 /// HTTP+SSE client engine talking to a `plank serve` host.
 #[derive(Debug)]
 pub struct RemoteDs4Engine {
@@ -48,6 +80,9 @@ pub struct RemoteDs4Engine {
     base: String,
     /// Optional bearer token sent as `Authorization: Bearer …`.
     token: Option<String>,
+    /// Stable random id for this engine instance, sent as `X-Plank-Client-Id`
+    /// so the server keys its host session by client rather than by turn.
+    client_id: String,
     /// Cached model name from `/info`.
     model_name: String,
     /// Cached context size from `/info`.
@@ -91,6 +126,7 @@ impl RemoteDs4Engine {
         Ok(Self {
             base,
             token,
+            client_id: new_client_id(),
             model_name: info.model_name,
             ctx_size: info.ctx_size,
             token_cache: RefCell::new(HashMap::new()),
@@ -120,7 +156,10 @@ impl RemoteDs4Engine {
             .timeout_recv_response(Some(std::time::Duration::from_mins(2)))
             .build()
             .into();
-        let mut req = agent.post(&url).header("Content-Type", "application/json");
+        let mut req = agent
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header(CLIENT_ID_HEADER, &self.client_id);
         if let Some(t) = &self.token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
@@ -180,9 +219,12 @@ impl RemoteDs4Engine {
     /// Best-effort cancel of an in-flight turn.
     fn cancel(&self, session_id: &str) {
         let url = format!("{}/generate/{session_id}", self.base);
+        // The server namespaces cancel ids by client id, so the DELETE must
+        // carry the same header the `/generate` did.
+        let req = ureq::delete(&url).header(CLIENT_ID_HEADER, &self.client_id);
         let req = match &self.token {
-            Some(t) => ureq::delete(&url).header("Authorization", &format!("Bearer {t}")),
-            None => ureq::delete(&url),
+            Some(t) => req.header("Authorization", &format!("Bearer {t}")),
+            None => req,
         };
         // Fire and forget: a failed cancel is not fatal (the dropped connection
         // already signals abandonment to a well-behaved server).
@@ -326,6 +368,15 @@ pub const SUGGESTED_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_ids_are_hex_and_distinct() {
+        let a = new_client_id();
+        let b = new_client_id();
+        assert_eq!(a.len(), 32);
+        assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+    }
 
     #[test]
     fn hash_is_stable_and_distinguishes() {

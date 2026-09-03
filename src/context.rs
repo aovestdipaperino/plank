@@ -322,17 +322,21 @@ fn git_status() -> Option<String> {
         .args(["--no-optional-locks", "status", "--short"])
         .output()
         .ok()
-        .map(|output| {
-            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if s.len() > MAX_STATUS_CHARS {
-                format!(
-                    "{}\n... (truncated because it exceeds 2k characters. If you need more information, run \"git status\" using BashTool)",
-                    &s[..MAX_STATUS_CHARS]
-                )
-            } else {
-                s
-            }
-        })
+        .map(|output| clip_status(String::from_utf8_lossy(&output.stdout).trim().to_string()))
+}
+
+/// Clips a status listing to [`MAX_STATUS_CHARS`] bytes, on a char boundary
+/// (paths in `git status` are arbitrary UTF-8), with the C agent's notice.
+fn clip_status(s: String) -> String {
+    if s.len() > MAX_STATUS_CHARS {
+        let cut = crate::session::floor_char_boundary(&s, MAX_STATUS_CHARS);
+        format!(
+            "{}\n... (truncated because it exceeds 2k characters. If you need more information, run \"git status\" using BashTool)",
+            &s[..cut]
+        )
+    } else {
+        s
+    }
 }
 
 /// Gets recent commit log (last 5 commits, one-line format).
@@ -772,5 +776,21 @@ mod tests {
             "plugin agent missing from the model-visible roster: {roster}"
         );
         assert!(content.stable_context().contains("demo:scout"));
+    }
+
+    /// A status listing full of non-ASCII paths (or an em dash in a branch
+    /// name) must clip on a character boundary rather than panic.
+    #[test]
+    fn oversized_git_status_is_clipped_on_a_char_boundary() {
+        let short = "?? a.txt".to_owned();
+        assert_eq!(clip_status(short.clone()), short);
+        // Lay the cut inside a 3-byte em dash: MAX_STATUS_CHARS is not a
+        // multiple of 3 once the leading ASCII byte shifts the alignment.
+        let s = format!("x{}", "\u{2014}".repeat(MAX_STATUS_CHARS));
+        let out = clip_status(s);
+        assert!(out.contains("truncated because it exceeds 2k characters"));
+        let head = out.split('\n').next().unwrap();
+        assert!(head.len() <= MAX_STATUS_CHARS);
+        assert!(head.starts_with('x'));
     }
 }

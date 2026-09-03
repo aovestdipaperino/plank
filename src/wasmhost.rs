@@ -199,6 +199,28 @@ mod extism_host {
     /// the frame surface's business, and will be far tighter than this.
     pub(super) const CALL_TIMEOUT_MS: u64 = 1_000;
 
+    /// Largest linear memory a guest may grow to, in 64 KiB wasm pages.
+    ///
+    /// Without this, `memory.grow` is bounded only by the 4 GiB wasm32 address
+    /// space, which a guest can reach in well under the wall-clock timeout —
+    /// on a machine that is also holding a multi-gigabyte model resident. 1024
+    /// pages is 64 MiB: room for a 120x40 frame many times over, plus any
+    /// JSON payload a surface exchanges, and small enough that a runaway plugin
+    /// cannot evict the model. A guest that grows past it sees `memory.grow`
+    /// fail, and its allocator then traps, which [`WasmHost::call`] reports as
+    /// [`WasmError::Trap`]: a plugin fault, counted as a strike, never a host
+    /// abort.
+    pub(super) const MEMORY_MAX_PAGES: u32 = 1024;
+
+    /// The manifest every component is instantiated from: the module bytes
+    /// plus the two hard resource bounds, wall-clock and memory. One function
+    /// so a test can inspect exactly what the runtime is handed.
+    pub(super) fn manifest_for(wasm: &[u8]) -> extism::Manifest {
+        extism::Manifest::new([extism::Wasm::data(wasm.to_vec())])
+            .with_timeout(std::time::Duration::from_millis(CALL_TIMEOUT_MS))
+            .with_memory_max(MEMORY_MAX_PAGES)
+    }
+
     /// Per-surface soft budget, in milliseconds, keyed by export prefix.
     ///
     /// The wall-clock timeout above is one number for every call, which is
@@ -350,8 +372,7 @@ mod extism_host {
             wasm: &[u8],
             granted: &[&str],
         ) -> Result<LoadedPlugin, WasmError> {
-            let manifest = extism::Manifest::new([extism::Wasm::data(wasm.to_vec())])
-                .with_timeout(std::time::Duration::from_millis(CALL_TIMEOUT_MS));
+            let manifest = manifest_for(wasm);
 
             // Every host function is provided to every component, and each
             // checks its own grant when called. Providing only the granted ones
@@ -527,6 +548,20 @@ mod tests {
                 "{export} claims more than the outer bound"
             );
         }
+    }
+    /// The sandbox bounds memory as well as time: a manifest without a
+    /// memory cap lets a guest grow to 4 GiB next to a resident model.
+    #[cfg(feature = "plugins")]
+    #[test]
+    fn the_manifest_caps_memory_and_wall_clock() {
+        use super::extism_host::{CALL_TIMEOUT_MS, MEMORY_MAX_PAGES, manifest_for};
+        let m = manifest_for(b"\0asm");
+        assert_eq!(m.memory.max_pages, Some(MEMORY_MAX_PAGES));
+        assert_eq!(m.timeout_ms, Some(CALL_TIMEOUT_MS));
+        // Generous enough for a frame plus JSON, far too small to matter next
+        // to a model: somewhere between 16 MiB and 256 MiB.
+        let bytes = u64::from(MEMORY_MAX_PAGES) * 65_536;
+        assert!((16 << 20..=256 << 20).contains(&bytes), "{bytes} bytes");
     }
     use super::*;
 

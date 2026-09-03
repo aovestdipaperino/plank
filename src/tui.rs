@@ -1183,11 +1183,37 @@ pub fn selection_text_content(log: &OutputLog, width: u16, sel: ContentSelection
     let height = u16::try_from(ey - sy + 1).unwrap_or(u16::MAX);
     let rect = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(rect);
-    let scroll = u16::try_from(sy).unwrap_or(u16::MAX);
-    para.scroll((scroll, 0)).render(rect, &mut buf);
+    let (text, scroll) = window_rows(log.to_text(), width, sy);
+    Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+        .render(rect, &mut buf);
     // Rebase into the buffer's own space (its row 0 is content row `sy`).
     let local: Selection = ((sx, 0), (ex, height.saturating_sub(1)));
     selection_text(&buf, rect, local)
+}
+
+/// Drops the logical lines of `text` that wrap entirely above row `top`, and
+/// returns the remaining text with the residual row offset into its first
+/// line. `Paragraph::scroll` takes a `u16`, so handing it the absolute row
+/// froze the pane once a session passed 65 535 wrapped rows (and
+/// `area.height + scroll.y` overflowed inside ratatui); after windowing, the
+/// residual is below the first kept line's own row count.
+fn window_rows(mut text: Text<'static>, width: u16, top: usize) -> (Text<'static>, u16) {
+    let mut skipped_rows = 0usize;
+    let mut skip = 0usize;
+    for line in &text.lines {
+        let rows = Paragraph::new(Text::from(line.clone()))
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        if skipped_rows + rows > top {
+            break;
+        }
+        skipped_rows += rows;
+        skip += 1;
+    }
+    text.lines.drain(..skip);
+    (text, u16::try_from(top - skipped_rows).unwrap_or(u16::MAX))
 }
 
 /// Minimal standard base64 (with padding) for the OSC 52 payload.
@@ -1602,7 +1628,10 @@ fn frame_geom(
 ) -> FrameGeom {
     // The roster sits below everything, and it never shrinks the scrollback to
     // nothing: on a short terminal it gives its rows back to the output.
-    let roster_rows = roster_rows.min(area.height.saturating_sub(STATUS_ROWS + input_rows + 3));
+    let roster_rows = roster_rows.min(
+        area.height
+            .saturating_sub(STATUS_ROWS.saturating_add(input_rows).saturating_add(3)),
+    );
     if has_prompt {
         let r = Layout::vertical([
             Constraint::Min(1),              // output
@@ -3395,18 +3424,22 @@ fn render_output(
 ) {
     let text = log.to_text();
     let width = area.width.max(1);
-    let para = Paragraph::new(text).wrap(Wrap { trim: false });
     // Exact wrapped-line count from ratatui itself: a char-packing estimate
     // undercounts word-wrapped rows, leaving the view unable to reach the
     // bottom (e.g. the long `/context` report).
-    let total = para.line_count(width);
+    let total = Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
     let max_top = total.saturating_sub(area.height as usize);
     if view.follow || view.top >= max_top {
         view.top = max_top;
         view.follow = true;
     }
-    let scroll = u16::try_from(view.top).unwrap_or(u16::MAX);
-    let para = para.scroll((scroll, 0));
+    // Skip whole lines above the viewport so the `u16` scroll stays small.
+    let (text, scroll) = window_rows(text, width, view.top);
+    let para = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     frame.render_widget(para, area);
     view.jump_hint_rect = if view.follow {
         None
@@ -5193,6 +5226,47 @@ mod tests {
             selection_text_content(&log, 20, ((0, 0), (4, 99))),
             "hello\nworld\nfooba"
         );
+    }
+
+    /// Past 65 535 wrapped rows the absolute scroll no longer fits ratatui's
+    /// `u16`; windowing must leave a residual below the pane height and keep
+    /// the newest line in the rendered text.
+    #[test]
+    fn window_rows_keeps_residual_scroll_below_pane_height() {
+        let mut log = OutputLog::new();
+        for i in 0..35_000 {
+            // Each line word-wraps to three rows at width 10.
+            log.push_plain(format!("row {i:05} second half"));
+        }
+        let width = 10;
+        let height = 30usize;
+        let total = Paragraph::new(log.to_text())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        assert!(total >= 70_000, "log has {total} rows");
+        let top = total - height;
+        let (text, residual) = window_rows(log.to_text(), width, top);
+        assert!(usize::from(residual) < height, "residual {residual}");
+        let last = text.lines.last().map(ToString::to_string);
+        assert_eq!(last.as_deref(), Some("row 34999 second half"));
+        // The window starts exactly `top` rows in: the remaining rows minus the
+        // residual fill the pane.
+        let remaining = Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+        assert_eq!(remaining - usize::from(residual), height);
+
+        // Content selection past the `u16` boundary still reads the right rows.
+        let sel = selection_text_content(&log, width, ((0, top), (9, top)));
+        // 105 000 rows of 3 per line: row `top` opens line 34990.
+        assert!(sel.starts_with("row 34990"), "{sel:?}");
+    }
+
+    #[test]
+    fn frame_geom_survives_oversized_input_rows() {
+        let area = Rect::new(0, 0, 80, 24);
+        let geom = frame_geom(area, true, u16::MAX, 0, 3);
+        assert!(geom.output.height <= area.height);
     }
 
     #[test]

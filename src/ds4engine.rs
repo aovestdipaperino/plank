@@ -69,6 +69,21 @@ unsafe extern "C" fn cancel_cb(_ud: *mut std::os::raw::c_void) -> bool {
     INTERRUPT.with(|f| f.load(Ordering::SeqCst))
 }
 
+/// `DS4_SESSION_SYNC_INTERRUPTED` (ds4.h): `ds4_session_sync` stopped because
+/// the cancel callback fired, leaving a valid shorter KV prefix behind.
+const SYNC_INTERRUPTED: std::os::raw::c_int = 2;
+
+/// Error text for a sync that reports `SYNC_INTERRUPTED` without any caller
+/// having asked for it — a stale cancel flag, not a failed prefill. Only used
+/// on the fallthrough, so the message is specific rather than "failed".
+fn sync_error(rc: std::os::raw::c_int, err: &[i8], what: &str) -> EngineError {
+    if rc == SYNC_INTERRUPTED {
+        EngineError::new(format!("{what} interrupted"))
+    } else {
+        EngineError::new(cstr_message(err, &format!("{what} failed")))
+    }
+}
+
 /// Bridges ds4's C display-progress callback to the Rust event sink.
 ///
 /// `base` is the count of cached tokens reused from the live KV prefix. The C
@@ -991,10 +1006,7 @@ impl Engine for Ds4Session {
                     ..GenerationStats::default()
                 });
             }
-            return Err(EngineError::new(cstr_message(
-                &err,
-                "prompt processing failed",
-            )));
+            return Err(sync_error(sync_rc, &err, "prompt processing"));
         }
 
         // SAFETY: session valid.
@@ -1444,6 +1456,11 @@ impl Engine for Ds4Session {
     }
 
     fn warm_sync(&mut self, on_event: &mut dyn FnMut(EngineEvent)) -> Result<bool, EngineError> {
+        // An interrupted generation leaves the thread-local cancel flag raised
+        // and `cancel_cb` still registered on the session; `generate`/`prefill`
+        // reset it on entry but this path never did, so the sync below would
+        // stop at once with `SYNC_INTERRUPTED` and report a failed prefill.
+        INTERRUPT.with(|f| f.store(false, Ordering::SeqCst));
         let total = self.warm_tokens.len();
         let session = self.ensure_session()?;
         // SAFETY: session and tokens are valid.
@@ -1478,10 +1495,7 @@ impl Engine for Ds4Session {
         // SAFETY: session valid; clearing before ProgressCtx drops.
         unsafe { ffi::ds4_session_set_display_progress(session, None, std::ptr::null_mut()) };
         if rc != 0 {
-            return Err(EngineError::new(cstr_message(
-                &err,
-                "context prefill failed",
-            )));
+            return Err(sync_error(rc, &err, "context prefill"));
         }
         Ok(true)
     }
@@ -1664,10 +1678,7 @@ impl Ds4HostSession {
                     ..GenerationStats::default()
                 }));
             }
-            return Err(EngineError::new(cstr_message(
-                &err,
-                "prompt processing failed",
-            )));
+            return Err(sync_error(sync_rc, &err, "prompt processing"));
         }
 
         // SAFETY: session valid.

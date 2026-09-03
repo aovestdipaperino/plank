@@ -252,8 +252,10 @@ pub fn search(
 /// A snippet of `text` around `pos`, clipped to a readable width.
 fn snippet_of(text: &str, pos: usize, query_len: usize) -> String {
     const WIDTH: usize = 120;
-    let start = pos.saturating_sub(WIDTH / 3);
-    let end = (pos + query_len + WIDTH / 3).min(text.len());
+    // Byte offsets: the window edges can land inside a multibyte character,
+    // so each is snapped to a boundary before slicing.
+    let start = crate::session::floor_char_boundary(text, pos.saturating_sub(WIDTH / 3));
+    let end = crate::session::ceil_char_boundary(text, pos.saturating_add(query_len + WIDTH / 3));
     let mut out = String::new();
     if start > 0 {
         out.push('…');
@@ -498,5 +500,19 @@ mod tests {
         let all = search("needle", None, true, &root);
         assert_eq!(all.len(), 2);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The snippet window is measured in bytes; when either edge lands inside
+    /// an em dash or emoji it must snap to a character boundary, not panic.
+    #[test]
+    fn snippet_window_snaps_to_char_boundaries() {
+        let text = format!("{}needle{}", "\u{2014}".repeat(30), "\u{1F600}".repeat(30));
+        let pos = text.find("needle").unwrap();
+        let snippet = snippet_of(&text, pos, "needle".len());
+        assert!(snippet.contains("needle"));
+        assert!(snippet.starts_with('\u{2026}') && snippet.ends_with('\u{2026}'));
+        // And a hit at the very start or end of the text is fine too.
+        let _ = snippet_of(&text, 0, 3);
+        let _ = snippet_of(&text, text.len() - 4, 4);
     }
 }

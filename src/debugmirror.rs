@@ -147,9 +147,8 @@ pub fn set_session_id(id: &str) {
 /// Constrains a candidate window name to what the console's handshake
 /// accepts: 1-64 bytes of printable ASCII, no whitespace. Session slugs
 /// (`adjective-celebrity`) already satisfy this, but a renamed session takes
-/// arbitrary user text (`crate::session::validate_name` only forbids path
-/// separators and a few reserved characters), so this does not trust that
-/// blindly — a name that would not survive the handshake falls back rather
+/// user text (`crate::session::validate_name` now restricts it to ASCII
+/// alphanumerics and `-`, but this does not trust that blindly) — a name that would not survive the handshake falls back rather
 /// than silently losing the mirror.
 fn sanitize_name(raw: &str) -> String {
     name_with_suffix(raw, "")

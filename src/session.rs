@@ -1140,8 +1140,14 @@ impl SessionStore {
         let tmp = self
             .dir
             .join(format!("{id}{FILE_EXT}.tmp.{}", std::process::id()));
-        fs::write(&tmp, &body)?;
-        if let Err(e) = fs::rename(&tmp, &path) {
+        // Write, fsync, then rename: a rename over the old transcript is only
+        // atomic on disk once the new bytes are durable, otherwise a crash can
+        // leave the name pointing at an empty or half-written file.
+        let written = fs::File::create(&tmp).and_then(|mut f| {
+            f.write_all(&body)?;
+            f.sync_all()
+        });
+        if let Err(e) = written.and_then(|()| fs::rename(&tmp, &path)) {
             let _ = fs::remove_file(&tmp);
             return Err(e.into());
         }
@@ -1218,10 +1224,13 @@ impl SessionStore {
     pub fn delete(&self, prefix: impl AsRef<str>) -> Result<String> {
         let (id, path) = self.find(prefix.as_ref())?;
         fs::remove_file(&path)?;
-        // The payload sidecar is a cache keyed to the transcript; it goes too.
+        // The payload sidecar is a cache keyed to the transcript; it goes too,
+        // and so does every ladder rung — hundreds of MB each, and keyed to a
+        // transcript that no longer exists.
         let payload = self.payload_path(&id);
         let _ = fs::remove_file(&payload);
         let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
+        let _ = self.remove_rungs(&id);
         Ok(id)
     }
 
@@ -1247,6 +1256,7 @@ impl SessionStore {
             let payload = self.payload_path(&id);
             let _ = fs::remove_file(&payload);
             let _ = fs::remove_file(crate::kvmeta::sidecar_path(&payload));
+            let _ = self.remove_rungs(&id);
             gone += 1;
         }
         Ok(gone)
@@ -1299,6 +1309,13 @@ impl SessionStore {
             crate::kvmeta::sidecar_path(&old_payload),
             crate::kvmeta::sidecar_path(&new_payload),
         );
+        // Ladder rungs do not travel: they are process-scoped accelerators for
+        // the *live* session (see `remove_rungs`), keyed on the old id by the
+        // in-memory ladder that captured them. Under the new name nothing would
+        // ever look them up again, so they would only sit on disk until the GC
+        // found them. A live session renaming itself discards its ladder too
+        // (`Agent::rename_session`), so no reader is left pointing at them.
+        let _ = self.remove_rungs(&old);
         Ok(name)
     }
 
@@ -1543,11 +1560,13 @@ pub const NAME_MAX: usize = 64;
 
 /// Validates a user-supplied session name, returning it trimmed.
 ///
-/// A name becomes a filename in the store, so it is held to what is safe there:
-/// ASCII letters, digits, `-`, `_` and `.`, not starting with a `.` (which would
-/// hide the file and could spell `..`), within [`NAME_MAX`] bytes. Everything
-/// else — path separators above all — is rejected rather than sanitized, so the
-/// name the user sees is exactly the name they typed.
+/// A name becomes a filename in the store, so it is held to exactly the
+/// grammar [`is_valid_id_prefix`] lists by: ASCII letters, digits and `-`,
+/// within [`NAME_MAX`] bytes, and not starting with the reserved `sysprompt`
+/// stem that [`SessionStore::session_files`] skips. Anything looser would let
+/// a rename succeed and then hide the session from every listing. Everything
+/// else — path separators above all — is rejected rather than sanitized, so
+/// the name the user sees is exactly the name they typed.
 ///
 /// # Errors
 ///
@@ -1562,18 +1581,41 @@ pub fn validate_name(name: &str) -> std::result::Result<&str, String> {
             "a session name cannot exceed {NAME_MAX} characters"
         ));
     }
-    if name.starts_with('.') {
-        return Err("a session name cannot start with '.'".to_owned());
-    }
     if let Some(bad) = name
         .chars()
-        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-'))
     {
         return Err(format!(
-            "'{bad}' is not allowed in a session name (use letters, digits, '-', '_' or '.')"
+            "'{bad}' is not allowed in a session name (use letters, digits or '-')"
         ));
     }
+    if name.to_ascii_lowercase().starts_with(SYSPROMPT_STEM) {
+        return Err(format!(
+            "a session name cannot start with '{SYSPROMPT_STEM}' (reserved for cache files)"
+        ));
+    }
+    debug_assert!(is_valid_id_prefix(name));
     Ok(name)
+}
+
+/// The largest char boundary of `s` that is `<= i` (clamped to `s.len()`).
+#[must_use]
+pub(crate) fn floor_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// The smallest char boundary of `s` that is `>= i` (clamped to `s.len()`).
+#[must_use]
+pub(crate) fn ceil_char_boundary(s: &str, i: usize) -> usize {
+    let mut i = i.min(s.len());
+    while !s.is_char_boundary(i) {
+        i += 1;
+    }
+    i
 }
 
 /// Renders the session list the way the C agent prints `/sessions`.
@@ -2030,8 +2072,8 @@ fn read_head_meta(path: &Path) -> Option<(u64, u64, String)> {
         .take(4)
         .map(<[u8]>::len)
         .sum::<usize>();
-    let end = (offset + title_len).min(buf.len());
-    let title = String::from_utf8_lossy(&buf[offset..end]).into_owned();
+    let end = offset.checked_add(title_len)?.min(buf.len());
+    let title = String::from_utf8_lossy(buf.get(offset..end)?).into_owned();
     Some((created, used, title))
 }
 
@@ -2100,11 +2142,15 @@ fn corrupt() -> SessionError {
 /// Reads a length-prefixed record body of `len` bytes plus its terminating
 /// newline, advancing `pos`.
 fn take_body(data: &[u8], pos: &mut usize, len: usize) -> Result<String> {
-    if data.len() < *pos + len + 1 || data[*pos + len] != b'\n' {
+    // `len` came out of the file: a corrupt header can declare anything up to
+    // `usize::MAX`, so every step is checked rather than trusted to fit.
+    let end = pos.checked_add(len).ok_or_else(corrupt)?;
+    let body = data.get(*pos..end).ok_or_else(corrupt)?;
+    if data.get(end) != Some(&b'\n') {
         return Err(corrupt());
     }
-    let s = String::from_utf8(data[*pos..*pos + len].to_vec()).map_err(|_| corrupt())?;
-    *pos += len + 1;
+    let s = String::from_utf8(body.to_vec()).map_err(|_| corrupt())?;
+    *pos = end + 1;
     Ok(s)
 }
 
@@ -2330,20 +2376,24 @@ fn read_meta_tail(path: &Path) -> Option<(String, String)> {
 /// Parses a `meta` record starting at `at`, requiring it to end exactly at
 /// the end of `buf` (which is the end of the file).
 fn parse_meta_at(buf: &[u8], at: usize) -> Option<(String, String)> {
-    let rest = &buf[at..];
+    let rest = buf.get(at..)?;
     let nl = rest.iter().position(|&b| b == b'\n')?;
     let header = std::str::from_utf8(&rest[..nl]).ok()?;
     let (tag_len, last_len) = header.strip_prefix("meta ")?.split_once(' ')?;
     let (tag_len, last_len): (usize, usize) = (tag_len.parse().ok()?, last_len.parse().ok()?);
-    let body = &rest[nl + 1..];
-    if body.len() != tag_len + 1 + last_len + 1 {
+    let body = rest.get(nl + 1..)?;
+    // Both lengths are file-supplied; the sum is checked so a corrupt record
+    // cannot overflow into a bogus match or an out-of-range index.
+    let last_start = tag_len.checked_add(1)?;
+    let last_end = last_start.checked_add(last_len)?;
+    if body.len() != last_end.checked_add(1)? {
         return None;
     }
-    if body[tag_len] != b'\n' || body[tag_len + 1 + last_len] != b'\n' {
+    if *body.get(tag_len)? != b'\n' || *body.get(last_end)? != b'\n' {
         return None;
     }
-    let tag = std::str::from_utf8(&body[..tag_len]).ok()?.to_string();
-    let last = std::str::from_utf8(&body[tag_len + 1..tag_len + 1 + last_len])
+    let tag = std::str::from_utf8(body.get(..tag_len)?).ok()?.to_string();
+    let last = std::str::from_utf8(body.get(last_start..last_end)?)
         .ok()?
         .to_string();
     Some((tag, last))
@@ -2841,6 +2891,78 @@ hello\n";
         .unwrap();
         assert!(store.load("bad-session").is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A header that declares a body longer than the file — or `usize::MAX`,
+    /// which overflows naive `pos + len` arithmetic — is an error, not a panic.
+    /// `read_head_meta` runs on every file during `list()`, so one corrupt
+    /// file must not take the whole listing down.
+    #[test]
+    fn absurd_or_truncated_lengths_are_corrupt_not_panics() {
+        let dir = temp_dir("badlen");
+        let store = SessionStore::open(&dir).unwrap();
+        let huge = format!("{}", usize::MAX);
+        let files: [(&str, Vec<u8>); 5] = [
+            (
+                "huge-title.kv",
+                format!("plank-session 1\ncreated 1\nused 2\ntitle {huge}\nhi\n").into_bytes(),
+            ),
+            (
+                "huge-msg.kv",
+                format!("plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user {huge}\nhi\n")
+                    .into_bytes(),
+            ),
+            (
+                "huge-meta.kv",
+                format!(
+                    "plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 2\nhi\nmeta {huge} {huge}\nt\np\n"
+                )
+                .into_bytes(),
+            ),
+            (
+                "short-msg.kv",
+                b"plank-session 1\ncreated 1\nused 2\ntitle 2\nhi\nmsg user 50\nhi\n".to_vec(),
+            ),
+            (
+                "short-title.kv",
+                b"plank-session 1\ncreated 1\nused 2\ntitle 50\nhi".to_vec(),
+            ),
+        ];
+        for (name, bytes) in &files {
+            fs::write(dir.join(name), bytes).unwrap();
+        }
+        for (name, _) in &files {
+            let id = name.strip_suffix(".kv").unwrap();
+            assert!(store.load(id).is_err(), "{name} must fail to load");
+            // Must not panic; a declared length past the header window is a
+            // malformed header, not a clipped title.
+            let head = read_head_meta(&dir.join(name));
+            if *name == "huge-title.kv" {
+                assert!(head.is_none());
+            }
+        }
+        // Listing walks every header and must survive all of them.
+        let _ = store.list().unwrap();
+        assert!(parse_meta_at(b"meta 18446744073709551615 1\nx\ny\n", 0).is_none());
+        assert!(parse_meta_at(b"meta 3 18446744073709551615\nx\ny\n", 0).is_none());
+        let mut pos = 0;
+        assert!(take_body(b"hi\n", &mut pos, usize::MAX).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn char_boundary_helpers_snap_to_the_nearest_boundary() {
+        let s = "ab\u{2014}cd"; // em dash is 3 bytes at 2..5
+        assert_eq!(floor_char_boundary(s, 3), 2);
+        assert_eq!(floor_char_boundary(s, 4), 2);
+        assert_eq!(floor_char_boundary(s, 5), 5);
+        assert_eq!(floor_char_boundary(s, 99), s.len());
+        assert_eq!(ceil_char_boundary(s, 3), 5);
+        assert_eq!(ceil_char_boundary(s, 4), 5);
+        assert_eq!(ceil_char_boundary(s, 2), 2);
+        assert_eq!(ceil_char_boundary(s, 99), s.len());
+        assert_eq!(floor_char_boundary("", 5), 0);
+        assert_eq!(ceil_char_boundary("", 5), 0);
     }
 
     #[test]
@@ -3761,6 +3883,74 @@ hello\n";
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Rungs are keyed on the session id and looked up only by the live
+    /// ladder, so a rename leaves nothing under the old name and copies
+    /// nothing to the new one; `delete` and `delete_all` take them with the
+    /// transcript.
+    #[test]
+    fn rename_and_delete_take_the_ladder_rungs_with_the_session() {
+        let dir = temp_dir("store-rung-housekeeping");
+        let store = SessionStore::open(&dir).unwrap();
+        let plant_rungs = |id: &str| {
+            for i in [0, 7] {
+                let rung = store.rung_path(id, i);
+                fs::write(&rung, b"kv").unwrap();
+                fs::write(crate::kvmeta::sidecar_path(&rung), b"{}").unwrap();
+            }
+        };
+        let rung_files = |prefix: &str| -> Vec<String> {
+            let mut v: Vec<String> = fs::read_dir(&dir)
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                .filter(|n| n.starts_with(&format!("{prefix}.rung-")))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let mut s = Session::new();
+        s.id = "old-name".to_owned();
+        s.push(Message::user("hello"));
+        store.save(&mut s).unwrap();
+        plant_rungs("old-name");
+        assert_eq!(
+            rung_files("old-name").len(),
+            4,
+            "blobs and sidecars planted"
+        );
+
+        assert_eq!(store.rename("old-name", "new-name").unwrap(), "new-name");
+        assert!(
+            rung_files("old-name").is_empty(),
+            "no `<old>.rung-*` survives"
+        );
+        assert!(
+            rung_files("new-name").is_empty(),
+            "and none is minted under the new id"
+        );
+
+        // `delete` takes the rungs of the session it removes and no other's.
+        plant_rungs("new-name");
+        let mut other = Session::new();
+        other.id = "other".to_owned();
+        other.push(Message::user("hi"));
+        store.save(&mut other).unwrap();
+        plant_rungs("other");
+        store.delete("new-name").unwrap();
+        assert!(rung_files("new-name").is_empty());
+        assert_eq!(
+            rung_files("other").len(),
+            4,
+            "a sibling's rungs are untouched"
+        );
+
+        // `delete_all` sweeps the rest.
+        assert_eq!(store.delete_all().unwrap(), 1);
+        assert!(rung_files("other").is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rename_refuses_an_invalid_or_taken_name() {
         let dir = temp_dir("store-rename-refuse");
@@ -3784,6 +3974,29 @@ hello\n";
         assert!(store.rename("one", "has spaces").is_err());
         // Renaming to its own name is a no-op success, not an "already taken" error.
         assert_eq!(store.rename("one", "one").unwrap(), "one");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename the store accepts must produce a session the store still lists:
+    /// `validate_name` and `session_files` have to speak the same grammar.
+    #[test]
+    fn a_renamed_session_is_always_listed() {
+        let dir = temp_dir("store-rename-listed");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.id = "one".to_owned();
+        s.push(Message::user("a"));
+        store.save(&mut s).unwrap();
+
+        let name = store.rename("one", "Parser-Hunt-2").unwrap();
+        let listed: Vec<String> = store.list().unwrap().into_iter().map(|e| e.id).collect();
+        assert!(listed.contains(&name), "{name} missing from {listed:?}");
+
+        for bad in ["my_notes", "v1.2", "sysprompt-foo"] {
+            assert!(store.rename(&name, bad).is_err(), "{bad} must be refused");
+        }
+        let listed: Vec<String> = store.list().unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(listed, vec![name]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4015,7 +4228,11 @@ hello\n";
     #[test]
     fn session_names_are_validated_not_sanitized() {
         assert_eq!(validate_name("  parser-hunt  ").unwrap(), "parser-hunt");
-        assert_eq!(validate_name("v2.9_final").unwrap(), "v2.9_final");
+        assert_eq!(validate_name("v29-final").unwrap(), "v29-final");
+        // `_` and `.` are refused because `session_files` (via
+        // `is_valid_id_prefix`) never lists a stem containing them: a session
+        // renamed to such a name would save fine and then vanish from every
+        // listing. The two grammars have to agree.
         for bad in [
             "",
             "   ",
@@ -4025,6 +4242,10 @@ hello\n";
             "a\\b",
             "why not",
             "caf\u{e9}",
+            "my_notes",
+            "v1.2",
+            "sysprompt-foo",
+            "sysprompt",
         ] {
             assert!(validate_name(bad).is_err(), "{bad:?} must be refused");
         }
