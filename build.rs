@@ -40,6 +40,7 @@ fn main() {
     // which plank links for the web tool.
     let objs = [
         "ds4.o",
+        "ds4_image.o",
         "ds4_distributed.o",
         "ds4_tp.o",
         "ds4_ssd.o",
@@ -77,6 +78,8 @@ fn main() {
     for f in [
         "ds4.c",
         "ds4.h",
+        "ds4_image.c",
+        "ds4_image.h",
         "ds4_metal.m",
         "ds4_ssd.c",
         "ds4_distributed.c",

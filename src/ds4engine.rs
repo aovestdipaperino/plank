@@ -154,6 +154,9 @@ impl Ds4Model {
         let opts = ffi::Ds4EngineOptions {
             model_path: c_path.as_ptr(),
             mtp_path: as_ptr(&c_mtp),
+            // Vision stays off until plank wires `--vision`; a null path keeps
+            // the engine text-only, exactly as the C does without the flag.
+            vision_path: std::ptr::null(),
             backend,
             n_threads,
             context_size: ctx_size,
@@ -180,6 +183,9 @@ impl Ds4Model {
             glm_mtp_timing: false,
             dspark: tuning.dspark,
             dspark_strict: tuning.dspark_strict,
+            // Keep the C's default: greedily verified draft commits, not exact
+            // stochastic p/q acceptance.
+            dspark_exact_sampling: false,
             dspark_confidence_threshold_set: tuning.dspark_confidence.is_some(),
             cuda_tensor_parallel: false,
             ssd_streaming: tuning.ssd_streaming,
@@ -555,98 +561,6 @@ impl ModelHandle for Ds4Model {
     fn count_tokens(&self, text: &str) -> i32 {
         Ds4Model::count_tokens(self, text)
     }
-}
-
-/// Whether to take the greedy-chain path on this machine.
-///
-/// The chain trades a per-token host round-trip for a device ring and one
-/// shared-event wait per token. That is a win where the round-trip dominates —
-/// upstream measured +1.75% on an M3 Ultra — but a loss where it does not:
-/// measured on an M5 Max it is ~1.3% *slower*, losing all three interleaved
-/// pairs (37.0/38.0/38.2 chained against 38.0/38.4/38.3 classic). So it is
-/// enabled everywhere except M5, which is also where the fork gates its other
-/// Metal decode work (`ds4_gpu_device_is_pre_m5_apple_silicon`).
-///
-/// `PLANK_GREEDY_CHAIN=1` forces it on anyway, which is how to re-measure the
-/// M5 verdict after a kernel change; the engine's own
-/// `DS4_DISABLE_GREEDY_CHAIN=1` still turns it off everywhere.
-fn chain_wanted() -> bool {
-    if std::env::var_os("PLANK_GREEDY_CHAIN").is_some_and(|v| v != "0") {
-        return true;
-    }
-    // SAFETY: reads a device name captured at Metal init; no arguments.
-    unsafe { ffi::ds4_gpu_device_is_m5_apple_silicon() == 0 }
-}
-
-/// Per-token state for a [`ffi::ds4_session_eval_chain_greedy`] burst.
-///
-/// The chain runs a whole run of argmax tokens inside one C call, so
-/// everything the serial decode step touches once per token has to be
-/// reachable from [`chain_on_token`] instead of from the loop body.
-struct ChainCtx<'a> {
-    model: &'a Ds4Model,
-    on_event: &'a mut dyn FnMut(EngineEvent),
-    interrupt: &'a dyn Fn() -> bool,
-    recovery: Option<&'a mut crate::engine::ThinkToolRecovery>,
-    utf8: &'a mut crate::engine::Utf8Stream,
-    reply_text: &'a mut String,
-    reply_tokens: &'a mut Vec<i32>,
-    generated: &'a mut i32,
-    steady_mark: &'a mut Option<(std::time::Instant, i32)>,
-    start: std::time::Instant,
-    eos: i32,
-    /// Set when the burst was stopped by EOS rather than by exhausting it.
-    hit_eos: bool,
-    /// Set when the burst was stopped by the caller's interrupt.
-    interrupted: bool,
-}
-
-/// Accepts one chained token, or stops the burst.
-///
-/// Returning false discards the token: the C leaves it out of the session
-/// checkpoint, so this must decline *before* recording anything, keeping
-/// `reply_tokens` and the KV cache in step.
-unsafe extern "C" fn chain_on_token(
-    ud: *mut std::os::raw::c_void,
-    token: std::os::raw::c_int,
-) -> bool {
-    // SAFETY: `ud` is the `ChainCtx` the burst was started with, borrowed
-    // exclusively for the duration of the synchronous C call.
-    let ctx = unsafe { &mut *ud.cast::<ChainCtx>() };
-    if (ctx.interrupt)() {
-        INTERRUPT.with(|f| f.store(true, Ordering::SeqCst));
-        ctx.interrupted = true;
-        return false;
-    }
-    if token == ctx.eos {
-        ctx.hit_eos = true;
-        return false;
-    }
-    // Recovery is judged on the reply *without* this token, which is the same
-    // point in the stream as the serial path's post-commit check: everything
-    // before it is committed, this one is not. Stopping here hands the outer
-    // loop a consistent state to inject into, and `should_recover` leaves its
-    // scan cursor alone when it returns true, so the outer call re-fires.
-    if let Some(rec) = ctx.recovery.as_deref_mut()
-        && rec.should_recover(ctx.reply_text)
-    {
-        return false;
-    }
-    let text = ctx.utf8.push(ctx.model.token_bytes(token));
-    ctx.reply_tokens.push(token);
-    // Feeds the status bar's expert-routing glyph; see `crate::experts`.
-    crate::status::note_routed_token(token);
-    if !text.is_empty() {
-        ctx.reply_text.push_str(&text);
-        (ctx.on_event)(EngineEvent::Text(text));
-    }
-    *ctx.generated += 1;
-    if ctx.steady_mark.is_none()
-        && ctx.start.elapsed().as_secs_f64() >= crate::engine::STEADY_WARMUP_SECS
-    {
-        *ctx.steady_mark = Some((std::time::Instant::now(), *ctx.generated));
-    }
-    true
 }
 
 /// Loaded ds4 session: one live FFI session (its private KV suffix + cursor)
@@ -1133,18 +1047,6 @@ impl Engine for Ds4Session {
         };
         let speculative = draft_block > 1;
         let mut spec = crate::engine::SpecStats::default();
-        // Greedy chain decode keeps the next token id on-device and encodes
-        // ahead of the host, so a run of argmax tokens pays no per-token sync,
-        // logits readback or CPU argmax. Correct only when the pass samples
-        // argmax anyway — the same temperature gate speculation uses, since
-        // `greedy()` flipping inside a DSML stanza is a no-op at this
-        // temperature. The C declines any session it cannot reproduce
-        // bit-identically, which includes every session holding a `--dspark`
-        // support model: the two paths are mutually exclusive.
-        let chain = opts.temperature <= 0.0 && !speculative && chain_wanted() && {
-            // SAFETY: session valid and prefilled by the sync above.
-            unsafe { ffi::ds4_session_chain_greedy_supported(session) }
-        };
 
         while generated < max_tokens {
             if steady_mark.is_none()
@@ -1161,141 +1063,96 @@ impl Engine for Ds4Session {
             // is nothing a shorter cap would make the loop notice sooner. Two
             // tokens is the C's floor — a one-token burst never runs a GPU eval
             // and would leave the logits stale.
-            if chain && max_tokens - generated >= 2 {
-                let budget = max_tokens - generated;
-                let mut cctx = ChainCtx {
-                    model: &self.model,
-                    on_event: &mut *on_event,
-                    interrupt,
-                    recovery: recovery.as_mut(),
-                    utf8: &mut utf8,
-                    reply_text: &mut reply_text,
-                    reply_tokens: &mut reply_tokens,
-                    generated: &mut generated,
-                    steady_mark: &mut steady_mark,
-                    start,
-                    eos,
-                    hit_eos: false,
-                    interrupted: false,
-                };
-                // SAFETY: session valid; `cctx` outlives the synchronous call
-                // and is only aliased by `chain_on_token`; err buffer valid.
+            // Greedy (argmax) sampling while the caller says so — inside a
+            // DSML stanza — mirroring the C's `worker_sample_with_mode`.
+            let g = greedy();
+            // SAFETY: session valid; rng is a valid out-ptr.
+            let token = unsafe {
+                ffi::ds4_session_sample(
+                    session,
+                    if g { 0.0 } else { opts.temperature },
+                    0,
+                    if g { 1.0 } else { opts.top_p },
+                    if g { 0.0 } else { opts.min_p },
+                    &raw mut rng,
+                )
+            };
+            if token == eos {
+                break;
+            }
+            if speculative {
+                let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
+                let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
+                // SAFETY: session valid; `accepted` is a valid out-buffer of
+                // `cap` ints; err buffer valid.
                 let n = unsafe {
-                    ffi::ds4_session_eval_chain_greedy(
+                    ffi::ds4_session_eval_speculative_argmax(
                         session,
-                        budget,
-                        Some(chain_on_token),
-                        (&raw mut cctx).cast(),
-                        std::ptr::null_mut(),
+                        token,
+                        max_tokens - generated,
+                        eos,
+                        accepted.as_mut_ptr(),
+                        cap,
                         err.as_mut_ptr(),
                         err.len(),
                     )
                 };
-                // Reading the outcome out is also `cctx`'s last use, so its
-                // exclusive borrows of the loop state end here and the
-                // recovery block below can take them back.
-                let (hit_eos, was_interrupted) = (cctx.hit_eos, cctx.interrupted);
                 if n < 0 {
                     return Err(EngineError::new(cstr_message(&err, "decode failed")));
                 }
-                if hit_eos || was_interrupted {
+                // Nothing committed — not even the sampled token — so there is
+                // no progress to make and looping again would spin forever.
+                if n == 0 {
                     break;
                 }
-                // Otherwise the burst either ran the budget out or stopped at a
-                // recovery point; fall through to the injection check below.
-            } else {
-                // Greedy (argmax) sampling while the caller says so — inside a
-                // DSML stanza — mirroring the C's `worker_sample_with_mode`.
-                let g = greedy();
-                // SAFETY: session valid; rng is a valid out-ptr.
-                let token = unsafe {
-                    ffi::ds4_session_sample(
-                        session,
-                        if g { 0.0 } else { opts.temperature },
-                        0,
-                        if g { 1.0 } else { opts.top_p },
-                        if g { 0.0 } else { opts.min_p },
-                        &raw mut rng,
-                    )
-                };
-                if token == eos {
-                    break;
-                }
-                if speculative {
-                    let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
-                    let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
-                    // SAFETY: session valid; `accepted` is a valid out-buffer of
-                    // `cap` ints; err buffer valid.
-                    let n = unsafe {
-                        ffi::ds4_session_eval_speculative_argmax(
-                            session,
-                            token,
-                            max_tokens - generated,
-                            eos,
-                            accepted.as_mut_ptr(),
-                            cap,
-                            err.as_mut_ptr(),
-                            err.len(),
-                        )
-                    };
-                    if n < 0 {
-                        return Err(EngineError::new(cstr_message(&err, "decode failed")));
-                    }
-                    // Nothing committed — not even the sampled token — so there is
-                    // no progress to make and looping again would spin forever.
-                    if n == 0 {
+                // `n` is positive here: negative returned above, zero broke.
+                let run = &accepted[..usize::try_from(n).unwrap_or(0).min(accepted.len())];
+                // Counted before the EOS scan below: the step drafted and
+                // verified regardless of whether its run ends the generation,
+                // and dropping the last step would flatter the acceptance rate
+                // of every turn that stops inside a run.
+                spec.steps = spec.steps.saturating_add(1);
+                spec.committed = spec.committed.saturating_add(n);
+                spec.drafted = spec.drafted.saturating_add(draft_block);
+                on_event(EngineEvent::Spec(spec));
+                let mut hit_eos = false;
+                for &t in run {
+                    if t == eos {
+                        hit_eos = true;
                         break;
                     }
-                    // `n` is positive here: negative returned above, zero broke.
-                    let run = &accepted[..usize::try_from(n).unwrap_or(0).min(accepted.len())];
-                    // Counted before the EOS scan below: the step drafted and
-                    // verified regardless of whether its run ends the generation,
-                    // and dropping the last step would flatter the acceptance rate
-                    // of every turn that stops inside a run.
-                    spec.steps = spec.steps.saturating_add(1);
-                    spec.committed = spec.committed.saturating_add(n);
-                    spec.drafted = spec.drafted.saturating_add(draft_block);
-                    on_event(EngineEvent::Spec(spec));
-                    let mut hit_eos = false;
-                    for &t in run {
-                        if t == eos {
-                            hit_eos = true;
-                            break;
-                        }
-                        let text = utf8.push(self.model.token_bytes(t));
-                        reply_tokens.push(t);
-                        // Feeds the status bar's expert-routing glyph; see `crate::experts`.
-                        crate::status::note_routed_token(t);
-                        if !text.is_empty() {
-                            reply_text.push_str(&text);
-                            on_event(EngineEvent::Text(text));
-                        }
-                        generated += 1;
-                        if generated >= max_tokens {
-                            break;
-                        }
-                    }
-                    if hit_eos {
-                        break;
-                    }
-                } else {
-                    // SAFETY: session valid; err buffer valid.
-                    let eval_rc = unsafe {
-                        ffi::ds4_session_eval(session, token, err.as_mut_ptr(), err.len())
-                    };
-                    if eval_rc != 0 {
-                        return Err(EngineError::new(cstr_message(&err, "decode failed")));
-                    }
-                    let text = utf8.push(self.model.token_bytes(token));
-                    reply_tokens.push(token);
+                    let text = utf8.push(self.model.token_bytes(t));
+                    reply_tokens.push(t);
                     // Feeds the status bar's expert-routing glyph; see `crate::experts`.
-                    crate::status::note_routed_token(token);
+                    crate::status::note_routed_token(t);
                     if !text.is_empty() {
                         reply_text.push_str(&text);
                         on_event(EngineEvent::Text(text));
                     }
                     generated += 1;
+                    if generated >= max_tokens {
+                        break;
+                    }
                 }
+                if hit_eos {
+                    break;
+                }
+            } else {
+                // SAFETY: session valid; err buffer valid.
+                let eval_rc =
+                    unsafe { ffi::ds4_session_eval(session, token, err.as_mut_ptr(), err.len()) };
+                if eval_rc != 0 {
+                    return Err(EngineError::new(cstr_message(&err, "decode failed")));
+                }
+                let text = utf8.push(self.model.token_bytes(token));
+                reply_tokens.push(token);
+                // Feeds the status bar's expert-routing glyph; see `crate::experts`.
+                crate::status::note_routed_token(token);
+                if !text.is_empty() {
+                    reply_text.push_str(&text);
+                    on_event(EngineEvent::Text(text));
+                }
+                generated += 1;
             }
 
             // Live recovery for a tool call opened inside an unclosed

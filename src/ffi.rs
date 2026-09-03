@@ -157,6 +157,8 @@ impl Default for Ds4TpOptions {
 pub struct Ds4EngineOptions {
     pub model_path: *const c_char,
     pub mtp_path: *const c_char,
+    /// Vision-encoder GGUF path; `NULL` keeps the engine text-only.
+    pub vision_path: *const c_char,
     pub backend: Ds4Backend,
     pub n_threads: c_int,
     pub context_size: c_int,
@@ -183,6 +185,8 @@ pub struct Ds4EngineOptions {
     pub dspark: bool,
     /// Load `DSpark` support but keep target-only decode.
     pub dspark_strict: bool,
+    /// Exact stochastic p/q acceptance instead of greedy-verified commits.
+    pub dspark_exact_sampling: bool,
     /// Whether `dspark_confidence_threshold` was set explicitly.
     pub dspark_confidence_threshold_set: bool,
     pub cuda_tensor_parallel: bool,
@@ -297,42 +301,6 @@ unsafe extern "C" {
     pub fn ds4_session_eval(
         s: *mut Ds4Session,
         token: c_int,
-        err: *mut c_char,
-        errlen: usize,
-    ) -> c_int;
-    /// Whether this session can take the Metal greedy-chain decode path.
-    ///
-    /// The C declines for anything the chain cannot reproduce bit-identically:
-    /// a non-Metal backend, GLM, distributed/TP, SSD streaming, quality mode,
-    /// directional steering, a CPU-routed layer — and, notably, **any loaded
-    /// support model**, so `--dspark` and the chain are mutually exclusive.
-    /// Must be called on a prefilled session: it also requires a valid
-    /// checkpoint.
-    /// Non-zero when the Metal device is an Apple M5. Reads the device name
-    /// captured at Metal init, so it is only meaningful once a model is loaded.
-    pub fn ds4_gpu_device_is_m5_apple_silicon() -> c_int;
-    pub fn ds4_session_chain_greedy_supported(s: *const Ds4Session) -> bool;
-    /// Decodes a burst of argmax tokens with the next id kept on-device,
-    /// removing the per-token host round-trip (sync + logits readback + CPU
-    /// argmax) that [`ds4_session_eval`] pays.
-    ///
-    /// The seed is this session's current argmax — the caller does not sample
-    /// it. `on_token` receives the seed first, then every chained id in order;
-    /// returning `false` stops the burst *without* committing that token, so
-    /// EOS and interrupt are both expressed that way. Only approved tokens
-    /// enter the session checkpoint.
-    ///
-    /// Returns the number of approved tokens, or -1 with `err` set. `max_tokens`
-    /// must be at least 2 — a one-token burst never runs a GPU eval and would
-    /// leave the logits stale. When `completed` comes back false the burst
-    /// stopped early and the session's logits are stale; when true they hold
-    /// the logits after the last approved token, as after `ds4_session_eval`.
-    pub fn ds4_session_eval_chain_greedy(
-        s: *mut Ds4Session,
-        max_tokens: c_int,
-        on_token: Option<unsafe extern "C" fn(*mut c_void, c_int) -> bool>,
-        on_token_ctx: *mut c_void,
-        completed: *mut bool,
         err: *mut c_char,
         errlen: usize,
     ) -> c_int;
@@ -459,7 +427,26 @@ mod tests {
 
     #[test]
     fn engine_options_size_matches_the_c_layout() {
-        assert_eq!(size_of::<Ds4EngineOptions>(), 272, "struct size");
+        assert_eq!(size_of::<Ds4EngineOptions>(), 280, "struct size");
+    }
+
+    /// The two fields the vision bump inserted mid-struct.
+    ///
+    /// Both are called out separately from the runs below because each one
+    /// *shifts* everything after it: `vision_path` slides every later field by
+    /// 8 bytes, and `dspark_exact_sampling` slides the flag tail by one. A
+    /// silent mismatch here would hand the engine garbage rather than fail to
+    /// compile, so they get their own assertions.
+    #[test]
+    fn engine_options_vision_bump_fields_match_the_c_layout() {
+        assert_offsets(&[
+            ("vision_path", offset_of!(Ds4EngineOptions, vision_path), 16),
+            (
+                "dspark_exact_sampling",
+                offset_of!(Ds4EngineOptions, dspark_exact_sampling),
+                118,
+            ),
+        ]);
     }
 
     /// The scalars and pointers ahead of the option flags.
@@ -468,78 +455,78 @@ mod tests {
         assert_offsets(&[
             ("model_path", offset_of!(Ds4EngineOptions, model_path), 0),
             ("mtp_path", offset_of!(Ds4EngineOptions, mtp_path), 8),
-            ("backend", offset_of!(Ds4EngineOptions, backend), 16),
-            ("n_threads", offset_of!(Ds4EngineOptions, n_threads), 20),
+            ("backend", offset_of!(Ds4EngineOptions, backend), 24),
+            ("n_threads", offset_of!(Ds4EngineOptions, n_threads), 28),
             (
                 "context_size",
                 offset_of!(Ds4EngineOptions, context_size),
-                24,
+                32,
             ),
             (
                 "prefill_chunk",
                 offset_of!(Ds4EngineOptions, prefill_chunk),
-                28,
+                36,
             ),
             (
                 "mtp_draft_tokens",
                 offset_of!(Ds4EngineOptions, mtp_draft_tokens),
-                32,
+                40,
             ),
-            ("mtp_margin", offset_of!(Ds4EngineOptions, mtp_margin), 36),
+            ("mtp_margin", offset_of!(Ds4EngineOptions, mtp_margin), 44),
             (
                 "dspark_confidence_threshold",
                 offset_of!(Ds4EngineOptions, dspark_confidence_threshold),
-                40,
+                48,
             ),
             (
                 "directional_steering_file",
                 offset_of!(Ds4EngineOptions, directional_steering_file),
-                48,
+                56,
             ),
             (
                 "expert_profile_path",
                 offset_of!(Ds4EngineOptions, expert_profile_path),
-                56,
+                64,
             ),
             (
                 "directional_steering_attn",
                 offset_of!(Ds4EngineOptions, directional_steering_attn),
-                64,
+                72,
             ),
             (
                 "directional_steering_ffn",
                 offset_of!(Ds4EngineOptions, directional_steering_ffn),
-                68,
+                76,
             ),
             (
                 "power_percent",
                 offset_of!(Ds4EngineOptions, power_percent),
-                72,
+                80,
             ),
             (
                 "ssd_streaming_cache_experts",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cache_experts),
-                76,
+                84,
             ),
             (
                 "ssd_streaming_cache_bytes",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cache_bytes),
-                80,
+                88,
             ),
             (
                 "ssd_streaming_full_layers",
                 offset_of!(Ds4EngineOptions, ssd_streaming_full_layers),
-                88,
+                96,
             ),
             (
                 "ssd_streaming_preload_experts",
                 offset_of!(Ds4EngineOptions, ssd_streaming_preload_experts),
-                92,
+                100,
             ),
             (
                 "simulate_used_memory_bytes",
                 offset_of!(Ds4EngineOptions, simulate_used_memory_bytes),
-                96,
+                104,
             ),
         ]);
     }
@@ -553,98 +540,98 @@ mod tests {
             (
                 "warm_weights",
                 offset_of!(Ds4EngineOptions, warm_weights),
-                104,
+                112,
             ),
-            ("quality", offset_of!(Ds4EngineOptions, quality), 105),
-            ("glm_mtp", offset_of!(Ds4EngineOptions, glm_mtp), 106),
+            ("quality", offset_of!(Ds4EngineOptions, quality), 113),
+            ("glm_mtp", offset_of!(Ds4EngineOptions, glm_mtp), 114),
             (
                 "glm_mtp_timing",
                 offset_of!(Ds4EngineOptions, glm_mtp_timing),
-                107,
+                115,
             ),
-            ("dspark", offset_of!(Ds4EngineOptions, dspark), 108),
+            ("dspark", offset_of!(Ds4EngineOptions, dspark), 116),
             (
                 "dspark_strict",
                 offset_of!(Ds4EngineOptions, dspark_strict),
-                109,
+                117,
             ),
             (
                 "dspark_confidence_threshold_set",
                 offset_of!(Ds4EngineOptions, dspark_confidence_threshold_set),
-                110,
+                119,
             ),
             (
                 "cuda_tensor_parallel",
                 offset_of!(Ds4EngineOptions, cuda_tensor_parallel),
-                111,
+                120,
             ),
             (
                 "ssd_streaming",
                 offset_of!(Ds4EngineOptions, ssd_streaming),
-                112,
+                121,
             ),
             (
                 "ssd_streaming_cold",
                 offset_of!(Ds4EngineOptions, ssd_streaming_cold),
-                113,
+                122,
             ),
             (
                 "ssd_streaming_full_layers_set",
                 offset_of!(Ds4EngineOptions, ssd_streaming_full_layers_set),
-                114,
+                123,
             ),
             (
                 "inspect_only",
                 offset_of!(Ds4EngineOptions, inspect_only),
-                115,
+                124,
             ),
             (
                 "placement_ctx_hint",
                 offset_of!(Ds4EngineOptions, placement_ctx_hint),
-                116,
+                128,
             ),
             (
                 "placement_session_count_hint",
                 offset_of!(Ds4EngineOptions, placement_session_count_hint),
-                120,
+                132,
             ),
             (
                 "share_session_prefill_workspace",
                 offset_of!(Ds4EngineOptions, share_session_prefill_workspace),
-                124,
+                136,
             ),
             (
                 "first_token_test",
                 offset_of!(Ds4EngineOptions, first_token_test),
-                125,
+                137,
             ),
             (
                 "metal_graph_test",
                 offset_of!(Ds4EngineOptions, metal_graph_test),
-                126,
+                138,
             ),
-            ("load_slice", offset_of!(Ds4EngineOptions, load_slice), 127),
+            ("load_slice", offset_of!(Ds4EngineOptions, load_slice), 139),
             (
                 "load_layer_start",
                 offset_of!(Ds4EngineOptions, load_layer_start),
-                128,
+                140,
             ),
             (
                 "load_layer_end",
                 offset_of!(Ds4EngineOptions, load_layer_end),
-                132,
+                144,
             ),
             (
                 "load_output",
                 offset_of!(Ds4EngineOptions, load_output),
-                136,
+                148,
             ),
             (
                 "distributed",
                 offset_of!(Ds4EngineOptions, distributed),
-                144,
+                152,
             ),
-            ("tp", offset_of!(Ds4EngineOptions, tp), 208),
+            ("tp", offset_of!(Ds4EngineOptions, tp), 216),
         ]);
     }
 }
