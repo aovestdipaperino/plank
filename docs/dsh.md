@@ -357,7 +357,7 @@ is the one thing in dsh that is free to adopt.
 ### Why plank should care specifically
 
 plank already has the analogous rule one layer down, in KV caching
-(`docs/KV-CACHING.md`): a blob's embedded signature is the sole trust input, the sidecar
+(`docs/KV-CACHE.md`): a blob's embedded signature is the sole trust input, the sidecar
 is advisory, and a stale checkpoint is rebuilt rather than trusted. The session-log
 invariant is the same discipline applied to text instead of tensors, and plank has more
 reasons to want it than dsh does, because plank has more ways to re-enter a transcript:
@@ -895,7 +895,7 @@ byte-identical before and after a rating is recorded.
 **Changes.**
 
 - Write the rule into `docs/ARCHITECTURE.md` as a named invariant, phrased as dsh phrases
-  it and cross-referenced to the KV analogue in `docs/KV-CACHING.md`: model-visible
+  it and cross-referenced to the KV analogue in `docs/KV-CACHE.md`: model-visible
   content must be reconstructible from the session log, because `/fork`, `/clone`,
   `/rollback`, `/checkpoint`, `/branch`, `/resume` and `/repro` all replay it, and because
   a replayed transcript that differs from the recorded one produces a KV prefix that

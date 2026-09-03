@@ -911,5 +911,5 @@ ABI break, since adding a surface is additive.
 ## See also
 
 - `docs/ARCHITECTURE.md` — the layers this plugs into
-- `docs/KV-CACHE.md` — why `tool` plugins must resolve before prompt fingerprinting
+- `docs/KV-CACHE.md` — the KV cache rationale and mechanics, including why `tool` plugins must resolve before prompt fingerprinting
 - `FINDINGS.md` — parity and tooling gotchas

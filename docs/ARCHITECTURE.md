@@ -26,7 +26,7 @@ for wire formats and prompt text.
   `/rollback`, `/checkpoint`, `/branch`, `/resume` and `/repro` all replay the
   transcript, and a replayed transcript that differs from the recorded one
   produces a KV prefix that silently disagrees with the blob on disk. This is
-  the text-level analogue of the KV discipline in `docs/KV-CACHING.md` (a
+  the text-level analogue of the KV discipline in `docs/KV-CACHE.md` (a
   blob's embedded signature is the sole trust input): the same rule applied to
   text instead of tensors. Where content is injected at request-assembly time,
   log the *rendered* text as a system-role transcript entry at the moment it
@@ -275,7 +275,7 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   later rewrite) and restores the deepest usable one immediately
   before a compaction pass mutates the transcript (`restore_rung_below`), so
   the engine extends forward from the rung instead of rebuilding. See
-  `docs/KV-CACHING.md` and `docs/KV-CACHE.md` for the full mechanics.
+  `docs/KV-CACHE.md` for the rationale and the full mechanics.
 
 ### Plugins (`plugins.rs`, `claudeplugin.rs`)
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
@@ -495,7 +495,7 @@ is parsed from the very arguments the settings seed.
 ## Data flows worth understanding
 
 ### System-prompt KV cache
-See **`docs/KV-CACHING.md`** for why this subsystem is shaped the way it is, and **`docs/KV-CACHE.md`** for the full mechanics — tiers, fingerprints, the
+See **`docs/KV-CACHE.md`** for why this subsystem is shaped the way it is and for the full mechanics — tiers, fingerprints, the
 warm walk, the on-disk format, forks, and GC. In outline, on startup the agent
 warms the cache before the first turn:
 
@@ -557,7 +557,7 @@ pass. Rungs live on disk beside the session
 (`<id>.rung-<n>.kv_raw`), trusted only by the signature embedded in the blob
 — never by filename — and are discarded whenever the session they describe
 is replaced or rewritten (`/new`, `/clear`, `/switch`, `/resume`, full
-compaction, exit). See `docs/KV-CACHING.md`/`docs/KV-CACHE.md` for the full
+compaction, exit). See `docs/KV-CACHE.md` for the rationale and the full
 mechanics, and `FINDINGS.md` for the gotchas that made this hard to get right.
 
 `/switch` and `/resume` try to restore the payload; on a fingerprint match the

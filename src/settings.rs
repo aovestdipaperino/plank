@@ -62,7 +62,7 @@
 //!   startup.
 //! - `tools.recall`, `tools.fanout`, `tools.runCode`, `git.signCommits` — these
 //!   feed the system prompt text, which is built once per session and then
-//!   KV-cached (see `docs/KV-CACHING.md`); applying a change live would silently
+//!   KV-cached (see `docs/KV-CACHE.md`); applying a change live would silently
 //!   invalidate a cache the model's prefill is relying on to be exactly what it
 //!   was before.
 //!
