@@ -984,6 +984,22 @@ instead of rebuilding from zero. Several things about it were not obvious:
   compile-time path (dev builds) → `../share/plank/metal` next to the
   executable (bottles ship the kernels there). Keep any new bundled-asset
   lookup on the same pattern.
+- **`set_metal_source_env` must list every entry in the C `required_sources`
+  table.** The C engine (`ds4_metal.m`, `ds4_gpu_full_source`) treats all 23
+  `.metal` files as mandatory: if even one env var is unset and the file
+  isn't found on its fallback search paths (`metal/<file>` and
+  `./metal/<file>` relative to CWD — which only work from the submodule
+  root), it prints "Metal source X not found" and aborts with "metal backend
+  unavailable", surfacing in Rust as the misleading "failed to open model".
+  The GLM 5.3 and vision kernels (`glm53_bf16`, `glm53_vision`,
+  `deepseek4_vision`, `glm53_kda`) landed in the antirez/main sync and
+  must be added to the `KERNELS` array in `set_metal_source_env` — the C
+  table is the source of truth, so re-diff it after any submodule bump.
+  Compounding the silence: `StderrLineReplacer` (active on a TTY during
+  model load) repaints the C engine's diagnostic lines in place and clears
+  the row on drop, so the real "not found" message never reaches the user —
+  only the Rust-side "failed to open model" does. Redirect stderr to a file
+  (the replacer returns `None` when fd 2 isn't a TTY) to see the C error.
 - **The default quant needs ~82 GB resident**, hence the hard 96 GB RAM
   guard before any download or model load (`src/main.rs`).
 - **Download resume trap:** a `.part` file already matching the full

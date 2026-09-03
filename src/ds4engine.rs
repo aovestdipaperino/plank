@@ -1907,9 +1907,20 @@ impl Drop for Ds4TokensGuard {
 /// build, unless the caller already set the overrides. Without this the loader
 /// only searches the current directory and aborts.
 fn set_metal_source_env() {
-    const KERNELS: [(&str, &str); 19] = [
+    const KERNELS: [(&str, &str); 23] = [
+        // Keep this in lockstep with the C `required_sources` table in
+        // `ds4_metal.m` (`ds4_gpu_full_source`): every entry there is
+        // mandatory, so a kernel shipped upstream but not listed here aborts
+        // startup with "metal backend unavailable". The GLM 5.3 and vision
+        // kernels landed in the antirez/main sync and must be pointed at
+        // explicitly, since the C engine's fallback search paths (relative
+        // `metal/...` and `./metal/...`) only work from the submodule root.
         ("DS4_METAL_FLASH_ATTN_SOURCE", "flash_attn.metal"),
         ("DS4_METAL_DENSE_SOURCE", "dense.metal"),
+        ("DS4_METAL_GLM53_BF16_SOURCE", "glm53_bf16.metal"),
+        ("DS4_METAL_GLM53_VISION_SOURCE", "glm53_vision.metal"),
+        ("DS4_METAL_DEEPSEEK4_VISION_SOURCE", "deepseek4_vision.metal"),
+        ("DS4_METAL_GLM53_KDA_SOURCE", "glm53_kda.metal"),
         ("DS4_METAL_MOE_SOURCE", "moe.metal"),
         ("DS4_METAL_DSV4_HC_SOURCE", "dsv4_hc.metal"),
         ("DS4_METAL_UNARY_SOURCE", "unary.metal"),
