@@ -160,6 +160,21 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
 {
   "type": "function",
   "function": {
+    "name": "view_image",
+    "description": "Open a local PNG or JPEG as a visual observation.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string"}
+      },
+      "required": ["path"]
+    }
+  }
+}
+
+{
+  "type": "function",
+  "function": {
     "name": "more",
     "description": "Continue the previous read-like output.",
     "parameters": {

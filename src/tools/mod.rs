@@ -357,6 +357,7 @@ pub fn dispatch(call: &ToolCall, ctx: &mut ToolContext) -> ToolResult {
         "EnterPlanMode" => tool_enter_plan_mode(ctx),
         "ExitPlanMode" => tool_exit_plan_mode(ctx, call),
         "read" => files::tool_read(ctx, call),
+        "view_image" => tool_view_image(call),
         "more" => files::tool_more(ctx, call),
         "write" => files::tool_write(ctx, call),
         "list" => files::tool_list(ctx, call),
@@ -678,6 +679,27 @@ pub fn parse_bool_default(s: Option<&str>, def: bool) -> bool {
 /// (`tools.recall`); when off, the tool is not advertised and dispatches as
 /// unknown. Results are bounded through the M4 spill policy like any other
 /// tool result.
+/// `view_image` — parity stub for the C's visual-observation tool.
+///
+/// The C advertises `view_image` unconditionally in the frozen tool table
+/// (`agent_tools_prompt_intro`, between `read` and `more`), but only serves it
+/// when the engine was given a vision encoder via `ds4-agent --vision FILE`.
+/// plank passes a null `vision_path`, so it is always in the second case and
+/// returns the C's own refusal byte-for-byte. This is parity behavior, not a
+/// placeholder: an agent run without `--vision` gets exactly this string.
+///
+/// Wiring the real path means giving the engine a `vision_path`, encoding the
+/// image with `ds4_engine_vision_encode_file`, and appending it through
+/// `ds4_chat_append_multimodal_message` — which also drags in the rule that
+/// image-conditioned KV must never reach the text-keyed disk cache.
+fn tool_view_image(call: &ToolCall) -> String {
+    let path = call.arg_value("path").unwrap_or("").trim();
+    if path.is_empty() {
+        return "Tool error: view_image requires path\n".to_string();
+    }
+    "Tool error: view_image requires ds4-agent --vision FILE\n".to_string()
+}
+
 fn tool_recall(ctx: &mut ToolContext, call: &ToolCall) -> String {
     use std::fmt::Write as _;
     if !crate::settings::active().tools.recall {
@@ -857,6 +879,27 @@ mod tests {
         let res = dispatch(&test_call("frobnicate", &[]), &mut ctx);
         assert!(res.is_error);
         assert_eq!(res.output, "Tool error: unknown tool: frobnicate\n");
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// `view_image` is advertised in the frozen prompt, so dispatch must route
+    /// it rather than answer "unknown tool" — and the refusal it gives without
+    /// a vision encoder is the C's string byte-for-byte, since that is exactly
+    /// what `ds4-agent` prints when run without `--vision`.
+    #[test]
+    fn view_image_is_routable_and_refuses_with_the_c_string() {
+        let (mut ctx, dir) = test_ctx();
+        let res = dispatch(
+            &test_call("view_image", &[("path", "/tmp/x.png")]),
+            &mut ctx,
+        );
+        assert_eq!(
+            res.output,
+            "Tool error: view_image requires ds4-agent --vision FILE\n"
+        );
+        // A missing path is refused before the encoder is even considered.
+        let res = dispatch(&test_call("view_image", &[]), &mut ctx);
+        assert_eq!(res.output, "Tool error: view_image requires path\n");
         std::fs::remove_dir_all(dir).ok();
     }
 
