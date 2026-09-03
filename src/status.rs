@@ -846,10 +846,22 @@ pub fn verb_phase(st: &Status) -> VerbPhase {
 /// Keep each operation on a single playful verb so the footer does not
 /// visually churn while progress updates stream in. The verb index is fixed
 /// for the turn; only the pool it indexes moves with the phase.
+///
+/// In the fun phase the seed has already been constrained to a multiple of
+/// [`FUN_ODDS`] by the roll in [`verb_phase`], so dividing that factor out
+/// before the modulo is what recovers a uniform spread across the pool —
+/// without it, `pool.len() == FUN_ODDS` would collapse every fun draw onto
+/// index 0.
 #[must_use]
 pub fn prefill_label(st: &Status) -> &'static str {
-    let pool = verbs_for(verb_phase(st));
-    pool[st.prefill_label as usize % pool.len()]
+    let phase = verb_phase(st);
+    let pool = verbs_for(phase);
+    let idx = if phase == VerbPhase::Fun {
+        (st.prefill_label / FUN_ODDS) as usize % pool.len()
+    } else {
+        st.prefill_label as usize % pool.len()
+    };
+    pool[idx]
 }
 
 /// Picks a stable random verb seed for a new turn, seeded from wall-clock.
@@ -2219,6 +2231,35 @@ mod tests {
         };
         assert_eq!(verb_phase(&st), VerbPhase::Fun);
         assert!(FUN_VERBS.contains(&prefill_label(&st)));
+    }
+
+    #[test]
+    fn fun_verbs_are_not_all_the_first_entry() {
+        // The fun-odds roll constrains the seed to a multiple of FUN_ODDS, and
+        // FUN_VERBS has FUN_ODDS entries, so a naive `seed % pool.len()` would
+        // collapse every fun draw onto index 0. Every multiple of FUN_ODDS must
+        // reach a distinct verb, and all of them must be reachable.
+        clear_tool_activity();
+        let drawn: std::collections::HashSet<_> = (0..FUN_VERBS.len())
+            .map(|k| {
+                #[allow(clippy::cast_possible_truncation)]
+                let k = k as u32;
+                let st = Status {
+                    state: WorkerState::Prefill,
+                    prefill_label: k * FUN_ODDS,
+                    ..Status::default()
+                };
+                assert_eq!(verb_phase(&st), VerbPhase::Fun);
+                prefill_label(&st)
+            })
+            .collect();
+        assert_eq!(
+            drawn.len(),
+            FUN_VERBS.len(),
+            "fun draws collapsed to {} distinct verb(s) instead of {}",
+            drawn.len(),
+            FUN_VERBS.len()
+        );
     }
 
     #[test]
