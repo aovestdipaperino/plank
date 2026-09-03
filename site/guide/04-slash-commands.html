@@ -255,6 +255,11 @@ pass; an argument steers what this one summary keeps</td>
 cache hit rate)</td>
 </tr>
 <tr>
+<td><code>/rate [+|-] [note]</code></td>
+<td>rate the last turn (thumbs up by default) with an optional note;
+works in the TUI and the plain REPL alike</td>
+</tr>
+<tr>
 <td><code>/remember [user] &lt;fact&gt;</code></td>
 <td>append a dated entry to project memory (or user memory with
 <code>user</code>)</td>
@@ -378,7 +383,10 @@ in the status bar</td>
 </tbody>
 </table>
 <p><code>/config</code> changes write to
-<code>./.plank/settings.json</code> and apply immediately. See <a
+<code>./.plank/settings.json</code> and apply immediately. In the TUI, a
+bare <code>/config</code> opens the form and
+<code>/config &lt;key&gt; &lt;value&gt;</code> sets and persists the
+value directly, the same as on the plain REPL. See <a
 href="08-configuration.html">Configuration</a>.</p>
 <h2 id="output-and-diagnostics">Output and diagnostics</h2>
 <table>

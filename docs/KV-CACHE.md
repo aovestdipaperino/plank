@@ -281,6 +281,15 @@ parent context from token zero rather than just the report. The stack is LIFO
 and pushes `None` rather than skipping, so a nested fork cannot pop the parent's
 snapshot.
 
+**Sidechains never write the live session's cache.** A `sidechain_depth`
+counter, raised by `/subagent` and the `agent` tool and read through
+`in_sidechain()`, gates `store_payload`, `save_payload_if_dirty`, rung anchoring
+and opportunistic micro-compaction: the sidechain's messages are about to be
+truncated back out, so a payload or rung captured over them would describe a
+prefix that no longer exists and miss forever. `end_subagent_fork` truncates the
+transcript to `fork_at` and then truncates the ladder past it
+(`KvLadder::truncate_to`), and every fork-end path goes through it.
+
 **Clean-room sidechains on an alternate engine.** When a definition names its
 own engine, the parent engine is never called, so there is nothing to snapshot
 (`snapshot_kv: false`). The parent transcript is stashed and only the framed
@@ -378,7 +387,14 @@ reach 2-3%). What *has* been measured live is the refusing path; see
   (`/new`, `/clear`, `/switch`, `/resume`, a full compaction, or a clean exit —
   `Agent::discard_ladder`, `SessionStore::remove_rungs`), and swept as a
   backstop by GC (below) for the case where none of those exit paths ran — a
-  crash, a `SIGKILL`, or a machine losing power mid-session.
+  crash, a `SIGKILL`, or a machine losing power mid-session. Transcript
+  edits that keep the session get the matching housekeeping: `rollback_to`
+  discards the ladder and marks the payload dirty; `fork_branch` truncates it
+  to the kept prefix (`KvLadder::truncate_to`, which drops every rung deeper
+  than the cut and hands them back for deletion); `SessionStore::delete`,
+  `delete_all` and `rename` remove `<id>.rung-N.kv_raw` along with the
+  session, and renaming the live session discards its in-memory ladder too,
+  since the rungs were keyed on the old id.
 - **GC treatment.** A rung gets its own role, `KvRole::Rung`, with a dedicated
   one-day TTL (`RUNG_BACKSTOP_SECS`) independent of `kvcache.ttlSessionDays` —
   a rung is worthless the instant its process is gone, unlike a saved session
@@ -390,7 +406,10 @@ reach 2-3%). What *has* been measured live is the refusing path; see
   session in the metadata graph: `plan_sweep`'s "has a surviving child" rule
   (Phase 1, item 3) would otherwise make the single most disposable blob in
   the cache the thing keeping the session payload — and the tier checkpoint
-  above it — alive.
+  above it — alive. The keep set the sweep is handed does include the live
+  session's rungs, each under the fingerprint of the transcript truncated to
+  that rung's depth (the same rule `select` looks them up by), so a running
+  session's ladder is never collected out from under it.
 
 - **The gate, and why it depends on context pressure.** An opportunistic pass
   is only taken when `compact::microcompact_is_worth_it(reclaimable,

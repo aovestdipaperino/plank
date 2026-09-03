@@ -327,6 +327,20 @@ turn the pass declines to fire, and then does so again every turn after,
 since the reclaimable total only grows. The decision and the restore must use
 the exact same selection call, made before either one touches the engine.
 
+The ladder also has to follow the transcript through every edit that is not a
+plain append, because a rung describing a prefix that no longer exists is worse
+than no rung: `wants_anchor` keeps reporting the depth as covered while `select`
+hands back a prefix that is gone. So rollback discards the ladder and marks the
+payload dirty; a fork keeps only the rungs at or below the kept prefix
+(`KvLadder::truncate_to`); a sub-agent sidechain (`/subagent`, the `agent` tool,
+tracked by `sidechain_depth` and `in_sidechain()`) never stores the payload,
+pushes a rung or micro-compacts, and `end_subagent_fork` truncates the rungs past
+`fork_at` when it folds the sidechain back out; deleting or renaming a session
+removes its `<id>.rung-N.kv_raw` blobs, and renaming the live one drops its
+in-memory ladder as well. On the retention side, the keep set handed to the sweep
+includes the live rungs, each fingerprinted over the transcript truncated to its
+own depth, which is the same rule the lookup uses.
+
 The decision itself is the last piece, and it is not a property of the ladder
 at all. Whether an opportunistic pass is worth its prefill cost is a question
 about *the value of context*, and that value is not constant: reclaiming a few

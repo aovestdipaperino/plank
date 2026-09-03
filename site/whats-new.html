@@ -138,6 +138,30 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>A whole-codebase review, and the fixes that came out of it,
+are on main and ship in the next release.</strong> The one you will feel
+first is that the sandbox now means what it says: <code>write</code> and
+<code>edit</code> are held to the same boundary as the shell, so a path
+outside the working directory, the temp roots and your
+<code>writablePaths</code> is refused with
+<code>Tool error: write path escapes workspace</code>, where before the
+model could route around the bash sandbox simply by choosing the file
+tool instead. A project's <code>.plank/sandbox.json</code> can now only
+tighten the policy, so a cloned repository cannot switch your sandbox
+off. <code>plank serve</code> got the same treatment: binding off
+loopback with no token now refuses to start unless you pass
+<code>--insecure</code> on the server side, bodies are capped at 16 MiB,
+idle connections time out, and shared-engine sessions are keyed per
+client so many turns from one laptop reuse one warm session. Underneath,
+every bash job, <code>!</code> command, MCP server and hook runs in its
+own process group and is killed as a tree, so a timed-out
+<code>sleep 600; echo ok</code> or a <code>cmd | tee</code> pipeline no
+longer outlives plank, and Ctrl-C or Esc on a running command actually
+reaches it and reports exit 143. And two slash commands the TUI had
+quietly left to the plain REPL now work in both:
+<code>/rate [+|-] [note]</code> is in the completion popup, and
+<code>/config &lt;key&gt; &lt;value&gt;</code> sets the value directly,
+opening the form only when you type a bare <code>/config</code>.</p>
 <p><strong>Every sub-agent gets a console window of its own.</strong>
 Delegating work to sub-agents made plank quieter and less legible at the
 same time: the parent told you it had handed off, and everything after

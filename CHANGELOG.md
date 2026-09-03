@@ -6,6 +6,89 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **`write` and `edit` now respect the sandbox.** The bash sandbox has always
+  confined model-initiated shell writes to the working directory, the temp
+  roots and any `writablePaths`, but the file tools were never asked the same
+  question, so a model could write anywhere on disk by choosing `write` instead
+  of `echo >`. Both tools now resolve their target through one choke point and
+  refuse anything outside those roots (plus `~/.plank` while that grant is
+  active) with `Tool error: write path escapes workspace: <path>`. The Seatbelt
+  profile and the check are built from the same list, so the two can no longer
+  drift. Reads stay uncontained by design. A project's `./.plank/sandbox.json`
+  can now only tighten the policy: its `"enabled": false`, `writablePaths` and
+  `excludedCommands` are ignored, so a cloned repository cannot widen the
+  sandbox of whoever opens it; relaxing it is the user-level file's job.
+- **`plank serve` refuses a token-less bind off loopback.** A server listening
+  on a non-loopback address with no `--token` hands the model to anyone who can
+  reach the port, so it now refuses to start unless `plank serve --insecure` is
+  passed explicitly. This is a server-side flag, distinct from the client's
+  `--insecure` that allows plaintext `http://` to a remote host. The server also
+  checks the bearer token in constant time before reading any body, answers a
+  `Content-Length` above 16 MiB with 413, and abandons a connection that sits
+  silent for 30 s mid-request.
+- **Plugins can no longer reach into `engine`, `worktree`, `tools` or
+  `pluginConfig`.** A plugin's `settings.json` is meant to sit below your own
+  settings, but for a key you never set it beat the built-in default, which let
+  a fetched plugin swap the model, redirect worktree symlinks or enable tools.
+  Those four sections are now dropped from the plugin layer with a warning.
+  Plugins in `~/.plank/plugins/dev/` now take precedence over same-named ones
+  fetched into `~/.plank/plugins/claude/`, so your own copy wins; project and
+  `--plugin-dir` plugins still outrank both. URL installs stage under
+  `~/.plank/.claude-staging`, outside every scan root, and skill and template
+  names containing `:` are rejected like agent names already were.
+- **Wasm plugins are quota-bound.** Linear memory is capped at 64 MiB per
+  plugin, and `state_set` refuses, before writing anything, a value over 1 MiB,
+  a key over 255 bytes, a 257th key, or a component store past 16 MiB.
+
+### Changed
+
+- **Child processes run in their own process group and are killed as a
+  tree.** Background bash jobs, immediate `!` commands, MCP servers and hooks
+  all spawn with their own group, and stopping or timing out any of them sends
+  SIGTERM to the group, waits briefly, then SIGKILLs and reaps. A `sleep 600;
+  echo ok` or a `cmd | tee` pipeline can no longer outlive its timeout, and a
+  hook's `timeout` now applies to compound commands too. Timed-out jobs are
+  swept at the top of every tool dispatch rather than only when the model
+  polls them. Because the children are no longer in the terminal's foreground
+  group, plank now delivers the interrupt itself: Ctrl-C in the REPL or Esc in
+  the TUI kills the running command's group and reports exit status 143, where
+  before the REPL reached the child only by accident and the TUI never did.
+- **Session names are restricted to what `/sessions` can list.** `/rename`
+  accepts ASCII letters, digits and `-`, and rejects names starting with
+  `sysprompt`, which is reserved for cache files. `_` and `.` used to pass
+  validation, but a session so named was silently unlistable.
+- **`/rate` and `/config <key> <value>` behave the same in the TUI as on the
+  plain REPL.** `/rate [+|-] [note]` now works in the TUI and appears in the
+  completion popup; `/config` with a key and value sets and persists the value
+  instead of opening the form, which opens only for a bare `/config`.
+
+### Fixed
+
+- **Transcript saves are durable and corrupt files no longer crash the
+  session list.** A save is now written, fsynced and renamed into place, and a
+  transcript with a corrupt length field is reported as corrupt instead of
+  panicking `/sessions`.
+- **Multibyte text no longer panics in `/search`, memory injection,
+  git-status clipping or the `recall` tool.** Every byte-window slice snaps to
+  a character boundary first.
+- **Interrupts reach sub-agents and never escalate by mistake.** Esc now stops
+  a running sub-agent or fan-out in the TUI; a consumed interrupt no longer
+  lets a later Ctrl-C escalate into a force quit; and a prefill after an
+  interrupted generation no longer fails on the engine's stale cancel flag.
+- **The KV ladder survives `/rollback`, `/fork`, `/rename` and sub-agent
+  sidechains.** Rollback discards the ladder, fork truncates it to the kept
+  prefix, sidechains never write the live session's payload or rungs, rename
+  and delete remove rung blobs, and the KV GC keeps the live session's rungs
+  instead of deleting them out from under it.
+- **A large streamed `write` no longer stalls the TUI.** DSML parameter parsing
+  is incremental and amortised linear, and the output pane scrolls correctly
+  past 65535 rows.
+- **`/plugins remove .` no longer deletes every dev plugin.** Uninstall
+  requires a bare valid plugin name and verifies the target's parent is a
+  plugin root.
+
 ## [3.5.5] - 2026-08-31
 
 ### Added

@@ -18,7 +18,7 @@ Sessions save automatically; `/save` forces it.
 /del <id>           # delete
 ```
 
-`/rename <name>` changes the name later saves use and leaves what is already on disk alone, so a session saved before the rename stays resumable under its old name and the next save is a copy rather than a move. Names are validated rather than quietly rewritten — letters, digits, `-`, `_` and `.` — and a name already taken on disk is confirmed with you before it is reused.
+`/rename <name>` changes the name later saves use and leaves what is already on disk alone, so a session saved before the rename stays resumable under its old name and the next save is a copy rather than a move. Names are validated rather than quietly rewritten: ASCII letters, digits and `-` only, and nothing starting with `sysprompt`, which is reserved for cache files. `_` and `.` used to be accepted, but a session so named never showed up in `/sessions`, so they are now refused up front. A name already taken on disk is confirmed with you before it is reused.
 
 `/strip <id>` drops a session's KV payload to reclaim disk. The transcript survives untouched, so the session still loads; it just re-prefills the conversation the next time you open it, and `/list` shows it as `stripped`.
 

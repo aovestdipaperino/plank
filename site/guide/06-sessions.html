@@ -155,10 +155,13 @@ from the first frame.</p>
 <p><code>/rename &lt;name&gt;</code> changes the name later saves use
 and leaves what is already on disk alone, so a session saved before the
 rename stays resumable under its old name and the next save is a copy
-rather than a move. Names are validated rather than quietly rewritten —
-letters, digits, <code>-</code>, <code>_</code> and <code>.</code> — and
-a name already taken on disk is confirmed with you before it is
-reused.</p>
+rather than a move. Names are validated rather than quietly rewritten:
+ASCII letters, digits and <code>-</code> only, and nothing starting with
+<code>sysprompt</code>, which is reserved for cache files.
+<code>_</code> and <code>.</code> used to be accepted, but a session so
+named never showed up in <code>/sessions</code>, so they are now refused
+up front. A name already taken on disk is confirmed with you before it
+is reused.</p>
 <p><code>/strip &lt;id&gt;</code> drops a session's KV payload to
 reclaim disk. The transcript survives untouched, so the session still
 loads; it just re-prefills the conversation the next time you open it,

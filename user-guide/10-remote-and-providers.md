@@ -72,6 +72,8 @@ The transport is synchronous, adds no async runtime, and streams tokens as they 
 
 Plain `http://` is allowed to localhost and refused elsewhere unless you pass `--insecure`. Keep a real deployment behind an SSH tunnel or a TLS reverse proxy.
 
+The server side has its own guard, and its own `--insecure`, which means something different. `plank serve --listen ADDR` on a non-loopback address with no `--token` refuses to start, because that hands the model to anyone who can reach the port; bind to `127.0.0.1`, pass a token, or pass `plank serve --insecure` to serve unauthenticated anyway. So the client flag waives TLS, the server flag waives authentication, and each is checked only by the side it belongs to. The server also caps a request body at 16 MiB and drops a connection that sits silent for 30 s mid-request.
+
 ## Shared engine
 
 ```sh
@@ -88,6 +90,8 @@ loads the weights once and serves many concurrent sessions from a single coopera
 | `--idle-reclaim-secs S` | snapshot an idle session's KV to disk and restore it on the next request |
 
 `/info` reports live-session and KV accounting.
+
+A host session belongs to a client, not to a turn. The client sends a stable `X-Plank-Client-Id` header, so many turns from one laptop reuse one warm session instead of attaching a new one each time; a session idle for 30 minutes is swept. An older client that does not send the header still works and is keyed per turn as before.
 
 ## Remote control
 

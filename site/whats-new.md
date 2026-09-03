@@ -7,6 +7,27 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**A whole-codebase review, and the fixes that came out of it, are on main
+and ship in the next release.** The one you will feel first is that the
+sandbox now means what it says: `write` and `edit` are held to the same
+boundary as the shell, so a path outside the working directory, the temp
+roots and your `writablePaths` is refused with `Tool error: write path
+escapes workspace`, where before the model could route around the bash
+sandbox simply by choosing the file tool instead. A project's
+`.plank/sandbox.json` can now only tighten the policy, so a cloned repository
+cannot switch your sandbox off. `plank serve` got the same treatment: binding
+off loopback with no token now refuses to start unless you pass `--insecure`
+on the server side, bodies are capped at 16 MiB, idle connections time out,
+and shared-engine sessions are keyed per client so many turns from one laptop
+reuse one warm session. Underneath, every bash job, `!` command, MCP server
+and hook runs in its own process group and is killed as a tree, so a timed-out
+`sleep 600; echo ok` or a `cmd | tee` pipeline no longer outlives plank, and
+Ctrl-C or Esc on a running command actually reaches it and reports exit 143.
+And two slash commands the TUI had quietly left to the plain REPL now work in
+both: `/rate [+|-] [note]` is in the completion popup, and
+`/config <key> <value>` sets the value directly, opening the form only when
+you type a bare `/config`.
+
 **Every sub-agent gets a console window of its own.** Delegating work to
 sub-agents made plank quieter and less legible at the same time: the parent
 told you it had handed off, and everything after that happened somewhere you

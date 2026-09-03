@@ -337,6 +337,15 @@ cleanly:
   `Ds4Session` per `session_id`, all sharing the one `SharedModel`. The SSE
   event mapping (`Prefill`/`Text`/`Done`) is unchanged — it is fed by the scheduler
   channel (§5) instead of a directly-owned session.
+  *As implemented*, the attach key is not the `session_id` after all: the client
+  mints a fresh `turn-N` per turn, so keying on it would give every turn a new
+  session. `plank serve` keys the `Ds4Session` by the stable `X-Plank-Client-Id`
+  header (falling back to `session_id` for older clients), keys cancels
+  `client:turn` so two clients' `turn-1` cannot cancel each other, and sweeps
+  entries idle for 30 minutes (`SESSION_IDLE_TTL`). The listener also checks the
+  bearer token in constant time before reading a body, caps bodies at 16 MiB,
+  times reads out at 30 s, and refuses a non-loopback bind without a token
+  unless `--insecure` is given.
 - **Local multi-session too.** The same `EngineHost` serves the in-process case
   (one plank process running several sessions — e.g. subagent sidechains, or a
   future `/switch`) without any network hop. REMOTE-CONTROL-DESIGN's "attach, don't

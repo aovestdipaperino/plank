@@ -20,6 +20,8 @@ You do not invoke tools directly; you ask for an outcome and the model chooses. 
 | `edit` | replace a region of a file, anchored on surrounding text |
 | `search` | search file contents |
 
+When the sandbox is on, `write` and `edit` are held to the same boundary as the shell: a path outside the workspace (the working directory, the system temp directories, any configured `writablePaths`, and `~/.plank` only while you have granted that) is refused with `Tool error: write path escapes workspace: <path>`. Reads are not contained.
+
 `edit` and an overwriting `write` render as **diff cards** in the TUI: an `Update(path)` header, an added/removed summary, and red/green `@@` hunks. A genuinely new file streams its contents dimmed as it is written, so you can watch it appear.
 
 ### Shell
@@ -31,6 +33,8 @@ You do not invoke tools directly; you ask for an outcome and the model chooses. 
 | `bash_stop` | stop a running job |
 
 Bash commands are **tracked jobs**, not blocking one-shot calls: each owns a process, reader threads, and an output file, so the model can start a long build, do something else, and check back. The first observation is head-biased so headers and early errors are visible; later ones are tail-biased so you see recent output rather than the top of a log.
+
+Every job runs in its own process group, and so do the commands you type with `!`. Stopping a job or hitting its timeout kills the whole tree, so a `sleep 600; echo ok` or a `cmd | tee` pipeline cannot outlive plank. A job that ran past its timeout is reaped by whatever tool call comes next, not only when the model polls it. Interrupting a running command (Ctrl-C in the REPL, Esc in the TUI) kills its group and reports exit status 143.
 
 ### Documents
 
@@ -93,7 +97,9 @@ Configure it in `~/.plank/sandbox.json`, overlaid by `./.plank/sandbox.json`:
 }
 ```
 
-Scalars come from the most specific file; lists concatenate. `excludedCommands` glob-matches the whole command line and skips the sandbox for it — a convenience escape hatch, **not a security boundary**.
+The project file can only tighten the policy. Its `"enabled": true` is honoured, but `"enabled": false`, `writablePaths` and `excludedCommands` in `./.plank/sandbox.json` are ignored, since a cloned repository must not be able to widen the sandbox of whoever opens it; anything that relaxes the sandbox goes in `~/.plank/sandbox.json`. `excludedCommands` glob-matches the whole command line and skips the sandbox for it — a convenience escape hatch, **not a security boundary**.
+
+The same roots contain the `write` and `edit` tools (see [Files](#files)), so a file the shell could not write, the model cannot write by another route either.
 
 Turn it off for a run with `--no-sandbox`, or permanently with `safety.sandbox: false`.
 

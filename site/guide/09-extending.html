@@ -300,7 +300,9 @@ interface</a>.</li>
 <p>Hooks run your shell commands (or inject static prompts) at lifecycle
 points. Configuration is JSON, merged from
 <code>~/.plank/hooks.json</code> then <code>./.plank/hooks.json</code>,
-with both lists running.</p>
+with both lists running. A hook runs in its own process group, so its
+<code>timeout</code> takes down a compound command and everything it
+forked, not just the shell.</p>
 <pre class="json"><code>{
   &quot;PreToolUse&quot;: [
     { &quot;matcher&quot;: &quot;bash|edit&quot;,
@@ -543,14 +545,21 @@ present the plank spelling wins and the shadowing is reported. A
 directory with no manifest at all but with recognizable components still
 loads, named after the directory it sits in.</p>
 <h3 id="activating-one">Activating one</h3>
-<p>Plugins are loaded from three places, in order:
-<code>~/.plank/plugins/dev/*</code> for ones you want everywhere,
+<p>Plugins are loaded from four places, in order:
+<code>~/.plank/plugins/claude/*</code> for ones fetched with
+<code>/install-claude-plugin</code>, <code>~/.plank/plugins/dev/*</code>
+for ones you wrote and want everywhere,
 <code>&lt;cwd&gt;/.plank/plugins/*</code> for ones that belong to a
 project, and each <code>--plugin-dir &lt;path&gt;</code> on the command
 line, which is repeatable and lasts only for that session. A later
-source shadows an earlier plugin of the same name, so a
+source shadows an earlier plugin of the same name, so your own
+<code>dev/</code> copy beats a fetched one of the same name, and a
 <code>--plugin-dir</code> copy is the natural way to try a change to a
-plugin you already have installed.</p>
+plugin you already have installed. URL installs are unpacked under
+<code>~/.plank/.claude-staging</code>, outside every scan root, so a
+half-finished download is never loaded as a plugin. Skill and template
+names may not contain <code>:</code>, since that is the
+<code>&lt;plugin&gt;:&lt;name&gt;</code> separator.</p>
 <p><code>/plugins</code> lists what loaded, where each one came from,
 what it contributes, and every warning raised along the way. Nothing
 about a bad plugin is fatal: a broken manifest or an unreadable
@@ -580,13 +589,18 @@ hook file in load order, then the project's
 directly above the built-in defaults, and below everything of yours:</p>
 <pre><code>defaults &lt; plugin &lt; ~/.plank/settings.json &lt; ./.plank/settings.json &lt; env &lt; CLI</code></pre>
 <p>Several plugins merge in load order, later winning. By construction a
-plugin can never override a setting you set yourself. The sharp edge is
-the key you did <em>not</em> set: a plugin that writes a
-<code>safety.*</code> key still beats the built-in default, so a plugin
-can, for instance, turn the bash sandbox off if you have never set it
-explicitly. plank warns at startup and in <code>/plugins</code> whenever
-a plugin's settings touch a <code>safety.*</code> key — that warning is
-worth reading. See <a href="08-configuration.html">Configuration</a>.</p>
+plugin can never override a setting you set yourself, and some sections
+it cannot set at all: anything under <code>engine</code>,
+<code>worktree</code>, <code>tools</code> or <code>pluginConfig</code>
+in a plugin's <code>settings.json</code> is dropped with a warning, so a
+plugin cannot swap the model, redirect worktree symlinks, or enable
+tools behind your back. The sharp edge is the key you did <em>not</em>
+set: a plugin that writes a <code>safety.*</code> key still beats the
+built-in default, so a plugin can, for instance, turn the bash sandbox
+off if you have never set it explicitly. plank warns at startup and in
+<code>/plugins</code> whenever a plugin's settings touch a
+<code>safety.*</code> key — that warning is worth reading. See <a
+href="08-configuration.html">Configuration</a>.</p>
 <h3 id="what-is-not-here-yet">What is not here yet</h3>
 <p>This release makes hand-placed plugin directories work, and nothing
 more. There is no installer, no marketplace, no dependency resolution,

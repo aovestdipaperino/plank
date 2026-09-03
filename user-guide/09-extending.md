@@ -125,7 +125,7 @@ Two consequences worth knowing:
 
 ## Hooks
 
-Hooks run your shell commands (or inject static prompts) at lifecycle points. Configuration is JSON, merged from `~/.plank/hooks.json` then `./.plank/hooks.json`, with both lists running.
+Hooks run your shell commands (or inject static prompts) at lifecycle points. Configuration is JSON, merged from `~/.plank/hooks.json` then `./.plank/hooks.json`, with both lists running. A hook runs in its own process group, so its `timeout` takes down a compound command and everything it forked, not just the shell.
 
 ```json
 {
@@ -275,7 +275,7 @@ Every part is optional; a directory with a manifest and one component is a plugi
 
 ### Activating one
 
-Plugins are loaded from three places, in order: `~/.plank/plugins/dev/*` for ones you want everywhere, `<cwd>/.plank/plugins/*` for ones that belong to a project, and each `--plugin-dir <path>` on the command line, which is repeatable and lasts only for that session. A later source shadows an earlier plugin of the same name, so a `--plugin-dir` copy is the natural way to try a change to a plugin you already have installed.
+Plugins are loaded from four places, in order: `~/.plank/plugins/claude/*` for ones fetched with `/install-claude-plugin`, `~/.plank/plugins/dev/*` for ones you wrote and want everywhere, `<cwd>/.plank/plugins/*` for ones that belong to a project, and each `--plugin-dir <path>` on the command line, which is repeatable and lasts only for that session. A later source shadows an earlier plugin of the same name, so your own `dev/` copy beats a fetched one of the same name, and a `--plugin-dir` copy is the natural way to try a change to a plugin you already have installed. URL installs are unpacked under `~/.plank/.claude-staging`, outside every scan root, so a half-finished download is never loaded as a plugin. Skill and template names may not contain `:`, since that is the `<plugin>:<name>` separator.
 
 `/plugins` lists what loaded, where each one came from, what it contributes, and every warning raised along the way. Nothing about a bad plugin is fatal: a broken manifest or an unreadable component demotes that one plugin, or just that one component, and the session continues.
 
@@ -295,7 +295,7 @@ A plugin's `settings.json` becomes a new precedence level directly above the bui
 defaults < plugin < ~/.plank/settings.json < ./.plank/settings.json < env < CLI
 ```
 
-Several plugins merge in load order, later winning. By construction a plugin can never override a setting you set yourself. The sharp edge is the key you did *not* set: a plugin that writes a `safety.*` key still beats the built-in default, so a plugin can, for instance, turn the bash sandbox off if you have never set it explicitly. plank warns at startup and in `/plugins` whenever a plugin's settings touch a `safety.*` key — that warning is worth reading. See [Configuration](08-configuration.md).
+Several plugins merge in load order, later winning. By construction a plugin can never override a setting you set yourself, and some sections it cannot set at all: anything under `engine`, `worktree`, `tools` or `pluginConfig` in a plugin's `settings.json` is dropped with a warning, so a plugin cannot swap the model, redirect worktree symlinks, or enable tools behind your back. The sharp edge is the key you did *not* set: a plugin that writes a `safety.*` key still beats the built-in default, so a plugin can, for instance, turn the bash sandbox off if you have never set it explicitly. plank warns at startup and in `/plugins` whenever a plugin's settings touch a `safety.*` key — that warning is worth reading. See [Configuration](08-configuration.md).
 
 ### What is not here yet
 

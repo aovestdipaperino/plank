@@ -41,7 +41,7 @@ Edit it in-session with `/config` (an interactive form) or one key at a time:
 /config ui.showThinking false
 ```
 
-Changes write `./.plank/settings.json` and apply immediately.
+Changes write `./.plank/settings.json` and apply immediately. The one-key form behaves the same in the TUI and in the plain REPL; only a bare `/config` opens the interactive form.
 
 ### `engine`
 

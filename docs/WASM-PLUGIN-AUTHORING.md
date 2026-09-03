@@ -216,6 +216,12 @@ Wired today: `log`, `print`, `state` (a per-component KV store — the only
 persistence most components need, and it needs no filesystem grant), `sound`,
 and `notify`.
 
+`state` has quotas, checked before anything touches the disk: 1 MiB per value,
+255-byte keys, 256 keys, 16 MiB in total per component. An over-quota
+`plank_state_set` returns an error that starts with your component id
+(`'<id>' state value for 'k' is N bytes, more than the ...-byte limit`) and
+stores nothing; the store is exactly as it was before the call.
+
 `notify(title, body)` fires a desktop notification. Your component id prefixes
 the title whether you like it or not — a notification that does not say which
 plugin produced it is one the user cannot act on or switch off — and both
@@ -326,6 +332,11 @@ This is not fuel metering: fuel meters guest instructions and needs wasmtime
 configuration Extism does not expose. A guest can still burn its whole budget
 inside one host call. What these do catch is the case that matters — a component
 ruining the frame rate.
+
+**Memory** is capped at 64 MiB of linear memory (1024 wasm pages, set in the
+manifest plank builds for you). Growing past it is a trap, and a trap is a
+strike: three and your component is disabled for the session. Keep frame
+buffers sized to the `w`/`h` you were handed rather than to a worst case.
 
 ## Rules that will bite you
 

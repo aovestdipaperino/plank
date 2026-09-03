@@ -41,6 +41,7 @@ See [Sessions](06-sessions.md).
 | `/context` | report context-window usage by category |
 | `/compact [instructions]` | compact the conversation now, rather than waiting for the automatic pass; an argument steers what this one summary keeps |
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
+| `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |
 
@@ -81,7 +82,7 @@ See [Extending plank](09-extending.md).
 | `/version` | the running version |
 | `/help` | full command and flag reference |
 
-`/config` changes write to `./.plank/settings.json` and apply immediately. See [Configuration](08-configuration.md).
+`/config` changes write to `./.plank/settings.json` and apply immediately. In the TUI, a bare `/config` opens the form and `/config <key> <value>` sets and persists the value directly, the same as on the plain REPL. See [Configuration](08-configuration.md).
 
 ## Output and diagnostics
 

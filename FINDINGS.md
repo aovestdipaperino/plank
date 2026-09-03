@@ -48,9 +48,17 @@ test` and review the diff before committing.
   with one, and an empty DSML block yields exactly
   `Tool error: empty tool call block\n` (`src/tools/mod.rs`,
   `dispatch_all`, mirroring `agent_execute_tool_calls`).
-- **Session identity is SHA-1(title bytes ‖ created_at as little-endian
-  u64).** Once assigned it never changes; listing ties break on ascending id;
-  only 40-hex-stem files are considered sessions (`src/session.rs`).
+- **Session identity is the filename stem, minted as a memorable
+  `adjective-celebrity` slug.** `SessionStore::mint_id` picks an unused slug
+  when a session starts (a short guid is appended on collision) and `load`
+  treats the filename as the identity; `session_identity_sha` (SHA-1 of title
+  bytes ‖ little-endian `created_at`) survives only for its own unit test and
+  no longer names anything. Legacy 40-hex ids still load by prefix, and
+  `display_id` shortens only those to 8 chars, so `&id[..8]` on a slug is a
+  bug. A session file is listed only if its stem satisfies
+  `is_valid_id_prefix` (1 to 80 ASCII alphanumerics or `-`), and
+  `validate_name` accepts exactly that grammar minus a leading `sysprompt`
+  (`src/session.rs`).
 - **The system-prompt reminder is pressure-based, not periodic.** It is
   re-injected only once the token-estimate distance since it was last seen
   exceeds 50,000 (`AGENT_SYSTEM_PROMPT_REMINDER_TOKENS` in the C,
@@ -1841,3 +1849,60 @@ instead of rebuilding from zero. Several things about it were not obvious:
   Ghostty rasterize the block ranges themselves and are exact, but a terminal
   that defers to the font draws tofu, so `logo::cell()` only hands octants to
   terminals known to draw them and takes `PLANK_LOGO_CELL` as an escape hatch.
+- **Byte-offset slicing of anything the user or the model wrote must snap to a
+  char boundary first.** A snippet window like `&text[pos - 40..pos + 40]` is
+  fine on ASCII and panics the moment an em dash or emoji sits inside the
+  window, and the same text reaches several unrelated slicers: the `recall`
+  tool's snippet, the `/search` snippet, memory injection's excerpt and the
+  git-status clip in session-start context. Each was fixed once, and the
+  shared answer is `floor_char_boundary`/`ceil_char_boundary` in
+  `src/session.rs` (`recall` in `src/tools/mod.rs` snaps inline). Before
+  slicing by a byte offset you did not get from `char_indices`, widen outward
+  to a boundary rather than inward, so the match itself is never cut.
+- **The two session-name grammars must agree, or a renamed session vanishes.**
+  `validate_name` decides what `/rename` will accept; `is_valid_id_prefix`
+  decides which files `list` even considers a session. A name the first
+  accepted and the second rejected (`v2.9_final`, once) was written to disk
+  and then never listed, never resumable, and not reported as an error
+  anywhere. `validate_name` now allows exactly ASCII alphanumerics and `-`
+  and carries a `debug_assert!(is_valid_id_prefix(name))`; keep the two in
+  lockstep if either grows (`src/session.rs`).
+- **A child in its own process group no longer hears the terminal's Ctrl-C.**
+  Bash jobs, immediate `!` commands, MCP servers and hooks spawn with
+  `process_group(0)` so `kill_process_group` (`src/tools/bash.rs`: SIGTERM,
+  500 ms grace, SIGKILL, `wait`) can take a whole `cmd | tee` pipeline down
+  instead of just the shell. The side effect is that SIGINT from the terminal
+  now reaches plank alone, so plank must forward the intent itself:
+  `refresh_for` polls `interrupt::pending()` and kills the job's group,
+  reporting exit status 143 (128 + SIGTERM) to the model. Previously a
+  plain-REPL Ctrl-C reached the child only by accident and the TUI never
+  signalled it at all.
+- **The engine's cancel flag outlives the generation that raised it.** The
+  thread-local `INTERRUPT` in `src/ds4engine.rs` and the C `cancel_cb`
+  registered on the session both stay set after an interrupted generation;
+  `generate`/`prefill` reset them on entry but `warm_sync` never did, so the
+  next sync stopped at once with rc 2 and was reported as a *failed* prefill.
+  `warm_sync` now clears the flag first, and rc 2
+  (`DS4_SESSION_SYNC_INTERRUPTED`) is rendered as "interrupted" at every sync
+  site, since it leaves a valid shorter KV prefix behind, not a broken one.
+- **DSML parameter scanning has to be incremental, or a large `write` payload
+  is quadratic on the UI thread.** The stream parser used to rescan the whole
+  buffered value for `</` on every appended byte. `crates/trace-stream/src/dsml.rs`
+  now resumes from a `param_scan_from` cursor, advanced past every `</` that
+  `close_tag_partial` proves can never complete a close tag, which makes the
+  scan amortised linear; byte-split close tags are covered by tests, and a
+  test-only `param_scan_work` counter asserts the bound.
+- **`Paragraph::scroll` is a `u16`, so a long log cannot be scrolled by
+  absolute row.** Past 65,535 wrapped rows the offset silently wraps (an
+  earlier version overflowed inside ratatui on `area.height + scroll.y`).
+  `window_rows` in `src/tui.rs` pre-skips whole logical lines above the
+  viewport and hands ratatui only the small remainder, so the `u16` stays
+  below the pane height; `frame_geom` uses saturating arithmetic for the same
+  reason.
+- **`plank serve` shared mode must key sessions by a stable client id, not the
+  per-turn `session_id`.** The `session_id` on `/generate` changes with every
+  turn (`RemoteDs4Engine` mints `turn-N`), so keying the host session on it
+  gave every turn a fresh session, a fresh prefill and a stranded predecessor.
+  Clients now send `X-Plank-Client-Id` (old
+  clients fall back to `session_id`), cancels are keyed `client:turn`, and
+  entries idle past `SESSION_IDLE_TTL` (30 minutes) are swept (`src/serve.rs`).

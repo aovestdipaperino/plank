@@ -498,7 +498,7 @@ granted per-plugin in the manifest. Nothing is granted by default.
 | `log` | `plank_log(level, msg)` | Always available; goes to the plank debug log, never the transcript |
 | `print` | `plank_print(text)`, `plank_print_md(text)` | Writes scrollback lines |
 | `notify` | `plank_notify(title, body)` | Desktop/terminal notification |
-| `state` | `plank_state_get(key)`, `plank_state_set(key, val)` | A per-plugin KV store under `~/.plank/plugins/<id>/state`. The *only* persistence most plugins need, and it needs no filesystem grant |
+| `state` | `plank_state_get(key)`, `plank_state_set(key, val)` | A per-plugin KV store under `~/.plank/plugins/<id>/state`. The *only* persistence most plugins need, and it needs no filesystem grant. Quotas: 1 MiB per value, 255-byte keys, 256 keys and 16 MiB in total per component (`STATE_MAX_*` in `src/wasmcaps.rs`); an over-quota `state_set` is refused with a `'<id>' ...` error before anything is written |
 | `fs` | Extism `allowed_paths` | Explicit path list, never `/` |
 | `net` | Extism `allowed_hosts` | Explicit host list |
 | `exec` | `plank_exec(cmd) -> {out, code}` | **Escape hatch.** Grants shell. Requires explicit user confirmation at install and is flagged in `/plugins` |
@@ -567,6 +567,12 @@ The UI loop must never be blocked by a plugin. Three mechanisms enforce it:
 3. **Strike-out.** A plugin that traps or overruns three times in a session is
    disabled for the rest of it, with one line in the transcript saying so. A
    plugin that breaks should degrade the feature, never the session.
+
+Memory is bounded the same way time is. The manifest caps linear memory at
+`MEMORY_MAX_PAGES` (1024 pages, 64 MiB, `src/wasmhost.rs`), which is generous
+for a screensaver and still small next to the model the same process holds
+resident; a guest that grows past it gets a `WasmError::Trap`, a plugin fault
+counted as a strike like any other, never a host failure.
 
 Plugins get **no ambient clock and no ambient randomness**. Time arrives as
 `now_ms`/`dt_ms` in the step payload, and seeds arrive in `OpenParams` — the

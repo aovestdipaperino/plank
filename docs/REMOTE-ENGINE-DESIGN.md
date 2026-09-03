@@ -164,6 +164,14 @@ server-side, unchanged.
     `count_tokens` is exact (matters for compaction thresholds in
     `src/compact.rs` — the open question in the vault note).
   - `DELETE /generate/{id}` → cancel signal for interrupt.
+- *As implemented* (`src/serve.rs`): the bearer token is compared in constant
+  time before any request body is read; a `Content-Length` over 16 MiB
+  (`MAX_BODY_BYTES`) is answered 413; accepted streams carry a 30 s read
+  timeout (`READ_TIMEOUT`); and binding off loopback with no `--token` refuses
+  to start unless `--insecure` is passed (`check_exposure`). Shared mode keys
+  the host session by the `X-Plank-Client-Id` header (falling back to
+  `session_id` for older clients), namespaces cancels as `client:turn`, and
+  sweeps entries idle for 30 minutes (`SESSION_IDLE_TTL`).
 - The C engine's `greedy` closure semantics (`src/engine.rs` doc: argmax while
   tool-call stanzas stream) are reproduced server-side. Because greedy state is
   derived from the streaming parser and the server runs the *same* parser over

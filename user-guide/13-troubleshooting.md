@@ -43,7 +43,7 @@ If it is a class of action you want prevented rather than observed, that is a `P
 
 ## A bash command failed with a permission error
 
-The sandbox limits model-initiated writes to the working directory and temp. A build that writes to a shared cache outside the tree will fail.
+The sandbox limits model-initiated writes to the working directory and temp. A build that writes to a shared cache outside the tree will fail, and so will a `write` or `edit` aimed there, with `Tool error: write path escapes workspace: <path>`.
 
 Name the path rather than switching the sandbox off:
 
@@ -51,7 +51,7 @@ Name the path rather than switching the sandbox off:
 { "writablePaths": ["/Users/me/.cache/my-build"] }
 ```
 
-in `./.plank/sandbox.json`. Commands you type with `!` or `!!` are never sandboxed.
+in `~/.plank/sandbox.json`. It has to be the user-level file: a project's `./.plank/sandbox.json` can only tighten the sandbox, so `writablePaths` there is ignored. Commands you type with `!` or `!!` are never sandboxed.
 
 ## An interactive command hangs
 
@@ -133,6 +133,7 @@ Also: `--provider` cannot be combined with `--remote` or the local backend selec
 ## A remote connection is refused
 
 - Plain `http://` is allowed to localhost only. For anything else, use TLS or pass `--insecure` knowingly.
+- `plank serve` itself refuses to start on a non-loopback address without a `--token`. Bind to loopback, give it a token, or pass `plank serve --insecure` if you really mean to serve unauthenticated; this is a different flag from the client's `--insecure`.
 - The token comes from `--remote-token` or `$PLANK_REMOTE_TOKEN`.
 - A browser client needs its Origin allowed with `--control-origin`; missing and loopback Origins are always allowed, other browser Origins are refused by default.
 - A remote client that mirrors but cannot *drive* is a bridge started with `/rc ask`: approve its request locally with `/grant` (or `/grant <session>`, the id in the notice). Plain `/rc` pre-authorizes control and has no such step.

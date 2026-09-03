@@ -184,11 +184,15 @@ href="12-advanced-workflows.html">Advanced workflows</a>.</p>
 failed with a permission error</h2>
 <p>The sandbox limits model-initiated writes to the working directory
 and temp. A build that writes to a shared cache outside the tree will
-fail.</p>
+fail, and so will a <code>write</code> or <code>edit</code> aimed there,
+with
+<code>Tool error: write path escapes workspace: &lt;path&gt;</code>.</p>
 <p>Name the path rather than switching the sandbox off:</p>
 <pre class="json"><code>{ &quot;writablePaths&quot;: [&quot;/Users/me/.cache/my-build&quot;] }</code></pre>
-<p>in <code>./.plank/sandbox.json</code>. Commands you type with
-<code>!</code> or <code>!!</code> are never sandboxed.</p>
+<p>in <code>~/.plank/sandbox.json</code>. It has to be the user-level
+file: a project's <code>./.plank/sandbox.json</code> can only tighten
+the sandbox, so <code>writablePaths</code> there is ignored. Commands
+you type with <code>!</code> or <code>!!</code> are never sandboxed.</p>
 <h2 id="an-interactive-command-hangs">An interactive command hangs</h2>
 <p>The model's <code>bash</code> tool cannot answer a prompt, page
 through output, or drive an editor. Run those yourself with
@@ -320,6 +324,11 @@ refused</h2>
 <ul>
 <li>Plain <code>http://</code> is allowed to localhost only. For
 anything else, use TLS or pass <code>--insecure</code> knowingly.</li>
+<li><code>plank serve</code> itself refuses to start on a non-loopback
+address without a <code>--token</code>. Bind to loopback, give it a
+token, or pass <code>plank serve --insecure</code> if you really mean to
+serve unauthenticated; this is a different flag from the client's
+<code>--insecure</code>.</li>
 <li>The token comes from <code>--remote-token</code> or
 <code>$PLANK_REMOTE_TOKEN</code>.</li>
 <li>A browser client needs its Origin allowed with

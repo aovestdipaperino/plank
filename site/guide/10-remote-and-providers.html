@@ -252,6 +252,16 @@ engine</td>
 <p>Plain <code>http://</code> is allowed to localhost and refused
 elsewhere unless you pass <code>--insecure</code>. Keep a real
 deployment behind an SSH tunnel or a TLS reverse proxy.</p>
+<p>The server side has its own guard, and its own
+<code>--insecure</code>, which means something different.
+<code>plank serve --listen ADDR</code> on a non-loopback address with no
+<code>--token</code> refuses to start, because that hands the model to
+anyone who can reach the port; bind to <code>127.0.0.1</code>, pass a
+token, or pass <code>plank serve --insecure</code> to serve
+unauthenticated anyway. So the client flag waives TLS, the server flag
+waives authentication, and each is checked only by the side it belongs
+to. The server also caps a request body at 16 MiB and drops a connection
+that sits silent for 30 s mid-request.</p>
 <h2 id="shared-engine">Shared engine</h2>
 <pre class="sh"><code>plank serve --shared-engine</code></pre>
 <p>loads the weights once and serves many concurrent sessions from a
@@ -289,6 +299,11 @@ request</td>
 </tbody>
 </table>
 <p><code>/info</code> reports live-session and KV accounting.</p>
+<p>A host session belongs to a client, not to a turn. The client sends a
+stable <code>X-Plank-Client-Id</code> header, so many turns from one
+laptop reuse one warm session instead of attaching a new one each time;
+a session idle for 30 minutes is swept. An older client that does not
+send the header still works and is keyed per turn as before.</p>
 <h2 id="remote-control">Remote control</h2>
 <pre class="sh"><code>plank --control            # loopback WebSocket on 127.0.0.1:31415</code></pre>
 <p>Another process, a browser, or a terminal client can attach to a

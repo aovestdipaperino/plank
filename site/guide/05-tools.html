@@ -180,6 +180,13 @@ directories, <code>*</code> stays within one component</td>
 </tr>
 </tbody>
 </table>
+<p>When the sandbox is on, <code>write</code> and <code>edit</code> are
+held to the same boundary as the shell: a path outside the workspace
+(the working directory, the system temp directories, any configured
+<code>writablePaths</code>, and <code>~/.plank</code> only while you
+have granted that) is refused with
+<code>Tool error: write path escapes workspace: &lt;path&gt;</code>.
+Reads are not contained.</p>
 <p><code>edit</code> and an overwriting <code>write</code> render as
 <strong>diff cards</strong> in the TUI: an <code>Update(path)</code>
 header, an added/removed summary, and red/green <code>@@</code> hunks. A
@@ -214,6 +221,13 @@ so the model can start a long build, do something else, and check back.
 The first observation is head-biased so headers and early errors are
 visible; later ones are tail-biased so you see recent output rather than
 the top of a log.</p>
+<p>Every job runs in its own process group, and so do the commands you
+type with <code>!</code>. Stopping a job or hitting its timeout kills
+the whole tree, so a <code>sleep 600; echo ok</code> or a
+<code>cmd | tee</code> pipeline cannot outlive plank. A job that ran
+past its timeout is reaped by whatever tool call comes next, not only
+when the model polls it. Interrupting a running command (Ctrl-C in the
+REPL, Esc in the TUI) kills its group and reports exit status 143.</p>
 <h3 id="documents">Documents</h3>
 <p><code>read</code> on a <code>.pdf</code> transparently converts the
 file to Markdown first, so a PDF is just a readable file:</p>
@@ -318,10 +332,18 @@ never sandboxed — you typing the command is the authorization.</p>
   &quot;writablePaths&quot;: [&quot;/some/extra/root&quot;],
   &quot;excludedCommands&quot;: [&quot;git push*&quot;, &quot;brew *&quot;]
 }</code></pre>
-<p>Scalars come from the most specific file; lists concatenate.
-<code>excludedCommands</code> glob-matches the whole command line and
-skips the sandbox for it — a convenience escape hatch, <strong>not a
-security boundary</strong>.</p>
+<p>The project file can only tighten the policy. Its
+<code>"enabled": true</code> is honoured, but
+<code>"enabled": false</code>, <code>writablePaths</code> and
+<code>excludedCommands</code> in <code>./.plank/sandbox.json</code> are
+ignored, since a cloned repository must not be able to widen the sandbox
+of whoever opens it; anything that relaxes the sandbox goes in
+<code>~/.plank/sandbox.json</code>. <code>excludedCommands</code>
+glob-matches the whole command line and skips the sandbox for it — a
+convenience escape hatch, <strong>not a security boundary</strong>.</p>
+<p>The same roots contain the <code>write</code> and <code>edit</code>
+tools (see <a href="#files">Files</a>), so a file the shell could not
+write, the model cannot write by another route either.</p>
 <p>Turn it off for a run with <code>--no-sandbox</code>, or permanently
 with <code>safety.sandbox: false</code>.</p>
 <h2 id="plan-mode">Plan mode</h2>

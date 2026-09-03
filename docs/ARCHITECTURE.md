@@ -198,7 +198,17 @@ uncorrupted.
 `dispatch` maps a `ToolCall` to an implementation, mirroring the C tool table:
 `files.rs` (read/more/write/list), `edit.rs` (edit with `[upto]` anchoring,
 search), `bash.rs` (sync + async jobs), `web.rs` (`google_search`, `visit_page`).
-Output framing matches the C byte-for-byte.
+Output framing matches the C byte-for-byte. Every tool that writes a path
+resolves it through `ToolContext::resolve_for_write` (`tools/mod.rs`), the
+single write-containment choke point: with the sandbox enabled the target must
+sit under one of `Sandbox::write_roots` (cwd, the temp roots, configured
+`writablePaths`, `~/.plank` once granted) or the tool returns
+`Tool error: <tool> path escapes workspace: <path>`. The Seatbelt profile is
+built from the same list, so the two cannot drift; reads are deliberately not
+contained. `dispatch` also runs `BashJobs::sweep` first, so a timed-out async
+job is reaped by any later tool call, and every child (bash, MCP servers,
+hooks) is spawned in its own process group and killed through
+`kill_process_group`.
 
 ### Worktree isolation (`worktree.rs`, `tools/worktree.rs`)
 
@@ -238,8 +248,12 @@ in-memory only — a resumed session always starts where it was launched.
 
 See `docs/SYSTEM-PROMPT.md` for the full story of how the system prompt is
 built, snapshotted to `sysprompt.kv`, and invalidated across versions.
-- `session.rs` — save/load/list/switch/delete with SHA-1 identities and history
-  rendering under `~/.plank/kvcache`.
+- `session.rs` — save/load/list/switch/delete/rename and history rendering
+  under `~/.plank/kvcache`. The filename stem is the identity: a memorable
+  `adjective-celebrity` slug minted on session start (legacy 40-hex ids still
+  load by prefix), and `validate_name` accepts only the grammar
+  `is_valid_id_prefix` lists by (ASCII alphanumerics and `-`), so a renamed
+  session can never disappear from `/list`.
 - `branch.rs` — the session *tree* behind `/tree`, `/fork` and `/clone`: one
   node per message, one active path (the live transcript), and the pure
   fork/clone/common-prefix operations. Off-path branches serialize as extra
@@ -266,16 +280,22 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
 ### Plugins (`plugins.rs`, `claudeplugin.rs`)
 - `plugins.rs` — what a plugin *is* once it is on disk: a directory bundling
   skills, agents, templates, hooks, an `.mcp.json` and a `settings.json`,
-  discovered under `~/.plank/plugins/dev/`, `~/.plank/plugins/claude/`,
-  `./.plank/plugins/`, or `--plugin-dir`, in that scan order. Both the plank
+  discovered under `~/.plank/plugins/claude/`, `~/.plank/plugins/dev/`,
+  `./.plank/plugins/`, then `--plugin-dir`, in that scan order, with a later
+  root winning a name collision: a user-authored `dev/` plugin beats a fetched
+  one, and project or `--plugin-dir` plugins outrank both. Both the plank
   (`.plank-plugin/plugin.json`, `templates/`, `hooks.json`) and Claude Code
   (`.claude-plugin/plugin.json`, `commands/`, `hooks/hooks.json`) spellings are
-  accepted.
+  accepted. A plugin's `settings.json` layers below the user's and cannot set
+  `engine.*`, `worktree.*`, `tools.*` or `pluginConfig`
+  (`PLUGIN_REFUSED_SECTIONS`); those keys are dropped and reported through
+  `settings_audit_warnings`.
 - `claudeplugin.rs` — the other half: fetching a Claude Code plugin from a git
   repository, a marketplace repository, or a `.tar.gz`, validating it against
   the hook events plank implements, and installing it into
-  `~/.plank/plugins/claude/`, the scan root `plugins.rs` checks between `dev/`
-  and the project root. It is a separate module because it owns a different
+  `~/.plank/plugins/claude/`, the scan root `plugins.rs` checks first, before
+  `dev/`. Downloads stage under `~/.plank/.claude-staging`, outside every scan
+  root. It is a separate module because it owns a different
   set of questions than `plugins.rs` — network, subprocess and trust decisions
   that only matter once, at install time, not on every scan.
 
