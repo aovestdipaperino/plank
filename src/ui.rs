@@ -7904,9 +7904,6 @@ impl Agent<'_> {
             DisableBracketedPaste,
             DisableMouseCapture
         );
-        // Hand the cursor back to the user's own terminal theme before the
-        // shell prompt returns.
-        crate::cursor::reset();
         ratatui::restore();
         result.map(|_| ())
     }
@@ -11846,9 +11843,6 @@ fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce
         DisableMouseCapture,
         LeaveAlternateScreen
     );
-    // Whatever runs under the suspension (an editor, a shell) gets the user's
-    // own cursor color back; the draw loops repaint ours on the way in.
-    crate::cursor::reset();
     let _ = disable_raw_mode();
     let out = {
         let _restore = Restore;

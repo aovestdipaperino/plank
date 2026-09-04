@@ -3212,6 +3212,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nano-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6599b871ac13aeeae64abe3d470b028396102414d680c96b489cbdb71e9ce1ed"
+dependencies = [
+ "ratatui",
+ "unicode-width 0.2.0",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3807,6 +3817,7 @@ dependencies = [
  "libc",
  "liteparse",
  "logo-art 0.3.0",
+ "nano-cursor",
  "notify-rust",
  "nucleo-matcher",
  "obscura",

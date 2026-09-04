@@ -1,122 +1,143 @@
 // Copyright (c) 2026 Enzo Lombardi
 // SPDX-License-Identifier: MIT
 
-//! Terminal cursor color, kept in sync with whether plank wants your input.
+//! Cursor colour, kept in sync with whether plank wants your input.
 //!
 //! The block cursor sitting on the prompt row is the one piece of the TUI the
 //! eye is already resting on, so it doubles as the phase indicator: the theme
 //! green while plank is idle and waiting for you, red while a turn is running.
-//! Set via the OSC 12 escape (`ESC ] 12 ; #rrggbb BEL`) and undone with OSC 112
-//! ("reset cursor color"), which hands the color back to the user's own
-//! terminal theme on exit.
 //!
-//! The same escape also pins the cursor to a *steady* block (DECSCUSR `ESC [
-//! 2 q`), because the point of a colored cursor is to be read at a glance and a
-//! blinking one makes you wait for it. Ghostty and friends blink by default and
-//! nothing in plank was overriding that, so the recolor made a pre-existing
-//! blink newly obvious. [`reset`] hands the style back with `ESC [ 0 q`
-//! alongside the color.
+//! The colour used to be *requested* with the OSC 12 escape, and a terminal is
+//! free to ignore that. Warp does: it renders the cursor as a widget in its own
+//! UI, coloured from its theme, so there is no grid cell for OSC 12 to recolour
+//! and no escape path into that widget. The same sequence that recolours the
+//! cursor in Ghostty does nothing at all there — not an error, silence, which
+//! is the worst failure mode for a visual indicator, because it works on your
+//! machine. So plank stops asking and paints the cursor itself, into the frame
+//! it is already drawing (see [`crate::tui`] `render_input`, which calls
+//! `nano_cursor`).
 //!
-//! Written to **stderr** for the same reason [`crate::title`] is: stderr
-//! reaches the same tty as stdout but bypasses the Ratatui frame buffer, so a
-//! color change can never tear a frame even when it lands mid-draw. No-op when
-//! stderr is not a terminal, and repeats are suppressed — the busy loop redraws
-//! at animation rate, and re-emitting the same escape every frame is pure noise
-//! on the wire (and visible flicker on terminals that repaint the cell).
+//! This module is what is left once the escapes are gone: two process-global
+//! cells that cross the `terminal.draw` boundary.
+//!
+//! - The **phase**, written by [`set`] at the three moments the draw loops
+//!   already know it (prompt live, turn running, compacting) and read by the
+//!   renderer through [`state`]. Ambient rather than a parameter, because the
+//!   call sites that know it and the renderer that needs it are separated by a
+//!   closure and several widget signatures.
+//! - The **caret**, written by the renderer through [`set_caret`] with the
+//!   position `nano_cursor` reports, and consumed by [`place`] after the frame
+//!   is flushed. plank never sets a ratatui cursor position, so ratatui emits
+//!   `Hide` — but hidden is not absent: terminals anchor the IME candidate
+//!   window and screen-reader focus to the position they are tracking, and
+//!   hiding without moving is how you break CJK input.
 
-use std::io::{IsTerminal, Write};
+use ratatui::layout::Position;
+use ratatui::style::Color;
+use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Cursor color while plank is at the prompt: the theme's military green,
+/// Cursor colour while plank is at the prompt: the theme's military green,
 /// `#87af5f` — the truecolor spelling of [`crate::status::THEME_COLOR`] (256
-/// color 106). OSC 12 takes a color spec, not a palette index, so the hue has
-/// to be written out longhand here.
-pub const IDLE_COLOR: &str = "#87af5f";
+/// colour 106), written out longhand because a [`Color::Rgb`] cannot carry a
+/// palette index.
+pub const IDLE_COLOR: Color = Color::Rgb(0x87, 0xaf, 0x5f);
 
-/// Cursor color while a turn is running: `#d75f5f` (256 color 167). A brick red
-/// rather than a pure `#ff0000`, so it sits in the same muted family as the
+/// Cursor colour while a turn is running: `#d75f5f` (256 colour 167). A brick
+/// red rather than a pure `#ff0000`, so it sits in the same muted family as the
 /// rest of the palette instead of glaring out of the prompt row.
-pub const BUSY_COLOR: &str = "#d75f5f";
+pub const BUSY_COLOR: Color = Color::Rgb(0xd7, 0x5f, 0x5f);
 
-/// What the cursor color is saying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What the cursor colour is saying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum State {
     /// At the prompt, waiting for the user.
+    #[default]
     Idle,
     /// Prefilling, generating, or compacting — plank owns the turn.
     Busy,
 }
 
 impl State {
-    /// The OSC 12 color spec for this state.
+    /// The colour this state paints the cursor.
     #[must_use]
-    pub fn color(self) -> &'static str {
+    pub fn color(self) -> Color {
         match self {
             Self::Idle => IDLE_COLOR,
             Self::Busy => BUSY_COLOR,
         }
     }
 
-    /// Discriminant used by [`LAST`]; `0` is reserved for "nothing written
-    /// yet", so the first `set` always reaches the terminal.
+    /// Discriminant stored in [`PHASE`]; `0` is reserved for "nothing written
+    /// yet".
     fn tag(self) -> u8 {
         match self {
             Self::Idle => 1,
             Self::Busy => 2,
         }
     }
+
+    /// Inverse of [`State::tag`]. `0` — never written — reads as [`State::Idle`]:
+    /// plank is waiting for you until a turn says otherwise.
+    fn from_tag(tag: u8) -> Self {
+        if tag == Self::Busy.tag() {
+            Self::Busy
+        } else {
+            Self::Idle
+        }
+    }
 }
 
-/// The state last written, so a redraw at the same state writes nothing.
-/// `0` means the cursor color is still the terminal's own.
-static LAST: AtomicU8 = AtomicU8::new(0);
+/// The phase the next drawn cursor will wear.
+static PHASE: AtomicU8 = AtomicU8::new(0);
 
-/// DECSCUSR "steady block": the cursor stops blinking so the color reads at a
-/// glance. Emitted with every color change rather than once at startup, so a
-/// full-screen app or a shell escape that reset the style gets corrected on the
-/// next phase change.
-pub const STEADY_BLOCK: &str = "\x1b[2 q";
-
-/// DECSCUSR "default": the style the user's terminal config asks for.
-pub const DEFAULT_STYLE: &str = "\x1b[0 q";
-
-/// The escapes that paint the cursor for `state`: color, then steady block.
-#[must_use]
-pub fn sequence(state: State) -> String {
-    format!("\x1b]12;{}\x07{STEADY_BLOCK}", state.color())
-}
-
-/// The escapes that hand the cursor color *and* blink style back to the
-/// terminal's own theme.
-pub const RESET_SEQUENCE: &str = "\x1b]112\x07\x1b[0 q";
-
-/// Sets the cursor color to `state`'s. Best-effort, and a no-op both when
-/// stderr is not a tty and when `state` is already what was last written.
+/// Records the phase for the frames drawn from here on. Cheap enough to call
+/// once per frame, which is what the draw loops do.
 pub fn set(state: State) {
-    if LAST.swap(state.tag(), Ordering::Relaxed) == state.tag() {
-        return;
-    }
-    write(&sequence(state));
+    PHASE.store(state.tag(), Ordering::Relaxed);
 }
 
-/// Restores the terminal's own cursor color. Called from the TUI teardown, so
-/// plank never leaves a shell prompt wearing plank's colors.
-pub fn reset() {
-    // Unconditional rather than guarded on `LAST`: the teardown runs once, and
-    // resetting a cursor that was never recolored is harmless.
-    LAST.store(0, Ordering::Relaxed);
-    write(RESET_SEQUENCE);
+/// The phase the renderer should paint.
+#[must_use]
+pub fn state() -> State {
+    State::from_tag(PHASE.load(Ordering::Relaxed))
 }
 
-/// One write of an already-formed escape, so it cannot interleave with other
-/// stderr output.
-fn write(seq: &str) {
-    let mut err = std::io::stderr();
-    if !err.is_terminal() {
+/// Where the cursor was painted on the last drawn frame, or `None` when that
+/// frame drew no prompt.
+static CARET: std::sync::Mutex<Option<Position>> = std::sync::Mutex::new(None);
+
+/// Records the caret `nano_cursor` reported, or `None` on a frame with no
+/// prompt. Cleared alongside `tui::set_input_rect(None)`: both answer "is
+/// there a live prompt on this frame?" and must not drift apart.
+pub fn set_caret(pos: Option<Position>) {
+    if let Ok(mut slot) = CARET.lock() {
+        *slot = pos;
+    }
+}
+
+/// The caret from the last drawn frame.
+#[must_use]
+pub fn caret() -> Option<Position> {
+    CARET.lock().ok().and_then(|c| *c)
+}
+
+/// Moves the terminal's own (hidden) cursor to the painted caret, so the IME
+/// candidate window and screen-reader focus land where the user is typing.
+///
+/// Call right after `terminal.draw` returns — after the frame is flushed, so
+/// this can never interleave with ratatui's own buffered writes and tear it.
+/// A no-op when the frame painted no caret, which is what makes it safe to
+/// call after every draw: the cell decides, not the call site.
+pub fn place() {
+    let Some(p) = caret() else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    if !out.is_terminal() {
         return;
     }
-    let _ = err.write_all(seq.as_bytes());
-    let _ = err.flush();
+    let _ = ratatui::crossterm::execute!(out, ratatui::crossterm::cursor::MoveTo(p.x, p.y));
 }
 
 #[cfg(test)]
@@ -125,29 +146,52 @@ mod tests {
 
     #[test]
     fn idle_is_the_theme_green() {
-        // The 256-color theme accent is 106 = #87af5f; the OSC spelling must
-        // track it, since OSC 12 cannot take the palette index.
+        // The 256-color theme accent is 106 = #87af5f; the drawn cursor's
+        // colour must track it, and a ratatui `Color::Rgb` cannot carry the
+        // palette index, so the hue is written out longhand.
         assert_eq!(crate::status::THEME_COLOR, 106);
-        assert_eq!(IDLE_COLOR, "#87af5f");
+        assert_eq!(IDLE_COLOR, Color::Rgb(0x87, 0xaf, 0x5f));
+        assert_eq!(State::Idle.color(), IDLE_COLOR);
     }
 
     #[test]
-    fn sequences_carry_the_color_and_pin_a_steady_block() {
-        assert_eq!(sequence(State::Idle), "\x1b]12;#87af5f\x07\x1b[2 q");
-        assert_eq!(sequence(State::Busy), "\x1b]12;#d75f5f\x07\x1b[2 q");
-        assert_eq!(RESET_SEQUENCE, "\x1b]112\x07\x1b[0 q");
+    fn busy_is_the_muted_brick_red() {
+        // 256 colour 167, not a pure #ff0000: it sits in the same muted family
+        // as the rest of the palette instead of glaring out of the prompt row.
+        assert_eq!(BUSY_COLOR, Color::Rgb(0xd7, 0x5f, 0x5f));
+        assert_eq!(State::Busy.color(), BUSY_COLOR);
     }
 
     #[test]
-    fn repeats_are_suppressed_but_changes_are_not() {
-        // `LAST` is process-global, so drive it through the same door `set`
-        // uses rather than asserting on terminal output.
-        LAST.store(0, Ordering::Relaxed);
-        let busy = State::Busy.tag();
-        let idle = State::Idle.tag();
-        assert_ne!(LAST.swap(busy, Ordering::Relaxed), busy);
-        assert_eq!(LAST.swap(busy, Ordering::Relaxed), busy);
-        assert_ne!(LAST.swap(idle, Ordering::Relaxed), idle);
-        LAST.store(0, Ordering::Relaxed);
+    fn the_phase_round_trips_through_the_store() {
+        set(State::Busy);
+        assert_eq!(state(), State::Busy);
+        set(State::Idle);
+        assert_eq!(state(), State::Idle);
+    }
+
+    #[test]
+    fn the_phase_defaults_to_idle_before_anything_sets_it() {
+        // Tag 0 is "never written". plank is waiting for you until a turn says
+        // otherwise, so an unwritten phase must read as idle rather than red.
+        assert_eq!(State::from_tag(0), State::Idle);
+    }
+
+    #[test]
+    fn the_caret_cell_round_trips_and_clears() {
+        // `place` moves the real cursor to whatever is in here, so a frame
+        // that draws no prompt must be able to empty it — otherwise the
+        // hidden cursor is left at a position from a previous frame.
+        set_caret(Some(Position::new(7, 3)));
+        assert_eq!(caret(), Some(Position::new(7, 3)));
+        set_caret(None);
+        assert_eq!(caret(), None);
+    }
+
+    #[test]
+    fn place_without_a_caret_does_nothing() {
+        set_caret(None);
+        place(); // must not panic, and must not move anything
+        assert_eq!(caret(), None);
     }
 }

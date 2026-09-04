@@ -81,6 +81,12 @@ libc = "0.2"
 # wrapped-line counts, so scrollback can clamp to the true bottom (word-wrap
 # produces more rows than a char-packing estimate).
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+# Paints the cursor into the frame instead of asking the terminal to recolour
+# it. OSC 12 is a request, and Warp renders its cursor as a widget in its own
+# UI where no escape can reach it — the indicator has to be drawn to be
+# reliable. Pulls ratatui's `underline-color` feature (additive, and unused
+# here: plank draws a block).
+nano-cursor = "0.1"
 unicode-width = "0.2"
 ureq = "3"
 # Plugin signature verification (minisign, docs/WASM-PLUGINS.md). `ring` is
