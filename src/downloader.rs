@@ -496,8 +496,7 @@ fn staged_is_current(root: &Path, kind: &str, entry: &crate::manifest::FileEntry
     if meta.len() != entry.bytes {
         return false;
     }
-    std::fs::read_to_string(staged_sha_path_in(root, kind))
-        .is_ok_and(|s| s.trim() == entry.sha256)
+    std::fs::read_to_string(staged_sha_path_in(root, kind)).is_ok_and(|s| s.trim() == entry.sha256)
 }
 
 /// Downloads and verifies one artifact. `Ok(Some(how))` means a cancel was
@@ -1656,7 +1655,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_staged_artifact_of_the_right_size_but_a_different_version_is_not_installed_as_the_new_one()
-     {
+    {
         // Finding 1's corrupting case: a same-length artifact from a different
         // manifest version must not slip past the size check and be installed
         // under the new version's hash unverified. The sidecar SHA-256
