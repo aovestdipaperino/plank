@@ -25,6 +25,7 @@ pub mod debugmirror;
 /// the extension routing is CI-tested; the conversion itself needs `docparse`.
 pub mod doc;
 pub mod download;
+pub mod downloader;
 #[cfg(ds4_engine)]
 pub mod ds4engine;
 /// Token-primary transcript core for the ds4 backend (issue #58). FFI-free and
