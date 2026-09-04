@@ -293,6 +293,21 @@ pub fn staged_path_in(root: &Path, kind: &str) -> PathBuf {
     crate::manifest::staging_dir_in(root).join(format!("{kind}.gguf"))
 }
 
+/// The SHA-256 (as verified at staging time) that `staged_path_in` is proven
+/// against, under `root`.
+///
+/// Staging is flat and untagged by version, so a `<kind>.gguf` left behind by
+/// an older accepted manifest is byte-for-byte indistinguishable from this
+/// run's target *except for its content*. This sidecar is what lets `run_job`
+/// tell "verified for the manifest I am installing" from "verified for some
+/// other one" without re-hashing tens of gigabytes on every check: it is
+/// written once, right after the real SHA-256 check passes, so trusting it
+/// later costs nothing beyond reading a few bytes.
+#[must_use]
+pub fn staged_sha_path_in(root: &Path, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root).join(format!("{kind}.gguf.sha256"))
+}
+
 /// Verified-but-not-yet-installed bytes for `kind`.
 #[must_use]
 pub fn staged_path(kind: &str) -> PathBuf {
@@ -420,9 +435,16 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
         if let Some(how) = read_cancel_in(root) {
             return finish_cancel(root, how, manifest, &jobs);
         }
-        if staged_path_in(root, kind).exists() {
+        if staged_is_current(root, kind, entry) {
             continue;
         }
+        // Stale: either wrong size, or right size but from a manifest version
+        // whose recorded SHA-256 does not match this one (see
+        // `staged_sha_path_in`). Either way it is not proof of anything for
+        // *this* manifest, so it must not be installed as it: clear it and
+        // fall through to a normal download-and-verify.
+        let _ = std::fs::remove_file(staged_path_in(root, kind));
+        let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
         match one_artifact(root, manifest, kind, entry, index + 1, of, fetch) {
             Ok(None) => {}
             Ok(Some(how)) => return finish_cancel(root, how, manifest, &jobs),
@@ -450,6 +472,29 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
     }
     publish(root, manifest, "", of, of, 0, 0, 0, Phase::Staged, None);
     Outcome::Verified
+}
+
+/// Whether the `<kind>.gguf` already sitting in staging under `root` is proof
+/// for *this* `entry`, not a leftover from a manifest version this run never
+/// downloaded.
+///
+/// A size match alone is necessary but not sufficient: two different builds
+/// of the same artifact can happen to share a length, and installing one under
+/// the other's hash is exactly the corruption this whole feature exists to
+/// prevent. So the sidecar SHA-256 written when the artifact was verified
+/// (`staged_sha_path_in`) must also match the manifest's. A missing sidecar
+/// (an artifact staged by an older build of this code, or one whose sidecar
+/// write failed) is treated as unproven, not as trusted.
+fn staged_is_current(root: &Path, kind: &str, entry: &crate::manifest::FileEntry) -> bool {
+    let staged = staged_path_in(root, kind);
+    let Ok(meta) = std::fs::metadata(&staged) else {
+        return false;
+    };
+    if meta.len() != entry.bytes {
+        return false;
+    }
+    std::fs::read_to_string(staged_sha_path_in(root, kind))
+        .is_ok_and(|s| s.trim() == entry.sha256)
 }
 
 /// Downloads and verifies one artifact. `Ok(Some(how))` means a cancel was
@@ -614,6 +659,10 @@ fn one_artifact(
         ));
     }
     std::fs::rename(&part, staged_path_in(root, kind)).map_err(|e| e.to_string())?;
+    // Best-effort: a missing or unreadable sidecar just means the next check
+    // treats this artifact as stale and re-verifies it, which is safe, only
+    // slower.
+    let _ = std::fs::write(staged_sha_path_in(root, kind), &entry.sha256);
     Ok(None)
 }
 
@@ -972,6 +1021,9 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
         }
         std::fs::rename(&from, dest)
             .map_err(|e| format!("cannot install {kind} at {}: {e}", dest.display()))?;
+        // No longer needed once the artifact it describes is gone; leaving it
+        // behind would only stop `staging/` from being cleaned up below.
+        let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
     }
     // Last, and only now: this file is the claim that the set is installed.
     std::fs::rename(&staged_manifest, crate::manifest::installed_path_in(root))
@@ -1568,12 +1620,62 @@ pub(crate) mod tests {
         let root = tempdir();
         std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
         std::fs::write(staged_path_in(&root, "main"), b"abc").expect("pre-staged");
+        std::fs::write(staged_sha_path_in(&root, "main"), ABC_SHA).expect("sidecar");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         // A fetcher that would panic if called proves nothing was refetched.
         let never = |_: &str, _: u64| -> Result<Box<dyn Read + Send>, String> {
             panic!("must not refetch a staged artifact")
         };
         assert_eq!(run_job(&root, &m, &never), Outcome::Verified);
+    }
+
+    #[test]
+    fn a_staged_artifact_of_the_wrong_size_is_replaced_rather_than_skipped() {
+        // Finding 1 (blocker): staging is flat and untagged by version, so a
+        // stale artifact left behind by an older accepted manifest is
+        // indistinguishable from the current one by name alone. A size
+        // mismatch is the cheapest proof that it is stale: it must be
+        // replaced, not trusted by existence.
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        // A same-named artifact from an older, shorter manifest version.
+        std::fs::write(staged_path_in(&root, "main"), b"ab").expect("stale, wrong size");
+        std::fs::write(staged_sha_path_in(&root, "main"), ABC_SHA).expect("stale sidecar");
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(&root, "main")).expect("re-staged"),
+            b"abc",
+            "the stale, wrong-size artifact must be replaced with the current one"
+        );
+    }
+
+    #[test]
+    fn a_staged_artifact_of_the_right_size_but_a_different_version_is_not_installed_as_the_new_one()
+     {
+        // Finding 1's corrupting case: a same-length artifact from a different
+        // manifest version must not slip past the size check and be installed
+        // under the new version's hash unverified. The sidecar SHA-256
+        // recorded when the artifact was actually verified is what closes
+        // this gap without re-hashing tens of gigabytes on every check.
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        // Same length as "abc" (3 bytes), different content and a sidecar
+        // that still names the OLD manifest's hash — exactly what a real
+        // stale artifact looks like after `one_artifact` staged it honestly
+        // for a different version.
+        std::fs::write(staged_path_in(&root, "main"), b"xyz").expect("stale, same size");
+        std::fs::write(staged_sha_path_in(&root, "main"), EMPTY_SHA).expect("stale sidecar");
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
+        assert_eq!(outcome, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(&root, "main")).expect("re-staged"),
+            b"abc",
+            "a same-size artifact from a different version must be re-verified, \
+             not installed as the current one"
+        );
     }
 
     #[test]
