@@ -127,7 +127,18 @@ const GROUP_KILL_GRACE: Duration = Duration::from_millis(500);
 /// well-behaved tools can clean up; after [`GROUP_KILL_GRACE`] the group gets
 /// SIGKILL. `wait()` always runs so nothing is left as a zombie. Signalling a
 /// group that has already gone is harmless (ESRCH is ignored).
+///
+/// If the child has already exited on its own, it is reaped without
+/// signalling: the PID may have been reused by an unrelated process, and
+/// `kill(-pgid, ...)` would hit the wrong group.
 pub(crate) fn kill_process_group(child: &mut Child) -> Option<std::process::ExitStatus> {
+    // Reap an already-exited child before signalling. Without this, a
+    // BashJob whose child died between polls would Drop, call terminate(),
+    // and send SIGTERM to a PID that may have been reused by another test's
+    // process — the root cause of cross-test SIGTERM flakes.
+    if let Ok(Some(status)) = child.try_wait() {
+        return Some(status);
+    }
     #[allow(clippy::cast_possible_wrap)]
     let pgid = child.id() as libc::pid_t;
     if pgid <= 0 {
@@ -887,7 +898,7 @@ pub fn run_immediate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{test_call, test_ctx};
+    use crate::tools::{home_writable, test_call, test_ctx};
 
     #[test]
     fn bash_echo_round_trip() {
@@ -920,6 +931,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn bash_sandbox_blocks_writes_outside_cwd() {
+        // The escape target lives under `$HOME` (outside cwd and temp), and
+        // `sandbox-exec` itself can't apply a profile from inside a nested
+        // sandbox — so skip both when `$HOME` isn't writable.
+        if !home_writable() {
+            return;
+        }
         let (mut ctx, dir) = test_ctx();
         ctx.sandbox.enabled = true;
 

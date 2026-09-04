@@ -17150,6 +17150,10 @@ mod tests {
         assert!(shared.interrupt.load(Ordering::Relaxed));
         assert!(close_pending);
         assert!(p.is_some());
+        // close_or_interrupt raises the process-wide interrupt flag; clear it
+        // so it doesn't leak into tests that poll it (bash refresh_for, goal
+        // loops, fan-out passes).
+        crate::interrupt::clear();
     }
 
     #[test]
@@ -17174,6 +17178,10 @@ mod tests {
         close_or_interrupt(&shared, &mut p, false, &mut close_pending);
         assert!(shared.interrupt.load(Ordering::Relaxed));
         assert!(p.is_none());
+        // close_or_interrupt raises the process-wide interrupt flag; clear it
+        // so it doesn't leak into tests that poll it (bash refresh_for, goal
+        // loops, fan-out passes).
+        crate::interrupt::clear();
     }
 
     // A sub-agent or fan-out pass polls only the process-wide flag, so an Esc

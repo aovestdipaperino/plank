@@ -749,11 +749,16 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::{test_call, test_ctx};
+    use crate::tools::{home_writable, test_call, test_ctx};
     use std::path::PathBuf;
 
     #[test]
     fn sandboxed_edit_refuses_paths_outside_the_workspace() {
+        // The test cwd lives under `$HOME` (not temp_dir(), which the sandbox
+        // always allows), so it can't be set up inside a nested write sandbox.
+        if !home_writable() {
+            return;
+        }
         let Some(home) = std::env::var_os("HOME") else {
             return;
         };

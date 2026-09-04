@@ -888,7 +888,45 @@ pub(crate) fn test_ctx() -> (ToolContext, PathBuf) {
         SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create scratch dir");
-    (ToolContext::new(&dir), dir)
+    let mut ctx = ToolContext::new(&dir);
+    // Test contexts exercise tool logic, not the Seatbelt sandbox: the sandbox
+    // is on by default on macOS, which would wrap every bash command in
+    // `sandbox-exec` — and that fails when `cargo test` itself runs inside a
+    // nested write sandbox (e.g. under plank's own Seatbelt). Tests that
+    // specifically exercise the sandbox opt in with `ctx.sandbox.enabled = true`.
+    ctx.sandbox.enabled = false;
+    // The process-wide SIGINT flag is a global static shared across all tests.
+    // A UI test that exercises `close_or_interrupt` can raise it and, if it
+    // forgets to clear, the stale flag makes every bash `refresh_for` loop
+    // SIGTERM its job before the timeout fires. Clear here so tool tests always
+    // start with a clean slate.
+    crate::interrupt::clear();
+    (ctx, dir)
+}
+
+/// True when the test process can write under `$HOME` — false inside a nested
+/// write sandbox (e.g. when `cargo test` itself runs under plank's Seatbelt,
+/// which allows writes only under the working directory and temp dirs). Tests
+/// that need to create a directory under `$HOME` or write to `~/.plank` skip
+/// when this returns false, since the denial is environmental rather than a
+/// real product bug. Mirrors the `home_ctx` early-return in `tools/files.rs`.
+#[cfg(test)]
+pub(crate) fn home_writable() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(home) = std::env::var_os("HOME") else {
+        return false;
+    };
+    let probe = std::path::Path::new(&home).join(format!(
+        ".plank-probe-{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let ok = std::fs::File::create(&probe).is_ok();
+    if ok {
+        std::fs::remove_file(&probe).ok();
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -1079,6 +1117,12 @@ mod tests {
     fn a_bash_step_inside_run_code_is_sandboxed_like_a_bare_call() {
         crate::settings::install_for_test(crate::settings::Settings::default());
 
+        // The escape target lives under `$HOME` (outside cwd and temp), and
+        // `sandbox-exec` can't apply a profile from inside a nested sandbox —
+        // so skip when `$HOME` isn't writable.
+        if !home_writable() {
+            return;
+        }
         // The scratch dir lives under temp_dir(), which the sandbox profile
         // always allows, so the escape target must sit outside both cwd and
         // temp — the same reasoning as `bash_sandbox_blocks_writes_outside_cwd`.
@@ -1204,6 +1248,12 @@ mod tests {
 
     #[test]
     fn dispatch_spills_oversized_results_and_more_continues() {
+        // Dispatch spills through the real `~/.plank/spill`, which is under
+        // `$HOME` — not writable inside a nested write sandbox, where the spill
+        // write silently fails and the full result passes through untruncated.
+        if !home_writable() {
+            return;
+        }
         // A 5 MB-style oversized result (here a 1000-byte read under a 100-byte
         // cap) yields a bounded preview plus a locator, and the generalised
         // `more` continues the spill by id.
