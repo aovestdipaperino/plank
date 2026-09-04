@@ -11766,6 +11766,14 @@ fn run_worker_ui<T: Send>(
         // joined before the scope can end.
         if ui.is_err() {
             shared.interrupt.store(true, Ordering::Relaxed);
+            // If the worker is parked on the AskBridge waiting for an answer,
+            // it will never observe the interrupt flag — unblock it directly so
+            // the join below does not deadlock.
+            if let Some(bridge) = ask
+                && bridge.is_pending()
+            {
+                bridge.respond(crate::tools::ask::AskOutcome::Interrupted);
+            }
         }
         let out = handle
             .join()
@@ -12737,7 +12745,7 @@ fn new_agent(
         tool_ctx,
         system,
         reminder: SystemPromptReminder::new(),
-        power_percent: 0,
+        power_percent: cfg.power_percent,
         payload_restored: false,
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
@@ -13124,13 +13132,20 @@ pub fn run_non_interactive(
 ///
 /// Returns `None` at EOF with nothing buffered; sets `eof` once stdin closes.
 fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
-    use std::io::Read as _;
+    read_batched_from(libc::STDIN_FILENO, eof)
+}
+
+/// Reads one batch from `fd`: bytes accumulated until a 200 ms quiet window.
+///
+/// Factored from [`read_quiet_batched`] so the pipe-split fix is testable
+/// without spawning a subprocess.
+fn read_batched_from(fd: std::os::fd::RawFd, eof: &mut bool) -> std::io::Result<Option<String>> {
     const QUIET_MS: i32 = 200;
     let mut buf = Vec::new();
     loop {
         let timeout = if buf.is_empty() { -1 } else { QUIET_MS };
         let mut pfd = libc::pollfd {
-            fd: libc::STDIN_FILENO,
+            fd,
             events: libc::POLLIN,
             revents: 0,
         };
@@ -13147,13 +13162,22 @@ fn read_quiet_batched(eof: &mut bool) -> std::io::Result<Option<String>> {
             // Quiet window elapsed with data buffered: submit it.
             break;
         }
+        // Read the fd directly rather than through `std::io::stdin()`, whose
+        // internal `BufReader` slurps the whole pipe into its own buffer on the
+        // first read. After that `poll` sees an empty fd, reports a quiet
+        // window, and a prompt over 4096 bytes is submitted truncated.
         let mut chunk = [0_u8; 4096];
-        let n = std::io::stdin().read(&mut chunk)?;
+        // SAFETY: `fd` is a valid fd open for reading; `chunk` is a valid
+        // writable buffer for the call.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         if n == 0 {
             *eof = true;
             break;
         }
-        buf.extend_from_slice(&chunk[..n]);
+        buf.extend_from_slice(&chunk[..n.cast_unsigned()]);
     }
     if buf.is_empty() {
         return Ok(None);
@@ -13167,6 +13191,11 @@ mod tests {
     use crate::engine::{EngineError, EngineEvent, GenerationStats, ThinkMode};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    /// Serialises tests that mutate process-global environment variables
+    /// (`env::set_var`/`remove_var`). Without it, parallel tests racing on the
+    /// same key can unset a variable a sibling is mid-read on.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Flattened text of a line, for asserting on layout.
     fn text_of(line: &ratatui::text::Line<'_>) -> String {
@@ -19498,6 +19527,9 @@ mod tests {
     /// renderer's blink logic would be correct and never triggered.
     #[test]
     fn a_local_pass_marks_itself_local_while_it_generates() {
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let seen = std::sync::Arc::new(AtomicBool::new(false));
         let mut engine = ScriptedEngine {
             replies: vec!["done\n".to_string()],
@@ -19723,6 +19755,9 @@ mod tests {
     #[test]
     fn a_cached_alt_engine_is_reused_across_dispatches() {
         const KEY: &str = "PLANK_TEST_REUSE_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(KEY, "sk-test") };
         let dir = scratch_dir("alt-engine-reuse");
         let cfg = test_cfg();
@@ -20062,6 +20097,9 @@ mod tests {
     #[test]
     fn remote_definition_runs_on_its_own_engine_and_restores_the_parent() {
         const KEY: &str = "PLANK_TEST_ALT_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(KEY, "sk-test") };
         let dir = scratch_dir("alt-engine-runs");
         let cfg = test_cfg();
@@ -20109,6 +20147,9 @@ mod tests {
     #[test]
     fn slash_subagent_honours_the_definitions_engine() {
         const KEY: &str = "PLANK_TEST_SLASH_ALT_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(KEY, "sk-test") };
         let dir = scratch_dir("slash-subagent-alt");
         let cfg = test_cfg();
@@ -20445,6 +20486,9 @@ or the user's next message aborts before its first token"
     #[test]
     fn slash_subagent_reports_an_unavailable_engine_without_forking() {
         const KEY: &str = "PLANK_TEST_SLASH_MISSING_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(KEY) };
         let dir = scratch_dir("slash-subagent-missing");
         let cfg = test_cfg();
@@ -20466,6 +20510,9 @@ or the user's next message aborts before its first token"
     #[test]
     fn clean_room_sidechain_hides_the_parent_transcript() {
         const KEY: &str = "PLANK_TEST_CLEANROOM_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(KEY, "sk-test") };
         let dir = scratch_dir("alt-engine-cleanroom");
         let cfg = test_cfg();
@@ -20512,6 +20559,9 @@ or the user's next message aborts before its first token"
     #[test]
     fn the_alt_engine_returns_to_its_cache_when_the_sidechain_fails() {
         const KEY: &str = "PLANK_TEST_FAIL_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::set_var(KEY, "sk-test") };
         let dir = scratch_dir("alt-engine-fails");
         let cfg = test_cfg();
@@ -20545,6 +20595,9 @@ or the user's next message aborts before its first token"
     #[test]
     fn a_missing_api_key_fails_before_the_fork() {
         const KEY: &str = "PLANK_TEST_ABSENT_KEY";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unsafe { std::env::remove_var(KEY) };
         let dir = scratch_dir("alt-engine-nokey");
         let cfg = test_cfg();
@@ -20567,6 +20620,9 @@ or the user's next message aborts before its first token"
     fn definitions_with_different_key_vars_get_separate_engines() {
         const A: &str = "PLANK_TEST_KEY_A";
         const B: &str = "PLANK_TEST_KEY_B";
+        let _g = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for var in [A, B] {
             unsafe { std::env::set_var(var, "sk-test") };
         }
@@ -21449,5 +21505,38 @@ or the user's next message aborts before its first token"
         assert_eq!(img.get_pixel(0, 2).0, [205, 0, 0, 255]);
         // An untouched blank cell (Reset bg) stays black.
         assert_eq!(img.get_pixel(2, 0).0, [0, 0, 0, 255]);
+    }
+
+    /// Regression: `read_quiet_batched` used to read through `std::io::stdin()`,
+    /// whose internal `BufReader` slurps the whole pipe into its own buffer on
+    /// the first read. After that `poll` saw an empty fd, reported a quiet
+    /// window, and a prompt over 4096 bytes was submitted truncated. Reading the
+    /// fd directly with `libc::read` collects every byte.
+    #[test]
+    fn read_batched_from_collects_a_prompt_larger_than_one_read_chunk() {
+        use std::io::Write as _;
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid two-element array for the call.
+        unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0, "pipe");
+        }
+        let (rx, tx) = (fds[0], fds[1]);
+        // 12 KiB — well past the 4096-byte chunk size.
+        let payload = "x".repeat(12 * 1024);
+        let payload_clone = payload.clone();
+        let writer = std::thread::spawn(move || {
+            // SAFETY: `tx` is a valid write end of the pipe.
+            let mut tx = unsafe { std::fs::File::from_raw_fd(tx) };
+            // Write everything, then close so the reader sees EOF.
+            tx.write_all(payload_clone.as_bytes()).expect("write");
+            drop(tx);
+        });
+        let mut eof = false;
+        let prompt = read_batched_from(rx, &mut eof).expect("read");
+        writer.join().expect("writer joined");
+        // The full prompt was collected — not truncated at 4096.
+        assert_eq!(prompt.as_deref(), Some(payload.as_str()));
+        assert!(eof, "EOF was reached");
     }
 }
