@@ -633,6 +633,11 @@ fn finish_cancel(
         }
     }
     clear_cancel_in(root);
+    // The `error` slot doubles as which-kind-of-cancel here: `status_report_in`
+    // never reads it for `Phase::Cancelled`, so stashing it costs nothing, and
+    // `note_last_run_outcome_in` needs to tell a Keep cancel (resume next
+    // launch, must NOT be recorded as declined) from a Delete cancel (bytes
+    // are gone, declining is correct) apart.
     publish(
         root,
         manifest,
@@ -643,9 +648,27 @@ fn finish_cancel(
         0,
         0,
         Phase::Cancelled,
-        None,
+        Some(
+            match how {
+                Cancel::Keep => "keep",
+                Cancel::Delete => "delete",
+            }
+            .to_string(),
+        ),
     );
     Outcome::Cancelled
+}
+
+/// Whether a `Phase::Cancelled` state was a Keep cancel (partial files stay,
+/// resume on the next launch) rather than a Delete cancel.
+///
+/// A state that predates this distinction (no `error`, or a value that is not
+/// one of the two markers `finish_cancel` writes) is treated as `Delete` — the
+/// conservative reading, since re-declining a version costs nothing but
+/// silently re-downloading one the user asked to stop would be worse.
+#[must_use]
+pub fn cancelled_kept(state: &State) -> bool {
+    state.phase == Phase::Cancelled && state.error.as_deref() == Some("keep")
 }
 
 /// Publishes one state snapshot. Best-effort: a download that is going fine is
@@ -1513,6 +1536,13 @@ pub(crate) mod tests {
         let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(part_path_in(&root, "main").exists(), "keep means keep");
+        // Fix C: a Keep cancel's whole point is "stop now, resume later", so
+        // `note_last_run_outcome_in` must be able to tell it apart from a
+        // Delete cancel and not treat it as a decline.
+        assert!(
+            cancelled_kept(&read_state_in(&root).expect("state published")),
+            "a Keep cancel must record as kept"
+        );
     }
 
     #[test]
@@ -1525,6 +1555,10 @@ pub(crate) mod tests {
         let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(!part_path_in(&root, "main").exists(), "delete means delete");
+        assert!(
+            !cancelled_kept(&read_state_in(&root).expect("state published")),
+            "a Delete cancel must not record as kept"
+        );
     }
 
     #[test]
@@ -1972,9 +2006,20 @@ pub(crate) mod tests {
         // popup could understate what [d] is about to erase.
         let dir = tempdir();
         std::fs::create_dir_all(crate::manifest::staging_dir_in(&dir)).expect("staging");
-        std::fs::write(part_path_in(&dir, "main"), vec![0u8; 20_000_000_000]).expect("main part");
-        std::fs::write(part_path_in(&dir, "vision"), vec![0u8; 16_200_000_000])
-            .expect("vision part");
+        // Sparse, not real bytes: `part_bytes_on_disk` reads `metadata().len()`,
+        // which `set_len` satisfies without writing a single block. Writing
+        // real 20 GB + 16.2 GB vecs here once measured 17.4s wall, 34 GB
+        // actually written to disk, and 20 GB held live on the heap until
+        // process exit — enough to fail outright on a CI runner with ~14 GB
+        // free.
+        File::create(part_path_in(&dir, "main"))
+            .expect("create main part")
+            .set_len(20_000_000_000)
+            .expect("size main part");
+        File::create(part_path_in(&dir, "vision"))
+            .expect("create vision part")
+            .set_len(16_200_000_000)
+            .expect("size vision part");
         let mut st = a_state();
         st.pid = std::process::id();
         st.updated = now_epoch();
