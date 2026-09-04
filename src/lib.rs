@@ -59,6 +59,7 @@ pub mod kvpane;
 pub mod kvtier;
 pub mod kvtree;
 pub mod logo;
+pub mod manifest;
 pub mod memory;
 #[cfg(feature = "builtin_editor")]
 pub mod miniedit;

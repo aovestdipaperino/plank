@@ -93,6 +93,12 @@ ring = "0.17"
 # reference tool produces by default. Same RustCrypto family as `sha2`, already
 # present.
 blake2 = "0.10"
+# Streaming SHA-256 for model-artifact verification (`src/downloader.rs`). The
+# rest of plank hashes by shelling out to `shasum` (`imagepaste`), which cannot
+# work here: an 87 GB artifact is verified *while it downloads*, so the hasher
+# has to live in-process and survive chunk by chunk. Already in the lockfile
+# behind the RustCrypto crates `blake2` pulls in, so this adds no new code.
+sha2 = "0.10"
 logo-art = "0.3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 # Fork of ratatui-markdown v0.3.6 (MIT OR Apache-2.0, cut at tag v0.3.6 before

@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "released": "2026-09-04",
+  "notes": "DeepSeek V4 Flash Vision-Experimental, initial manifest",
+  "files": {
+    "main": {
+      "name": "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf",
+      "url": "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main/DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8.gguf",
+      "bytes": 86720111776,
+      "sha256": "8f2d42c0071ccf8a98f391cc2b835fd123f12330690b3059dbb7707920e5ad9e"
+    },
+    "vision": {
+      "name": "DeepSeek-V4-Flash-Vision-Encoder.gguf",
+      "url": "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main/DeepSeek-V4-Flash-Vision-Encoder.gguf",
+      "bytes": 932857760,
+      "sha256": "00cd4d81a435364967400a95c42703343e11da6b6f18c5143fe76e1d94d5035f"
+    },
+    "dspark": {
+      "name": "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf",
+      "url": "https://huggingface.co/antirez/deepseek-v4-gguf/resolve/main/DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf",
+      "bytes": 5989114528,
+      "sha256": "0807a67fd9ce5874bfc60d8d2461f50e11657e3dd94913d3473f85aa679bc877"
+    }
+  }
+}
