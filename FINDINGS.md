@@ -2014,7 +2014,7 @@ grid cell to recolour and no escape path into that widget. Not an error —
 silence, which is the worst failure mode for an indicator, because it works on
 your machine. plank paints the cursor itself with `nano-cursor` instead.
 
-Two consequences that are easy to break:
+Three consequences that are easy to break:
 
 - `render_input` must paint the cursor *after* the text. `nano_cursor::render`
   reads the cell it is about to paint for the glyph's colour (to re-ink it
@@ -2027,3 +2027,11 @@ Two consequences that are easy to break:
 - The caret cell is cleared next to `set_input_rect(None)` on no-prompt
   frames. Those two lines answer the same question and must not drift apart,
   or `place()` moves the real cursor to a position from an older frame.
+
+The phase and the caret are process globals, and `render_input` writes the
+caret on every prompt frame. libtest runs tests in parallel, so any test that
+draws a prompt — even one testing something unrelated, like how a sub-agent
+name is coloured — can overwrite the caret a concurrent test is asserting on.
+`cursor::TEST_LOCK` serializes every test that touches either global; acquire
+it at the top of the `#[test]` function and never inside a shared helper, or
+the non-reentrant mutex deadlocks the suite instead of failing it.
