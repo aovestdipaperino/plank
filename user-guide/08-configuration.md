@@ -145,7 +145,7 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--backend NAME` | `metal`, `cuda`, or `cpu` |
 | `--metal` / `--cuda` / `--cpu` | the same, as switches |
 | `--power N` | GPU power cap percent (1..100) |
-| `-c, --ctx N` | context window in tokens |
+| `-c, --ctx N` | context window in tokens, or with a `k`/`m` suffix: `-c 128k`, `-c 1m` |
 | `-n, --tokens N` | maximum tokens to generate (default 50000) |
 | `--quality` | quality mode |
 | `--warm-weights` | touch all weights at load |

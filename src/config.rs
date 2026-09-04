@@ -457,9 +457,10 @@ Options:
       --idle-reclaim-secs S  snapshot & reclaim a session's KV after it is idle S
                            seconds, restoring on next request (--shared-engine;
                            default 0 = off)
-      --session-ctx-size N default per-session context window in tokens for
-                           --shared-engine; fits more clients (default 0 = model
-                           max; a client's own ctx_size request overrides)
+      --session-ctx-size N default per-session context window for
+                           --shared-engine; fits more clients. Tokens, or k/m as
+                           for --ctx (default 0 = model max; a client's own
+                           ctx_size request overrides)
       --kv-budget-bytes B  aggregate KV-bytes admission budget for --shared-engine;
                            reject an attach past B rather than OOM (default 0 = off,
                            count-only admission)
@@ -495,7 +496,8 @@ Options:
                            (omit PORT for an ephemeral one, printed to stderr)
   -sys, --system TEXT      override the system prompt
       --trace PATH         append a trace log to PATH
-  -c, --ctx N              context window size in tokens (default 1048576)
+  -c, --ctx N              context window size in tokens; accepts a k/m suffix,
+                           e.g. 128k or 1m (default 1048576)
   -n, --tokens N           maximum tokens to generate (default 50000)
       --temp F             sampling temperature (0..100)
       --top-p F            nucleus sampling threshold (0..1)
@@ -552,6 +554,36 @@ pub fn parse_int(s: &str, opt: &str) -> Result<i32, String> {
         .ok()
         .filter(|v| *v > 0)
         .ok_or_else(|| format!("invalid value for {opt}: {s}"))
+}
+
+/// Parses a context window in tokens, accepting a `k` or `m` suffix.
+///
+/// Windows are quoted in those units everywhere they are discussed — "a 128k
+/// context", "the 1M build" — so `-c 128k` is what someone reaches for, and
+/// `-c 131072` is the spelling that needs a calculator. The multiplier is
+/// binary (1024, 1024²) because that is where those round figures come from:
+/// the default window really is 1048576 tokens, not 1000000.
+///
+/// # Errors
+/// Returns an error when `s` is not a positive token count, when the suffix is
+/// anything other than a single `k`/`m` (case-insensitive), or when the result
+/// does not fit an `i32`.
+pub fn parse_ctx_size(s: &str, opt: &str) -> Result<i32, String> {
+    let bad = || format!("invalid value for {opt}: {s}");
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b'k' | b'K') => (&s[..s.len() - 1], 1024_i64),
+        Some(b'm' | b'M') => (&s[..s.len() - 1], 1024 * 1024),
+        _ => (s, 1),
+    };
+    let n: i64 = digits.parse().map_err(|_| bad())?;
+    if n <= 0 {
+        return Err(bad());
+    }
+    // Checked, so a `9999m` that would wrap into a plausible-looking small
+    // window is refused rather than silently accepted.
+    n.checked_mul(mult)
+        .and_then(|v| i32::try_from(v).ok())
+        .ok_or_else(bad)
 }
 
 /// Parses a positive `u64`, naming `opt` in the error message.
@@ -1196,7 +1228,12 @@ pub fn parse_options_with(
                 c.idle_reclaim_secs =
                     u64::try_from(parse_int(need_arg(&mut i)?, arg)?.max(0)).unwrap_or(0);
             }
-            "--session-ctx-size" => c.session_ctx_size = parse_int(need_arg(&mut i)?, arg)?.max(0),
+            // `0` is this flag's "no per-session cap", so it is the one window
+            // that may legitimately be zero.
+            "--session-ctx-size" => {
+                let v = need_arg(&mut i)?;
+                c.session_ctx_size = if v == "0" { 0 } else { parse_ctx_size(v, arg)? };
+            }
             "--kv-budget-bytes" => {
                 c.kv_budget_bytes = parse_u64(need_arg(&mut i)?, arg)?;
             }
@@ -1246,7 +1283,7 @@ pub fn parse_options_with(
             "-sys" | "--system" => need_arg(&mut i)?.clone_into(&mut c.system),
             "--trace" => c.trace_path = Some(PathBuf::from(need_arg(&mut i)?)),
             "-c" | "--ctx" => {
-                c.generation.ctx_size = parse_int(need_arg(&mut i)?, arg)?;
+                c.generation.ctx_size = parse_ctx_size(need_arg(&mut i)?, arg)?;
                 c.ctx_size_explicit = true;
                 c.cli_set("engine.ctx");
             }
@@ -1582,6 +1619,66 @@ mod tests {
         // Per-session sizing + KV budget default to off (today's behavior).
         assert_eq!(d.session_ctx_size, 0);
         assert_eq!(d.kv_budget_bytes, 0);
+    }
+
+    /// A context window is quoted in `k`/`m` everywhere else in the field
+    /// ("a 128k window"), so the flag accepts it written that way. The unit is
+    /// binary, matching how those figures are actually derived: 128k is
+    /// 131072, not 128000.
+    #[test]
+    fn context_sizes_accept_k_and_m_suffixes() {
+        for (text, want) in [
+            ("8192", 8192),
+            ("128k", 128 * 1024),
+            ("128K", 128 * 1024),
+            ("1m", 1024 * 1024),
+            ("1M", 1024 * 1024),
+        ] {
+            assert_eq!(
+                parse_ctx_size(text, "--ctx"),
+                Ok(want),
+                "parsing {text} as a context size"
+            );
+        }
+    }
+
+    /// The suffix must not become a way to smuggle in a nonsense window: a
+    /// value that overflows `i32` is an error, not a wrapped-around one, and
+    /// the units stop at `m` rather than accepting any trailing letter.
+    #[test]
+    fn context_sizes_reject_garbage_and_overflow() {
+        for bad in [
+            "", "k", "m", "0", "0k", "-8k", "8g", "8kb", "1.5k", "8 k", "9999m",
+        ] {
+            assert!(
+                parse_ctx_size(bad, "--ctx").is_err(),
+                "{bad} must be refused"
+            );
+        }
+    }
+
+    /// `--session-ctx-size 0` means "no per-session cap" and must keep
+    /// working: it is the one window flag for which zero is a real value.
+    #[test]
+    fn session_ctx_size_still_accepts_zero() {
+        let c = parse_options(&["--session-ctx-size".into(), "0".into()]).unwrap();
+        assert_eq!(c.session_ctx_size, 0);
+        assert!(parse_options(&["-c".into(), "0".into()]).is_err());
+    }
+
+    /// The flags that take a window, end to end.
+    #[test]
+    fn ctx_flags_accept_suffixed_values() {
+        let c = parse_options(&[
+            "-c".into(),
+            "256k".into(),
+            "--session-ctx-size".into(),
+            "32k".into(),
+        ])
+        .unwrap();
+        assert_eq!(c.generation.ctx_size, 256 * 1024);
+        assert!(c.ctx_size_explicit);
+        assert_eq!(c.session_ctx_size, 32 * 1024);
     }
 
     #[test]

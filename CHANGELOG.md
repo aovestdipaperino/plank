@@ -6,7 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- Model upgrades are now driven by a versioned `ds4.manifest` covering all three artifacts (main, vision, DSpark), replacing the Hugging Face tree scan. Downloads run in a detached background process that survives quitting plank, resume across launches, are verified by SHA-256 while streaming, and install on the next launch. `/model` and Alt-M show and cancel them.
+### Added
+
+- **`--ctx` accepts a `k`/`m` suffix.** A context window is quoted in those
+  units everywhere it is discussed — "a 128k context", "the 1M build" — so
+  `-c 128k` and `-c 1m` now work alongside `-c 131072`. The multiplier is
+  binary, which is where those round figures come from: the default window is
+  1048576 tokens, not 1000000. `--session-ctx-size` takes the same spelling
+  (its `0`, meaning "no per-session cap", is unchanged). A value that would
+  overflow the window is refused rather than wrapped.
+- **Model upgrades are driven by a versioned `ds4.manifest`.** It covers all
+  three artifacts (main, vision, DSpark) and is compared by a single version
+  number, replacing the Hugging Face tree scan and the per-file `.source`
+  stamps. When a newer version appears plank asks before doing anything, and
+  only on a yes: the download then runs in a detached process that survives
+  quitting plank, is verified by SHA-256 as it streams, and is installed at the
+  next launch rather than under a running session. Partial and verified files
+  live in `~/.plank/staging/` and resume rather than restart. A status segment
+  shows progress, Alt-M cancels, and `/model` reports, cancels or starts one.
 
 ## [3.6.3] - 2026-09-04
 
