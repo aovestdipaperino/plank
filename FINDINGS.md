@@ -2005,3 +2005,25 @@ for a reason that had nothing to do with what it was testing. The fix is an
 atomic counter folded into the directory name alongside pid and timestamp, so
 two tests in the same process can never collide even when the clock does not
 move between them.
+
+## The cursor is drawn, not requested
+
+OSC 12 (`ESC ] 12 ; #rrggbb BEL`) is a *request*, and Warp ignores it: it draws
+its cursor as a widget in its own UI, coloured from its theme, so there is no
+grid cell to recolour and no escape path into that widget. Not an error —
+silence, which is the worst failure mode for an indicator, because it works on
+your machine. plank paints the cursor itself with `nano-cursor` instead.
+
+Two consequences that are easy to break:
+
+- `render_input` must paint the cursor *after* the text. `nano_cursor::render`
+  reads the cell it is about to paint for the glyph's colour (to re-ink it
+  rather than erase it) and its width (so a wide CJK glyph gets both cells).
+- plank never calls `frame.set_cursor_position`, so ratatui emits `Hide`. But
+  hidden is not absent: terminals anchor the IME candidate window and
+  screen-reader focus to the position they track, so `cursor::place()` still
+  moves the hidden cursor to the caret after each draw. Skip that and CJK
+  input breaks with nothing visibly wrong.
+- The caret cell is cleared next to `set_input_rect(None)` on no-prompt
+  frames. Those two lines answer the same question and must not drift apart,
+  or `place()` moves the real cursor to a position from an older frame.

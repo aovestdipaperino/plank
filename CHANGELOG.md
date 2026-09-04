@@ -10,8 +10,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **The prompt's phase cursor is drawn into the frame instead of sent as an
   OSC 12 escape.** OSC 12 recolouring was silently ignored by Warp and other
-  terminals, so the idle/busy indicator simply never appeared for a lot of
-  users. `render_input` now paints it itself with the `nano-cursor` crate: a
+  terminals, so the idle/busy indicator never appeared on them. `render_input` now paints it itself with the `nano-cursor` crate: a
   post-pass block cursor over the text just drawn, coloured green while
   waiting on you and red while the agent is busy, re-inking the glyph
   underneath for contrast and covering both cells of a double-width
