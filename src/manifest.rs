@@ -149,6 +149,68 @@ pub fn read_at(path: &Path) -> Option<Manifest> {
     parse(&std::fs::read_to_string(path).ok()?).ok()
 }
 
+/// What startup should do about the remote manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Decision {
+    /// Nothing to do: the installed set is current, or newer.
+    UpToDate,
+    /// The files on disk already match this manifest, but nothing recorded
+    /// that. Write it as installed and say nothing.
+    Adopt(Manifest),
+    /// Offer to download this manifest's set. `from` is the installed version,
+    /// or 0 when there was none.
+    Offer { manifest: Manifest, from: u32 },
+}
+
+/// Decides what to do about `remote`, given what is installed and what is on
+/// disk.
+///
+/// `size_of` reports the byte length of the locally installed artifact of a
+/// given kind, or `None` when it is absent. It is injected rather than read
+/// from the filesystem because a wrong answer here costs the user an 87 GB
+/// download, which is worth testing exhaustively without a disk.
+///
+/// Only kinds in both [`KINDS`] and the manifest are considered: a manifest
+/// entry this build does not know how to install cannot block adoption, and a
+/// kind the manifest omits cannot be demanded on disk.
+#[must_use]
+pub fn decide(
+    remote: Manifest,
+    installed: Option<&Manifest>,
+    size_of: &dyn Fn(&str) -> Option<u64>,
+) -> Decision {
+    if let Some(installed) = installed {
+        return if remote.version > installed.version {
+            let from = installed.version;
+            Decision::Offer {
+                manifest: remote,
+                from,
+            }
+        } else {
+            // Equal, or a rolled-back remote. Never downgrade.
+            Decision::UpToDate
+        };
+    }
+
+    // Adopt-on-first-sight: no installed manifest, but if every artifact this
+    // build installs is present at the manifest's own size, the set on disk is
+    // almost certainly already this release — recorded by a plank that predates
+    // manifests. Silently adopt rather than offering a re-download of bytes the
+    // user already has.
+    let matches = KINDS
+        .iter()
+        .filter_map(|kind| remote.files.get(*kind).map(|e| (*kind, e)))
+        .all(|(kind, entry)| size_of(kind) == Some(entry.bytes));
+    if matches {
+        Decision::Adopt(remote)
+    } else {
+        Decision::Offer {
+            manifest: remote,
+            from: 0,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +300,123 @@ mod tests {
         assert_eq!(installed_path(), root.join("ds4.manifest"));
         assert_eq!(staging_dir(), root.join("staging"));
         assert_eq!(downloads_dir(), root.join("downloads"));
+    }
+
+    /// `sample()` at a given version, so tests can build a "newer" manifest.
+    fn sample_at(version: u32) -> String {
+        sample().replace(r#""version": 3"#, &format!(r#""version": {version}"#))
+    }
+
+    /// A size lookup that reports every artifact present at its manifest size.
+    fn all_present(kind: &str) -> Option<u64> {
+        match kind {
+            "main" => Some(100),
+            "vision" => Some(200),
+            "dspark" => Some(300),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn same_version_is_up_to_date() {
+        let remote = parse(sample()).expect("parses");
+        let installed = parse(sample()).expect("parses");
+        assert!(matches!(
+            decide(remote, Some(&installed), &all_present),
+            Decision::UpToDate
+        ));
+    }
+
+    #[test]
+    fn a_newer_remote_is_offered() {
+        let remote = parse(&sample_at(4)).expect("parses");
+        let installed = parse(sample()).expect("parses");
+        match decide(remote, Some(&installed), &all_present) {
+            Decision::Offer { manifest, from } => {
+                assert_eq!(manifest.version, 4);
+                assert_eq!(from, 3);
+            }
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_older_remote_is_ignored() {
+        // A rolled-back manifest must never trigger a downgrade download.
+        let remote = parse(&sample_at(2)).expect("parses");
+        let installed = parse(sample()).expect("parses");
+        assert!(matches!(
+            decide(remote, Some(&installed), &all_present),
+            Decision::UpToDate
+        ));
+    }
+
+    #[test]
+    fn no_installed_manifest_but_matching_sizes_adopts_silently() {
+        // Adopt-on-first-sight. Without this rule, every existing user is offered
+        // an 87 GB re-download the day this ships.
+        let remote = parse(sample()).expect("parses");
+        match decide(remote, None, &all_present) {
+            Decision::Adopt(m) => assert_eq!(m.version, 3),
+            other => panic!("expected adoption, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_installed_manifest_and_a_wrong_size_offers() {
+        let remote = parse(sample()).expect("parses");
+        let sizes = |kind: &str| {
+            if kind == "vision" {
+                Some(999)
+            } else {
+                all_present(kind)
+            }
+        };
+        match decide(remote, None, &sizes) {
+            Decision::Offer { from, .. } => assert_eq!(from, 0),
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_installed_manifest_and_a_missing_file_offers() {
+        let remote = parse(sample()).expect("parses");
+        let sizes = |kind: &str| {
+            if kind == "dspark" {
+                None
+            } else {
+                all_present(kind)
+            }
+        };
+        match decide(remote, None, &sizes) {
+            Decision::Offer { from, .. } => assert_eq!(from, 0),
+            other => panic!("expected an offer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn adoption_only_considers_kinds_the_manifest_actually_lists() {
+        // A manifest with no dspark entry must not demand a dspark file on disk.
+        let text = r#"{"version":1,"released":"x","notes":"","files":{
+            "main": { "name": "m.gguf", "url": "u", "bytes": 100, "sha256": "aa" }
+        }}"#;
+        let remote = parse(text).expect("parses");
+        let sizes = |kind: &str| (kind == "main").then_some(100);
+        assert!(matches!(decide(remote, None, &sizes), Decision::Adopt(_)));
+    }
+
+    #[test]
+    fn an_unknown_kind_is_not_required_on_disk() {
+        // `futureproof` is in the manifest but this build cannot install it, so it
+        // must not block adoption or the size check.
+        let text = sample().replace(
+            r#""dspark":"#,
+            r#""futureproof": { "name": "f.gguf", "url": "u", "bytes": 7, "sha256": "dd" }, "dspark":"#,
+        );
+        let remote = parse(&text).expect("parses");
+        assert!(matches!(
+            decide(remote, None, &all_present),
+            Decision::Adopt(_)
+        ));
     }
 }
