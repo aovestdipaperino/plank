@@ -596,6 +596,9 @@ impl CompactSink for TuiCompactSink<'_> {
             self.log
                 .set_progress(Some(tui::compact_progress_line(frac)));
         }
+        // Compaction is plank's turn, not yours — same red as generation, and
+        // the idle loop paints it back green when the prompt returns.
+        crate::cursor::set(crate::cursor::State::Busy);
         let (log, view) = (&*self.log, &mut *self.view);
         let _ = self.terminal.draw(|f| {
             tui::draw(
@@ -2190,6 +2193,20 @@ impl Agent<'_> {
             }
             SubSinkTarget::Null | SubSinkTarget::Stdout => None,
         };
+        // The plan a sub-agent puts up follows its status lines into the pane
+        // (or nowhere), on the same restore-on-every-exit-path discipline.
+        let parent_md = self.tool_ctx.markdown_sink.take();
+        self.tool_ctx.markdown_sink = match &self.sub_sink {
+            SubSinkTarget::Events(tx) => {
+                let tx = tx.clone();
+                Some(Box::new(move |doc: &str| {
+                    let _ = tx.send(crate::worker::UiEvent::Sub(Box::new(
+                        crate::worker::UiEvent::Markdown(doc.to_owned()),
+                    )));
+                }))
+            }
+            SubSinkTarget::Null | SubSinkTarget::Stdout => None,
+        };
         // Its own console window, on the same restore-on-every-exit-path
         // discipline as the status sink above. The guard is scoped to the
         // rounds, so nesting works for free: guards stack LIFO, matching
@@ -2200,6 +2217,7 @@ impl Agent<'_> {
             self.run_subagent_rounds()
         };
         self.tool_ctx.status_sink = parent_sink;
+        self.tool_ctx.markdown_sink = parent_md;
         result
     }
 
@@ -3825,7 +3843,7 @@ impl Agent<'_> {
             "Write the AGENTS.md file to the current directory."
         );
 
-        log.push_spans(tui::user_echo_spans(prompt));
+        log.push_user_echo(prompt);
         self.session.push(Message::user(prompt));
         if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
             log.push_plain(format!("/init failed: {e}"));
@@ -4502,7 +4520,7 @@ impl Agent<'_> {
                 Role::User => {
                     let text = m.text.trim();
                     if !text.is_empty() {
-                        log.push_spans(tui::user_echo_spans(text));
+                        log.push_user_echo(text);
                     }
                 }
                 Role::Assistant => {
@@ -7767,6 +7785,9 @@ impl Agent<'_> {
             DisableBracketedPaste,
             DisableMouseCapture
         );
+        // Hand the cursor back to the user's own terminal theme before the
+        // shell prompt returns.
+        crate::cursor::reset();
         ratatui::restore();
         result.map(|_| ())
     }
@@ -7898,7 +7919,7 @@ impl Agent<'_> {
         // so a long generation cannot be mistaken for an idle user.
         let mut last_activity = Instant::now();
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
-            log.push_spans(tui::user_echo_spans(initial));
+            log.push_user_echo(initial);
             self.session.push(Message::user(initial));
             self.tui_turn(
                 terminal,
@@ -8047,6 +8068,10 @@ impl Agent<'_> {
                     Some(run) => (&run.log, &mut run.view),
                     None => (&log, &mut view),
                 };
+            // The prompt is live on this frame: the cursor goes back to the
+            // theme green. Set per-frame rather than once on entry because a
+            // turn ending is not the only way back here (panes, suspends).
+            crate::cursor::set(crate::cursor::State::Idle);
             let completed = terminal
                 .draw(|f| {
                     // A `/btw` panel left open from an earlier turn keeps the
@@ -8227,7 +8252,7 @@ impl Agent<'_> {
                             }
                         } else {
                             r.bus.broadcast(UiEvent::UserEcho(line.clone()));
-                            log.push_spans(tui::user_echo_spans(&line));
+                            log.push_user_echo(&line);
                             self.session.push(Message::user(line));
                             run = true;
                         }
@@ -8786,7 +8811,7 @@ impl Agent<'_> {
                             );
                             continue;
                         }
-                        log.push_spans(tui::user_echo_spans(&line));
+                        log.push_user_echo(&line);
                         let result = Self::tui_bang(
                             &self.tool_ctx.cwd.clone(),
                             &cmd,
@@ -8851,7 +8876,7 @@ impl Agent<'_> {
                             );
                         }
                         let echo = if line.is_empty() { &message } else { &line };
-                        log.push_spans(tui::user_echo_spans(echo));
+                        log.push_user_echo(echo);
                         self.session.push(Message::user(&message));
                         self.tui_turn(
                             terminal,
@@ -9850,6 +9875,14 @@ impl Agent<'_> {
             let tx = tx.clone();
             Box::new(move |msg: &str| {
                 let _ = tx.send(UiEvent::SystemStatus(msg.to_owned()));
+            })
+        });
+        // Same channel, so a plan lands in the log in the order it happened,
+        // but rendered as a document rather than as a `✦` status line.
+        self.tool_ctx.markdown_sink = Some({
+            let tx = tx.clone();
+            Box::new(move |doc: &str| {
+                let _ = tx.send(UiEvent::Markdown(doc.to_owned()));
             })
         });
         if let Some(reason) = self.fire_user_prompt_submit(&mut |w| {
@@ -11342,7 +11375,7 @@ impl Agent<'_> {
             }
             _ => match self.slash_message(cmd, arg) {
                 Some(Ok(message)) => {
-                    log.push_spans(tui::user_echo_spans(line));
+                    log.push_user_echo(line);
                     self.session.push(Message::user(message));
                     if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
                         log.push_plain(format!("{cmd} failed: {e}"));
@@ -11358,7 +11391,7 @@ impl Agent<'_> {
                             input.buf.set_text(text);
                         }
                         if let Some(prompt) = out.prompt {
-                            log.push_spans(tui::user_echo_spans(&prompt));
+                            log.push_user_echo(&prompt);
                             self.session.push(Message::user(prompt));
                             if let Err(e) =
                                 self.tui_turn(terminal, log, view, input, btw, arcade, sub)
@@ -11668,6 +11701,9 @@ fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce
         DisableMouseCapture,
         LeaveAlternateScreen
     );
+    // Whatever runs under the suspension (an editor, a shell) gets the user's
+    // own cursor color back; the draw loops repaint ours on the way in.
+    crate::cursor::reset();
     let _ = disable_raw_mode();
     let out = {
         let _restore = Restore;
@@ -12099,6 +12135,9 @@ fn busy_ui_loop(
                 Some(run) => (&run.log, &mut run.view),
                 None => (log, view),
             };
+        // The turn owns the engine: the prompt still takes keystrokes (they
+        // queue), but plank is not waiting on you, so the cursor goes red.
+        crate::cursor::set(crate::cursor::State::Busy);
         terminal
             .draw(|f| {
                 // The `/btw` split is about the main task, so it steps aside
@@ -12352,7 +12391,7 @@ fn busy_ui_loop(
                             // `/help`) run against a turn-start snapshot, so they
                             // stay available while the model streams.
                             input.history.add(&line);
-                            log.push_spans(tui::user_echo_spans(&line));
+                            log.push_user_echo(&line);
                             log.push_ansi(&out);
                             view.follow = true;
                             sub.follow_all();
@@ -12378,7 +12417,7 @@ fn busy_ui_loop(
                             );
                         } else {
                             input.history.add(&line);
-                            log.push_spans(tui::user_echo_spans(&line));
+                            log.push_user_echo(&line);
                             log.push_dim("[queued — joins the conversation at the next step]");
                             shared.push_queued(line);
                             view.follow = true;
@@ -12650,6 +12689,12 @@ fn new_agent(
         let color = std::io::stdout().is_terminal();
         tool_ctx.status_sink = Some(Box::new(move |msg: &str| {
             println!("{}", crate::status::system_line(msg, color));
+        }));
+        // The plain REPL has no markdown renderer, but printing the document
+        // verbatim still keeps its headings and line breaks — which is the
+        // whole point next to the one-line `✦` status form.
+        tool_ctx.markdown_sink = Some(Box::new(|doc: &str| {
+            println!("{doc}\n");
         }));
         // Interactive approval for web access, like agent_web_confirm;
         // headless runs keep the auto-deny default.

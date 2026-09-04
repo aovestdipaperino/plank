@@ -102,6 +102,12 @@ pub struct ToolContext {
     /// Front end for system status lines emitted during a dispatch; `None`
     /// swallows them (non-interactive runs, tests).
     pub status_sink: Option<StatusSinkFn>,
+    /// Front end for whole markdown documents a tool shows the user — the plan
+    /// `ExitPlanMode` presents. Separate from [`Self::status_sink`] because a
+    /// status line is a one-line notice styled with a `✦` bullet, and a plan is
+    /// a document that has to keep its headings, lists and line breaks. `None`
+    /// falls back to the status sink.
+    pub markdown_sink: Option<StatusSinkFn>,
     /// Live MCP servers started from the `.mcp.json` config, if any.
     pub mcp: Vec<mcp::McpServer>,
     /// Resolved paths of recent successful `read` calls, oldest first, for
@@ -220,6 +226,7 @@ impl ToolContext {
             web: web::WebState::default(),
             web_confirm: None,
             status_sink: None,
+            markdown_sink: None,
             mcp: Vec::new(),
             recent_reads: Vec::new(),
             hooks: crate::hooks::Hooks::default(),
@@ -249,6 +256,15 @@ impl ToolContext {
     pub fn publish_status(&self, msg: &str) {
         if let Some(sink) = self.status_sink.as_ref() {
             sink(msg);
+        }
+    }
+
+    /// Shows a whole markdown document in the transcript, falling back to a
+    /// status line when no front end takes documents.
+    pub fn publish_markdown(&self, doc: &str) {
+        match self.markdown_sink.as_ref() {
+            Some(sink) => sink(doc),
+            None => self.publish_status(doc),
         }
     }
 
@@ -581,15 +597,21 @@ fn tool_exit_plan_mode(ctx: &mut ToolContext, call: &ToolCall) -> String {
         return "Tool error: ExitPlanMode requires a non-empty 'plan' describing what you intend to do\n"
             .to_string();
     }
-    let Some(asker) = ctx.asker.as_mut() else {
+    if ctx.asker.is_none() {
         // No interactive user to approve; lift the gate and proceed.
         ctx.plan_mode = false;
         return "No interactive user is available to approve the plan \
                 (non-interactive mode); plan mode lifted, proceed.\n"
             .to_string();
-    };
+    }
+    // The plan goes into the transcript first, rendered as the markdown it is,
+    // and the question stays a question. Folding the plan into the question
+    // instead put a whole document inside the approval panel's one bold line,
+    // where it was unreadable and pushed the options off the panel. Published
+    // before the ask because the ask blocks until the user answers.
+    ctx.publish_markdown(plan);
     let req = ask::AskRequest {
-        question: format!("Approve this plan?\n\n{plan}"),
+        question: "Approve this plan?".to_string(),
         header: "Plan".to_string(),
         options: vec![
             ask::AskOption {
@@ -603,7 +625,13 @@ fn tool_exit_plan_mode(ctx: &mut ToolContext, call: &ToolCall) -> String {
         ],
         multi: false,
     };
-    match asker.ask(req) {
+    let outcome = match ctx.asker.as_mut() {
+        Some(asker) => asker.ask(req),
+        // Unreachable: the `is_none` return above ran first, and nothing
+        // between here and there can clear it.
+        None => ask::AskOutcome::Declined,
+    };
+    match outcome {
         ask::AskOutcome::Answered(labels) if labels.iter().any(|l| l == "Approve") => {
             ctx.plan_mode = false;
             "Plan approved. Plan mode is off; you may now modify the workspace to carry it out.\n"
@@ -1011,6 +1039,56 @@ mod tests {
         );
         assert!(!res.is_error, "write still blocked: {}", res.output);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn exit_plan_mode_shows_the_plan_and_keeps_the_question_short() {
+        use std::sync::{Arc, Mutex};
+
+        /// Approves whatever it is asked, recording the question it saw.
+        struct Yes(Arc<Mutex<Vec<String>>>);
+        impl ask::Asker for Yes {
+            fn ask(&mut self, req: ask::AskRequest) -> ask::AskOutcome {
+                self.0.lock().unwrap().push(req.question);
+                ask::AskOutcome::Answered(vec!["Approve".to_string()])
+            }
+        }
+
+        let (mut ctx, dir) = test_ctx();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let shown = Arc::new(Mutex::new(Vec::new()));
+        ctx.asker = Some(Box::new(Yes(asked.clone())));
+        ctx.markdown_sink = Some({
+            let shown = shown.clone();
+            Box::new(move |doc: &str| shown.lock().unwrap().push(doc.to_owned()))
+        });
+        ctx.plan_mode = true;
+
+        let plan = "# Plan\n\n1. first\n2. second";
+        let res = dispatch(&test_call("ExitPlanMode", &[("plan", plan)]), &mut ctx);
+        assert!(!res.is_error);
+        assert!(!ctx.plan_mode, "approval must lift the gate");
+        // The plan reaches the transcript whole, with its line breaks intact...
+        assert_eq!(*shown.lock().unwrap(), vec![plan.to_string()]);
+        // ...and the approval panel is left asking a question, not holding a
+        // document that it would flatten into one line.
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["Approve this plan?".to_string()]
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_plan_falls_back_to_the_status_sink_when_no_document_sink_exists() {
+        let (mut ctx, _dir) = test_ctx();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        ctx.status_sink = Some({
+            let seen = seen.clone();
+            Box::new(move |m: &str| seen.lock().unwrap().push(m.to_owned()))
+        });
+        ctx.publish_markdown("# Plan");
+        assert_eq!(*seen.lock().unwrap(), vec!["# Plan".to_string()]);
     }
 
     #[test]

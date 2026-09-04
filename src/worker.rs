@@ -42,6 +42,10 @@ pub enum UiEvent {
     SystemStatus(String),
     /// A git-style diff card for a file an `edit`/`write` call changed.
     EditCard(crate::tools::diff::EditPreview),
+    /// A complete markdown document a tool wants shown in the transcript —
+    /// the plan `ExitPlanMode` puts up for approval. Rendered like assistant
+    /// text rather than as a status line: it is a document, not a notice.
+    Markdown(String),
     /// A plain log line.
     Plain(String),
     /// A user-echo line (queued prompts, `/btw` questions).
@@ -468,8 +472,9 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Dim(t) => log.push_dim(t),
         UiEvent::SystemStatus(t) => log.push_ansi(&crate::status::system_line(&t, true)),
         UiEvent::EditCard(p) => crate::tui::render_diff_card(log, &p),
+        UiEvent::Markdown(t) => log.push_markdown(&t),
         UiEvent::Plain(t) => log.push_plain(t),
-        UiEvent::UserEcho(t) => log.push_spans(crate::tui::user_echo_spans(&t)),
+        UiEvent::UserEcho(t) => log.push_user_echo(&t),
         UiEvent::EndLine => log.end_line(),
         // Both are for remote front-ends only: locally the desktop notification
         // has already fired, and the log was cleared at the `/clear` call site.
