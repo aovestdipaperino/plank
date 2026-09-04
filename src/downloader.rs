@@ -668,9 +668,12 @@ fn one_artifact(
         ));
     }
     std::fs::rename(&part, staged_path_in(root, kind)).map_err(|e| e.to_string())?;
-    // Best-effort: a missing or unreadable sidecar just means the next check
-    // treats this artifact as stale and re-verifies it, which is safe, only
-    // slower.
+    // The sidecar proves this artifact belongs to *this* manifest, not a
+    // leftover from an older version: without it, `staged_is_current` returns
+    // false and the next check re-downloads the artifact from scratch. If the
+    // sidecar write fails, losing ~87 GB to a retry is exactly the downside we
+    // guard against. Rehashing the staged file to rebuild the sidecar would be
+    // the cheaper repair, but that is a deliberate follow-up, not an oversight.
     let _ = std::fs::write(staged_sha_path_in(root, kind), &entry.sha256);
     Ok(None)
 }
@@ -1033,7 +1036,9 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
             // Either already moved by an interrupted earlier swap (nothing
             // left in staging), or the destination already satisfies this
             // manifest's entry and whatever sits in staging is unproven for
-            // it — either way, nothing to rename here.
+            // it — either way, nothing to rename here. Clean up any leftover
+            // sidecar (e.g., from a crash after renaming but before removing it).
+            let _ = std::fs::remove_file(staged_sha_path_in(root, kind));
             continue;
         }
         std::fs::rename(&from, dest)
