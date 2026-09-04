@@ -140,6 +140,13 @@ pub fn place() {
     let _ = ratatui::crossterm::execute!(out, ratatui::crossterm::cursor::MoveTo(p.x, p.y));
 }
 
+/// Serializes tests that touch [`PHASE`] or [`CARET`]. Both are process
+/// globals and libtest runs tests in parallel, so a test that reads either
+/// one has to exclude every other test that writes it — including any test
+/// that draws a prompt, since `render_input` writes the caret.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +171,9 @@ mod tests {
 
     #[test]
     fn the_phase_round_trips_through_the_store() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set(State::Busy);
         assert_eq!(state(), State::Busy);
         set(State::Idle);
@@ -182,6 +192,9 @@ mod tests {
         // `place` moves the real cursor to whatever is in here, so a frame
         // that draws no prompt must be able to empty it — otherwise the
         // hidden cursor is left at a position from a previous frame.
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_caret(Some(Position::new(7, 3)));
         assert_eq!(caret(), Some(Position::new(7, 3)));
         set_caret(None);
@@ -190,6 +203,9 @@ mod tests {
 
     #[test]
     fn place_without_a_caret_does_nothing() {
+        let _guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         set_caret(None);
         place(); // must not panic, and must not move anything
         assert_eq!(caret(), None);

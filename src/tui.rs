@@ -4330,6 +4330,9 @@ mod tests {
                 .join("\n")
         }
 
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let with = render(Some("research"));
         assert!(with.contains("[sub-agent: research]"), "{with}");
         assert!(with.contains("Esc: back to main"), "{with}");
@@ -4416,6 +4419,9 @@ mod tests {
     fn the_roster_draws_below_the_status_bar_with_bullets_and_a_tally() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut pane = SubPane::default();
         pane.begin(
@@ -4489,6 +4495,9 @@ mod tests {
 
     #[test]
     fn a_long_activity_line_is_truncated_rather_than_overrunning_the_tally() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut pane = SubPane::default();
         pane.begin("agent".to_string(), &"x".repeat(400), 0);
         pane.add_tokens(None, 0, 1_000);
@@ -4568,6 +4577,9 @@ mod tests {
         // capped at TASK_MAX_COLS regardless of the width available.
         const TASK: &str = "Find the largest (longest) Roman numeral string when \
             counting from 1 to 50 inclusive. Write out your reasoning.";
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut pane = SubPane::default();
         pane.begin("sub-agent".to_string(), TASK, 0);
         let roster = pane.roster_view(27_000);
@@ -4746,6 +4758,9 @@ mod tests {
 
     #[test]
     fn a_row_shows_its_elapsed_time_before_any_tokens_are_counted() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // A local engine reports a pass's tokens only when the pass completes.
         // Until then the row still has something true to say.
         let mut pane = SubPane::default();
@@ -5033,25 +5048,36 @@ mod tests {
     /// reason `drawn_input_colors` does, plus one more: the cursor is a
     /// post-pass that *reads* the cells the text left behind, so it cannot be
     /// tested without them actually being there.
-    fn drawn_input_cells(input: &str, cursor: usize) -> Vec<(String, Color, Color)> {
+    ///
+    /// `via_backend` picks where the cells are read from. `true` reads them
+    /// back off `TestBackend` after the draw, which is the only way to prove
+    /// styling actually reached a backend rather than just the in-memory
+    /// frame. `false` captures the buffer from inside the draw closure,
+    /// before ratatui's `Buffer::diff` runs — required for a double-width
+    /// glyph's *trailing* cell, whose style-only change `diff` never emits to
+    /// the backend (real terminals paint the whole glyph from one SGR
+    /// sequence at the leading cell, so that cell's own background is never
+    /// sent). A caller that only inspects the leading cell should pass
+    /// `true`; the double-width test needs `false`.
+    fn drawn_input_cells(
+        input: &str,
+        cursor: usize,
+        via_backend: bool,
+    ) -> Vec<(String, Color, Color)> {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
         let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
-        // Captured from inside the closure rather than read back off the
-        // backend after `draw`: ratatui's `Buffer::diff` drops style-only
-        // changes to a wide glyph's *trailing* cell (real terminals paint
-        // the whole glyph from one SGR sequence at the leading cell, so
-        // that cell's own background is never sent), which would make the
-        // trailing half of a double-width caret invisible to a test that
-        // reads the backend's post-flush buffer instead of the frame that
-        // was actually rendered.
         let mut captured: Option<ratatui::buffer::Buffer> = None;
         term.draw(|f| {
             render_input(f, Rect::new(0, 0, 60, 1), InputState::new(input, cursor));
             captured = Some(f.buffer_mut().clone());
         })
         .unwrap();
-        let buf = captured.expect("draw closure always runs");
+        let buf = if via_backend {
+            term.backend().buffer().clone()
+        } else {
+            captured.expect("draw closure always runs")
+        };
         (0..60)
             .map(|x| {
                 let cell = &buf[(x, 0)];
@@ -5060,15 +5086,20 @@ mod tests {
             .collect()
     }
 
-    /// The cell the caret sits on for `input` with the caret at `cursor`.
+    /// The cell the caret sits on for `input` with the caret at `cursor`,
+    /// read back off the backend after the draw — proving the styling
+    /// actually reached it.
     fn caret_cell(input: &str, cursor: usize) -> (String, Color, Color) {
-        let cells = drawn_input_cells(input, cursor);
+        let cells = drawn_input_cells(input, cursor, true);
         let at = crate::cursor::caret().expect("a prompt frame records its caret");
         cells[at.x as usize].clone()
     }
 
     #[test]
     fn the_caret_wears_the_phase_colour() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cursor::set(crate::cursor::State::Idle);
         let (_, _, idle_bg) = caret_cell("hello", 0);
         assert_eq!(idle_bg, crate::cursor::IDLE_COLOR);
@@ -5082,6 +5113,9 @@ mod tests {
 
     #[test]
     fn the_glyph_under_the_caret_is_re_inked_not_erased() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cursor::set(crate::cursor::State::Idle);
         // A green block over green text would erase the character. `Ink::Auto`
         // has to push the glyph away from the cursor colour to keep it legible.
@@ -5092,9 +5126,12 @@ mod tests {
 
     #[test]
     fn a_double_width_glyph_gets_both_of_its_cells() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::cursor::set(crate::cursor::State::Idle);
         // Painting one half of a wide glyph slices it down the middle.
-        let cells = drawn_input_cells("日本", 0);
+        let cells = drawn_input_cells("日本", 0, false);
         let at = crate::cursor::caret()
             .expect("a prompt frame records its caret")
             .x as usize;
@@ -5106,6 +5143,9 @@ mod tests {
     fn a_frame_with_no_prompt_clears_the_caret() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Otherwise `cursor::place` would move the real cursor to a position
         // from an older frame, dropping the IME window somewhere stale.
         crate::cursor::set_caret(Some(Position::new(9, 9)));
@@ -5131,6 +5171,9 @@ mod tests {
 
     #[test]
     fn the_subagent_name_reaches_the_screen_in_its_colour() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::agents::set_roster_for_test(&["drawnreviewer"]);
 
         // The colour of the `r` in `:drawnreviewer` is the whole question:
@@ -5154,6 +5197,9 @@ mod tests {
 
     #[test]
     fn a_known_command_reaches_the_screen_green() {
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // The plain case, drawn rather than computed — this is what catches a
         // regression between `input_spans` and the terminal.
         let cells = drawn_input_colors("/btw what is this");
@@ -5310,6 +5356,9 @@ mod tests {
     fn the_slash_menu_draws_the_command_and_its_description() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let menu = crate::slashmenu::SlashMenu::new(
             vec![crate::slashmenu::Entry {
                 name: "/compact".into(),
@@ -6449,6 +6498,9 @@ mod tests {
     fn draw_publishes_the_frame_regions_for_ui_remote() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let _guard = crate::uiremote::TEST_LOCK
             .lock()
@@ -6500,6 +6552,9 @@ mod tests {
     fn session_name_floats_right_on_the_rule_above_the_prompt() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let log = OutputLog::new();
         let mut view = OutputView::default();
@@ -6551,6 +6606,9 @@ mod tests {
     fn green_rule_separates_output_from_the_visible_prompt() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let mut log = OutputLog::new();
         log.push_plain("some output");
@@ -6608,6 +6666,9 @@ mod tests {
     fn multiline_input_renders_every_row_and_places_the_cursor() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
+        let _guard = crate::cursor::TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let log = OutputLog::new();
         let mut view = OutputView::default();
