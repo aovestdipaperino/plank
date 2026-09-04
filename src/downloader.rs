@@ -79,7 +79,10 @@ pub struct State {
 /// How to treat the partial files when cancelling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cancel {
-    /// Leave the `.part` files; the next launch resumes them.
+    /// Leave the `.part` files; they resume when the user accepts the next
+    /// daily offer, or immediately via `/model download`. Nothing resumes
+    /// them on its own — the next launch's 24-hour check was already stamped
+    /// by this one.
     Keep,
     /// Delete the `.part` files only. Verified, staged `<kind>.gguf` artifacts
     /// are left alone: they are hash-proven, cost nothing to keep, and will
@@ -1196,7 +1199,7 @@ pub fn cancel_prompt_in(root: &Path) -> Option<String> {
     in_flight(state.phase).then(|| {
         format!(
             "Cancel the model download? {:.1} GB on disk in partial files.\n\
-             [k] cancel, keep the partial files (the next launch resumes them)\n\
+             [k] cancel, keep the partial files (resume via /model download, or the next offer)\n\
              [d] cancel and delete the partial files (verified artifacts are kept)\n\
              [Esc] keep downloading",
             crate::download::gb(part_bytes_on_disk(root))
@@ -1253,9 +1256,9 @@ pub fn cancel_command_in(root: &Path, delete: bool) -> String {
             "Cancelling; the partial files will be deleted (verified artifacts are kept)."
                 .to_string()
         }
-        Ok(()) => {
-            "Cancelling; the partial files are kept and will resume on the next launch.".to_string()
-        }
+        Ok(()) => "Cancelling; the partial files are kept. Resume with /model download, \
+                   or the next daily offer."
+            .to_string(),
         Err(e) => format!("Could not signal the downloader: {e}"),
     }
 }
@@ -2190,7 +2193,8 @@ pub(crate) mod tests {
         write_state_in(&dir, &st).expect("publish");
         assert_eq!(
             cancel_command_in(&dir, false),
-            "Cancelling; the partial files are kept and will resume on the next launch."
+            "Cancelling; the partial files are kept. Resume with /model download, \
+             or the next daily offer."
         );
         assert_eq!(read_cancel_in(&dir), Some(Cancel::Keep));
     }
