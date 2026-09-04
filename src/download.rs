@@ -1259,25 +1259,35 @@ fn check_manifest_at_startup_in(
             let _ = std::fs::write(crate::manifest::installed_path_in(root), &m.raw);
         }
         crate::manifest::Decision::Offer { manifest, from } => {
-            // Recorded unconditionally, before any early return below: this
-            // only writes the job file for `/model download` to pick up
-            // later, it does not itself start anything downloading (that
-            // still needs `spawn`, below). Without this, a declined offer or
-            // a non-TTY run leaves no job on disk, so `read_job_in` finds
-            // nothing and `/model download` answers "No model download is
-            // pending" forever — the version becomes permanently
-            // unreachable even though the user asked for it explicitly.
-            if let Err(e) = crate::downloader::write_job_in(root, &manifest) {
-                eprintln!("plank: could not record the download job: {e}");
-            }
             // First-run acquisition belongs to `ensure_model`, not the
             // manifest flow: with no installed manifest AND no model on disk,
             // starting a background download here would race the foreground
             // download `ensure_model` is about to start for the very same
             // file — nearly 2x the transfer for one first run. An `Adopt`
             // decision never reaches this arm, so it is unaffected.
+            //
+            // This must come before the job is written: a bare first run has
+            // nothing to resume and `ensure_model` is about to fetch the
+            // whole ~87 GB file itself, so recording a job here would let a
+            // user who types `/model download` right after trigger a
+            // redundant full background re-fetch of what the foreground
+            // download just obtained (harmless once finished — it stages,
+            // verifies and renames identical content — but exactly the race
+            // this gate exists to avoid).
             if from == 0 && !artifact_installed_in(root, "main") {
                 return;
+            }
+            // Recorded unconditionally from here on, before any further early
+            // return below: this only writes the job file for `/model
+            // download` to pick up later, it does not itself start anything
+            // downloading (that still needs `spawn`, below). Without this, a
+            // declined offer or a non-TTY run leaves no job on disk, so
+            // `read_job_in` finds nothing and `/model download` answers "No
+            // model download is pending" forever — the version becomes
+            // permanently unreachable even though the user asked for it
+            // explicitly.
+            if let Err(e) = crate::downloader::write_job_in(root, &manifest) {
+                eprintln!("plank: could not record the download job: {e}");
             }
             // Already declined (or the last attempt was cancelled or failed a
             // hash check): do not silently re-offer. `/model download` is how
@@ -1716,6 +1726,13 @@ mod tests {
         assert!(
             !called.load(Ordering::Relaxed),
             "must not spawn a background download on a bare first run"
+        );
+        assert!(
+            crate::downloader::read_job_in(&root).is_none(),
+            "finding 4: a bare first run must not plant a job either — \
+             `/model download` right after would trigger a redundant full \
+             background re-fetch of the file `ensure_model` is about to get \
+             in the foreground"
         );
     }
 
