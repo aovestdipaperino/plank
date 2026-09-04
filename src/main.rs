@@ -34,6 +34,16 @@ use plank::status;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // `plank --model-downloader` is the detached background model downloader
+    // (`src/downloader.rs`), re-execing this same binary so the helper can
+    // never disagree with the plank that spawned it. It loads no engine, reads
+    // no settings and touches no session: it takes the download lock, works
+    // through `~/.plank/downloads/job.json`, and exits. Handled before every
+    // other dispatch so nothing above can print to a stream that is /dev/null.
+    if args.first().map(String::as_str) == Some("--model-downloader") {
+        return ExitCode::from(u8::try_from(plank::downloader::run_helper()).unwrap_or(1));
+    }
+
     // `plank serve ...` runs the flavor-(a) host instead of the interactive
     // agent (issue #26). It reuses `make_engine`, so it hosts the real ds4
     // engine on a Metal box and the EchoEngine stub elsewhere.

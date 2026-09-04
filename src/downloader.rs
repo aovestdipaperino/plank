@@ -662,6 +662,212 @@ fn publish(
     );
 }
 
+/// The flock file that guarantees one downloader per machine.
+///
+/// Machine-wide, not per-project: the artifacts live in `~/.plank`, so two
+/// planks in two repos downloading the same 87 GB file into the same staging
+/// directory would corrupt each other's `.part`.
+#[must_use]
+pub fn lock_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("lock")
+}
+
+/// `~/.plank/downloads/lock`.
+#[must_use]
+pub fn lock_path() -> PathBuf {
+    lock_path_in(&crate::manifest::plank_dir())
+}
+
+/// The manifest the running (or next) helper is installing.
+#[must_use]
+pub fn job_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("job.json")
+}
+
+/// `~/.plank/downloads/job.json`.
+#[must_use]
+pub fn job_path() -> PathBuf {
+    job_path_in(&crate::manifest::plank_dir())
+}
+
+/// Where a detached helper's stderr goes, since it has no terminal.
+#[must_use]
+pub fn log_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("log")
+}
+
+/// `~/.plank/downloads/log`.
+#[must_use]
+pub fn log_path() -> PathBuf {
+    log_path_in(&crate::manifest::plank_dir())
+}
+
+/// Records `manifest` as the job for the helper to pick up.
+///
+/// Stored as the manifest's own bytes rather than a wrapper struct: the helper
+/// needs exactly the manifest, and a wrapper would be a second format to keep
+/// in sync with `ds4.manifest` for no gain.
+///
+/// # Errors
+/// Propagates filesystem errors.
+pub fn write_job_in(root: &Path, manifest: &crate::manifest::Manifest) -> std::io::Result<()> {
+    let path = job_path_in(root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &manifest.raw)
+}
+
+/// Records `manifest` as the job for the helper to pick up, under `~/.plank`.
+///
+/// # Errors
+/// Propagates filesystem errors.
+pub fn write_job(manifest: &crate::manifest::Manifest) -> std::io::Result<()> {
+    write_job_in(&crate::manifest::plank_dir(), manifest)
+}
+
+/// The pending job, if one is recorded and still parses.
+#[must_use]
+pub fn read_job_in(root: &Path) -> Option<crate::manifest::Manifest> {
+    crate::manifest::read_at(&job_path_in(root))
+}
+
+/// The pending job under `~/.plank`, if one is recorded and still parses.
+#[must_use]
+pub fn read_job() -> Option<crate::manifest::Manifest> {
+    read_job_in(&crate::manifest::plank_dir())
+}
+
+/// Whether a helper currently holds the lock at `root`.
+#[must_use]
+pub fn running_in(root: &Path) -> bool {
+    matches!(
+        crate::singleton::probe_lock(&lock_path_in(root)),
+        crate::singleton::LockProbe::Contended
+    )
+}
+
+/// Whether a helper currently holds the lock under `~/.plank`.
+#[must_use]
+pub fn running() -> bool {
+    running_in(&crate::manifest::plank_dir())
+}
+
+/// Spawns the detached helper for `manifest`, unless one is already running.
+///
+/// Detached deliberately: the download outlives the plank that started it, and
+/// outlives the terminal that plank was typed into. `setsid` in the child is
+/// what breaks it off the controlling terminal, and all three standard streams
+/// go to `/dev/null` so nothing it writes can ever land in a user's session —
+/// diagnostics go to [`log_path`] instead.
+///
+/// # Errors
+/// Returns a message when the job cannot be recorded or the child cannot be
+/// spawned. Callers treat that as "fall back to a foreground download", never
+/// as fatal.
+pub fn spawn_detached(manifest: &crate::manifest::Manifest) -> Result<(), String> {
+    if running() {
+        return Ok(());
+    }
+    write_job(manifest).map_err(|e| format!("cannot record the download job: {e}"))?;
+    clear_cancel();
+    let exe = std::env::current_exe().map_err(|e| format!("cannot find plank's own path: {e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--model-downloader")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    detach(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot start the downloader: {e}"))?;
+    // Reaped immediately: `setsid` already made the grandchild session leader,
+    // so nothing here needs to wait on it, and not reaping would leave a zombie
+    // for as long as this plank runs.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+/// Puts the child in its own session, so it survives the terminal closing.
+#[cfg(unix)]
+fn detach(cmd: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt as _;
+    // SAFETY: `setsid` is async-signal-safe and is the only call made between
+    // fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        })
+    };
+}
+
+/// No session concept to detach from; the caller's fallback path applies.
+#[cfg(not(unix))]
+fn detach(_cmd: &mut std::process::Command) {}
+
+/// The `plank --model-downloader` entry point. Returns a process exit code.
+///
+/// Takes the lock for its whole life, so a second helper started by another
+/// plank exits immediately instead of fighting over the same `.part` files.
+#[must_use]
+pub fn run_helper() -> i32 {
+    let root = crate::manifest::plank_dir();
+    let path = lock_path_in(&root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+    else {
+        return 1;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd as _;
+        // SAFETY: `lock` owns a valid fd; LOCK_NB makes this non-blocking.
+        let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            // Another helper owns the download. Not an error worth reporting.
+            return 0;
+        }
+    }
+    let Some(manifest) = read_job_in(&root) else {
+        log_line("no job recorded; nothing to download");
+        return 1;
+    };
+    // A cancel flag left over from a previous run must not stop this one before
+    // it starts.
+    clear_cancel();
+    let outcome = run_job(&root, &manifest, &http_fetch);
+    log_line(&format!(
+        "job for version {} ended: {outcome:?}",
+        manifest.version
+    ));
+    // The lock drops with `lock` here, releasing the flock.
+    drop(lock);
+    match outcome {
+        Outcome::Verified | Outcome::Cancelled => 0,
+        Outcome::Failed(_) => 1,
+    }
+}
+
+/// Appends one timestamped line to the helper's log. Best-effort.
+fn log_line(msg: &str) {
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "[{}] {msg}", now_epoch());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1125,5 +1331,35 @@ mod tests {
                 .min(body.len());
             Ok(Box::new(std::io::Cursor::new(body[start..].to_vec())))
         }
+    }
+
+    #[test]
+    fn helper_paths_sit_under_the_downloads_directory() {
+        let root = tempdir();
+        assert_eq!(lock_path_in(&root), root.join("downloads").join("lock"));
+        assert_eq!(job_path_in(&root), root.join("downloads").join("job.json"));
+        assert_eq!(log_path_in(&root), root.join("downloads").join("log"));
+    }
+
+    #[test]
+    fn a_job_written_is_a_job_read_back() {
+        let root = tempdir();
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        write_job_in(&root, &m).expect("write job");
+        let back = read_job_in(&root).expect("read job");
+        assert_eq!(back.version, m.version);
+        assert_eq!(back.raw, m.raw, "the job is the manifest bytes, verbatim");
+    }
+
+    #[test]
+    fn an_absent_job_reads_as_none() {
+        let root = tempdir();
+        assert!(read_job_in(&root).is_none());
+    }
+
+    #[test]
+    fn nothing_is_running_when_no_lock_is_held() {
+        let root = tempdir();
+        assert!(!running_in(&root));
     }
 }
