@@ -1153,12 +1153,23 @@ fn record_declined_in(root: &Path, version: u32) {
 /// A Keep cancel is deliberately excluded: its entire point is "stop now,
 /// resume later", so it must not be treated as a decline — that is what
 /// [`crate::downloader::cancelled_kept`] distinguishes.
+///
+/// The state file is terminal-phase evidence that outlives the run it
+/// describes (so `/model status` can still report a failure or cancel after
+/// the helper has exited), and this runs on every startup, well before
+/// `decide` gets a chance to record a *newer* decline of its own. Without the
+/// version guard, an old Delete-cancel's state would keep rewriting the
+/// single-slot `declined` marker back down to its own version every startup,
+/// silently un-declining any later version the user said no to: Delete-cancel
+/// v4, later decline v5, and the next check overwrites `declined` from 5 back
+/// to 4, so v5's prompt returns every 24 hours despite the user having
+/// already said no. Never move the marker backwards.
 fn note_last_run_outcome_in(root: &Path) {
     if let Some(state) = crate::downloader::read_state_in(root) {
         let declined = state.phase == crate::downloader::Phase::Failed
             || (state.phase == crate::downloader::Phase::Cancelled
                 && !crate::downloader::cancelled_kept(&state));
-        if declined {
+        if declined && state.version >= read_declined_in(root).unwrap_or(0) {
             record_declined_in(root, state.version);
         }
     }
@@ -1754,6 +1765,56 @@ mod tests {
             !called.load(Ordering::Relaxed),
             "a declined version must not be re-offered"
         );
+    }
+
+    #[test]
+    fn a_stale_cancelled_state_does_not_un_decline_a_newer_version() {
+        // Finding 3: `note_last_run_outcome_in` runs on every startup and
+        // unconditionally used to overwrite the single-slot `declined`
+        // marker with whatever version the persisted state file names — and
+        // that file persists indefinitely after a Delete cancel. Scenario:
+        // Delete-cancel v4 (declined records 4), then later decline v5
+        // (declined records 5) through the normal offer flow. The next
+        // startup's `note_last_run_outcome_in` must not see v4's leftover
+        // Cancelled/Delete state and rewrite `declined` back down to 4 —
+        // that would make the v5 prompt return every 24 hours despite the
+        // user already having said no to it.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+
+        let mut state = crate::downloader::tests::a_state();
+        state.version = 4;
+        state.phase = crate::downloader::Phase::Cancelled;
+        state.error = Some("delete".to_string());
+        crate::downloader::write_state_in(&root, &state).expect("publish v4's leftover state");
+
+        record_declined_in(&root, 5);
+
+        note_last_run_outcome_in(&root);
+
+        assert_eq!(
+            read_declined_in(&root),
+            Some(5),
+            "a stale v4 state must not un-decline the already-declined v5"
+        );
+    }
+
+    #[test]
+    fn note_last_run_outcome_still_records_a_forward_decline() {
+        // The guard added for finding 3 must only block moving the marker
+        // backwards, not recording a genuinely newer decline.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        record_declined_in(&root, 3);
+
+        let mut state = crate::downloader::tests::a_state();
+        state.version = 5;
+        state.phase = crate::downloader::Phase::Failed;
+        crate::downloader::write_state_in(&root, &state).expect("publish v5's failed state");
+
+        note_last_run_outcome_in(&root);
+
+        assert_eq!(read_declined_in(&root), Some(5));
     }
 
     #[test]

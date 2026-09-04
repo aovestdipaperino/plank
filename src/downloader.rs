@@ -1295,7 +1295,7 @@ pub fn spawn_watcher() {
 pub(crate) mod tests {
     use super::*;
 
-    fn a_state() -> State {
+    pub(crate) fn a_state() -> State {
         State {
             pid: 4711,
             version: 3,
