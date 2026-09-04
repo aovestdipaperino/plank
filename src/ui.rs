@@ -11847,7 +11847,15 @@ fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce
         event::DisableFocusChange,
         DisableBracketedPaste,
         DisableMouseCapture,
-        LeaveAlternateScreen
+        LeaveAlternateScreen,
+        // Hand the cursor back *visible*. plank draws its own cursor into the
+        // frame and never sets a ratatui cursor position, so every draw emits
+        // `Hide` — which used not to be true, when the prompt row set a frame
+        // cursor and the last idle frame left it shown. Nothing else re-shows
+        // it here: `Terminal`'s `Drop` is the only thing that would, and the
+        // terminal is merely borrowed, so it does not run. Without this, an
+        // `$EDITOR` launched by Ctrl-G starts with DECTCEM off.
+        ratatui::crossterm::cursor::Show
     );
     let _ = disable_raw_mode();
     let out = {
