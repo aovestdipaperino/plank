@@ -2608,6 +2608,7 @@ mod tests {
             file_size: 10,
             tag: String::new(),
             last_prompt: String::new(),
+            cwd: String::new(),
             payload_bytes: 0,
             path: PathBuf::from("/tmp/x.kv"),
         }

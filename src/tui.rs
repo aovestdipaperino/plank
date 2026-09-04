@@ -6973,6 +6973,7 @@ mod tests {
                 file_size: 1024 * (i as u64 + 1),
                 tag: String::new(),
                 last_prompt: String::new(),
+                cwd: String::new(),
                 payload_bytes: 0,
                 path: std::path::PathBuf::from(format!("/tmp/session-{i}.kv")),
             })

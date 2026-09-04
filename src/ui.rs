@@ -30,7 +30,7 @@ use crate::editor::{History, LineBuffer, default_history_path};
 use crate::engine::{Engine, EngineEvent};
 use crate::remote::control::RemoteState;
 use crate::render::{RenderOptions, TokenRenderer};
-use crate::session::{Message, Session, SessionStore};
+use crate::session::{Message, Session, SessionEntry, SessionStore};
 use crate::status::{self, Status, WorkerState};
 use crate::sysprompt::{self, SystemPromptReminder};
 use crate::tools::{ToolContext, dispatch, dispatch_all};
@@ -3961,8 +3961,9 @@ impl Agent<'_> {
             },
             "/retitle" => println!("{}", self.retitle_sessions()),
             "/resume" => match self.resume_pick(arg) {
-                Ok(None) => match self.store.list() {
-                    Ok(entries) => print!(
+                Ok(None) => {
+                    let entries = self.resume_entries();
+                    print!(
                         "{}",
                         crate::session::render_resume_list(
                             &entries,
@@ -3970,9 +3971,8 @@ impl Agent<'_> {
                             self.color,
                             RESUME_LIST_LIMIT
                         )
-                    ),
-                    Err(e) => println!("resume failed: {e}"),
-                },
+                    );
+                }
                 Ok(Some(s)) => {
                     print!(
                         "{}",
@@ -4383,7 +4383,9 @@ impl Agent<'_> {
             return Ok(None);
         }
         if let Ok(n) = arg.parse::<usize>() {
-            let entries = self.store.list().map_err(|e| e.to_string())?;
+            // The number indexes into the project-scoped listing the user saw,
+            // so the same scoped set must be used here.
+            let entries = self.resume_entries();
             let entry = entries
                 .get(n.wrapping_sub(1))
                 .ok_or_else(|| format!("no session number {n} (see /resume)"))?;
@@ -4404,7 +4406,7 @@ impl Agent<'_> {
     /// screen would wipe anything printed here.
     fn resume_from_cli(&mut self, arg: &str) -> Result<(), String> {
         let session = if arg.trim().is_empty() {
-            let entries = self.store.list().map_err(|e| e.to_string())?;
+            let entries = self.resume_entries();
             let entry = entries
                 .first()
                 .ok_or_else(|| "no saved sessions to resume".to_string())?;
@@ -5061,16 +5063,35 @@ the original is frozen and listed in /tree"
         )
     }
 
+    /// Sessions visible to `/resume`: those saved in the current project, plus
+    /// legacy sessions whose project was never recorded (empty `cwd`). Other
+    /// projects' sessions are hidden so the picker shows only this workspace's
+    /// work. When the current directory cannot be determined, nothing is
+    /// filtered.
+    fn resume_entries(&self) -> Vec<SessionEntry> {
+        let entries = self.store.list().unwrap_or_default();
+        let cwd = self.tool_ctx.cwd.to_string_lossy();
+        if cwd.is_empty() {
+            return entries;
+        }
+        entries
+            .into_iter()
+            .filter(|e| e.cwd.is_empty() || e.cwd == cwd)
+            .collect()
+    }
+
     /// Builds the `/resume` picker over the saved-session listing.
     ///
     /// Errors are folded into an empty pane: the picker then says "no session
     /// matches", which is the same thing an unreadable store means to someone
     /// looking for something to resume.
     fn resume_pane(&self) -> crate::resumepane::ResumePane {
-        let entries = self.store.list().unwrap_or_default();
-        let scope = std::env::current_dir()
-            .ok()
-            .and_then(|d| d.file_name().map(|n| n.to_string_lossy().into_owned()))
+        let entries = self.resume_entries();
+        let scope = self
+            .tool_ctx
+            .cwd
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         crate::resumepane::ResumePane::new(entries, now_secs()).with_scope(scope)
     }

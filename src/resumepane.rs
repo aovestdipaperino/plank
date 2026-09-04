@@ -423,6 +423,7 @@ mod tests {
             file_size: 1024,
             tag: tag.to_owned(),
             last_prompt: last.to_owned(),
+            cwd: String::new(),
             payload_bytes: 0,
             path: std::path::PathBuf::from(format!("/tmp/{id}.kv")),
         }

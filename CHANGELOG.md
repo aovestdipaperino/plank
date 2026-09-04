@@ -44,6 +44,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **`/resume` lists only this project's sessions.** A transcript now records
+  the directory it ran in, and the `/resume` picker, its numbered listing and
+  `plank --resume` all filter to the current working directory. Sessions saved
+  before the field existed have no recorded directory and stay visible
+  everywhere, so nothing already on disk disappears from the picker.
+
 - **Child processes run in their own process group and are killed as a
   tree.** Background bash jobs, immediate `!` commands, MCP servers and hooks
   all spawn with their own group, and stopping or timing out any of them sends

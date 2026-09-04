@@ -396,6 +396,10 @@ pub struct SessionEntry {
     pub tag: String,
     /// Clipped last user prompt; empty for pre-meta files.
     pub last_prompt: String,
+    /// Project directory the session ran in; empty for pre-`/insights` files
+    /// (the field predates the record). Used to scope `/resume` to the
+    /// current project.
+    pub cwd: String,
     /// Size of the engine KV payload sidecar in bytes; 0 when stripped or
     /// never saved (the C lists `payload_bytes == 0` as "stripped").
     pub payload_bytes: u64,
@@ -1385,7 +1389,7 @@ impl SessionStore {
             // transcript itself is never parsed here.
             let entry = match read_head_meta(&path) {
                 Some((created_at, last_used, title)) => {
-                    let (tag, last_prompt) = read_meta_tail(&path).unwrap_or_default();
+                    let (tag, last_prompt, cwd) = read_meta_tail(&path).unwrap_or_default();
                     SessionEntry {
                         id,
                         title,
@@ -1394,6 +1398,7 @@ impl SessionStore {
                         file_size,
                         tag,
                         last_prompt,
+                        cwd,
                         payload_bytes,
                         path,
                     }
@@ -1406,6 +1411,7 @@ impl SessionStore {
                     file_size,
                     tag: String::new(),
                     last_prompt: String::new(),
+                    cwd: String::new(),
                     payload_bytes,
                     path,
                 },
@@ -2372,10 +2378,15 @@ fn last_prompt_of(transcript: &[Message]) -> String {
 /// Reads the trailing `meta` record with a bounded tail read; `None` for
 /// files predating the record (or when validation fails).
 ///
+/// Returns `(tag, last_prompt, cwd)`: the `cwd` is extracted from the
+/// `cwd <len>` record that sits immediately before `meta` when present, so
+/// `/resume` can scope its listing to the current project without a second
+/// tail read or a full parse.
+///
 /// Message bodies can contain `\nmeta ` lines, so candidates are scanned
 /// from the end and accepted only when their declared lengths land exactly
 /// on end-of-file.
-fn read_meta_tail(path: &Path) -> Option<(String, String)> {
+fn read_meta_tail(path: &Path) -> Option<(String, String, String)> {
     const TAIL_BYTES: u64 = 8 * 1024;
     let mut f = fs::File::open(path).ok()?;
     let file_len = f.metadata().ok()?.len();
@@ -2395,8 +2406,9 @@ fn read_meta_tail(path: &Path) -> Option<(String, String)> {
         } else {
             buf[at - 1] == b'\n'
         };
-        if line_start && let Some(parsed) = parse_meta_at(&buf, at) {
-            return Some(parsed);
+        if line_start && let Some((tag, last)) = parse_meta_at(&buf, at) {
+            let cwd = parse_cwd_before_meta(&buf, at).unwrap_or_default();
+            return Some((tag, last, cwd));
         }
         if at == 0 {
             break;
@@ -2404,6 +2416,29 @@ fn read_meta_tail(path: &Path) -> Option<(String, String)> {
         search_end = at;
     }
     None
+}
+
+/// Extracts the `cwd` record that sits immediately before the `meta` record at
+/// `meta_at` in `buf`. Returns `None` when no `cwd` record is present — the
+/// session predates the field or was saved without a project path.
+///
+/// The `cwd` record is the last record written before `meta`, so it is the two
+/// lines directly above it: `cwd <len>` then the path body. The body is a
+/// filesystem path (no newlines), and the declared length is checked against
+/// the actual body length so a transcript body that happens to end with
+/// `cwd <n>` cannot fool the reader.
+fn parse_cwd_before_meta(buf: &[u8], meta_at: usize) -> Option<String> {
+    if meta_at == 0 {
+        return None;
+    }
+    let pre = std::str::from_utf8(buf.get(..meta_at)?).ok()?;
+    // `pre` ends with the newline that precedes `meta`. Strip it, then split
+    // off the last two lines: the cwd body and the `cwd <len>` header above it.
+    let trimmed = pre.strip_suffix('\n')?;
+    let (rest, body_line) = trimmed.rsplit_once('\n')?;
+    let (_before, header_line) = rest.rsplit_once('\n').unwrap_or(("", rest));
+    let len: usize = header_line.strip_prefix("cwd ")?.trim().parse().ok()?;
+    (body_line.len() == len).then(|| body_line.to_owned())
 }
 
 /// Parses a `meta` record starting at `at`, requiring it to end exactly at
@@ -3727,9 +3762,11 @@ hello\n";
 
         // Tail reader finds the real trailer.
         let path = store.path_for_id(&id);
-        let (tag, last) = read_meta_tail(&path).unwrap();
+        let (tag, last, cwd) = read_meta_tail(&path).unwrap();
         assert_eq!(tag, "wip");
         assert_eq!(last, "Fix the flaky test in ci.rs");
+        // No cwd was set on this session, so the tail reader reports empty.
+        assert_eq!(cwd, "");
 
         // Head reader agrees with the full parse.
         let (created, _used, title) = read_head_meta(&path).unwrap();
@@ -3756,6 +3793,41 @@ hello\n";
         assert_eq!(entries[0].last_prompt, "");
         assert_eq!(entries[0].title, s.title);
         assert!(store.load(&id[..8]).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_carries_the_project_cwd_from_the_tail() {
+        let dir = temp_dir("cwd");
+        let store = SessionStore::open(&dir).unwrap();
+
+        // A session with a project directory recorded.
+        let mut a = Session::new();
+        a.cwd = "/home/enzo/plank".to_string();
+        a.push(Message::user("ship the feature"));
+        let id_a = store.save(&mut a).unwrap();
+
+        // A session without one (legacy / pre-`/insights`).
+        let mut b = Session::new();
+        b.push(Message::user("older work"));
+        let id_b = store.save(&mut b).unwrap();
+
+        // The tail reader extracts the cwd that sits before `meta`.
+        let path_a = store.path_for_id(&id_a);
+        let (_tag, _last, cwd) = read_meta_tail(&path_a).unwrap();
+        assert_eq!(cwd, "/home/enzo/plank");
+
+        let path_b = store.path_for_id(&id_b);
+        let (_tag, _last, cwd_b) = read_meta_tail(&path_b).unwrap();
+        assert_eq!(cwd_b, "");
+
+        // `list` surfaces the same cwd on the entry.
+        let entries = store.list().unwrap();
+        let ea = entries.iter().find(|e| e.id == id_a).unwrap();
+        assert_eq!(ea.cwd, "/home/enzo/plank");
+        let eb = entries.iter().find(|e| e.id == id_b).unwrap();
+        assert_eq!(eb.cwd, "");
+
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -3800,6 +3872,7 @@ hello\n";
             file_size: 2048,
             tag: "wip".to_string(),
             last_prompt: "rerun the tests".to_string(),
+            cwd: String::new(),
             payload_bytes: 0,
             path: PathBuf::new(),
         }];
@@ -4392,6 +4465,7 @@ hello\n";
             file_size: 2048,
             tag: String::new(),
             last_prompt: String::new(),
+            cwd: String::new(),
             payload_bytes: 0,
             path: PathBuf::from("/x"),
         }];
