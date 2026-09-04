@@ -197,10 +197,17 @@ pub fn decide(
     // almost certainly already this release — recorded by a plank that predates
     // manifests. Silently adopt rather than offering a re-download of bytes the
     // user already has.
-    let matches = KINDS
+    let intersection: Vec<_> = KINDS
         .iter()
         .filter_map(|kind| remote.files.get(*kind).map(|e| (*kind, e)))
-        .all(|(kind, entry)| size_of(kind) == Some(entry.bytes));
+        .collect();
+    // `all()` is vacuously true on an empty iterator, so an empty manifest
+    // would otherwise adopt itself into the installed record while having
+    // downloaded nothing, suppressing any genuine release at that version.
+    let matches = !intersection.is_empty()
+        && intersection
+            .iter()
+            .all(|(kind, entry)| size_of(kind) == Some(entry.bytes));
     if matches {
         Decision::Adopt(remote)
     } else {
@@ -418,5 +425,19 @@ mod tests {
             decide(remote, None, &all_present),
             Decision::Adopt(_)
         ));
+    }
+
+    #[test]
+    fn a_manifest_naming_no_known_artifact_is_never_adopted() {
+        // `all()` is vacuously true on an empty iterator, so without an explicit
+        // emptiness check this manifest would be recorded as installed while
+        // nothing had been downloaded — and would then suppress a genuine
+        // release at the same version as "up to date".
+        let text = r#"{"version":5,"released":"x","notes":"","files":{}}"#;
+        let remote = parse(text).expect("parses");
+        match decide(remote, None, &|_| None) {
+            Decision::Offer { from, .. } => assert_eq!(from, 0),
+            other => panic!("expected an offer, got {other:?}"),
+        }
     }
 }
