@@ -2361,16 +2361,32 @@ fn render_input(frame: &mut Frame, input_area: Rect, state: InputState<'_>) {
     let (lines, cur_row, cur_col) = wrap_input(input, text_area.width, state.cursor, state.sel);
     frame.render_widget(Paragraph::new(lines), text_area);
 
-    let cursor = Position::new(
+    let caret = Position::new(
         (text_area.x + cur_col).min(input_area.right().saturating_sub(1)),
         input_area.y + cur_row.min(input_area.height.saturating_sub(1)),
     );
-    frame.set_cursor_position(cursor);
+    // A post-pass over the text just drawn, and the ordering is not a style
+    // preference: `render` reads the cell to get the glyph's colour, so it can
+    // re-ink it instead of erasing it under the block, and the glyph's width,
+    // so a double-width CJK character gets both of its cells. Block shape,
+    // automatic ink and no blink are the crate's defaults and exactly what
+    // plank wants — a colour meant to be read at a glance should not make you
+    // wait for it.
+    let report = nano_cursor::Cursor::new(crate::cursor::state().color()).render(
+        text_area,
+        frame.buffer_mut(),
+        caret,
+        Instant::now(),
+    );
+    // No `set_cursor_position`, so ratatui emits `Hide` and plank's own block
+    // is the only cursor on screen. The hidden one still has to be *moved*
+    // there, which `crate::cursor::place` does once the frame is flushed.
+    crate::cursor::set_caret(Some(report.position));
     // ratatui 0.29 keeps `Frame::cursor_position` private with no getter, so
-    // the snapshot's cursor field is recorded here, at the one site that sets
-    // it, rather than read back off the frame.
+    // the snapshot's cursor field is recorded here, at the one site that
+    // decides the caret, rather than read back off the frame.
     if crate::uiremote::recording_enabled() {
-        crate::uiremote::set_cursor(cursor.x, cursor.y);
+        crate::uiremote::set_cursor(report.position.x, report.position.y);
     }
 }
 
@@ -3344,11 +3360,14 @@ pub fn draw(
     }
 
     // Input line: hidden entirely (no prompt, no cursor) while the agent is busy.
-    match input {
-        Some(input) => render_input(frame, input_row, input),
+    if let Some(input) = input {
+        render_input(frame, input_row, input);
+    } else {
         // No prompt on this frame: forget its rect so a stray click cannot
-        // steer a cursor that is not on screen.
-        None => set_input_rect(None),
+        // steer a cursor that is not on screen, and forget the caret so
+        // `cursor::place` does not move the real one to a stale position.
+        set_input_rect(None);
+        crate::cursor::set_caret(None);
     }
 
     // Status bar, reverse-styled across the full width, with a magenta bar.
@@ -3575,11 +3594,14 @@ pub fn draw_btw_split(
     render_output(frame, inner, btw_log, btw_view, None);
 
     // Input line and status bar span the full width, identical to `draw`.
-    match input {
-        Some(input) => render_input(frame, input_row, input),
+    if let Some(input) = input {
+        render_input(frame, input_row, input);
+    } else {
         // No prompt on this frame: forget its rect so a stray click cannot
-        // steer a cursor that is not on screen.
-        None => set_input_rect(None),
+        // steer a cursor that is not on screen, and forget the caret so
+        // `cursor::place` does not move the real one to a stale position.
+        set_input_rect(None);
+        crate::cursor::set_caret(None);
     }
     let status_style = Style::default()
         .bg(Color::Indexed(238))
@@ -5002,6 +5024,109 @@ mod tests {
                 (cell.symbol().chars().next().unwrap_or(' '), cell.fg)
             })
             .collect()
+    }
+
+    /// The full styled cells of the drawn input row, as
+    /// `(symbol, fg, bg)`, with the caret at char index `cursor`.
+    ///
+    /// Goes through `render_input` and a real ratatui backend for the same
+    /// reason `drawn_input_colors` does, plus one more: the cursor is a
+    /// post-pass that *reads* the cells the text left behind, so it cannot be
+    /// tested without them actually being there.
+    fn drawn_input_cells(input: &str, cursor: usize) -> Vec<(String, Color, Color)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut term = Terminal::new(TestBackend::new(60, 1)).unwrap();
+        // Captured from inside the closure rather than read back off the
+        // backend after `draw`: ratatui's `Buffer::diff` drops style-only
+        // changes to a wide glyph's *trailing* cell (real terminals paint
+        // the whole glyph from one SGR sequence at the leading cell, so
+        // that cell's own background is never sent), which would make the
+        // trailing half of a double-width caret invisible to a test that
+        // reads the backend's post-flush buffer instead of the frame that
+        // was actually rendered.
+        let mut captured: Option<ratatui::buffer::Buffer> = None;
+        term.draw(|f| {
+            render_input(f, Rect::new(0, 0, 60, 1), InputState::new(input, cursor));
+            captured = Some(f.buffer_mut().clone());
+        })
+        .unwrap();
+        let buf = captured.expect("draw closure always runs");
+        (0..60)
+            .map(|x| {
+                let cell = &buf[(x, 0)];
+                (cell.symbol().to_string(), cell.fg, cell.bg)
+            })
+            .collect()
+    }
+
+    /// The cell the caret sits on for `input` with the caret at `cursor`.
+    fn caret_cell(input: &str, cursor: usize) -> (String, Color, Color) {
+        let cells = drawn_input_cells(input, cursor);
+        let at = crate::cursor::caret().expect("a prompt frame records its caret");
+        cells[at.x as usize].clone()
+    }
+
+    #[test]
+    fn the_caret_wears_the_phase_colour() {
+        crate::cursor::set(crate::cursor::State::Idle);
+        let (_, _, idle_bg) = caret_cell("hello", 0);
+        assert_eq!(idle_bg, crate::cursor::IDLE_COLOR);
+
+        crate::cursor::set(crate::cursor::State::Busy);
+        let (_, _, busy_bg) = caret_cell("hello", 0);
+        assert_eq!(busy_bg, crate::cursor::BUSY_COLOR);
+
+        crate::cursor::set(crate::cursor::State::Idle);
+    }
+
+    #[test]
+    fn the_glyph_under_the_caret_is_re_inked_not_erased() {
+        crate::cursor::set(crate::cursor::State::Idle);
+        // A green block over green text would erase the character. `Ink::Auto`
+        // has to push the glyph away from the cursor colour to keep it legible.
+        let (symbol, fg, bg) = caret_cell("hello", 0);
+        assert_eq!(symbol, "h");
+        assert_ne!(fg, bg);
+    }
+
+    #[test]
+    fn a_double_width_glyph_gets_both_of_its_cells() {
+        crate::cursor::set(crate::cursor::State::Idle);
+        // Painting one half of a wide glyph slices it down the middle.
+        let cells = drawn_input_cells("日本", 0);
+        let at = crate::cursor::caret()
+            .expect("a prompt frame records its caret")
+            .x as usize;
+        assert_eq!(cells[at].2, crate::cursor::IDLE_COLOR);
+        assert_eq!(cells[at + 1].2, crate::cursor::IDLE_COLOR);
+    }
+
+    #[test]
+    fn a_frame_with_no_prompt_clears_the_caret() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // Otherwise `cursor::place` would move the real cursor to a position
+        // from an older frame, dropping the IME window somewhere stale.
+        crate::cursor::set_caret(Some(Position::new(9, 9)));
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        term.draw(|f| {
+            draw(
+                f,
+                &log,
+                None,
+                "",
+                &mut view,
+                None,
+                &TaskView::default(),
+                None,
+                &RosterView::default(),
+            );
+        })
+        .unwrap();
+        assert_eq!(crate::cursor::caret(), None);
     }
 
     #[test]
@@ -6521,8 +6646,12 @@ mod tests {
             row(prompt_y + 1)
         );
         // The status bar was pushed down to make room; the cursor is on row 2
-        // of the input, indented past the prompt.
-        let (cx, cy) = term.get_cursor_position().unwrap().into();
+        // of the input, indented past the prompt. `render_input` no longer
+        // calls `frame.set_cursor_position` — the caret is a painted cell,
+        // recorded in `crate::cursor` instead of the real terminal cursor.
+        let (cx, cy) = crate::cursor::caret()
+            .expect("a prompt frame records its caret")
+            .into();
         assert_eq!(cy, prompt_y + 1);
         let prompt_width = u16::try_from(Span::raw(crate::status::prompt_text()).width()).unwrap();
         assert_eq!(cx, prompt_width + 2);

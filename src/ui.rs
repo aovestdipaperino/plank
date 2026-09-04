@@ -305,6 +305,7 @@ fn repaint_idle(
             remote_capture(rem, f);
         })
         .map_err(|e| e.to_string())?;
+    crate::cursor::place();
     Ok(completed.buffer.clone())
 }
 
@@ -714,6 +715,7 @@ impl CompactSink for TuiCompactSink<'_> {
                 &tui::RosterView::default(),
             );
         });
+        crate::cursor::place();
     }
 }
 
@@ -9101,6 +9103,7 @@ impl Agent<'_> {
                         &tui::RosterView::default(),
                     );
                 });
+                crate::cursor::place();
                 self.dirty = false;
                 while event::poll(Duration::ZERO).unwrap_or(false) {
                     if let Ok(Event::Key(k)) = event::read()
@@ -11044,6 +11047,7 @@ impl Agent<'_> {
                             &tui::RosterView::default(),
                         );
                     });
+                    crate::cursor::place();
                 });
                 log.set_progress(None);
                 self.fire_session_start("clear", &mut |w| log.push_plain(w));
@@ -11224,6 +11228,7 @@ impl Agent<'_> {
                             &tui::RosterView::default(),
                         );
                     });
+                    crate::cursor::place();
                 });
                 log.set_progress(None);
                 log.push_plain(msg);
@@ -11388,6 +11393,7 @@ impl Agent<'_> {
                                     &tui::RosterView::default(),
                                 );
                             });
+                            crate::cursor::place();
                         }
                         // Nothing else is reading the keyboard while the
                         // command runs, so without this drain an Esc is not
@@ -12369,6 +12375,7 @@ fn busy_ui_loop(
                 remote_capture(remote, f);
             })
             .map_err(|e| e.to_string())?;
+        crate::cursor::place();
         remote_service(remote);
         if finished {
             // The worker is done (turn over); drain the tail in order. The
