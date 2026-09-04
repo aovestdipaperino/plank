@@ -90,9 +90,50 @@ pub fn sequence(state: State) -> String {
 /// terminal's own theme.
 pub const RESET_SEQUENCE: &str = "\x1b]112\x07\x1b[0 q";
 
+/// Which cursor indicator plank uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorMode {
+    /// Recolour the terminal's own cursor with OSC 12. The default: it keeps
+    /// cursor presentation where the user configured it. Inert on terminals
+    /// that ignore the escape, Warp among them.
+    #[default]
+    Terminal,
+    /// Paint the cursor into the frame with `nano-cursor`. Works everywhere,
+    /// at the cost of overriding the terminal's own cursor style.
+    Drawn,
+    /// No phase indicator; the terminal's cursor is left entirely alone.
+    Off,
+}
+
+impl CursorMode {
+    /// The settings-file spelling of the mode.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CursorMode::Terminal => "terminal",
+            CursorMode::Drawn => "drawn",
+            CursorMode::Off => "off",
+        }
+    }
+
+    /// Parses a settings value.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "terminal" | "osc" | "true" => Some(CursorMode::Terminal),
+            "drawn" | "block" => Some(CursorMode::Drawn),
+            "off" | "none" | "false" => Some(CursorMode::Off),
+            _ => None,
+        }
+    }
+}
+
 /// Sets the cursor color to `state`'s. Best-effort, and a no-op both when
 /// stderr is not a tty and when `state` is already what was last written.
 pub fn set(state: State) {
+    if crate::settings::active().ui.cursor != CursorMode::Terminal {
+        return;
+    }
     if LAST.swap(state.tag(), Ordering::Relaxed) == state.tag() {
         return;
     }
@@ -149,5 +190,22 @@ mod tests {
         assert_eq!(LAST.swap(busy, Ordering::Relaxed), busy);
         assert_ne!(LAST.swap(idle, Ordering::Relaxed), idle);
         LAST.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn cursor_mode_round_trips_through_its_settings_spelling() {
+        for m in [CursorMode::Terminal, CursorMode::Drawn, CursorMode::Off] {
+            assert_eq!(CursorMode::parse(m.as_str()), Some(m));
+        }
+        assert_eq!(CursorMode::parse("  DRAWN "), Some(CursorMode::Drawn));
+        assert_eq!(CursorMode::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn the_default_is_the_terminal_path() {
+        // OSC 12 keeps the user's own cursor on terminals that honour it; the
+        // drawn block is opt-in because it takes cursor presentation away from
+        // the terminal.
+        assert_eq!(CursorMode::default(), CursorMode::Terminal);
     }
 }
