@@ -358,6 +358,27 @@ static LOCAL_POWER: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32:
 /// power suffix, which is the bar's own anchor.
 static WASM_SEGMENTS: std::sync::RwLock<Vec<Cell>> = std::sync::RwLock::new(Vec::new());
 
+/// The download segment, mirrored from the helper's state file by
+/// `downloader::spawn_watcher`.
+///
+/// A plain slot rather than a contributed `Cell`: this is plank's own segment,
+/// not a plugin's, and it must sit with the ctx gauge rather than in the
+/// contributed block that rides against the power suffix.
+static DOWNLOAD_SEGMENT: std::sync::RwLock<Option<String>> = std::sync::RwLock::new(None);
+
+/// Sets (or clears) the download segment.
+pub fn set_download_segment(text: Option<String>) {
+    if let Ok(mut slot) = DOWNLOAD_SEGMENT.write() {
+        *slot = text;
+    }
+}
+
+/// The download segment, when a download is live.
+#[must_use]
+pub fn download_segment() -> Option<String> {
+    DOWNLOAD_SEGMENT.read().ok().and_then(|s| s.clone())
+}
+
 /// One contributed status-bar cell as the bar needs it.
 #[derive(Debug, Clone, Default)]
 pub struct Cell {
@@ -1643,6 +1664,11 @@ fn build_status_text_with_cells(
         Some(seg) => format!("{ctx} | {}", theme(&seg)),
         None => ctx,
     };
+    // The download segment rides with the ctx gauge for the same reason the
+    // dspark segment does: it describes the whole session rather than this
+    // turn, and keeping it left of the state word keeps the power suffix
+    // anchored on the right.
+    let ctx = splice_download_segment(ctx, download_segment().as_deref(), theme);
     // Contributed cells ride between the state word and the power suffix: the
     // suffix is the line's right anchor and must stay last.
     let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
@@ -1691,6 +1717,25 @@ pub fn spec_segment(st: &Status) -> Option<String> {
         st.spec.tokens_per_step(),
         100.0 * st.spec.block_fill()
     ))
+}
+
+/// Appends `seg` (already themed) to `ctx`, or returns `ctx` unchanged.
+///
+/// Pure and taking the segment text as a parameter, rather than reading
+/// [`download_segment`] itself, so this composition is testable without
+/// touching the process-global slot — every other status-bar test builds
+/// exact-match text under default (parallel) test threads, and a global set
+/// mid-run would otherwise leak into them exactly as
+/// [`FINDINGS.md`](../FINDINGS.md) warns.
+fn splice_download_segment(
+    ctx: String,
+    seg: Option<&str>,
+    theme: impl Fn(&str) -> String,
+) -> String {
+    match seg {
+        Some(seg) => format!("{ctx} | {}", theme(seg)),
+        None => ctx,
+    }
 }
 
 /// [`build_status_text`] fitted into `cols` columns.
@@ -1823,6 +1868,27 @@ pub fn no_model_lines() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Exercises the composition directly, rather than through the
+    /// process-global [`DOWNLOAD_SEGMENT`] slot: every other status-bar test
+    /// builds exact-match text under default (parallel) test threads, and a
+    /// global set mid-run would leak into them (this repo's `FINDINGS.md` has
+    /// a prior instance of exactly this flake).
+    #[test]
+    fn the_download_segment_rides_with_the_ctx_gauge() {
+        let ctx = splice_download_segment(
+            "ctx 12%".to_string(),
+            Some("⇩ model 1/3 41%"),
+            |s: &str| s.to_owned(),
+        );
+        assert_eq!(ctx, "ctx 12% | ⇩ model 1/3 41%");
+    }
+
+    #[test]
+    fn no_download_adds_not_one_byte_to_the_bar() {
+        let ctx = splice_download_segment("ctx 12%".to_string(), None, |s: &str| s.to_owned());
+        assert_eq!(ctx, "ctx 12%");
+    }
 
     /// Elision drops the lowest-priority cells first and keeps the order.
     ///

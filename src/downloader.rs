@@ -948,6 +948,56 @@ pub fn swap_staged() -> Result<Option<u32>, String> {
     swap_staged_in(&crate::manifest::plank_dir())
 }
 
+/// The status-bar text for `state`, or the empty-ish forms for the phases that
+/// have no progress to show.
+///
+/// Deliberately narrow: the bar is the one line always on screen, and a
+/// download is not the thing the user is doing. Detail belongs to `/model`.
+#[must_use]
+pub fn segment_text(state: &State) -> String {
+    let pos = format!("{}/{}", state.index, state.of);
+    match state.phase {
+        Phase::Staged => "⇩ model ready on restart".to_string(),
+        Phase::Cancelled => "⇩ model cancelled".to_string(),
+        Phase::Failed => "⇩ model failed".to_string(),
+        Phase::Rehashing => format!("⇩ model {pos} resuming"),
+        Phase::Verifying => format!("⇩ model {pos} verifying"),
+        Phase::Downloading => {
+            let pct = (100 * state.done_bytes)
+                .checked_div(state.total_bytes)
+                .unwrap_or(0)
+                .min(100);
+            if state.rate_bps == 0 {
+                format!("⇩ model {pos} {pct}%")
+            } else {
+                format!("⇩ model {pos} {pct}% {}MB/s", state.rate_bps / 1_000_000)
+            }
+        }
+    }
+}
+
+/// Starts the thread that mirrors the helper's state file into the status bar.
+///
+/// A thread rather than a check inside the render path: the state file is
+/// written by another process, so reading it is a filesystem round trip that
+/// has no business happening once per frame.
+///
+/// Idempotent via [`std::sync::Once`]: `main.rs` calls this after each of its
+/// two (mutually exclusive) `check_manifest_at_startup` call sites, and a
+/// future caller that runs both in the same process must not end up with two
+/// threads fighting to publish the same global segment.
+pub fn spawn_watcher() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            loop {
+                crate::status::set_download_segment(live_state().as_ref().map(segment_text));
+                std::thread::sleep(PUBLISH_EVERY);
+            }
+        });
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,6 +1016,49 @@ mod tests {
             error: None,
             updated: 1_000_000,
         }
+    }
+
+    #[test]
+    fn segment_shows_position_percent_and_rate_while_downloading() {
+        let mut st = a_state();
+        st.done_bytes = 41;
+        st.total_bytes = 100;
+        st.rate_bps = 12_000_000;
+        assert_eq!(segment_text(&st), "⇩ model 1/3 41% 12MB/s");
+    }
+
+    #[test]
+    fn segment_omits_the_rate_before_one_is_measured() {
+        let mut st = a_state();
+        st.done_bytes = 41;
+        st.total_bytes = 100;
+        st.rate_bps = 0;
+        assert_eq!(segment_text(&st), "⇩ model 1/3 41%");
+    }
+
+    #[test]
+    fn a_zero_total_does_not_divide_by_zero() {
+        let mut st = a_state();
+        st.done_bytes = 0;
+        st.total_bytes = 0;
+        st.rate_bps = 0;
+        assert_eq!(segment_text(&st), "⇩ model 1/3 0%");
+    }
+
+    #[test]
+    fn the_other_phases_each_get_their_own_word() {
+        let mut st = a_state();
+        st.phase = Phase::Rehashing;
+        assert_eq!(segment_text(&st), "⇩ model 1/3 resuming");
+        st.phase = Phase::Verifying;
+        assert_eq!(segment_text(&st), "⇩ model 1/3 verifying");
+        st.phase = Phase::Staged;
+        assert_eq!(segment_text(&st), "⇩ model ready on restart");
+        st.phase = Phase::Cancelled;
+        assert_eq!(segment_text(&st), "⇩ model cancelled");
+        st.phase = Phase::Failed;
+        st.error = Some("checksum mismatch".to_string());
+        assert_eq!(segment_text(&st), "⇩ model failed");
     }
 
     #[test]

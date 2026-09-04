@@ -487,6 +487,9 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
         plank::download::check_manifest_at_startup();
+        // Mirrors the background downloader's state into the status bar. Cheap
+        // and idempotent: it does nothing at all when no download is running.
+        plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model)?;
         // Vision is always on: the encoder GGUF sits beside the main model and
         // is fetched on demand when missing, the same as the main model.
@@ -720,6 +723,9 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
         plank::download::check_manifest_at_startup();
+        // Mirrors the background downloader's state into the status bar. Cheap
+        // and idempotent: it does nothing at all when no download is running.
+        plank::downloader::spawn_watcher();
         plank::download::ensure_model(&model_path)?;
         // Vision is always on: the encoder GGUF sits beside the main model and
         // is fetched on demand when missing, the same as the main model.
