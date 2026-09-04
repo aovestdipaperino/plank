@@ -630,10 +630,10 @@ fn one_artifact(
     file.flush().map_err(|e| e.to_string())?;
 
     // A body that ends early reads as a clean EOF. Leave the .part alone: those
-    // bytes are good, just incomplete, and the next run resumes them.
+    // bytes are good, just incomplete, and the user can resume them.
     if done != entry.bytes {
         return Err(format!(
-            "{kind}: got {done} of {} bytes; it will resume on the next launch",
+            "{kind}: got {done} of {} bytes; resume with /model download or the next offer",
             entry.bytes
         ));
     }
@@ -711,7 +711,7 @@ fn finish_cancel(
 }
 
 /// Whether a `Phase::Cancelled` state was a Keep cancel (partial files stay,
-/// resume on the next launch) rather than a Delete cancel.
+/// resumable via `/model download` or the next daily offer) rather than a Delete cancel.
 ///
 /// A state that predates this distinction (no `error`, or a value that is not
 /// one of the two markers `finish_cancel` writes) is treated as `Delete` — the
