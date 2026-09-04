@@ -281,7 +281,9 @@ Plugins are loaded from four places, in order: `~/.plank/plugins/claude/*` for o
 
 ### Naming
 
-One rule covers skills, agents and templates: a plugin contribution is always addressable as `<plugin>:<name>`, and it keeps the bare `<name>` only when nothing else claims it. Your own skills and agents always win the bare name, and when two plugins offer the same name neither keeps it — both stay reachable only in their namespaced form. `/skills`, `/agent` and `/templates` show the contributing plugin beside each entry.
+One rule covers agents and templates: a plugin contribution is always addressable as `<plugin>:<name>`, and it keeps the bare `<name>` only when nothing else claims it. Your own agents and templates always win the bare name, and when two plugins offer the same name neither keeps it — both stay reachable only in their namespaced form. `/agent` and `/templates` show the contributing plugin beside each entry.
+
+Plugin **skills** are namespaced only: a plugin skill is always `/plugin:name` and never gets the bare `/name`, even when nothing else claims it. Your own skills (in `~/.plank/skills` or `./.plank/skills`) are still reachable as `/name`. `/skills` shows the contributing plugin beside each entry.
 
 MCP servers are the exception: the separator is `-`, so a disambiguated server is `<plugin>-<server>`. Server names are embedded in the tool name `mcp__<server>__<tool>` and split at the first `__`, which is also why a plugin server name containing `__` is rejected outright.
 

@@ -160,8 +160,8 @@ pub fn render_list(skills: &[Skill]) -> String {
         return "no skills found (checked ~/.plank/skills and ./.plank/skills)\n".to_string();
     }
     let mut out = String::from("Skills (invoke with /<name> [arguments]):\n");
-    // An uncontested plugin skill is registered under both its bare name and
-    // its `<plugin>:<name>` alias; `listing` shows it once and names the plugin.
+    // An uncontested plugin skill is registered only under its `<plugin>:<name>`
+    // alias; `listing` surfaces it once, naming the plugin.
     for listed in crate::plugins::listing(skills) {
         let s = listed.entry;
         out.push_str("  /");
@@ -193,8 +193,8 @@ pub fn render_names(skills: &[Skill]) -> String {
             .to_string();
     }
     let mut out = String::from("Available skills (call skill with name set to one of):\n");
-    // Listing an uncontested plugin skill under both its bare name and its
-    // alias would read to the model as two different skills, so show it once.
+    // A plugin skill is registered only under its `<plugin>:<name>` alias, so
+    // listing it once is already correct — no bare-name twin to suppress.
     for listed in crate::plugins::listing(skills) {
         out.push_str("- ");
         out.push_str(listed.name);
