@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The prompt's phase cursor is drawn into the frame instead of sent as an
+  OSC 12 escape.** OSC 12 recolouring was silently ignored by Warp and other
+  terminals, so the idle/busy indicator simply never appeared for a lot of
+  users. `render_input` now paints it itself with the `nano-cursor` crate: a
+  post-pass block cursor over the text just drawn, coloured green while
+  waiting on you and red while the agent is busy, re-inking the glyph
+  underneath for contrast and covering both cells of a double-width
+  character. The real terminal cursor stays hidden (ratatui emits `Hide`)
+  but is still moved to the caret after every draw, so IME candidate windows
+  and screen-reader focus track the prompt instead of a stale position. The
+  now-pointless `ui.cursor` setting, which only ever gated the OSC 12 path,
+  is gone.
+
 ### Added
 
 - **`--ctx` accepts a `k`/`m` suffix.** A context window is quoted in those
