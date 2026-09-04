@@ -207,6 +207,101 @@ fn remote_capture(remote: Option<&Mutex<UiRemote>>, frame: &mut ratatui::Frame) 
     }
 }
 
+/// Repaints the idle-loop frame, exactly as `tui_loop`'s own draw call
+/// composes it.
+///
+/// Extracted so a blocking prompt (Ctrl-D quit, Alt-M cancel) can repaint
+/// immediately before it blocks in `crossterm::event::read()`. Without this,
+/// the terminal shows the frame from *before* the prompt's lines were pushed
+/// into `log` — the screen looks frozen, and the user's next keystroke is
+/// silently consumed as the answer.
+#[allow(clippy::too_many_arguments)]
+fn repaint_idle(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    sub_pane: &mut tui::SubPane,
+    btw_panel: &mut BtwPanel,
+    input: &TuiInput,
+    idle_status: &str,
+    selection: Option<tui::ContentSelection>,
+    task_view: &tui::TaskView,
+    config_form: Option<&crate::configform::ConfigForm>,
+    kv_pane: Option<&crate::kvpane::KvPane>,
+    resume_pane: Option<&crate::resumepane::ResumePane>,
+    arcade: &crate::arcade::Arcade,
+    wasm_frame: Option<&crate::wasmreg::OpenFrame>,
+    rem: Option<&Mutex<UiRemote>>,
+) -> Result<ratatui::buffer::Buffer, String> {
+    let sub_active = sub_pane.active;
+    let sub_title: Option<String> = if sub_active {
+        sub_pane.label().map(str::to_owned)
+    } else {
+        None
+    };
+    let roster = sub_pane.roster_view(tui::roster_clock_ms());
+    let roster_rows = roster.height();
+    let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
+    let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+        match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
+            Some(run) => (&run.log, &mut run.view),
+            None => (log, view),
+        };
+    let completed = terminal
+        .draw(|f| {
+            if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {
+                tui::draw_btw_split(
+                    f,
+                    draw_log,
+                    btw_log,
+                    btw_view,
+                    Some(input.state()),
+                    idle_status,
+                    draw_view,
+                    task_view,
+                    &roster,
+                );
+            } else {
+                tui::draw(
+                    f,
+                    draw_log,
+                    Some(input.state()),
+                    idle_status,
+                    draw_view,
+                    selection,
+                    task_view,
+                    sub_title.as_deref(),
+                    &roster,
+                );
+            }
+            if let Some(m) = &input.slash {
+                tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
+            }
+            if let Some(p) = &input.popup {
+                tui::draw_popup(f, input.buf.text(), p, roster_rows);
+            }
+            if let Some(form) = config_form {
+                tui::draw_config(f, form);
+            }
+            if let Some(pane) = kv_pane {
+                tui::draw_kvcache(f, pane);
+            }
+            if let Some(pane) = resume_pane {
+                tui::draw_resume(f, pane);
+            }
+            // Drawn last: the arcade covers the whole frame.
+            if arcade.is_open() {
+                tui::draw_arcade(f, arcade);
+            }
+            if let Some(open) = wasm_frame {
+                tui::draw_wasm_frame(f, open);
+            }
+            remote_capture(rem, f);
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(completed.buffer.clone())
+}
+
 /// Answers deferred remote requests. Call right after `terminal.draw` returns.
 fn remote_service(remote: Option<&Mutex<UiRemote>>) {
     if let Some(m) = remote
@@ -8054,77 +8149,27 @@ impl Agent<'_> {
                 Some(label) => format!("[sub-agent: {label}] {status}"),
                 None => status,
             };
-            let roster = sub_pane.roster_view(tui::roster_clock_ms());
-            let roster_rows = roster.height();
-            let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
-            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
-                match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
-                    Some(run) => (&run.log, &mut run.view),
-                    None => (&log, &mut view),
-                };
-            let completed = terminal
-                .draw(|f| {
-                    // A `/btw` panel left open from an earlier turn keeps the
-                    // split view even while idle; text selection falls back to
-                    // the single-column path (no panel). The sub-agent pane
-                    // takes precedence: the split is about the main task.
-                    if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {
-                        tui::draw_btw_split(
-                            f,
-                            draw_log,
-                            btw_log,
-                            btw_view,
-                            Some(input.state()),
-                            &idle_status,
-                            draw_view,
-                            &task_view,
-                            &roster,
-                        );
-                    } else {
-                        tui::draw(
-                            f,
-                            draw_log,
-                            Some(input.state()),
-                            &idle_status,
-                            draw_view,
-                            selection,
-                            &task_view,
-                            sub_title.as_deref(),
-                            &roster,
-                        );
-                    }
-                    if let Some(m) = &input.slash {
-                        tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
-                    }
-                    if let Some(p) = &input.popup {
-                        tui::draw_popup(f, input.buf.text(), p, roster_rows);
-                    }
-                    if let Some(form) = &config_form {
-                        tui::draw_config(f, form);
-                    }
-                    if let Some(pane) = &kv_pane {
-                        tui::draw_kvcache(f, pane);
-                    }
-                    if let Some(pane) = &resume_pane {
-                        tui::draw_resume(f, pane);
-                    }
-                    // Drawn last: the arcade covers the whole frame.
-                    if arcade.is_open() {
-                        tui::draw_arcade(f, &arcade);
-                    }
-                    // And a WASM frame covers it in turn — the two are never
-                    // open at once, but ordering them makes that a fact about
-                    // the code rather than an assumption about the callers.
-                    if let Some(open) = &wasm_frame {
-                        tui::draw_wasm_frame(f, open);
-                    }
-                    remote_capture(rem, f);
-                })
-                .map_err(|e| e.to_string())?;
+            let completed_buffer = repaint_idle(
+                terminal,
+                &log,
+                &mut view,
+                &mut sub_pane,
+                &mut btw_panel,
+                &input,
+                &idle_status,
+                selection,
+                &task_view,
+                config_form.as_ref(),
+                kv_pane.as_ref(),
+                resume_pane.as_ref(),
+                &arcade,
+                wasm_frame.as_ref(),
+                rem,
+            )?;
             // Snapshot the just-drawn buffer (ratatui has already swapped, so
-            // `completed.buffer` is the frame the user sees, not the blank one).
+            // this is the frame the user sees, not the blank one).
             if capture_crt {
-                crt_frame = Some(frame_to_image(completed.buffer));
+                crt_frame = Some(frame_to_image(&completed_buffer));
             }
             remote_service(rem);
 
@@ -8681,6 +8726,28 @@ impl Agent<'_> {
                         // whether they just threw away 40 GB.
                         if let Some(warning) = crate::downloader::quit_warning() {
                             log.push_dim(warning);
+                            // Repaint before blocking: the frame is only drawn
+                            // at the top of this loop, so without this the
+                            // terminal would look frozen with the warning
+                            // invisible, and the user's next keystroke would
+                            // be silently consumed as the answer.
+                            repaint_idle(
+                                terminal,
+                                &log,
+                                &mut view,
+                                &mut sub_pane,
+                                &mut btw_panel,
+                                &input,
+                                &idle_status,
+                                selection,
+                                &task_view,
+                                config_form.as_ref(),
+                                kv_pane.as_ref(),
+                                resume_pane.as_ref(),
+                                &arcade,
+                                wasm_frame.as_ref(),
+                                rem,
+                            )?;
                             if !await_yes_default()? {
                                 continue;
                             }
@@ -8734,6 +8801,26 @@ impl Agent<'_> {
                     for line in prompt.lines() {
                         log.push_dim(line.to_string());
                     }
+                    // Same reasoning as the Ctrl-D quit prompt: repaint before
+                    // blocking, since a stray keystroke here can mean deleting
+                    // an 87 GB verified download.
+                    repaint_idle(
+                        terminal,
+                        &log,
+                        &mut view,
+                        &mut sub_pane,
+                        &mut btw_panel,
+                        &input,
+                        &idle_status,
+                        selection,
+                        &task_view,
+                        config_form.as_ref(),
+                        kv_pane.as_ref(),
+                        resume_pane.as_ref(),
+                        &arcade,
+                        wasm_frame.as_ref(),
+                        rem,
+                    )?;
                     match await_cancel_choice()? {
                         Some(delete) => {
                             log.push_dim(crate::downloader::cancel_command(delete));
