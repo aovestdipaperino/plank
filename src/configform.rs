@@ -34,6 +34,7 @@ pub enum FieldId {
     UiShowToolResults,
     UiShowThinking,
     UiNotifications,
+    UiCursor,
     UiNotifyAfterSecs,
     UiCrtOff,
     UiScreensaver,
@@ -186,6 +187,13 @@ pub static FIELDS: &[Field] = &[
         "ui",
         "notifications",
         "macOS desktop notifications: always, unfocused, never",
+        Kind::Bool,
+    ),
+    f(
+        FieldId::UiCursor,
+        "ui",
+        "cursor",
+        "cursor indicator: terminal, drawn, off",
         Kind::Bool,
     ),
     f(
@@ -392,6 +400,7 @@ pub fn display(s: &Settings, id: FieldId) -> String {
         FieldId::UiShowToolResults => s.ui.show_tool_results.to_string(),
         FieldId::UiShowThinking => s.ui.show_thinking.to_string(),
         FieldId::UiNotifications => s.ui.notifications.as_str().to_string(),
+        FieldId::UiCursor => s.ui.cursor.as_str().to_string(),
         FieldId::UiNotifyAfterSecs => s.ui.notify_after_secs.to_string(),
         FieldId::UiCrtOff => s.ui.crt_off.to_string(),
         FieldId::UiScreensaver => s.ui.screensaver.as_str().to_string(),
@@ -447,6 +456,15 @@ fn toggle(s: &mut Settings, id: FieldId) {
                 NotifyMode::Always => NotifyMode::Unfocused,
                 NotifyMode::Unfocused => NotifyMode::Never,
                 NotifyMode::Never => NotifyMode::Always,
+            };
+        }
+        // Cycles the three cursor modes like the notification modes.
+        FieldId::UiCursor => {
+            use crate::cursor::CursorMode;
+            s.ui.cursor = match s.ui.cursor {
+                CursorMode::Terminal => CursorMode::Drawn,
+                CursorMode::Drawn => CursorMode::Off,
+                CursorMode::Off => CursorMode::Terminal,
             };
         }
         // Cycles 1m -> 2m -> 5m -> never, like the notification modes.
@@ -541,11 +559,8 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         }
         // Bool/Tri fields accept an explicit textual value from the REPL path.
         // Accepts always/unfocused/never, plus the legacy true/false.
-        FieldId::UiNotifications => {
-            s.ui.notifications = crate::notify::NotifyMode::parse(raw).ok_or_else(|| {
-                format!("notifications must be always, unfocused, or never (got {raw})")
-            })?;
-        }
+        FieldId::UiNotifications => s.ui.notifications = parse_notify_mode(raw)?,
+        FieldId::UiCursor => s.ui.cursor = parse_cursor_mode(raw)?,
         FieldId::UiScreensaver => {
             s.ui.screensaver = crate::arcade::ScreensaverDelay::parse(raw)
                 .ok_or_else(|| format!("screensaver must be 1m, 2m, 5m, or never (got {raw})"))?;
@@ -592,6 +607,22 @@ pub fn set_value(s: &mut Settings, id: FieldId, raw: &str) -> Result<(), String>
         FieldId::SafetyBtwSuspend => s.safety.btw_suspend = parse_tri(raw)?,
     }
     Ok(())
+}
+
+/// Parses `raw` as a [`crate::notify::NotifyMode`], with a `set_value`-style
+/// error message. Pulled out of `set_value` to keep that function's line
+/// count under clippy's `too_many_lines` threshold.
+fn parse_notify_mode(raw: &str) -> Result<crate::notify::NotifyMode, String> {
+    crate::notify::NotifyMode::parse(raw)
+        .ok_or_else(|| format!("notifications must be always, unfocused, or never (got {raw})"))
+}
+
+/// Parses `raw` as a [`crate::cursor::CursorMode`], with a `set_value`-style
+/// error message. Pulled out of `set_value` to keep that function's line
+/// count under clippy's `too_many_lines` threshold.
+fn parse_cursor_mode(raw: &str) -> Result<crate::cursor::CursorMode, String> {
+    crate::cursor::CursorMode::parse(raw)
+        .ok_or_else(|| format!("cursor must be terminal, drawn, or off (got {raw})"))
 }
 
 fn set_bool(s: &mut Settings, id: FieldId, b: bool) {
@@ -1563,6 +1594,16 @@ mod tests {
         // Empty clears the optional.
         set_from_path(&mut s, "engine.backend", "").unwrap();
         assert_eq!(s.engine.backend, None);
+    }
+
+    #[test]
+    fn ui_cursor_is_a_known_config_key() {
+        let mut s = Settings::default();
+        assert_eq!(s.ui.cursor, crate::cursor::CursorMode::Terminal);
+        let field = set_from_path(&mut s, "ui.cursor", "drawn").unwrap();
+        assert_eq!(field.id, FieldId::UiCursor);
+        assert_eq!(s.ui.cursor, crate::cursor::CursorMode::Drawn);
+        assert!(set_from_path(&mut s, "ui.cursor", "sideways").is_err());
     }
 
     #[test]

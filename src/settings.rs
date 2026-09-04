@@ -156,6 +156,10 @@ pub struct UiSettings {
     /// Minimum turn duration, in seconds, before a completed turn notifies.
     /// Awaiting-input notifications ignore this. Default 10.
     pub notify_after_secs: u64,
+    /// Which cursor phase indicator to use: `terminal` (OSC 12, the default),
+    /// `drawn` (painted into the frame, works on terminals that ignore the
+    /// escape), or `off`.
+    pub cursor: crate::cursor::CursorMode,
     /// Play the CRT power-off animation of the final frame on clean TUI
     /// exit. On by default; see issue #54.
     pub crt_off: bool,
@@ -201,6 +205,7 @@ impl Default for UiSettings {
             show_thinking: false,
             notifications: crate::notify::NotifyMode::Always,
             notify_after_secs: 10,
+            cursor: crate::cursor::CursorMode::Terminal,
             crt_off: true,
             reduced_motion: false,
             screensaver: crate::arcade::ScreensaverDelay::default(),
@@ -642,6 +647,10 @@ impl Settings {
         if let Some(v) = num(ui, "notifyAfterSecs") {
             self.ui.notify_after_secs = v;
             self.note("ui.notifyAfterSecs", origin);
+        }
+        if let Some(v) = string(ui, "cursor").and_then(|s| crate::cursor::CursorMode::parse(&s)) {
+            self.ui.cursor = v;
+            self.note("ui.cursor", origin);
         }
         if let Some(v) = boolean(ui, "crtOff") {
             self.ui.crt_off = v;
