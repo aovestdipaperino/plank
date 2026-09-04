@@ -2474,7 +2474,18 @@ impl Agent<'_> {
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
+        let mut round = 0usize;
         loop {
+            round += 1;
+            // Pressure builds *inside* a turn too: a long read/edit/test loop
+            // can cross the soft limit many rounds after the turn started, and
+            // a generation issued against an over-full window fails outright.
+            // The C checks this at the top of every continuation round
+            // ("soft limit before tool continuation", `worker_run_turn`);
+            // round 0 is already covered by the pre-turn check above.
+            if round > 1 && self.maybe_compact()?.aborted() {
+                return Ok(());
+            }
             let prompt_text = render_transcript(&self.session, &self.system);
             let (stream, assistant_text, stats) =
                 self.stream_generation(&prompt_text, turn_start)?;
@@ -9867,7 +9878,21 @@ impl Agent<'_> {
         // Stop hooks run at most once per turn, so a hook that always exits 2
         // cannot loop the model forever.
         let mut stop_hook_ran = false;
+        let mut round = 0usize;
         loop {
+            round += 1;
+            // Pressure builds *inside* a turn too (the C's "soft limit before
+            // tool continuation"): round 1 is covered by the pre-turn check
+            // above, every continuation round needs its own, or a long tool
+            // loop generates against an over-full window.
+            if round > 1
+                && self
+                    .maybe_compact_notify(&mut NoteSink(&mut note), &compact_interrupt)?
+                    .aborted()
+            {
+                shared.interrupt.store(false, Ordering::Relaxed);
+                return Ok(());
+            }
             let base_prompt = render_transcript(&self.session, &self.system);
             // Text already streamed for this pass and preserved across in-pass
             // `/btw` suspensions (BTW-SUSPEND-DESIGN §4.3). Empty unless the
@@ -14903,6 +14928,62 @@ mod tests {
         );
 
         crate::settings::install_for_test(crate::settings::Settings::default());
+    }
+
+    /// Context pressure that builds up *inside* a turn must still compact.
+    ///
+    /// The C checks `agent_worker_compact_if_needed` at the top of every tool
+    /// round ("soft limit before tool continuation"), not just before the
+    /// user's turn: a long read/edit/test loop can cross the soft limit many
+    /// rounds after the turn started, and without a per-round check the next
+    /// generation is issued against an over-full window.
+    #[test]
+    fn a_turn_compacts_between_tool_rounds() {
+        let dir = scratch_dir("compact-mid-turn");
+        let cfg = test_cfg();
+        // Big enough that the system prompt alone is not already over the
+        // trigger, small enough that one fat assistant message crosses it.
+        let ctx: i32 = 40_000;
+        let engine = ScriptedEngine {
+            ctx_override: Some(ctx),
+            replies: vec![
+                // Round 0: a huge reply ending in an invalid stanza, so the
+                // turn continues with a tool-error round.
+                format!(
+                    "{}<\u{ff5c}DSML\u{ff5c}tool_calls><b>",
+                    "x".repeat(4 * usize::try_from(ctx).unwrap())
+                ),
+                // The compaction summary the mid-turn pass asks for.
+                "<summary>durable state</summary>".to_string(),
+                // Round 1's real answer.
+                "all done".to_string(),
+            ],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("go"));
+
+        // Precondition: nothing to compact at turn start.
+        let start = render_transcript(&agent.session, &agent.system);
+        assert!(
+            !compact::should_compact(ctx, agent.engine.count_tokens(&start)),
+            "the turn must start below the trigger, or this proves nothing"
+        );
+
+        agent.run_turn().unwrap();
+
+        assert!(
+            agent.session.transcript[0]
+                .text
+                .starts_with("<tool_result>Compacted session summary:"),
+            "mid-turn compaction never ran: {:?}",
+            agent
+                .session
+                .transcript
+                .iter()
+                .map(|m| m.text.chars().take(60).collect::<String>())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// With `context.microcompact` off, the opportunistic end-of-turn pass

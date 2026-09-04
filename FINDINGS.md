@@ -917,6 +917,19 @@ without the model files).
   DeepSeek image token block at token N". It is 512 now. The C reference
   chunks at 4096 and never meets this.
 
+## Compaction cadence — the C checks every tool round, not just every turn
+
+- **`maybe_compact` at turn start is only half the C's cadence.** The C calls
+  `agent_worker_compact_if_needed` twice: once before the user turn ("soft
+  limit before user turn") and once at the top of every continuation round
+  ("soft limit before tool continuation", `worker_run_turn`). The port kept
+  only the first, so context that filled up *inside* a turn — the normal case
+  for a long read/edit/test loop, where every round appends a tool result —
+  was never checked, and the next generation went out against an over-full
+  window. The end-of-turn opportunistic microcompact does not cover this: it
+  runs only on the path where the turn is already over. Both loops
+  (`run_turn`, `worker_turn`) now check on each round past the first.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

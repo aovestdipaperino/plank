@@ -138,9 +138,17 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v3.6.0 is out</strong>, and the beta channel is on 3.6.2. The
+<p><strong>v3.6.0 is out</strong>, and the beta channel is on 3.6.3. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>Long turns compact themselves now.</strong> Plank asked
+whether the context needed compacting before a turn started, and then
+never asked again while that turn ran — but a turn appends a tool result
+on every round, so a session that reads, edits and tests its way through
+a dozen rounds could sail past the soft limit halfway through and keep
+generating against a window that was already full. The check now runs at
+the top of every round, which is what the C reference plank was ported
+from has always done.</p>
 <p><strong>Plank can see. Paste a screenshot and ask what
 broke.</strong> Vision has been in the box for a while, but it never
 actually worked: four separate faults in the image path sat on top of

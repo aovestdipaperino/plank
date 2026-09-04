@@ -13,7 +13,55 @@ it.
 Riding the beta channel today, on top of the newest stable release. Install with
 `brew install aovestdipaperino/tap/plank-agent-beta`.
 
-### 3.5.3
+### 3.6.3
+
+🧮 **Context pressure is checked between tool rounds, not only between turns.**
+A turn that reads, edits and tests its way through a dozen rounds fills the
+window as it goes, and plank only asked whether it should compact *before* the
+turn started. Cross the soft limit halfway through and the next generation went
+out against an over-full context. The check now runs at the top of every
+continuation round, on both front ends, which is what the C reference does and
+what the port had quietly dropped.
+
+### 3.6.2
+
+👁️ **Plank can see, and this time it is true.** The vision encoder has shipped
+beside the model for a while, but the image path never actually worked: four
+faults sat on top of each other, and between them a pasted screenshot either
+aborted the process with `malloc: pointer being freed was not allocated` or came
+back described as something that was never in the picture. The engine now gets a
+buffer it can own and free; an image already in the conversation keeps the span
+the engine built for it instead of having one rebuilt that could never match; the
+encoder's metadata is read before the free that zeroes it, so an image no longer
+arrives with an empty layout and takes the surrounding message down with it; and
+the prefill chunk sits above the 384-token image-block cap the engine refuses to
+split. Paste a stack trace, a failing UI, a diagram or a photo of a whiteboard
+and the model looks at the picture. The encoder lives at
+`~/.plank/ds4flash.vision.gguf`, is fetched on first launch, and runs on the same
+Metal device, so no pixels leave the Mac.
+
+## Stable releases
+
+### 3.6.0
+
+The 3.5 beta series became stable here, led by a whole-codebase security review.
+
+🔒 **The sandbox means what it says.** `write` and `edit` were never asked the
+question the shell has always been asked, so a model could route around the bash
+sandbox by choosing the file tool instead. Both now resolve their target through
+one choke point and refuse anything outside the working directory, the temp roots
+and your `writablePaths`. A project's `.plank/sandbox.json` can only *tighten*
+the policy, so a cloned repository cannot switch your sandbox off, and
+`plank serve` refuses a token-less bind off loopback unless you pass
+`--insecure` on the server side. Reads stay uncontained by design.
+
+🧵 **Every child process runs in its own group and is killed as a tree.** A
+timed-out `sleep 600; echo ok`, a `cmd | tee` pipeline, an MCP server or a hook
+no longer outlives plank, and Ctrl-C on a running command actually reaches it.
+
+The betas that got here, newest first:
+
+#### 3.5.3
 
 🪟 **Every sub-agent streams into a console window of its own.** The debug-console
 mirror showed you the main session; a sub-agent's reasoning went nowhere. Now each
@@ -35,7 +83,7 @@ opt-in, so the window keeps rendering after the error line.
 uncommitted changes, so a bug report names an exact build rather than a version
 that shipped many times.
 
-### 3.5.1
+#### 3.5.1
 
 📄 **The status footer counts what you have changed.** The TUI's location row
 already told you which tree you were in — path and branch. It now also tells you
@@ -44,7 +92,7 @@ bright green and lines deleted in bright red. Staged and unstaged work count
 together, untracked files included, so a file you edited and then added shows up
 once. A clean tree shows nothing.
 
-### 3.4.1
+#### 3.4.1
 
 Opens the new beta channel on the same code as 3.4.0.
 
@@ -56,8 +104,6 @@ differences along the way — `${CLAUDE_PLUGIN_ROOT}` becomes a real path, and
 nested hook config gets unwrapped — so the plugin's hooks and MCP servers just
 work. Tried end to end with `obra/superpowers`: one command, all 14 skills
 showed up on the next start.
-
-## Stable releases
 
 ### 3.4.0
 

@@ -7,8 +7,16 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v3.6.0 is out**, and the beta channel is on 3.6.2. The patch number is still
+**v3.6.0 is out**, and the beta channel is on 3.6.3. The patch number is still
 the channel: `.0` is stable, anything above it is beta.
+
+**Long turns compact themselves now.** Plank asked whether the context needed
+compacting before a turn started, and then never asked again while that turn ran
+— but a turn appends a tool result on every round, so a session that reads,
+edits and tests its way through a dozen rounds could sail past the soft limit
+halfway through and keep generating against a window that was already full. The
+check now runs at the top of every round, which is what the C reference plank
+was ported from has always done.
 
 **Plank can see. Paste a screenshot and ask what broke.** Vision has been in
 the box for a while, but it never actually worked: four separate faults in the

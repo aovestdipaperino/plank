@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.6.3] - 2026-09-04
+
+### Fixed
+
+- **Context is compacted between tool rounds, not only between turns.**
+  `should_compact` was consulted once, before a turn started, and never again
+  while that turn ran — but a turn appends a tool result on every round, so a
+  long read/edit/test loop could cross the soft limit many rounds in and keep
+  generating against an over-full window. The C reference checks at the top of
+  every continuation round (`agent_worker_compact_if_needed`, "soft limit before
+  tool continuation") and the port had kept only the pre-turn call; both the
+  plain REPL and the TUI worker loop now check per round. The end-of-turn
+  opportunistic microcompact did not cover this: it runs only once the turn is
+  already over.
+
 ## [3.6.2] - 2026-09-04
 
 ### Fixed
