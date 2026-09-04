@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.6.0] - 2026-09-04
+
 ### Security
 
 - **`write` and `edit` now respect the sandbox.** The bash sandbox has always
