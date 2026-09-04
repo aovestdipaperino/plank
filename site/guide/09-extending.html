@@ -458,14 +458,18 @@ that misses the response deadline is dropped along with all of its
 tools, so check <code>mcp.timeoutSecs</code> if one is slow to
 start.</p>
 <h3 id="reading-images-with-ocr-mcp">Reading images with ocr-mcp</h3>
-<p>plank can attach a screenshot, but the ds4 engine is text-only, so
-the model receives a path rather than pixels. <a
+<p>plank sees images natively now, through the bundled vision encoder
+and the <code>view_image</code> tool, so this is no longer the only way
+to get a screenshot in front of the model. It is still the better way to
+get <em>text</em> out of one. Vision describes an image within a
+384-token budget; OCR transcribes it. For a full-page stack trace, a
+scanned invoice or a wall of log output, you want the transcription.</p>
+<p><a
 href="https://github.com/aovestdipaperino/ocr-mcp"><code>ocr-mcp</code></a>
-closes that gap: it is a small MCP server that runs a local GLM-OCR
-model and exposes one tool, <code>transcribe_image</code>. Paste a
-screenshot of a stack trace, ask what it says, and the model calls the
-tool on the path and reads the answer back. Nothing leaves the machine
-and there is no API key.</p>
+is a small MCP server that runs a local GLM-OCR model and exposes one
+tool, <code>transcribe_image</code>. Paste a screenshot, ask what it
+says, and the model calls the tool on the path and reads the answer
+back. Nothing leaves the machine and there is no API key.</p>
 <p>Install it, along with the <code>llama-server</code> binary that does
 the inference:</p>
 <pre class="sh"><code>brew install llama.cpp
@@ -566,14 +570,20 @@ about a bad plugin is fatal: a broken manifest or an unreadable
 component demotes that one plugin, or just that one component, and the
 session continues.</p>
 <h3 id="naming">Naming</h3>
-<p>One rule covers skills, agents and templates: a plugin contribution
-is always addressable as <code>&lt;plugin&gt;:&lt;name&gt;</code>, and
-it keeps the bare <code>&lt;name&gt;</code> only when nothing else
-claims it. Your own skills and agents always win the bare name, and when
-two plugins offer the same name neither keeps it — both stay reachable
-only in their namespaced form. <code>/skills</code>, <code>/agent</code>
-and <code>/templates</code> show the contributing plugin beside each
+<p>One rule covers agents and templates: a plugin contribution is always
+addressable as <code>&lt;plugin&gt;:&lt;name&gt;</code>, and it keeps
+the bare <code>&lt;name&gt;</code> only when nothing else claims it.
+Your own agents and templates always win the bare name, and when two
+plugins offer the same name neither keeps it — both stay reachable only
+in their namespaced form. <code>/agent</code> and
+<code>/templates</code> show the contributing plugin beside each
 entry.</p>
+<p>Plugin <strong>skills</strong> are namespaced only: a plugin skill is
+always <code>/plugin:name</code> and never gets the bare
+<code>/name</code>, even when nothing else claims it. Your own skills
+(in <code>~/.plank/skills</code> or <code>./.plank/skills</code>) are
+still reachable as <code>/name</code>. <code>/skills</code> shows the
+contributing plugin beside each entry.</p>
 <p>MCP servers are the exception: the separator is <code>-</code>, so a
 disambiguated server is <code>&lt;plugin&gt;-&lt;server&gt;</code>.
 Server names are embedded in the tool name

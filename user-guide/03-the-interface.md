@@ -134,11 +134,15 @@ The marker is coloured as you type, by where the output goes: **red `!`** feeds 
 
 Paste an image (or a path to one) into the prompt and plank attaches it. On macOS an image on the clipboard arrives as an empty paste, which is the signal plank uses; pasting the *path* to an image file works too, including a file dragged onto the terminal. Either way the file is deduplicated by content into `~/.plank/image-cache/` and attached to your message.
 
-**The bytes are cached exactly as you pasted them.** plank does not resample or re-encode, which it used to do to satisfy an image-upload limit it never actually had. The local ds4 engine is text-only and never uploads pixels anywhere, so shrinking them only threw away the pixel density and DPI metadata that anything reading the image later would want.
+**The bytes are cached exactly as you pasted them.** plank does not resample or re-encode, which it used to do to satisfy an image-upload limit it never actually had. Nothing uploads your pixels anywhere, so shrinking them only threw away the pixel density and DPI metadata that anything reading the image later would want. The vision encoder does its own resizing at encode time, from the original file.
 
-What reaches the model is the *path*, not the picture. On its own that makes a pasted screenshot of a stack trace just a filename. Give the model a tool that can read image files and the same paste becomes useful, which is what [ocr-mcp](09-extending.md#reading-images-with-ocr-mcp) is for: with it registered, the model calls `transcribe_image` on the path and gets the text back.
+**The model can see it.** plank ships a vision encoder alongside the main model, at `~/.plank/ds4flash.vision.gguf`, and offers it to the model without any setup on your part: it is downloaded on first launch if it is missing, and the `view_image` tool is always available. Paste a screenshot of a stack trace and ask what broke, and the model looks at the picture rather than at a filename. The same applies to a diagram, a screenshot of a failing UI, or a photo of a whiteboard.
 
-Without such a tool, transcribe the important part into your prompt yourself.
+What your message carries is still the path. The model turns that path into pixels by calling `view_image` on it, which is why you see a `view_image` line in the transcript before the answer. The image is encoded locally, on the same Metal device as the model, so nothing about it leaves the Mac.
+
+There is a size budget. An image is resized to fit 384 visual tokens, so a very wide or very tall screenshot loses detail before it loses shape. If you want the model to read small text, crop to the part that matters rather than sending the whole desktop.
+
+For a page of dense text, an OCR pass is still the better tool: [ocr-mcp](09-extending.md#reading-images-with-ocr-mcp) transcribes an image to text instead of describing it, which is what you want for a full-page stack trace or a scanned document.
 
 ## Reading PDFs
 

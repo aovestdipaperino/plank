@@ -876,6 +876,47 @@ instead of rebuilding from zero. Several things about it were not obvious:
   session TTL and sorts it last under the byte budget instead of first; the
   fallback needs its own `.rung-` branch.
 
+## Vision (M12) — four ways the image path lied about ownership
+
+All four were live at once, which is why the feature looked wired up and
+described a screenshot as "a close-up photograph of a person's face". The
+regression test is `tests/vision_ownership.rs` (engine-gated, self-skips
+without the model files).
+
+- **`ds4_prompt_append_vision` *moves* the embedding's `data` pointer; it does
+  not copy the floats.** `span->embedding = *embedding; memset(embedding, 0,
+  ...)` — and for DeepSeek the append goes further and calls
+  `free(embedding->data)` outright, replacing it with its own permuted block.
+  So an embedding handed to the append **must** own a `malloc`'d buffer: pass a
+  `Vec<f32>`'s pointer and the C frees a Rust allocation, which the `Vec` then
+  frees again. On macOS Rust's global allocator *is* the system malloc, so the
+  first free succeeds and the second aborts the process with `malloc: pointer
+  being freed was not allocated`, far from the aliasing that caused it.
+  `crate::cbuf::malloc_copy_f32` is the one place that mints those buffers.
+- **A kept span's vision span cannot be rebuilt — only preserved.** The C
+  rewrites the embedding it is handed (permuted block, sentinel rows
+  interleaved, `token_count` 100 → 114, `layout` → 0), so the span the engine
+  returned is the only copy of the real buffer, and reconstructing one from the
+  encoder's embedding gets rejected: "image span does not cover one complete
+  DeepSeek image block". `reconcile` therefore frees only the spans at or past
+  the divergence point and leaves the kept ones alone; a kept span's tokens are
+  reused verbatim, so its offsets stay valid.
+- **`ds4_vision_embedding_free` memsets the struct, so read every field
+  first.** `vision_encode_file` copied the floats out, freed the C buffer, and
+  *then* read `layout`, the token grid, dimensions and fingerprint — all zero
+  by then. `token_count` survived only because it happened to be saved
+  earlier. A zero `layout` makes the append fail with "invalid DeepSeek vision
+  embedding layout", and since a failed append returns an empty token delta,
+  the whole message — image *and* text — silently vanished from the prompt.
+  That silent drop is now logged through `errlog`.
+- **The prefill chunk is a floor set by vision, not by responsiveness.** The
+  engine refuses to split a DeepSeek image block across prefill chunks, and
+  `ds4_deepseek4_image_layout_build` caps a block at 384 tokens. plank pinned
+  `DEFAULT_PREFILL_CHUNK` at 256 for Ctrl-C granularity, so any image past
+  thumbnail size failed the entire prefill with "malformed or oversized
+  DeepSeek image token block at token N". It is 512 now. The C reference
+  chunks at 4096 and never meets this.
+
 ## Part 2 — Environment & tooling
 
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`

@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [3.6.2] - 2026-09-04
+
+### Fixed
+
+- **Images actually reach the model, and no longer crash it.** Four separate
+  faults sat on top of each other in the vision path, so a pasted or
+  `view_image`d picture would abort the process with
+  `malloc: pointer being freed was not allocated` — or, when it survived,
+  describe something that was never in the image. The engine takes ownership of
+  an embedding buffer (and for DeepSeek frees and replaces it outright), so it
+  is now handed a `malloc`'d copy instead of a pointer into a Rust `Vec` that
+  was being freed twice; a reused message's image span is preserved across
+  turns rather than reconstructed, which cannot work because the engine rewrites
+  the span it hands back; the encoder's metadata is read before the free that
+  zeroes it, instead of after, so the image no longer arrives with an empty
+  layout and gets silently dropped along with the message text around it; and the
+  prefill chunk was raised from 256 to 512 tokens, above the engine's 384-token
+  image-block cap, since it refuses to split a block across chunks and failed
+  the whole prefill for anything past thumbnail size. A failed image append is
+  now logged instead of swallowed.
+
 ## [3.6.0] - 2026-09-04
 
 ### Security

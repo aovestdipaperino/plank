@@ -241,6 +241,15 @@ content, so a second read of the same document costs nothing.</p>
 <em>your</em> path, never the cache path. A file that cannot be parsed
 comes back as a plain tool error.</p>
 <p>PDF is currently the only converted format.</p>
+<p><code>view_image</code> hands the model an actual picture instead of
+a path. It is served unconditionally, backed by the vision encoder plank
+keeps beside the main model, and it works on the usual formats:</p>
+<pre><code>what does the error in screenshot.png say?</code></pre>
+<p>The image is encoded locally within a 384 visual token budget, so a
+large screenshot is scaled down before the model sees it. Pasting an
+image into the prompt is the same road: your message carries the cached
+path, and the model calls <code>view_image</code> on it. See <a
+href="03-the-interface.html#pasting-images">The interface</a>.</p>
 <h3 id="web">Web</h3>
 <table>
 <thead>

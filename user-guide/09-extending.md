@@ -210,7 +210,9 @@ what was my last published article on medium?
 
 ### Reading images with ocr-mcp
 
-plank can attach a screenshot, but the ds4 engine is text-only, so the model receives a path rather than pixels. [`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp) closes that gap: it is a small MCP server that runs a local GLM-OCR model and exposes one tool, `transcribe_image`. Paste a screenshot of a stack trace, ask what it says, and the model calls the tool on the path and reads the answer back. Nothing leaves the machine and there is no API key.
+plank sees images natively now, through the bundled vision encoder and the `view_image` tool, so this is no longer the only way to get a screenshot in front of the model. It is still the better way to get *text* out of one. Vision describes an image within a 384-token budget; OCR transcribes it. For a full-page stack trace, a scanned invoice or a wall of log output, you want the transcription.
+
+[`ocr-mcp`](https://github.com/aovestdipaperino/ocr-mcp) is a small MCP server that runs a local GLM-OCR model and exposes one tool, `transcribe_image`. Paste a screenshot, ask what it says, and the model calls the tool on the path and reads the answer back. Nothing leaves the machine and there is no API key.
 
 Install it, along with the `llama-server` binary that does the inference:
 

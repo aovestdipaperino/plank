@@ -194,7 +194,15 @@ pub const DEFAULT_CONTROL_QUEUE_MAX: usize = 1 << 20; // 1 MiB
 /// boundary, so Ctrl-C during prefill is observed within ~one chunk instead of
 /// only after the whole prompt is prefilled. Small enough to feel responsive,
 /// large enough that the extra command-buffer overhead stays negligible.
-pub const DEFAULT_PREFILL_CHUNK: u32 = 256;
+///
+/// The floor is set by vision, not by responsiveness: the engine refuses to
+/// split a `DeepSeek` image token block across chunks, so a chunk smaller than
+/// the largest possible block fails the whole prefill with "malformed or
+/// oversized `DeepSeek` image token block". `ds4_deepseek4_image_layout_build`
+/// caps a block at 384 tokens, so anything above that is safe — this used to
+/// be 256, which broke every image bigger than a thumbnail. (The C reference
+/// chunks at 4096 and never notices.)
+pub const DEFAULT_PREFILL_CHUNK: u32 = 512;
 
 /// Engine tuning options forwarded to the native ds4 engine, mirroring the
 /// engine-relevant fields of the C `agent_config.engine`. Zero/`None` values
@@ -231,7 +239,8 @@ pub struct EngineTuning {
     pub dspark_confidence: Option<f32>,
     /// Prefill chunk size in tokens, fixed at [`DEFAULT_PREFILL_CHUNK`]. Chunked
     /// so Ctrl-C is observed at chunk boundaries instead of only after the whole
-    /// prompt is prefilled. Not user-configurable (no CLI flag).
+    /// prompt is prefilled. Not user-configurable (no CLI flag), and it must
+    /// stay above the 384-token `DeepSeek` image block cap — see the constant.
     pub prefill_chunk: u32,
     /// Quality mode from `--quality`.
     pub quality: bool,

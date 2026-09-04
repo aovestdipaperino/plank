@@ -488,12 +488,16 @@ impl Ds4Model {
             .collect();
         let c_part_ptrs: Vec<*const std::os::raw::c_char> =
             c_parts.iter().map(|c| c.as_ptr()).collect();
-        // Build FFI embeddings from the owned data. The C function copies the
-        // float data, so we can free these after the call.
+        // Build FFI embeddings from the owned data. `ds4_prompt_append_vision`
+        // *moves* each `data` pointer into the output span rather than copying
+        // the floats, and the span is later released with
+        // `ds4_vision_embedding_free` (a plain `free`) — so each embedding must
+        // carry its own `malloc`'d copy. Handing it `img.data`'s pointer would
+        // have the C free a Rust `Vec` allocation the `Vec` frees too.
         let mut ffi_embeddings: Vec<ffi::Ds4VisionEmbedding> = images
             .iter()
             .map(|img| ffi::Ds4VisionEmbedding {
-                data: img.data.as_ptr().cast_mut(),
+                data: crate::cbuf::malloc_copy_f32(&img.data),
                 token_count: img.token_count,
                 layout: img.layout,
                 grid_width: img.grid_width,
@@ -510,9 +514,11 @@ impl Ds4Model {
             .collect();
         let mut err = [0_i8; 256];
         let mut tokens = Ds4TokensGuard::new();
-        // SAFETY: engine/tokens valid; strings outlive the call. The C function
-        // copies embedding data into its own buffer, so our pointers remain
-        // valid for the duration.
+        // SAFETY: engine/tokens valid; strings outlive the call. Each
+        // embedding's `data` is a `malloc`'d buffer this call takes ownership
+        // of: on success it is moved into the matching span (and the source
+        // zeroed), on failure it stays with `ffi_embeddings`. Either way the
+        // sweep below frees exactly what no span owns.
         let ok = unsafe {
             ffi::ds4_chat_begin(self.engine, tokens.as_mut_ptr());
             let base = usize::try_from(tokens.len()).unwrap_or(0);
@@ -527,6 +533,14 @@ impl Ds4Model {
                 err.as_mut_ptr(),
                 err.len(),
             );
+            // Whatever the outcome, no embedding this function still holds is
+            // owned by a returned span: success zeroes every entry, and a
+            // partial failure moves the already-appended ones back into
+            // `ffi_embeddings` and zeroes those spans. Freeing all of them is
+            // therefore correct on both paths, and a no-op for zeroed entries.
+            for emb in &mut ffi_embeddings {
+                ffi::ds4_vision_embedding_free(&raw mut *emb);
+            }
             if rc != 0 {
                 let delta = tokens.slice_from(base).to_vec();
                 // Adjust each span's token_start to be relative to the delta
@@ -539,9 +553,18 @@ impl Ds4Model {
                 }
                 return (delta, spans);
             }
+            crate::errlog::log_error(
+                "vision",
+                &format!(
+                    "multimodal append failed, image dropped: {}",
+                    cstr_message(&err, "no detail")
+                ),
+            );
             false
         };
         if !ok {
+            // The delta is empty, so this message contributes no tokens at all
+            // — the reason the failure above is logged rather than swallowed.
             return (Vec::new(), Vec::new());
         }
         // Unreachable: the closure above returns on both paths.
@@ -909,9 +932,6 @@ impl Ds4Session {
     /// point — which the KV was already going to force. This replaces the old
     /// text-splice matching entirely.
     fn reconcile(&mut self, transcript: &str) {
-        // Clear vision spans from the previous turn; they are rebuilt below as
-        // image-carrying sections are tokenized or matched.
-        self.vision_spans.clear();
         let sections = parse_sections(transcript);
         let keys: Vec<SectionKey> = sections
             .iter()
@@ -954,6 +974,21 @@ impl Ds4Session {
             }
             s
         });
+        // Vision spans belonging to kept spans stay exactly as they are. They
+        // cannot be recreated: for DeepSeek the engine frees the embedding it
+        // was handed and replaces it with its own permuted block (sentinel rows
+        // interleaved, a different token count), so the only copy of a span's
+        // real buffer is the span itself. A kept span's tokens are reused
+        // verbatim and do not move, so its offsets stay valid; everything from
+        // the divergence on is retokenized and its spans are freed.
+        let kept_tokens = self
+            .transcript
+            .spans()
+            .iter()
+            .take(keep)
+            .map(|s| s.ntokens)
+            .sum::<usize>();
+        self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
         self.transcript.truncate_spans(keep);
         for (role, text) in sections.iter().skip(keep) {
             let Some(span_role) = SpanRole::from_tag(role) else {
@@ -963,6 +998,10 @@ impl Ds4Session {
             // same way the warm walk builds it. Both paths must produce byte-
             // identical tokens or the KV common-prefix probe stops right after
             // the system prompt and every turn re-prefills the conversation.
+            //
+            // `vision` collects the spans this message contributes: filled in by
+            // the multimodal branch, empty for every other message.
+            let mut vision = Vec::new();
             let mut toks = if span_role == SpanRole::System {
                 self.model
                     .system_message_tokens(text, self.trusted_system_len)
@@ -975,32 +1014,30 @@ impl Ds4Session {
                 let (delta, spans) = self
                     .model
                     .multimodal_message_tokens("user", &parts, &images.1);
-                // Record each span's absolute token offset within the
-                // transcript. The span's token_start is relative to the delta;
-                // add the transcript's current length (before pushing this span)
-                // to make it absolute.
-                let offset = u32::try_from(self.transcript.tokens().len()).unwrap_or(0);
-                for mut span in spans {
-                    span.token_start = span.token_start.saturating_add(offset);
-                    self.vision_spans.push(span);
-                }
+                vision = spans;
                 delta
             } else {
                 self.model.message_tokens(role, text)
             };
+            let mut shift = 0_u32;
             if self.transcript.is_empty() {
-                // First message carries the chat-template preamble (BOS/open).
+                // First message carries the chat-template preamble (BOS/open),
+                // which pushes this message's own tokens — image blocks
+                // included — down by its length.
                 let mut begin = self.model.begin_tokens(self.think);
+                shift = u32::try_from(begin.len()).unwrap_or(0);
                 begin.extend_from_slice(&toks);
                 toks = begin;
             }
+            // The token_start the tokenizer reported is relative to this
+            // message's own tokens; make it absolute for the sync.
+            let base = u32::try_from(self.transcript.tokens().len()).unwrap_or(0);
+            for mut span in vision {
+                span.token_start = span.token_start.saturating_add(shift).saturating_add(base);
+                self.vision_spans.push(span);
+            }
             self.transcript.push_span(span_role, 0, text.clone(), &toks);
         }
-        // Rebuild vision spans for kept spans (those before `keep` that were
-        // not retokenized). Their token offsets are the cumulative span lengths.
-        // This runs after the new spans are pushed, so the transcript is
-        // complete; we scan all spans and match them against pending images.
-        self.rebuild_vision_spans();
     }
 
     /// Finds and removes the image embeddings for a section whose text matches
@@ -1049,76 +1086,32 @@ impl Ds4Session {
         Some((vec![before, after], vec![img.embedding]))
     }
 
-    /// Rebuilds `vision_spans` for all transcript spans that carry images,
-    /// including those that were kept (not retokenized) by `reconcile`.
+    /// Releases every live vision span's embedding buffer and empties the
+    /// list.
     ///
-    /// Called after `reconcile` finishes pushing new spans. Scans the
-    /// transcript spans, and for each that matches a pending image, records a
-    /// vision span at the span's token offset. Spans already recorded during
-    /// `reconcile` (for newly tokenized sections) are preserved; this only
-    /// adds entries for kept spans that were not retokenized.
-    fn rebuild_vision_spans(&mut self) {
-        if self.pending_images.is_empty() {
-            return;
-        }
-        // Collect (span_index, image) pairs for spans that match a pending
-        // image but were not already recorded as a vision span during reconcile.
-        // A span is "already recorded" if a vision span's token_start falls
-        // within its token range.
-        let mut offset = 0u32;
-        for (i, span) in self.transcript.spans().iter().enumerate() {
-            let span_len = u32::try_from(span.ntokens).unwrap_or(0);
-            // Check if this span's text matches any pending image.
-            let matches = self.pending_images.iter().any(|(key, _)| {
-                key.strip_prefix("[user]\n")
-                    .and_then(|k| k.strip_suffix('\n'))
-                    .is_some_and(|k| k == span.text.as_str())
-            });
-            if matches {
-                // Check if a vision span was already recorded for this span
-                // during reconcile (its token_start is within [offset, offset+span_len)).
-                let already = self.vision_spans.iter().any(|vs| {
-                    vs.token_start >= offset && vs.token_start < offset.saturating_add(span_len)
-                });
-                if !already {
-                    // This is a kept span that carries an image but was not
-                    // retokenized. We need to re-tokenize it as multimodal to
-                    // get the vision span. This is the rare case (a resumed
-                    // session with images in the kept prefix).
-                    // For now, we skip re-tokenization of kept spans — the
-                    // image tokens are already in the transcript's token buffer
-                    // from the original tokenization. We just need to record
-                    // the span's token offset as the vision span's token_start.
-                    // The embedding data is in the pending_images.
-                    if let Some(pos) = self.pending_images.iter().position(|(key, _)| {
-                        key.strip_prefix("[user]\n")
-                            .and_then(|k| k.strip_suffix('\n'))
-                            .is_some_and(|k| k == span.text.as_str())
-                    }) {
-                        let (_, img) = self.pending_images.remove(pos);
-                        let mut ffi_emb = ffi::Ds4VisionEmbedding {
-                            data: img.embedding.data.as_ptr().cast_mut(),
-                            token_count: img.embedding.token_count,
-                            layout: img.embedding.layout,
-                            grid_width: img.embedding.grid_width,
-                            grid_height: img.embedding.grid_height,
-                            width: img.embedding.width,
-                            height: img.embedding.height,
-                            content_width: img.embedding.content_width,
-                            content_height: img.embedding.content_height,
-                            fingerprint: img.embedding.fingerprint,
-                        };
-                        self.vision_spans.push(ffi::Ds4VisionSpan {
-                            token_start: offset,
-                            embedding: std::mem::take(&mut ffi_emb),
-                        });
-                    }
-                }
+    /// Each span's `data` is a `malloc`'d buffer this session owns: the engine
+    /// allocated it inside `ds4_chat_append_multimodal_message` and moved it
+    /// into the span. Dropping the vector alone would leak it, so both
+    /// `reconcile` and `Drop` come through here.
+    fn free_vision_spans(&mut self) {
+        self.free_vision_spans_from(0);
+    }
+
+    /// Releases every vision span that starts at or after `token_start`,
+    /// keeping the ones below it. Used by `reconcile` to discard exactly the
+    /// spans whose tokens are about to be retokenized.
+    fn free_vision_spans_from(&mut self, token_start: u32) {
+        for span in &mut self.vision_spans {
+            if span.token_start < token_start {
+                continue;
             }
-            offset = offset.saturating_add(span_len);
-            // Suppress unused variable warning for `i` in non-debug builds.
-            let _ = i;
+            // SAFETY: the buffer was allocated by the engine (or by
+            // `crate::cbuf`) and is owned by this span; the call is a no-op on a
+            // zeroed embedding, and the memset it does prevents a second free.
+            unsafe { ffi::ds4_vision_embedding_free(&raw mut span.embedding) };
         }
+        self.vision_spans
+            .retain(|span| span.token_start < token_start);
     }
 
     /// Reconciles the transcript and builds this turn's live prompt: the token
@@ -1871,7 +1864,20 @@ impl Engine for Ds4Session {
         }
         // SAFETY: engine valid.
         let n_embd = unsafe { ffi::ds4_engine_embd_dim(self.model.engine) };
+        // Every field has to be read *before* the free below:
+        // `ds4_vision_embedding_free` memsets the struct, so anything read
+        // after it comes back zero — which used to leave `layout` and the
+        // token grid at 0 and made the C reject the embedding ("invalid
+        // DeepSeek vision embedding layout") on every append.
         let token_count = emb.token_count;
+        let layout = emb.layout;
+        let grid_width = emb.grid_width;
+        let grid_height = emb.grid_height;
+        let width = emb.width;
+        let height = emb.height;
+        let content_width = emb.content_width;
+        let content_height = emb.content_height;
+        let fingerprint = emb.fingerprint;
         let data = if token_count > 0 && n_embd > 0 && !emb.data.is_null() {
             let len = usize::try_from(token_count)
                 .ok()
@@ -1893,14 +1899,14 @@ impl Engine for Ds4Session {
         Ok(crate::engine::VisionEmbedding {
             data,
             token_count,
-            layout: emb.layout,
-            grid_width: emb.grid_width,
-            grid_height: emb.grid_height,
-            width: emb.width,
-            height: emb.height,
-            content_width: emb.content_width,
-            content_height: emb.content_height,
-            fingerprint: emb.fingerprint,
+            layout,
+            grid_width,
+            grid_height,
+            width,
+            height,
+            content_width,
+            content_height,
+            fingerprint,
         })
     }
 
@@ -1917,14 +1923,8 @@ impl Drop for Ds4Session {
             // Arc refcount reaches zero (design §4).
             unsafe { ffi::ds4_session_free(self.session) };
         }
-        // Free any vision span embedding buffers the engine transferred to us
-        // during `reconcile`. Safe to call on a zeroed embedding.
-        for span in &mut self.vision_spans {
-            // SAFETY: each span's embedding was produced by
-            // `ds4_chat_append_multimodal_message`, which transfers ownership of
-            // the `data` buffer to the caller.
-            unsafe { ffi::ds4_vision_embedding_free(&raw mut span.embedding) };
-        }
+        // Free any vision span embedding buffers still owned by this session.
+        self.free_vision_spans();
     }
 }
 

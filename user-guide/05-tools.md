@@ -50,6 +50,14 @@ Everything else behaves normally: paging, line numbers, and `more` continuation 
 
 PDF is currently the only converted format.
 
+`view_image` hands the model an actual picture instead of a path. It is served unconditionally, backed by the vision encoder plank keeps beside the main model, and it works on the usual formats:
+
+```
+what does the error in screenshot.png say?
+```
+
+The image is encoded locally within a 384 visual token budget, so a large screenshot is scaled down before the model sees it. Pasting an image into the prompt is the same road: your message carries the cached path, and the model calls `view_image` on it. See [The interface](03-the-interface.md#pasting-images).
+
 ### Web
 
 | Tool | What it does |

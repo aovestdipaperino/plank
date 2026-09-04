@@ -7,6 +7,35 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**Plank can see. Paste a screenshot and ask what broke.** Vision has been in
+the box for a while, but it never actually worked: four separate faults in the
+image path sat on top of each other, and between them they either crashed the
+process outright with `malloc: pointer being freed was not allocated` or, worse,
+answered confidently about an image the model had never been shown. A screenshot
+of a browser window came back described as a close-up photograph of a person's
+face, which is the sort of failure that looks like a bad model rather than a bad
+pointer.
+
+All four are fixed. The engine takes ownership of the buffer it is handed and
+frees it itself, so it now gets a copy of its own instead of a pointer into
+memory Rust was also freeing. An image already in the conversation keeps the
+span the engine built for it rather than having one reconstructed on the next
+turn, which could never have worked, because the engine rewrites that span as it
+consumes it. The encoder's metadata is read before the call that zeroes it, so
+an image no longer arrives with an empty layout and gets discarded along with
+the message text wrapped around it. And the prefill chunk was raised past the
+384 token cap on an image block, which the engine refuses to split, so anything
+larger than a thumbnail no longer fails the whole prefill.
+
+What that adds up to: paste a screenshot of a stack trace, a failing UI, a
+diagram or a photo of a whiteboard, and the model looks at the picture. The
+encoder lives beside the main model at `~/.plank/ds4flash.vision.gguf`, is
+fetched on first launch if it is missing, and runs on the same Metal device, so
+no pixels leave the Mac. Images are encoded within a budget of 384 visual
+tokens, so crop to the part that matters when you want small text read, and
+reach for [ocr-mcp](https://github.com/aovestdipaperino/ocr-mcp) when you want a
+dense page transcribed rather than described.
+
 **A whole-codebase review, and the fixes that came out of it, are on main
 and ship in the next release.** The one you will feel first is that the
 sandbox now means what it says: `write` and `edit` are held to the same

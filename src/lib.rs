@@ -11,6 +11,7 @@ pub mod agents;
 pub mod anim;
 pub mod arcade;
 pub mod branch;
+pub mod cbuf;
 pub mod checkpoint;
 pub mod claudeplugin;
 pub mod compact;
