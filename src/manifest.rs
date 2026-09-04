@@ -103,25 +103,60 @@ pub fn plank_dir() -> PathBuf {
     home.join(".plank")
 }
 
+/// The installed manifest: what the files currently under `root` are.
+#[must_use]
+pub fn installed_path_in(root: &Path) -> PathBuf {
+    root.join("ds4.manifest")
+}
+
 /// The installed manifest: what the files currently in `~/.plank` are.
 ///
 /// Written only by a successful swap, and written *last*, so its presence is
 /// proof the whole set landed.
 #[must_use]
 pub fn installed_path() -> PathBuf {
-    plank_dir().join("ds4.manifest")
+    installed_path_in(&plank_dir())
+}
+
+/// Where in-flight and verified-but-not-yet-installed artifacts live, under
+/// `root`.
+#[must_use]
+pub fn staging_dir_in(root: &Path) -> PathBuf {
+    root.join("staging")
 }
 
 /// Where in-flight and verified-but-not-yet-installed artifacts live.
 #[must_use]
 pub fn staging_dir() -> PathBuf {
-    plank_dir().join("staging")
+    staging_dir_in(&plank_dir())
+}
+
+/// Helper-process bookkeeping under `root`: lock, job, state, cancel flag, log.
+#[must_use]
+pub fn downloads_dir_in(root: &Path) -> PathBuf {
+    root.join("downloads")
 }
 
 /// Helper-process bookkeeping: lock, job, state, cancel flag, log.
 #[must_use]
 pub fn downloads_dir() -> PathBuf {
-    plank_dir().join("downloads")
+    downloads_dir_in(&plank_dir())
+}
+
+/// Where an artifact of `kind` is installed under `root`.
+///
+/// Derives the filename directly rather than delegating to `download::`,
+/// whose `default_*_path` functions each read `HOME` independently: those
+/// filenames (`ds4flash.gguf`, `ds4flash.vision.gguf`, `ds4flash.dspark.gguf`)
+/// are mirrored here so a test can pass an explicit root.
+#[must_use]
+pub fn local_path_for_in(root: &Path, kind: &str) -> Option<PathBuf> {
+    match kind {
+        "main" => Some(root.join("ds4flash.gguf")),
+        "vision" => Some(root.join("ds4flash.vision.gguf")),
+        "dspark" => Some(root.join("ds4flash.dspark.gguf")),
+        _ => None,
+    }
 }
 
 /// Where an artifact of `kind` is installed.
@@ -294,6 +329,27 @@ mod tests {
         // manifest may not claim it.
         let text = sample().replace(r#""version": 3"#, r#""version": 0"#);
         assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn in_variants_nest_under_the_given_root() {
+        let root = Path::new("/tmp/some-root");
+        assert_eq!(installed_path_in(root), root.join("ds4.manifest"));
+        assert_eq!(staging_dir_in(root), root.join("staging"));
+        assert_eq!(downloads_dir_in(root), root.join("downloads"));
+        assert_eq!(
+            local_path_for_in(root, "main"),
+            Some(root.join("ds4flash.gguf"))
+        );
+        assert_eq!(
+            local_path_for_in(root, "vision"),
+            Some(root.join("ds4flash.vision.gguf"))
+        );
+        assert_eq!(
+            local_path_for_in(root, "dspark"),
+            Some(root.join("ds4flash.dspark.gguf"))
+        );
+        assert_eq!(local_path_for_in(root, "bogus"), None);
     }
 
     #[test]

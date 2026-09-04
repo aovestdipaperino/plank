@@ -96,19 +96,31 @@ pub fn pid_alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// `<root>/downloads/state.json`.
+#[must_use]
+pub fn state_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("state.json")
+}
+
 /// `~/.plank/downloads/state.json`.
 #[must_use]
 pub fn state_path() -> PathBuf {
-    crate::manifest::downloads_dir().join("state.json")
+    state_path_in(&crate::manifest::plank_dir())
+}
+
+/// `<root>/downloads/cancel`.
+#[must_use]
+pub fn cancel_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("cancel")
 }
 
 /// `~/.plank/downloads/cancel`.
 #[must_use]
 pub fn cancel_path() -> PathBuf {
-    crate::manifest::downloads_dir().join("cancel")
+    cancel_path_in(&crate::manifest::plank_dir())
 }
 
-/// Publishes `state`, atomically.
+/// Publishes `state` under `root`, atomically.
 ///
 /// Written to a sibling temp file and renamed, so a reader polling twice a
 /// second never sees a half-written JSON object.
@@ -116,8 +128,8 @@ pub fn cancel_path() -> PathBuf {
 /// # Errors
 /// Propagates any filesystem error from creating the directory, writing the
 /// temp file, or renaming it.
-pub fn write_state(state: &State) -> std::io::Result<()> {
-    let path = state_path();
+pub fn write_state_in(root: &Path, state: &State) -> std::io::Result<()> {
+    let path = state_path_in(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -128,10 +140,26 @@ pub fn write_state(state: &State) -> std::io::Result<()> {
     std::fs::rename(&tmp, &path)
 }
 
+/// Publishes `state`, atomically.
+///
+/// # Errors
+/// Propagates any filesystem error from creating the directory, writing the
+/// temp file, or renaming it.
+pub fn write_state(state: &State) -> std::io::Result<()> {
+    write_state_in(&crate::manifest::plank_dir(), state)
+}
+
+/// Reads the published state under `root`, whatever its age. `None` when
+/// absent or corrupt.
+#[must_use]
+pub fn read_state_in(root: &Path) -> Option<State> {
+    serde_json::from_str(&std::fs::read_to_string(state_path_in(root)).ok()?).ok()
+}
+
 /// Reads the published state, whatever its age. `None` when absent or corrupt.
 #[must_use]
 pub fn read_state() -> Option<State> {
-    serde_json::from_str(&std::fs::read_to_string(state_path()).ok()?).ok()
+    read_state_in(&crate::manifest::plank_dir())
 }
 
 /// Whether `state` should be ignored: too old *and* written by a process that
@@ -155,13 +183,13 @@ pub fn live_state() -> Option<State> {
     (!is_stale(&state, now_epoch(), &pid_alive)).then_some(state)
 }
 
-/// Asks the running helper to stop.
+/// Asks the running helper to stop, under `root`.
 ///
 /// # Errors
 /// Propagates any filesystem error from creating the directory or writing the
 /// flag.
-pub fn request_cancel(how: Cancel) -> std::io::Result<()> {
-    let path = cancel_path();
+pub fn request_cancel_in(root: &Path, how: Cancel) -> std::io::Result<()> {
+    let path = cancel_path_in(root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -172,6 +200,15 @@ pub fn request_cancel(how: Cancel) -> std::io::Result<()> {
             Cancel::Delete => "delete",
         },
     )
+}
+
+/// Asks the running helper to stop.
+///
+/// # Errors
+/// Propagates any filesystem error from creating the directory or writing the
+/// flag.
+pub fn request_cancel(how: Cancel) -> std::io::Result<()> {
+    request_cancel_in(&crate::manifest::plank_dir(), how)
 }
 
 /// Parses a cancel-flag body. Anything unrecognized is `None` — a corrupt flag
@@ -185,17 +222,30 @@ fn parse_cancel(text: &str) -> Option<Cancel> {
     }
 }
 
+/// The pending cancel request under `root`, if any.
+#[must_use]
+pub fn read_cancel_in(root: &Path) -> Option<Cancel> {
+    parse_cancel(&std::fs::read_to_string(cancel_path_in(root)).ok()?)
+}
+
 /// The pending cancel request, if any.
 #[must_use]
 pub fn read_cancel() -> Option<Cancel> {
-    parse_cancel(&std::fs::read_to_string(cancel_path()).ok()?)
+    read_cancel_in(&crate::manifest::plank_dir())
+}
+
+/// Clears any pending cancel request under `root`. Best-effort: a stale flag
+/// that cannot be removed is caught by the helper's own startup, which clears
+/// it before work begins.
+pub fn clear_cancel_in(root: &Path) {
+    let _ = std::fs::remove_file(cancel_path_in(root));
 }
 
 /// Clears any pending cancel request. Best-effort: a stale flag that cannot be
 /// removed is caught by the helper's own startup, which clears it before work
 /// begins.
 pub fn clear_cancel() {
-    let _ = std::fs::remove_file(cancel_path());
+    clear_cancel_in(&crate::manifest::plank_dir());
 }
 
 /// Read buffer, matching `download::fetch`'s 1 MiB.
@@ -204,16 +254,28 @@ const CHUNK: usize = 1 << 20;
 /// for a status bar and slow enough that the rename costs nothing.
 const PUBLISH_EVERY: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// In-flight bytes for `kind`, under `root`.
+#[must_use]
+pub fn part_path_in(root: &Path, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root).join(format!("{kind}.part"))
+}
+
 /// In-flight bytes for `kind`.
 #[must_use]
 pub fn part_path(kind: &str) -> PathBuf {
-    crate::manifest::staging_dir().join(format!("{kind}.part"))
+    part_path_in(&crate::manifest::plank_dir(), kind)
+}
+
+/// Verified-but-not-yet-installed bytes for `kind`, under `root`.
+#[must_use]
+pub fn staged_path_in(root: &Path, kind: &str) -> PathBuf {
+    crate::manifest::staging_dir_in(root).join(format!("{kind}.gguf"))
 }
 
 /// Verified-but-not-yet-installed bytes for `kind`.
 #[must_use]
 pub fn staged_path(kind: &str) -> PathBuf {
-    crate::manifest::staging_dir().join(format!("{kind}.gguf"))
+    staged_path_in(&crate::manifest::plank_dir(), kind)
 }
 
 /// Lowercase hex.
@@ -226,7 +288,8 @@ pub fn hex(digest: &[u8]) -> String {
     })
 }
 
-/// Feeds an existing `.part` back through `hasher`, returning its length.
+/// Feeds an existing `.part` back through `hasher`, returning its length, or
+/// `None` if `should_stop` reports true partway through.
 ///
 /// This is what makes resume and incremental hashing coexist: `sha2` has no
 /// serializable state, so rather than invent a sidecar format (and a new way to
@@ -236,20 +299,31 @@ pub fn hex(digest: &[u8]) -> String {
 ///
 /// An absent `.part` is 0 bytes and an untouched hasher, not an error.
 ///
+/// For an interrupted multi-gigabyte download this read alone can take
+/// minutes, so `should_stop` is polled once per chunk rather than only after
+/// the whole file is read.
+///
 /// # Errors
 /// Propagates read errors other than "not found".
-pub fn rehash(part: &Path, hasher: &mut Sha256) -> std::io::Result<u64> {
+pub fn rehash(
+    part: &Path,
+    hasher: &mut Sha256,
+    should_stop: &dyn Fn() -> bool,
+) -> std::io::Result<Option<u64>> {
     let mut file = match File::open(part) {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Some(0)),
         Err(e) => return Err(e),
     };
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
     loop {
+        if should_stop() {
+            return Ok(None);
+        }
         let n = file.read(&mut buf)?;
         if n == 0 {
-            return Ok(total);
+            return Ok(Some(total));
         }
         hasher.update(&buf[..n]);
         total += n as u64;
@@ -309,8 +383,8 @@ pub fn http_fetch(url: &str, offset: u64) -> Result<Box<dyn Read + Send>, String
 /// staged, the manifest itself is written into staging *last*, which is what
 /// makes the set self-describing for the swap in Task 6.
 #[must_use]
-pub fn run_job(manifest: &crate::manifest::Manifest, fetch: &Fetcher) -> Outcome {
-    let staging = crate::manifest::staging_dir();
+pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetcher) -> Outcome {
+    let staging = crate::manifest::staging_dir_in(root);
     if let Err(e) = std::fs::create_dir_all(&staging) {
         return Outcome::Failed(format!("cannot create {}: {e}", staging.display()));
     }
@@ -322,17 +396,18 @@ pub fn run_job(manifest: &crate::manifest::Manifest, fetch: &Fetcher) -> Outcome
     let of = jobs.len();
 
     for (index, (kind, entry)) in jobs.iter().enumerate() {
-        if let Some(how) = read_cancel() {
-            return finish_cancel(how, manifest, &jobs);
+        if let Some(how) = read_cancel_in(root) {
+            return finish_cancel(root, how, manifest, &jobs);
         }
-        if staged_path(kind).exists() {
+        if staged_path_in(root, kind).exists() {
             continue;
         }
-        match one_artifact(manifest, kind, entry, index + 1, of, fetch) {
+        match one_artifact(root, manifest, kind, entry, index + 1, of, fetch) {
             Ok(None) => {}
-            Ok(Some(how)) => return finish_cancel(how, manifest, &jobs),
+            Ok(Some(how)) => return finish_cancel(root, how, manifest, &jobs),
             Err(e) => {
                 publish(
+                    root,
                     manifest,
                     kind,
                     index + 1,
@@ -352,14 +427,15 @@ pub fn run_job(manifest: &crate::manifest::Manifest, fetch: &Fetcher) -> Outcome
     if let Err(e) = std::fs::write(staging.join("ds4.manifest"), &manifest.raw) {
         return Outcome::Failed(format!("cannot stage the manifest: {e}"));
     }
-    publish(manifest, "", of, of, 0, 0, 0, Phase::Staged, None);
+    publish(root, manifest, "", of, of, 0, 0, 0, Phase::Staged, None);
     Outcome::Verified
 }
 
 /// Downloads and verifies one artifact. `Ok(Some(how))` means a cancel was
 /// observed mid-stream.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn one_artifact(
+    root: &Path,
     manifest: &crate::manifest::Manifest,
     kind: &str,
     entry: &crate::manifest::FileEntry,
@@ -367,10 +443,11 @@ fn one_artifact(
     of: usize,
     fetch: &Fetcher,
 ) -> Result<Option<Cancel>, String> {
-    let part = part_path(kind);
+    let part = part_path_in(root, kind);
     let mut hasher = Sha256::new();
 
     publish(
+        root,
         manifest,
         kind,
         index,
@@ -381,8 +458,17 @@ fn one_artifact(
         Phase::Rehashing,
         None,
     );
-    let mut done = rehash(&part, &mut hasher)
-        .map_err(|e| format!("cannot re-read {}: {e}", part.display()))?;
+    let should_stop = || read_cancel_in(root).is_some();
+    let Some(mut done) = rehash(&part, &mut hasher, &should_stop)
+        .map_err(|e| format!("cannot re-read {}: {e}", part.display()))?
+    else {
+        // A cancel arrived while rehashing an existing .part. Whatever the
+        // pending request says (keep or delete), it is handled by run_job's
+        // loop after this artifact returns — surface it the same way a
+        // cancel mid-stream does.
+        let how = read_cancel_in(root).unwrap_or(Cancel::Keep);
+        return Ok(Some(how));
+    };
 
     // A .part longer than the manifest says is not a resume point, it is
     // garbage from a different release. Start over rather than append to it.
@@ -415,6 +501,7 @@ fn one_artifact(
     };
 
     publish(
+        root,
         manifest,
         kind,
         index,
@@ -431,7 +518,7 @@ fn one_artifact(
     let mut window_bytes = 0u64;
     let mut rate = 0u64;
     loop {
-        if let Some(how) = read_cancel() {
+        if let Some(how) = read_cancel_in(root) {
             let _ = file.flush();
             return Ok(Some(how));
         }
@@ -459,6 +546,7 @@ fn one_artifact(
             window_bytes = 0;
             last_publish = Instant::now();
             publish(
+                root,
                 manifest,
                 kind,
                 index,
@@ -483,6 +571,7 @@ fn one_artifact(
     }
 
     publish(
+        root,
         manifest,
         kind,
         index,
@@ -503,28 +592,40 @@ fn one_artifact(
             entry.sha256
         ));
     }
-    std::fs::rename(&part, staged_path(kind)).map_err(|e| e.to_string())?;
+    std::fs::rename(&part, staged_path_in(root, kind)).map_err(|e| e.to_string())?;
     Ok(None)
 }
 
 /// Clears the flag, optionally removes partial work, and publishes the stop.
 fn finish_cancel(
+    root: &Path,
     how: Cancel,
     manifest: &crate::manifest::Manifest,
     jobs: &[(&str, &crate::manifest::FileEntry)],
 ) -> Outcome {
     if how == Cancel::Delete {
         for (kind, _) in jobs {
-            let _ = std::fs::remove_file(part_path(kind));
-            let _ = std::fs::remove_file(staged_path(kind));
+            let _ = std::fs::remove_file(part_path_in(root, kind));
+            let _ = std::fs::remove_file(staged_path_in(root, kind));
         }
-        let _ = std::fs::remove_file(crate::manifest::staging_dir().join("ds4.manifest"));
+        let _ = std::fs::remove_file(crate::manifest::staging_dir_in(root).join("ds4.manifest"));
         // Only if it is now empty: a directory with anything else in it is not
         // ours to remove.
-        let _ = std::fs::remove_dir(crate::manifest::staging_dir());
+        let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root));
     }
-    clear_cancel();
-    publish(manifest, "", 0, jobs.len(), 0, 0, 0, Phase::Cancelled, None);
+    clear_cancel_in(root);
+    publish(
+        root,
+        manifest,
+        "",
+        0,
+        jobs.len(),
+        0,
+        0,
+        0,
+        Phase::Cancelled,
+        None,
+    );
     Outcome::Cancelled
 }
 
@@ -532,6 +633,7 @@ fn finish_cancel(
 /// not worth aborting over an unwritable status file.
 #[allow(clippy::too_many_arguments)]
 fn publish(
+    root: &Path,
     manifest: &crate::manifest::Manifest,
     current: &str,
     index: usize,
@@ -542,19 +644,22 @@ fn publish(
     phase: Phase,
     error: Option<String>,
 ) {
-    let _ = write_state(&State {
-        pid: std::process::id(),
-        version: manifest.version,
-        current: current.to_string(),
-        index,
-        of,
-        done_bytes,
-        total_bytes,
-        rate_bps,
-        phase,
-        error,
-        updated: now_epoch(),
-    });
+    let _ = write_state_in(
+        root,
+        &State {
+            pid: std::process::id(),
+            version: manifest.version,
+            current: current.to_string(),
+            index,
+            of,
+            done_bytes,
+            total_bytes,
+            rate_bps,
+            phase,
+            error,
+            updated: now_epoch(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -657,7 +762,9 @@ mod tests {
     fn rehash_of_an_absent_part_is_zero_bytes_and_the_empty_digest() {
         let dir = tempdir();
         let mut hasher = Sha256::new();
-        let n = rehash(&dir.join("absent.part"), &mut hasher).expect("absent is not an error");
+        let n = rehash(&dir.join("absent.part"), &mut hasher, &|| false)
+            .expect("absent is not an error")
+            .expect("not cancelled");
         assert_eq!(n, 0);
         assert_eq!(hex(&hasher.finalize()), EMPTY_SHA);
     }
@@ -668,7 +775,9 @@ mod tests {
         let part = dir.join("x.part");
         std::fs::write(&part, b"abc").expect("write");
         let mut hasher = Sha256::new();
-        let n = rehash(&part, &mut hasher).expect("rehash");
+        let n = rehash(&part, &mut hasher, &|| false)
+            .expect("rehash")
+            .expect("not cancelled");
         assert_eq!(n, 3);
         assert_eq!(hex(&hasher.finalize()), ABC_SHA);
     }
@@ -681,26 +790,47 @@ mod tests {
         let part = dir.join("y.part");
         std::fs::write(&part, b"a").expect("write");
         let mut hasher = Sha256::new();
-        let offset = rehash(&part, &mut hasher).expect("rehash");
+        let offset = rehash(&part, &mut hasher, &|| false)
+            .expect("rehash")
+            .expect("not cancelled");
         assert_eq!(offset, 1);
         hasher.update(b"bc");
         assert_eq!(hex(&hasher.finalize()), ABC_SHA);
     }
 
     #[test]
-    fn run_job_verifies_stages_and_reports_done() {
+    fn rehash_polls_should_stop_and_reports_cancellation() {
+        // An interrupted multi-gigabyte .part can take minutes to re-read; the
+        // caller must be able to abandon that read partway through, not only
+        // after it finishes.
         let dir = tempdir();
-        let _guard = with_plank_home(&dir);
+        let part = dir.join("z.part");
+        // Several chunks' worth so should_stop is polled more than once, in
+        // spirit; CHUNK is 1 MiB so a few KB here still exercises one read.
+        std::fs::write(&part, b"abc").expect("write");
+        let mut hasher = Sha256::new();
+        let n = rehash(&part, &mut hasher, &|| true).expect("read succeeds");
+        assert_eq!(n, None, "should_stop firing immediately cancels the rehash");
+    }
+
+    #[test]
+    fn run_job_verifies_stages_and_reports_done() {
+        let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert_eq!(outcome, Outcome::Verified);
         assert_eq!(
-            std::fs::read(staged_path("main")).expect("staged file"),
+            std::fs::read(staged_path_in(&root, "main")).expect("staged file"),
             b"abc"
         );
-        assert!(!part_path("main").exists(), "the .part is consumed");
         assert!(
-            crate::manifest::staging_dir().join("ds4.manifest").exists(),
+            !part_path_in(&root, "main").exists(),
+            "the .part is consumed"
+        );
+        assert!(
+            crate::manifest::staging_dir_in(&root)
+                .join("ds4.manifest")
+                .exists(),
             "the manifest is staged alongside the artifacts"
         );
     }
@@ -709,83 +839,213 @@ mod tests {
     fn a_hash_mismatch_deletes_the_part_and_fails_once() {
         // Wrong bytes cannot be fixed by resuming, so the .part must not survive
         // to be resumed on the next launch.
-        let dir = tempdir();
-        let _guard = with_plank_home(&dir);
+        let root = tempdir();
         let m = manifest_for(&[("main", b"abc".as_slice(), EMPTY_SHA)]);
-        let outcome = run_job(&m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
-        assert!(!part_path("main").exists(), "bad bytes are discarded");
-        assert!(!staged_path("main").exists(), "nothing is staged");
+        assert!(
+            !part_path_in(&root, "main").exists(),
+            "bad bytes are discarded"
+        );
+        assert!(!staged_path_in(&root, "main").exists(), "nothing is staged");
     }
 
     #[test]
     fn a_short_body_leaves_the_part_for_the_next_run() {
         // A truncated body reads as a clean EOF. It must not be verified, and it
         // must not be deleted: those bytes are good, just incomplete.
-        let dir = tempdir();
-        let _guard = with_plank_home(&dir);
+        let root = tempdir();
         let mut m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         m.files.get_mut("main").expect("main").bytes = 10;
-        let outcome = run_job(&m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert!(matches!(outcome, Outcome::Failed(_)), "got {outcome:?}");
         assert_eq!(
-            std::fs::read(part_path("main")).expect("part survives"),
+            std::fs::read(part_path_in(&root, "main")).expect("part survives"),
             b"abc"
         );
     }
 
     #[test]
     fn a_pending_cancel_stops_before_any_bytes_and_keep_preserves_partials() {
-        let dir = tempdir();
-        let _guard = with_plank_home(&dir);
-        std::fs::create_dir_all(crate::manifest::staging_dir()).expect("staging");
-        std::fs::write(part_path("main"), b"a").expect("seed a partial");
-        request_cancel(Cancel::Keep).expect("flag");
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::write(part_path_in(&root, "main"), b"a").expect("seed a partial");
+        request_cancel_in(&root, Cancel::Keep).expect("flag");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert_eq!(outcome, Outcome::Cancelled);
-        assert!(part_path("main").exists(), "keep means keep");
+        assert!(part_path_in(&root, "main").exists(), "keep means keep");
     }
 
     #[test]
     fn cancel_with_delete_removes_the_partials() {
-        let dir = tempdir();
-        let _guard = with_plank_home(&dir);
-        std::fs::create_dir_all(crate::manifest::staging_dir()).expect("staging");
-        std::fs::write(part_path("main"), b"a").expect("seed a partial");
-        request_cancel(Cancel::Delete).expect("flag");
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::write(part_path_in(&root, "main"), b"a").expect("seed a partial");
+        request_cancel_in(&root, Cancel::Delete).expect("flag");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
-        let outcome = run_job(&m, &serving(&[("main", b"abc".to_vec())]));
+        let outcome = run_job(&root, &m, &serving(&[("main", b"abc".to_vec())]));
         assert_eq!(outcome, Outcome::Cancelled);
-        assert!(!part_path("main").exists(), "delete means delete");
+        assert!(!part_path_in(&root, "main").exists(), "delete means delete");
     }
 
     #[test]
     fn an_already_staged_artifact_is_not_refetched() {
         // Resuming a job that got through two of three files must not restart the
         // two that are done.
-        let dir = tempdir();
-        let _guard = with_plank_home(&dir);
-        std::fs::create_dir_all(crate::manifest::staging_dir()).expect("staging");
-        std::fs::write(staged_path("main"), b"abc").expect("pre-staged");
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::write(staged_path_in(&root, "main"), b"abc").expect("pre-staged");
         let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
         // A fetcher that would panic if called proves nothing was refetched.
         let never = |_: &str, _: u64| -> Result<Box<dyn Read + Send>, String> {
             panic!("must not refetch a staged artifact")
         };
-        assert_eq!(run_job(&m, &never), Outcome::Verified);
+        assert_eq!(run_job(&root, &m, &never), Outcome::Verified);
     }
 
-    /// A unique scratch directory under the system temp dir, removed on drop by
-    /// [`HomeGuard`]. The repo has no `tempfile` dependency, so this is hand-rolled
-    /// the way `src/imagepaste.rs`'s tests do it.
+    #[test]
+    fn resuming_after_a_truncated_body_ends_up_correctly_staged_and_verified() {
+        // Finding 3: the digest-equality guarantee for resume, exercised
+        // end-to-end through run_job rather than only at the rehash unit
+        // level. The first run gets a truncated body and leaves a .part; the
+        // second run is served only the remainder, from the offset run_job
+        // actually asks for. This is the test that would catch an off-by-one
+        // between the resume offset and the hasher state.
+        let root = tempdir();
+        let full: &[u8] = b"the quick brown fox jumps over the lazy dog";
+        let mut hasher = Sha256::new();
+        hasher.update(full);
+        let sha = hex(&hasher.finalize());
+        let m = manifest_for(&[("main", full, &sha)]);
+
+        // First run: serve only the first half, then EOF (a clean truncation,
+        // not an error) so the .part is left behind for resume.
+        let half = full.len() / 2;
+        let first = serving(&[("main", full[..half].to_vec())]);
+        let outcome1 = run_job(&root, &m, &first);
+        assert!(matches!(outcome1, Outcome::Failed(_)), "got {outcome1:?}");
+        assert!(part_path_in(&root, "main").exists(), "partial is kept");
+        assert_eq!(
+            std::fs::read(part_path_in(&root, "main")).expect("part"),
+            full[..half]
+        );
+
+        // Second run: a fetcher that only knows how to serve the tail starting
+        // exactly at `half`, so if run_job asked for the wrong offset this
+        // fetcher would either panic (offset 0 request) or serve the wrong
+        // slice (any other wrong offset), and the final digest check would
+        // catch it either way.
+        let full_owned = full.to_vec();
+        let resume_only = move |url: &str, offset: u64| -> Result<Box<dyn Read + Send>, String> {
+            let kind = url.rsplit('/').next().unwrap_or_default();
+            assert_eq!(kind, "main");
+            let offset = usize::try_from(offset).expect("offset fits in usize in this test");
+            assert_eq!(
+                offset, half,
+                "run_job must resume from exactly the bytes already on disk"
+            );
+            Ok(Box::new(std::io::Cursor::new(
+                full_owned[offset..].to_vec(),
+            )))
+        };
+        let outcome2 = run_job(&root, &m, &resume_only);
+        assert_eq!(outcome2, Outcome::Verified);
+        assert_eq!(
+            std::fs::read(staged_path_in(&root, "main")).expect("staged"),
+            full
+        );
+        assert!(
+            !part_path_in(&root, "main").exists(),
+            "the .part is consumed"
+        );
+    }
+
+    /// A reader that, after its first read, sets the cancel flag before any
+    /// further reads are served. `run_job`'s per-chunk cancel poll then stops
+    /// it before the body is exhausted.
+    struct CancelAfterFirstChunk {
+        root: std::path::PathBuf,
+        data: Vec<u8>,
+        pos: usize,
+        fired: bool,
+    }
+
+    impl Read for CancelAfterFirstChunk {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            if !self.fired {
+                self.fired = true;
+                // First chunk: hand back a few bytes and arm the cancel so
+                // the *next* poll in run_job's loop sees it before reading
+                // any more.
+                let n = 3.min(self.data.len() - self.pos);
+                buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+                self.pos += n;
+                request_cancel_in(&self.root, Cancel::Keep).expect("flag");
+                return Ok(n);
+            }
+            panic!("run_job must stop polling before reading further chunks");
+        }
+    }
+
+    #[test]
+    fn a_cancel_set_mid_stream_stops_immediately_and_keeps_the_bytes_so_far() {
+        // Finding 4: existing tests only covered a cancel checked between
+        // artifacts. This drives one set from inside the fetcher's reader,
+        // partway through the byte stream itself.
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        let m = manifest_for(&[("main", b"abcdefghij".as_slice(), EMPTY_SHA)]);
+
+        let root_for_reader = root.clone();
+        let fetcher = move |_: &str, offset: u64| -> Result<Box<dyn Read + Send>, String> {
+            assert_eq!(offset, 0);
+            Ok(Box::new(CancelAfterFirstChunk {
+                root: root_for_reader.clone(),
+                data: b"abcdefghij".to_vec(),
+                pos: 0,
+                fired: false,
+            }) as Box<dyn Read + Send>)
+        };
+
+        let outcome = run_job(&root, &m, &fetcher);
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(
+            part_path_in(&root, "main").exists(),
+            "Keep leaves the .part in place"
+        );
+        assert_eq!(
+            std::fs::read(part_path_in(&root, "main")).expect("partial bytes"),
+            b"abc",
+            "only the bytes received before the cancel was observed are kept"
+        );
+    }
+
+    /// A unique scratch directory under the system temp dir, removed on drop.
+    /// The repo has no `tempfile` dependency, so this is hand-rolled the way
+    /// `src/imagepaste.rs`'s tests do it. Every test passes this root
+    /// explicitly to the `_in` functions under test; none of them touch
+    /// process environment, so they are safe under cargo's default test
+    /// parallelism (see `FINDINGS.md`'s note on the spill tests' hazard, and
+    /// `src/spill.rs`'s `_in` pattern this mirrors).
     fn tempdir() -> std::path::PathBuf {
+        // A nanosecond timestamp alone is not enough: cargo runs tests on
+        // multiple threads, and two calls on different threads can land in
+        // the same nanosecond, colliding on the same directory and letting
+        // one test's cancel flag or state file leak into another's. The
+        // atomic counter guarantees uniqueness regardless of timing.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
-            "plank-dl-{}-{}",
+            "plank-dl-{}-{}-{n}",
             std::process::id(),
             now_epoch_nanos()
         ));
         std::fs::create_dir_all(&dir).expect("create temp dir");
+        TempDirs::register(&dir);
         dir
     }
 
@@ -796,44 +1056,33 @@ mod tests {
             .map_or(0, |d| d.as_nanos())
     }
 
-    /// Points `HOME` at `dir` for the duration, so `manifest::plank_dir()` and
-    /// everything under it resolve inside the sandbox.
-    ///
-    /// `set_var` is process-global, so these tests must not run concurrently with
-    /// each other; the guard's mutex enforces that. (`FINDINGS.md` records the same
-    /// hazard for the spill tests.)
-    struct HomeGuard {
-        previous: Option<std::ffi::OsString>,
-        dir: std::path::PathBuf,
-        _lock: std::sync::MutexGuard<'static, ()>,
+    /// Sweeps every directory `tempdir()` created, on process exit, via a
+    /// `Drop` guard stashed in a `OnceLock` the first time it is needed.
+    /// Avoids leaking scratch directories across a whole `cargo test` run
+    /// without requiring each test to remember to clean up after itself.
+    struct TempDirs {
+        dirs: std::sync::Mutex<Vec<std::path::PathBuf>>,
     }
 
-    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn with_plank_home(dir: &std::path::Path) -> HomeGuard {
-        let lock = HOME_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = std::env::var_os("HOME");
-        // SAFETY: serialized by HOME_LOCK; no other thread in these tests reads HOME.
-        unsafe { std::env::set_var("HOME", dir) };
-        HomeGuard {
-            previous,
-            dir: dir.to_path_buf(),
-            _lock: lock,
+    impl Drop for TempDirs {
+        fn drop(&mut self) {
+            if let Ok(dirs) = self.dirs.lock() {
+                for dir in dirs.iter() {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
         }
     }
 
-    impl Drop for HomeGuard {
-        fn drop(&mut self) {
-            // SAFETY: still holding HOME_LOCK.
-            unsafe {
-                match &self.previous {
-                    Some(v) => std::env::set_var("HOME", v),
-                    None => std::env::remove_var("HOME"),
-                }
+    impl TempDirs {
+        fn register(dir: &std::path::Path) {
+            static REGISTRY: std::sync::OnceLock<TempDirs> = std::sync::OnceLock::new();
+            let registry = REGISTRY.get_or_init(|| TempDirs {
+                dirs: std::sync::Mutex::new(Vec::new()),
+            });
+            if let Ok(mut dirs) = registry.dirs.lock() {
+                dirs.push(dir.to_path_buf());
             }
-            let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
 
