@@ -1976,3 +1976,32 @@ without the model files).
   Clients now send `X-Plank-Client-Id` (old
   clients fall back to `session_id`), cancels are keyed `client:turn`, and
   entries idle past `SESSION_IDLE_TTL` (30 minutes) are swept (`src/serve.rs`).
+
+## The staged manifest must be renamed last
+
+`downloader::swap_staged` installs artifacts and then moves `staging/ds4.manifest`
+into `~/.plank/`. The order is load-bearing, not stylistic: the installed manifest
+is the *claim* that the set is installed, so writing it before the artifacts move
+turns any crash mid-swap into a mismatched main/vision/dspark trio that plank then
+believes is a matched set. Two of the three files can be a year apart in build,
+and the engine's load error for that is cryptic. The test
+`a_swap_interrupted_midway_completes_on_the_next_run` pins the behavior.
+
+Related: `sha2` is a direct dependency solely because artifacts are verified
+*while streaming*. The rest of plank hashes by shelling out to `shasum`
+(`imagepaste`), which cannot work for an 87 GB file being written a megabyte at a
+time. A resumed `.part` re-reads itself from disk to rebuild the hasher, since
+`sha2` exposes no serializable state — do not add a hasher-state sidecar.
+
+## Hand-rolled test tempdirs need an atomic counter, not just pid + nanos
+
+Model-manifest tests that build their own scratch directory (rather than using
+a crate like `tempfile`) keyed the directory name on process id plus a
+nanosecond timestamp, on the assumption that the pair was unique enough. Under
+real test-harness parallelism it collided: two tests in the same process
+landed on the same directory name in the same nanosecond window, and one
+test's `~/.plank/downloads/cancel` flag file leaked into the other, failing it
+for a reason that had nothing to do with what it was testing. The fix is an
+atomic counter folded into the directory name alongside pid and timestamp, so
+two tests in the same process can never collide even when the clock does not
+move between them.
