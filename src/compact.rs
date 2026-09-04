@@ -54,9 +54,17 @@ pub const REINJECT_CAP_TOKENS: i32 = 50_000;
 /// the current task — a tool result that follows the last `# Task list`
 /// injection is part of the active work and is kept.
 fn clear_set(transcript: &[Message]) -> Vec<usize> {
-    let task_inject = transcript
-        .iter()
-        .rposition(|m| m.text.contains("# Task list"));
+    // Match the exact `TaskList::inject_block` prefix, not just any message
+    // that contains "# Task list": a tool result that reads a Markdown file
+    // with that heading would otherwise shield every later tool result from
+    // micro-compaction. The injection is always a User message starting with
+    // either "# Task list\n\nYour current tasks" (no goal) or "Current goal: "
+    // (goal first, then the task list).
+    let task_inject = transcript.iter().rposition(|m| {
+        m.role == Role::User
+            && (m.text.starts_with("# Task list\n\nYour current tasks")
+                || m.text.starts_with("Current goal: "))
+    });
     let idx: Vec<usize> = transcript
         .iter()
         .enumerate()

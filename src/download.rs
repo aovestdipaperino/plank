@@ -704,6 +704,30 @@ fn partial_bytes(dest: &Path) -> u64 {
     std::fs::metadata(dest.with_extension("part")).map_or(0, |m| m.len())
 }
 
+/// Path of the sidecar that records which URL a `.part` was downloaded from,
+/// so a stale `.part` from a different source (or a previous build) is detected
+/// and discarded rather than appended to or renamed into place.
+fn part_url_path(dest: &Path) -> PathBuf {
+    dest.with_extension("part.url")
+}
+
+/// Returns `true` if a `.part` exists and its recorded source URL matches
+/// `url`. Returns `false` if there is no `.part`, no sidecar, or a mismatch.
+fn part_matches_url(dest: &Path, url: &str) -> bool {
+    let part = dest.with_extension("part");
+    if !part.exists() {
+        return false;
+    }
+    std::fs::read_to_string(part_url_path(dest))
+        .is_ok_and(|recorded| recorded.trim() == url)
+}
+
+/// Discards a stale `.part` and its sidecar so the next download starts fresh.
+fn discard_stale_part(dest: &Path) {
+    let _ = std::fs::remove_file(dest.with_extension("part"));
+    let _ = std::fs::remove_file(part_url_path(dest));
+}
+
 /// Downloads `url` to `dest` via `ureq`, showing the animated progress bar.
 fn download(url: &str, dest: &Path) -> Result<(), String> {
     if let Some(parent) = dest.parent() {
@@ -712,10 +736,20 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     let part = dest.with_extension("part");
     let total = content_length(url);
 
+    // A .part from a different URL (e.g. a previous build, or a different model)
+    // must not be appended to or renamed into place. Discard it and start fresh.
+    if partial_bytes(dest) > 0 && !part_matches_url(dest, url) {
+        discard_stale_part(dest);
+    }
+
+    // Record the source URL so a future resume can verify provenance.
+    let _ = std::fs::write(part_url_path(dest), url);
+
     // A .part that already matches the full size just needs the final rename
     // (e.g. a previous run died between finishing the body and renaming).
     if total.is_some_and(|t| t > 0 && partial_bytes(dest) == t) {
         std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+        let _ = std::fs::remove_file(part_url_path(dest));
         finish(dest);
         eprintln!("Model ready at {}.", dest.display());
         return Ok(());
@@ -749,8 +783,17 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
                 gb(expected)
             ));
         }
+    } else {
+        // No content-length: the server did not report a size, so a clean EOF
+        // is not proof of completeness. Refuse to rename rather than ship a
+        // truncated model that will fail deep in the loader.
+        return Err(
+            "download incomplete: server reported no content length. Re-run plank to retry."
+                .to_string(),
+        );
     }
     std::fs::rename(&part, dest).map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(part_url_path(dest));
     finish(dest);
     eprintln!("Model ready at {}.", dest.display());
     Ok(())
