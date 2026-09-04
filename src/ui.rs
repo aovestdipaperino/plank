@@ -207,6 +207,107 @@ fn remote_capture(remote: Option<&Mutex<UiRemote>>, frame: &mut ratatui::Frame) 
     }
 }
 
+/// Repaints the idle-loop frame, exactly as `tui_loop`'s own draw call
+/// composes it.
+///
+/// Extracted so a blocking prompt (Ctrl-D quit, Alt-M cancel) can repaint
+/// immediately before it blocks in `crossterm::event::read()`. Without this,
+/// the terminal shows the frame from *before* the prompt's lines were pushed
+/// into `log` — the screen looks frozen, and the user's next keystroke is
+/// silently consumed as the answer.
+#[allow(clippy::too_many_arguments)]
+fn repaint_idle(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    sub_pane: &mut tui::SubPane,
+    btw_panel: &mut BtwPanel,
+    input: &TuiInput,
+    idle_status: &str,
+    selection: Option<tui::ContentSelection>,
+    task_view: &tui::TaskView,
+    config_form: Option<&crate::configform::ConfigForm>,
+    kv_pane: Option<&crate::kvpane::KvPane>,
+    resume_pane: Option<&crate::resumepane::ResumePane>,
+    arcade: &crate::arcade::Arcade,
+    wasm_frame: Option<&crate::wasmreg::OpenFrame>,
+    rem: Option<&Mutex<UiRemote>>,
+) -> Result<ratatui::buffer::Buffer, String> {
+    let sub_active = sub_pane.active;
+    let sub_title: Option<String> = if sub_active {
+        sub_pane.label().map(str::to_owned)
+    } else {
+        None
+    };
+    let roster = sub_pane.roster_view(tui::roster_clock_ms());
+    let roster_rows = roster.height();
+    let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
+    let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
+        match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
+            Some(run) => (&run.log, &mut run.view),
+            None => (log, view),
+        };
+    // The prompt is live on this frame: the cursor goes back to the theme
+    // green. Set per-frame rather than once on entry because a turn ending is
+    // not the only way back here (panes, suspends) — and because this function
+    // is also what repaints before the Alt-M and Ctrl-D prompts block, which
+    // are likewise frames where plank is waiting on you.
+    crate::cursor::set(crate::cursor::State::Idle);
+    let completed = terminal
+        .draw(|f| {
+            if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {
+                tui::draw_btw_split(
+                    f,
+                    draw_log,
+                    btw_log,
+                    btw_view,
+                    Some(input.state()),
+                    idle_status,
+                    draw_view,
+                    task_view,
+                    &roster,
+                );
+            } else {
+                tui::draw(
+                    f,
+                    draw_log,
+                    Some(input.state()),
+                    idle_status,
+                    draw_view,
+                    selection,
+                    task_view,
+                    sub_title.as_deref(),
+                    &roster,
+                );
+            }
+            if let Some(m) = &input.slash {
+                tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
+            }
+            if let Some(p) = &input.popup {
+                tui::draw_popup(f, input.buf.text(), p, roster_rows);
+            }
+            if let Some(form) = config_form {
+                tui::draw_config(f, form);
+            }
+            if let Some(pane) = kv_pane {
+                tui::draw_kvcache(f, pane);
+            }
+            if let Some(pane) = resume_pane {
+                tui::draw_resume(f, pane);
+            }
+            // Drawn last: the arcade covers the whole frame.
+            if arcade.is_open() {
+                tui::draw_arcade(f, arcade);
+            }
+            if let Some(open) = wasm_frame {
+                tui::draw_wasm_frame(f, open);
+            }
+            remote_capture(rem, f);
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(completed.buffer.clone())
+}
+
 /// Answers deferred remote requests. Call right after `terminal.draw` returns.
 fn remote_service(remote: Option<&Mutex<UiRemote>>) {
     if let Some(m) = remote
@@ -4093,6 +4194,7 @@ impl Agent<'_> {
                 }
             }
             "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
+            "/model" => println!("{}", Self::model_text_command(arg)),
             "/config" => {
                 if arg == "--resolved" {
                     print!(
@@ -5054,6 +5156,20 @@ the original is frozen and listed in /tree"
             other => {
                 format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
             }
+        }
+    }
+
+    /// Static-text `/model`, for the plain-stdout REPL.
+    ///
+    /// The TUI's Alt-M popup has no equivalent on a piped stdout, so per
+    /// `CLAUDE.md` every pane-driven command needs this text form.
+    fn model_text_command(arg: &str) -> String {
+        match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] | ["status"] => crate::downloader::status_report(),
+            ["cancel"] => crate::downloader::cancel_command(false),
+            ["cancel", "--delete"] => crate::downloader::cancel_command(true),
+            ["download"] => crate::downloader::start_from_manifest(),
+            _ => "usage: /model [status] | /model cancel [--delete] | /model download".to_string(),
         }
     }
 
@@ -8063,81 +8179,27 @@ impl Agent<'_> {
                 Some(label) => format!("[sub-agent: {label}] {status}"),
                 None => status,
             };
-            let roster = sub_pane.roster_view(tui::roster_clock_ms());
-            let roster_rows = roster.height();
-            let selected_row = sub_pane.cursor.checked_sub(1).filter(|_| sub_active);
-            let (draw_log, draw_view): (&OutputLog, &mut tui::OutputView) =
-                match selected_row.and_then(|i| sub_pane.runs.get_mut(i)) {
-                    Some(run) => (&run.log, &mut run.view),
-                    None => (&log, &mut view),
-                };
-            // The prompt is live on this frame: the cursor goes back to the
-            // theme green. Set per-frame rather than once on entry because a
-            // turn ending is not the only way back here (panes, suspends).
-            crate::cursor::set(crate::cursor::State::Idle);
-            let completed = terminal
-                .draw(|f| {
-                    // A `/btw` panel left open from an earlier turn keeps the
-                    // split view even while idle; text selection falls back to
-                    // the single-column path (no panel). The sub-agent pane
-                    // takes precedence: the split is about the main task.
-                    if let (false, Some((btw_log, btw_view))) = (sub_active, btw_panel.as_mut()) {
-                        tui::draw_btw_split(
-                            f,
-                            draw_log,
-                            btw_log,
-                            btw_view,
-                            Some(input.state()),
-                            &idle_status,
-                            draw_view,
-                            &task_view,
-                            &roster,
-                        );
-                    } else {
-                        tui::draw(
-                            f,
-                            draw_log,
-                            Some(input.state()),
-                            &idle_status,
-                            draw_view,
-                            selection,
-                            &task_view,
-                            sub_title.as_deref(),
-                            &roster,
-                        );
-                    }
-                    if let Some(m) = &input.slash {
-                        tui::draw_slash_menu(f, input.buf.text(), m, roster_rows);
-                    }
-                    if let Some(p) = &input.popup {
-                        tui::draw_popup(f, input.buf.text(), p, roster_rows);
-                    }
-                    if let Some(form) = &config_form {
-                        tui::draw_config(f, form);
-                    }
-                    if let Some(pane) = &kv_pane {
-                        tui::draw_kvcache(f, pane);
-                    }
-                    if let Some(pane) = &resume_pane {
-                        tui::draw_resume(f, pane);
-                    }
-                    // Drawn last: the arcade covers the whole frame.
-                    if arcade.is_open() {
-                        tui::draw_arcade(f, &arcade);
-                    }
-                    // And a WASM frame covers it in turn — the two are never
-                    // open at once, but ordering them makes that a fact about
-                    // the code rather than an assumption about the callers.
-                    if let Some(open) = &wasm_frame {
-                        tui::draw_wasm_frame(f, open);
-                    }
-                    remote_capture(rem, f);
-                })
-                .map_err(|e| e.to_string())?;
+            let completed_buffer = repaint_idle(
+                terminal,
+                &log,
+                &mut view,
+                &mut sub_pane,
+                &mut btw_panel,
+                &input,
+                &idle_status,
+                selection,
+                &task_view,
+                config_form.as_ref(),
+                kv_pane.as_ref(),
+                resume_pane.as_ref(),
+                &arcade,
+                wasm_frame.as_ref(),
+                rem,
+            )?;
             // Snapshot the just-drawn buffer (ratatui has already swapped, so
-            // `completed.buffer` is the frame the user sees, not the blank one).
+            // this is the frame the user sees, not the blank one).
             if capture_crt {
-                crt_frame = Some(frame_to_image(completed.buffer));
+                crt_frame = Some(frame_to_image(&completed_buffer));
             }
             remote_service(rem);
 
@@ -8689,6 +8751,37 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
+                        // A live background download is worth one line before
+                        // quitting, so nobody closes the terminal wondering
+                        // whether they just threw away 40 GB.
+                        if let Some(warning) = crate::downloader::quit_warning() {
+                            log.push_dim(warning);
+                            // Repaint before blocking: the frame is only drawn
+                            // at the top of this loop, so without this the
+                            // terminal would look frozen with the warning
+                            // invisible, and the user's next keystroke would
+                            // be silently consumed as the answer.
+                            repaint_idle(
+                                terminal,
+                                &log,
+                                &mut view,
+                                &mut sub_pane,
+                                &mut btw_panel,
+                                &input,
+                                &idle_status,
+                                selection,
+                                &task_view,
+                                config_form.as_ref(),
+                                kv_pane.as_ref(),
+                                resume_pane.as_ref(),
+                                &arcade,
+                                wasm_frame.as_ref(),
+                                rem,
+                            )?;
+                            if !await_yes_default()? {
+                                continue;
+                            }
+                        }
                         break;
                     }
                     input.buf.delete();
@@ -8726,6 +8819,44 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                     input.buf.move_next_word();
+                }
+                // Alt-M: the background model download's one on-screen control.
+                // A modifier chord rather than a bare key because the input line
+                // owns every unmodified character, and Alt-m is unbound.
+                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let Some(prompt) = crate::downloader::cancel_prompt() else {
+                        log.push_dim("No model download is running.");
+                        continue;
+                    };
+                    for line in prompt.lines() {
+                        log.push_dim(line.to_string());
+                    }
+                    // Same reasoning as the Ctrl-D quit prompt: repaint before
+                    // blocking, since a stray keystroke here can mean deleting
+                    // an 87 GB verified download.
+                    repaint_idle(
+                        terminal,
+                        &log,
+                        &mut view,
+                        &mut sub_pane,
+                        &mut btw_panel,
+                        &input,
+                        &idle_status,
+                        selection,
+                        &task_view,
+                        config_form.as_ref(),
+                        kv_pane.as_ref(),
+                        resume_pane.as_ref(),
+                        &arcade,
+                        wasm_frame.as_ref(),
+                        rem,
+                    )?;
+                    match await_cancel_choice()? {
+                        Some(delete) => {
+                            log.push_dim(crate::downloader::cancel_command(delete));
+                        }
+                        None => log.push_dim("Still downloading."),
+                    }
                 }
                 KeyCode::Left if word_mod => {
                     input.buf.move_prev_word();
@@ -11135,6 +11266,9 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/model" => {
+                log.push_dim(Self::model_text_command(arg));
+            }
             "/skills" => {
                 for line in crate::skills::render_list(&self.skills).lines() {
                     log.push_plain(line.to_owned());
@@ -11722,6 +11856,47 @@ fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce
     };
     let _ = terminal.clear();
     out
+}
+
+/// Blocks for the one keystroke that answers the Alt-M cancel prompt.
+///
+/// A free function at module scope, not a method: it needs nothing from
+/// `Agent`, and the call site inside the key match reads better without a
+/// `Self::` prefix.
+///
+/// `Some(true)` deletes the partial files, `Some(false)` keeps them, `None`
+/// leaves the download alone. Anything unrecognized is `None`: a stray
+/// keystroke must never be read as "delete 36 GB".
+fn await_cancel_choice() -> Result<Option<bool>, String> {
+    loop {
+        match ratatui::crossterm::event::read().map_err(|e| e.to_string())? {
+            ratatui::crossterm::event::Event::Key(key)
+                if key.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                return Ok(match key.code {
+                    KeyCode::Char('k' | 'K') => Some(false),
+                    KeyCode::Char('d' | 'D') => Some(true),
+                    _ => None,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Blocks for a `[Y/n]` answer, where Enter means yes. A free function for the
+/// same reason as [`await_cancel_choice`].
+fn await_yes_default() -> Result<bool, String> {
+    loop {
+        match ratatui::crossterm::event::read().map_err(|e| e.to_string())? {
+            ratatui::crossterm::event::Event::Key(key)
+                if key.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                return Ok(!matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pre-rendered output for the read-only slash commands that stay usable while

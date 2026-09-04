@@ -57,188 +57,6 @@ const DSPARK_FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf";
 /// this is fetched at startup when absent, the same as the main model.
 const VISION_ENCODER_FILE: &str = "DeepSeek-V4-Flash-Vision-Encoder.gguf";
 
-/// Records which `FILE` produced the local model, alongside it.
-///
-/// Without this a bumped [`FILE`] would be invisible to anyone who already has
-/// a model: [`ensure_model`] only ever checked that the path exists, so an old
-/// download would be used forever. The stamp is advisory — a missing or
-/// unreadable one means "unknown", never "re-download".
-fn stamp_path(model: &Path) -> PathBuf {
-    model.with_extension("source")
-}
-
-/// The `FILE` the model at `path` was downloaded from, if recorded.
-fn stamped_source(path: &Path) -> Option<String> {
-    let s = std::fs::read_to_string(stamp_path(path)).ok()?;
-    let s = s.trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-/// Which repo file the model at `path` is, as best we can tell.
-///
-/// The stamp is authoritative. Failing that the name is inferred from what the
-/// path actually resolves to, which covers the common setup of symlinking
-/// `ds4flash.gguf` at a GGUF kept elsewhere (a shared `~/.ds4/models`, say):
-/// the link target still carries the build in its name.
-fn local_build(path: &Path) -> Option<String> {
-    stamped_source(path).or_else(|| {
-        let resolved = std::fs::canonicalize(path).ok()?;
-        let name = resolved.file_name()?.to_str()?;
-        (name.starts_with("DeepSeek-V4-") && is_gguf(name)).then(|| name.to_string())
-    })
-}
-
-/// Whether `name` is a GGUF, by extension.
-fn is_gguf(name: &str) -> bool {
-    std::path::Path::new(name)
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-}
-
-/// The build-independent part of a repo filename: the quant recipe, without
-/// any trailing `-MMDD` release tag.
-///
-/// `…-chat-v2-imatrix-0731.gguf` and `…-chat-v2-imatrix.gguf` share the family
-/// `…-chat-v2-imatrix`, which is what makes one recognizable as a newer cut of
-/// the other. Only a four-digit tag is stripped, so a recipe that genuinely
-/// ends in digits is left alone.
-fn family_of(file: &str) -> &str {
-    let stem = file.strip_suffix(".gguf").unwrap_or(file);
-    match stem.rsplit_once('-') {
-        Some((head, tag)) if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => stem,
-    }
-}
-
-/// Picks the most recently committed member of `family` out of a Hugging Face
-/// tree listing.
-///
-/// The API is the authority on ordering: every entry carries its commit date,
-/// so nothing here has to parse `-MMDD` tags or reason about year boundaries.
-/// Two builds of the same recipe are also byte-identical in size, so the date
-/// is the only signal that works.
-fn newest_in_family(json: &str, family: &str) -> Option<String> {
-    let entries: serde_json::Value = serde_json::from_str(json).ok()?;
-    let mut best: Option<(String, String)> = None;
-    for entry in entries.as_array()? {
-        let path = entry.get("path")?.as_str()?;
-        if entry.get("type").and_then(serde_json::Value::as_str) != Some("file")
-            || family_of(path) != family
-            || !is_gguf(path)
-        {
-            continue;
-        }
-        let date = entry
-            .get("lastCommit")
-            .and_then(|c| c.get("date"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        // ISO-8601 dates from the API sort correctly as plain strings.
-        if best.as_ref().is_none_or(|(_, b)| date > b.as_str()) {
-            best = Some((path.to_string(), date.to_string()));
-        }
-    }
-    best.map(|(path, _)| path)
-}
-
-/// Hugging Face tree listing for [`REPO`]. `expand=true` is what attaches each
-/// file's `lastCommit`, which is the whole basis for "newer".
-#[cfg(not(test))]
-const TREE_URL: &str =
-    "https://huggingface.co/api/models/antirez/deepseek-v4-gguf/tree/main?expand=true";
-/// How often to ask Hugging Face what the newest build is.
-const MODEL_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
-/// Bounded timeout for that request. Startup must never hang on the network.
-#[cfg(not(test))]
-const MODEL_CHECK_TIMEOUT_SECS: u64 = 3;
-/// Cache of `(last_check_epoch, newest_known_file)`, beside the model.
-const MODEL_CHECK_FILE: &str = "model-check";
-
-/// Fetches the repo tree, bounded by [`MODEL_CHECK_TIMEOUT_SECS`]. `None` on
-/// any failure — offline, timeout, HTTP error — so the caller stays quiet.
-#[cfg(not(test))]
-fn fetch_tree() -> Option<String> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(MODEL_CHECK_TIMEOUT_SECS)))
-        .build()
-        .new_agent();
-    let mut resp = agent
-        .get(TREE_URL)
-        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.body_mut().read_to_string().ok()
-}
-
-/// Test builds never touch the network; [`decide_upgrade`] is driven directly.
-#[cfg(test)]
-fn fetch_tree() -> Option<String> {
-    None
-}
-
-/// Current Unix time in whole seconds, or 0 if the clock predates the epoch.
-fn now_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Reads the model-check cache: `(last_check_epoch, newest_known_file)`.
-fn read_check_cache(path: &Path) -> (Option<u64>, Option<String>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let mut lines = text.lines();
-    let when = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
-    let newest = lines
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    (when, newest)
-}
-
-/// Pure decision: given what is on disk, the cache, and the clock, work out
-/// whether to offer an upgrade.
-///
-/// Returns `(refreshed_cache, offer)`. `fetch` is injected so tests can drive
-/// the whole thing without a network.
-///
-/// Asking is throttled to [`MODEL_CHECK_INTERVAL_SECS`], and the timestamp is
-/// written whether or not the offer is accepted. That is deliberate: a startup
-/// prompt you have already declined must not reappear on the next launch.
-fn decide_upgrade(
-    have: Option<&str>,
-    last: Option<u64>,
-    cached: Option<String>,
-    now: u64,
-    fetch: impl FnOnce() -> Option<String>,
-) -> (Option<(u64, String)>, Option<String>) {
-    // Nothing identifiable on disk means no family to track, so stay silent
-    // rather than guess a user's quant recipe wrong.
-    let Some(have) = have else {
-        return (None, None);
-    };
-    let family = family_of(have);
-
-    let due = last.is_none_or(|t| now.saturating_sub(t) >= MODEL_CHECK_INTERVAL_SECS);
-    let (newest, refreshed) = if due {
-        match fetch().as_deref().and_then(|j| newest_in_family(j, family)) {
-            Some(found) => (Some(found.clone()), Some((now, found))),
-            // A failed check is not worth burning the interval on.
-            None => (cached, None),
-        }
-    } else {
-        (cached, None)
-    };
-
-    let offer = newest.filter(|n| n != have);
-    (refreshed, offer)
-}
-
 /// Rotating status lines shown while the model downloads.
 const MESSAGES: [&str; 200] = [
     "Summoning alien intelligence from the void...",
@@ -623,9 +441,9 @@ pub fn ensure_vision_encoder() -> Result<(), String> {
 /// terminal (so no prompt is possible), or when the download fails.
 pub fn ensure_model(path: &Path) -> Result<(), String> {
     if path.exists() {
-        if std::io::stdin().is_terminal() {
-            return offer_upgrade(path);
-        }
+        // Upgrades are the manifest's business now (`check_manifest_at_startup`),
+        // and they happen in the background rather than as a blocking prompt
+        // before the engine loads.
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -662,43 +480,6 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
     download(&model_url(), path)
 }
 
-/// Asks Hugging Face whether a newer build of the local model's quant family
-/// exists and, if so, offers to fetch it.
-///
-/// Never fatal: a model that is one release behind still works, so every
-/// failure path here — offline, unreadable cache, declined prompt — leaves the
-/// existing model in place and returns `Ok`.
-fn offer_upgrade(path: &Path) -> Result<(), String> {
-    let have = local_build(path);
-    let cache = path.with_file_name(MODEL_CHECK_FILE);
-    let (last, cached) = read_check_cache(&cache);
-    let (refreshed, offer) = decide_upgrade(have.as_deref(), last, cached, now_epoch(), fetch_tree);
-
-    if let Some((when, ref newest)) = refreshed {
-        let _ = std::fs::write(&cache, format!("{when}\n{newest}\n"));
-    }
-    let Some(newest) = offer else {
-        return Ok(());
-    };
-
-    eprintln!("A newer DeepSeek V4 Flash build is available:");
-    eprintln!("  have: {}", have.unwrap_or_default());
-    eprintln!("  new:  {newest}");
-    eprint!("Download it now? [y/N] ");
-    io::stderr().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| e.to_string())?;
-    if matches!(answer.trim(), "y" | "Y" | "yes") {
-        // Fetch the build we actually found, not the compiled-in default.
-        download(&file_url(&newest), path)?;
-        let _ = std::fs::write(stamp_path(path), format!("{newest}\n"));
-        return Ok(());
-    }
-    Ok(())
-}
-
 /// Size of the partial download alongside `dest`, or 0 if none.
 fn partial_bytes(dest: &Path) -> u64 {
     std::fs::metadata(dest.with_extension("part")).map_or(0, |m| m.len())
@@ -718,8 +499,7 @@ fn part_matches_url(dest: &Path, url: &str) -> bool {
     if !part.exists() {
         return false;
     }
-    std::fs::read_to_string(part_url_path(dest))
-        .is_ok_and(|recorded| recorded.trim() == url)
+    std::fs::read_to_string(part_url_path(dest)).is_ok_and(|recorded| recorded.trim() == url)
 }
 
 /// Discards a stale `.part` and its sidecar so the next download starts fresh.
@@ -799,13 +579,6 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Records the [`FILE`] that produced `dest`, so a later [`FILE`] bump can be
-/// noticed. Best-effort: a model that downloaded fine is not worth failing
-/// over an unwritable sidecar.
-fn write_stamp(dest: &Path) {
-    let _ = std::fs::write(stamp_path(dest), format!("{FILE}\n"));
-}
-
 /// Celebratory sounds, best first.
 ///
 /// `Tada` is the one to play, but Apple dropped it from `/System/Library/Sounds`
@@ -854,9 +627,15 @@ fn play_tada() {
 #[cfg(not(target_os = "macos"))]
 fn play_tada() {}
 
-/// Marks a finished download: stamps the build and sounds the fanfare.
+/// Marks a finished download: sounds the fanfare.
+///
+/// It used to also write a `.source` stamp naming the repo file the model came
+/// from, which was how a bumped `FILE` constant became visible to someone who
+/// already had a model. The manifest replaced that entirely: `~/.plank/ds4.manifest`
+/// records the whole installed set by version, so a per-file stamp has nothing
+/// left to say.
 fn finish(dest: &Path) {
-    write_stamp(dest);
+    let _ = dest;
     play_tada();
 }
 
@@ -1313,9 +1092,316 @@ fn content_length(url: &str) -> Option<u64> {
         .ok()
 }
 
+/// Bytes as gigabytes, shared with `downloader`'s user-facing text so the two
+/// modules never format the same quantity two different ways.
 #[allow(clippy::cast_precision_loss)]
-fn gb(bytes: u64) -> f64 {
+pub(crate) fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
+}
+
+/// The manifest URL. Kept in the repo rather than on a release asset so the
+/// artifact set is reviewed in a pull request like any other change.
+#[cfg(not(test))]
+const MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/aovestdipaperino/plank/main/ds4.manifest";
+/// Bounded timeout for the manifest fetch. Startup must never hang on the
+/// network.
+#[cfg(not(test))]
+const MANIFEST_TIMEOUT_SECS: u64 = 3;
+/// How often to ask whether a newer artifact set exists.
+const MANIFEST_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Records when the manifest was last fetched, beside the model.
+const MANIFEST_CHECK_FILE: &str = "manifest-check";
+
+/// Fetches the manifest, bounded by [`MANIFEST_TIMEOUT_SECS`]. `None` on any
+/// failure — offline, timeout, HTTP error — so the caller stays quiet.
+#[cfg(not(test))]
+fn fetch_manifest() -> Option<String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(MANIFEST_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(MANIFEST_URL)
+        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.body_mut().read_to_string().ok()
+}
+
+/// Test builds never touch the network.
+#[cfg(test)]
+fn fetch_manifest() -> Option<String> {
+    None
+}
+
+/// Whether the 24-hour check window has elapsed under `root`, and records
+/// that it has.
+///
+/// The timestamp is written whether or not anything comes of the check: a
+/// startup prompt already declined must not reappear on the next launch.
+fn check_due_in(root: &Path) -> bool {
+    let path = root.join(MANIFEST_CHECK_FILE);
+    let last = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    let now = crate::downloader::now_epoch();
+    if last.is_some_and(|t| now.saturating_sub(t) < MANIFEST_CHECK_INTERVAL_SECS) {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{now}\n"));
+    true
+}
+
+/// Where a manifest version the user declined (or that failed / was
+/// cancelled) is recorded under `root`, so it is not silently re-offered.
+fn declined_path_in(root: &Path) -> PathBuf {
+    crate::manifest::downloads_dir_in(root).join("declined")
+}
+
+/// The version most recently declined under `root`, if any.
+fn read_declined_in(root: &Path) -> Option<u32> {
+    std::fs::read_to_string(declined_path_in(root))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Records `version` as declined under `root`. Best-effort: a failure here
+/// just means the offer may reappear, which is recoverable.
+fn record_declined_in(root: &Path, version: u32) {
+    let path = declined_path_in(root);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{version}\n"));
+}
+
+/// If the last background job ended in a failed hash check, or in a cancel
+/// that discarded the partial files, records its version as declined.
+///
+/// The spec is explicit that automatic retry after a hash mismatch, or after
+/// a Delete cancel, is out of scope: without this, the next `24h` check
+/// window would silently restart the very download the user just stopped.
+/// `/model download` remains the way to start it again on purpose.
+///
+/// A Keep cancel is deliberately excluded: its entire point is "stop now,
+/// resume later", so it must not be treated as a decline — that is what
+/// [`crate::downloader::cancelled_kept`] distinguishes.
+///
+/// The state file is terminal-phase evidence that outlives the run it
+/// describes (so `/model status` can still report a failure or cancel after
+/// the helper has exited), and this runs on every startup, well before
+/// `decide` gets a chance to record a *newer* decline of its own. Without the
+/// version guard, an old Delete-cancel's state would keep rewriting the
+/// single-slot `declined` marker back down to its own version every startup,
+/// silently un-declining any later version the user said no to: Delete-cancel
+/// v4, later decline v5, and the next check overwrites `declined` from 5 back
+/// to 4, so v5's prompt returns every 24 hours despite the user having
+/// already said no. Never move the marker backwards.
+fn note_last_run_outcome_in(root: &Path) {
+    if let Some(state) = crate::downloader::read_state_in(root) {
+        let declined = state.phase == crate::downloader::Phase::Failed
+            || (state.phase == crate::downloader::Phase::Cancelled
+                && !crate::downloader::cancelled_kept(&state));
+        if declined && state.version >= read_declined_in(root).unwrap_or(0) {
+            record_declined_in(root, state.version);
+        }
+    }
+}
+
+/// Whether an artifact of `kind` is present on disk under `root`.
+fn artifact_installed_in(root: &Path, kind: &str) -> bool {
+    crate::manifest::local_path_for_in(root, kind).is_some_and(|p| p.exists())
+}
+
+/// Prints the manifest's version transition and notes, then blocks for a
+/// `[y/N]` answer. Only `y`/`Y`/`yes` accepts; anything else — including a
+/// bare Enter — declines.
+///
+/// Mirrors the pre-manifest `offer_upgrade`'s prompt shape (commit 8d9ef82):
+/// a 93 GB background transfer must not start unannounced, and the safe
+/// default is no.
+fn confirm_background_download(manifest: &crate::manifest::Manifest, from: u32) -> bool {
+    eprintln!(
+        "plank: a newer model is available (version {} → {}{}).",
+        from,
+        manifest.version,
+        if manifest.notes.is_empty() {
+            String::new()
+        } else {
+            format!(": {}", manifest.notes)
+        }
+    );
+    eprint!("Download it in the background? [y/N] ");
+    io::stderr().flush().ok();
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    matches!(answer.trim(), "y" | "Y" | "yes")
+}
+
+/// The whole startup manifest flow, reading and writing state under `root`,
+/// with the manifest fetch, the background spawn, and the interactive
+/// confirmation injected so it can be exercised without a network, a real
+/// detached process, or a real terminal.
+///
+/// `confirm` returns `None` when there is nobody to ask (no controlling
+/// terminal) and `Some(accepted)` otherwise, folding the non-TTY gate and the
+/// `[y/N]` prompt into one seam a test can answer deterministically.
+///
+/// Never fatal, and never blocking on anything but the interactive prompt
+/// (itself gated on a real terminal). A model one release behind still works,
+/// so every failure path here — offline, unparseable manifest, an unwritable
+/// staging directory — leaves the existing model in place and returns.
+fn check_manifest_at_startup_in(
+    root: &Path,
+    fetch: &dyn Fn() -> Option<String>,
+    spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
+) {
+    // Anything a previous run verified gets installed first, before the engine
+    // maps the model.
+    match crate::downloader::swap_staged_in(root) {
+        Ok(Some(version)) => eprintln!("plank: installed model manifest version {version}."),
+        Ok(None) => {}
+        Err(e) => eprintln!("plank: could not install the downloaded model: {e}"),
+    }
+
+    // A helper already at work needs no second opinion.
+    if crate::downloader::running_in(root) {
+        return;
+    }
+    if !check_due_in(root) {
+        return;
+    }
+    note_last_run_outcome_in(root);
+    let Some(remote) = fetch().and_then(|t| crate::manifest::parse(&t).ok()) else {
+        return;
+    };
+    let installed = crate::manifest::read_at(&crate::manifest::installed_path_in(root));
+    let size_of = |kind: &str| {
+        let path = crate::manifest::local_path_for_in(root, kind)?;
+        std::fs::metadata(path).map(|m| m.len()).ok()
+    };
+    match crate::manifest::decide(remote, installed.as_ref(), &size_of) {
+        crate::manifest::Decision::UpToDate => {}
+        crate::manifest::Decision::Adopt(m) => {
+            // The files on disk are already this release; record that and say
+            // nothing. Without this, every existing user is offered an 87 GB
+            // re-download the day the manifest ships.
+            let _ = std::fs::write(crate::manifest::installed_path_in(root), &m.raw);
+        }
+        crate::manifest::Decision::Offer { manifest, from } => {
+            // First-run acquisition belongs to `ensure_model`, not the
+            // manifest flow: with no installed manifest AND no model on disk,
+            // starting a background download here would race the foreground
+            // download `ensure_model` is about to start for the very same
+            // file — nearly 2x the transfer for one first run. An `Adopt`
+            // decision never reaches this arm, so it is unaffected.
+            //
+            // This must come before the job is written: a bare first run has
+            // nothing to resume and `ensure_model` is about to fetch the
+            // whole ~87 GB file itself, so recording a job here would let a
+            // user who types `/model download` right after trigger a
+            // redundant full background re-fetch of what the foreground
+            // download just obtained (harmless once finished — it stages,
+            // verifies and renames identical content — but exactly the race
+            // this gate exists to avoid).
+            if from == 0 && !artifact_installed_in(root, "main") {
+                return;
+            }
+            // Recorded unconditionally from here on, before any further early
+            // return below: this only writes the job file for `/model
+            // download` to pick up later, it does not itself start anything
+            // downloading (that still needs `spawn`, below). Without this, a
+            // declined offer or a non-TTY run leaves no job on disk, so
+            // `read_job_in` finds nothing and `/model download` answers "No
+            // model download is pending" forever — the version becomes
+            // permanently unreachable even though the user asked for it
+            // explicitly.
+            if let Err(e) = crate::downloader::write_job_in(root, &manifest) {
+                eprintln!("plank: could not record the download job: {e}");
+            }
+            // Already declined (or the last attempt was cancelled or failed a
+            // hash check): do not silently re-offer. `/model download` is how
+            // the user restarts it on purpose.
+            if read_declined_in(root) == Some(manifest.version) {
+                return;
+            }
+            // A 93 GB transfer must not start unannounced, and there is no
+            // one to ask on a piped or headless run.
+            let Some(accepted) = confirm(&manifest, from) else {
+                return;
+            };
+            if !accepted {
+                record_declined_in(root, manifest.version);
+                return;
+            }
+            match spawn(&manifest) {
+                Ok(()) => {
+                    eprintln!(
+                        "plank: downloading it in the background. Alt-M or /model to cancel."
+                    );
+                }
+                Err(e) => eprintln!("plank: could not start the background download: {e}"),
+            }
+        }
+    }
+}
+
+/// The whole startup manifest flow: install anything staged, then decide
+/// whether to start a background download.
+///
+/// Skips entirely when `model_path` is `Some`: a `-m <path>` user's model
+/// never lives at the manifest's hardcoded `~/.plank` locations, so the size
+/// check would always read "nothing installed" and both the swap and the
+/// download decision would operate on a file the engine never loads from.
+///
+/// Never fatal, and never blocking except on the interactive download prompt
+/// (itself gated on a real terminal).
+pub fn check_manifest_at_startup(model_path: Option<&Path>) {
+    check_manifest_at_startup_with(
+        model_path,
+        &crate::manifest::plank_dir(),
+        &fetch_manifest,
+        &crate::downloader::spawn_detached,
+        &real_confirm,
+    );
+}
+
+/// [`check_manifest_at_startup`] with every side effect injected, so a test
+/// can drive the `model_path` skip, the manifest fetch, the background
+/// spawn, and the interactive confirmation all deterministically.
+fn check_manifest_at_startup_with(
+    model_path: Option<&Path>,
+    root: &Path,
+    fetch: &dyn Fn() -> Option<String>,
+    spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
+) {
+    if model_path.is_some() {
+        return;
+    }
+    check_manifest_at_startup_in(root, fetch, spawn, confirm);
+}
+
+/// The real confirmation: `None` when there is no controlling terminal to ask
+/// (a piped or headless run), `Some(answer)` from the blocking `[y/N]` prompt
+/// otherwise.
+fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    Some(confirm_background_download(manifest, from))
 }
 
 #[cfg(test)]
@@ -1575,140 +1661,6 @@ mod tests {
         }
     }
 
-    const APRIL: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
-    const JULY: &str =
-        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
-
-    /// A tree listing shaped like the real one, newest entry deliberately not
-    /// last so the pick cannot pass by accident.
-    fn tree() -> String {
-        format!(
-            r#"[
-              {{"type":"file","path":"{JULY}","lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
-              {{"type":"file","path":"{APRIL}","lastCommit":{{"date":"2026-05-11T10:00:00.000Z"}}}},
-              {{"type":"file","path":"DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf",
-                "lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
-              {{"type":"directory","path":"imatrix"}}
-            ]"#
-        )
-    }
-
-    #[test]
-    fn family_strips_only_a_four_digit_release_tag() {
-        let family = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix";
-        assert_eq!(family_of(JULY), family);
-        assert_eq!(
-            family_of(APRIL),
-            family,
-            "the untagged build is the same family"
-        );
-        // The Vision-Exp default is its own family — no 4-digit tag to strip.
-        assert_eq!(
-            family_of(FILE),
-            "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8",
-            "the pinned default too"
-        );
-        // A recipe ending in digits is not a release tag.
-        assert_eq!(family_of("Model-MXFP4.gguf"), "Model-MXFP4");
-        assert_eq!(family_of("Model-Q4K-12345.gguf"), "Model-Q4K-12345");
-    }
-
-    #[test]
-    fn newest_is_picked_by_commit_date_within_the_family() {
-        let family = family_of(APRIL);
-        assert_eq!(newest_in_family(&tree(), family).as_deref(), Some(JULY));
-        // The Q4 build is a different family and must never be offered to a
-        // machine running the Q2 quant.
-        assert_ne!(
-            newest_in_family(&tree(), family).as_deref(),
-            Some("DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf")
-        );
-        // An unknown family matches nothing; malformed JSON is not fatal.
-        assert!(newest_in_family(&tree(), "Nope").is_none());
-        assert!(newest_in_family("not json", family).is_none());
-    }
-
-    #[test]
-    fn upgrade_is_offered_only_for_a_genuinely_newer_build() {
-        let now = 1_800_000_000;
-        let fetch = || Some(tree());
-
-        // Running April: July is offered and the cache is refreshed.
-        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, fetch);
-        assert_eq!(offer.as_deref(), Some(JULY));
-        assert_eq!(cache, Some((now, JULY.to_string())));
-
-        // Already on July: nothing to offer.
-        let (_, offer) = decide_upgrade(Some(JULY), None, None, now, fetch);
-        assert!(offer.is_none());
-
-        // Nothing identifiable on disk: stay silent rather than guess.
-        let (cache, offer) = decide_upgrade(None, None, None, now, fetch);
-        assert!(offer.is_none() && cache.is_none());
-    }
-
-    #[test]
-    fn the_check_is_throttled_and_a_decline_is_not_re_asked() {
-        let now = 1_800_000_000;
-        let boom = || panic!("must not hit the network inside the interval");
-
-        // Within the interval the cached answer is reused, no fetch.
-        let recent = now - MODEL_CHECK_INTERVAL_SECS + 1;
-        let (cache, offer) =
-            decide_upgrade(Some(APRIL), Some(recent), Some(JULY.to_string()), now, boom);
-        assert_eq!(
-            offer.as_deref(),
-            Some(JULY),
-            "the cached answer still stands"
-        );
-        assert!(cache.is_none(), "no refresh without a fetch");
-
-        // Past the interval it checks again.
-        let stale = now - MODEL_CHECK_INTERVAL_SECS;
-        let (cache, _) = decide_upgrade(Some(APRIL), Some(stale), None, now, || Some(tree()));
-        assert_eq!(cache, Some((now, JULY.to_string())));
-    }
-
-    #[test]
-    fn a_failed_check_does_not_burn_the_interval() {
-        let now = 1_800_000_000;
-        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, || None);
-        assert!(cache.is_none(), "offline must not count as a check");
-        assert!(offer.is_none());
-        // A previously cached answer survives an offline check.
-        let (_, offer) = decide_upgrade(Some(APRIL), None, Some(JULY.to_string()), now, || None);
-        assert_eq!(offer.as_deref(), Some(JULY));
-    }
-
-    #[test]
-    fn the_local_build_is_read_from_the_stamp_or_the_link_target() {
-        let dir = std::env::temp_dir().join(format!("plank-build-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("ds4flash.gguf");
-
-        // A stamp is authoritative.
-        std::fs::write(&model, b"weights").unwrap();
-        write_stamp(&model);
-        assert_eq!(local_build(&model).as_deref(), Some(FILE));
-
-        // Without one, a symlink reveals the build through its target — the
-        // shared ~/.ds4/models setup.
-        std::fs::remove_file(stamp_path(&model)).unwrap();
-        std::fs::remove_file(&model).unwrap();
-        let real = dir.join(APRIL);
-        std::fs::write(&real, b"weights").unwrap();
-        std::os::unix::fs::symlink(&real, &model).unwrap();
-        assert_eq!(local_build(&model).as_deref(), Some(APRIL));
-
-        // An opaque name stays unknown.
-        let opaque = dir.join("mystery.gguf");
-        std::fs::write(&opaque, b"weights").unwrap();
-        assert!(local_build(&opaque).is_none());
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn url_points_at_the_flash_gguf() {
         let url = model_url();
@@ -1771,5 +1723,303 @@ mod tests {
     #[test]
     fn gb_conversion() {
         assert!((gb(1_500_000_000) - 1.5).abs() < 1e-9);
+    }
+
+    /// A well-formed manifest naming only `main`, at `version` and `bytes`.
+    fn manifest_text(version: u32, bytes: u64) -> String {
+        format!(
+            r#"{{"version":{version},"released":"t","notes":"","files":{{
+                "main": {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": {bytes}, "sha256": "{}" }}
+            }}}}"#,
+            "a".repeat(64)
+        )
+    }
+
+    /// A `spawn` stub recording whether it was called, for asserting a path
+    /// never reaches the background download.
+    fn spy_spawn() -> (
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        impl Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    ) {
+        let called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = called.clone();
+        let spawn = move |_: &crate::manifest::Manifest| {
+            flag.store(true, Ordering::Relaxed);
+            Ok(())
+        };
+        (called, spawn)
+    }
+
+    #[test]
+    fn an_offer_with_no_model_installed_does_not_spawn() {
+        // Finding 1b: first-run acquisition belongs to `ensure_model`, not the
+        // manifest flow. With no installed manifest and no `main` artifact on
+        // disk, `decide` returns `Offer { from: 0 }` — starting a background
+        // download here would race `ensure_model`'s own foreground download
+        // of the very same file.
+        let root = crate::downloader::tests::tempdir();
+        let (called, spawn) = spy_spawn();
+        let text = manifest_text(5, 100);
+        // `from == 0` must return before ever consulting `confirm`, so a
+        // confirm stub that panics if called doubles as proof of that.
+        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
+            panic!("must not even ask on a bare first run")
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "must not spawn a background download on a bare first run"
+        );
+        assert!(
+            crate::downloader::read_job_in(&root).is_none(),
+            "finding 4: a bare first run must not plant a job either — \
+             `/model download` right after would trigger a redundant full \
+             background re-fetch of the file `ensure_model` is about to get \
+             in the foreground"
+        );
+    }
+
+    #[test]
+    fn an_explicit_model_path_skips_the_flow_entirely() {
+        // Finding 2 (and the re-review's Fix D): a `-m /custom/path` user's
+        // model never lives at the manifest's hardcoded `~/.plank`
+        // locations. Passing a configured path must return before touching
+        // `fetch`, `spawn`, or `confirm` at all. Every seam here panics if
+        // invoked, so this test would fail if the `model_path.is_some()`
+        // early return were ever removed or reordered past them — unlike
+        // calling the real `check_manifest_at_startup`, whose `fetch_manifest`
+        // is stubbed to `None` in test builds regardless of the skip, and so
+        // could not tell the fix apart from its absence.
+        let root = crate::downloader::tests::tempdir();
+        check_manifest_at_startup_with(
+            Some(Path::new("/some/custom/model.gguf")),
+            &root,
+            &|| panic!("must not fetch the manifest when -m is set"),
+            &|_| panic!("must not spawn a download when -m is set"),
+            &|_, _| panic!("must not prompt when -m is set"),
+        );
+    }
+
+    #[test]
+    fn a_declined_version_is_not_re_offered() {
+        // Findings 1 and 5 (and the re-review's Fix D): once the user has
+        // said no (or a prior attempt was cancelled or failed a hash check),
+        // the same version must not come back on its own; only
+        // `/model download` restarts it. `confirm` is stubbed to panic if
+        // reached, so this test would fail if the declined check were
+        // removed or the version comparison were wrong — unlike a stub that
+        // merely relies on the test process having no controlling terminal,
+        // which would mask that exact regression.
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        std::fs::write(declined_path_in(&root), "4\n").expect("declined marker");
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            panic!("a declined version must not even reach the confirm prompt")
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a declined version must not be re-offered"
+        );
+    }
+
+    #[test]
+    fn a_stale_cancelled_state_does_not_un_decline_a_newer_version() {
+        // Finding 3: `note_last_run_outcome_in` runs on every startup and
+        // unconditionally used to overwrite the single-slot `declined`
+        // marker with whatever version the persisted state file names — and
+        // that file persists indefinitely after a Delete cancel. Scenario:
+        // Delete-cancel v4 (declined records 4), then later decline v5
+        // (declined records 5) through the normal offer flow. The next
+        // startup's `note_last_run_outcome_in` must not see v4's leftover
+        // Cancelled/Delete state and rewrite `declined` back down to 4 —
+        // that would make the v5 prompt return every 24 hours despite the
+        // user already having said no to it.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+
+        let mut state = crate::downloader::tests::a_state();
+        state.version = 4;
+        state.phase = crate::downloader::Phase::Cancelled;
+        state.error = Some("delete".to_string());
+        crate::downloader::write_state_in(&root, &state).expect("publish v4's leftover state");
+
+        record_declined_in(&root, 5);
+
+        note_last_run_outcome_in(&root);
+
+        assert_eq!(
+            read_declined_in(&root),
+            Some(5),
+            "a stale v4 state must not un-decline the already-declined v5"
+        );
+    }
+
+    #[test]
+    fn note_last_run_outcome_still_records_a_forward_decline() {
+        // The guard added for finding 3 must only block moving the marker
+        // backwards, not recording a genuinely newer decline.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        record_declined_in(&root, 3);
+
+        let mut state = crate::downloader::tests::a_state();
+        state.version = 5;
+        state.phase = crate::downloader::Phase::Failed;
+        crate::downloader::write_state_in(&root, &state).expect("publish v5's failed state");
+
+        note_last_run_outcome_in(&root);
+
+        assert_eq!(read_declined_in(&root), Some(5));
+    }
+
+    #[test]
+    fn a_declined_offer_can_still_be_started_by_hand() {
+        // Fix A: the stated requirement is that a declined version stays
+        // reachable through `/model download`. Before the fix, the job file
+        // that command reads was written only inside `spawn_detached`, so a
+        // decline (or a non-TTY run, exercised below) left nothing for
+        // `start_from_manifest_in` to find and it answered "No model
+        // download is pending" forever.
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        let (called, spawn) = spy_spawn();
+        // `confirm` returns `Some(false)`: the user is asked and says no.
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            Some(false)
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a decline must not itself start the download"
+        );
+
+        let message = crate::downloader::start_from_manifest_in(&root);
+        assert_eq!(
+            message, "Downloading model manifest version 4 in the background.",
+            "a declined version must still be startable by hand: {message}"
+        );
+    }
+
+    #[test]
+    fn a_headless_offer_can_still_be_started_by_hand() {
+        // Fix A, the non-TTY half: `confirm` returning `None` (no controlling
+        // terminal) must not, by itself, leave the job unrecorded either.
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| None);
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a headless run must not itself start the download"
+        );
+
+        let message = crate::downloader::start_from_manifest_in(&root);
+        assert_eq!(
+            message, "Downloading model manifest version 4 in the background.",
+            "a headless offer must still be startable by hand: {message}"
+        );
+    }
+
+    /// A `State` for a finished job at `version`, in the given `phase`, with
+    /// `error` set the way [`crate::downloader::finish_cancel`] (private to
+    /// `downloader.rs`) would for a cancel of that kind.
+    fn finished_state(
+        version: u32,
+        phase: crate::downloader::Phase,
+        error: Option<&str>,
+    ) -> crate::downloader::State {
+        crate::downloader::State {
+            pid: std::process::id(),
+            version,
+            current: String::new(),
+            index: 0,
+            of: 1,
+            done_bytes: 0,
+            total_bytes: 0,
+            rate_bps: 0,
+            phase,
+            error: error.map(str::to_string),
+            updated: crate::downloader::now_epoch(),
+        }
+    }
+
+    #[test]
+    fn a_keep_cancelled_version_is_still_offered_next_run() {
+        // Fix C: `Cancel::Keep` means "stop now, resume later" — that is the
+        // entire point of offering it separately from `Delete`. So it must
+        // not be recorded as a decline, unlike a Delete cancel (next test).
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        crate::downloader::write_state_in(
+            &root,
+            &finished_state(4, crate::downloader::Phase::Cancelled, Some("keep")),
+        )
+        .expect("seed a Keep-cancelled state");
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            Some(true)
+        });
+        assert!(
+            called.load(Ordering::Relaxed),
+            "a Keep-cancelled version must still be offered on the next run"
+        );
+    }
+
+    #[test]
+    fn a_delete_cancelled_version_is_not_re_offered() {
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        crate::downloader::write_state_in(
+            &root,
+            &finished_state(4, crate::downloader::Phase::Cancelled, Some("delete")),
+        )
+        .expect("seed a Delete-cancelled state");
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            panic!("a Delete-cancelled version must not even reach the confirm prompt")
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a Delete-cancelled version must not be re-offered"
+        );
+    }
+
+    #[test]
+    fn an_adopt_writes_the_installed_manifest_and_spawns_nothing() {
+        // Adopt-on-first-sight: the artifact on disk already matches the
+        // remote manifest's size, so it is recorded as installed silently —
+        // no prompt, no spawn.
+        let root = crate::downloader::tests::tempdir();
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(
+            crate::manifest::local_path_for_in(&root, "main").expect("main path"),
+            vec![0u8; 100],
+        )
+        .expect("pre-existing model file");
+        let text = manifest_text(3, 100);
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
+            panic!("an adopt must not reach the confirm prompt")
+        });
+        assert!(!called.load(Ordering::Relaxed), "an adopt must not spawn");
+        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
+            .expect("installed manifest recorded");
+        assert_eq!(recorded.version, 3);
     }
 }

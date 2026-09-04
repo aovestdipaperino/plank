@@ -3815,6 +3815,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sha2",
  "similar",
  "stdext",
  "tokio",

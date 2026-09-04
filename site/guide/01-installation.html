@@ -207,6 +207,37 @@ is on by default, so it resolves to
 with the same prompt, resume and progress (<code>--dspark-off</code>
 skips it). See <a
 href="08-configuration.html#speculative-decoding">Configuration</a>.</p>
+<h2 id="staying-on-the-current-model">Staying on the current model</h2>
+<p>Once a model is installed, plank checks for a newer one at most once
+a day by fetching <code>ds4.manifest</code>, a small file that names
+the current main, vision and DSpark artifacts and a version number.
+When a newer version appears, plank asks first:
+<code>Download it in the background? [y/N]</code>, defaulting to no.
+Say yes and it starts in a detached background process rather than
+blocking the session: it keeps running even if you quit plank or close
+the terminal, so closing the laptop lid mid-transfer costs nothing but
+time. Say no (or just press Enter) and nothing downloads yet; run
+<code>/model download</code> whenever you are ready to start it. A dropped connection or a stopped
+helper leaves verified artifacts and partial files in
+<code>~/.plank/staging/</code>; nothing resumes it automatically, but
+accepting the next daily offer or running <code>/model download</code>
+picks up right where it left off, re-downloading only what wasn't
+finished. Only one such download runs per machine, whichever plank
+noticed the update first.</p>
+<p>While a download is live, a status segment shows its progress, for
+example <code>⇩ model 2/3 41% 12MB/s</code>. In the TUI, Alt-M opens a
+prompt to cancel it: keep the partial files (resume with
+<code>/model download</code>, or the next daily offer) or delete them
+outright. From either the TUI or
+the plain REPL, <code>/model</code> (or <code>/model status</code>)
+reports what is happening, <code>/model cancel</code> stops it (add
+<code>--delete</code> to also remove the partial files), and
+<code>/model download</code> starts one by hand.</p>
+<p>New artifacts are verified by SHA-256 as they stream in, but they are
+not installed the moment the download finishes — a running plank has
+the current model mapped into memory, so the swap happens at the next
+launch instead. Expect a fresh model to be in effect the next time you
+start plank, not mid-session.</p>
 <p>To use a model you already have somewhere else:</p>
 <pre class="sh"><code>plank -m ~/models/ds4flash.gguf</code></pre>
 <p>or set it permanently with <code>engine.model</code> in

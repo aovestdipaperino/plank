@@ -62,6 +62,14 @@ Things worth knowing before you start an 87 GB transfer:
 
 The DSpark draft checkpoint (~5.6 GB) follows the same path — DSpark is on by default, so it resolves to `~/.plank/ds4flash.dspark.gguf` and is offered for download with the same prompt, resume and progress (`--dspark-off` skips it). See [Configuration](08-configuration.md#speculative-decoding).
 
+## Staying on the current model
+
+Once a model is installed, plank checks for a newer one at most once a day by fetching `ds4.manifest`, a small file that names the current main, vision and DSpark artifacts and a version number. When a newer version appears, plank asks first: `Download it in the background? [y/N]`, defaulting to no. Say yes and it starts in a detached background process rather than blocking the session: it keeps running even if you quit plank or close the terminal, so closing the laptop lid mid-transfer costs nothing but time. Say no (or just press Enter) and nothing downloads yet; run `/model download` whenever you are ready to start it. A dropped connection or a stopped helper leaves verified artifacts and partial files in `~/.plank/staging/`; nothing resumes it automatically, but accepting the next daily offer or running `/model download` picks up right where it left off, re-downloading only what wasn't finished. Only one such download runs per machine, whichever plank noticed the update first.
+
+While a download is live, a status segment shows its progress, for example `⇩ model 2/3 41% 12MB/s`. In the TUI, Alt-M opens a prompt to cancel it: keep the partial files (resume with `/model download`, or the next daily offer) or delete them outright. From either the TUI or the plain REPL, `/model` (or `/model status`) reports what is happening, `/model cancel` stops it (add `--delete` to also remove the partial files), and `/model download` starts one by hand.
+
+New artifacts are verified by SHA-256 as they stream in, but they are not installed the moment the download finishes — a running plank has the current model mapped into memory, so the swap happens at the next launch instead. Expect a fresh model to be in effect the next time you start plank, not mid-session.
+
 To use a model you already have somewhere else:
 
 ```sh

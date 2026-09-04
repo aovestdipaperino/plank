@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Model upgrades are now driven by a versioned `ds4.manifest` covering all three artifacts (main, vision, DSpark), replacing the Hugging Face tree scan. Downloads run in a detached background process that survives quitting plank, resume across launches, are verified by SHA-256 while streaming, and install on the next launch. `/model` and Alt-M show and cancel them.
+
 ## [3.6.3] - 2026-09-04
 
 ### Fixed
