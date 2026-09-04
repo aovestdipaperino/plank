@@ -2133,7 +2133,9 @@ impl Agent<'_> {
         // and it recognizes any name of this shape.
         let id = self.isolation_seq;
         self.isolation_seq += 1;
-        let slug = crate::worktree::agent_slug(u64::from(std::process::id()) << 8 | u64::from(id));
+        // Shift by 32, not 8: the low 8 bits only allow 256 sub-agents before
+        // the seq wraps into the pid bits and collides with an earlier slug.
+        let slug = crate::worktree::agent_slug(u64::from(std::process::id()) << 32 | u64::from(id));
         let session = crate::worktree::create_agent_worktree(&self.tool_ctx.cwd, &slug)?;
         let outer_cwd = std::mem::replace(&mut self.tool_ctx.cwd, session.path.clone());
         Ok(Some(AgentIsolation {
@@ -3951,18 +3953,9 @@ impl Agent<'_> {
                         "{}",
                         crate::session::render_history(&s.transcript, 6, self.color)
                     );
-                    if let Some(note) = self.load_session_payload(&s) {
+                    if let Some(note) = self.reset_for_adopted_session(s) {
                         println!("{}", self.debug_line(&note));
                     }
-                    self.discard_ladder();
-                    self.session = s;
-                    crate::debugmirror::set_session_id(&self.session.id);
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
                 }
                 Err(e) => println!("switch failed: {e}"),
             },
@@ -3989,18 +3982,9 @@ impl Agent<'_> {
                         "{}",
                         crate::session::render_history(&s.transcript, 6, self.color)
                     );
-                    if let Some(note) = self.load_session_payload(&s) {
+                    if let Some(note) = self.reset_for_adopted_session(s) {
                         println!("{}", self.debug_line(&note));
                     }
-                    self.discard_ladder();
-                    self.session = s;
-                    crate::debugmirror::set_session_id(&self.session.id);
-                    self.broadcast_session_reset(Some(
-                        "[session replaced — its history is on the local screen only]",
-                    ));
-                    self.last_ctx_used = 0;
-                    self.checkpoints.clear();
-                    self.usage = SessionUsage::default();
                 }
                 Err(e) => println!("resume failed: {e}"),
             },
@@ -5146,6 +5130,24 @@ the original is frozen and listed in /tree"
     /// Shared by `/switch` and `/resume` (both the argument form and the
     /// picker), so the three cannot drift on what "replace the session" clears.
     fn adopt_session(&mut self, s: Session, log: &mut OutputLog, sub: &mut tui::SubPane) {
+        let note = self.reset_for_adopted_session(s);
+        // Same reason as `/clear`: the pane is the old session's.
+        sub.reset();
+        self.replay_history_into_log(log);
+        if let Some(note) = note {
+            log.push_dim(note);
+        }
+    }
+
+    /// Swaps in a loaded session and resets every piece of agent state scoped
+    /// to the old one. Returns the payload-restore note (if any) for the caller
+    /// to display in its own way.
+    ///
+    /// Both the plain-REPL and TUI `/switch`/`/resume` paths call this so they
+    /// cannot drift on what "replace the session" clears — `reminder`,
+    /// `payload_dirty`, `loop_guard`, `fork_kv` and `session_start` are all
+    /// reset here, matching what `session_start`'s doc comment claims.
+    fn reset_for_adopted_session(&mut self, s: Session) -> Option<String> {
         let note = self.load_session_payload(&s);
         self.discard_ladder();
         self.session = s;
@@ -5156,12 +5158,13 @@ the original is frozen and listed in /tree"
         self.last_ctx_used = 0;
         self.checkpoints.clear();
         self.usage = SessionUsage::default();
-        // Same reason as `/clear`: the pane is the old session's.
-        sub.reset();
-        self.replay_history_into_log(log);
-        if let Some(note) = note {
-            log.push_dim(note);
-        }
+        // State scoped to the old session's turn loop, not the new one's.
+        self.reminder = SystemPromptReminder::new();
+        self.payload_dirty = false;
+        self.loop_guard = crate::guard::LoopGuard::new();
+        self.fork_kv.clear();
+        self.session_start = std::time::Instant::now();
+        note
     }
 
     /// Every fingerprint this launch is using, across every engine it holds and
@@ -9553,6 +9556,14 @@ impl Agent<'_> {
                     };
                     if let Some((outcome, reason)) = settled {
                         self.goal = None;
+                        // Mark the durable goal as Done, mirroring the plain
+                        // path at `run_goal_loop`'s exit. Without this,
+                        // `active_goal()` keeps returning `Some` and the
+                        // settled objective is injected into later sub-agent
+                        // tasks and post-compaction re-injection.
+                        if let Some(g) = self.session.goal.as_mut() {
+                            g.status = crate::goal::GoalStatus::Done;
+                        }
                         // Mirrors the plain path's save at each
                         // `drive_goal_loop` exit: the adjudication exchange
                         // just pushed into `self.session` (or, on the
