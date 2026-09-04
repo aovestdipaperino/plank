@@ -282,13 +282,24 @@ impl AskState {
     }
 }
 
-/// Rows the question panel needs: a header/question line, a blank spacer, one
-/// row per option, and a key-hint line. Used by the TUI to size the panel so it
-/// never overlaps the status bar. Bounded because the option count is bounded.
+/// Rows the question panel needs: one row per line of the question (the first
+/// shares its row with the header chip), a blank spacer, one row per option,
+/// and a key-hint line. Used by the TUI to size the panel so it never overlaps
+/// the status bar. Bounded because both counts are bounded.
 #[must_use]
-pub fn panel_rows(options: usize) -> u16 {
-    let rows = 2 + options + 1;
+pub fn panel_rows(question_lines: usize, options: usize) -> u16 {
+    let rows = question_lines.max(1) + 1 + options + 1;
     u16::try_from(rows).unwrap_or(u16::MAX)
+}
+
+/// The question split into the lines the panel draws, one per `\n`.
+///
+/// A `\n` inside a Ratatui `Span` is a stray control character, not a break, so
+/// a multi-line question rendered as one span comes out as a single run-on
+/// line — which is what a plan handed to `ExitPlanMode` used to look like.
+#[must_use]
+pub fn question_lines(question: &str) -> Vec<&str> {
+    question.split('\n').collect()
 }
 
 /// Resolves a plain-REPL answer line against a request.
@@ -648,7 +659,19 @@ mod tests {
 
     #[test]
     fn panel_rows_scales_with_options() {
-        assert!(panel_rows(4) > panel_rows(2));
+        assert!(panel_rows(1, 4) > panel_rows(1, 2));
+    }
+
+    #[test]
+    fn panel_rows_makes_room_for_a_multi_line_question() {
+        // A question that wraps onto its own rows must grow the panel, or the
+        // extra rows are drawn under the status bar and lost.
+        assert_eq!(
+            panel_rows(question_lines("one\ntwo\nthree").len(), 2),
+            panel_rows(1, 2) + 2
+        );
+        // The empty question still gets its header row.
+        assert_eq!(panel_rows(question_lines("").len(), 2), panel_rows(1, 2));
     }
 
     #[test]

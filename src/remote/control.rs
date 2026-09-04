@@ -305,7 +305,10 @@ impl ServerMsg {
     #[must_use]
     pub fn from_event(ev: &UiEvent) -> Option<Self> {
         Some(match ev {
-            UiEvent::Visible(t) => Self::Visible { text: t.clone() },
+            // `Markdown` shares this arm deliberately: the wire has no document
+            // frame, and a plan is markdown meant to be read as such, so it goes
+            // down the one frame remote clients already render as markdown.
+            UiEvent::Visible(t) | UiEvent::Markdown(t) => Self::Visible { text: t.clone() },
             UiEvent::Think(t) => Self::Think { text: t.clone() },
             UiEvent::Tool(t) => Self::Tool { text: t.clone() },
             UiEvent::Error(t) => Self::Error { text: t.clone() },

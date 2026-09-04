@@ -127,6 +127,46 @@ fn line_text(line: &Line<'_>) -> String {
 /// entry, both in document order); if that pairing is unavailable it falls back
 /// to the rendered body rows with the `│ ` gutter stripped — which may include
 /// soft-wrap breaks, so it is a last resort only.
+/// Renders `src` as markdown, appends the rows to `lines`, and returns the
+/// code-block registry entries for what was appended.
+///
+/// `start` must be `lines.len()`: it is the index the appended rows begin at,
+/// which is what [`annotate_code_blocks`] scans from. Shared by the streaming
+/// re-render ([`OutputLog::md_render`]) and the one-shot
+/// [`OutputLog::push_markdown`], so a document pushed whole is styled exactly
+/// like one that arrived a token at a time.
+fn render_markdown_at(
+    lines: &mut Vec<Line<'static>>,
+    start: usize,
+    src: &str,
+) -> Vec<CodeBlockRegion> {
+    static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    let width = ratatui::crossterm::terminal::size()
+        .map_or(80, |(w, _)| w as usize)
+        .max(20);
+    let hl = HIGHLIGHTER
+        .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
+        .clone();
+    let md =
+        MarkdownRenderer::new(width).with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
+    let blocks = md.parse(src);
+    // The verbatim source of each top-level code block, in document order.
+    // Copying must use this, not the rendered rows: the renderer soft-wraps
+    // long lines to the width, and reading those wrapped rows back would
+    // turn every wrap point into a spurious newline. Blockquoted code blocks
+    // are excluded here just as they are skipped by `annotate_code_blocks`
+    // (their headers carry a gutter prefix), so the two lists stay aligned.
+    let raw_codes: Vec<&str> = blocks
+        .iter()
+        .filter_map(|b| match b {
+            MarkdownBlock::CodeBlock { code, .. } => Some(code.as_str()),
+            _ => None,
+        })
+        .collect();
+    lines.extend(md.render(&blocks, &ThemeConfig::new()));
+    annotate_code_blocks(lines, start, &raw_codes)
+}
+
 fn annotate_code_blocks(
     lines: &mut [Line<'static>],
     from: usize,
@@ -735,37 +775,15 @@ impl OutputLog {
 
     /// Re-renders the whole in-progress markdown segment in place.
     fn md_render(&mut self) {
-        static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
         let Some(start) = self.md_start else { return };
-        let width = ratatui::crossterm::terminal::size()
-            .map_or(80, |(w, _)| w as usize)
-            .max(20);
-        let hl = HIGHLIGHTER
-            .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
-            .clone();
-        let md = MarkdownRenderer::new(width)
-            .with_render_hooks(Box::new(HighlightHooks::new(hl, width)));
-        let blocks = md.parse(&self.md_buf);
-        // The verbatim source of each top-level code block, in document order.
-        // Copying must use this, not the rendered rows: the renderer soft-wraps
-        // long lines to the width, and reading those wrapped rows back would
-        // turn every wrap point into a spurious newline. Blockquoted code blocks
-        // are excluded here just as they are skipped by `annotate_code_blocks`
-        // (their headers carry a gutter prefix), so the two lists stay aligned.
-        let raw_codes: Vec<&str> = blocks
-            .iter()
-            .filter_map(|b| match b {
-                MarkdownBlock::CodeBlock { code, .. } => Some(code.as_str()),
-                _ => None,
-            })
-            .collect();
         self.lines.truncate(start);
-        self.lines.extend(md.render(&blocks, &ThemeConfig::new()));
+        let md_buf = std::mem::take(&mut self.md_buf);
+        let regions = render_markdown_at(&mut self.lines, start, &md_buf);
+        self.md_buf = md_buf;
         // Rebuild the code-block registry for the re-rendered segment; blocks
         // in committed earlier segments keep their (stable) indices.
         self.code_blocks.retain(|r| r.header < start);
-        self.code_blocks
-            .extend(annotate_code_blocks(&mut self.lines, start, &raw_codes));
+        self.code_blocks.extend(regions);
         self.last_md_render = Some(Instant::now());
         self.md_dirty = false;
         #[cfg(test)]
@@ -781,6 +799,30 @@ impl OutputLog {
             self.newline();
         }
         self.lines.push(Line::from(spans));
+    }
+
+    /// Appends a complete markdown document, rendered the same way streamed
+    /// assistant text is.
+    ///
+    /// For text a tool hands over whole rather than a token at a time — the
+    /// plan under `ExitPlanMode`. It is committed immediately, not left in the
+    /// streaming buffer, so a later segment cannot re-render or truncate it.
+    pub fn push_markdown(&mut self, src: &str) {
+        self.md_close();
+        self.end_line();
+        let start = self.lines.len();
+        let regions = render_markdown_at(&mut self.lines, start, src);
+        self.code_blocks.extend(regions);
+    }
+
+    /// Appends the echo of a submitted prompt, keeping the user's own line
+    /// breaks (see [`user_echo_lines`]).
+    pub fn push_user_echo(&mut self, text: &str) {
+        self.md_close();
+        if !self.current.is_empty() {
+            self.newline();
+        }
+        self.lines.extend(user_echo_lines(text));
     }
 
     /// Appends a plain system line.
@@ -1040,21 +1082,35 @@ fn apply_sgr(mut style: Style, params: &str) -> Style {
     style
 }
 
-/// Builds the styled user-echo line shown for a submitted prompt.
+/// Builds the styled user echo for a submitted prompt, one [`Line`] per line
+/// the user typed.
+///
+/// One line per input line rather than one span holding the whole prompt: a
+/// `\n` inside a [`Span`] is not a line break to Ratatui, it is a stray control
+/// character, so a multi-line prompt built that way is echoed back as a single
+/// run-on line.
+///
+/// Only the first line carries the red `*` bullet; the rest are indented two
+/// columns so the block hangs under it and reads as one prompt rather than as
+/// several. `\r\n` is folded to `\n` (bracketed paste from some terminals), and
+/// the empty prompt still yields a single bullet line so the echo never
+/// silently disappears.
 #[must_use]
-pub fn user_echo_spans(text: &str) -> Vec<Span<'static>> {
-    vec![
-        Span::styled(
-            "* ",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            text.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]
+pub fn user_echo_lines(text: &str) -> Vec<Line<'static>> {
+    let bullet = Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    let body = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    text.replace("\r\n", "\n")
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            Line::from(vec![
+                Span::styled(if i == 0 { "* " } else { "  " }, bullet),
+                Span::styled(line.to_string(), body),
+            ])
+        })
+        .collect()
 }
 
 /// A mouse selection over screen cells, in reading order: inclusive
@@ -3325,9 +3381,12 @@ pub fn draw_ask(
     tasks: &TaskView,
 ) {
     let area = frame.area();
-    let panel_rows = crate::tools::ask::panel_rows(req.options.len())
-        // Never let the panel eat the whole screen: leave at least one output row.
-        .min(area.height.saturating_sub(2));
+    let panel_rows = crate::tools::ask::panel_rows(
+        crate::tools::ask::question_lines(&req.question).len(),
+        req.options.len(),
+    )
+    // Never let the panel eat the whole screen: leave at least one output row.
+    .min(area.height.saturating_sub(2));
     let r = Layout::vertical([
         Constraint::Min(1),             // output
         Constraint::Length(panel_rows), // question panel
@@ -3363,20 +3422,34 @@ fn render_ask_panel(
     state: &crate::tools::ask::AskState,
 ) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!(" {} ", req.header),
-            Style::default()
-                .bg(THEME_GREEN)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            req.question.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    // The header chip rides on the first question line; the rest are indented
+    // to clear it, so a multi-line question reads as a block under the chip
+    // rather than being flattened into one run-on line.
+    let chip = format!(" {} ", req.header);
+    let indent = " ".repeat(chip.chars().count() + 2);
+    for (i, q) in crate::tools::ask::question_lines(&req.question)
+        .into_iter()
+        .enumerate()
+    {
+        let head = if i == 0 {
+            Span::styled(
+                chip.clone(),
+                Style::default()
+                    .bg(THEME_GREEN)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw(indent.clone())
+        };
+        let mut spans = vec![head];
+        if i == 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(q.to_string(), bold));
+        lines.push(Line::from(spans));
+    }
     lines.push(Line::raw(String::new()));
     for (i, opt) in req.options.iter().enumerate() {
         let is_cursor = i == state.cursor;
@@ -6132,8 +6205,56 @@ mod tests {
 
     #[test]
     fn user_echo_is_bold() {
-        let spans = user_echo_spans("hi");
-        assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+        let lines = user_echo_lines("hi");
+        assert!(
+            lines[0]
+                .spans
+                .iter()
+                .all(|s| s.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    /// Text of a line, gutter included.
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn user_echo_keeps_the_line_breaks_the_user_typed() {
+        // A `\n` inside one Span renders as a control character, not a break,
+        // so a multi-line prompt has to become several lines here or it is
+        // echoed back as one run-on line.
+        let lines = user_echo_lines("first\nsecond\n\nfourth");
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(text, ["* first", "  second", "  ", "  fourth"]);
+        assert!(lines.iter().all(|l| l.spans.len() == 2));
+    }
+
+    #[test]
+    fn user_echo_folds_crlf_and_never_vanishes() {
+        assert_eq!(
+            user_echo_lines("a\r\nb")
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            ["* a", "  b"]
+        );
+        // An empty prompt still leaves a bullet behind rather than nothing.
+        assert_eq!(
+            user_echo_lines("")
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>(),
+            ["* "]
+        );
+    }
+
+    #[test]
+    fn push_user_echo_lands_every_line_in_the_log() {
+        let mut log = OutputLog::default();
+        log.push_user_echo("one\ntwo");
+        let text: Vec<String> = log.lines.iter().map(line_text).collect();
+        assert_eq!(text, ["* one", "  two"]);
     }
 
     /// Row index of the input line (the prompt), found by its cyan prompt glyph.
@@ -6144,6 +6265,59 @@ mod tests {
             let cell = &buf[(0, y)];
             cell.symbol().starts_with(head) && cell.style().fg == Some(Color::Cyan)
         })
+    }
+
+    #[test]
+    fn ask_panel_keeps_a_multi_line_question_on_separate_rows() {
+        use crate::tools::ask::{AskOption, AskRequest, AskState};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let req = AskRequest {
+            question: "Approve?\nalpha line\nbeta line".to_string(),
+            header: "Plan".to_string(),
+            options: vec![AskOption {
+                label: "Approve".to_string(),
+                description: String::new(),
+            }],
+            multi: false,
+        };
+        let state = AskState::new(req.options.len(), req.multi);
+        let mut log = OutputLog::new();
+        let mut view = OutputView::default();
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| {
+            draw_ask(
+                f,
+                &log,
+                &req,
+                &state,
+                "idle",
+                &mut view,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        // Each question line gets its own row rather than being run together.
+        let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+        let (a, b, c) = (
+            row_of("Approve?").expect("first question line"),
+            row_of("alpha line").expect("second question line"),
+            row_of("beta line").expect("third question line"),
+        );
+        assert_eq!((b, c), (a + 1, a + 2));
+        // And the options are still on screen, not pushed off by the question.
+        assert!(row_of("> Approve").is_some_and(|r| r > c));
+        // Suppress the unused-mut warning on a log nothing writes to.
+        log.end_line();
     }
 
     #[test]
