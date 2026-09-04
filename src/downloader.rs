@@ -176,11 +176,17 @@ pub fn is_stale(state: &State, now: u64, alive: &dyn Fn(u32) -> bool) -> bool {
     now.saturating_sub(state.updated) > STALE_AFTER_SECS && !alive(state.pid)
 }
 
+/// The published state under `root`, if it is worth trusting.
+#[must_use]
+pub fn live_state_in(root: &Path) -> Option<State> {
+    let state = read_state_in(root)?;
+    (!is_stale(&state, now_epoch(), &pid_alive)).then_some(state)
+}
+
 /// The published state, if it is worth trusting.
 #[must_use]
 pub fn live_state() -> Option<State> {
-    let state = read_state()?;
-    (!is_stale(&state, now_epoch(), &pid_alive)).then_some(state)
+    live_state_in(&crate::manifest::plank_dir())
 }
 
 /// Asks the running helper to stop, under `root`.
@@ -976,6 +982,174 @@ pub fn segment_text(state: &State) -> String {
     }
 }
 
+/// A phase where work is still outstanding, and cancelling means something.
+fn in_flight(phase: Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Rehashing | Phase::Downloading | Phase::Verifying
+    )
+}
+
+/// Multi-line answer to `/model`, for both UI paths, reading state under `root`.
+#[must_use]
+pub fn status_report_in(root: &Path) -> String {
+    use std::fmt::Write as _;
+
+    let Some(state) = live_state_in(root) else {
+        return "No model download is running.".to_string();
+    };
+    let pct = state
+        .done_bytes
+        .saturating_mul(100)
+        .checked_div(state.total_bytes)
+        .unwrap_or(0)
+        .min(100);
+    let mut out = format!("Model download, manifest version {}:\n", state.version);
+    match state.phase {
+        Phase::Staged => {
+            out.push_str("  verified and staged; it installs the next time plank starts.\n");
+        }
+        Phase::Cancelled => out.push_str("  cancelled.\n"),
+        Phase::Failed => {
+            let why = state.error.as_deref().unwrap_or("unknown error");
+            let _ = writeln!(out, "  failed: {why}");
+        }
+        Phase::Rehashing => {
+            let _ = writeln!(
+                out,
+                "  {} ({}/{}): re-reading {:.1} GB to resume",
+                state.current,
+                state.index,
+                state.of,
+                crate::download::gb(state.done_bytes)
+            );
+        }
+        Phase::Verifying => {
+            let _ = writeln!(
+                out,
+                "  {} ({}/{}): verifying checksum",
+                state.current, state.index, state.of
+            );
+        }
+        Phase::Downloading => {
+            let _ = writeln!(
+                out,
+                "  {} ({}/{}): {:.1} of {:.1} GB, {pct}%, {} MB/s",
+                state.current,
+                state.index,
+                state.of,
+                crate::download::gb(state.done_bytes),
+                crate::download::gb(state.total_bytes),
+                state.rate_bps / 1_000_000
+            );
+        }
+    }
+    if in_flight(state.phase) {
+        out.push_str("  /model cancel [--delete] stops it (Alt-M in the TUI).");
+    }
+    out
+}
+
+/// Multi-line answer to `/model`, for both UI paths.
+#[must_use]
+pub fn status_report() -> String {
+    status_report_in(&crate::manifest::plank_dir())
+}
+
+/// The quit confirmation, when one is warranted, reading state under `root`.
+///
+/// The helper is a detached process, so quitting plank does not interrupt it.
+/// Saying it "will resume later" would be a promise about something that is
+/// not happening; the honest sentence is that the download continues without
+/// plank.
+#[must_use]
+pub fn quit_warning_in(root: &Path) -> Option<String> {
+    let state = live_state_in(root)?;
+    in_flight(state.phase).then(|| {
+        "A new model is still downloading. It will keep going in the background \
+         after you quit. Quit anyway? [Y/n] "
+            .to_string()
+    })
+}
+
+/// The quit confirmation, when one is warranted.
+#[must_use]
+pub fn quit_warning() -> Option<String> {
+    quit_warning_in(&crate::manifest::plank_dir())
+}
+
+/// The cancel confirmation, when there is something to cancel, reading state
+/// under `root`.
+#[must_use]
+pub fn cancel_prompt_in(root: &Path) -> Option<String> {
+    let state = live_state_in(root)?;
+    in_flight(state.phase).then(|| {
+        format!(
+            "Cancel the model download? {:.1} GB downloaded.\n\
+             [k] cancel, keep the partial files (the next launch resumes them)\n\
+             [d] cancel and delete them\n\
+             [Esc] keep downloading",
+            crate::download::gb(state.done_bytes)
+        )
+    })
+}
+
+/// The cancel confirmation, when there is something to cancel.
+#[must_use]
+pub fn cancel_prompt() -> Option<String> {
+    cancel_prompt_in(&crate::manifest::plank_dir())
+}
+
+/// Starts a download for the recorded job under `root`, for `/model download`.
+/// Returns the line to show the user.
+#[must_use]
+pub fn start_from_manifest_in(root: &Path) -> String {
+    if running_in(root) {
+        return "A model download is already running.".to_string();
+    }
+    let Some(manifest) = read_job_in(root) else {
+        return "No model download is pending. plank checks for one at startup, once a day."
+            .to_string();
+    };
+    match spawn_detached(&manifest) {
+        Ok(()) => format!(
+            "Downloading model manifest version {} in the background.",
+            manifest.version
+        ),
+        Err(e) => format!("Could not start the download: {e}"),
+    }
+}
+
+/// Starts a download for the recorded job, for `/model download`. Returns the
+/// line to show the user.
+#[must_use]
+pub fn start_from_manifest() -> String {
+    start_from_manifest_in(&crate::manifest::plank_dir())
+}
+
+/// Applies a `/model cancel` request against state under `root`. Returns the
+/// line to show the user.
+#[must_use]
+pub fn cancel_command_in(root: &Path, delete: bool) -> String {
+    if live_state_in(root).is_none_or(|s| !in_flight(s.phase)) {
+        return "No model download is running.".to_string();
+    }
+    let how = if delete { Cancel::Delete } else { Cancel::Keep };
+    match request_cancel_in(root, how) {
+        Ok(()) if delete => "Cancelling; the partial files will be deleted.".to_string(),
+        Ok(()) => {
+            "Cancelling; the partial files are kept and will resume on the next launch.".to_string()
+        }
+        Err(e) => format!("Could not signal the downloader: {e}"),
+    }
+}
+
+/// Applies a `/model cancel` request. Returns the line to show the user.
+#[must_use]
+pub fn cancel_command(delete: bool) -> String {
+    cancel_command_in(&crate::manifest::plank_dir(), delete)
+}
+
 /// Starts the thread that mirrors the helper's state file into the status bar.
 ///
 /// A thread rather than a check inside the render path: the state file is
@@ -1638,5 +1812,135 @@ mod tests {
                 .version,
             3
         );
+    }
+
+    #[test]
+    fn status_report_says_so_when_nothing_is_downloading() {
+        let dir = tempdir();
+        assert_eq!(status_report_in(&dir), "No model download is running.");
+    }
+
+    #[test]
+    fn status_report_describes_a_live_download() {
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        st.done_bytes = 41;
+        st.total_bytes = 100;
+        write_state_in(&dir, &st).expect("publish");
+        let text = status_report_in(&dir);
+        assert!(text.contains("version 3"), "{text:?}");
+        assert!(text.contains("main"), "{text:?}");
+        assert!(text.contains("41%"), "{text:?}");
+    }
+
+    #[test]
+    fn status_report_surfaces_a_failure_reason() {
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        st.phase = Phase::Failed;
+        st.error = Some("checksum mismatch".to_string());
+        write_state_in(&dir, &st).expect("publish");
+        assert!(status_report_in(&dir).contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn quit_warning_is_absent_with_no_download() {
+        let dir = tempdir();
+        assert!(quit_warning_in(&dir).is_none());
+    }
+
+    #[test]
+    fn quit_warning_says_the_download_keeps_going() {
+        // The detached helper survives quit, so the prompt must say so rather than
+        // promise a resume that is not what happens.
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        write_state_in(&dir, &st).expect("publish");
+        let text = quit_warning_in(&dir).expect("a warning");
+        assert!(text.contains("keep going in the background"), "{text:?}");
+        assert!(text.contains("Quit anyway?"), "{text:?}");
+    }
+
+    #[test]
+    fn a_finished_download_raises_no_quit_warning() {
+        let dir = tempdir();
+        for phase in [Phase::Staged, Phase::Failed, Phase::Cancelled] {
+            let mut st = a_state();
+            st.pid = std::process::id();
+            st.updated = now_epoch();
+            st.phase = phase;
+            write_state_in(&dir, &st).expect("publish");
+            assert!(quit_warning_in(&dir).is_none(), "{phase:?} should not warn");
+        }
+    }
+
+    #[test]
+    fn cancel_prompt_reports_how_much_would_be_thrown_away() {
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        st.done_bytes = 36_200_000_000;
+        write_state_in(&dir, &st).expect("publish");
+        let text = cancel_prompt_in(&dir).expect("a prompt");
+        assert!(text.contains("36.2 GB"), "{text:?}");
+    }
+
+    #[test]
+    fn cancel_prompt_absent_when_nothing_running() {
+        let dir = tempdir();
+        assert!(cancel_prompt_in(&dir).is_none());
+    }
+
+    #[test]
+    fn start_from_manifest_reports_nothing_pending() {
+        let dir = tempdir();
+        assert_eq!(
+            start_from_manifest_in(&dir),
+            "No model download is pending. plank checks for one at startup, once a day."
+        );
+    }
+
+    #[test]
+    fn cancel_command_reports_nothing_running() {
+        let dir = tempdir();
+        assert_eq!(
+            cancel_command_in(&dir, false),
+            "No model download is running."
+        );
+    }
+
+    #[test]
+    fn cancel_command_signals_keep() {
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        write_state_in(&dir, &st).expect("publish");
+        assert_eq!(
+            cancel_command_in(&dir, false),
+            "Cancelling; the partial files are kept and will resume on the next launch."
+        );
+        assert_eq!(read_cancel_in(&dir), Some(Cancel::Keep));
+    }
+
+    #[test]
+    fn cancel_command_signals_delete() {
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        write_state_in(&dir, &st).expect("publish");
+        assert_eq!(
+            cancel_command_in(&dir, true),
+            "Cancelling; the partial files will be deleted."
+        );
+        assert_eq!(read_cancel_in(&dir), Some(Cancel::Delete));
     }
 }

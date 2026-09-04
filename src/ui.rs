@@ -4091,6 +4091,7 @@ impl Agent<'_> {
                 }
             }
             "/kvcache" => println!("{}", self.kvcache_text_command(arg)),
+            "/model" => println!("{}", Self::model_text_command(arg)),
             "/config" => {
                 if arg == "--resolved" {
                     print!(
@@ -5052,6 +5053,20 @@ the original is frozen and listed in /tree"
             other => {
                 format!("usage: /kvcache [gc|pin <fp>|unpin <fp>|rm <fp>] (got {other:?})")
             }
+        }
+    }
+
+    /// Static-text `/model`, for the plain-stdout REPL.
+    ///
+    /// The TUI's Alt-M popup has no equivalent on a piped stdout, so per
+    /// `CLAUDE.md` every pane-driven command needs this text form.
+    fn model_text_command(arg: &str) -> String {
+        match arg.split_whitespace().collect::<Vec<_>>().as_slice() {
+            [] | ["status"] => crate::downloader::status_report(),
+            ["cancel"] => crate::downloader::cancel_command(false),
+            ["cancel", "--delete"] => crate::downloader::cancel_command(true),
+            ["download"] => crate::downloader::start_from_manifest(),
+            _ => "usage: /model [status] | /model cancel [--delete] | /model download".to_string(),
         }
     }
 
@@ -8661,6 +8676,15 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('d') if ctrl => {
                     if input.buf.text().is_empty() {
+                        // A live background download is worth one line before
+                        // quitting, so nobody closes the terminal wondering
+                        // whether they just threw away 40 GB.
+                        if let Some(warning) = crate::downloader::quit_warning() {
+                            log.push_dim(warning);
+                            if !await_yes_default()? {
+                                continue;
+                            }
+                        }
                         break;
                     }
                     input.buf.delete();
@@ -8698,6 +8722,24 @@ impl Agent<'_> {
                 }
                 KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
                     input.buf.move_next_word();
+                }
+                // Alt-M: the background model download's one on-screen control.
+                // A modifier chord rather than a bare key because the input line
+                // owns every unmodified character, and Alt-m is unbound.
+                KeyCode::Char('m') if key.modifiers.contains(KeyModifiers::ALT) => {
+                    let Some(prompt) = crate::downloader::cancel_prompt() else {
+                        log.push_dim("No model download is running.");
+                        continue;
+                    };
+                    for line in prompt.lines() {
+                        log.push_dim(line.to_string());
+                    }
+                    match await_cancel_choice()? {
+                        Some(delete) => {
+                            log.push_dim(crate::downloader::cancel_command(delete));
+                        }
+                        None => log.push_dim("Still downloading."),
+                    }
                 }
                 KeyCode::Left if word_mod => {
                     input.buf.move_prev_word();
@@ -11091,6 +11133,9 @@ impl Agent<'_> {
                     }
                 }
             }
+            "/model" => {
+                log.push_dim(Self::model_text_command(arg));
+            }
             "/skills" => {
                 for line in crate::skills::render_list(&self.skills).lines() {
                     log.push_plain(line.to_owned());
@@ -11675,6 +11720,47 @@ fn with_tui_suspended<T>(terminal: &mut ratatui::DefaultTerminal, f: impl FnOnce
     };
     let _ = terminal.clear();
     out
+}
+
+/// Blocks for the one keystroke that answers the Alt-M cancel prompt.
+///
+/// A free function at module scope, not a method: it needs nothing from
+/// `Agent`, and the call site inside the key match reads better without a
+/// `Self::` prefix.
+///
+/// `Some(true)` deletes the partial files, `Some(false)` keeps them, `None`
+/// leaves the download alone. Anything unrecognized is `None`: a stray
+/// keystroke must never be read as "delete 36 GB".
+fn await_cancel_choice() -> Result<Option<bool>, String> {
+    loop {
+        match ratatui::crossterm::event::read().map_err(|e| e.to_string())? {
+            ratatui::crossterm::event::Event::Key(key)
+                if key.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                return Ok(match key.code {
+                    KeyCode::Char('k' | 'K') => Some(false),
+                    KeyCode::Char('d' | 'D') => Some(true),
+                    _ => None,
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Blocks for a `[Y/n]` answer, where Enter means yes. A free function for the
+/// same reason as [`await_cancel_choice`].
+fn await_yes_default() -> Result<bool, String> {
+    loop {
+        match ratatui::crossterm::event::read().map_err(|e| e.to_string())? {
+            ratatui::crossterm::event::Event::Key(key)
+                if key.kind == ratatui::crossterm::event::KeyEventKind::Press =>
+            {
+                return Ok(!matches!(key.code, KeyCode::Char('n' | 'N') | KeyCode::Esc));
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Pre-rendered output for the read-only slash commands that stay usable while

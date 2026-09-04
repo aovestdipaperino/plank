@@ -1050,8 +1050,10 @@ fn content_length(url: &str) -> Option<u64> {
         .ok()
 }
 
+/// Bytes as gigabytes, shared with `downloader`'s user-facing text so the two
+/// modules never format the same quantity two different ways.
 #[allow(clippy::cast_precision_loss)]
-fn gb(bytes: u64) -> f64 {
+pub(crate) fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
 }
 

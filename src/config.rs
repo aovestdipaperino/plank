@@ -849,6 +849,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "show the KV cache tree; pin, delete or sweep entries",
     },
     SlashCommand {
+        name: "/model",
+        args: "[status|cancel|download]",
+        desc: "background model download: status, cancel, download",
+    },
+    SlashCommand {
         name: "/export",
         args: "[md|html] [path]",
         desc: "write the transcript to a shareable file",
@@ -994,6 +999,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || slash_command_with_args(cmd, "/del")
         || slash_command_with_args(cmd, "/strip")
         || slash_command_with_args(cmd, "/kvcache")
+        || slash_command_with_args(cmd, "/model")
         || slash_command_with_args(cmd, "/history")
         || slash_command_with_args(cmd, "/checkpoint")
         || slash_command_with_args(cmd, "/rollback")
