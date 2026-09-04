@@ -84,6 +84,19 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     if wire.version == 0 {
         return Err("bad manifest: version 0 is reserved".to_string());
     }
+    for (kind, entry) in &wire.files {
+        if !is_sha256_hex(&entry.sha256) {
+            return Err(format!(
+                "bad manifest: {kind}.sha256 is not 64 lowercase hex characters"
+            ));
+        }
+        if entry.bytes == 0 {
+            return Err(format!("bad manifest: {kind}.bytes must not be 0"));
+        }
+        if !entry.url.starts_with("https://") {
+            return Err(format!("bad manifest: {kind}.url must start with https://"));
+        }
+    }
     Ok(Manifest {
         version: wire.version,
         released: wire.released,
@@ -91,6 +104,14 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         files: wire.files,
         raw: text.to_string(),
     })
+}
+
+/// Whether `s` is exactly 64 lowercase hex characters — a well-formed
+/// SHA-256 digest.
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `~/.plank`, or `./.plank` when `HOME` is unset.
@@ -257,23 +278,32 @@ pub fn decide(
 mod tests {
     use super::*;
 
+    /// 64 lowercase hex characters, distinguishable by their leading digit so
+    /// tests can tell entries apart at a glance.
+    const SHA_MAIN: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const SHA_VISION: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    const SHA_DSPARK: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+    const SHA_OTHER: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
     /// A complete, well-formed manifest, used by most tests here.
-    fn sample() -> &'static str {
-        r#"{
+    fn sample() -> String {
+        format!(
+            r#"{{
           "version": 3,
           "released": "2026-09-04",
           "notes": "Vision-Exp refresh",
-          "files": {
-            "main":   { "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 100, "sha256": "aa" },
-            "vision": { "name": "v.gguf", "url": "https://example.invalid/v", "bytes": 200, "sha256": "bb" },
-            "dspark": { "name": "d.gguf", "url": "https://example.invalid/d", "bytes": 300, "sha256": "cc" }
-          }
-        }"#
+          "files": {{
+            "main":   {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 100, "sha256": "{SHA_MAIN}" }},
+            "vision": {{ "name": "v.gguf", "url": "https://example.invalid/v", "bytes": 200, "sha256": "{SHA_VISION}" }},
+            "dspark": {{ "name": "d.gguf", "url": "https://example.invalid/d", "bytes": 300, "sha256": "{SHA_DSPARK}" }}
+          }}
+        }}"#
+        )
     }
 
     #[test]
     fn parses_every_field() {
-        let m = parse(sample()).expect("sample parses");
+        let m = parse(&sample()).expect("sample parses");
         assert_eq!(m.version, 3);
         assert_eq!(m.released, "2026-09-04");
         assert_eq!(m.notes, "Vision-Exp refresh");
@@ -282,7 +312,7 @@ mod tests {
         assert_eq!(main.name, "m.gguf");
         assert_eq!(main.url, "https://example.invalid/m");
         assert_eq!(main.bytes, 100);
-        assert_eq!(main.sha256, "aa");
+        assert_eq!(main.sha256, SHA_MAIN);
     }
 
     #[test]
@@ -290,7 +320,7 @@ mod tests {
         // The installed manifest is written by copying `raw`, never by
         // re-serializing: a round trip through serde would silently drop any
         // field this build does not know about.
-        let m = parse(sample()).expect("sample parses");
+        let m = parse(&sample()).expect("sample parses");
         assert_eq!(m.raw, sample());
     }
 
@@ -298,7 +328,12 @@ mod tests {
     fn an_unknown_file_kind_is_ignored_not_an_error() {
         // The manifest must be able to grow a fourth artifact before the
         // client reading it knows what that artifact is.
-        let text = sample().replace(r#""dspark":"#, r#""futureproof": { "name": "f.gguf", "url": "u", "bytes": 1, "sha256": "dd" }, "dspark":"#);
+        let text = sample().replace(
+            r#""dspark":"#,
+            &format!(
+                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 1, "sha256": "{SHA_OTHER}" }}, "dspark":"#
+            ),
+        );
         let m = parse(&text).expect("unknown kind parses");
         assert_eq!(m.files.len(), 4);
         assert!(m.files.contains_key("futureproof"));
@@ -308,10 +343,12 @@ mod tests {
     fn a_missing_dspark_entry_parses() {
         // Not every release has to ship all three. Absence is a fact for
         // `decide` (Task 2) to act on, not a parse failure.
-        let text = r#"{"version":1,"released":"x","notes":"","files":{
-            "main": { "name": "m.gguf", "url": "u", "bytes": 1, "sha256": "aa" }
-        }}"#;
-        let m = parse(text).expect("partial manifest parses");
+        let text = format!(
+            r#"{{"version":1,"released":"x","notes":"","files":{{
+            "main": {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 1, "sha256": "{SHA_MAIN}" }}
+        }}}}"#
+        );
+        let m = parse(&text).expect("partial manifest parses");
         assert!(m.files.contains_key("main"));
         assert!(!m.files.contains_key("dspark"));
     }
@@ -382,8 +419,8 @@ mod tests {
 
     #[test]
     fn same_version_is_up_to_date() {
-        let remote = parse(sample()).expect("parses");
-        let installed = parse(sample()).expect("parses");
+        let remote = parse(&sample()).expect("parses");
+        let installed = parse(&sample()).expect("parses");
         assert!(matches!(
             decide(remote, Some(&installed), &all_present),
             Decision::UpToDate
@@ -393,7 +430,7 @@ mod tests {
     #[test]
     fn a_newer_remote_is_offered() {
         let remote = parse(&sample_at(4)).expect("parses");
-        let installed = parse(sample()).expect("parses");
+        let installed = parse(&sample()).expect("parses");
         match decide(remote, Some(&installed), &all_present) {
             Decision::Offer { manifest, from } => {
                 assert_eq!(manifest.version, 4);
@@ -407,7 +444,7 @@ mod tests {
     fn an_older_remote_is_ignored() {
         // A rolled-back manifest must never trigger a downgrade download.
         let remote = parse(&sample_at(2)).expect("parses");
-        let installed = parse(sample()).expect("parses");
+        let installed = parse(&sample()).expect("parses");
         assert!(matches!(
             decide(remote, Some(&installed), &all_present),
             Decision::UpToDate
@@ -418,7 +455,7 @@ mod tests {
     fn no_installed_manifest_but_matching_sizes_adopts_silently() {
         // Adopt-on-first-sight. Without this rule, every existing user is offered
         // an 87 GB re-download the day this ships.
-        let remote = parse(sample()).expect("parses");
+        let remote = parse(&sample()).expect("parses");
         match decide(remote, None, &all_present) {
             Decision::Adopt(m) => assert_eq!(m.version, 3),
             other => panic!("expected adoption, got {other:?}"),
@@ -427,7 +464,7 @@ mod tests {
 
     #[test]
     fn no_installed_manifest_and_a_wrong_size_offers() {
-        let remote = parse(sample()).expect("parses");
+        let remote = parse(&sample()).expect("parses");
         let sizes = |kind: &str| {
             if kind == "vision" {
                 Some(999)
@@ -443,7 +480,7 @@ mod tests {
 
     #[test]
     fn no_installed_manifest_and_a_missing_file_offers() {
-        let remote = parse(sample()).expect("parses");
+        let remote = parse(&sample()).expect("parses");
         let sizes = |kind: &str| {
             if kind == "dspark" {
                 None
@@ -460,10 +497,12 @@ mod tests {
     #[test]
     fn adoption_only_considers_kinds_the_manifest_actually_lists() {
         // A manifest with no dspark entry must not demand a dspark file on disk.
-        let text = r#"{"version":1,"released":"x","notes":"","files":{
-            "main": { "name": "m.gguf", "url": "u", "bytes": 100, "sha256": "aa" }
-        }}"#;
-        let remote = parse(text).expect("parses");
+        let text = format!(
+            r#"{{"version":1,"released":"x","notes":"","files":{{
+            "main": {{ "name": "m.gguf", "url": "https://example.invalid/m", "bytes": 100, "sha256": "{SHA_MAIN}" }}
+        }}}}"#
+        );
+        let remote = parse(&text).expect("parses");
         let sizes = |kind: &str| (kind == "main").then_some(100);
         assert!(matches!(decide(remote, None, &sizes), Decision::Adopt(_)));
     }
@@ -474,7 +513,9 @@ mod tests {
         // must not block adoption or the size check.
         let text = sample().replace(
             r#""dspark":"#,
-            r#""futureproof": { "name": "f.gguf", "url": "u", "bytes": 7, "sha256": "dd" }, "dspark":"#,
+            &format!(
+                r#""futureproof": {{ "name": "f.gguf", "url": "https://example.invalid/f", "bytes": 7, "sha256": "{SHA_OTHER}" }}, "dspark":"#
+            ),
         );
         let remote = parse(&text).expect("parses");
         assert!(matches!(
@@ -495,5 +536,46 @@ mod tests {
             Decision::Offer { from, .. } => assert_eq!(from, 0),
             other => panic!("expected an offer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_sha256_that_is_not_64_hex_characters_is_rejected() {
+        for bad in ["aa", "", &"a".repeat(63), &"a".repeat(65), &"g".repeat(64)] {
+            let text = sample().replace(SHA_MAIN, bad);
+            assert!(parse(&text).is_err(), "{bad:?} should not pass as a sha256");
+        }
+    }
+
+    #[test]
+    fn an_uppercase_sha256_is_rejected() {
+        // Only lowercase hex — a typo'd or mixed-case digest must not slip
+        // through and cost a full download before the mismatch is caught.
+        let mixed_case = "aB".repeat(32);
+        let text = sample().replace(SHA_MAIN, &mixed_case);
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn zero_bytes_is_rejected() {
+        let text = sample().replace(r#""bytes": 100"#, r#""bytes": 0"#);
+        assert!(parse(&text).is_err());
+    }
+
+    #[test]
+    fn a_non_https_url_is_rejected() {
+        for scheme in ["http://example.invalid/m", "file:///etc/passwd", "ftp://x"] {
+            let text = sample().replace("https://example.invalid/m", scheme);
+            assert!(
+                parse(&text).is_err(),
+                "{scheme:?} must not be accepted as a manifest url"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_entry_still_parses() {
+        // The validation above must not be so strict it rejects the sample
+        // fixture itself.
+        assert!(parse(&sample()).is_ok());
     }
 }
