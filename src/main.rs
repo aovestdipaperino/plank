@@ -486,7 +486,7 @@ fn make_local_engine(cfg: &AgentConfig) -> Result<Box<dyn Engine>, String> {
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup();
+        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
@@ -722,7 +722,7 @@ fn make_host(cfg: &AgentConfig) -> Result<plank::host::EngineHost, String> {
         // whether to start a new background download. Must precede
         // `ensure_model`, so a staged upgrade is in place before the engine
         // maps the file. Never fatal.
-        plank::download::check_manifest_at_startup();
+        plank::download::check_manifest_at_startup(cfg.model_path.as_deref());
         // Mirrors the background downloader's state into the status bar. Cheap
         // and idempotent: it does nothing at all when no download is running.
         plank::downloader::spawn_watcher();
