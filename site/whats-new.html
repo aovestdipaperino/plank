@@ -138,6 +138,9 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
+<p><strong>v3.6.0 is out</strong>, and the beta channel is on 3.6.2. The
+patch number is still the channel: <code>.0</code> is stable, anything
+above it is beta.</p>
 <p><strong>Plank can see. Paste a screenshot and ask what
 broke.</strong> Vision has been in the box for a while, but it never
 actually worked: four separate faults in the image path sat on top of
@@ -168,17 +171,17 @@ crop to the part that matters when you want small text read, and reach
 for <a href="https://github.com/aovestdipaperino/ocr-mcp">ocr-mcp</a>
 when you want a dense page transcribed rather than described.</p>
 <p><strong>A whole-codebase review, and the fixes that came out of it,
-are on main and ship in the next release.</strong> The one you will feel
-first is that the sandbox now means what it says: <code>write</code> and
-<code>edit</code> are held to the same boundary as the shell, so a path
-outside the working directory, the temp roots and your
-<code>writablePaths</code> is refused with
-<code>Tool error: write path escapes workspace</code>, where before the
-model could route around the bash sandbox simply by choosing the file
-tool instead. A project's <code>.plank/sandbox.json</code> can now only
-tighten the policy, so a cloned repository cannot switch your sandbox
-off. <code>plank serve</code> got the same treatment: binding off
-loopback with no token now refuses to start unless you pass
+shipped in v3.6.0.</strong> The one you will feel first is that the
+sandbox now means what it says: <code>write</code> and <code>edit</code>
+are held to the same boundary as the shell, so a path outside the
+working directory, the temp roots and your <code>writablePaths</code> is
+refused with <code>Tool error: write path escapes workspace</code>,
+where before the model could route around the bash sandbox simply by
+choosing the file tool instead. A project's
+<code>.plank/sandbox.json</code> can now only tighten the policy, so a
+cloned repository cannot switch your sandbox off.
+<code>plank serve</code> got the same treatment: binding off loopback
+with no token now refuses to start unless you pass
 <code>--insecure</code> on the server side, bodies are capped at 16 MiB,
 idle connections time out, and shared-engine sessions are keyed per
 client so many turns from one laptop reuse one warm session. Underneath,

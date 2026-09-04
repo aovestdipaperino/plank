@@ -7,6 +7,9 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
+**v3.6.0 is out**, and the beta channel is on 3.6.2. The patch number is still
+the channel: `.0` is stable, anything above it is beta.
+
 **Plank can see. Paste a screenshot and ask what broke.** Vision has been in
 the box for a while, but it never actually worked: four separate faults in the
 image path sat on top of each other, and between them they either crashed the
@@ -36,8 +39,8 @@ tokens, so crop to the part that matters when you want small text read, and
 reach for [ocr-mcp](https://github.com/aovestdipaperino/ocr-mcp) when you want a
 dense page transcribed rather than described.
 
-**A whole-codebase review, and the fixes that came out of it, are on main
-and ship in the next release.** The one you will feel first is that the
+**A whole-codebase review, and the fixes that came out of it, shipped in
+v3.6.0.** The one you will feel first is that the
 sandbox now means what it says: `write` and `edit` are held to the same
 boundary as the shell, so a path outside the working directory, the temp
 roots and your `writablePaths` is refused with `Tool error: write path
