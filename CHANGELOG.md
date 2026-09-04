@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-09-04
+
 ### Changed
 
 - **The prompt's phase cursor is drawn into the frame instead of sent as an
