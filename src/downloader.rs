@@ -34,6 +34,19 @@ pub enum Phase {
     Failed,
     /// Stopped on request.
     Cancelled,
+    /// A phase name this build does not recognize.
+    ///
+    /// Two plank versions can share one `~/.plank`, and plank self-updates:
+    /// without this, an older plank reading a newer helper's state file (one
+    /// naming a phase it predates) would fail to deserialize the whole
+    /// `State`, `read_state` would return `None`, and `/model cancel` would
+    /// wrongly say nothing is running — with no way to stop a 93 GB download
+    /// in flight. Treated as "something may be running": not in-flight for
+    /// [`quit_warning`] (nothing concrete to warn about), but a cancel is
+    /// still allowed through, on the theory that a cancel request left
+    /// sitting for a helper that turns out not to be running is harmless.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The helper's published progress.
@@ -68,7 +81,9 @@ pub struct State {
 pub enum Cancel {
     /// Leave the `.part` files; the next launch resumes them.
     Keep,
-    /// Delete the `.part` files and the staging directory.
+    /// Delete the `.part` files only. Verified, staged `<kind>.gguf` artifacts
+    /// are left alone: they are hash-proven, cost nothing to keep, and will
+    /// be installed at the next launch.
     Delete,
 }
 
@@ -610,14 +625,12 @@ fn finish_cancel(
     jobs: &[(&str, &crate::manifest::FileEntry)],
 ) -> Outcome {
     if how == Cancel::Delete {
+        // Only `.part` files: a verified, staged `<kind>.gguf` is hash-proven
+        // and will be installed at the next launch, so deleting it here would
+        // throw away tens of gigabytes of already-good data for nothing.
         for (kind, _) in jobs {
             let _ = std::fs::remove_file(part_path_in(root, kind));
-            let _ = std::fs::remove_file(staged_path_in(root, kind));
         }
-        let _ = std::fs::remove_file(crate::manifest::staging_dir_in(root).join("ds4.manifest"));
-        // Only if it is now empty: a directory with anything else in it is not
-        // ours to remove.
-        let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root));
     }
     clear_cancel_in(root);
     publish(
@@ -965,6 +978,7 @@ pub fn segment_text(state: &State) -> String {
     match state.phase {
         Phase::Staged => "⇩ model ready on restart".to_string(),
         Phase::Cancelled => "⇩ model cancelled".to_string(),
+        Phase::Unknown => "⇩ model".to_string(),
         Phase::Failed => "⇩ model failed".to_string(),
         Phase::Rehashing => format!("⇩ model {pos} resuming"),
         Phase::Verifying => format!("⇩ model {pos} verifying"),
@@ -1010,6 +1024,11 @@ pub fn status_report_in(root: &Path) -> String {
             out.push_str("  verified and staged; it installs the next time plank starts.\n");
         }
         Phase::Cancelled => out.push_str("  cancelled.\n"),
+        Phase::Unknown => {
+            out.push_str(
+                "  unrecognized phase (from a newer plank); a download may still be running.\n",
+            );
+        }
         Phase::Failed => {
             let why = state.error.as_deref().unwrap_or("unknown error");
             let _ = writeln!(out, "  failed: {why}");
@@ -1078,6 +1097,22 @@ pub fn quit_warning() -> Option<String> {
     quit_warning_in(&crate::manifest::plank_dir())
 }
 
+/// Total bytes currently sitting in `.part` files under `root`'s staging
+/// directory — the amount `Cancel::Delete` would actually throw away.
+///
+/// Deliberately not `state.done_bytes`: that field is the *current* artifact's
+/// progress only, so on a job's second or third file it would understate what
+/// is on disk. It also never counts a verified `<kind>.gguf`, since `Delete`
+/// leaves those alone.
+#[must_use]
+fn part_bytes_on_disk(root: &Path) -> u64 {
+    crate::manifest::KINDS
+        .iter()
+        .filter_map(|kind| std::fs::metadata(part_path_in(root, kind)).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// The cancel confirmation, when there is something to cancel, reading state
 /// under `root`.
 #[must_use]
@@ -1085,11 +1120,11 @@ pub fn cancel_prompt_in(root: &Path) -> Option<String> {
     let state = live_state_in(root)?;
     in_flight(state.phase).then(|| {
         format!(
-            "Cancel the model download? {:.1} GB downloaded.\n\
+            "Cancel the model download? {:.1} GB on disk in partial files.\n\
              [k] cancel, keep the partial files (the next launch resumes them)\n\
-             [d] cancel and delete them\n\
+             [d] cancel and delete the partial files (verified artifacts are kept)\n\
              [Esc] keep downloading",
-            crate::download::gb(state.done_bytes)
+            crate::download::gb(part_bytes_on_disk(root))
         )
     })
 }
@@ -1131,12 +1166,18 @@ pub fn start_from_manifest() -> String {
 /// line to show the user.
 #[must_use]
 pub fn cancel_command_in(root: &Path, delete: bool) -> String {
-    if live_state_in(root).is_none_or(|s| !in_flight(s.phase)) {
+    // `Unknown` is a phase this build does not recognize (from a newer
+    // plank sharing the same `~/.plank`). The safe reading is "something may
+    // be running", so a cancel is let through rather than refused.
+    if live_state_in(root).is_none_or(|s| !in_flight(s.phase) && s.phase != Phase::Unknown) {
         return "No model download is running.".to_string();
     }
     let how = if delete { Cancel::Delete } else { Cancel::Keep };
     match request_cancel_in(root, how) {
-        Ok(()) if delete => "Cancelling; the partial files will be deleted.".to_string(),
+        Ok(()) if delete => {
+            "Cancelling; the partial files will be deleted (verified artifacts are kept)."
+                .to_string()
+        }
         Ok(()) => {
             "Cancelling; the partial files are kept and will resume on the next launch.".to_string()
         }
@@ -1173,7 +1214,7 @@ pub fn spawn_watcher() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn a_state() -> State {
@@ -1256,6 +1297,50 @@ mod tests {
             let back: Phase = serde_json::from_str(&json).expect("deserializes");
             assert_eq!(back, phase);
         }
+    }
+
+    #[test]
+    fn an_unrecognized_phase_falls_back_to_unknown_instead_of_failing_the_whole_state() {
+        // Finding 7: two plank versions can share one ~/.plank. An older
+        // plank reading a newer helper's state file naming a phase it
+        // predates must not fail to deserialize the whole `State` — that
+        // would make `read_state` return `None`, and `/model cancel` would
+        // then wrongly say nothing is running.
+        let dir = tempdir();
+        let mut st = a_state();
+        st.pid = std::process::id();
+        st.updated = now_epoch();
+        let mut value = serde_json::to_value(&st).expect("serializes to a value");
+        value["phase"] = serde_json::Value::String("some-future-phase".to_string());
+        std::fs::create_dir_all(state_path_in(&dir).parent().expect("parent"))
+            .expect("downloads dir");
+        std::fs::write(
+            state_path_in(&dir),
+            serde_json::to_string(&value).expect("serializes"),
+        )
+        .expect("write state");
+
+        let back = read_state_in(&dir).expect("still deserializes as a whole State");
+        assert_eq!(back.phase, Phase::Unknown);
+
+        // Not in-flight for the quit warning: there is nothing concrete to
+        // warn about.
+        assert!(!in_flight(back.phase));
+        assert!(quit_warning_in(&dir).is_none());
+
+        // But a cancel is still let through: the safe reading is "something
+        // may be running".
+        assert_ne!(
+            cancel_command_in(&dir, false),
+            "No model download is running."
+        );
+    }
+
+    #[test]
+    fn unknown_phase_gets_a_plain_segment_word() {
+        let mut st = a_state();
+        st.phase = Phase::Unknown;
+        assert_eq!(segment_text(&st), "⇩ model");
     }
 
     #[test]
@@ -1584,7 +1669,7 @@ mod tests {
     /// process environment, so they are safe under cargo's default test
     /// parallelism (see `FINDINGS.md`'s note on the spill tests' hazard, and
     /// `src/spill.rs`'s `_in` pattern this mirrors).
-    fn tempdir() -> std::path::PathBuf {
+    pub(crate) fn tempdir() -> std::path::PathBuf {
         // A nanosecond timestamp alone is not enough: cargo runs tests on
         // multiple threads, and two calls on different threads can land in
         // the same nanosecond, colliding on the same directory and letting
@@ -1882,14 +1967,47 @@ mod tests {
 
     #[test]
     fn cancel_prompt_reports_how_much_would_be_thrown_away() {
+        // The total across every `.part` on disk, not `state.done_bytes`
+        // (which is only the current artifact's progress) — otherwise the
+        // popup could understate what [d] is about to erase.
         let dir = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&dir)).expect("staging");
+        std::fs::write(part_path_in(&dir, "main"), vec![0u8; 20_000_000_000]).expect("main part");
+        std::fs::write(part_path_in(&dir, "vision"), vec![0u8; 16_200_000_000])
+            .expect("vision part");
         let mut st = a_state();
         st.pid = std::process::id();
         st.updated = now_epoch();
-        st.done_bytes = 36_200_000_000;
+        st.done_bytes = 1;
         write_state_in(&dir, &st).expect("publish");
         let text = cancel_prompt_in(&dir).expect("a prompt");
         assert!(text.contains("36.2 GB"), "{text:?}");
+    }
+
+    #[test]
+    fn cancel_with_delete_keeps_verified_staged_artifacts() {
+        // Finding 4: `Cancel::Delete` must remove only `.part` files, never a
+        // verified, staged `<kind>.gguf` — those are hash-proven and cost
+        // nothing to keep.
+        let root = tempdir();
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(&root)).expect("staging");
+        std::fs::write(staged_path_in(&root, "main"), b"abc").expect("pre-staged, verified");
+        std::fs::write(part_path_in(&root, "vision"), b"partial").expect("in-flight partial");
+        request_cancel_in(&root, Cancel::Delete).expect("flag");
+        let m = manifest_for(&[
+            ("main", b"abc".as_slice(), ABC_SHA),
+            ("vision", b"abcdefg".as_slice(), ABC_SHA),
+        ]);
+        let outcome = run_job(&root, &m, &serving(&[("vision", b"abcdefg".to_vec())]));
+        assert_eq!(outcome, Outcome::Cancelled);
+        assert!(
+            staged_path_in(&root, "main").exists(),
+            "a verified artifact must survive a delete cancel"
+        );
+        assert!(
+            !part_path_in(&root, "vision").exists(),
+            "the in-flight .part is still deleted"
+        );
     }
 
     #[test]
@@ -1939,7 +2057,7 @@ mod tests {
         write_state_in(&dir, &st).expect("publish");
         assert_eq!(
             cancel_command_in(&dir, true),
-            "Cancelling; the partial files will be deleted."
+            "Cancelling; the partial files will be deleted (verified artifacts are kept)."
         );
         assert_eq!(read_cancel_in(&dir), Some(Cancel::Delete));
     }
