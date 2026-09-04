@@ -57,188 +57,6 @@ const DSPARK_FILE: &str = "DeepSeek-V4-Flash-Vision-Exp-DSpark-support.gguf";
 /// this is fetched at startup when absent, the same as the main model.
 const VISION_ENCODER_FILE: &str = "DeepSeek-V4-Flash-Vision-Encoder.gguf";
 
-/// Records which `FILE` produced the local model, alongside it.
-///
-/// Without this a bumped [`FILE`] would be invisible to anyone who already has
-/// a model: [`ensure_model`] only ever checked that the path exists, so an old
-/// download would be used forever. The stamp is advisory — a missing or
-/// unreadable one means "unknown", never "re-download".
-fn stamp_path(model: &Path) -> PathBuf {
-    model.with_extension("source")
-}
-
-/// The `FILE` the model at `path` was downloaded from, if recorded.
-fn stamped_source(path: &Path) -> Option<String> {
-    let s = std::fs::read_to_string(stamp_path(path)).ok()?;
-    let s = s.trim().to_string();
-    (!s.is_empty()).then_some(s)
-}
-
-/// Which repo file the model at `path` is, as best we can tell.
-///
-/// The stamp is authoritative. Failing that the name is inferred from what the
-/// path actually resolves to, which covers the common setup of symlinking
-/// `ds4flash.gguf` at a GGUF kept elsewhere (a shared `~/.ds4/models`, say):
-/// the link target still carries the build in its name.
-fn local_build(path: &Path) -> Option<String> {
-    stamped_source(path).or_else(|| {
-        let resolved = std::fs::canonicalize(path).ok()?;
-        let name = resolved.file_name()?.to_str()?;
-        (name.starts_with("DeepSeek-V4-") && is_gguf(name)).then(|| name.to_string())
-    })
-}
-
-/// Whether `name` is a GGUF, by extension.
-fn is_gguf(name: &str) -> bool {
-    std::path::Path::new(name)
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
-}
-
-/// The build-independent part of a repo filename: the quant recipe, without
-/// any trailing `-MMDD` release tag.
-///
-/// `…-chat-v2-imatrix-0731.gguf` and `…-chat-v2-imatrix.gguf` share the family
-/// `…-chat-v2-imatrix`, which is what makes one recognizable as a newer cut of
-/// the other. Only a four-digit tag is stripped, so a recipe that genuinely
-/// ends in digits is left alone.
-fn family_of(file: &str) -> &str {
-    let stem = file.strip_suffix(".gguf").unwrap_or(file);
-    match stem.rsplit_once('-') {
-        Some((head, tag)) if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()) => head,
-        _ => stem,
-    }
-}
-
-/// Picks the most recently committed member of `family` out of a Hugging Face
-/// tree listing.
-///
-/// The API is the authority on ordering: every entry carries its commit date,
-/// so nothing here has to parse `-MMDD` tags or reason about year boundaries.
-/// Two builds of the same recipe are also byte-identical in size, so the date
-/// is the only signal that works.
-fn newest_in_family(json: &str, family: &str) -> Option<String> {
-    let entries: serde_json::Value = serde_json::from_str(json).ok()?;
-    let mut best: Option<(String, String)> = None;
-    for entry in entries.as_array()? {
-        let path = entry.get("path")?.as_str()?;
-        if entry.get("type").and_then(serde_json::Value::as_str) != Some("file")
-            || family_of(path) != family
-            || !is_gguf(path)
-        {
-            continue;
-        }
-        let date = entry
-            .get("lastCommit")
-            .and_then(|c| c.get("date"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        // ISO-8601 dates from the API sort correctly as plain strings.
-        if best.as_ref().is_none_or(|(_, b)| date > b.as_str()) {
-            best = Some((path.to_string(), date.to_string()));
-        }
-    }
-    best.map(|(path, _)| path)
-}
-
-/// Hugging Face tree listing for [`REPO`]. `expand=true` is what attaches each
-/// file's `lastCommit`, which is the whole basis for "newer".
-#[cfg(not(test))]
-const TREE_URL: &str =
-    "https://huggingface.co/api/models/antirez/deepseek-v4-gguf/tree/main?expand=true";
-/// How often to ask Hugging Face what the newest build is.
-const MODEL_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
-/// Bounded timeout for that request. Startup must never hang on the network.
-#[cfg(not(test))]
-const MODEL_CHECK_TIMEOUT_SECS: u64 = 3;
-/// Cache of `(last_check_epoch, newest_known_file)`, beside the model.
-const MODEL_CHECK_FILE: &str = "model-check";
-
-/// Fetches the repo tree, bounded by [`MODEL_CHECK_TIMEOUT_SECS`]. `None` on
-/// any failure — offline, timeout, HTTP error — so the caller stays quiet.
-#[cfg(not(test))]
-fn fetch_tree() -> Option<String> {
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(MODEL_CHECK_TIMEOUT_SECS)))
-        .build()
-        .new_agent();
-    let mut resp = agent
-        .get(TREE_URL)
-        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
-        .call()
-        .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    resp.body_mut().read_to_string().ok()
-}
-
-/// Test builds never touch the network; [`decide_upgrade`] is driven directly.
-#[cfg(test)]
-fn fetch_tree() -> Option<String> {
-    None
-}
-
-/// Current Unix time in whole seconds, or 0 if the clock predates the epoch.
-fn now_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Reads the model-check cache: `(last_check_epoch, newest_known_file)`.
-fn read_check_cache(path: &Path) -> (Option<u64>, Option<String>) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    let mut lines = text.lines();
-    let when = lines.next().and_then(|l| l.trim().parse::<u64>().ok());
-    let newest = lines
-        .next()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string);
-    (when, newest)
-}
-
-/// Pure decision: given what is on disk, the cache, and the clock, work out
-/// whether to offer an upgrade.
-///
-/// Returns `(refreshed_cache, offer)`. `fetch` is injected so tests can drive
-/// the whole thing without a network.
-///
-/// Asking is throttled to [`MODEL_CHECK_INTERVAL_SECS`], and the timestamp is
-/// written whether or not the offer is accepted. That is deliberate: a startup
-/// prompt you have already declined must not reappear on the next launch.
-fn decide_upgrade(
-    have: Option<&str>,
-    last: Option<u64>,
-    cached: Option<String>,
-    now: u64,
-    fetch: impl FnOnce() -> Option<String>,
-) -> (Option<(u64, String)>, Option<String>) {
-    // Nothing identifiable on disk means no family to track, so stay silent
-    // rather than guess a user's quant recipe wrong.
-    let Some(have) = have else {
-        return (None, None);
-    };
-    let family = family_of(have);
-
-    let due = last.is_none_or(|t| now.saturating_sub(t) >= MODEL_CHECK_INTERVAL_SECS);
-    let (newest, refreshed) = if due {
-        match fetch().as_deref().and_then(|j| newest_in_family(j, family)) {
-            Some(found) => (Some(found.clone()), Some((now, found))),
-            // A failed check is not worth burning the interval on.
-            None => (cached, None),
-        }
-    } else {
-        (cached, None)
-    };
-
-    let offer = newest.filter(|n| n != have);
-    (refreshed, offer)
-}
-
 /// Rotating status lines shown while the model downloads.
 const MESSAGES: [&str; 200] = [
     "Summoning alien intelligence from the void...",
@@ -623,9 +441,9 @@ pub fn ensure_vision_encoder() -> Result<(), String> {
 /// terminal (so no prompt is possible), or when the download fails.
 pub fn ensure_model(path: &Path) -> Result<(), String> {
     if path.exists() {
-        if std::io::stdin().is_terminal() {
-            return offer_upgrade(path);
-        }
+        // Upgrades are the manifest's business now (`check_manifest_at_startup`),
+        // and they happen in the background rather than as a blocking prompt
+        // before the engine loads.
         return Ok(());
     }
     if !std::io::stdin().is_terminal() {
@@ -660,43 +478,6 @@ pub fn ensure_model(path: &Path) -> Result<(), String> {
         return Err("no model available; re-run with -m <path> or download it".to_string());
     }
     download(&model_url(), path)
-}
-
-/// Asks Hugging Face whether a newer build of the local model's quant family
-/// exists and, if so, offers to fetch it.
-///
-/// Never fatal: a model that is one release behind still works, so every
-/// failure path here — offline, unreadable cache, declined prompt — leaves the
-/// existing model in place and returns `Ok`.
-fn offer_upgrade(path: &Path) -> Result<(), String> {
-    let have = local_build(path);
-    let cache = path.with_file_name(MODEL_CHECK_FILE);
-    let (last, cached) = read_check_cache(&cache);
-    let (refreshed, offer) = decide_upgrade(have.as_deref(), last, cached, now_epoch(), fetch_tree);
-
-    if let Some((when, ref newest)) = refreshed {
-        let _ = std::fs::write(&cache, format!("{when}\n{newest}\n"));
-    }
-    let Some(newest) = offer else {
-        return Ok(());
-    };
-
-    eprintln!("A newer DeepSeek V4 Flash build is available:");
-    eprintln!("  have: {}", have.unwrap_or_default());
-    eprintln!("  new:  {newest}");
-    eprint!("Download it now? [y/N] ");
-    io::stderr().flush().ok();
-    let mut answer = String::new();
-    std::io::stdin()
-        .read_line(&mut answer)
-        .map_err(|e| e.to_string())?;
-    if matches!(answer.trim(), "y" | "Y" | "yes") {
-        // Fetch the build we actually found, not the compiled-in default.
-        download(&file_url(&newest), path)?;
-        let _ = std::fs::write(stamp_path(path), format!("{newest}\n"));
-        return Ok(());
-    }
-    Ok(())
 }
 
 /// Size of the partial download alongside `dest`, or 0 if none.
@@ -756,13 +537,6 @@ fn download(url: &str, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Records the [`FILE`] that produced `dest`, so a later [`FILE`] bump can be
-/// noticed. Best-effort: a model that downloaded fine is not worth failing
-/// over an unwritable sidecar.
-fn write_stamp(dest: &Path) {
-    let _ = std::fs::write(stamp_path(dest), format!("{FILE}\n"));
-}
-
 /// Celebratory sounds, best first.
 ///
 /// `Tada` is the one to play, but Apple dropped it from `/System/Library/Sounds`
@@ -811,9 +585,15 @@ fn play_tada() {
 #[cfg(not(target_os = "macos"))]
 fn play_tada() {}
 
-/// Marks a finished download: stamps the build and sounds the fanfare.
+/// Marks a finished download: sounds the fanfare.
+///
+/// It used to also write a `.source` stamp naming the repo file the model came
+/// from, which was how a bumped `FILE` constant became visible to someone who
+/// already had a model. The manifest replaced that entirely: `~/.plank/ds4.manifest`
+/// records the whole installed set by version, so a per-file stamp has nothing
+/// left to say.
 fn finish(dest: &Path) {
-    write_stamp(dest);
+    let _ = dest;
     play_tada();
 }
 
@@ -1275,6 +1055,126 @@ fn gb(bytes: u64) -> f64 {
     bytes as f64 / 1_000_000_000.0
 }
 
+/// The manifest URL. Kept in the repo rather than on a release asset so the
+/// artifact set is reviewed in a pull request like any other change.
+#[cfg(not(test))]
+const MANIFEST_URL: &str =
+    "https://raw.githubusercontent.com/aovestdipaperino/plank/main/ds4.manifest";
+/// Bounded timeout for the manifest fetch. Startup must never hang on the
+/// network.
+#[cfg(not(test))]
+const MANIFEST_TIMEOUT_SECS: u64 = 3;
+/// How often to ask whether a newer artifact set exists.
+const MANIFEST_CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60;
+/// Records when the manifest was last fetched, beside the model.
+const MANIFEST_CHECK_FILE: &str = "manifest-check";
+
+/// Fetches the manifest, bounded by [`MANIFEST_TIMEOUT_SECS`]. `None` on any
+/// failure — offline, timeout, HTTP error — so the caller stays quiet.
+#[cfg(not(test))]
+fn fetch_manifest() -> Option<String> {
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(MANIFEST_TIMEOUT_SECS)))
+        .build()
+        .new_agent();
+    let mut resp = agent
+        .get(MANIFEST_URL)
+        .header("User-Agent", concat!("plank/", env!("CARGO_PKG_VERSION")))
+        .call()
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.body_mut().read_to_string().ok()
+}
+
+/// Test builds never touch the network.
+#[cfg(test)]
+fn fetch_manifest() -> Option<String> {
+    None
+}
+
+/// Whether the 24-hour check window has elapsed, and records that it has.
+///
+/// The timestamp is written whether or not anything comes of the check: a
+/// startup prompt already declined must not reappear on the next launch.
+fn check_due() -> bool {
+    let path = crate::manifest::plank_dir().join(MANIFEST_CHECK_FILE);
+    let last = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| t.trim().parse::<u64>().ok());
+    let now = crate::downloader::now_epoch();
+    if last.is_some_and(|t| now.saturating_sub(t) < MANIFEST_CHECK_INTERVAL_SECS) {
+        return false;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, format!("{now}\n"));
+    true
+}
+
+/// The whole startup manifest flow: install anything staged, then decide
+/// whether to start a background download.
+///
+/// Never fatal, and never blocking. A model one release behind still works, so
+/// every failure path here — offline, unparseable manifest, an unwritable
+/// staging directory — leaves the existing model in place and returns.
+pub fn check_manifest_at_startup() {
+    // Anything a previous run verified gets installed first, before the engine
+    // maps the model.
+    match crate::downloader::swap_staged() {
+        Ok(Some(version)) => eprintln!("plank: installed model manifest version {version}."),
+        Ok(None) => {}
+        Err(e) => eprintln!("plank: could not install the downloaded model: {e}"),
+    }
+
+    // A helper already at work needs no second opinion.
+    if crate::downloader::running() {
+        return;
+    }
+    if !check_due() {
+        return;
+    }
+    let Some(remote) = fetch_manifest().and_then(|t| crate::manifest::parse(&t).ok()) else {
+        return;
+    };
+    let installed = crate::manifest::read_at(&crate::manifest::installed_path());
+    let size_of = |kind: &str| {
+        let path = crate::manifest::local_path_for(kind)?;
+        std::fs::metadata(path).map(|m| m.len()).ok()
+    };
+    match crate::manifest::decide(remote, installed.as_ref(), &size_of) {
+        crate::manifest::Decision::UpToDate => {}
+        crate::manifest::Decision::Adopt(m) => {
+            // The files on disk are already this release; record that and say
+            // nothing. Without this, every existing user is offered an 87 GB
+            // re-download the day the manifest ships.
+            let _ = std::fs::write(crate::manifest::installed_path(), &m.raw);
+        }
+        crate::manifest::Decision::Offer { manifest, from } => {
+            eprintln!(
+                "plank: a newer model is available (version {} → {}{}).",
+                from,
+                manifest.version,
+                if manifest.notes.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", manifest.notes)
+                }
+            );
+            match crate::downloader::spawn_detached(&manifest) {
+                Ok(()) => {
+                    eprintln!(
+                        "plank: downloading it in the background. Alt-M or /model to cancel."
+                    );
+                }
+                Err(e) => eprintln!("plank: could not start the background download: {e}"),
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1530,140 +1430,6 @@ mod tests {
             assert_eq!(classify(key, true), Action::Play);
             assert!(game.handle_key(key), "{code:?} should move the paddle");
         }
-    }
-
-    const APRIL: &str = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf";
-    const JULY: &str =
-        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf";
-
-    /// A tree listing shaped like the real one, newest entry deliberately not
-    /// last so the pick cannot pass by accident.
-    fn tree() -> String {
-        format!(
-            r#"[
-              {{"type":"file","path":"{JULY}","lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
-              {{"type":"file","path":"{APRIL}","lastCommit":{{"date":"2026-05-11T10:00:00.000Z"}}}},
-              {{"type":"file","path":"DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf",
-                "lastCommit":{{"date":"2026-07-31T10:00:00.000Z"}}}},
-              {{"type":"directory","path":"imatrix"}}
-            ]"#
-        )
-    }
-
-    #[test]
-    fn family_strips_only_a_four_digit_release_tag() {
-        let family = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix";
-        assert_eq!(family_of(JULY), family);
-        assert_eq!(
-            family_of(APRIL),
-            family,
-            "the untagged build is the same family"
-        );
-        // The Vision-Exp default is its own family — no 4-digit tag to strip.
-        assert_eq!(
-            family_of(FILE),
-            "DeepSeek-V4-Flash-Vision-Exp-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8",
-            "the pinned default too"
-        );
-        // A recipe ending in digits is not a release tag.
-        assert_eq!(family_of("Model-MXFP4.gguf"), "Model-MXFP4");
-        assert_eq!(family_of("Model-Q4K-12345.gguf"), "Model-Q4K-12345");
-    }
-
-    #[test]
-    fn newest_is_picked_by_commit_date_within_the_family() {
-        let family = family_of(APRIL);
-        assert_eq!(newest_in_family(&tree(), family).as_deref(), Some(JULY));
-        // The Q4 build is a different family and must never be offered to a
-        // machine running the Q2 quant.
-        assert_ne!(
-            newest_in_family(&tree(), family).as_deref(),
-            Some("DeepSeek-V4-Flash-Q4KExperts-chat-v2-imatrix-0731.gguf")
-        );
-        // An unknown family matches nothing; malformed JSON is not fatal.
-        assert!(newest_in_family(&tree(), "Nope").is_none());
-        assert!(newest_in_family("not json", family).is_none());
-    }
-
-    #[test]
-    fn upgrade_is_offered_only_for_a_genuinely_newer_build() {
-        let now = 1_800_000_000;
-        let fetch = || Some(tree());
-
-        // Running April: July is offered and the cache is refreshed.
-        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, fetch);
-        assert_eq!(offer.as_deref(), Some(JULY));
-        assert_eq!(cache, Some((now, JULY.to_string())));
-
-        // Already on July: nothing to offer.
-        let (_, offer) = decide_upgrade(Some(JULY), None, None, now, fetch);
-        assert!(offer.is_none());
-
-        // Nothing identifiable on disk: stay silent rather than guess.
-        let (cache, offer) = decide_upgrade(None, None, None, now, fetch);
-        assert!(offer.is_none() && cache.is_none());
-    }
-
-    #[test]
-    fn the_check_is_throttled_and_a_decline_is_not_re_asked() {
-        let now = 1_800_000_000;
-        let boom = || panic!("must not hit the network inside the interval");
-
-        // Within the interval the cached answer is reused, no fetch.
-        let recent = now - MODEL_CHECK_INTERVAL_SECS + 1;
-        let (cache, offer) =
-            decide_upgrade(Some(APRIL), Some(recent), Some(JULY.to_string()), now, boom);
-        assert_eq!(
-            offer.as_deref(),
-            Some(JULY),
-            "the cached answer still stands"
-        );
-        assert!(cache.is_none(), "no refresh without a fetch");
-
-        // Past the interval it checks again.
-        let stale = now - MODEL_CHECK_INTERVAL_SECS;
-        let (cache, _) = decide_upgrade(Some(APRIL), Some(stale), None, now, || Some(tree()));
-        assert_eq!(cache, Some((now, JULY.to_string())));
-    }
-
-    #[test]
-    fn a_failed_check_does_not_burn_the_interval() {
-        let now = 1_800_000_000;
-        let (cache, offer) = decide_upgrade(Some(APRIL), None, None, now, || None);
-        assert!(cache.is_none(), "offline must not count as a check");
-        assert!(offer.is_none());
-        // A previously cached answer survives an offline check.
-        let (_, offer) = decide_upgrade(Some(APRIL), None, Some(JULY.to_string()), now, || None);
-        assert_eq!(offer.as_deref(), Some(JULY));
-    }
-
-    #[test]
-    fn the_local_build_is_read_from_the_stamp_or_the_link_target() {
-        let dir = std::env::temp_dir().join(format!("plank-build-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let model = dir.join("ds4flash.gguf");
-
-        // A stamp is authoritative.
-        std::fs::write(&model, b"weights").unwrap();
-        write_stamp(&model);
-        assert_eq!(local_build(&model).as_deref(), Some(FILE));
-
-        // Without one, a symlink reveals the build through its target — the
-        // shared ~/.ds4/models setup.
-        std::fs::remove_file(stamp_path(&model)).unwrap();
-        std::fs::remove_file(&model).unwrap();
-        let real = dir.join(APRIL);
-        std::fs::write(&real, b"weights").unwrap();
-        std::os::unix::fs::symlink(&real, &model).unwrap();
-        assert_eq!(local_build(&model).as_deref(), Some(APRIL));
-
-        // An opaque name stays unknown.
-        let opaque = dir.join("mystery.gguf");
-        std::fs::write(&opaque, b"weights").unwrap();
-        assert!(local_build(&opaque).is_none());
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

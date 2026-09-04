@@ -763,8 +763,10 @@ pub fn running() -> bool {
 ///
 /// # Errors
 /// Returns a message when the job cannot be recorded or the child cannot be
-/// spawned. Callers treat that as "fall back to a foreground download", never
-/// as fatal.
+/// spawned. There is deliberately no in-process fallback — a foreground 87 GB
+/// download is exactly what this whole feature exists to avoid — so callers
+/// report the error and nothing downloads; `/model download` is how the user
+/// retries.
 pub fn spawn_detached(manifest: &crate::manifest::Manifest) -> Result<(), String> {
     if running() {
         return Ok(());
@@ -866,6 +868,84 @@ fn log_line(msg: &str) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
         let _ = writeln!(f, "[{}] {msg}", now_epoch());
     }
+}
+
+/// Installs a complete staged set under `root`, if one is waiting.
+///
+/// This runs at launch rather than the instant a download verifies, because a
+/// running plank has the 87 GB main model mapped: overwriting it under a live
+/// process is exactly the kind of thing that works in testing and corrupts a
+/// session in the field.
+///
+/// The ordering is the whole design. Files move first, the installed manifest
+/// moves last, so the manifest's presence is proof the entire set landed. A
+/// crash between two renames leaves no installed manifest and leaves the
+/// remaining artifacts in staging, so the next launch simply finishes the job —
+/// artifacts already moved are no longer in staging and are skipped.
+///
+/// Nothing is re-hashed here. Staging is ours, and every byte in it was
+/// verified on the way in.
+///
+/// Returns the version installed, or `None` when there was nothing complete to
+/// install.
+///
+/// # Errors
+/// Returns a message only when a rename of a verified artifact fails — a real
+/// filesystem problem the user needs to hear about.
+pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
+    let staged_manifest = crate::manifest::staging_dir_in(root).join("ds4.manifest");
+    let Some(manifest) = crate::manifest::read_at(&staged_manifest) else {
+        return Ok(None);
+    };
+
+    // Everything this build installs, paired with where it goes.
+    let jobs: Vec<(&str, &crate::manifest::FileEntry, PathBuf)> = crate::manifest::KINDS
+        .iter()
+        .filter_map(|kind| {
+            let entry = manifest.files.get(*kind)?;
+            let dest = crate::manifest::local_path_for_in(root, kind)?;
+            Some((*kind, entry, dest))
+        })
+        .collect();
+
+    // Each artifact must be either already installed at the right size (a
+    // resumed swap) or staged at the right size. Anything else means the set is
+    // incomplete, and a partial swap would leave a mismatched trio on disk.
+    let complete = jobs.iter().all(|(kind, entry, dest)| {
+        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
+        size(&staged_path_in(root, kind)) == Some(entry.bytes) || size(dest) == Some(entry.bytes)
+    });
+    if !complete {
+        return Ok(None);
+    }
+
+    if let Err(e) = std::fs::create_dir_all(root) {
+        return Err(format!("cannot create the plank directory: {e}"));
+    }
+    for (kind, _, dest) in &jobs {
+        let from = staged_path_in(root, kind);
+        if !from.exists() {
+            // Already moved by an interrupted earlier swap.
+            continue;
+        }
+        std::fs::rename(&from, dest)
+            .map_err(|e| format!("cannot install {kind} at {}: {e}", dest.display()))?;
+    }
+    // Last, and only now: this file is the claim that the set is installed.
+    std::fs::rename(&staged_manifest, crate::manifest::installed_path_in(root))
+        .map_err(|e| format!("cannot record the installed manifest: {e}"))?;
+    let _ = std::fs::remove_dir(crate::manifest::staging_dir_in(root));
+    let _ = std::fs::remove_file(state_path_in(root));
+    Ok(Some(manifest.version))
+}
+
+/// Installs a complete staged set under `~/.plank`, if one is waiting.
+///
+/// # Errors
+/// Returns a message only when a rename of a verified artifact fails — a real
+/// filesystem problem the user needs to hear about.
+pub fn swap_staged() -> Result<Option<u32>, String> {
+    swap_staged_in(&crate::manifest::plank_dir())
 }
 
 #[cfg(test)]
@@ -1361,5 +1441,109 @@ mod tests {
     fn nothing_is_running_when_no_lock_is_held() {
         let root = tempdir();
         assert!(!running_in(&root));
+    }
+
+    /// Stages a complete set for `manifest` with the given bodies, under `root`.
+    fn stage(root: &Path, manifest: &crate::manifest::Manifest, bodies: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(root)).expect("staging");
+        for (kind, body) in bodies {
+            std::fs::write(staged_path_in(root, kind), body).expect("stage artifact");
+        }
+        std::fs::write(
+            crate::manifest::staging_dir_in(root).join("ds4.manifest"),
+            &manifest.raw,
+        )
+        .expect("stage manifest");
+    }
+
+    #[test]
+    fn swap_moves_every_artifact_and_records_the_manifest_last() {
+        let root = tempdir();
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage(&root, &m, &[("main", b"abc")]);
+
+        let swapped = swap_staged_in(&root).expect("swap succeeds");
+        assert_eq!(swapped, Some(3));
+        let installed = crate::manifest::local_path_for_in(&root, "main").expect("main path");
+        assert_eq!(std::fs::read(installed).expect("installed"), b"abc");
+        assert!(
+            !staged_path_in(&root, "main").exists(),
+            "staging is drained"
+        );
+        let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
+            .expect("installed manifest");
+        assert_eq!(recorded.version, 3);
+    }
+
+    #[test]
+    fn swap_with_nothing_staged_is_a_no_op() {
+        let root = tempdir();
+        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
+        assert!(!crate::manifest::installed_path_in(&root).exists());
+    }
+
+    #[test]
+    fn swap_refuses_an_incomplete_set() {
+        // The staged manifest lists two artifacts but only one is present: a
+        // partial swap would leave a mismatched main/vision pair on disk.
+        let root = tempdir();
+        let m = manifest_for(&[
+            ("main", b"abc".as_slice(), ABC_SHA),
+            ("vision", b"abc".as_slice(), ABC_SHA),
+        ]);
+        stage(&root, &m, &[("main", b"abc")]);
+
+        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
+        assert!(
+            !crate::manifest::installed_path_in(&root).exists(),
+            "nothing recorded"
+        );
+        assert!(
+            staged_path_in(&root, "main").exists(),
+            "staging is left intact for a retry"
+        );
+    }
+
+    #[test]
+    fn swap_refuses_a_staged_file_of_the_wrong_size() {
+        let root = tempdir();
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage(&root, &m, &[("main", b"ab")]);
+        assert_eq!(swap_staged_in(&root).expect("no-op"), None);
+        assert!(!crate::manifest::installed_path_in(&root).exists());
+    }
+
+    #[test]
+    fn a_swap_interrupted_midway_completes_on_the_next_run() {
+        // Simulates a crash after the first rename: `main` is already installed
+        // and gone from staging, `vision` is still waiting. The installed
+        // manifest has not been written, so the re-run must finish the job
+        // rather than skip it.
+        let root = tempdir();
+        let m = manifest_for(&[
+            ("main", b"abc".as_slice(), ABC_SHA),
+            ("vision", b"abc".as_slice(), ABC_SHA),
+        ]);
+        stage(&root, &m, &[("main", b"abc"), ("vision", b"abc")]);
+        // Perform the "already happened" half by hand.
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::rename(
+            staged_path_in(&root, "main"),
+            crate::manifest::local_path_for_in(&root, "main").expect("main path"),
+        )
+        .expect("first rename");
+
+        assert_eq!(swap_staged_in(&root).expect("completes"), Some(3));
+        assert!(
+            crate::manifest::local_path_for_in(&root, "vision")
+                .expect("v")
+                .exists()
+        );
+        assert_eq!(
+            crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
+                .expect("installed")
+                .version,
+            3
+        );
     }
 }
