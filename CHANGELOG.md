@@ -20,6 +20,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and screen-reader focus track the prompt instead of a stale position. The
   now-pointless `ui.cursor` setting, which only ever gated the OSC 12 path,
   is gone.
+- **The logo goes back to the plain-eyed plank.** The round spectacles added
+  earlier today are reverted; the banner and the macOS notification icon are
+  the bare pixel-eyed board again. The embedded copy is materialized to a temp
+  file by size, so an already-cached notification icon replaces itself on the
+  next notification rather than staying stale.
 
 ### Added
 
