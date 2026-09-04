@@ -427,6 +427,13 @@ pub fn run_job(root: &Path, manifest: &crate::manifest::Manifest, fetch: &Fetche
     if let Err(e) = std::fs::create_dir_all(&staging) {
         return Outcome::Failed(format!("cannot create {}: {e}", staging.display()));
     }
+    // A staged manifest is the swap's proof the whole set landed for *some*
+    // version. Leaving a stale one here while this run stages a different
+    // manifest's artifacts would let a later, unrelated interruption present
+    // that old manifest alongside artifacts it never described. This run
+    // writes its own manifest back in, last, only once everything it staged
+    // verifies.
+    let _ = std::fs::remove_file(staging.join("ds4.manifest"));
 
     let jobs: Vec<(&str, &crate::manifest::FileEntry)> = crate::manifest::KINDS
         .iter()
@@ -1002,11 +1009,16 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
         .collect();
 
     // Each artifact must be either already installed at the right size (a
-    // resumed swap) or staged at the right size. Anything else means the set is
-    // incomplete, and a partial swap would leave a mismatched trio on disk.
+    // resumed swap — this is about the DESTINATION file, so size alone is
+    // fine: it was staged, verified and renamed by an earlier, interrupted
+    // swap of this very manifest) or currently staged and proven, via the
+    // sidecar SHA-256, to belong to this manifest's entry rather than some
+    // other version's artifact that happens to share a length. Anything else
+    // means the set is incomplete, and a partial swap would leave a
+    // mismatched trio on disk.
     let complete = jobs.iter().all(|(kind, entry, dest)| {
-        let size = |p: &Path| std::fs::metadata(p).map(|m| m.len()).ok();
-        size(&staged_path_in(root, kind)) == Some(entry.bytes) || size(dest) == Some(entry.bytes)
+        let dest_size_matches = std::fs::metadata(dest).map(|m| m.len()).ok() == Some(entry.bytes);
+        dest_size_matches || staged_is_current(root, kind, entry)
     });
     if !complete {
         return Ok(None);
@@ -1015,10 +1027,13 @@ pub fn swap_staged_in(root: &Path) -> Result<Option<u32>, String> {
     if let Err(e) = std::fs::create_dir_all(root) {
         return Err(format!("cannot create the plank directory: {e}"));
     }
-    for (kind, _, dest) in &jobs {
+    for (kind, entry, dest) in &jobs {
         let from = staged_path_in(root, kind);
-        if !from.exists() {
-            // Already moved by an interrupted earlier swap.
+        if !staged_is_current(root, kind, entry) {
+            // Either already moved by an interrupted earlier swap (nothing
+            // left in staging), or the destination already satisfies this
+            // manifest's entry and whatever sits in staging is unproven for
+            // it — either way, nothing to rename here.
             continue;
         }
         std::fs::rename(&from, dest)
@@ -1864,6 +1879,15 @@ pub(crate) mod tests {
 
     /// Builds a manifest over `(kind, bytes, sha256)` triples.
     fn manifest_for(entries: &[(&str, &[u8], &str)]) -> crate::manifest::Manifest {
+        manifest_for_version(3, entries)
+    }
+
+    /// Like `manifest_for`, but with an explicit version — for tests that need
+    /// two distinct manifests to tell apart.
+    fn manifest_for_version(
+        version: u32,
+        entries: &[(&str, &[u8], &str)],
+    ) -> crate::manifest::Manifest {
         let files: Vec<String> = entries
             .iter()
             .map(|(kind, bytes, sha)| {
@@ -1874,7 +1898,7 @@ pub(crate) mod tests {
             })
             .collect();
         let text = format!(
-            r#"{{"version":3,"released":"t","notes":"","files":{{{}}}}}"#,
+            r#"{{"version":{version},"released":"t","notes":"","files":{{{}}}}}"#,
             files.join(",")
         );
         crate::manifest::parse(&text).expect("test manifest parses")
@@ -1933,8 +1957,34 @@ pub(crate) mod tests {
         assert!(!running_in(&root));
     }
 
-    /// Stages a complete set for `manifest` with the given bodies, under `root`.
+    /// Stages a complete set for `manifest` with the given bodies, under `root`,
+    /// including the `<kind>.gguf.sha256` sidecar `staged_is_current` requires
+    /// — taken from the manifest's own entry, matching what `run_job` writes
+    /// after a real verification.
     fn stage(root: &Path, manifest: &crate::manifest::Manifest, bodies: &[(&str, &[u8])]) {
+        std::fs::create_dir_all(crate::manifest::staging_dir_in(root)).expect("staging");
+        for (kind, body) in bodies {
+            std::fs::write(staged_path_in(root, kind), body).expect("stage artifact");
+            if let Some(entry) = manifest.files.get(*kind) {
+                std::fs::write(staged_sha_path_in(root, kind), &entry.sha256)
+                    .expect("stage sidecar");
+            }
+        }
+        std::fs::write(
+            crate::manifest::staging_dir_in(root).join("ds4.manifest"),
+            &manifest.raw,
+        )
+        .expect("stage manifest");
+    }
+
+    /// Like `stage`, but deliberately omits the `<kind>.gguf.sha256` sidecar —
+    /// simulating an artifact staged by a build of this code that predates the
+    /// sidecar, or one whose sidecar write failed.
+    fn stage_without_sidecar(
+        root: &Path,
+        manifest: &crate::manifest::Manifest,
+        bodies: &[(&str, &[u8])],
+    ) {
         std::fs::create_dir_all(crate::manifest::staging_dir_in(root)).expect("staging");
         for (kind, body) in bodies {
             std::fs::write(staged_path_in(root, kind), body).expect("stage artifact");
@@ -2034,6 +2084,110 @@ pub(crate) mod tests {
                 .expect("installed")
                 .version,
             3
+        );
+    }
+
+    const XYZ_SHA: &str = "3608bca1e44ea6c4d268eb6db02260269892c0b42b86bbf1e77a6fa16c3c9282";
+
+    #[test]
+    fn swap_refuses_a_staged_manifest_whose_artifact_was_overwritten_by_a_later_version() {
+        // v5 stages completely and its manifest lands in staging. A later
+        // run for v6 replaces `main` in staging (same size, different bytes,
+        // different sidecar) but is interrupted before v6's own manifest is
+        // written — leaving v5's manifest sitting next to a `main.gguf` that
+        // is actually v6's. The swap must refuse this set rather than install
+        // a mismatched trio recorded as v5.
+        let root = tempdir();
+        let v5 = manifest_for_version(5, &[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage(&root, &v5, &[("main", b"abc")]);
+
+        // v6's run_job overwrites the staged artifact and its sidecar, but
+        // never gets to (re)write `ds4.manifest` — v5's is still the one on
+        // disk.
+        std::fs::write(staged_path_in(&root, "main"), b"xyz").expect("overwrite artifact");
+        std::fs::write(staged_sha_path_in(&root, "main"), XYZ_SHA).expect("overwrite sidecar");
+
+        assert_eq!(
+            swap_staged_in(&root).expect("no-op"),
+            None,
+            "a staged artifact whose sidecar does not match the staged manifest's \
+             entry must never be installed under that manifest's version"
+        );
+        assert!(
+            !crate::manifest::installed_path_in(&root).exists(),
+            "nothing recorded"
+        );
+        assert!(
+            staged_path_in(&root, "main").exists(),
+            "the mismatched artifact is left in staging, not installed"
+        );
+    }
+
+    #[test]
+    fn run_job_clears_a_stale_staged_manifest_before_it_runs() {
+        // A leftover `ds4.manifest` from a previous, unrelated version must
+        // not survive into a run that stages a different manifest's files —
+        // otherwise an interruption before this run writes its own manifest
+        // would leave the old one sitting next to this run's artifacts.
+        let root = tempdir();
+        let old = manifest_for_version(5, &[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage(&root, &old, &[("main", b"abc")]);
+        assert!(
+            crate::manifest::staging_dir_in(&root)
+                .join("ds4.manifest")
+                .exists()
+        );
+
+        let new = manifest_for_version(6, &[("main", b"xyz".as_slice(), XYZ_SHA)]);
+        let fetch = serving(&[("main", b"xyz".to_vec())]);
+        let outcome = run_job(&root, &new, &fetch);
+        assert!(matches!(outcome, Outcome::Verified), "{outcome:?}");
+
+        let recorded =
+            crate::manifest::read_at(&crate::manifest::staging_dir_in(&root).join("ds4.manifest"))
+                .expect("a manifest is staged");
+        assert_eq!(
+            recorded.version, 6,
+            "the stale v5 manifest must not survive"
+        );
+    }
+
+    #[test]
+    fn a_staged_artifact_with_no_sidecar_at_all_is_treated_as_stale() {
+        // The realistic migration case: something staged by an earlier build
+        // of this branch, before the sidecar existed. Right size, no sidecar
+        // at all — must not be trusted, and must be re-downloaded rather than
+        // installed or left staged undecided.
+        let root = tempdir();
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage_without_sidecar(&root, &m, &[("main", b"abc")]);
+        assert!(!staged_sha_path_in(&root, "main").exists());
+
+        assert!(
+            !staged_is_current(&root, "main", m.files.get("main").expect("entry")),
+            "a sidecar-less artifact must not be trusted, even at the right size"
+        );
+
+        let fetch = serving(&[("main", b"abc".to_vec())]);
+        let outcome = run_job(&root, &m, &fetch);
+        assert!(matches!(outcome, Outcome::Verified), "{outcome:?}");
+        assert!(
+            staged_sha_path_in(&root, "main").exists(),
+            "run_job re-verified the artifact and wrote a fresh sidecar for it"
+        );
+    }
+
+    #[test]
+    fn swap_removes_the_sidecars_it_consumes() {
+        let root = tempdir();
+        let m = manifest_for(&[("main", b"abc".as_slice(), ABC_SHA)]);
+        stage(&root, &m, &[("main", b"abc")]);
+        assert!(staged_sha_path_in(&root, "main").exists());
+
+        assert_eq!(swap_staged_in(&root).expect("swap succeeds"), Some(3));
+        assert!(
+            !staged_sha_path_in(&root, "main").exists(),
+            "the sidecar is consumed along with the artifact it describes"
         );
     }
 
