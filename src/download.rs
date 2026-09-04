@@ -1142,21 +1142,25 @@ fn record_declined_in(root: &Path, version: u32) {
     let _ = std::fs::write(path, format!("{version}\n"));
 }
 
-/// If the last background job ended in a cancel or a failed hash check,
-/// records its version as declined.
+/// If the last background job ended in a failed hash check, or in a cancel
+/// that discarded the partial files, records its version as declined.
 ///
 /// The spec is explicit that automatic retry after a hash mismatch, or after
-/// a user-requested cancel, is out of scope: without this, the next `24h`
-/// check window would silently restart the very download the user just
-/// stopped. `/model download` remains the way to start it again on purpose.
+/// a Delete cancel, is out of scope: without this, the next `24h` check
+/// window would silently restart the very download the user just stopped.
+/// `/model download` remains the way to start it again on purpose.
+///
+/// A Keep cancel is deliberately excluded: its entire point is "stop now,
+/// resume later", so it must not be treated as a decline — that is what
+/// [`crate::downloader::cancelled_kept`] distinguishes.
 fn note_last_run_outcome_in(root: &Path) {
-    if let Some(state) = crate::downloader::read_state_in(root)
-        && matches!(
-            state.phase,
-            crate::downloader::Phase::Cancelled | crate::downloader::Phase::Failed
-        )
-    {
-        record_declined_in(root, state.version);
+    if let Some(state) = crate::downloader::read_state_in(root) {
+        let declined = state.phase == crate::downloader::Phase::Failed
+            || (state.phase == crate::downloader::Phase::Cancelled
+                && !crate::downloader::cancelled_kept(&state));
+        if declined {
+            record_declined_in(root, state.version);
+        }
     }
 }
 
@@ -1193,8 +1197,13 @@ fn confirm_background_download(manifest: &crate::manifest::Manifest, from: u32) 
 }
 
 /// The whole startup manifest flow, reading and writing state under `root`,
-/// with the manifest fetch and the background spawn injected so it can be
-/// exercised without a network or a real detached process.
+/// with the manifest fetch, the background spawn, and the interactive
+/// confirmation injected so it can be exercised without a network, a real
+/// detached process, or a real terminal.
+///
+/// `confirm` returns `None` when there is nobody to ask (no controlling
+/// terminal) and `Some(accepted)` otherwise, folding the non-TTY gate and the
+/// `[y/N]` prompt into one seam a test can answer deterministically.
 ///
 /// Never fatal, and never blocking on anything but the interactive prompt
 /// (itself gated on a real terminal). A model one release behind still works,
@@ -1204,6 +1213,7 @@ fn check_manifest_at_startup_in(
     root: &Path,
     fetch: &dyn Fn() -> Option<String>,
     spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
 ) {
     // Anything a previous run verified gets installed first, before the engine
     // maps the model.
@@ -1238,6 +1248,17 @@ fn check_manifest_at_startup_in(
             let _ = std::fs::write(crate::manifest::installed_path_in(root), &m.raw);
         }
         crate::manifest::Decision::Offer { manifest, from } => {
+            // Recorded unconditionally, before any early return below: this
+            // only writes the job file for `/model download` to pick up
+            // later, it does not itself start anything downloading (that
+            // still needs `spawn`, below). Without this, a declined offer or
+            // a non-TTY run leaves no job on disk, so `read_job_in` finds
+            // nothing and `/model download` answers "No model download is
+            // pending" forever — the version becomes permanently
+            // unreachable even though the user asked for it explicitly.
+            if let Err(e) = crate::downloader::write_job_in(root, &manifest) {
+                eprintln!("plank: could not record the download job: {e}");
+            }
             // First-run acquisition belongs to `ensure_model`, not the
             // manifest flow: with no installed manifest AND no model on disk,
             // starting a background download here would race the foreground
@@ -1255,10 +1276,10 @@ fn check_manifest_at_startup_in(
             }
             // A 93 GB transfer must not start unannounced, and there is no
             // one to ask on a piped or headless run.
-            if !std::io::stdin().is_terminal() {
+            let Some(accepted) = confirm(&manifest, from) else {
                 return;
-            }
-            if !confirm_background_download(&manifest, from) {
+            };
+            if !accepted {
                 record_declined_in(root, manifest.version);
                 return;
             }
@@ -1285,14 +1306,39 @@ fn check_manifest_at_startup_in(
 /// Never fatal, and never blocking except on the interactive download prompt
 /// (itself gated on a real terminal).
 pub fn check_manifest_at_startup(model_path: Option<&Path>) {
-    if model_path.is_some() {
-        return;
-    }
-    check_manifest_at_startup_in(
+    check_manifest_at_startup_with(
+        model_path,
         &crate::manifest::plank_dir(),
         &fetch_manifest,
         &crate::downloader::spawn_detached,
+        &real_confirm,
     );
+}
+
+/// [`check_manifest_at_startup`] with every side effect injected, so a test
+/// can drive the `model_path` skip, the manifest fetch, the background
+/// spawn, and the interactive confirmation all deterministically.
+fn check_manifest_at_startup_with(
+    model_path: Option<&Path>,
+    root: &Path,
+    fetch: &dyn Fn() -> Option<String>,
+    spawn: &dyn Fn(&crate::manifest::Manifest) -> Result<(), String>,
+    confirm: &dyn Fn(&crate::manifest::Manifest, u32) -> Option<bool>,
+) {
+    if model_path.is_some() {
+        return;
+    }
+    check_manifest_at_startup_in(root, fetch, spawn, confirm);
+}
+
+/// The real confirmation: `None` when there is no controlling terminal to ask
+/// (a piped or headless run), `Some(answer)` from the blocking `[y/N]` prompt
+/// otherwise.
+fn real_confirm(manifest: &crate::manifest::Manifest, from: u32) -> Option<bool> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    Some(confirm_background_download(manifest, from))
 }
 
 #[cfg(test)]
@@ -1651,7 +1697,11 @@ mod tests {
         let root = crate::downloader::tests::tempdir();
         let (called, spawn) = spy_spawn();
         let text = manifest_text(5, 100);
-        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn);
+        // `from == 0` must return before ever consulting `confirm`, so a
+        // confirm stub that panics if called doubles as proof of that.
+        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
+            panic!("must not even ask on a bare first run")
+        });
         assert!(
             !called.load(Ordering::Relaxed),
             "must not spawn a background download on a bare first run"
@@ -1660,20 +1710,35 @@ mod tests {
 
     #[test]
     fn an_explicit_model_path_skips_the_flow_entirely() {
-        // Finding 2: a `-m /custom/path` user's model never lives at the
-        // manifest's hardcoded `~/.plank` locations. Passing a configured
-        // path must return before touching the filesystem at all.
-        check_manifest_at_startup(Some(Path::new("/some/custom/model.gguf")));
-        // Nothing to assert beyond "did not panic and did not hang" — the
-        // function takes the real `plank_dir()` fast-path only when this
-        // early return is skipped, so reaching here at all is the proof.
+        // Finding 2 (and the re-review's Fix D): a `-m /custom/path` user's
+        // model never lives at the manifest's hardcoded `~/.plank`
+        // locations. Passing a configured path must return before touching
+        // `fetch`, `spawn`, or `confirm` at all. Every seam here panics if
+        // invoked, so this test would fail if the `model_path.is_some()`
+        // early return were ever removed or reordered past them — unlike
+        // calling the real `check_manifest_at_startup`, whose `fetch_manifest`
+        // is stubbed to `None` in test builds regardless of the skip, and so
+        // could not tell the fix apart from its absence.
+        let root = crate::downloader::tests::tempdir();
+        check_manifest_at_startup_with(
+            Some(Path::new("/some/custom/model.gguf")),
+            &root,
+            &|| panic!("must not fetch the manifest when -m is set"),
+            &|_| panic!("must not spawn a download when -m is set"),
+            &|_, _| panic!("must not prompt when -m is set"),
+        );
     }
 
     #[test]
     fn a_declined_version_is_not_re_offered() {
-        // Findings 1 and 5: once the user has said no (or a prior attempt was
-        // cancelled or failed a hash check), the same version must not come
-        // back on its own; only `/model download` restarts it.
+        // Findings 1 and 5 (and the re-review's Fix D): once the user has
+        // said no (or a prior attempt was cancelled or failed a hash check),
+        // the same version must not come back on its own; only
+        // `/model download` restarts it. `confirm` is stubbed to panic if
+        // reached, so this test would fail if the declined check were
+        // removed or the version comparison were wrong — unlike a stub that
+        // merely relies on the test process having no controlling terminal,
+        // which would mask that exact regression.
         let root = crate::downloader::tests::tempdir();
         let installed = manifest_text(3, 100);
         std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
@@ -1682,10 +1747,135 @@ mod tests {
         std::fs::write(declined_path_in(&root), "4\n").expect("declined marker");
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn);
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            panic!("a declined version must not even reach the confirm prompt")
+        });
         assert!(
             !called.load(Ordering::Relaxed),
             "a declined version must not be re-offered"
+        );
+    }
+
+    #[test]
+    fn a_declined_offer_can_still_be_started_by_hand() {
+        // Fix A: the stated requirement is that a declined version stays
+        // reachable through `/model download`. Before the fix, the job file
+        // that command reads was written only inside `spawn_detached`, so a
+        // decline (or a non-TTY run, exercised below) left nothing for
+        // `start_from_manifest_in` to find and it answered "No model
+        // download is pending" forever.
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        let (called, spawn) = spy_spawn();
+        // `confirm` returns `Some(false)`: the user is asked and says no.
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            Some(false)
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a decline must not itself start the download"
+        );
+
+        let message = crate::downloader::start_from_manifest_in(&root);
+        assert_eq!(
+            message, "Downloading model manifest version 4 in the background.",
+            "a declined version must still be startable by hand: {message}"
+        );
+    }
+
+    #[test]
+    fn a_headless_offer_can_still_be_started_by_hand() {
+        // Fix A, the non-TTY half: `confirm` returning `None` (no controlling
+        // terminal) must not, by itself, leave the job unrecorded either.
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| None);
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a headless run must not itself start the download"
+        );
+
+        let message = crate::downloader::start_from_manifest_in(&root);
+        assert_eq!(
+            message, "Downloading model manifest version 4 in the background.",
+            "a headless offer must still be startable by hand: {message}"
+        );
+    }
+
+    /// A `State` for a finished job at `version`, in the given `phase`, with
+    /// `error` set the way [`crate::downloader::finish_cancel`] (private to
+    /// `downloader.rs`) would for a cancel of that kind.
+    fn finished_state(
+        version: u32,
+        phase: crate::downloader::Phase,
+        error: Option<&str>,
+    ) -> crate::downloader::State {
+        crate::downloader::State {
+            pid: std::process::id(),
+            version,
+            current: String::new(),
+            index: 0,
+            of: 1,
+            done_bytes: 0,
+            total_bytes: 0,
+            rate_bps: 0,
+            phase,
+            error: error.map(str::to_string),
+            updated: crate::downloader::now_epoch(),
+        }
+    }
+
+    #[test]
+    fn a_keep_cancelled_version_is_still_offered_next_run() {
+        // Fix C: `Cancel::Keep` means "stop now, resume later" — that is the
+        // entire point of offering it separately from `Delete`. So it must
+        // not be recorded as a decline, unlike a Delete cancel (next test).
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        crate::downloader::write_state_in(
+            &root,
+            &finished_state(4, crate::downloader::Phase::Cancelled, Some("keep")),
+        )
+        .expect("seed a Keep-cancelled state");
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            Some(true)
+        });
+        assert!(
+            called.load(Ordering::Relaxed),
+            "a Keep-cancelled version must still be offered on the next run"
+        );
+    }
+
+    #[test]
+    fn a_delete_cancelled_version_is_not_re_offered() {
+        let root = crate::downloader::tests::tempdir();
+        let installed = manifest_text(3, 100);
+        std::fs::write(crate::manifest::installed_path_in(&root), &installed).expect("installed");
+        let remote_text = manifest_text(4, 200);
+        std::fs::create_dir_all(crate::manifest::downloads_dir_in(&root)).expect("downloads dir");
+        crate::downloader::write_state_in(
+            &root,
+            &finished_state(4, crate::downloader::Phase::Cancelled, Some("delete")),
+        )
+        .expect("seed a Delete-cancelled state");
+
+        let (called, spawn) = spy_spawn();
+        check_manifest_at_startup_in(&root, &|| Some(remote_text.clone()), &spawn, &|_, _| {
+            panic!("a Delete-cancelled version must not even reach the confirm prompt")
+        });
+        assert!(
+            !called.load(Ordering::Relaxed),
+            "a Delete-cancelled version must not be re-offered"
         );
     }
 
@@ -1704,7 +1894,9 @@ mod tests {
         let text = manifest_text(3, 100);
 
         let (called, spawn) = spy_spawn();
-        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn);
+        check_manifest_at_startup_in(&root, &|| Some(text.clone()), &spawn, &|_, _| {
+            panic!("an adopt must not reach the confirm prompt")
+        });
         assert!(!called.load(Ordering::Relaxed), "an adopt must not spawn");
         let recorded = crate::manifest::read_at(&crate::manifest::installed_path_in(&root))
             .expect("installed manifest recorded");
