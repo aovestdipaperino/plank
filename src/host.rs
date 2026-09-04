@@ -892,17 +892,21 @@ fn restore_reclaimed(
     timings: &mut KvTimings,
 ) -> Result<(), EngineError> {
     let mut session = Arc::clone(model).spawn(slot.ctx_size)?;
-    if let Some(path) = slot.snapshot_path.take() {
+    // Read and restore before taking the path from the slot: a read or restore
+    // failure leaves `snapshot_path` in place for a retry, instead of orphaning
+    // the snapshot file on disk with no reference to it.
+    if let Some(path) = slot.snapshot_path.as_ref() {
         let bytes =
-            std::fs::read(&path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
+            std::fs::read(path).map_err(|e| EngineError::new(format!("restore snapshot: {e}")))?;
         let started = Instant::now();
         session.restore_bytes(&bytes)?;
         timings.restore = Some(KvTiming {
             bytes: bytes.len(),
             elapsed: started.elapsed(),
         });
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path);
     }
+    slot.snapshot_path = None;
     slot.ctx_tokens = session.ctx_tokens();
     slot.session = Some(session);
     Ok(())

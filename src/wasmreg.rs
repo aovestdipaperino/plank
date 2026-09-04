@@ -2110,19 +2110,6 @@ impl Registry {
             ..Self::default()
         };
         for component in &set.components {
-            let Some(sha) = module_sha256(&component.path) else {
-                out.warnings.push(format!(
-                    "wasm component '{}': cannot hash {}",
-                    component.manifest.id,
-                    component.path.display()
-                ));
-                continue;
-            };
-            let decision = judge(component, &sha, project, trust);
-            if !decision.is_trusted() {
-                out.held.push((component.clone(), decision));
-                continue;
-            }
             let Ok(bytes) = std::fs::read(&component.path) else {
                 out.warnings.push(format!(
                     "wasm component '{}': cannot read {}",
@@ -2131,6 +2118,19 @@ impl Registry {
                 ));
                 continue;
             };
+            let Some(sha) = crate::imagepaste::sha256_hex(&bytes) else {
+                out.warnings.push(format!(
+                    "wasm component '{}': cannot hash {}",
+                    component.manifest.id,
+                    component.path.display()
+                ));
+                continue;
+            };
+            let decision = judge(component, &bytes, &sha, project, trust);
+            if !decision.is_trusted() {
+                out.held.push((component.clone(), decision));
+                continue;
+            }
             // Exactly the capabilities this component declared — which, by the
             // time it reaches here, the user has approved. The runtime never
             // sees the manifest, so the grant set is the whole of what it
@@ -2777,15 +2777,42 @@ fn render_config(manifest: &WasmManifest) -> String {
 /// Split from `build` only to keep that function under the length lint; the
 /// pairing is the point, since a decision made without looking for a signature
 /// would never let a signed update through.
-fn judge(component: &WasmComponent, sha256: &str, project: &Path, trust: &TrustStore) -> Decision {
+///
+/// Takes the module `bytes` directly so the signature check and the eventual
+/// `host.load` all see the same buffer — closing a TOCTOU window where the file
+/// on disk could be swapped between the hash read and the load read.
+fn judge(
+    component: &WasmComponent,
+    bytes: &[u8],
+    sha256: &str,
+    project: &Path,
+    trust: &TrustStore,
+) -> Decision {
     // Before the signature is even read: a disabled component should not prompt
     // for approval it will not use, and reading a `.minisig` for something
     // switched off is work nobody asked for.
     if trust.disabled().contains(&component.manifest.id) {
         return Decision::Disabled;
     }
-    let sig = signature_status(&component.path, trust);
+    let sig = signature_status_for_path(&component.path, bytes, trust);
     trust.evaluate(component, sha256, project, &sig)
+}
+
+/// Reads `<module>.minisig` beside a module and verifies it against the
+/// publisher keys `trust` holds, using `bytes` — the module contents the caller
+/// already read — rather than reading the module a second time. This is the
+/// TOCTOU-safe half of [`signature_status`], for the `build` path.
+fn signature_status_for_path(module: &Path, bytes: &[u8], trust: &TrustStore) -> SigStatus {
+    let mut sig_path = module.as_os_str().to_os_string();
+    sig_path.push(".minisig");
+    let Ok(sig_text) = std::fs::read_to_string(PathBuf::from(sig_path)) else {
+        return SigStatus::Absent;
+    };
+    let sig = match crate::wasmsig::Signature::parse(&sig_text) {
+        Ok(sig) => sig,
+        Err(e) => return SigStatus::Invalid(e.to_string()),
+    };
+    signature_status_for_sig(&sig, bytes, trust)
 }
 
 /// Reads `<module>.minisig` beside a module and verifies it against the
@@ -2816,6 +2843,17 @@ pub fn signature_status(module: &Path, trust: &TrustStore) -> SigStatus {
     let Ok(bytes) = std::fs::read(module) else {
         return SigStatus::Invalid("cannot read the module to verify it".to_string());
     };
+    signature_status_for_sig(&sig, &bytes, trust)
+}
+
+/// The verification half of [`signature_status`], split out so the `build`
+/// path can pass the same module bytes it already read — and will load into
+/// the host — instead of reading the file a second time and racing a swap.
+fn signature_status_for_sig(
+    sig: &crate::wasmsig::Signature,
+    bytes: &[u8],
+    trust: &TrustStore,
+) -> SigStatus {
     // Only keys the user has accepted count. Trying every key would let an
     // attacker who can write the trust file also choose the verdict.
     for (id, encoded) in trust.publishers() {
@@ -2825,7 +2863,7 @@ pub fn signature_status(module: &Path, trust: &TrustStore) -> SigStatus {
         if key.key_id != sig.key_id() {
             continue;
         }
-        return match crate::wasmsig::verify(&bytes, &sig, &key) {
+        return match crate::wasmsig::verify(bytes, sig, &key) {
             Ok(()) => SigStatus::Valid(id.clone()),
             Err(e) => SigStatus::Invalid(e.to_string()),
         };
