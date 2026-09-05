@@ -73,6 +73,13 @@ pub struct SidechainDump {
     pub fork_at: usize,
     /// The sidechain's messages, framed task first, in order.
     pub messages: Vec<crate::session::Message>,
+    /// The `subagent-<ordinal>` of the console window this sidechain streamed
+    /// to, so a console attaching later can reopen the same window.
+    pub ordinal: usize,
+    /// Whether that window was connected when the sidechain ended. A dump
+    /// that was never mirrored is what a late console gets backfilled with;
+    /// set once the backfill has been written so it is sent only once.
+    pub mirrored: bool,
 }
 
 impl SidechainDump {
@@ -83,6 +90,8 @@ impl SidechainDump {
         task: &str,
         fork_at: usize,
         messages: &[crate::session::Message],
+        ordinal: usize,
+        mirrored: bool,
     ) -> Self {
         Self {
             label: label.to_owned(),
@@ -98,6 +107,8 @@ impl SidechainDump {
                     images: Vec::new(),
                 })
                 .collect(),
+            ordinal,
+            mirrored,
         }
     }
 }
@@ -329,7 +340,7 @@ mod tests {
             crate::session::Message::user("task"),
             crate::session::Message::assistant("done"),
         ];
-        let mut dump = SidechainDump::new("reviewer", "look at x", 7, &msgs);
+        let mut dump = SidechainDump::new("reviewer", "look at x", 7, &msgs, 1, true);
         dump.outcome = "failed: interrupted".to_owned();
         let report = build_sidecar_report("9.9.9", "repro-2000.md", 1, &dump, "[user]\ntask\n");
         let path = save_sidecar(&main, 1, &report).unwrap();
@@ -367,12 +378,20 @@ mod tests {
                 fingerprint: [1; 32],
             },
         });
-        let dump = SidechainDump::new("sub-agent", "t", 0, &[m]);
+        let dump = SidechainDump::new("sub-agent", "t", 0, &[m], 1, true);
         assert_eq!(dump.messages.len(), 1);
         assert!(dump.messages[0].images.is_empty());
         assert_eq!(dump.messages[0].at, 42);
         assert_eq!(dump.messages[0].text, "<tool_result>img</tool_result>");
         assert_eq!(dump.outcome, "ended");
+    }
+
+    #[test]
+    fn a_dump_remembers_its_window_ordinal_and_whether_it_was_mirrored() {
+        let m = crate::session::Message::assistant("hi");
+        let dump = SidechainDump::new("sub-agent", "t", 0, &[m], 3, false);
+        assert_eq!(dump.ordinal, 3);
+        assert!(!dump.mirrored);
     }
 
     #[test]

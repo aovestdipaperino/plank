@@ -821,10 +821,23 @@ fn fanout_slot_result(
             "no report".to_owned(),
         ),
     };
-    let mut dump =
-        crate::repro::SidechainDump::new(&s.label, &s.task, fork_at, &s.session.transcript);
+    let mut dump = crate::repro::SidechainDump::new(
+        &s.label,
+        &s.task,
+        fork_at,
+        &s.session.transcript,
+        s.mirror.ordinal(),
+        crate::debugmirror::is_connected(s.mirror.id()),
+    );
     dump.outcome = outcome;
     (("agent".to_string(), out), dump)
+}
+
+/// What a finished serial sub-agent hands back for its `/repro` dump.
+#[derive(Debug, Clone, Copy)]
+struct SubagentDone {
+    ordinal: usize,
+    mirrored: bool,
 }
 
 struct FanoutSlot {
@@ -2404,7 +2417,7 @@ impl Agent<'_> {
             task: task.clone(),
         });
         self.tool_ctx.subagent_depth += 1;
-        let result = match alt {
+        let (done, result) = match alt {
             None => self.run_subagent_loop(),
             Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_subagent_loop),
         };
@@ -2412,7 +2425,7 @@ impl Agent<'_> {
         let isolation_note = self.end_agent_isolation(isolation);
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
-        let report = self.end_subagent_fork(fork_at, &label, &task);
+        let report = self.end_subagent_fork(fork_at, &label, &task, done);
         if let Err(e) = &result {
             self.note_sidechain_outcome(&format!("failed: {e}"));
         }
@@ -2528,7 +2541,7 @@ impl Agent<'_> {
     /// or compaction. Bounded by a round budget so a stuck sub-agent cannot loop
     /// forever. Nested `agent` calls route through [`run_tool_calls`], so the
     /// [`SUBAGENT_DEPTH_CAP`](crate::tools::SUBAGENT_DEPTH_CAP) guard applies.
-    fn run_subagent_loop(&mut self) -> Result<(), String> {
+    fn run_subagent_loop(&mut self) -> (SubagentDone, Result<(), String>) {
         // The parent turn's status sink writes bare `SystemStatus` events into
         // the MAIN log; leaving it installed would scatter the sub-agent's
         // "Searching Google for …" notices across the parent transcript while
@@ -2573,7 +2586,11 @@ impl Agent<'_> {
         };
         self.tool_ctx.status_sink = parent_sink;
         self.tool_ctx.markdown_sink = parent_md;
-        result
+        let done = SubagentDone {
+            ordinal: mirror.ordinal(),
+            mirrored: crate::debugmirror::is_connected(mirror.id()),
+        };
+        (done, result)
     }
 
     /// The bounded generate→dispatch rounds of a sub-agent sidechain; see
@@ -6973,13 +6990,21 @@ the original is frozen and listed in /tree"
     /// report, extracted before the truncate. Every fork-end path goes
     /// through here so the depth counter opened by
     /// [`begin_subagent_fork`](Self::begin_subagent_fork) always closes.
-    fn end_subagent_fork(&mut self, fork_at: usize, label: &str, task: &str) -> Option<String> {
+    fn end_subagent_fork(
+        &mut self,
+        fork_at: usize,
+        label: &str,
+        task: &str,
+        done: SubagentDone,
+    ) -> Option<String> {
         let report = last_assistant_text(&self.session.transcript[fork_at..]);
         let mut dump = crate::repro::SidechainDump::new(
             label,
             task,
             fork_at,
             &self.session.transcript[fork_at..],
+            done.ordinal,
+            done.mirrored,
         );
         dump.outcome = if report.is_some() {
             "report".to_owned()
@@ -7497,12 +7522,12 @@ the original is frozen and listed in /tree"
     /// always runs clean-room — the parent transcript is stashed and only the
     /// framed task is visible — so no parent context is sent to the provider and
     /// only the task is billed.
-    fn run_sidechain_on(
+    fn run_sidechain_on<T>(
         &mut self,
         key: EngineKey,
         engine: Box<dyn Engine>,
-        run: impl FnOnce(&mut Self) -> Result<(), String>,
-    ) -> Result<(), String> {
+        run: impl FnOnce(&mut Self) -> T,
+    ) -> T {
         let parent_engine = std::mem::replace(&mut self.engine, engine);
         // The framed task is the last message; keep it, hide everything before.
         let stashed = {
@@ -7541,7 +7566,11 @@ the original is frozen and listed in /tree"
     /// the sidechain produced no report (e.g. interrupted before any output);
     /// the transcript is still restored.
     fn finish_subagent_fork(&mut self, fork_at: usize, task: &str) -> bool {
-        match self.end_subagent_fork(fork_at, "subagent", task) {
+        let done = SubagentDone {
+            ordinal: 0,
+            mirrored: true,
+        };
+        match self.end_subagent_fork(fork_at, "subagent", task, done) {
             Some(report) => {
                 self.session
                     .push(Message::user(crate::agents::report_message(task, &report)));
@@ -19379,7 +19408,15 @@ mod tests {
 
         assert_eq!(
             agent
-                .end_subagent_fork(fork_at, "sub-agent", "t")
+                .end_subagent_fork(
+                    fork_at,
+                    "sub-agent",
+                    "t",
+                    SubagentDone {
+                        ordinal: 1,
+                        mirrored: true,
+                    },
+                )
                 .as_deref(),
             Some("sidechain reply")
         );
