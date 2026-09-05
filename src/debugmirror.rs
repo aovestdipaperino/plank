@@ -234,13 +234,28 @@ pub fn reconcile() {
     if reg.contains_key(&MirrorId::PARENT) {
         return; // Already connected; nothing to reconcile.
     }
-    // Best-effort, single attempt. Nothing listening on the control port is
-    // the overwhelmingly common case (no console running) and must be
-    // silent: this is optional dev tooling, not a required dependency.
-    let port = CONTROL_PORT.load(Ordering::Relaxed);
+    // Best-effort, single attempt. No console running is the overwhelmingly
+    // common case and must be silent and cheap: this is optional dev tooling,
+    // not a required dependency.
+    let Some(port) = console_port() else {
+        return;
+    };
     if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &session_name()) {
         reg.insert(MirrorId::PARENT, stream);
     }
+}
+
+/// The control port to dial, or `None` when no console is up.
+///
+/// On the real control port this asks the client crate's liveness marker (an
+/// `flock` on a temp file the console holds for its lifetime: two syscalls,
+/// no network I/O) instead of paying for a TCP connect that fails. Tests
+/// point `CONTROL_PORT` at their own `fake_console` listener, which holds no
+/// such lock, so any non-default port skips the marker and dials directly.
+fn console_port() -> Option<u16> {
+    let port = CONTROL_PORT.load(Ordering::Relaxed);
+    let marker_applies = port == turbo_debug_client::CONTROL_PORT;
+    (!marker_applies || turbo_debug_client::is_console_running()).then_some(port)
 }
 
 /// Mirrors a synthetic opening `<think>` tag so the console's own
@@ -410,7 +425,9 @@ pub fn open_subagent() -> SubagentMirror {
         return SubagentMirror { id };
     }
     let name = subagent_name(&raw_session_name(), ordinal);
-    let port = CONTROL_PORT.load(Ordering::Relaxed);
+    let Some(port) = console_port() else {
+        return SubagentMirror { id };
+    };
     if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &name) {
         MIRRORS
             .lock()

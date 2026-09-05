@@ -6371,9 +6371,12 @@ dependencies = [
 
 [[package]]
 name = "turbo-debug-client"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbc55aec361f750b1a9acdcc8c940f3db6b8c8ed54e62df144c03c43d57afa9c"
+checksum = "d9278b286e90dd2dd0a43d5a00c72ae900ee53df7fb2db47c0d58ceb04bd2165"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "typenum"
