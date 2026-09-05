@@ -867,6 +867,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "append a durable note to project or user memory",
     },
     SlashCommand {
+        name: "/memory",
+        args: "",
+        desc: "edit user and project memory together in the built-in editor",
+    },
+    SlashCommand {
         name: "/think",
         args: "[low|medium|max|off]",
         desc: "set how much reasoning to ask the model for",
@@ -993,6 +998,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
             | "/frame"
             | "/templates"
             | "/tasks"
+            | "/memory"
             | "/agent"
             | "/hooks"
             | "/remote-control"

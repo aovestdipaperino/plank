@@ -26,6 +26,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   searched, so a search over `.` no longer returns the `target/package/` copy
   of every source file ahead of the real matches.
 
+### Added
+
+- **`/memory` edits every memory file at once.** It builds one buffer from
+  `~/.plank/MEMORY.md` and `./.plank/MEMORY.md`, each between
+  `<!-- plank-memory: begin/end <scope> <path> -->` markers, and opens it in
+  the built-in editor. On save the buffer is split back along the markers:
+  only files whose text changed are written, a file is created when its
+  empty section gained text, notes typed between or after sections join the
+  section above them, and deleting a section's markers leaves that file
+  untouched. Malformed markup (an unclosed or duplicated section) writes
+  nothing. The path on a marker is informational; a hand-edited one cannot
+  redirect the write. The plain-stdout path prints the combined view.
+
 ### Changed
 
 - **Reasoning defaults to low effort.** `--think-low` is now the default and

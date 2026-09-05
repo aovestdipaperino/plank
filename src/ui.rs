@@ -4336,6 +4336,15 @@ impl Agent<'_> {
                 ),
                 Err(e) => println!("{e}\nusage: /remember [user] <text> (default scope: project)"),
             },
+            // Static equivalent of the TUI editor: print the combined view so
+            // the sources and their bounds are at least visible here.
+            "/memory" => {
+                print!(
+                    "{}",
+                    crate::memory::combine(&crate::memory::sources_for(&self.tool_ctx.cwd))
+                );
+                println!("/memory editing requires the interactive TUI");
+            }
             "/rate" => println!("{}", self.rate_command(arg)),
             "/search" => {
                 if arg.trim().is_empty() {
@@ -11476,6 +11485,7 @@ impl Agent<'_> {
                     log.push_plain("usage: /remember [user] <text> (default scope: project)");
                 }
             },
+            "/memory" => self.tui_memory(log, terminal),
             "/search" => {
                 if arg.trim().is_empty() {
                     log.push_plain("usage: /search <query> [--all]".to_owned());
@@ -11695,6 +11705,38 @@ impl Agent<'_> {
     ///
     /// Every refusal is a log line and no launch, so a typo cannot create a
     /// file. The browser branch sits above the editor branch and outside the
+    /// `/memory`: every memory source in one buffer of the built-in editor,
+    /// each between markers naming its scope and file; on accept the buffer
+    /// is split back along those markers (`memory::apply`) and only the
+    /// files whose text changed are written.
+    #[cfg(feature = "builtin_editor")]
+    fn tui_memory(&mut self, log: &mut OutputLog, terminal: &mut ratatui::DefaultTerminal) {
+        let sources = crate::memory::sources_for(&self.tool_ctx.cwd);
+        let initial = crate::memory::combine(&sources);
+        let edited = with_tui_suspended(terminal, || {
+            crate::miniedit::edit_file("memory.md", &initial)
+        });
+        match edited {
+            Ok(Some(text)) => match crate::memory::apply(&sources, &text) {
+                Ok(report) => {
+                    for line in report {
+                        log.push_dim(format!("[memory] {line}"));
+                    }
+                }
+                Err(e) => log.push_plain(format!("/memory: {e}; nothing written")),
+            },
+            Ok(None) => log.push_dim("[memory] unchanged".to_owned()),
+            Err(e) => log.push_plain(format!("/memory failed: {e}")),
+        }
+    }
+
+    #[cfg(not(feature = "builtin_editor"))]
+    fn tui_memory(&mut self, log: &mut OutputLog, _terminal: &mut ratatui::DefaultTerminal) {
+        log.push_plain(
+            "/memory needs the built-in editor (build with --features builtin_editor)".to_owned(),
+        );
+    }
+
     /// `builtin_editor` feature gate: rendering an HTML report needs no editor,
     /// so it works in a build that has none compiled in.
     fn tui_open(
