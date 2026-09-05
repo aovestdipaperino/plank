@@ -789,6 +789,16 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.preflight_error.as_deref()
     }
 
+    /// Records a failure raised outside the renderer, on the same channel a
+    /// preflight failure uses, so the caller's existing "stop the engine and
+    /// feed the error back to the model" path handles it. The first failure
+    /// wins; later ones are ignored. Used by the turn loop's repetition guard.
+    pub fn fail_preflight(&mut self, err: impl Into<String>) {
+        if self.preflight_error.is_none() {
+            self.preflight_error = Some(err.into());
+        }
+    }
+
     /// Starts the stream already inside a `<think>` block.
     ///
     /// Use when the chat template opened thinking in the prefill prefix, so the

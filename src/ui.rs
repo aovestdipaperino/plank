@@ -597,6 +597,40 @@ fn tool_error_payload(kind: PassError, err: &str) -> String {
     }
 }
 
+/// Bytes of trailing reasoning the turn loop watches for a repetition cycle.
+///
+/// Wide enough for four cycles of a three-paragraph loop; see
+/// [`crate::insights::RepeatGuard::with_window`].
+const REPEAT_LOOP_WINDOW: usize = 8192;
+
+/// Model-facing text fed back when a pass is stopped for repeating itself.
+/// A single line on purpose: a `\`-continued literal would strip indentation.
+const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
+
+/// Per-chunk bookkeeping shared by every generation site: refreshes the
+/// greedy-sampling flag from the renderer, feeds the repetition guard while
+/// the model is thinking, and reports whether the pass must stop — because
+/// the guard saw the tail cycling, or because a mid-stream preflight failed.
+///
+/// A tripped guard records [`REPEAT_LOOP_ERROR`] on the renderer, so the
+/// ordinary preflight-error path feeds it back to the model. Only reasoning
+/// is watched: visible output and tool arguments legitimately repeat — a
+/// `write` of a table with identical rows would trip the guard — and the
+/// observed hour-long stall was a `<think>` block that cycled three
+/// paragraphs 263 times until the token cap (FINDINGS.md).
+fn stream_chunk_must_stop<S: RenderSink>(
+    guard: &mut crate::insights::RepeatGuard,
+    stream: &mut StreamRenderer<S>,
+    chunk: &str,
+    greedy: &AtomicBool,
+) -> bool {
+    greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
+    if stream.in_think() && guard.feed(chunk) {
+        stream.fail_preflight(REPEAT_LOOP_ERROR);
+    }
+    stream.preflight_error().is_some()
+}
+
 /// Which [`PassError`] a finished pass represents.
 fn pass_error_kind(preflight: bool, in_think_rejected: bool) -> PassError {
     if preflight {
@@ -1869,6 +1903,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
+        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
         let bufs = self
@@ -1910,8 +1945,7 @@ impl Agent<'_> {
                         // debug console; a no-op unless showThinking is off
                         // and a console is connected.
                         crate::debugmirror::push(&t);
-                        greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-                        if stream.preflight_error().is_some() {
+                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
                             preflight_stop.store(true, Ordering::Relaxed);
                         }
                     }
@@ -2491,6 +2525,7 @@ fn generate_pass(
     let mut assistant_text = String::new();
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
+    let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
     let st;
     let prompt = match bufs {
         Some(b) => {
@@ -2518,8 +2553,7 @@ fn generate_pass(
                     // — a sub-agent's when a `SubagentMirror` guard is active,
                     // the parent's otherwise.
                     crate::debugmirror::push(&t);
-                    greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-                    if stream.preflight_error().is_some() {
+                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
                         preflight_stop.store(true, Ordering::Relaxed);
                     }
                 }
@@ -5887,7 +5921,7 @@ the original is frozen and listed in /tree"
                     // A degenerate reply repeats one clause until the budget
                     // runs out; stopping it early is the difference between a
                     // dropped section and minutes of visible nonsense.
-                    let mut guard = insights::RepeatGuard::new();
+                    let mut guard = crate::insights::RepeatGuard::new();
                     let mut looped = false;
                     let opts = crate::engine::GenerationOptions {
                         // Per section: the two that must *write* something to
@@ -6111,6 +6145,26 @@ the original is frozen and listed in /tree"
             .find(&id)
             .map_or_else(|_| self.store.dir().join(format!("{id}.kv")), |(_, p)| p);
         Some((id, path))
+    }
+
+    /// The headless counterpart of [`Self::report_session_on_exit`]: saves the
+    /// transcript like an interactive exit does, but announces it on stderr so
+    /// a script consuming stdout sees only the model's output. A headless run
+    /// used to leave no trace at all, which made a slow or looping run
+    /// impossible to analyse afterwards; `--no-session` (`enabled == false`)
+    /// restores that for callers who want nothing written.
+    fn save_headless_session(&mut self, enabled: bool) {
+        if !enabled {
+            self.discard_ladder();
+            return;
+        }
+        if let Some((id, path)) = self.save_for_exit() {
+            eprintln!(
+                "plank: session saved to {} (resume with: plank /resume {})",
+                path.display(),
+                crate::session::display_id(&id)
+            );
+        }
     }
 
     /// At session end, saves the transcript and prints where it landed and how
@@ -10498,6 +10552,7 @@ impl Agent<'_> {
         // Mirrors the C's worker greedy flag: argmax sampling while the
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
+        let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
         let ctx_size = self.engine.ctx_size();
         let power = self.power_percent;
         let think = self.think;
@@ -10534,8 +10589,7 @@ impl Agent<'_> {
                     stream.push(&t);
                     // See `stream_generation`: same tee, TUI side.
                     crate::debugmirror::push(&t);
-                    greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
-                    if stream.preflight_error().is_some() {
+                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
                         preflight_stop.store(true, Ordering::Relaxed);
                     }
                     gen_count += 1;
@@ -13394,6 +13448,7 @@ pub fn run_non_interactive(
     if let Some(prompt) = cfg.prompt.as_deref() {
         agent.session.push(Message::user(prompt));
         let r = agent.run_turn();
+        agent.save_headless_session(cfg.save_session);
         agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
         crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
         return r;
@@ -13414,6 +13469,7 @@ pub fn run_non_interactive(
         agent.session.push(Message::user(prompt.trim_end()));
         agent.run_turn()?;
     }
+    agent.save_headless_session(cfg.save_session);
     agent.fire_session_end("exit", &mut |w| eprintln!("{w}"));
     crate::debugmirror::disconnect(crate::debugmirror::REASON_EXIT);
     Ok(())

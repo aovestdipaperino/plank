@@ -2035,3 +2035,91 @@ name is coloured — can overwrite the caret a concurrent test is asserting on.
 `cursor::TEST_LOCK` serializes every test that touches either global; acquire
 it at the top of the `#[test]` function and never inside a shared helper, or
 the non-reentrant mutex deadlocks the suite instead of failing it.
+
+## An hour-long turn was one thinking loop, not a hundred tool calls
+
+A session that took plank two hours on a request Claude Code finished in
+minutes had 46 tool calls and no edit to the project. The time was one
+assistant message: 149K characters of `<think>` in which three paragraphs
+("Need maybe add `MF_AUTO_DISMISS` to...") repeated 263 times, until the 50K
+token `n_predict` cap stopped it. At 25 tokens per second that is about 50
+minutes of silence, and the reply after the cap was empty.
+
+`insights::RepeatGuard` already detected exactly this, but was wired only into
+the insights sections. It now runs on every generation site (`stream_generation`,
+the quiet sub-agent pass, `worker_generate_kind`) through
+`ui::stream_chunk_must_stop`, with three rules that are easy to break:
+
+- **Watch reasoning only.** The guard is fed while `stream.in_think()`.
+  Visible output and tool arguments repeat legitimately — a `write` of a table
+  with identical rows is four cycles of a 12-byte period — and would trip it.
+- **The window must hold four cycles of a paragraph loop.** The observed
+  period was about 600 bytes; the insights default of 1 KiB can never see it.
+  The turn loop uses `RepeatGuard::with_window(8192)`, and the check interval
+  scales with the window so the scan stays bounded on fast provider streams.
+- **Stop through the preflight-error channel.** `StreamRenderer::fail_preflight`
+  records the model-facing text, so the existing "engine interrupted but it is
+  a tool error, not a user abort" path feeds it back as `Tool error:` and the
+  turn continues. A new stop reason would have needed its own plumbing at all
+  three consumers.
+
+## `edit` on a CRLF file: multi-line `old` never matches, single-line `old` corrupts
+
+`src/helpers/msgbox.rs` in turbo-vision is CRLF on 242 of 265 lines. The model
+writes LF. A byte-exact match of a multi-line `old` therefore always fails
+("old text anchor not found"), and each failure costs a full re-read and retry
+turn — five of them in one 40-minute run. Worse, a single-line `old` matches
+as a substring and the LF in `new` replaces the file's CRLF, so the diff shows
+the anchor line changed by line ending alone. `tools::edit::adapt_line_endings`
+now converts LF to CRLF in both `old` and `new` when the whole file is CRLF
+and the text carries no `\r` of its own; mixed-ending files are left alone,
+because guessing there would corrupt the other kind of line.
+
+## `search` must skip `target/`, or Cargo's package copy drowns the real matches
+
+`cargo package` leaves a full copy of the crate under `target/package/<crate>/`.
+The search tool skipped only `.git`, so a search over `.` returned that copy of
+every example first: two results in one session were 54K and 71K characters of
+duplicates, a third of the session's prefill, and the model then spent a turn
+on "search output polluted target". The walker now skips `SEARCH_SKIP_DIRS`
+(VCS metadata, `node_modules`) and any directory holding a `CACHEDIR.TAG`, the
+marker Cargo writes into `target/`. The tag is checked rather than the name, so
+a source directory called `target` is still searched.
+
+## Three reruns of one request: where a local agent's time really goes
+
+Method, so it can be repeated: check out the target project at a fixed tag in a
+scratch worktree, `tokensave init` it, run
+`plank --non-interactive -p "<request>"` under a 40-minute `alarm`, and analyse
+the saved transcript (headless runs now save one) for invokes per stanza,
+thinking size per turn, and edit failures. The request was "add an option to
+auto dismiss message boxes after 3 seconds" against turbo-vision-4-rust v2.3.0,
+which Claude Code completes in a few minutes.
+
+| run | changes in effect | wall | tool calls | edits (failed) | outcome |
+|---|---|---|---|---|---|
+| original | — | ~2 h | 46 | 1 (1) | thinking loop, nothing edited |
+| 1 | repeat guard, CRLF edit, search skip | 40 min cap | ? | 14 (5) | 3 files, ~80 % done |
+| 2 | + Working style rules 1-4, session recording | 23 min | 69 | 15 (0) | 6 files incl. unasked docs, tests pass |
+| 3 | + rules 5-7, `--think-low` | 16.5 min | 36 | 13 (0) | 4 files, code only, tests pass |
+
+What each lever bought, in order of size:
+
+- **Stopping the loop** is the difference between two hours and any finite
+  time at all. Nothing else matters until it is in place.
+- **`--think-low`** was the biggest change in a finished run: 23 → 16.5 min,
+  and the reasoning changed character from a stuttering "Need maybe..." list
+  to numbered plans with no repeated paragraphs. It is now the default.
+- **CRLF-aware `edit`** removed five failed edits, each a re-read and a retry
+  turn, in the one CRLF file.
+- **Scope rule** removed six turns of changelog, docs-reference and
+  user-guide edits nobody asked for.
+- **Edit from search context** cut reads from 21 to 8; the edit phase ran 13
+  edits in about four minutes.
+- **Batching** helped only during exploration (3-4 invokes per stanza); the
+  edit phase is inherently one edit per turn.
+
+What is left is genuine reasoning at ~25 tokens per second: one 15K-character
+planning block cost four minutes of run 3 and produced a correct plan. From
+here the lever is decode speed, not the prompt. Run transcripts:
+`witty-ohm` (original), `wacky-rossi` (run 2), `witty-mercury-efd30951` (run 3).

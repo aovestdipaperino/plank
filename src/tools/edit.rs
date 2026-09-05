@@ -114,6 +114,37 @@ pub fn edit_find_old_span(data: &[u8], old: &[u8]) -> Result<(usize, usize, bool
     Ok((head_pos, tail_pos - head_pos + tail.len(), true))
 }
 
+/// Adapts a model-authored `old`/`new` pair to a CRLF file.
+///
+/// The model writes LF; a Windows-style file has `\r\n`. A byte-exact match
+/// of a multi-line `old` then always fails, and a single-line match silently
+/// converts that one line to LF — both seen in the field on a CRLF source
+/// file (see FINDINGS.md). When the file uses CRLF and the text carries no
+/// `\r` of its own, every LF in both `old` and `new` becomes CRLF so the
+/// match works and the file keeps its own line endings. A file with mixed or
+/// pure-LF endings, or text that already contains `\r`, is left alone.
+pub(crate) fn adapt_line_endings(data: &[u8], old: &str, new: &str) -> (String, String) {
+    if !file_uses_crlf(data) || old.contains('\r') || new.contains('\r') {
+        return (old.to_owned(), new.to_owned());
+    }
+    (old.replace('\n', "\r\n"), new.replace('\n', "\r\n"))
+}
+
+/// True when every newline in `data` is preceded by a carriage return and
+/// there is at least one such newline.
+fn file_uses_crlf(data: &[u8]) -> bool {
+    let mut saw_newline = false;
+    for (i, &b) in data.iter().enumerate() {
+        if b == b'\n' {
+            saw_newline = true;
+            if i == 0 || data[i - 1] != b'\r' {
+                return false;
+            }
+        }
+    }
+    saw_newline
+}
+
 /// Preflights an edit's old text against the current file contents.
 ///
 /// Mirrors `agent_preflight_edit_old`: silently passes while the path is
@@ -132,6 +163,7 @@ pub fn preflight_edit_old(ctx: &ToolContext, call: &ToolCall) -> Result<(), Stri
         return Err("edit requires non-empty old text".to_string());
     }
     let data = read_file_bytes(&ctx.resolve(path), path)?;
+    let (old, _) = adapt_line_endings(&data, old, "");
     edit_find_old_span(&data, old.as_bytes()).map(|_| ())
 }
 
@@ -281,6 +313,7 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
         Ok(d) => d,
         Err(err) => return format!("Tool error: {err}\n"),
     };
+    let (old, new_text) = adapt_line_endings(&data, old, new_text);
     let (offset, remove_len, anchored) = match edit_find_old_span(&data, old.as_bytes()) {
         Ok(span) => span,
         Err(err) => return format!("Tool error: {err}\n"),
@@ -315,6 +348,27 @@ pub fn tool_edit(ctx: &mut ToolContext, call: &ToolCall) -> String {
 // ---------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------
+
+/// Directory names the search never descends into: VCS metadata and the
+/// dependency trees that are never the code being edited.
+const SEARCH_SKIP_DIRS: &[&str] = &[".git", ".hg", ".svn", ".jj", "node_modules"];
+
+/// Whether `search` should skip a directory entry.
+///
+/// Names in [`SEARCH_SKIP_DIRS`] are skipped outright. So is any directory
+/// carrying a `CACHEDIR.TAG`, the marker Cargo writes into `target/` (and
+/// other tools into their caches): on a Rust project a search over `.`
+/// otherwise returns the `target/package/` copy of every source file first
+/// and drowns the real matches — one such result was 71K characters of
+/// duplicates (see FINDINGS.md). The tag file is checked rather than the
+/// name `target`, so a source directory that happens to be called `target`
+/// is still searched.
+fn is_skipped_search_dir(path: &Path, name: &std::ffi::OsStr) -> bool {
+    if SEARCH_SKIP_DIRS.iter().any(|d| name == *d) {
+        return true;
+    }
+    path.join("CACHEDIR.TAG").is_file()
+}
 
 /// Minimal POSIX-ERE-style matcher standing in for the C `regex_t` usage.
 ///
@@ -672,7 +726,8 @@ impl SearchCtx {
         let _ = spans;
     }
 
-    /// Recursively searches a path, skipping `.git` and honoring the cap.
+    /// Recursively searches a path, skipping VCS metadata and build output,
+    /// and honoring the cap.
     fn search_path(&mut self, path: &Path, display: &str, depth: usize) {
         if self.results >= self.max_results || depth > 24 {
             return;
@@ -695,7 +750,7 @@ impl SearchCtx {
                 break;
             }
             let name = entry.file_name();
-            if name == ".git" {
+            if is_skipped_search_dir(&entry.path(), &name) {
                 continue;
             }
             let child_display = format!("{display}/{}", name.to_string_lossy());
@@ -888,6 +943,69 @@ mod tests {
     }
 
     // Ports of the C DS4_AGENT_TEST cases for [upto] spans.
+    #[test]
+    fn crlf_file_adapts_multiline_old_and_new() {
+        let data = b"use a;\r\nuse b;\r\nfn main() {}\r\n";
+        let (old, new) = adapt_line_endings(data, "use a;\nuse b;\n", "use a;\nuse b;\nuse c;\n");
+        assert_eq!(old, "use a;\r\nuse b;\r\n");
+        assert_eq!(new, "use a;\r\nuse b;\r\nuse c;\r\n");
+        let (off, len, _) = edit_find_old_span(data, old.as_bytes()).unwrap();
+        assert_eq!((off, len), (0, old.len()));
+    }
+
+    #[test]
+    fn lf_file_leaves_old_and_new_alone() {
+        let data = b"use a;\nuse b;\n";
+        let (old, new) = adapt_line_endings(data, "use a;\nuse b;\n", "x\n");
+        assert_eq!(old, "use a;\nuse b;\n");
+        assert_eq!(new, "x\n");
+    }
+
+    #[test]
+    fn mixed_endings_or_explicit_cr_are_not_adapted() {
+        let mixed = b"a\r\nb\nc\r\n";
+        assert_eq!(
+            adapt_line_endings(mixed, "b\n", "d\n"),
+            ("b\n".into(), "d\n".into())
+        );
+        let crlf = b"a\r\nb\r\n";
+        assert_eq!(
+            adapt_line_endings(crlf, "a\r\n", "z\n"),
+            ("a\r\n".into(), "z\n".into())
+        );
+        assert!(!file_uses_crlf(b"no newline at all"));
+    }
+
+    #[test]
+    fn search_skips_cachedir_tagged_and_named_dirs() {
+        let root = std::env::temp_dir().join(format!("plank-search-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("target/package")).unwrap();
+        std::fs::write(
+            root.join("target/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55",
+        )
+        .unwrap();
+        std::fs::write(root.join("target/package/dup.rs"), "needle_xyz\n").unwrap();
+        std::fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        std::fs::write(root.join("node_modules/pkg/i.js"), "needle_xyz\n").unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/real.rs"), "needle_xyz\n").unwrap();
+        assert!(is_skipped_search_dir(
+            &root.join("target"),
+            std::ffi::OsStr::new("target")
+        ));
+        assert!(is_skipped_search_dir(
+            &root.join("node_modules"),
+            std::ffi::OsStr::new("node_modules")
+        ));
+        assert!(!is_skipped_search_dir(
+            &root.join("src"),
+            std::ffi::OsStr::new("src")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn upto_tail_newline_is_not_part_of_anchor() {
         let data = b"CFLAGS = -Wall -Wextra -g\nLDFLAGS =\n\nall: bc\n\nbc: main.c\n\t$(CC) $(CFLAGS) -o bc main.c $(LDFLAGS)\n\nclean:\n\trm -f bc\n";

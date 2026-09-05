@@ -125,7 +125,22 @@ ask permission to start a browser.\n\n\
 ## Rules\n\n\
 - Prefer read/search to get anchors, then anchored edit to avoid retyping large text.\n\
 - Write code that is reliable; keep a clear mental model of complex parts.\n\
-- Preserve the current system configuration integrity unless explicitly asked otherwise.\n",
+- Preserve the current system configuration integrity unless explicitly asked otherwise.\n\n\
+## Working style\n\n\
+- Batch independent tool calls in one message whenever they do not depend on each other's \
+results: every round trip is paid for separately.\n\
+- Explore briefly, then act. Once you have found and read the code to change, stop exploring \
+and edit; never re-read a file you have already seen.\n\
+- Decide, do not deliberate. When two designs are both plausible, pick the smaller one that \
+covers every call site, say so in one line, and proceed.\n\
+- Keep reasoning short and forward-moving; if you are restating an earlier thought, stop and \
+emit the tool calls you already planned.\n\
+- Edit from search output: search with context, then edit directly from the lines shown \
+instead of re-reading them.\n\
+- Stay in scope: change the code asked about and its tests; leave docs, changelogs, READMEs and \
+examples alone unless asked.\n\
+- Review changes per file (git diff -- <path>) or with git diff --stat; a whole-repository diff \
+is truncated.\n",
     );
     if crate::settings::active().git.sign_commits {
         out.push('\n');
@@ -483,12 +498,40 @@ fn build_tools_prompt_parts_with_wasm(
     insert_marker_spelling_note(&mut out);
     insert_document_read_note(&mut out);
     append_native_extra_schemas(&mut out);
+    append_working_style(&mut out);
     let trusted_len = out.len();
     crate::tools::mcp::append_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_resource_tool_schemas(&mut out, mcp_servers);
     crate::tools::mcp::append_server_instructions(&mut out, mcp_servers);
     append_wasm_tool_schemas(&mut out, wasm_tools);
     (out, trusted_len)
+}
+
+/// Plank-owned guidance on how to spend turns, appended after the native tool
+/// schemas and inside the trusted span.
+///
+/// Not in the C constants, so it sits outside [`build_tools_prompt_base`] and
+/// the parity suite keeps locking the base byte-for-byte. Every line here was
+/// earned by a measured failure (FINDINGS.md): a two-hour session that made 46
+/// tool calls at two per stanza, read 360K characters before deciding
+/// anything, and then deliberated between two equally good designs until its
+/// reasoning looped. The same request, done with batched calls and an early
+/// decision, is minutes of work. Written as plain lines, never a
+/// `\`-continued literal, so indentation cannot be stripped silently.
+const WORKING_STYLE: &str = "# Working style
+
+- Batch independent tool calls. Put several <｜DSML｜invoke> blocks in one <｜DSML｜tool_calls> stanza whenever the calls do not depend on each other's results: reading three files, running two searches, a glob plus a read. Every stanza costs a full round trip, so one stanza with five invokes is far cheaper than five stanzas with one.
+- Explore briefly, then act. Once you have found the code to change and read it once, stop exploring and edit. Do not re-read a file you have already seen; do not read a file whole when a search would locate the lines.
+- Decide, do not deliberate. When two designs are both plausible, pick the smaller one that covers every call site, say so in one line, and proceed. The user can redirect you after seeing a result; they cannot use a decision you never made.
+- Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
+- Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
+- Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
+- Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
+";
+
+fn append_working_style(out: &mut String) {
+    out.push('\n');
+    out.push_str(WORKING_STYLE);
 }
 
 /// Appends one function schema per WASM component tool, in the same shape the

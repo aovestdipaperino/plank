@@ -1646,10 +1646,25 @@ impl ThinkTicker {
 /// the pass stopped as soon as the tail is provably cyclic. A false positive
 /// costs one section of prose; the statistics and every other section are
 /// untouched.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RepeatGuard {
     tail: String,
     since_check: usize,
+    /// Bytes of trailing output examined for a cycle.
+    window: usize,
+    /// Bytes generated between checks.
+    check_every: usize,
+}
+
+impl Default for RepeatGuard {
+    fn default() -> Self {
+        Self {
+            tail: String::new(),
+            since_check: 0,
+            window: REPEAT_WINDOW,
+            check_every: REPEAT_CHECK_EVERY,
+        }
+    }
 }
 
 /// Bytes of trailing output examined for a cycle.
@@ -1670,21 +1685,36 @@ impl RepeatGuard {
         Self::default()
     }
 
+    /// A guard that watches a wider tail, for streams whose loops have long
+    /// periods: a coding agent stuck in its reasoning repeats whole
+    /// paragraphs, not clauses. One observed loop cycled three paragraphs of
+    /// about 600 bytes for 149K characters; the default 1 KiB window can
+    /// never hold four such cycles. The check interval scales with the
+    /// window so the scan stays a bounded fraction of the bytes streamed.
+    #[must_use]
+    pub fn with_window(window: usize) -> Self {
+        Self {
+            window,
+            check_every: (window / 16).max(REPEAT_CHECK_EVERY),
+            ..Self::default()
+        }
+    }
+
     /// Feeds one streamed chunk. Returns true once the output has been
     /// repeating itself for [`REPEAT_CYCLES`] cycles.
     pub fn feed(&mut self, chunk: &str) -> bool {
         self.tail.push_str(chunk);
-        if self.tail.len() > REPEAT_WINDOW {
+        if self.tail.len() > self.window {
             // Trim from the front to a char boundary: the window is a byte
             // budget, and slicing mid-character would panic.
-            let mut cut = self.tail.len() - REPEAT_WINDOW;
+            let mut cut = self.tail.len() - self.window;
             while cut < self.tail.len() && !self.tail.is_char_boundary(cut) {
                 cut += 1;
             }
             self.tail.drain(..cut);
         }
         self.since_check += chunk.len();
-        if self.since_check < REPEAT_CHECK_EVERY {
+        if self.since_check < self.check_every {
             return false;
         }
         self.since_check = 0;
@@ -2896,6 +2926,37 @@ Tool result 3 (read):\nfine\n</tool_result>",
         let total: u32 = agg.response_histogram.iter().map(|r| r.1).sum();
         assert_eq!(total, 4, "{:?}", agg.response_histogram);
         assert_eq!(agg.response_median, 700);
+    }
+
+    #[test]
+    fn wide_window_catches_paragraph_loops_the_default_misses() {
+        // Three ~200-byte paragraphs cycling: a 600-byte period, four cycles
+        // need 2400 bytes of tail. The default 1 KiB window cannot see it.
+        let para = |n: u8| {
+            format!(
+                "Need maybe add flag {n} to both modules and the re-export list. \
+                 The helpers module keeps a Borland style table while the views \
+                 module exposes plain public constants, so each needs a doc line, \
+                 a bit at 0x1000 and one call site in message_box_rect.\n\n"
+            )
+        };
+        let cycle = format!("{}{}{}", para(1), para(2), para(3));
+        let mut narrow = RepeatGuard::new();
+        let mut wide = RepeatGuard::with_window(8192);
+        let mut narrow_hit = false;
+        let mut wide_hit = false;
+        for _ in 0..6 {
+            for chunk in cycle.as_bytes().chunks(7) {
+                let chunk = std::str::from_utf8(chunk).unwrap();
+                narrow_hit |= narrow.feed(chunk);
+                wide_hit |= wide.feed(chunk);
+            }
+        }
+        assert!(
+            !narrow_hit,
+            "the narrow window should not see a 600-byte period"
+        );
+        assert!(wide_hit, "the wide window should catch the paragraph loop");
     }
 
     #[test]

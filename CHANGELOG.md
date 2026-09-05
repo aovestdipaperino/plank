@@ -6,6 +6,42 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A turn can no longer spend an hour repeating one thought.** The
+  repetition guard that already protected `/insights` now watches the
+  reasoning of every generation pass (plain REPL, TUI, and sub-agent
+  sidechains). When the `<think>` tail cycles, the pass is stopped and the
+  model is told to act on the plan it already has. This was measured, not
+  guessed: a two-hour session on a small feature request turned out to be one
+  149K-character thinking block, three paragraphs repeated 263 times until the
+  token cap.
+- **`edit` works on CRLF files.** When the whole file uses `\r\n` and the
+  model's `old`/`new` text does not, both are converted before matching, so a
+  multi-line `old` matches and the file keeps its line endings. Before, every
+  such edit failed and a single-line edit silently converted the anchor line
+  to LF.
+- **`search` skips build output.** Directories carrying a `CACHEDIR.TAG`
+  (Cargo's `target/`), `node_modules`, and VCS metadata are no longer
+  searched, so a search over `.` no longer returns the `target/package/` copy
+  of every source file ahead of the real matches.
+
+### Changed
+
+- **Reasoning defaults to low effort.** `--think-low` is now the default and
+  `--think` restores the previous medium level. On the same coding request the
+  low setting finished in 16 minutes where medium took 23, with the same
+  result and no repeated paragraphs in its reasoning.
+- **The system prompt gains a "Working style" section** (plank-owned, after
+  the native tool schemas, outside the C-parity base): batch independent
+  invokes in one stanza, explore briefly then act, decide rather than
+  deliberate, keep reasoning forward-moving, edit straight from search
+  context, stay in the requested scope, and review diffs per file. The
+  provider prompt carries the same rules in native-tool wording.
+- **Headless runs save their session.** `--non-interactive` now writes the
+  transcript to `~/.plank/kvcache` at exit and names it on stderr, so a slow
+  or looping run can be analysed afterwards; `--no-session` opts out.
+
 ## [4.0.0] - 2026-09-04
 
 ### Changed

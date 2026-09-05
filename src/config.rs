@@ -52,6 +52,9 @@ pub struct AgentConfig {
     pub plugin_dirs: Vec<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
+    /// False when `--no-session` was given: the headless run leaves no
+    /// transcript under `~/.plank/kvcache`. Interactive runs always save.
+    pub save_session: bool,
     /// True when `--minimal-prompt` was given: start with the smallest prompt
     /// this build can produce — no MCP servers, skills, templates, plugin
     /// agents, WASM components, or session-start context. For measuring
@@ -309,7 +312,12 @@ impl Default for AgentConfig {
             generation: GenerationOptions {
                 n_predict: DEFAULT_N_PREDICT,
                 ctx_size: DEFAULT_CTX_SIZE,
-                think_mode: ThinkMode::Medium,
+                // Low, not Medium: on the same coding request the brief-reasoning
+                // preamble turned a 23-minute run into a 16-minute one with the
+                // same result, and replaced a stuttering "Need maybe..." style
+                // with numbered plans (FINDINGS.md, "Three reruns of one
+                // request"). `--think` restores Medium.
+                think_mode: ThinkMode::Low,
                 ..GenerationOptions::default()
             },
             prompt: None,
@@ -322,6 +330,7 @@ impl Default for AgentConfig {
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
             non_interactive: false,
+            save_session: true,
             minimal_prompt: false,
             ui_remote: None,
             show_help: false,
@@ -486,6 +495,8 @@ Options:
                            saved session; writes ~/.plank/usage-data/report.html
                            (\"fast\" skips the written sections)
       --non-interactive    disable the interactive UI
+      --no-session         with --non-interactive: do not save the transcript
+                           to ~/.plank/kvcache at exit
       --dump-config        print every effective setting with the layer it came
                            from (default, plugin, ~/.plank, ./.plank, CLI) and exit
       --minimal-prompt     start with the smallest prompt this build can make:
@@ -1258,6 +1269,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
             // Bare `--ui-remote` means an ephemeral port. A following bare
@@ -1590,7 +1602,14 @@ mod tests {
                 .ctx_size_explicit
         );
         assert_eq!(c.system, DEFAULT_SYSTEM_PROMPT);
-        assert_eq!(c.generation.think_mode, ThinkMode::Medium);
+        assert_eq!(c.generation.think_mode, ThinkMode::Low);
+        assert_eq!(
+            parse_options(&args(&["--think"]))
+                .unwrap()
+                .generation
+                .think_mode,
+            ThinkMode::Medium
+        );
         assert!(c.prompt.is_none());
         // In-pass /btw suspend is on by default; --disable-btw-suspend opts out.
         assert!(c.btw.suspend);
@@ -1769,6 +1788,17 @@ mod tests {
                 .ui_remote,
             Some(0)
         );
+    }
+
+    #[test]
+    fn no_session_flag_disables_the_headless_save() {
+        assert!(
+            parse_options(&args(&["--non-interactive"]))
+                .unwrap()
+                .save_session
+        );
+        let c = parse_options(&args(&["--non-interactive", "--no-session"])).unwrap();
+        assert!(!c.save_session);
     }
 
     #[test]
