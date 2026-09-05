@@ -4049,39 +4049,110 @@ impl Agent<'_> {
         out
     }
 
-    /// Runs the /init command: prompts the model to create AGENTS.md
+    /// The `/init` prompt: asks the model to analyze the codebase and write an
+    /// `AGENTS.md` for future sessions. Shared by the plain REPL and TUI paths
+    /// so the wording lives in one place.
+    const INIT_PROMPT: &'static str = concat!(
+        "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
+        "Include:\n",
+        "1. Build, lint, and test commands (especially non-standard ones)\n",
+        "2. High-level architecture and structure\n",
+        "3. Required setup or environment variables\n",
+        "4. Non-obvious gotchas or workflow quirks\n\n",
+        "Exclude:\n",
+        "- File-by-file listings the agent can discover\n",
+        "- Standard language conventions\n",
+        "- Generic advice\n",
+        "- Information from README unless essential\n\n",
+        "Preface with:\n",
+        "```",
+        "# AGENTS.md\n\n",
+        "This file provides guidance to the agent when working with code in this repository.",
+        "```",
+        "\n\n",
+        "Write the AGENTS.md file to the current directory."
+    );
+
+    /// The session-state half of `/clear` (and `/new`): drops the ladder, mints
+    /// a fresh session, and re-scaffolds session-start context — everything
+    /// except the front-end-specific screen wipe and rewarm. Shared by the
+    /// plain and TUI `/clear` arms and by `/init`, which clears without wiping
+    /// the screen.
+    fn reset_session_state(&mut self) {
+        self.discard_ladder();
+        self.session = Session::new();
+        // A new session, a new name — minted here for the same reason
+        // `new_agent` mints one at launch (see `SessionStore::mint_id`).
+        self.session.id = self.store.mint_id();
+        crate::debugmirror::set_session_id(&self.session.id);
+        self.broadcast_session_reset(None);
+        self.reminder = SystemPromptReminder::new();
+        // Same merged roster the launch path advertises, so /clear
+        // cannot silently drop plugin-contributed agents from it.
+        self.context_content = ContextContent::new_with_agents(&self.agents);
+        push_session_context(&mut self.session, &self.context_content);
+        // Scaffolding only — not activity worth a resume point (see
+        // `save_for_exit`); a real turn re-dirties it.
+        self.session.dirty = false;
+        self.last_ctx_used = 0;
+        self.checkpoints.clear();
+        self.usage = SessionUsage::default();
+    }
+
+    /// Plain-REPL `/clear`: reset the session and reinstate the warm prefix.
+    /// The plain REPL has no screen to wipe, so this *is* "/clear without
+    /// clearing the screen" — used by both `/clear` and the tail of `/init`.
+    fn clear_session_plain(&mut self) {
+        self.reset_session_state();
+        // Reinstate the warm prefix; without it the next turn silently
+        // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
+        // The plain REPL has no persistent prompt to replace, so the
+        // analogue of the TUI throbber is one transient stderr line,
+        // erased once the KV is back (matching `warm_plain`).
+        let color = self.color;
+        let mut announced = false;
+        self.rewarm_after_reset(&mut || {
+            if !announced {
+                announced = true;
+                if color {
+                    eprint!("\x1b[33mstarting a new session…{ANSI_RESET}");
+                } else {
+                    eprint!("starting a new session…");
+                }
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+            }
+        });
+        if announced {
+            eprint!("\r\x1b[2K");
+            let _ = std::io::Write::flush(&mut std::io::stderr());
+        }
+        self.fire_session_start("clear", &mut |w| println!("{w}"));
+        println!("started a new session");
+    }
+
+    /// Runs the /init command: prompts the model to create AGENTS.md, then
+    /// clears the session (the plain REPL never clears the screen) so the init
+    /// exchange does not carry into later turns.
     fn run_init(&mut self) {
         println!("Initializing AGENTS.md...");
         println!("The model will now analyze the codebase and generate documentation.\n");
 
-        let prompt = concat!(
-            "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
-            "Include:\n",
-            "1. Build, lint, and test commands (especially non-standard ones)\n",
-            "2. High-level architecture and structure\n",
-            "3. Required setup or environment variables\n",
-            "4. Non-obvious gotchas or workflow quirks\n\n",
-            "Exclude:\n",
-            "- File-by-file listings Claude can discover\n",
-            "- Standard language conventions\n",
-            "- Generic advice\n",
-            "- Information from README unless essential\n\n",
-            "Preface with:\n",
-            "```",
-            "# AGENTS.md\n\n",
-            "This file provides guidance to the agent when working with code in this repository.",
-            "```",
-            "\n\n",
-            "Write the AGENTS.md file to the current directory."
-        );
-
-        self.session.push(Message::user(prompt));
+        self.session.push(Message::user(Self::INIT_PROMPT));
         if let Err(e) = self.run_turn() {
             println!("/init failed: {e}");
         }
+        // The init prompt and the model's AGENTS.md draft are scaffolding for
+        // the file write, not part of the conversation — clear the session so
+        // the next turn starts fresh.
+        self.clear_session_plain();
     }
 
     /// Runs the /init command in TUI mode.
+    ///
+    /// The init prompt is not echoed and the model's AGENTS.md draft is not
+    /// left in the log: the turn's output is truncated back to a checkpoint
+    /// taken before it, then the session is cleared without wiping the screen
+    /// so the exchange does not carry into later turns.
     #[allow(clippy::too_many_arguments)]
     fn tui_run_init(
         &mut self,
@@ -4096,32 +4167,75 @@ impl Agent<'_> {
         log.push_plain("Initializing AGENTS.md...");
         log.push_plain("The model will now analyze the codebase and generate documentation.\n");
 
-        let prompt = concat!(
-            "Analyze this codebase and create an AGENTS.md file for future agent sessions.\n\n",
-            "Include:\n",
-            "1. Build, lint, and test commands (especially non-standard ones)\n",
-            "2. High-level architecture and structure\n",
-            "3. Required setup or environment variables\n",
-            "4. Non-obvious gotchas or workflow quirks\n\n",
-            "Exclude:\n",
-            "- File-by-file listings Claude can discover\n",
-            "- Standard language conventions\n",
-            "- Generic advice\n",
-            "- Information from README unless essential\n\n",
-            "Preface with:\n",
-            "```",
-            "# AGENTS.md\n\n",
-            "This file provides guidance to the agent when working with code in this repository.",
-            "```",
-            "\n\n",
-            "Write the AGENTS.md file to the current directory."
-        );
-
-        log.push_user_echo(prompt);
-        self.session.push(Message::user(prompt));
-        if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
+        self.session.push(Message::user(Self::INIT_PROMPT));
+        // Drop everything the turn renders (the AGENTS.md draft, tool banners,
+        // the turn footer) so it never stays in the TUI log. The file write
+        // itself still happens during the turn.
+        let mark = log.checkpoint();
+        let result = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+        log.truncate_to(mark);
+        if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
         }
+        // Clear the session without wiping the screen.
+        self.tui_clear_session(log, terminal, view, sub, false);
+    }
+
+    /// TUI `/clear` (and `/new`): reset the session, optionally wipe the screen,
+    /// reinstate the warm prefix, and re-fire session-start. `clear_screen` is
+    /// false for `/init`, which clears without wiping the screen.
+    fn tui_clear_session(
+        &mut self,
+        log: &mut OutputLog,
+        terminal: &mut ratatui::DefaultTerminal,
+        view: &mut tui::OutputView,
+        sub: &mut tui::SubPane,
+        clear_screen: bool,
+    ) {
+        self.reset_session_state();
+        if clear_screen {
+            // Issue #72: the screen must reflect the fresh session, so drop
+            // the old conversation and re-render what a launch shows.
+            log.clear();
+            *view = tui::OutputView::default();
+            // The pane belongs to the old session. Left alone it would keep
+            // an obsolete sub-agent transcript on offer under Ctrl-O — and,
+            // while it is the active pane, would swallow the cleared log and
+            // every later turn behind the still-displayed old output.
+            sub.reset();
+            self.tui_write_banner(log);
+        }
+        // Reinstate the warm prefix; without it the next turn silently
+        // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
+        // It takes long enough to notice, so hide the prompt and pin a
+        // throbber in its place — the same "agent is busy" shape a turn
+        // uses (`draw` with `input: None`), so the fresh banner stays
+        // visible and no input can be typed into a session whose KV is
+        // still being restored.
+        self.rewarm_after_reset(&mut || {
+            log.set_progress(Some(tui::progress_line(&format!(
+                "{} starting a new session",
+                crate::status::throbber()
+            ))));
+            let (l, v) = (&*log, &mut *view);
+            let _ = terminal.draw(|f| {
+                tui::draw(
+                    f,
+                    l,
+                    None,
+                    "",
+                    v,
+                    None,
+                    &tui::TaskView::default(),
+                    None,
+                    &tui::RosterView::default(),
+                );
+            });
+            crate::cursor::place();
+        });
+        log.set_progress(None);
+        self.fire_session_start("clear", &mut |w| log.push_plain(w));
+        log.push_plain("started a new session");
     }
 
     /// Handles a slash command; returns false when the REPL should exit.
@@ -4137,48 +4251,7 @@ impl Agent<'_> {
             }
             "/quit" | "/exit" => return Ok(false),
             "/new" | "/clear" => {
-                self.discard_ladder();
-                self.session = Session::new();
-                // A new session, a new name — minted here for the same reason
-                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
-                self.session.id = self.store.mint_id();
-                crate::debugmirror::set_session_id(&self.session.id);
-                self.broadcast_session_reset(None);
-                self.reminder = SystemPromptReminder::new();
-                // Same merged roster the launch path advertises, so /clear
-                // cannot silently drop plugin-contributed agents from it.
-                self.context_content = ContextContent::new_with_agents(&self.agents);
-                push_session_context(&mut self.session, &self.context_content);
-                // Scaffolding only — not activity worth a resume point (see
-                // `save_for_exit`); a real turn re-dirties it.
-                self.session.dirty = false;
-                self.last_ctx_used = 0;
-                self.checkpoints.clear();
-                self.usage = SessionUsage::default();
-                // Reinstate the warm prefix; without it the next turn silently
-                // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
-                // The plain REPL has no persistent prompt to replace, so the
-                // analogue of the TUI throbber is one transient stderr line,
-                // erased once the KV is back (matching `warm_plain`).
-                let color = self.color;
-                let mut announced = false;
-                self.rewarm_after_reset(&mut || {
-                    if !announced {
-                        announced = true;
-                        if color {
-                            eprint!("\x1b[33mstarting a new session…{ANSI_RESET}");
-                        } else {
-                            eprint!("starting a new session…");
-                        }
-                        let _ = std::io::Write::flush(&mut std::io::stderr());
-                    }
-                });
-                if announced {
-                    eprint!("\r\x1b[2K");
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
-                }
-                self.fire_session_start("clear", &mut |w| println!("{w}"));
-                println!("started a new session");
+                self.clear_session_plain();
             }
             "/help" => print!("{}", crate::config::usage()),
             "/version" => println!("plank {}", crate::logo::version_label()),
@@ -11273,65 +11346,7 @@ impl Agent<'_> {
             "/config" => self.tui_config_command(arg, log, config_form),
             "/rate" => log.push_dim(self.rate_command(arg)),
             "/new" | "/clear" => {
-                self.discard_ladder();
-                self.session = Session::new();
-                // A new session, a new name — minted here for the same reason
-                // `new_agent` mints one at launch (see `SessionStore::mint_id`).
-                self.session.id = self.store.mint_id();
-                crate::debugmirror::set_session_id(&self.session.id);
-                self.broadcast_session_reset(None);
-                self.reminder = SystemPromptReminder::new();
-                // Same merged roster the launch path advertises, so /clear
-                // cannot silently drop plugin-contributed agents from it.
-                self.context_content = ContextContent::new_with_agents(&self.agents);
-                push_session_context(&mut self.session, &self.context_content);
-                // Scaffolding only — not activity worth a resume point (see
-                // `save_for_exit`); a real turn re-dirties it.
-                self.session.dirty = false;
-                self.last_ctx_used = 0;
-                self.checkpoints.clear();
-                self.usage = SessionUsage::default();
-                // Issue #72: the screen must reflect the fresh session, so drop
-                // the old conversation and re-render what a launch shows.
-                log.clear();
-                *view = tui::OutputView::default();
-                // The pane belongs to the old session. Left alone it would keep
-                // an obsolete sub-agent transcript on offer under Ctrl-O — and,
-                // while it is the active pane, would swallow the cleared log and
-                // every later turn behind the still-displayed old output.
-                sub.reset();
-                self.tui_write_banner(log);
-                // Reinstate the warm prefix; without it the next turn silently
-                // rebuilds the whole system-prompt KV (see `rewarm_after_reset`).
-                // It takes long enough to notice, so hide the prompt and pin a
-                // throbber in its place — the same "agent is busy" shape a turn
-                // uses (`draw` with `input: None`), so the fresh banner stays
-                // visible and no input can be typed into a session whose KV is
-                // still being restored.
-                self.rewarm_after_reset(&mut || {
-                    log.set_progress(Some(tui::progress_line(&format!(
-                        "{} starting a new session",
-                        crate::status::throbber()
-                    ))));
-                    let (l, v) = (&*log, &mut *view);
-                    let _ = terminal.draw(|f| {
-                        tui::draw(
-                            f,
-                            l,
-                            None,
-                            "",
-                            v,
-                            None,
-                            &tui::TaskView::default(),
-                            None,
-                            &tui::RosterView::default(),
-                        );
-                    });
-                    crate::cursor::place();
-                });
-                log.set_progress(None);
-                self.fire_session_start("clear", &mut |w| log.push_plain(w));
-                log.push_plain("started a new session");
+                self.tui_clear_session(log, terminal, view, sub, true);
             }
             "/checkpoint" => {
                 if arg.is_empty() {
