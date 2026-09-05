@@ -7,8 +7,15 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v4.1.0 is out**, and the beta channel is on 4.1.1. The patch number is still
+**v4.1.0 is out**, and the beta channel is on 4.1.2. The patch number is still
 the channel: `.0` is stable, anything above it is beta.
+
+**4.1.2 (beta) stops the sandbox asking about reads.** Any bash command that
+so much as mentioned `~/.plank`, including `cat ~/.plank/settings.json`, used to
+raise "Allow it to write there?", because the sandbox profile is built before
+the command runs and the trigger was a text match. A command made only of known
+read-only utilities with no redirect now runs without the question. Anything
+that could write still asks, and the sandbox itself is unchanged.
 
 **A turn can no longer spend an hour repeating one thought.** This release
 started from a measurement rather than a hunch. A small feature request that

@@ -138,9 +138,17 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v4.1.0 is out</strong>, and the beta channel is on 4.1.1. The
+<p><strong>v4.1.0 is out</strong>, and the beta channel is on 4.1.2. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>4.1.2 (beta) stops the sandbox asking about reads.</strong>
+Any bash command that so much as mentioned <code>~/.plank</code>,
+including <code>cat ~/.plank/settings.json</code>, used to raise "Allow
+it to write there?", because the sandbox profile is built before the
+command runs and the trigger was a text match. A command made only of
+known read-only utilities with no redirect now runs without the
+question. Anything that could write still asks, and the sandbox itself
+is unchanged.</p>
 <p><strong>A turn can no longer spend an hour repeating one
 thought.</strong> This release started from a measurement rather than a
 hunch. A small feature request that Claude Code finishes in a few
