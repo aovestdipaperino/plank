@@ -20,6 +20,12 @@ use std::collections::{HashMap, VecDeque};
 /// Identical-call threshold: the Nth identical call gets the advisory.
 const REPEAT_THRESHOLD: u32 = 3;
 
+/// Hard block threshold: once a call's identical-repeat count exceeds this,
+/// the call is refused outright instead of merely advised. Gives the model
+/// `REPEAT_THRESHOLD..=BLOCK_THRESHOLD` advisory chances to self-correct
+/// before the circuit breaker trips.
+const BLOCK_THRESHOLD: u32 = 5;
+
 /// How many recent calls the guard remembers before aging out. Wide enough
 /// that a multi-call cycle (the two-hour repro had a period of eight) shows
 /// up at least twice in full.
@@ -40,6 +46,13 @@ pub enum Nudge {
     None,
     /// An advisory line to append to the tool result the model receives.
     Advisory(String),
+    /// A hard block: the call must be refused and must not be dispatched.
+    /// The caller returns a tool error with this text instead of running
+    /// the call. This is the circuit breaker an advisory-only guard cannot
+    /// provide — a stuck model that reads the advisory, says "let's stop,"
+    /// and re-emits the identical call is physically prevented from
+    /// running it.
+    Block(String),
 }
 
 /// Detects repeated identical tool calls within a bounded window.
@@ -78,6 +91,11 @@ impl LoopGuard {
         self.window.push_back(sig.clone());
         let count = self.repeats.entry(sig).or_insert(0);
         *count += 1;
+        if *count > BLOCK_THRESHOLD {
+            return Nudge::Block(format!(
+                "you have called this tool with these arguments {count} times; the result has not changed. This call is refused. Do something different: act on what you already know, or tell the user what is missing"
+            ));
+        }
         if *count >= REPEAT_THRESHOLD {
             return Nudge::Advisory(format!(
                 "you have called this tool with these arguments {count} times; the result has not changed. Do not call it again: act on what you already know, or tell the user what is missing"
@@ -115,8 +133,17 @@ impl Nudge {
     #[must_use]
     pub fn as_advisory(&self) -> Option<&str> {
         match self {
-            Nudge::None => None,
+            Nudge::None | Nudge::Block(_) => None,
             Nudge::Advisory(s) => Some(s),
+        }
+    }
+
+    /// The block text, if this nudge is a hard block.
+    #[must_use]
+    pub fn as_block(&self) -> Option<&str> {
+        match self {
+            Nudge::None | Nudge::Advisory(_) => None,
+            Nudge::Block(s) => Some(s),
         }
     }
 }
@@ -189,5 +216,24 @@ mod tests {
         }
         // The first sig aged out, so a single repeat is not yet an advisory.
         assert_eq!(g.observe("read", d.clone()), Nudge::None);
+    }
+
+    #[test]
+    fn a_block_fires_after_advisory_chances_are_exhausted() {
+        let mut g = LoopGuard::new();
+        let d = digest("file.txt");
+        // Counts 1-2: no nudge.
+        assert_eq!(g.observe("read", d.clone()), Nudge::None);
+        assert_eq!(g.observe("read", d.clone()), Nudge::None);
+        // Counts 3-5: advisory (REPEAT_THRESHOLD..=BLOCK_THRESHOLD).
+        for expected_count in 3..=BLOCK_THRESHOLD {
+            let nudge = g.observe("read", d.clone());
+            let text = nudge.as_advisory().expect("advisory before block");
+            assert!(text.contains(&format!("{expected_count} times")), "{text}");
+        }
+        // Count 6: block (count > BLOCK_THRESHOLD).
+        let nudge = g.observe("read", d.clone());
+        let text = nudge.as_block().expect("block after threshold");
+        assert!(text.contains("refused"), "{text}");
     }
 }

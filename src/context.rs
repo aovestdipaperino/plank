@@ -391,6 +391,38 @@ pub fn current_local_iso_date() -> String {
     format_local_date().unwrap_or_else(|()| "date unavailable".to_string())
 }
 
+/// Formats a Unix epoch second as a local `YYYY-MM-DD HH:MM:SS` string.
+/// Returns `"?"` when the timestamp is 0 (unknown) or unformattable.
+#[must_use]
+pub fn format_local_time(secs: u64) -> String {
+    if secs == 0 {
+        return "?".to_string();
+    }
+    format_local_time_impl(secs).unwrap_or_else(|()| "?".to_string())
+}
+
+fn format_local_time_impl(secs: u64) -> Result<String, ()> {
+    let t: libc::time_t = i64::try_from(secs).map_err(|_| ())?;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&raw const t, &raw mut tm) }.is_null() {
+        return Err(());
+    }
+    let mut buf = [0u8; 32];
+    let fmt = c"%Y-%m-%d %H:%M:%S";
+    let n = unsafe {
+        libc::strftime(
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            fmt.as_ptr(),
+            &raw const tm,
+        )
+    };
+    if n == 0 {
+        return Err(());
+    }
+    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
+}
+
 /// Formats the current date as local ISO format (YYYY-MM-DD).
 fn format_local_date() -> Result<String, ()> {
     let secs = SystemTime::now()

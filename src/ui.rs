@@ -945,6 +945,75 @@ pub fn render_transcript(session: &Session, system: &str) -> String {
     out
 }
 
+/// Same as [`render_transcript`] but with periodic `[timestamp]` markers
+/// inserted between messages, for the `/repro` diagnostic dump. The markers
+/// are **not** part of the engine input — [`write_repro`](Agent::write_repro)
+/// uses [`render_transcript`] for token counting and this function only for
+/// the report body — so the KV common-prefix probe is unaffected.
+///
+/// A marker is emitted every `TIMESTAMP_INTERVAL` messages that have a non-zero
+/// `at` timestamp, plus one at the end. Each marker shows the wall-clock time
+/// and the elapsed since the first marker, so a tight loop shows up as many
+/// markers with small deltas.
+#[must_use]
+pub fn render_transcript_for_repro(session: &Session, system: &str) -> String {
+    use std::fmt::Write as _;
+    const TIMESTAMP_INTERVAL: usize = 20;
+    let mut out = format!("[system]\n{system}\n");
+    let mut first_ts: Option<u64> = None;
+    let mut ts_count = 0usize; // messages with a non-zero `at` seen since last marker
+    for (i, m) in session.transcript.iter().enumerate() {
+        // Emit a periodic timestamp marker before this message.
+        if m.at != 0 {
+            let is_due = ts_count >= TIMESTAMP_INTERVAL;
+            let is_first = first_ts.is_none();
+            if is_first || is_due {
+                let elapsed = first_ts.map_or(0u64, |f| m.at.saturating_sub(f));
+                let _ = writeln!(
+                    out,
+                    "[timestamp] {} (msg {i}, {})",
+                    crate::context::format_local_time(m.at),
+                    format_elapsed(elapsed)
+                );
+                if first_ts.is_none() {
+                    first_ts = Some(m.at);
+                }
+                ts_count = 0;
+            }
+            ts_count += 1;
+        }
+        let tag = match m.role {
+            crate::session::Role::User => "user",
+            crate::session::Role::Assistant => "assistant",
+        };
+        let _ = write!(out, "[{tag}]\n{}\n", m.text);
+    }
+    // Final marker so the total duration is visible.
+    if let Some(f) = first_ts {
+        if let Some(last) = session.transcript.iter().rev().find(|m| m.at != 0) {
+            let elapsed = last.at.saturating_sub(f);
+            let _ = writeln!(
+                out,
+                "[timestamp] {} (end, {})",
+                crate::context::format_local_time(last.at),
+                format_elapsed(elapsed)
+            );
+        }
+    }
+    out
+}
+
+/// Formats a duration in seconds as `+Xs`, `+XmYs`, or `+XhYm`.
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("+{secs}s")
+    } else if secs < 3600 {
+        format!("+{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("+{}h{}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
 /// Owned buffers backing a [`crate::engine::StructuredTurn`]; kept alive at the
 /// call site so the borrowed `StructuredTurn` outlives the `generate` call.
 struct StructuredBufs {
@@ -1201,26 +1270,40 @@ fn normalise_args(call: &ToolCall) -> String {
     s
 }
 
-/// Observes each tool call against the loop guard and appends any advisory to
-/// the observations the model receives. The async-job polling path
-/// (`bash_status`/`bash_stop`) is exempted: it polls with identical args by
-/// design, and a legitimate poll must never be mistaken for a stuck loop.
-fn apply_loop_guard(
+/// Observes each tool call against the loop guard *before* dispatch, returning
+/// one nudge per call. A [`Nudge::Block`] means the call must be refused — the
+/// caller returns a hard error instead of dispatching. The async-job polling
+/// path (`bash_status`/`bash_stop`) is exempted: it polls with identical args
+/// by design, and a legitimate poll must never be mistaken for a stuck loop.
+fn observe_calls(
     guard: &mut crate::guard::LoopGuard,
     calls: &[ToolCall],
-    observations: String,
+) -> Vec<crate::guard::Nudge> {
+    if !crate::settings::active().tools.repeat_advisory {
+        return vec![crate::guard::Nudge::None; calls.len()];
+    }
+    calls
+        .iter()
+        .map(|call| {
+            if matches!(call.name.as_str(), "bash_status" | "bash_stop") {
+                return crate::guard::Nudge::None;
+            }
+            let digest = crate::session::sha1_hex(normalise_args(call).as_bytes());
+            guard.observe(&call.name, digest)
+        })
+        .collect()
+}
+
+/// Appends any advisory lines from pre-computed nudges to the observations the
+/// model receives. Block nudges are handled by the caller (the call is refused
+/// before dispatch); this only formats the softer advisory tier.
+fn append_advisories(
+    nudges: &[crate::guard::Nudge],
+    mut observations: String,
 ) -> String {
     use std::fmt::Write as _;
-    if !crate::settings::active().tools.repeat_advisory {
-        return observations;
-    }
-    let mut observations = observations;
-    for call in calls {
-        if matches!(call.name.as_str(), "bash_status" | "bash_stop") {
-            continue;
-        }
-        let digest = crate::session::sha1_hex(normalise_args(call).as_bytes());
-        if let crate::guard::Nudge::Advisory(text) = guard.observe(&call.name, digest) {
+    for nudge in nudges {
+        if let crate::guard::Nudge::Advisory(text) = nudge {
             if !observations.ends_with('\n') {
                 observations.push('\n');
             }
@@ -2025,17 +2108,47 @@ impl Agent<'_> {
                 .join(", ");
             crate::status::ToolActivity::begin(format!("🔧 {names}"))
         });
+        // Observe each call against the loop guard *before* dispatch. A block
+        // means the call is refused outright — the model gets a hard error
+        // instead of a result it can ignore. This is the circuit breaker the
+        // advisory-only guard could not provide: a stuck model that reads the
+        // advisory, says "let's stop," and re-emits the identical call is now
+        // physically prevented from running it.
+        let nudges = observe_calls(&mut self.loop_guard, calls);
+        let has_block = nudges
+            .iter()
+            .any(|n| matches!(n, crate::guard::Nudge::Block(_)));
         // `view_image` needs the engine to encode the image, which `dispatch`
         // (taking only `&mut ToolContext`) cannot reach. Route it through the
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
         let needs_engine =
             |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
-        let observations = if !calls.iter().any(needs_engine) {
-            dispatch_all(calls, &mut self.tool_ctx)
+        if has_block {
+            // Per-call dispatch so blocked calls get hard error results instead
+            // of running. Non-blocked calls in the same stanza still dispatch.
+            self.tool_ctx.edit_previews.clear();
+            let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
+            for (i, call) in calls.iter().enumerate() {
+                let out = if let crate::guard::Nudge::Block(text) = &nudges[i] {
+                    format!("Tool error: refused by loop guard — {text}\n")
+                } else if call.name == "agent" {
+                    self.run_agent_tool(call)
+                } else if call.name == "fanout" {
+                    self.run_fanout_tool(call)
+                } else if call.name == "view_image" {
+                    self.run_view_image(call)
+                } else {
+                    dispatch(call, &mut self.tool_ctx).output
+                };
+                results.push((call.name.clone(), out));
+            }
+            append_advisories(&nudges, format_tool_results(&results))
+        } else if !calls.iter().any(needs_engine) {
+            append_advisories(&nudges, dispatch_all(calls, &mut self.tool_ctx))
         } else if calls.is_empty() {
             "Tool error: empty tool call block\n".to_string()
         } else if let Some(results) = self.run_agent_fanout(calls) {
-            format_tool_results(&results)
+            append_advisories(&nudges, format_tool_results(&results))
         } else {
             // Mirror dispatch_all: clear any undrained previews so cards never leak.
             self.tool_ctx.edit_previews.clear();
@@ -2052,9 +2165,8 @@ impl Agent<'_> {
                 };
                 results.push((call.name.clone(), out));
             }
-            format_tool_results(&results)
-        };
-        apply_loop_guard(&mut self.loop_guard, calls, observations)
+            append_advisories(&nudges, format_tool_results(&results))
+        }
     }
 
     /// Runs the model-invocable `view_image` tool: encodes the image through
@@ -6310,7 +6422,12 @@ the original is frozen and listed in /tree"
     /// pointer, so a bare `/open` opens the dump that was just generated (the
     /// file the user most likely wants to read or annotate next).
     fn write_repro(&mut self, note: &str) -> Result<std::path::PathBuf, String> {
+        // `rendered` is the exact engine input (no timestamp markers) — used
+        // for the token count so that figure stays accurate. `rendered_for_repro`
+        // is the same transcript with periodic `[timestamp]` markers for the
+        // report body, so a stuck loop's wall-clock progression is visible.
         let rendered = render_transcript(&self.session, &self.system);
+        let rendered_for_repro = render_transcript_for_repro(&self.session, &self.system);
         let version = crate::logo::version_label();
         let date = crate::context::current_local_iso_date();
         let meta = crate::repro::Meta {
@@ -6325,7 +6442,7 @@ the original is frozen and listed in /tree"
             session_tag: &self.session.tag,
             note: note.trim(),
         };
-        let report = crate::repro::build_report(&meta, self.cfg, &rendered);
+        let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
         let path = crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)?;
         // `repro::save` builds its path from `$HOME` (or the already-absolute
         // cwd), so unlike `openfile::note_edited` there is nothing to resolve.
@@ -13728,11 +13845,15 @@ mod tests {
     #[test]
     fn loop_guard_advisory_fires_on_the_third_identical_call() {
         let mut guard = crate::guard::LoopGuard::new();
-        let out1 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r1".to_string());
+        let call = [read_call("f.txt")];
+        let n1 = observe_calls(&mut guard, &call);
+        let out1 = append_advisories(&n1, "r1".to_string());
         assert!(!out1.contains("[loop guard]"), "first call: no advisory");
-        let out2 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r2".to_string());
+        let n2 = observe_calls(&mut guard, &call);
+        let out2 = append_advisories(&n2, "r2".to_string());
         assert!(!out2.contains("[loop guard]"), "second call: no advisory");
-        let out3 = apply_loop_guard(&mut guard, &[read_call("f.txt")], "r3".to_string());
+        let n3 = observe_calls(&mut guard, &call);
+        let out3 = append_advisories(&n3, "r3".to_string());
         assert!(out3.contains("[loop guard]"), "third call: advisory");
         assert!(out3.contains("3 times"));
     }
@@ -13744,9 +13865,28 @@ mod tests {
         let mut guard = crate::guard::LoopGuard::new();
         let mut out = String::new();
         for _ in 0..5 {
-            out = apply_loop_guard(&mut guard, &[poll_call()], out);
+            let nudges = observe_calls(&mut guard, &[poll_call()]);
+            out = append_advisories(&nudges, out);
         }
         assert!(!out.contains("[loop guard]"), "polls must be exempt: {out}");
+    }
+
+    #[test]
+    fn loop_guard_blocks_repeated_call_instead_of_dispatching() {
+        // After BLOCK_THRESHOLD advisories, the guard escalates from Advisory
+        // to Block. The block is a hard refusal: the call does not run.
+        let mut guard = crate::guard::LoopGuard::new();
+        let call = [read_call("f.txt")];
+        // Counts 1-2: no nudge. Counts 3-5: advisory. Count 6: block.
+        for _ in 0..5 {
+            let nudges = observe_calls(&mut guard, &call);
+            let _ = append_advisories(&nudges, String::new());
+        }
+        let nudges = observe_calls(&mut guard, &call);
+        assert!(
+            nudges.iter().any(|n| matches!(n, crate::guard::Nudge::Block(_))),
+            "6th identical call should be blocked"
+        );
     }
 
     #[test]
@@ -13845,6 +13985,47 @@ mod tests {
         assert_eq!(before, after, "task state must not perturb the rendering");
         assert!(after.starts_with("[system]\nSYS\n[user]\nhello\n"));
         assert!(!after.contains("# Task list"), "{after}");
+    }
+
+    #[test]
+    fn repro_transcript_has_periodic_timestamps() {
+        // Build a session with 45 timestamped messages (at = 1000 + i*5).
+        let mut s = Session::new();
+        for i in 0..45u64 {
+            let mut m = Message::user(format!("msg {i}"));
+            m.at = 1000 + i * 5;
+            s.transcript.push(m);
+        }
+        let rendered = render_transcript_for_repro(&s, "SYS");
+        // First marker at msg 0.
+        assert!(rendered.contains("[timestamp]"), "should have timestamps");
+        assert!(rendered.contains("(msg 0, +0s)"), "first marker at msg 0");
+        // Every 20 timestamped messages: a marker at msg 20 and msg 40.
+        // Elapsed is from the first marker (msg 0 at t=1000), so msg 20 is
+        // +1m40s (100s) and msg 40 is +3m20s (200s).
+        assert!(rendered.contains("(msg 20, +1m40s)"), "periodic marker at msg 20");
+        assert!(rendered.contains("(msg 40, +3m20s)"), "periodic marker at msg 40");
+        // End marker.
+        assert!(rendered.contains("(end,"), "should have an end marker");
+        // The plain render_transcript has no timestamps.
+        let plain = render_transcript(&s, "SYS");
+        assert!(!plain.contains("[timestamp]"), "plain render must not have timestamps");
+    }
+
+    #[test]
+    fn repro_transcript_skips_unstamped_messages() {
+        // Messages with at=0 (loaded from old files) are skipped — no marker
+        // is emitted for them, and they don't advance the periodic counter.
+        let mut s = Session::new();
+        s.push(Message::user("no timestamp")); // at=0 from Message::user, but push stamps it
+        // Force a zero-timestamp message.
+        let mut m = Message::user("explicitly zero");
+        m.at = 0;
+        s.transcript.push(m);
+        let rendered = render_transcript_for_repro(&s, "SYS");
+        // The first message was stamped by push(), so there should be a marker.
+        // The zero-timestamp message should not produce a marker.
+        assert!(rendered.contains("[timestamp]"), "stamped message gets a marker");
     }
 
     #[test]
