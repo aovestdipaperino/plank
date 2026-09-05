@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.1.2] - 2026-09-05
+
+### Fixed
+
+- **Reading `~/.plank` no longer asks for write permission.** The sandbox
+  prompt "This command names ~/.plank. Allow it to write there?" fired on any
+  bash command that mentioned the directory, including
+  `cat ~/.plank/settings.json`, because the Seatbelt profile is built before
+  the command runs and the trigger was a text match. Commands made only of
+  known read-only utilities with no output redirect or command substitution
+  now skip the question. Anything unrecognised still prompts, and the profile
+  itself is unchanged, so a miss costs one extra question rather than a
+  silent grant.
+
 ## [4.1.0] - 2026-09-05
 
 ### Fixed

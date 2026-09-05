@@ -246,6 +246,101 @@ fn mentions_plank_home_at(cmd: &str, plank_home: Option<&Path>) -> bool {
     needles.iter().any(|n| contains_path_prefix(cmd, n))
 }
 
+/// True when `cmd` is provably read-only: every simple command in the line
+/// starts with a utility from a small allowlist of readers, and no output
+/// redirect appears anywhere. The [`mentions_plank_home`] prompt is skipped for
+/// such commands, because `cat ~/.plank/settings.json` cannot write no matter
+/// what the profile says.
+///
+/// Conservative in the safe direction: anything not recognised (an unknown
+/// program, `sed -i`, `find -delete`, a subshell, a script) counts as a
+/// potential write and keeps the prompt. A miss here therefore costs one extra
+/// question, never a silent grant — the Seatbelt profile remains the boundary.
+#[must_use]
+pub fn is_read_only_command(cmd: &str) -> bool {
+    const READERS: &[&str] = &[
+        "cat",
+        "ls",
+        "head",
+        "tail",
+        "less",
+        "more",
+        "grep",
+        "egrep",
+        "fgrep",
+        "rg",
+        "wc",
+        "stat",
+        "file",
+        "du",
+        "df",
+        "echo",
+        "printf",
+        "sort",
+        "uniq",
+        "jq",
+        "diff",
+        "cmp",
+        "test",
+        "[",
+        "readlink",
+        "realpath",
+        "tree",
+        "cut",
+        "tr",
+        "column",
+        "nl",
+        "od",
+        "xxd",
+        "hexdump",
+        "strings",
+        "basename",
+        "dirname",
+        "pwd",
+        "which",
+        "type",
+        "true",
+        "false",
+        "md5",
+        "shasum",
+        "sha256sum",
+        "md5sum",
+        "date",
+        "env",
+        "printenv",
+    ];
+    if cmd.contains('>') || cmd.contains('`') || cmd.contains("$(") {
+        return false;
+    }
+    let mut any = false;
+    for segment in cmd
+        .split(['|', ';', '\n'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+    {
+        let mut words = segment.split_whitespace();
+        let Some(first) = words.next() else {
+            continue;
+        };
+        any = true;
+        // `2>&1` never survives the '>' check above, so a leading env
+        // assignment is the only prefix to skip.
+        let head = if first.contains('=') && !first.starts_with('=') {
+            match words.next() {
+                Some(w) => w,
+                None => return false,
+            }
+        } else {
+            first
+        };
+        let name = head.rsplit('/').next().unwrap_or(head);
+        if !READERS.contains(&name) {
+            return false;
+        }
+    }
+    any
+}
+
 /// True when `needle` occurs in `text` as a whole path component prefix, so
 /// `~/.plank` and `~/.plank/kvcache` match but `~/.plankton` does not.
 fn contains_path_prefix(text: &str, needle: &str) -> bool {
@@ -471,6 +566,33 @@ mod tests {
             "touch /nonexistent/home/.plank/x",
             None
         ));
+    }
+
+    #[test]
+    fn read_only_commands_are_recognised_conservatively() {
+        // Pure readers, alone and in pipelines, with the usual noise.
+        assert!(is_read_only_command(
+            "cat ~/.plank/settings.json | head -40"
+        ));
+        assert!(is_read_only_command(
+            "ls -la ~/.plank; echo ---; cat ~/.plank/x"
+        ));
+        assert!(is_read_only_command(
+            "grep -n foo ~/.plank/settings.json && wc -l ~/.plank/x"
+        ));
+        assert!(is_read_only_command("/bin/cat ~/.plank/x"));
+        assert!(is_read_only_command("LC_ALL=C sort ~/.plank/x"));
+        // Redirects, substitutions and anything unrecognised keep the prompt.
+        assert!(!is_read_only_command("cat x > ~/.plank/y"));
+        assert!(!is_read_only_command("cat ~/.plank/x 2>/dev/null"));
+        assert!(!is_read_only_command("echo $(rm -rf ~/.plank)"));
+        assert!(!is_read_only_command("rm -rf ~/.plank"));
+        assert!(!is_read_only_command("sed -i s/a/b/ ~/.plank/x"));
+        assert!(!is_read_only_command("find ~/.plank -delete"));
+        assert!(!is_read_only_command("cat ~/.plank/x | tee ~/.plank/y"));
+        assert!(!is_read_only_command("plank --dump-config"));
+        assert!(!is_read_only_command("FOO=1"));
+        assert!(!is_read_only_command(""));
     }
 
     #[test]

@@ -637,12 +637,14 @@ pub fn tool_bash(ctx: &mut ToolContext, call: &ToolCall) -> String {
     ))
     .unwrap_or(60);
     // `~/.plank` is read-only under the sandbox unless the user says otherwise.
-    // Ask only when the command actually names it, so ordinary commands never
-    // see a prompt, and only while the session grant is still unset.
+    // Ask only when the command actually names it and is not provably
+    // read-only, so ordinary commands and `cat ~/.plank/...` never see a
+    // prompt, and only while the session grant is still unset.
     let mut grant_once = false;
     if ctx.sandbox.should_sandbox(cmd)
         && !ctx.sandbox.plank_home_writable
         && crate::sandbox::mentions_plank_home(cmd)
+        && !crate::sandbox::is_read_only_command(cmd)
     {
         match plank_home_grant(ctx) {
             PlankHomeGrant::Session => ctx.sandbox.plank_home_writable = true,

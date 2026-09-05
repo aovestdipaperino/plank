@@ -2123,3 +2123,18 @@ What is left is genuine reasoning at ~25 tokens per second: one 15K-character
 planning block cost four minutes of run 3 and produced a correct plan. From
 here the lever is decode speed, not the prompt. Run transcripts:
 `witty-ohm` (original), `wacky-rossi` (run 2), `witty-mercury-efd30951` (run 3).
+
+## The `~/.plank` write prompt fires on reads, because it reads the command text
+
+The bash tool builds the Seatbelt profile before the command runs, so it cannot
+observe a write to `~/.plank`; it scans the command string for `~/.plank`,
+`$HOME/.plank` or the expanded path instead (`sandbox::mentions_plank_home`).
+That meant `cat ~/.plank/settings.json` asked "Allow it to write there?" during
+an AGENTS.md pass (repro `repro-1788602110`), and denying changed nothing since
+the read was allowed anyway. The fix is not to parse shell: `is_read_only_command`
+accepts a line only when every simple command starts with a listed reader and
+there is no `>`, backtick or `$(`, and everything else keeps prompting. Note
+`2>/dev/null` contains `>` and still prompts; that is deliberate, because telling
+fd redirects from output redirects is exactly the parsing the allowlist avoids.
+The profile stays the boundary, so the classifier can only over-ask, never
+over-grant.
