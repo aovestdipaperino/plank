@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.1.4] - 2026-09-06
+
 ### Added
 
 - **A debug console that starts late is backfilled.** Connecting
