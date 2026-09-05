@@ -10,8 +10,11 @@
 //! can reproduce the state that triggered a bug without the live session.
 //!
 //! Files land in `~/.plank/repro/` (or the working dir when `HOME` is unset),
-//! named `repro-<unix-seconds>[-<n>].md`. Nothing here touches the live
-//! session — it is a read-only snapshot.
+//! named `repro-<unix-seconds>[-<n>].md`. When the repetition guard stops a
+//! looping pass the agent writes one automatically as
+//! `repro-loop-<unix-seconds>[-<n>].md`, so a stall is captured without
+//! anyone having to notice it. Nothing here touches the live session — it is
+//! a read-only snapshot.
 //!
 //! Sub-agent sidechains are folded out of the transcript the moment they end,
 //! so the main dump never shows what a sub-agent did. The agent keeps the last
@@ -241,11 +244,22 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
 ///
 /// Returns a message when the directory or file cannot be created.
 pub fn save(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
-    save_in(&repro_dir(cwd), secs, report)
+    save_in(&repro_dir(cwd), "repro", secs, report)
 }
 
-/// Writes `report` into an explicit directory, disambiguating same-second
-/// filenames with a `-N` suffix.
+/// Like [`save`], but named `repro-loop-<secs>.md`: the dump written
+/// automatically the moment the repetition guard stops a looping pass, so a
+/// stall is captured without the user having to notice it and type `/repro`.
+///
+/// # Errors
+///
+/// Returns a message when the directory or file cannot be created.
+pub fn save_loop(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
+    save_in(&repro_dir(cwd), "repro-loop", secs, report)
+}
+
+/// Writes `report` into an explicit directory as `<prefix>-<secs>.md`,
+/// disambiguating same-second filenames with a `-N` suffix.
 ///
 /// Split out from [`save`] so tests can exercise the naming rule against a
 /// scratch directory without reaching for the process-global `HOME`.
@@ -253,12 +267,12 @@ pub fn save(cwd: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
 /// # Errors
 /// Returns the OS error message when the directory cannot be created or the
 /// file cannot be written.
-pub fn save_in(dir: &Path, secs: u64, report: &str) -> Result<PathBuf, String> {
+pub fn save_in(dir: &Path, prefix: &str, secs: u64, report: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    let mut path = dir.join(format!("repro-{secs}.md"));
+    let mut path = dir.join(format!("{prefix}-{secs}.md"));
     let mut n = 1;
     while path.exists() {
-        path = dir.join(format!("repro-{secs}-{n}.md"));
+        path = dir.join(format!("{prefix}-{secs}-{n}.md"));
         n += 1;
     }
     std::fs::write(&path, report).map_err(|e| e.to_string())?;
@@ -309,7 +323,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("plank-repro-side-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).unwrap();
-        let main = save_in(&dir, 2000, "main").unwrap();
+        let main = save_in(&dir, "repro", 2000, "main").unwrap();
         assert_eq!(sidecar_path(&main, 1), dir.join("repro-2000.sub-1.md"));
         let msgs = vec![
             crate::session::Message::user("task"),
@@ -369,11 +383,31 @@ mod tests {
         // Never mutate HOME here: `cargo test` runs tests on parallel threads
         // in one process, so a process-global env write races every other test
         // (and every `git` subprocess they spawn) — see issue #43.
-        let a = save_in(&dir, 1000, "first").unwrap();
-        let b = save_in(&dir, 1000, "second").unwrap();
+        let a = save_in(&dir, "repro", 1000, "first").unwrap();
+        let b = save_in(&dir, "repro", 1000, "second").unwrap();
         assert_ne!(a, b);
         assert_eq!(std::fs::read_to_string(&a).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(&b).unwrap(), "second");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn loop_dumps_carry_their_own_prefix() {
+        let dir = std::env::temp_dir().join(format!("plank-repro-loop-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let a = save_in(&dir, "repro-loop", 1000, "looped").unwrap();
+        assert_eq!(
+            a.file_name().unwrap().to_str().unwrap(),
+            "repro-loop-1000.md"
+        );
+        let b = save_in(&dir, "repro-loop", 1000, "again").unwrap();
+        assert_eq!(
+            b.file_name().unwrap().to_str().unwrap(),
+            "repro-loop-1000-1.md"
+        );
+        // A manual `/repro` in the same second does not collide with the loop dump.
+        let c = save_in(&dir, "repro", 1000, "manual").unwrap();
+        assert_eq!(c.file_name().unwrap().to_str().unwrap(), "repro-1000.md");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -135,6 +135,9 @@ and edit; never re-read a file you have already seen.\n\
 covers every call site, say so in one line, and proceed.\n\
 - Keep reasoning short and forward-moving; if you are restating an earlier thought, stop and \
 emit the tool calls you already planned.\n\
+- Narrate progress outside your thinking: before every batch of tool calls, write one or two \
+plain sentences for the user saying what the last results told you and what you are about to \
+do. Your thinking is hidden from the user by default, so this is the only status they see.\n\
 - Edit from search output: search with context, then edit directly from the lines shown \
 instead of re-reading them.\n\
 - Stay in scope: change the code asked about and its tests; leave docs, changelogs, READMEs and \
@@ -524,6 +527,7 @@ const WORKING_STYLE: &str = "# Working style
 - Explore briefly, then act. Once you have found the code to change and read it once, stop exploring and edit. Do not re-read a file you have already seen; do not read a file whole when a search would locate the lines.
 - Decide, do not deliberate. When two designs are both plausible, pick the smaller one that covers every call site, say so in one line, and proceed. The user can redirect you after seeing a result; they cannot use a decision you never made.
 - Keep reasoning short and forward-moving. Each thought must add a fact or a decision. If you notice yourself restating an earlier thought, stop thinking and emit the tool calls you have already planned.
+- Narrate progress outside your thinking. After </think> and before every <｜DSML｜tool_calls> stanza, write one or two plain sentences for the user: what the last results told you and what you are about to do. Your thinking is hidden from the user by default, so this line is the only status they see between tool rounds; without it a long thinking block looks like a stall.
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.

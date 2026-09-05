@@ -1255,6 +1255,56 @@ fn strip_thinking(text: &str) -> String {
     out.trim().to_owned()
 }
 
+/// One dim line describing what a tool stanza ran, in the user's terms rather
+/// than the tool table's: "Ran 1 shell command", "Read 3 files, edited 1 file",
+/// "Ran 2 searches". Unfamiliar tools (MCP, WASM, sub-agents) fall back to a
+/// generic "tool call" count so the line never lies about what happened. The
+/// first word is capitalized once for the whole line, so a mixed stanza reads
+/// as one sentence.
+fn tool_activity_summary(calls: &[ToolCall]) -> String {
+    fn plural(n: usize, one: &str, many: &str) -> String {
+        if n == 1 {
+            format!("{n} {one}")
+        } else {
+            format!("{n} {many}")
+        }
+    }
+    let (mut shell, mut reads, mut edits, mut searches, mut other) = (0, 0, 0, 0, 0);
+    for c in calls {
+        match c.name.as_str() {
+            "bash" => shell += 1,
+            "read" | "more" | "view_image" => reads += 1,
+            "edit" | "write" => edits += 1,
+            "search" | "glob" | "google_search" | "visit_page" => searches += 1,
+            _ => other += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if shell > 0 {
+        parts.push(format!(
+            "ran {}",
+            plural(shell, "shell command", "shell commands")
+        ));
+    }
+    if reads > 0 {
+        parts.push(format!("read {}", plural(reads, "file", "files")));
+    }
+    if edits > 0 {
+        parts.push(format!("edited {}", plural(edits, "file", "files")));
+    }
+    if searches > 0 {
+        parts.push(format!("ran {}", plural(searches, "search", "searches")));
+    }
+    if other > 0 {
+        parts.push(format!("ran {}", plural(other, "tool call", "tool calls")));
+    }
+    let mut line = parts.join(", ");
+    if let Some(first) = line.get(..1) {
+        line.replace_range(..1, &first.to_ascii_uppercase());
+    }
+    line
+}
+
 /// Concatenates tool outputs into the model-facing result block, given
 /// `(tool name, output)` pairs in the model's call order.
 ///
@@ -2109,6 +2159,20 @@ impl Agent<'_> {
         Ok((stream, assistant_text, stats))
     }
 
+    /// Emits the dim one-line record of what a stanza just ran (see
+    /// [`tool_activity_summary`]) when thinking is hidden. With thinking off,
+    /// and banners off by default too, the screen otherwise shows nothing
+    /// between the model's last sentence and its next one while a long
+    /// thinking block plus tool round trip goes by; this line is the only
+    /// evidence that work happened. Thinking on already shows the calls in
+    /// context, and `/init` asks for silence outright.
+    fn tool_activity_line(&self, calls: &[ToolCall]) -> Option<String> {
+        if crate::settings::active().ui.show_thinking || self.quiet_tools {
+            return None;
+        }
+        Some(tool_activity_summary(calls))
+    }
+
     /// Executes one DSML block's tool calls, routing any `agent` call through
     /// the sub-agent driver (issue #50) and everything else through the normal
     /// [`dispatch_all`]. Frames results identically to [`dispatch_all`] so the
@@ -2819,6 +2883,13 @@ impl Agent<'_> {
             );
             self.session.push(Message::assistant(assistant_text));
             self.payload_dirty = true;
+            // The looping text is in the transcript now: dump it before the
+            // error goes back to the model and the turn moves on.
+            if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR)
+                && let Some(line) = self.loop_repro_line()
+            {
+                println!("{}", self.debug_line(&line));
+            }
             let st = Status {
                 state: if stats.interrupted {
                     WorkerState::Stopped
@@ -2873,6 +2944,9 @@ impl Agent<'_> {
                 self.sync_tasks_after_dispatch();
                 let mut renderer = stream.into_sink().into_renderer();
                 renderer.finish();
+                if let Some(line) = self.tool_activity_line(&calls) {
+                    println!("{}", self.debug_line(&line));
+                }
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -6548,6 +6622,36 @@ the original is frozen and listed in /tree"
     /// pointer, so a bare `/open` opens the dump that was just generated (the
     /// file the user most likely wants to read or annotate next).
     fn write_repro(&mut self, note: &str) -> Result<(std::path::PathBuf, usize), String> {
+        self.write_repro_with(note, crate::repro::save)
+    }
+
+    /// The automatic dump taken the moment the repetition guard stops a pass
+    /// (`repro-loop-<secs>.md`), so a stall is on disk before anyone has to
+    /// notice it. Returns the `[repro written to …]` line to show, or nothing
+    /// inside a sub-agent sidechain, whose transcript is not the user's session
+    /// and is captured as a sidecar of the next main dump instead. A failed
+    /// write is reported on the same line rather than aborting the turn: the
+    /// dump is diagnostics, the turn is the work.
+    fn loop_repro_line(&mut self) -> Option<String> {
+        if self.in_sidechain() {
+            return None;
+        }
+        Some(
+            match self.write_repro_with(
+                "model looped; repro saved automatically",
+                crate::repro::save_loop,
+            ) {
+                Ok((path, sidecars)) => Self::repro_written_line(&path, sidecars),
+                Err(e) => format!("[loop repro not written: {e}]"),
+            },
+        )
+    }
+
+    fn write_repro_with(
+        &mut self,
+        note: &str,
+        save: fn(&std::path::Path, u64, &str) -> Result<std::path::PathBuf, String>,
+    ) -> Result<(std::path::PathBuf, usize), String> {
         // `rendered` is the exact engine input (no timestamp markers) — used
         // for the token count so that figure stays accurate. `rendered_for_repro`
         // is the same transcript with periodic `[timestamp]` markers for the
@@ -6569,7 +6673,7 @@ the original is frozen and listed in /tree"
             note: note.trim(),
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
-        let path = crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)?;
+        let path = save(&self.tool_ctx.cwd, now_secs(), &report)?;
         // Sub-agent sidechains are gone from the transcript by now; the
         // remembered dumps go beside the main file, oldest first.
         let main_file = path
@@ -7788,7 +7892,17 @@ struct TurnOutput {
     /// mid-thought); the turn loop closes it before pushing the message.
     ended_in_think: bool,
     calls: Vec<ToolCall>,
-    error: Option<String>,
+    error: Option<PassFailure>,
+}
+
+/// Why a TUI pass ended with a tool error instead of tool calls.
+struct PassFailure {
+    /// The framed `<tool_result>` body fed back to the model.
+    payload: String,
+    /// The repetition guard stopped this pass ([`REPEAT_LOOP_ERROR`]); the
+    /// turn loop writes the automatic `repro-loop-*` dump once the text is in
+    /// the transcript.
+    looped: bool,
 }
 
 /// Interactive input state for the ratatui UI.
@@ -10596,6 +10710,13 @@ impl Agent<'_> {
             self.session.push(Message::assistant(assistant_text));
             self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
+            // The looping text is in the transcript now: dump it before the
+            // error goes back to the model and the turn moves on.
+            if out.error.as_ref().is_some_and(|e| e.looped)
+                && let Some(line) = self.loop_repro_line()
+            {
+                let _ = tx.send(UiEvent::Dim(line));
+            }
             if out.interrupted {
                 crate::interrupt::clear();
                 self.last_turn_interrupted = true;
@@ -10609,7 +10730,7 @@ impl Agent<'_> {
             // Side questions answer at every generation boundary, before the
             // next tool dispatch (BTW-DESIGN §4.4 drain points 1 and 2).
             self.drain_btw(tx, shared);
-            if let Some(payload) = out.error {
+            if let Some(PassFailure { payload, .. }) = out.error {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
@@ -10619,6 +10740,9 @@ impl Agent<'_> {
             if !out.calls.is_empty() {
                 let observations = self.run_tool_calls(&out.calls);
                 self.sync_tasks_after_dispatch();
+                if let Some(line) = self.tool_activity_line(&out.calls) {
+                    let _ = tx.send(UiEvent::Dim(line));
+                }
                 let previews = std::mem::take(&mut self.tool_ctx.edit_previews);
                 crate::openfile::note_written(
                     &mut self.last_edited,
@@ -10960,6 +11084,7 @@ impl Agent<'_> {
                         power_percent: power,
                         think,
                         greedy_sampling: greedy.load(Ordering::Relaxed),
+                        looping: repeat.repeating(),
                         ..Status::default()
                     }
                 }
@@ -11115,7 +11240,10 @@ impl Agent<'_> {
             assistant_text,
             ended_in_think: finished.ended_in_think,
             calls,
-            error,
+            error: error.map(|payload| PassFailure {
+                payload,
+                looped: preflight_error == Some(REPEAT_LOOP_ERROR),
+            }),
         })
     }
 
@@ -13938,6 +14066,36 @@ mod tests {
     /// Flattened text of a line, for asserting on layout.
     fn text_of(line: &ratatui::text::Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn named_calls(names: &[&str]) -> Vec<ToolCall> {
+        names
+            .iter()
+            .map(|n| ToolCall {
+                name: (*n).to_string(),
+                args: Vec::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn tool_activity_summary_counts_by_kind_and_pluralizes() {
+        assert_eq!(
+            tool_activity_summary(&named_calls(&["bash"])),
+            "Ran 1 shell command"
+        );
+        assert_eq!(
+            tool_activity_summary(&named_calls(&["bash", "bash", "bash"])),
+            "Ran 3 shell commands"
+        );
+        assert_eq!(
+            tool_activity_summary(&named_calls(&["read", "read", "edit", "search"])),
+            "Read 2 files, edited 1 file, ran 1 search"
+        );
+        assert_eq!(
+            tool_activity_summary(&named_calls(&["mcp_foo", "agent"])),
+            "Ran 2 tool calls"
+        );
     }
 
     fn read_call(path: &str) -> ToolCall {

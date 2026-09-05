@@ -1654,6 +1654,10 @@ pub struct RepeatGuard {
     window: usize,
     /// Bytes generated between checks.
     check_every: usize,
+    /// Set at the first check that finds [`REPEAT_WARN_CYCLES`] cycles, and
+    /// kept for the rest of the pass so the footer's loop marker does not
+    /// flicker while the tail drifts in and out of alignment.
+    repeating: bool,
 }
 
 impl Default for RepeatGuard {
@@ -1663,6 +1667,7 @@ impl Default for RepeatGuard {
             since_check: 0,
             window: REPEAT_WINDOW,
             check_every: REPEAT_CHECK_EVERY,
+            repeating: false,
         }
     }
 }
@@ -1674,6 +1679,10 @@ const REPEAT_WINDOW: usize = 1024;
 const REPEAT_MIN_PERIOD: usize = 12;
 /// Consecutive identical blocks needed before the pass is stopped.
 const REPEAT_CYCLES: usize = 4;
+/// Consecutive identical blocks at which the loop is *reported* (see
+/// [`RepeatGuard::repeating`]) without yet stopping the pass: two cycles are
+/// enough to show a loop marker, not enough to be sure it is one.
+const REPEAT_WARN_CYCLES: usize = 2;
 /// Bytes generated between checks. Scanning every chunk would be wasted work;
 /// a loop is not urgent enough to catch within one token.
 const REPEAT_CHECK_EVERY: usize = 64;
@@ -1718,16 +1727,33 @@ impl RepeatGuard {
             return false;
         }
         self.since_check = 0;
-        self.is_cyclic()
+        if self.has_cycles(REPEAT_CYCLES) {
+            self.repeating = true;
+            return true;
+        }
+        if !self.repeating && self.has_cycles(REPEAT_WARN_CYCLES) {
+            self.repeating = true;
+        }
+        false
     }
 
-    /// Whether the tail ends in the same block repeated back to back.
-    fn is_cyclic(&self) -> bool {
+    /// Whether the stream has been seen repeating itself — at least
+    /// [`REPEAT_WARN_CYCLES`] cycles at some check — so the footer can flag
+    /// the loop before [`feed`](Self::feed) stops the pass. Sticky for the
+    /// life of the guard.
+    #[must_use]
+    pub fn repeating(&self) -> bool {
+        self.repeating
+    }
+
+    /// Whether the tail ends in the same block repeated `cycles` times back
+    /// to back.
+    fn has_cycles(&self, cycles: usize) -> bool {
         let bytes = self.tail.as_bytes();
         let len = bytes.len();
-        for period in REPEAT_MIN_PERIOD..=len / REPEAT_CYCLES {
+        for period in REPEAT_MIN_PERIOD..=len / cycles {
             let block = &bytes[len - period..];
-            if (1..REPEAT_CYCLES)
+            if (1..cycles)
                 .all(|back| &bytes[len - period * (back + 1)..len - period * back] == block)
             {
                 return true;
@@ -2972,6 +2998,24 @@ Tool result 3 (read):\nfine\n</tool_result>",
             }
         }
         assert!(tripped, "a repeating list entry must stop the pass");
+        assert!(guard.repeating(), "a tripped guard reports the loop");
+
+        // The loop is reported a couple of cycles before the pass is stopped,
+        // so the footer can show it while the model is still going.
+        let mut guard = RepeatGuard::new();
+        let entry = "{\"name\": \"Skills\", \"why\": \"you repeat steps\"}, ";
+        assert!(!guard.feed(entry) && !guard.repeating());
+        assert!(
+            !guard.feed(entry) && guard.repeating(),
+            "two cycles flag it"
+        );
+        assert!(!guard.feed(entry), "three cycles do not yet stop the pass");
+        // Varied prose never flags a loop.
+        let mut guard = RepeatGuard::new();
+        for i in 0..50 {
+            let _ = guard.feed(&format!("different sentence number {i} here. "));
+        }
+        assert!(!guard.repeating());
 
         // A run of blank lines is the other shape the same failure takes.
         let mut guard = RepeatGuard::new();

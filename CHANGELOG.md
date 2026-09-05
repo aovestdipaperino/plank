@@ -6,8 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.1.3] - 2026-09-05
+
 ### Added
 
+- **The status bar says when the model is looping.** The repetition guard
+  now reports a cycle after two identical repeats of the reasoning tail,
+  two cycles before it stops the pass, and the footer shows `🔁 looping`
+  next to the ctx gauge for as long as the guard sees it. Until now the only
+  sign of a loop was the pass ending with a tool error.
+- **A looping pass is dumped automatically.** When the repetition guard stops
+  a pass, the agent writes `repro-loop-<time>.md` (with sub-agent sidecars)
+  the way `/repro` would, and prints the `[repro written to …]` line, so the
+  stall is on disk before anyone has to notice it. Sub-agent sidechains do
+  not write their own dump; they ride along as sidecars of the next main one.
+- **A one-line record of what each tool round ran.** With thinking hidden,
+  the screen used to show nothing between the model's last sentence and its
+  next one while a thinking block plus tool round trip went by. A dim
+  `Ran 2 shell commands, read 3 files` line now follows each dispatch.
+  Thinking on already shows the calls; `/init` stays silent.
 - **`/repro` writes sub-agent sidecars.** A sub-agent sidechain is truncated
   out of the transcript the moment it ends, so the main dump could never show
   what a sub-agent did before it was interrupted. The agent now remembers the
@@ -22,6 +39,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The system prompt asks the model to narrate between tool rounds.** A new
+  reminder line tells the model to write one or two plain sentences after
+  `</think>` and before every tool-call stanza saying what the last results
+  showed and what it will do next, because hidden thinking makes a long
+  round look like a stall. Parity fixtures regenerated.
 - **`/init` runs quietly.** Tool banners, the `write` content preview and
   tool results are suppressed during the generation turn regardless of the
   `ui.show*` settings, so the AGENTS.md draft no longer scrolls past on its

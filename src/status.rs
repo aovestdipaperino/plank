@@ -252,6 +252,9 @@ pub struct Status {
     pub thinking: bool,
     /// True when sampling greedily (shown as a snowflake).
     pub greedy_sampling: bool,
+    /// True once the repetition guard has seen the reasoning cycling; the
+    /// footer flags it with [`LOOP_MARK`] while the pass is still running.
+    pub looping: bool,
     /// Context tokens in use.
     pub ctx_used: i32,
     /// Context window size.
@@ -275,6 +278,21 @@ pub struct Status {
 /// ⚡100%`), and two different meanings for one mark in a single footer is
 /// exactly the sort of thing nobody notices until they misread it.
 const SPEC_MARK: &str = "⏩";
+
+/// Marks the footer's loop segment, shown while the repetition guard sees the
+/// reasoning cycling (`🔁 looping`).
+const LOOP_MARK: &str = "🔁";
+
+/// The loop segment: ` | 🔁 looping` while `st.looping`, empty otherwise. Rides
+/// after the ctx gauge in the generating footer, whether or not the progress
+/// segment is in the bar, so the marker is visible in both front-ends.
+fn loop_segment(st: &Status) -> String {
+    if st.looping {
+        format!(" | {LOOP_MARK} looping")
+    } else {
+        String::new()
+    }
+}
 
 /// Returns the input prompt text.
 #[must_use]
@@ -1711,10 +1729,11 @@ fn build_status_text_with_cells(
     let power = format!("{}{power}", wasm_segment_text_keeping(cells, color));
     let body = match st.state {
         WorkerState::Prefill | WorkerState::Generating => {
+            let looping = loop_segment(st);
             match progress_segment(st, color).filter(|_| progress_in_bar) {
-                Some(progress) => format!("{ctx} | {progress}{power}"),
+                Some(progress) => format!("{ctx}{looping} | {progress}{power}"),
                 // Progress lifted into the output area (showThinking off).
-                None => format!("{ctx}{power}"),
+                None => format!("{ctx}{looping}{power}"),
             }
         }
         WorkerState::Compacting => format!(
@@ -2256,6 +2275,41 @@ mod tests {
 
         // No progress segment outside prefill/generating.
         assert!(progress_segment(&Status::default(), false).is_none());
+    }
+
+    #[test]
+    fn the_footer_flags_a_detected_loop_in_and_out_of_the_bar() {
+        let st = Status {
+            state: WorkerState::Generating,
+            looping: true,
+            ..Status::default()
+        };
+        for in_bar in [true, false] {
+            let shown = build_status_text(&st, false, in_bar);
+            assert!(
+                shown.contains(&format!(" | {LOOP_MARK} looping")),
+                "{shown}"
+            );
+        }
+        let calm = build_status_text(
+            &Status {
+                state: WorkerState::Generating,
+                ..Status::default()
+            },
+            false,
+            true,
+        );
+        assert!(!calm.contains(LOOP_MARK), "{calm}");
+        // Idle never shows it, whatever the flag says.
+        let idle = build_status_text(
+            &Status {
+                looping: true,
+                ..Status::default()
+            },
+            false,
+            true,
+        );
+        assert!(!idle.contains(LOOP_MARK), "{idle}");
     }
 
     #[test]

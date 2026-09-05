@@ -2089,6 +2089,16 @@ the quiet sub-agent pass, `worker_generate_kind`) through
   turn continues. A new stop reason would have needed its own plumbing at all
   three consumers.
 
+The guard also has a *warning* level: `RepeatGuard::repeating()` turns true at
+two identical cycles (`REPEAT_WARN_CYCLES`) and stays true for the pass, while
+the stop still waits for four. The TUI status snapshot copies it into
+`Status::looping`, which the footer renders as `🔁 looping` after the ctx
+gauge. Two consequences worth remembering: the flag is sticky on purpose, since
+the tail drifts in and out of alignment between checks and a flickering marker
+reads as a bug; and the plain REPL never shows it, because its status bar is
+cleared the moment output starts streaming, so there is no generating footer to
+carry it.
+
 ## `edit` on a CRLF file: multi-line `old` never matches, single-line `old` corrupts
 
 `src/helpers/msgbox.rs` in turbo-vision is CRLF on 242 of 265 lines. The model
