@@ -29,7 +29,10 @@
 //!   with a high-water mark so a reconnect never repeats what the console
 //!   already showed. Finished sub-agents are replayed from the `/repro` dump
 //!   ring under their original window names.
-//! - Under `cfg(test)` a thread claims the fake console via `test_support::use_console`; other threads' pushes are dropped so the suite stays hermetic (production builds compile the check to `true`). A test that owns a console cannot mirror from a spawned thread.
+//! - Under `cfg(test)` a thread claims the fake console via
+//!   `test_support::use_console`; other threads' pushes are dropped so the
+//!   suite stays hermetic (production builds compile the check to `true`). A
+//!   test that owns a console cannot mirror from a spawned thread.
 //!
 //! What gets mirrored is the *whole* raw model stream — thinking, visible
 //! answer, tool-call markup, byte for byte — because the console runs its own
@@ -177,6 +180,13 @@ const NAME_PREFIX: &str = "plank:";
 /// the session's id (session start, `/new`, `/rename`, `/resume`), it is cheap
 /// when the name is unchanged: a mutex lock and a string comparison.
 pub fn set_session_id(id: &str) {
+    // Hermeticity: this tears down the process-wide registry, so under
+    // `cfg(test)` only the thread that claimed the fake console may run it —
+    // otherwise any test building an `Agent` would disconnect a console test
+    // running beside it. Compiles to `true` in production builds.
+    if !console_owned_by_this_thread() {
+        return;
+    }
     let mut cur = CURRENT_SESSION_NAME
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -390,7 +400,9 @@ pub fn is_connected(id: MirrorId) -> bool {
 }
 
 /// [`push`] to a specific window, ignoring the thread's routing. Used by the
-/// backfill, which writes to windows it did not open on this thread.
+/// backfill, which writes to windows it did not open on this thread. A write
+/// failure drops the connection but deliberately keeps the window's `LIVE`
+/// entry, so the next [`reconcile`] redials it rather than forgetting it.
 pub fn push_to(id: MirrorId, text: &str) {
     if !console_owned_by_this_thread() {
         return;

@@ -836,7 +836,11 @@ fn fanout_slot_result(
 /// What a finished serial sub-agent hands back for its `/repro` dump.
 #[derive(Debug, Clone, Copy)]
 struct SubagentDone {
+    /// The sub-agent window's ordinal within the session, as minted by
+    /// [`crate::debugmirror::open_subagent`]; `0` when none was opened.
     ordinal: usize,
+    /// Whether that window was connected while the sidechain ran, so its
+    /// passes already reached the console and need no `/repro` replay.
     mirrored: bool,
 }
 
@@ -1181,6 +1185,10 @@ fn generate_fanout_round(
         let reconciled = crate::debugmirror::reconcile();
         for slot in slot_chunk.iter() {
             if reconciled.subagents_new.contains(&slot.mirror.id()) {
+                // Same guard as `Agent::console_reinjects_think`: a structured
+                // engine never opens a `<think>` tag, so re-injecting one would
+                // desync the console's renderer.
+                let reinject = !ctx.think_off && !slot.engine.wants_structured();
                 let texts: Vec<&str> = slot
                     .session
                     .transcript
@@ -1188,7 +1196,7 @@ fn generate_fanout_round(
                     .filter(|m| m.role == crate::session::Role::Assistant)
                     .map(|m| m.text.as_str())
                     .collect();
-                if let Some(p) = crate::debugmirror::backfill_payload(texts, !ctx.think_off) {
+                if let Some(p) = crate::debugmirror::backfill_payload(texts, reinject) {
                     crate::debugmirror::push_to(slot.mirror.id(), &p);
                     crate::debugmirror::flush_to(slot.mirror.id());
                 }
@@ -3655,6 +3663,9 @@ impl Agent<'_> {
             "<tool_result>Compacted session summary:\n{summary}</tool_result>"
         )));
         self.session.transcript.extend(tail);
+        // The transcript just shrank; `console_seen` is an index into it (see
+        // the field doc), so a stale mark would silently disable the backfill.
+        self.console_seen = self.console_seen.min(self.session.transcript.len());
         let reinject = compact::build_reinjection(
             &self.tool_ctx.recent_reads,
             compact::reinject_budget(self.engine.ctx_size()),
@@ -7045,6 +7056,9 @@ the original is frozen and listed in /tree"
     /// report, extracted before the truncate. Every fork-end path goes
     /// through here so the depth counter opened by
     /// [`begin_subagent_fork`](Self::begin_subagent_fork) always closes.
+    /// `done` carries the sidechain's console window (ordinal, and whether it
+    /// was already mirrored live) so the remembered dump knows whether the
+    /// backfill still owes that window a replay.
     fn end_subagent_fork(
         &mut self,
         fork_at: usize,
@@ -7109,14 +7123,17 @@ the original is frozen and listed in /tree"
                 .map(|m| m.text.clone())
                 .collect()
         };
-        if r.parent_new {
-            let limit = self
-                .fork_points
-                .first()
-                .copied()
-                .unwrap_or(self.session.transcript.len());
+        let len = self.session.transcript.len();
+        // A cross-provider sub-agent stashes the parent transcript for the
+        // sidechain's duration, leaving `fork_points` holding parent-relative
+        // indices into a transcript that is not there. A fork point past the
+        // end is the tell.
+        let stashed = self.fork_points.first().is_some_and(|&fp| fp > len);
+        if r.parent_new && !stashed {
+            let limit = self.fork_points.first().copied().unwrap_or(len).min(len);
             if self.console_seen < limit {
-                let texts = assistant_texts(&self.session.transcript[self.console_seen..limit]);
+                let texts =
+                    assistant_texts(&self.session.transcript[self.console_seen.min(limit)..limit]);
                 if let Some(p) =
                     crate::debugmirror::backfill_payload(texts.iter().map(String::as_str), reinject)
                 {
@@ -7125,6 +7142,8 @@ the original is frozen and listed in /tree"
                 }
                 self.console_seen = limit;
             }
+        }
+        if r.parent_new {
             for dump in self.sidechain_dumps.iter_mut().filter(|d| !d.mirrored) {
                 if dump.ordinal != 0 {
                     let texts = assistant_texts(&dump.messages);
@@ -7143,7 +7162,13 @@ the original is frozen and listed in /tree"
         if let Some(&fork_at) = self.fork_points.last() {
             let live = crate::debugmirror::current_id();
             if r.subagents_new.contains(&live) {
-                let texts = assistant_texts(&self.session.transcript[fork_at..]);
+                // Stashed mode: the current transcript *is* the sidechain.
+                let window = if fork_at > len {
+                    &self.session.transcript[..]
+                } else {
+                    &self.session.transcript[fork_at..]
+                };
+                let texts = assistant_texts(window);
                 if let Some(p) =
                     crate::debugmirror::backfill_payload(texts.iter().map(String::as_str), reinject)
                 {
@@ -14626,6 +14651,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Compaction shrinks the transcript, so the console backfill's
+    /// high-water mark must be clamped or the backfill silently stops.
+    #[test]
+    fn rebuild_after_compact_clamps_the_console_mark() {
+        let dir = scratch_dir("compact-console-mark");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("old context"));
+        agent.session.push(Message::assistant("old answer"));
+        agent.console_seen = 10;
+        agent.rebuild_after_compact("<summary>did things</summary>");
+        assert!(
+            agent.console_seen <= agent.session.transcript.len(),
+            "{} > {}",
+            agent.console_seen,
+            agent.session.transcript.len()
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn rebuild_after_compact_reinjects_the_task_list_once() {
         let dir = scratch_dir("compact-tasks");
@@ -17998,8 +18043,56 @@ mod tests {
         assert_eq!(agent.console_seen, fork_at);
         dm::reset();
     }
+
+    /// A cross-provider sub-agent stashes the parent transcript for the
+    /// sidechain's duration, so `fork_points[0]` points past the end of the
+    /// current transcript. The backfill must not slice out of range.
+    #[test]
+    fn a_stashed_parent_transcript_does_not_panic_the_backfill() {
+        use crate::debugmirror::test_support as dm;
+        let _g = dm::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("console-stashed-parent");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("parent answer"));
+        let fork_at = agent.begin_subagent_fork(None, "delegated", false);
+        assert_eq!(agent.fork_points, vec![fork_at]);
+        let mirror = crate::debugmirror::open_subagent();
+        let _active = mirror.activate();
+        // The stash: the parent transcript is gone, only the framed task
+        // remains, so `fork_points[0]` is past the end.
+        agent.session.transcript = vec![Message::assistant("child answer")];
+        assert!(fork_at > agent.session.transcript.len());
+
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        let r = crate::debugmirror::reconcile();
+        assert_eq!(r.subagents_new, vec![mirror.id()]);
+        agent.backfill_console(&r);
+
+        let (_h, mut parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (_h, mut child) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let p = dm::read_available(&mut parent);
+        let c = dm::read_available(&mut child);
+        assert!(
+            !p.contains("child answer") && !p.contains("parent answer"),
+            "{p:?}"
+        );
+        assert!(c.contains("child answer"), "{c:?}");
+        assert_eq!(agent.console_seen, 0);
+        dm::reset();
+    }
     #[test]
     fn replay_history_renders_markdown_and_thinking_not_plain() {
+        // Installing settings runs `debugmirror::reconcile`, and with
+        // showThinking on that clears the mirror registry process-wide; take
+        // the console lock so a concurrent console test is not disconnected.
+        let _dm = crate::debugmirror::test_support::lock();
         // showThinking now defaults off; opt this thread in explicitly since
         // the test is exercising the thinking-rendered case.
         let mut settings = crate::settings::Settings::default();
@@ -18073,6 +18166,10 @@ mod tests {
     #[test]
     fn replay_history_consumes_in_think_tool_call_instead_of_ignoring_it() {
         // Opt this thread into in-think dispatch; the shipped default is off.
+        // Installing settings runs `debugmirror::reconcile`, and with
+        // showThinking on that clears the mirror registry process-wide; take
+        // the console lock so a concurrent console test is not disconnected.
+        let _dm = crate::debugmirror::test_support::lock();
         // Also opt into showThinking (now off by default) since this test
         // asserts the thinking text itself renders.
         let mut settings = crate::settings::Settings::default();
@@ -19979,6 +20076,10 @@ mod tests {
     /// path; only a bare `/config` opens the modal form.
     #[test]
     fn tui_config_with_an_argument_sets_the_value_instead_of_opening_the_form() {
+        // Installing settings runs `debugmirror::reconcile`, and with
+        // showThinking on that clears the mirror registry process-wide; take
+        // the console lock so a concurrent console test is not disconnected.
+        let _dm = crate::debugmirror::test_support::lock();
         let dir = scratch_dir("tui-config-set");
         let mut settings = crate::settings::Settings::default();
         settings.ui.show_thinking = true;
