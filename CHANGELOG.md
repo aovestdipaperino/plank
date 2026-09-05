@@ -38,6 +38,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deliberate, keep reasoning forward-moving, edit straight from search
   context, stay in the requested scope, and review diffs per file. The
   provider prompt carries the same rules in native-tool wording.
+- **AGENTS.md is the only agent-instructions file plank reads.** `CLAUDE.md`
+  is no longer a silent fallback. Instead, an interactive start in a project
+  root that has a `CLAUDE.md` and no `AGENTS.md` creates `AGENTS.md` as a
+  symbolic link to it (relative target, so the checkout can move), and a
+  project with neither is asked whether to generate one with `/init`, in the
+  TUI's option panel or at the plain prompt. Headless runs do none of this
+  and never write into the checkout or block on a question.
 - **Headless runs save their session.** `--non-interactive` now writes the
   transcript to `~/.plank/kvcache` at exit and names it on stderr, so a slow
   or looping run can be analysed afterwards; `--no-session` opts out.

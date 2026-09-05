@@ -82,7 +82,7 @@ impl ContextContent {
         }
     }
 
-    /// Tier 2 (project-stable) context: the discovered `AGENTS.md`/`CLAUDE.md`
+    /// Tier 2 (project-stable) context: the discovered `AGENTS.md`
     /// set and persistent memory. These rarely change, so they form a reusable
     /// KV prefix keyed by [`Self::stable_hash`] (`project.kv`, issue #60). Empty
     /// when nothing stable was discovered.
@@ -134,7 +134,7 @@ impl ContextContent {
     /// Content hash of the Tier 2 (stable) context, used as the volatile part of
     /// the `project.kv` fingerprint key (`fp2 = sha(fp1 ‖ stable-hash)`). `None`
     /// when there is no stable content to cache. Pure function of the discovered
-    /// AGENTS.md/CLAUDE.md set and memory, so it is deterministic and
+    /// AGENTS.md set and memory, so it is deterministic and
     /// order-stable given the same inputs.
     #[must_use]
     pub fn stable_hash(&self) -> Option<String> {
@@ -353,21 +353,21 @@ fn git_recent_commits() -> Option<String> {
 
 /// Discovers AGENTS.md files from the current directory upward.
 ///
-/// CLAUDE.md is treated as a synonym: in each directory it is used as a
-/// fallback when AGENTS.md is missing (AGENTS.md wins when both exist).
+/// Only `AGENTS.md` is read. `CLAUDE.md` is no longer a fallback: an
+/// interactive start links `AGENTS.md` to a lone `CLAUDE.md` in the project
+/// root instead (`agentsmd::prepare`), so the file the model sees is always
+/// the one named for it, and a `CLAUDE.md` elsewhere up the tree is left to
+/// the tool it was written for.
 fn discover_agents_md_files() -> Option<String> {
     let mut contents = Vec::new();
     let mut current_dir = std::env::current_dir().ok()?;
 
     loop {
-        for name in ["AGENTS.md", "CLAUDE.md"] {
-            let path = current_dir.join(name);
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let header = format!("\n---\n# From: {}\n---\n", path.display());
-                contents.push(header);
-                contents.push(content);
-                break;
-            }
+        let path = current_dir.join("AGENTS.md");
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            let header = format!("\n---\n# From: {}\n---\n", path.display());
+            contents.push(header);
+            contents.push(content);
         }
 
         // At the filesystem root `parent()` is None; stop walking without

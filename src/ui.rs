@@ -7941,7 +7941,7 @@ impl Agent<'_> {
     ///
     /// # Errors
     /// Returns an error string on unrecoverable terminal or engine failure.
-    fn run_tui(&mut self) -> Result<(), String> {
+    fn run_tui(&mut self, offer_init: bool) -> Result<(), String> {
         // Install the `ask` rendezvous (issue #34): the worker's asker parks a
         // question on the shared bridge and the event loop renders it. Both
         // halves share one Arc-backed bridge.
@@ -7980,7 +7980,7 @@ impl Agent<'_> {
         // Still launching: `tui_loop` warms the KV cache before the real UI
         // appears, and only flips the title to Idle once it accepts input.
         crate::title::set(crate::title::State::Loading);
-        let result = self.tui_loop(&mut terminal);
+        let result = self.tui_loop(&mut terminal, offer_init);
         // Retro CRT power-off of the final frame on a clean exit. Best-effort:
         // any error is swallowed so the terminal is always restored and the
         // real turn outcome (`result`) is what we return. `tui_loop` hands back
@@ -8083,6 +8083,7 @@ impl Agent<'_> {
     fn tui_loop(
         &mut self,
         terminal: &mut ratatui::DefaultTerminal,
+        offer_init: bool,
     ) -> Result<Option<image::RgbaImage>, String> {
         // Cloned out of `self` so the remote state stays reachable while the
         // loop hands `&mut self` to a turn.
@@ -8141,6 +8142,34 @@ impl Agent<'_> {
         // screensaver is waiting for. A running turn never reaches this loop,
         // so a long generation cannot be mistaken for an idle user.
         let mut last_activity = Instant::now();
+        // No AGENTS.md and no CLAUDE.md to link: offer to generate one before
+        // anything else runs, through the same panel every other question
+        // uses. Declining just starts the session.
+        if offer_init
+            && run_yes_no_panel(
+                terminal,
+                &log,
+                &mut view,
+                "AGENTS.md",
+                crate::agentsmd::OFFER_QUESTION,
+                ("Not now", "start the session without one"),
+                (
+                    "Generate",
+                    "run /init: the model reads the codebase and writes AGENTS.md",
+                ),
+            )
+        {
+            self.tui_run_init(
+                &mut log,
+                terminal,
+                &mut view,
+                &mut input,
+                &mut btw_panel,
+                &mut arcade,
+                &mut sub_pane,
+            );
+            last_activity = Instant::now();
+        }
         if let Some(initial) = self.cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
             log.push_user_echo(initial);
             self.session.push(Message::user(initial));
@@ -11777,6 +11806,12 @@ impl Agent<'_> {
 /// Only an explicit yes counts; a closed or unreadable stdin declines, which is
 /// what keeps a piped run from silently agreeing to overwrite something.
 fn confirm_on_stdin(question: &str) -> bool {
+    ask_yes_no_on_stdin(question, "overwrite it? [y/N] ")
+}
+
+/// [`confirm_on_stdin`] with the caller's own answer prompt, for questions
+/// that are not about overwriting something.
+fn ask_yes_no_on_stdin(question: &str, prompt: &str) -> bool {
     // A piped stdin is somebody else's protocol stream (the headless front end
     // reads prompts off it): asking there would both go unanswered and eat a
     // line. Declining is the safe answer.
@@ -11784,7 +11819,7 @@ fn confirm_on_stdin(question: &str) -> bool {
         println!("{question} — declined (stdin is not a terminal)");
         return false;
     }
-    print!("{question}\noverwrite it? [y/N] ");
+    print!("{question}\n{prompt}");
     let _ = std::io::stdout().flush();
     let mut answer = String::new();
     if std::io::stdin().read_line(&mut answer).is_err() {
@@ -11803,18 +11838,44 @@ fn run_confirm_panel(
     view: &mut tui::OutputView,
     question: &str,
 ) -> bool {
+    run_yes_no_panel(
+        terminal,
+        log,
+        view,
+        "Overwrite",
+        question,
+        ("Keep it", "cancel the rename and leave both sessions alone"),
+        (
+            "Overwrite",
+            "adopt the name; the next save replaces the saved session",
+        ),
+    )
+}
+
+/// The two-option panel behind [`run_confirm_panel`], with the caller's header
+/// and labels. `no` is listed first so a stray Enter picks the safe answer;
+/// the result is true only when `yes` was chosen.
+fn run_yes_no_panel(
+    terminal: &mut ratatui::DefaultTerminal,
+    log: &OutputLog,
+    view: &mut tui::OutputView,
+    header: &str,
+    question: &str,
+    no: (&str, &str),
+    yes: (&str, &str),
+) -> bool {
     use crate::tools::ask::{AskOption, AskRequest, AskState};
     let req = AskRequest {
         question: question.to_owned(),
-        header: "Overwrite".to_owned(),
+        header: header.to_owned(),
         options: vec![
             AskOption {
-                label: "Keep it".to_owned(),
-                description: "cancel the rename and leave both sessions alone".to_owned(),
+                label: no.0.to_owned(),
+                description: no.1.to_owned(),
             },
             AskOption {
-                label: "Overwrite".to_owned(),
-                description: "adopt the name; the next save replaces the saved session".to_owned(),
+                label: yes.0.to_owned(),
+                description: yes.1.to_owned(),
             },
         ],
         multi: false,
@@ -13147,6 +13208,25 @@ pub fn run_interactive(
     local_engine: Option<Box<dyn Engine>>,
     plugins: crate::plugins::PluginSet,
 ) -> Result<(), String> {
+    // Before the agent collects its session context, so a freshly linked
+    // AGENTS.md is read on this very start. Interactive only: the headless
+    // front end never gets here, and must neither write into a checkout nor
+    // block on a question.
+    let offer_init = match std::env::current_dir()
+        .map_err(|e| e.to_string())
+        .and_then(|cwd| crate::agentsmd::prepare(&cwd))
+    {
+        Ok(crate::agentsmd::Startup::Linked(path)) => {
+            println!("plank: linked {} -> CLAUDE.md", path.display());
+            false
+        }
+        Ok(crate::agentsmd::Startup::Missing) => true,
+        Ok(crate::agentsmd::Startup::Present) => false,
+        Err(e) => {
+            eprintln!("plank: {e}");
+            false
+        }
+    };
     let mut agent = new_agent(engine, cfg, true, local_engine, plugins)?;
 
     // The notification mode is seeded (and kept live) by
@@ -13172,10 +13252,13 @@ pub fn run_interactive(
     // A real terminal gets the full-screen ratatui UI (works cleanly in Warp
     // and other block terminals via the alternate screen). Piped input falls
     // back to the plain line REPL.
+    // A resumed session already carries whatever context it had; offering
+    // /init there would splice a generation into an old conversation.
+    let offer_init = offer_init && !resumed;
     let result = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        agent.run_tui()
+        agent.run_tui(offer_init)
     } else {
-        run_plain_flow(&mut agent, cfg)
+        run_plain_flow(&mut agent, cfg, offer_init)
     };
     // Whatever happened, fire SessionEnd, save the session, and tell the user
     // how to resume it.
@@ -13226,7 +13309,11 @@ impl crate::tools::ask::Asker for StdinAsker {
 
 /// Plain-REPL session flow: warm the cache, run the one-shot `-p` prompt if
 /// any, then read lines until EOF.
-fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String> {
+fn run_plain_flow(
+    agent: &mut Agent<'_>,
+    cfg: &AgentConfig,
+    offer_init: bool,
+) -> Result<(), String> {
     // The plain REPL answers `ask` questions by printing numbered options and
     // reading a line from stdin (issue #34).
     agent.tool_ctx.asker = Some(Box::new(StdinAsker { color: agent.color }));
@@ -13235,6 +13322,11 @@ fn run_plain_flow(agent: &mut Agent<'_>, cfg: &AgentConfig) -> Result<(), String
     crate::title::set(crate::title::State::Idle);
     if let Some(history) = agent.resumed_history() {
         print!("{history}");
+    }
+    // No AGENTS.md and no CLAUDE.md to link: offer to generate one. Declining
+    // (or a non-terminal stdin) simply starts the session.
+    if offer_init && ask_yes_no_on_stdin(crate::agentsmd::OFFER_QUESTION, "generate it? [y/N] ") {
+        agent.run_init();
     }
     if let Some(initial) = cfg.prompt.as_deref().filter(|p| !p.is_empty()) {
         print!("{}", status::format_user_prompt_echo(initial, agent.color));

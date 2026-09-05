@@ -8,6 +8,7 @@
 //! section of the original agent.
 
 pub mod agents;
+pub mod agentsmd;
 pub mod anim;
 pub mod arcade;
 pub mod branch;
