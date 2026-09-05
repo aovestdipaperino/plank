@@ -391,6 +391,46 @@ fn farewell(reason: &str) -> String {
     format!("\n\n---\n\n_plank disconnected: {reason}_\n")
 }
 
+/// True when `text` closes a `<think>` block it never opened: a local
+/// engine's chat template pre-opens the tag in the prefill, so the raw bytes
+/// (and the transcript) carry only `</think>`.
+pub(crate) fn needs_think_prefix(text: &str) -> bool {
+    match (text.find("<think>"), text.find("</think>")) {
+        (None, Some(_)) => true,
+        (Some(open), Some(close)) => close < open,
+        _ => false,
+    }
+}
+
+/// The bytes to write into a window that connected late: every earlier pass
+/// verbatim, framed so the reader can tell replay from the live stream that
+/// follows. `reinject_think` mirrors [`begin_in_think`]'s guard (local engine,
+/// thinking on): under it a pass missing its opening tag gets one, so the
+/// console's renderer enters the thinking state exactly as it would have live.
+/// `None` when there is nothing to replay, so no framing is sent either.
+#[must_use]
+pub fn backfill_payload<'a>(
+    passes: impl IntoIterator<Item = &'a str>,
+    reinject_think: bool,
+) -> Option<String> {
+    let mut body = String::new();
+    let mut n = 0usize;
+    for pass in passes {
+        if reinject_think && needs_think_prefix(pass) {
+            body.push_str("<think>");
+        }
+        body.push_str(pass);
+        body.push('\n');
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    Some(format!(
+        "\n\n---\n\n_plank backfill: {n} earlier passes_\n\n{body}\n\n---\n\n_live from here_\n\n"
+    ))
+}
+
 /// The reason string for an ordinary quit.
 pub const REASON_EXIT: &str = "session ended";
 
@@ -1350,5 +1390,38 @@ mod tests {
         assert_eq!(test_support::read_available(&mut parent), "to the parent");
         assert_eq!(sub.ordinal(), 1);
         reset();
+    }
+
+    #[test]
+    fn backfill_payload_frames_the_passes_and_counts_them() {
+        let p = backfill_payload(["first answer", "second answer"], false).unwrap();
+        assert!(
+            p.starts_with("\n\n---\n\n_plank backfill: 2 earlier passes_\n\n"),
+            "{p:?}"
+        );
+        assert!(p.ends_with("\n\n---\n\n_live from here_\n\n"), "{p:?}");
+        assert!(p.contains("first answer\nsecond answer\n"), "{p:?}");
+    }
+
+    #[test]
+    fn backfill_payload_is_none_for_no_passes() {
+        assert_eq!(backfill_payload(std::iter::empty::<&str>(), true), None);
+    }
+
+    /// A local engine's chat template pre-opens `<think>` without emitting
+    /// the tag, so the stored text has only the close. Replay re-injects the
+    /// open exactly where live mirroring would have (`begin_in_think`).
+    #[test]
+    fn backfill_payload_reinjects_the_missing_think_open_only_when_asked() {
+        assert!(needs_think_prefix("pondering</think>answer"));
+        assert!(!needs_think_prefix("<think>pondering</think>answer"));
+        assert!(!needs_think_prefix("plain answer"));
+        let local = backfill_payload(["pondering</think>answer"], true).unwrap();
+        assert!(
+            local.contains("<think>pondering</think>answer\n"),
+            "{local:?}"
+        );
+        let provider = backfill_payload(["pondering</think>answer"], false).unwrap();
+        assert!(!provider.contains("<think>pondering"), "{provider:?}");
     }
 }
