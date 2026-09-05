@@ -24,6 +24,12 @@
 //! - [`push`] never retries. A write failure (console closed mid-generation)
 //!   just drops the connection so the rest of the turn streams normally; the
 //!   next reconcile (next turn, or the next settings change) will try again.
+//! - [`reconcile`] returns what it newly dialed, and the agent backfills
+//!   exactly those windows from the transcript (`Agent::backfill_console`),
+//!   with a high-water mark so a reconnect never repeats what the console
+//!   already showed. Finished sub-agents are replayed from the `/repro` dump
+//!   ring under their original window names.
+//! - Under `cfg(test)` a thread claims the fake console via `test_support::use_console`; other threads' pushes are dropped so the suite stays hermetic (production builds compile the check to `true`). A test that owns a console cannot mirror from a spawned thread.
 //!
 //! What gets mirrored is the *whole* raw model stream — thinking, visible
 //! answer, tool-call markup, byte for byte — because the console runs its own

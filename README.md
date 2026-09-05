@@ -165,6 +165,8 @@ turbo-debug-console
 
 The console is entirely optional and plank never depends on it. If nothing is listening, plank connects to nothing, says nothing, and behaves exactly as it always has. If you close the console mid-turn, the mirror is dropped and the turn carries on. Turning `showThinking` back on disconnects it, since the reasoning is back in the scrollback where you can already see it.
 
+Start the console late and it catches up. When a console connects to a session that is already under way, plank replays the assistant passes so far into the window, between a `plank backfill: N earlier passes` rule and a `live from here` rule, then the live stream continues below. Sub-agents get the same treatment: a sub-agent still running gets its own window filled with its passes so far, and the last few finished sub-agents (the same eight `/repro` keeps as sidecars) each get their `plank:<session>:subagent-<n>` window reopened and replayed once. Nothing is replayed twice: a `showThinking` flip or a console restart only sends what that console has not already shown.
+
 What arrives there is the *whole* stream, not just the hidden part: thinking, answer, and tool calls, rendered by the same renderer plank uses for its own output. That is deliberate. The console shares plank's streaming renderer as the [`trace-stream`](https://crates.io/crates/trace-stream) crate rather than reimplementing it, so the two cannot drift, and reasoning arrives in the context of the answer it produced rather than as disembodied fragments.
 
 ### Settings file

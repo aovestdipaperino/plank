@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **A debug console that starts late is backfilled.** Connecting
+  `turbo-debug-console` to a session already under way replays the assistant
+  passes so far into the session window, and the passes of any running or
+  recently finished sub-agent into their own windows, before the live stream
+  continues. Until now a late console opened blank and finished sub-agent
+  windows never appeared.
+
 ## [4.1.3] - 2026-09-05
 
 ### Added

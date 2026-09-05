@@ -2174,3 +2174,12 @@ there is no `>`, backtick or `$(`, and everything else keeps prompting. Note
 fd redirects from output redirects is exactly the parsing the allowlist avoids.
 The profile stays the boundary, so the classifier can only over-ask, never
 over-grant.
+
+- **The transcript stores local-engine thinking without its opening tag.** The
+  local chat template pre-opens `<think>` in the prefill, so the raw stream
+  (and therefore `Message::assistant` text) begins mid-thought and carries only
+  `</think>`. Anything that re-emits stored passes as a stream — the console
+  backfill — must re-inject `<think>` under the same guard `begin_in_think`
+  uses (`debugmirror::needs_think_prefix`), or the console renders the
+  reasoning in answer style. Provider engines emit both tags and must not get
+  the prefix.
