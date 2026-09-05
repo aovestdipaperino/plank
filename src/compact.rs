@@ -21,8 +21,16 @@ pub const COMPACT_MIN_FREE_TOKENS: i32 = 8192;
 pub const COMPACT_TAIL_DIVISOR: i32 = 8;
 /// Hard cap on the verbatim tail, in tokens.
 pub const COMPACT_TAIL_CAP_TOKENS: i32 = 8192;
-/// Newest tool results microcompact leaves intact.
-pub const MICROCOMPACT_KEEP_RESULTS: usize = 3;
+/// Minimum tokens one micro-compaction pass reclaims, oldest results first.
+///
+/// A pass used to keep the newest three results and clear everything else in
+/// one sweep, however much or little that was. The repro that motivated the
+/// pressure floor also showed the sweep itself was the problem: a 13-chunk
+/// read of a plan file lost its first ten chunks before the model reached the
+/// end. A pass now clears the *oldest* clearable results until it has
+/// reclaimed a token budget ([`microcompact_delete_budget`], at least this
+/// many), and stops. Recent work survives for as long as the window allows.
+pub const MICROCOMPACT_DELETE_TOKENS: i32 = 16_384;
 /// Tool-result bodies at or below this many bytes are not worth clearing.
 pub const MICROCOMPACT_MIN_BYTES: usize = 256;
 /// Replacement body for tool results cleared by microcompact.
@@ -43,16 +51,31 @@ pub const MICROCOMPACT_BYTES_PER_TOKEN_FLOOR: f64 = 2.0;
 /// The floor [`microcompact_floor`] relaxes *to* at the full-compaction
 /// trigger. Deliberately not zero: see that function.
 pub const MICROCOMPACT_FLOOR_EPSILON: f64 = 0.05;
+/// Percentage of the context window that must be in use before an
+/// opportunistic micro-compaction is considered at all.
+///
+/// The bytes-per-token gate below measures the *KV* cost of a pass and nothing
+/// else: with a fresh rung covering the whole transcript the re-prefill is
+/// near zero, so the gate accepted a pass after every tool-heavy turn in a 1M
+/// window that was 7% full. The model then saw every file it had just read
+/// replaced by a stub, re-read the same files, lost them again, and cycled for
+/// two hours without a single edit. Clearing tool output also destroys the
+/// information the model is working from, and that cost is only worth paying
+/// when the window is genuinely short.
+pub const MICROCOMPACT_PRESSURE_PERCENT: i32 = 75;
 /// Maximum files re-injected after a full compaction.
 pub const REINJECT_MAX_FILES: usize = 5;
 /// Hard cap on the post-compaction re-injection budget, in tokens.
 pub const REINJECT_CAP_TOKENS: i32 = 50_000;
 
-/// The indices of tool-result bodies microcompact would clear: the newest
-/// [`MICROCOMPACT_KEEP_RESULTS`] survive, plus anything under
-/// [`MICROCOMPACT_MIN_BYTES`] (never candidates) plus anything belonging to
-/// the current task — a tool result that follows the last `# Task list`
-/// injection is part of the active work and is kept.
+/// The indices of tool-result bodies microcompact may clear, oldest first.
+/// Never candidates: anything under [`MICROCOMPACT_MIN_BYTES`], image-bearing
+/// results, anything belonging to the current task (a tool result that
+/// follows the last `# Task list` injection is part of the active work), and
+/// the current tool-call batch — every tool result after the last assistant
+/// message that precedes a tool result. That last rule covers two promises at
+/// once: a result the model has not yet had a turn to act on is never cleared,
+/// and the results of the batch it just ran are never cleared as a set.
 fn clear_set(transcript: &[Message]) -> Vec<usize> {
     // Match the exact `TaskList::inject_block` prefix, not just any message
     // that contains "# Task list": a tool result that reads a Markdown file
@@ -79,15 +102,33 @@ fn clear_set(transcript: &[Message]) -> Vec<usize> {
         })
         .map(|(i, _)| i)
         .collect();
-    idx.iter()
-        .enumerate()
-        .filter(|(pos, i)| {
-            let is_last = *pos >= idx.len().saturating_sub(MICROCOMPACT_KEEP_RESULTS);
-            let is_task = task_inject.is_some_and(|t| **i > t);
-            !is_last && !is_task
+    // The current batch starts after the last assistant message that has any
+    // tool result after it; results before that assistant turn have been seen
+    // and acted on (the model produced a turn after reading them).
+    let batch_start = idx.last().and_then(|&last| {
+        transcript[..last]
+            .iter()
+            .rposition(|m| m.role == Role::Assistant)
+    });
+    idx.into_iter()
+        .filter(|&i| {
+            let is_task = task_inject.is_some_and(|t| i > t);
+            let is_current_batch = batch_start.is_none_or(|b| i > b);
+            !is_task && !is_current_batch
         })
-        .map(|(_, i)| *i)
         .collect()
+}
+
+/// Tokens a pass must reclaim at `ctx_used`/`ctx_size`: enough to bring the
+/// window back under [`MICROCOMPACT_PRESSURE_PERCENT`], and never less than
+/// [`MICROCOMPACT_DELETE_TOKENS`].
+#[must_use]
+pub fn microcompact_delete_budget(ctx_size: i32, ctx_used: i32) -> i32 {
+    let threshold = i64::from(ctx_size.max(0)) * i64::from(MICROCOMPACT_PRESSURE_PERCENT) / 100;
+    let excess = i64::from(ctx_used) - threshold;
+    i32::try_from(excess)
+        .unwrap_or(i32::MAX)
+        .max(MICROCOMPACT_DELETE_TOKENS)
 }
 
 /// Bytes a microcompact would reclaim, without clearing anything. Used to gate
@@ -130,8 +171,9 @@ pub fn compaction_trigger_used(ctx_size: i32) -> i32 {
 /// The bytes-per-token floor an opportunistic pass must clear at this level of
 /// context pressure.
 ///
-/// Flat [`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`] until the window is half way to
-/// the full-compaction trigger, then a clamped linear relaxation down to
+/// Flat [`MICROCOMPACT_BYTES_PER_TOKEN_FLOOR`] up to the pressure threshold
+/// ([`MICROCOMPACT_PRESSURE_PERCENT`], where a pass first becomes admissible),
+/// then a clamped linear relaxation down to
 /// [`MICROCOMPACT_FLOOR_EPSILON`] at the trigger itself: at that point full
 /// compaction is imminent and will rebuild the KV anyway, so a cheap pass must
 /// never be the blocker.
@@ -155,8 +197,10 @@ pub fn microcompact_floor(ctx_size: i32, ctx_used: i32) -> f64 {
     if ctx_used >= trigger {
         return MICROCOMPACT_FLOOR_EPSILON;
     }
-    let relax_start = trigger / 2;
-    if ctx_used <= relax_start {
+    // Relaxation begins where the pressure threshold admits a pass at all;
+    // below it the gate refuses outright and the floor is moot.
+    let relax_start = (ctx_size * MICROCOMPACT_PRESSURE_PERCENT) / 100;
+    if ctx_used <= relax_start || relax_start >= trigger {
         return MICROCOMPACT_BYTES_PER_TOKEN_FLOOR;
     }
     let span = f64::from(trigger - relax_start);
@@ -165,10 +209,7 @@ pub fn microcompact_floor(ctx_size: i32, ctx_used: i32) -> f64 {
         + (MICROCOMPACT_BYTES_PER_TOKEN_FLOOR - MICROCOMPACT_FLOOR_EPSILON) * remaining
 }
 
-/// Whether clearing `reclaimable` bytes justifies `reprefill_tokens` of
-/// prefill, at the context pressure `ctx_used`/`ctx_size` describes.
-///
-/// The first gate compared bytes against a flat threshold and could not see the
+/// History of the bytes-per-token gate: the first version compared bytes against a flat threshold and could not see the
 /// token cost at all: one measured pass reclaimed ~12 KB and paid ~14,000
 /// tokens, because rewriting a body in place forces a rebuild from zero. The
 /// second was token-denominated but pressure-blind: a measured 1.16 bytes per
@@ -176,6 +217,26 @@ pub fn microcompact_floor(ctx_size: i32, ctx_used: i32) -> f64 {
 /// where the alternative is a full compaction (a model round-trip plus a total
 /// rebuild). The floor therefore relaxes as pressure rises — see
 /// [`microcompact_floor`].
+/// Whether the window is full enough for an opportunistic pass to be worth
+/// its information cost: at least [`MICROCOMPACT_PRESSURE_PERCENT`] of
+/// `ctx_size` is in use. Below this, no pass fires regardless of how cheap
+/// the KV side of it looks.
+#[must_use]
+pub fn microcompact_pressure_reached(ctx_size: i32, ctx_used: i32) -> bool {
+    if ctx_size <= 0 || ctx_used <= 0 {
+        return false;
+    }
+    i64::from(ctx_used) * 100 >= i64::from(ctx_size) * i64::from(MICROCOMPACT_PRESSURE_PERCENT)
+}
+
+/// Whether clearing `reclaimable` bytes justifies `reprefill_tokens` of
+/// prefill, at the context pressure `ctx_used`/`ctx_size` describes.
+///
+/// Two conditions, both required. First, [`microcompact_pressure_reached`]:
+/// below [`MICROCOMPACT_PRESSURE_PERCENT`] of the window the answer is no,
+/// whatever the KV arithmetic says, because clearing results the model is
+/// still working from costs more than context it does not yet need. Second,
+/// the bytes-per-token trade described below.
 #[must_use]
 pub fn microcompact_is_worth_it(
     reclaimable: usize,
@@ -183,6 +244,9 @@ pub fn microcompact_is_worth_it(
     ctx_size: i32,
     ctx_used: i32,
 ) -> bool {
+    if !microcompact_pressure_reached(ctx_size, ctx_used) {
+        return false;
+    }
     if reprefill_tokens <= 0 {
         return true;
     }
@@ -190,23 +254,45 @@ pub fn microcompact_is_worth_it(
     f64::from(reclaimable) / f64::from(reprefill_tokens) >= microcompact_floor(ctx_size, ctx_used)
 }
 
-/// Clears the bodies of old tool results in place, keeping the newest
-/// [`MICROCOMPACT_KEEP_RESULTS`] intact plus anything belonging to the current
-/// task; returns `(cleared, bytes_reclaimed)`.
+/// Clears the bodies of old tool results in place, oldest first, until at
+/// least `budget_tokens` (as measured by `count_tokens`) have been reclaimed
+/// or no candidate is left; returns `(cleared, bytes_reclaimed)`. The
+/// candidates are those of [`clear_set`]: never the current batch, the current
+/// task's results, small or image-bearing results.
 ///
 /// This is the cheap first step of compaction: no model round-trip, and the
 /// conversation flow (user turns, assistant turns, tool-call structure) is
 /// preserved — only bulky, stale tool output is dropped. Clearing an early
 /// message invalidates the KV prefix from that point, but so would a full
 /// compaction, and this one costs zero generated tokens.
-pub fn microcompact(transcript: &mut [Message]) -> (usize, usize) {
-    let clear = clear_set(transcript);
+pub fn microcompact(
+    transcript: &mut [Message],
+    budget_tokens: i32,
+    count_tokens: &mut dyn FnMut(&str) -> i32,
+) -> (usize, usize) {
+    let stub = format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>");
+    let stub_tokens = count_tokens(&stub);
     let mut bytes = 0usize;
-    for &i in &clear {
-        bytes += transcript[i].text.len();
-        transcript[i].text = format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>");
+    let mut cleared = 0usize;
+    let mut reclaimed = 0i32;
+    for i in clear_set(transcript) {
+        if reclaimed >= budget_tokens {
+            break;
+        }
+        let body = std::mem::replace(&mut transcript[i].text, stub.clone());
+        bytes += body.len();
+        reclaimed = reclaimed.saturating_add((count_tokens(&body) - stub_tokens).max(0));
+        cleared += 1;
     }
-    (clear.len(), bytes)
+    (cleared, bytes)
+}
+
+/// [`microcompact`] with no budget: every candidate is cleared. Tests and
+/// callers that want the old sweep behaviour.
+pub fn microcompact_all(transcript: &mut [Message]) -> (usize, usize) {
+    microcompact(transcript, i32::MAX, &mut |s| {
+        i32::try_from(s.len()).unwrap_or(i32::MAX)
+    })
 }
 
 /// Token budget for the post-compaction file re-injection.
@@ -477,13 +563,14 @@ mod tests {
             big_tool_result("fourth"),
             big_tool_result("fifth"),
         ];
-        let (cleared, bytes) = microcompact(&mut t);
-        // Five large results; the newest three survive.
-        assert_eq!(cleared, 2);
+        let (cleared, bytes) = microcompact_all(&mut t);
+        // Five large results; the current batch (after the last assistant
+        // turn) survives, the three acted-on ones are cleared.
+        assert_eq!(cleared, 3);
         assert!(bytes > 0, "reclaimed bytes reported");
         assert!(t[1].text.contains(MICROCOMPACT_STUB));
         assert!(t[3].text.contains(MICROCOMPACT_STUB));
-        assert!(t[4].text.contains("third"));
+        assert!(t[4].text.contains(MICROCOMPACT_STUB));
         assert!(t[6].text.contains("fourth"));
         assert!(t[7].text.contains("fifth"));
         // Non-tool and tiny messages untouched.
@@ -491,7 +578,72 @@ mod tests {
         assert_eq!(t[2].text, "<tool_result>tiny</tool_result>");
         assert_eq!(t[5].text, "working on it");
         // Idempotent: cleared stubs are small, nothing more to do.
-        assert_eq!(microcompact(&mut t), (0, 0));
+        assert_eq!(microcompact_all(&mut t), (0, 0));
+    }
+
+    /// The pass is budgeted and oldest-first: it clears until it has reclaimed
+    /// the requested tokens and then stops, leaving newer results intact.
+    #[test]
+    fn a_budgeted_pass_clears_oldest_first_and_stops_at_the_budget() {
+        let mut t = vec![Message::user("go")];
+        for tag in ["first", "second", "third", "fourth", "fifth"] {
+            t.push(big_tool_result(tag));
+            t.push(Message::assistant("noted"));
+        }
+        // Bytes as tokens: each body is ~600 bytes, so a 700-token budget
+        // needs exactly two.
+        let mut count = |s: &str| i32::try_from(s.len()).unwrap();
+        let (cleared, _) = microcompact(&mut t, 700, &mut count);
+        assert_eq!(cleared, 2);
+        assert!(t[1].text.contains(MICROCOMPACT_STUB), "oldest first");
+        assert!(t[3].text.contains(MICROCOMPACT_STUB));
+        assert!(t[5].text.contains("third"), "budget met: newer results stay");
+        assert!(t[9].text.contains("fifth"));
+        // The next pass continues from where this one stopped.
+        let (cleared, _) = microcompact(&mut t, 1, &mut count);
+        assert_eq!(cleared, 1);
+        assert!(t[5].text.contains(MICROCOMPACT_STUB));
+    }
+
+    /// Two promises in one rule: a result the model has not yet acted on is
+    /// never cleared, and the results of the batch it just ran are never
+    /// cleared as a set — even under an unlimited budget.
+    #[test]
+    fn the_current_batch_and_unacted_results_are_never_cleared() {
+        // Trailing results with no assistant turn after them.
+        let mut t = vec![
+            Message::user("go"),
+            big_tool_result("old"),
+            Message::assistant("<tool_calls>"),
+            big_tool_result("batch-a"),
+            big_tool_result("batch-b"),
+            big_tool_result("batch-c"),
+        ];
+        let (cleared, _) = microcompact_all(&mut t);
+        assert_eq!(cleared, 1);
+        assert!(t[1].text.contains(MICROCOMPACT_STUB));
+        for i in 3..6 {
+            assert!(!t[i].text.contains(MICROCOMPACT_STUB), "batch member {i}");
+        }
+        // With nothing but the current batch, nothing is clearable at all.
+        let only_batch = vec![
+            Message::user("go"),
+            big_tool_result("a"),
+            big_tool_result("b"),
+            big_tool_result("c"),
+            big_tool_result("d"),
+        ];
+        assert_eq!(microcompact_reclaimable(&only_batch), 0);
+        assert_eq!(microcompact_first_index(&only_batch), None);
+    }
+
+    #[test]
+    fn the_delete_budget_restores_the_window_below_the_threshold() {
+        // Well under the threshold's excess: the floor applies.
+        assert_eq!(microcompact_delete_budget(1_000_000, 760_000), MICROCOMPACT_DELETE_TOKENS);
+        // Far past it: enough to fall back to 75%.
+        assert_eq!(microcompact_delete_budget(1_000_000, 900_000), 150_000);
+        assert_eq!(microcompact_delete_budget(0, 0), MICROCOMPACT_DELETE_TOKENS);
     }
 
     #[test]
@@ -502,7 +654,7 @@ mod tests {
         // prefix from that point, so a pass that reclaims little costs more
         // than it saves. This pins the predicate that gate reads.
 
-        // Nothing clearable: the newest three results are all there is.
+        // Nothing clearable: the current batch is all there is.
         let short = vec![
             Message::user("do the thing"),
             big_tool_result("first"),
@@ -512,7 +664,7 @@ mod tests {
         assert_eq!(
             microcompact_reclaimable(&short),
             0,
-            "the newest three are never candidates"
+            "the current batch is never a candidate"
         );
         assert!(microcompact_reclaimable(&short) < MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES);
 
@@ -522,6 +674,7 @@ mod tests {
         for tag in ["first", "second"] {
             small.push(big_tool_result(tag));
         }
+        small.push(Message::assistant("seen"));
         for tag in ["third", "fourth", "fifth"] {
             small.push(big_tool_result(tag));
         }
@@ -540,6 +693,7 @@ mod tests {
                 "x".repeat(MICROCOMPACT_OPPORTUNISTIC_MIN_BYTES)
             )));
         }
+        large.push(Message::assistant("seen"));
         for tag in ["third", "fourth", "fifth"] {
             large.push(big_tool_result(tag));
         }
@@ -551,7 +705,7 @@ mod tests {
         // The predicate agrees with what the pass actually clears.
         let mut t = large.clone();
         let before = microcompact_reclaimable(&t);
-        let (cleared, bytes) = microcompact(&mut t);
+        let (cleared, bytes) = microcompact_all(&mut t);
         assert_eq!(cleared, 2);
         assert_eq!(
             bytes, before,
@@ -572,19 +726,19 @@ mod tests {
             Message::user("do the thing"),
             big_tool_result("first"),
             big_tool_result("second"),
+            Message::assistant("seen"),
             Message::user("# Task list\n\nYour current tasks"),
             big_tool_result("third"),
             big_tool_result("fourth"),
         ];
-        let (cleared, _) = microcompact(&mut t);
-        // "first" is old and not part of the current task -> cleared.
-        assert_eq!(cleared, 1);
+        let (cleared, _) = microcompact_all(&mut t);
+        // "first" and "second" are old and not part of the current task -> cleared.
+        assert_eq!(cleared, 2);
         assert!(t[1].text.contains(MICROCOMPACT_STUB));
-        // "second" survives as one of the newest three.
-        assert!(t[2].text.contains("second"));
+        assert!(t[2].text.contains(MICROCOMPACT_STUB));
         // "third"/"fourth" follow the injection -> kept as current-task work.
-        assert!(t[4].text.contains("third"));
-        assert!(t[5].text.contains("fourth"));
+        assert!(t[5].text.contains("third"));
+        assert!(t[6].text.contains("fourth"));
     }
 
     #[test]
@@ -645,8 +799,8 @@ mod tests {
             t.push(Message::assistant("ok"));
             t.push(Message::user(big.clone()));
         }
-        // The newest MICROCOMPACT_KEEP_RESULTS results survive, so the earliest
-        // cleared body is the first tool result in the transcript, at index 2.
+        // The current batch survives, so the earliest cleared body is the
+        // first tool result in the transcript, at index 2.
         assert_eq!(microcompact_first_index(&t), Some(2));
 
         // Nothing clearable => nothing to report.
@@ -656,14 +810,37 @@ mod tests {
 
     #[test]
     fn the_gate_weighs_bytes_reclaimed_against_tokens_reprefilled() {
-        // A near-empty 1M window: pressure is nil, the floor is the strict one.
-        let (size, used) = (1_000_000, 25_000);
+        // A 1M window exactly at the pressure threshold: admissible, and the
+        // floor is still the strict one (relaxation starts here).
+        let (size, used) = (1_000_000, 750_000);
         // The measured regression: ~12 KB reclaimed for ~14,000 tokens of prefill.
         assert!(!microcompact_is_worth_it(12_000, 14_000, size, used));
         // With a usable rung the remainder is small and the pass is clearly worth it.
         assert!(microcompact_is_worth_it(12_000, 500, size, used));
-        // Nothing to re-prefill: always worth it.
+        // Nothing to re-prefill: always worth it once under pressure.
         assert!(microcompact_is_worth_it(5_000, 0, size, used));
+    }
+
+    /// The two-hour repro (`repro-1788613069`): a 1M window 7% full, a rung
+    /// covering the whole transcript so the re-prefill was zero, and the gate
+    /// said yes after every turn. Every read the model made was stubbed out
+    /// before its next turn and it cycled through the same reads for two hours
+    /// without one edit. Below the pressure threshold the answer is no even
+    /// when the KV side is free.
+    #[test]
+    fn below_the_pressure_threshold_nothing_fires_even_when_kv_is_free() {
+        let size = 1_048_576;
+        let used = 71_085;
+        assert!(!microcompact_pressure_reached(size, used));
+        assert!(!microcompact_is_worth_it(50_000, 0, size, used));
+        assert!(!microcompact_is_worth_it(usize::MAX, 1, size, used));
+        // Just under 75%: still no. At 75%: yes.
+        assert!(!microcompact_pressure_reached(1000, 749));
+        assert!(microcompact_pressure_reached(1000, 750));
+        assert!(microcompact_is_worth_it(50_000, 0, 1000, 750));
+        // Degenerate windows never count as under pressure.
+        assert!(!microcompact_pressure_reached(0, 100));
+        assert!(!microcompact_pressure_reached(1000, 0));
     }
 
     /// The exact numbers logged by the run-3 benchmark: 12,344 bytes against
@@ -680,7 +857,8 @@ mod tests {
     /// kind and must be accepted.
     #[test]
     fn the_same_trade_is_accepted_under_pressure_before_full_compaction() {
-        let (size, used) = (30_000, 18_000);
+        let (size, used) = (100_000, 80_000);
+        assert!(microcompact_pressure_reached(size, used));
         // Still short of full compaction: this is the pre-emption window.
         assert!(!should_compact(size, used));
         assert!(microcompact_is_worth_it(12_344, 10_674, size, used));
@@ -711,7 +889,7 @@ mod tests {
     /// Monotone in each input, in the obvious direction.
     #[test]
     fn the_gate_is_monotone_in_bytes_tokens_and_pressure() {
-        let (size, used) = (30_000, 17_000);
+        let (size, used) = (100_000, 78_000);
         // More bytes reclaimed => more willing.
         assert!(!microcompact_is_worth_it(8_000, 10_000, size, used));
         assert!(microcompact_is_worth_it(20_000, 10_000, size, used));
@@ -720,9 +898,9 @@ mod tests {
         assert!(!microcompact_is_worth_it(12_344, 40_000, size, used));
         // More pressure => more willing; the floor never rises with pressure.
         assert!(!microcompact_is_worth_it(12_344, 10_674, size, 5_000));
-        assert!(microcompact_is_worth_it(12_344, 10_674, size, 20_000));
+        assert!(microcompact_is_worth_it(12_344, 10_674, size, 82_000));
         let mut prev = f64::MAX;
-        for used in (0..=30_000).step_by(250) {
+        for used in (0..=100_000).step_by(250) {
             let f = microcompact_floor(size, used);
             assert!(f <= prev, "floor rose with pressure at used={used}");
             prev = f;
@@ -779,8 +957,9 @@ mod tests {
         ];
         for _ in 0..4 {
             t.push(Message::user(big.clone()));
+            t.push(Message::assistant("seen"));
         }
-        let (cleared, _) = microcompact(&mut t);
+        let (cleared, _) = microcompact_all(&mut t);
         // The image-bearing result at index 1 is exempt; only the text-only
         // old results are candidates.
         assert!(

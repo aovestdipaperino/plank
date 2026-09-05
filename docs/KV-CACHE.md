@@ -1133,11 +1133,19 @@ reach 2-3%). What *has* been measured live is the refusing path; see
   reprefill_tokens, ctx_size, ctx_used)` agrees, where `reprefill_tokens` is
   the rendered transcript's token count minus whatever the selected rung
   covers. The comparison is bytes reclaimed per token re-prefilled against a
-  floor, and that floor is **not fixed**: it is
-  `MICROCOMPACT_BYTES_PER_TOKEN_FLOOR` (2.0) while used context sits at or
-  below half of `compact::compaction_trigger_used(ctx_size)`, then relaxes
-  linearly to a small epsilon (`MICROCOMPACT_FLOOR_EPSILON`, 0.05) at that
-  trigger — the exact point `should_compact` starts firing, so the cheap
+  floor. Before any of that, a hard precondition: nothing fires below
+  `MICROCOMPACT_PRESSURE_PERCENT` (75%) of the window
+  (`compact::microcompact_pressure_reached`). The KV arithmetic measures only
+  the prefill cost of a pass; with a fresh rung covering the whole transcript
+  that cost is zero, and the gate said yes after every tool-heavy turn in a 1M
+  window 7% full. Each pass stubbed out the files the model had just read, it
+  re-read them, lost them again, and cycled for two hours without one edit.
+  Clearing results the model is still working from has an information cost the
+  arithmetic cannot see, and it is only worth paying when the window is
+  genuinely short. Past the threshold the floor is **not fixed**: it is
+  `MICROCOMPACT_BYTES_PER_TOKEN_FLOOR` (2.0) at the threshold itself, then
+  relaxes linearly to a small epsilon (`MICROCOMPACT_FLOOR_EPSILON`, 0.05) at
+  `compact::compaction_trigger_used(ctx_size)` — the exact point `should_compact` starts firing, so the cheap
   decision and the expensive one are anchored to the same threshold and cannot
   contradict each other (`compact::microcompact_floor`). The floor bottoms out
   at an epsilon rather than at zero because zero means "accept any pass at

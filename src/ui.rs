@@ -3253,14 +3253,33 @@ impl Agent<'_> {
         if let Some(edit) = compact::microcompact_first_index(&self.session.transcript) {
             self.restore_rung_below(edit);
         }
-        let (cleared, _) = compact::microcompact(&mut self.session.transcript);
+        // Full compaction is due: reclaim enough to get clear of its trigger,
+        // never less than the standard budget.
+        let rendered = render_transcript(&self.session, &self.system);
+        let used = self.engine.count_tokens(&rendered);
+        let ctx_size = self.engine.ctx_size();
+        let budget = compact::microcompact_delete_budget(ctx_size, used)
+            .max(used - compact::compaction_trigger_used(ctx_size) + 1);
+        let cleared = self.microcompact_with_budget(budget);
         if cleared == 0 {
             return None;
         }
         self.last_ctx_used = 0;
         let rendered = render_transcript(&self.session, &self.system);
         let used = self.engine.count_tokens(&rendered);
-        (!compact::should_compact(self.engine.ctx_size(), used)).then_some(cleared)
+        (!compact::should_compact(ctx_size, used)).then_some(cleared)
+    }
+
+    /// Runs one budgeted micro-compaction pass against the live engine's
+    /// tokenizer; returns the number of results cleared.
+    fn microcompact_with_budget(&mut self, budget_tokens: i32) -> usize {
+        let engine = &mut self.engine;
+        let (cleared, _) = compact::microcompact(
+            &mut self.session.transcript,
+            budget_tokens,
+            &mut |s| engine.count_tokens(s),
+        );
+        cleared
     }
 
     /// The durable goal *only while it is being worked*. Model-facing
@@ -3323,7 +3342,8 @@ impl Agent<'_> {
                 )
             });
         }
-        let (cleared, _) = compact::microcompact(&mut self.session.transcript);
+        let budget = compact::microcompact_delete_budget(ctx_size, total);
+        let cleared = self.microcompact_with_budget(budget);
         self.last_ctx_used = 0;
         Some(cleared)
     }
@@ -13842,7 +13862,7 @@ mod tests {
         }
         s.tasks.add("keep me across compaction", None);
         let before = s.tasks.clone();
-        let (cleared, _) = crate::compact::microcompact(&mut s.transcript);
+        let (cleared, _) = crate::compact::microcompact_all(&mut s.transcript);
         assert!(cleared > 0, "compaction should clear some large results");
         assert_eq!(s.tasks, before, "compaction leaves the task list untouched");
         let block = s
@@ -15144,9 +15164,8 @@ mod tests {
         agent
             .session
             .push(Message::user(format!("<tool_result>{big}</tool_result>")));
-        // Three newer results, so the anchored one falls outside the
-        // newest-`MICROCOMPACT_KEEP_RESULTS` keep window and becomes the
-        // clearing candidate.
+        // Newer results after an assistant turn, so the anchored one is no
+        // longer in the current batch and becomes the clearing candidate.
         for _ in 0..3 {
             agent.session.push(Message::assistant("more"));
             agent.session.push(Message::user(format!(
@@ -15175,9 +15194,12 @@ mod tests {
         );
     }
 
-    /// Small enough that the synthetic transcript below sits under real
-    /// context pressure without needing a huge one.
-    const E2E_CTX_SIZE: i32 = 20_000;
+    /// Sized so the synthetic transcript below lands in the pre-emption
+    /// window: past `MICROCOMPACT_PRESSURE_PERCENT` of the window but short
+    /// of the full-compaction trigger. Below 32,768 the two coincide (the
+    /// 8,192-free-tokens rule makes the trigger exactly 75%), so the window
+    /// has to be larger than that for the test to exist at all.
+    const E2E_CTX_SIZE: i32 = 60_000;
 
     /// THE end-to-end test the whole feature lacked: nothing anywhere proved a
     /// rung is ever actually USED in the real path. This drives
@@ -15204,7 +15226,7 @@ mod tests {
         // test would prove nothing.
         agent.store.save(&mut agent.session).unwrap();
 
-        let big = "a".repeat(12_000);
+        let big = "a".repeat(70_000);
         agent.anchor_rung_before_tool_result(big.len());
         let rung = *agent.ladder.rungs().last().expect("anchored");
         agent
@@ -15214,7 +15236,7 @@ mod tests {
             agent.session.push(Message::assistant("more"));
             agent.session.push(Message::user(format!(
                 "<tool_result>{}</tool_result>",
-                "b".repeat(6_000)
+                "b".repeat(32_000)
             )));
         }
 
@@ -15233,6 +15255,10 @@ mod tests {
         assert!(
             !compact::should_compact(E2E_CTX_SIZE, total),
             "full compaction must not already be due"
+        );
+        assert!(
+            compact::microcompact_pressure_reached(E2E_CTX_SIZE, total),
+            "the window must be past the pressure threshold (total={total})"
         );
 
         events.lock().unwrap().clear();
@@ -15416,9 +15442,14 @@ mod tests {
         let cfg = test_cfg();
         let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
 
-        // Four old-enough tool results: with microcompact on, the oldest
-        // (outside the newest-3 keep window) is a genuine clearing candidate.
-        for _ in 0..4 {
+        // An acted-on tool result followed by a newer batch: with microcompact
+        // on, the old one is a genuine clearing candidate.
+        agent.session.push(Message::user(format!(
+            "<tool_result>{}</tool_result>",
+            "a".repeat(1_000)
+        )));
+        agent.session.push(Message::assistant("seen"));
+        for _ in 0..3 {
             agent.session.push(Message::user(format!(
                 "<tool_result>{}</tool_result>",
                 "a".repeat(1_000)
@@ -15430,7 +15461,7 @@ mod tests {
         // vacuous (e.g. a `None` any implementation would produce).
         let mut control = agent.session.transcript.clone();
         assert_eq!(
-            compact::microcompact(&mut control).0,
+            compact::microcompact_all(&mut control).0,
             1,
             "sanity: the setup does have a clearing candidate"
         );

@@ -694,6 +694,24 @@ and still fixtured. A real-engine measurement of the prefix-stability win
 (earlier suffix stop vs. per-pass prefix invalidation) is pending; the gate is
 the conservative default until then.
 
+### A 75% pressure floor sits in front of the whole gate
+
+`repro-1788613069` (2026-09-05, v4.1.2 beta): 1M window, 71K tokens used, a
+2600-line plan file plus a dozen source files read in chunks. Every read landed
+under `MICROCOMPACT_KEEP_RESULTS = 3`, and the rung anchored before each large
+result made the re-prefill term of the gate zero, so `microcompact_is_worth_it`
+returned true at the end of every turn. The model saw each file it had just
+read replaced by the stub before its next turn, re-read the same files, lost
+them again, and at temperature 0 the identical visible context produced the
+identical eight tool calls: 214 reads, 30 bash, 0 edits in two hours. The loop
+guard never fired because the cycle was eight calls long and its window is ten,
+so no signature reached three repeats. The fix is a hard precondition,
+`microcompact_pressure_reached` (`MICROCOMPACT_PRESSURE_PERCENT = 75`), ahead
+of the bytes-per-token trade, and the floor's relaxation now starts at that
+threshold instead of at half the trigger. Consequence for small windows: below
+32,768 tokens the 8,192-free rule puts the full-compaction trigger at exactly
+75%, so there is no opportunistic window at all and full compaction handles it.
+
 ### The gate is context-pressure-dependent, and had to become so
 
 Three successive gates, each fixing the previous one's blindness:
@@ -719,7 +737,8 @@ Three successive gates, each fixing the previous one's blindness:
    not because it has been measured to pay.
 4. The same ratio against a **pressure-dependent floor**
    (`compact::microcompact_floor`): flat 2.0 up to half of
-   `compaction_trigger_used(ctx_size)`, then linear to a small epsilon (0.05,
+   `compaction_trigger_used(ctx_size)` (since 2026-09-05: up to the 75%
+   pressure threshold, see the section above), then linear to a small epsilon (0.05,
    `MICROCOMPACT_FLOOR_EPSILON`) at that trigger. The epsilon rather than 0.0
    because 0.0 means "accept any pass at all", and the opportunistic pass runs
    at the end of a turn while `should_compact` is consulted at the start of the
@@ -728,7 +747,8 @@ Three successive gates, each fixing the previous one's blindness:
 
    The accepting branch of this gate has **never fired in a live session**. It
    needs roughly 42% of the context window used (half of
-   `compaction_trigger_used`), and a benchmark of file-reading turns reaches
+   `compaction_trigger_used`; 75% after the pressure floor above), and a
+   benchmark of file-reading turns reaches
    2-3% of a 1M-token window; the only evidence that a pass fires and a rung is
    restored comes from unit tests with a synthetic small `ctx_size`.
 

@@ -760,6 +760,19 @@ impl SearchCtx {
 }
 
 /// Implements the `search` tool with literal or regex line matching.
+/// Whether a literal query reads like a regex: alternation, anchors, character
+/// classes or quantifiers on the preceding atom. A bare `.` is not enough, it is
+/// far more common in file names and paths than as a wildcard.
+fn looks_like_regex(query: &str) -> bool {
+    let b = query.as_bytes();
+    b.contains(&b'|')
+        || b.first() == Some(&b'^')
+        || b.last() == Some(&b'$')
+        || (b.contains(&b'[') && b.contains(&b']'))
+        || (b.contains(&b'(') && b.contains(&b')') && (b.contains(&b'|') || b.contains(&b'?')))
+        || b.windows(2).any(|w| matches!(w, [b'.', b'*'] | [b'.', b'+'] | [b'\\', b'd' | b'w' | b's' | b'b']))
+}
+
 pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
     let query = call.arg_value("query").unwrap_or("");
     if query.is_empty() {
@@ -791,6 +804,11 @@ pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
     }
     sctx.search_path(&ctx.resolve(path), path, 0);
     if sctx.out.is_empty() {
+        // A literal query full of regex metacharacters almost always meant a
+        // regex: say so, or the model concludes the symbols do not exist.
+        if !use_regex && looks_like_regex(query) {
+            return "No matches (query was matched literally; it looks like a regex — pass mode=regex to match it as one)\n".to_string();
+        }
         return "No matches\n".to_string();
     }
     let header = format!(
@@ -1051,6 +1069,19 @@ mod tests {
         assert!(out.contains("  1 hello\n"));
         assert!(out.contains("  3 hello again\n"));
         let out = tool_search(&mut ctx, &test_call("search", &[("query", "absent")]));
+        assert_eq!(out, "No matches\n");
+        // The repro: an alternation matched literally. The reply must point at
+        // regex mode instead of letting the model conclude nothing exists.
+        let out = tool_search(&mut ctx, &test_call("search", &[("query", "hello|world")]));
+        assert!(out.starts_with("No matches ("), "{out}");
+        assert!(out.contains("mode=regex"), "{out}");
+        let out = tool_search(
+            &mut ctx,
+            &test_call("search", &[("query", "hello|world"), ("mode", "regex")]),
+        );
+        assert!(out.starts_with("2 matches shown"), "{out}");
+        // A plain miss with a dot stays terse.
+        let out = tool_search(&mut ctx, &test_call("search", &[("query", "a.txt")]));
         assert_eq!(out, "No matches\n");
         std::fs::remove_dir_all(dir).ok();
     }
