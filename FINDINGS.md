@@ -952,6 +952,12 @@ without the model files).
 
 ## Part 2 — Environment & tooling
 
+- **libgit2 reports 0 insertions for untracked files.** `DiffStats::insertions`
+  treats untracked files as binary blobs, so the status bar showed `+0` for a
+  brand-new 200-line file the agent just created. `diff_stats` in `status.rs`
+  manually counts lines in each `Delta::Untracked` file and adds them to the
+  insertion count. Staged new files are fine — libgit2 counts those — the gap
+  is only for files not yet in the index.
 - **Bumping `refs/ds4` is three coupled edits, not one.** `ds4_engine_options`
   is mirrored field-for-field by `ffi::Ds4EngineOptions`, and the mirror is
   positional: a field added mid-struct in the C shifts everything after it and

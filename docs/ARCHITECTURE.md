@@ -308,7 +308,11 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   renders the `/config` modal overlay.
 - `status.rs` — the compact footer text and the prefill progress bar. Also owns
   the rotating status-bar tips (`TIPS`/`rotating_tip`), shown in yellow at the
-  tail of the bar and advanced off the animation clock.
+  tail of the bar and advanced off the animation clock. The git diff stat
+  (`+N -M`) uses `git2`'s tree-to-workdir-with-index diff. libgit2 treats
+  untracked files as binary blobs, so `DiffStats::insertions` reports 0 lines
+  for them; `diff_stats` manually counts lines in each `Delta::Untracked` file
+  and adds them to the insertion count so newly-created files show `+N`.
 - `configform.rs` — the front-end-agnostic `/config` editor: the `FIELDS`
   registry, the `ConfigForm` key/edit state machine, and the textual setter used
   by the plain REPL.
