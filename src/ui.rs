@@ -3100,6 +3100,9 @@ impl Agent<'_> {
         let (stream, text, stats) = self.stream_generation(&prompt_text, Instant::now())?;
         let finished = stream.finished();
         self.session.push(Message::assistant(text.clone()));
+        // Streamed live to the parent window, so the console has seen it:
+        // it must not be replayed to a window that connects later.
+        self.note_pass_mirrored();
         self.payload_dirty = true;
         // The flag handling here is exactly `run_turn`'s for a cut-off turn:
         // record it on `last_turn_interrupted` and clear the
@@ -5789,6 +5792,8 @@ the original is frozen and listed in /tree"
         self.payload_dirty = false;
         self.loop_guard = crate::guard::LoopGuard::new();
         self.fork_kv.clear();
+        // fork_points stays parallel to fork_kv (see the field doc); clear both together.
+        self.fork_points.clear();
         self.session_start = std::time::Instant::now();
         note
     }
@@ -10983,6 +10988,9 @@ impl Agent<'_> {
         let out = self.worker_generate(tx, shared, &prompt, Instant::now(), false)?;
         self.session
             .push(Message::assistant(out.assistant_text.clone()));
+        // Streamed live to the parent window, so the console has seen it:
+        // it must not be replayed to a window that connects later.
+        self.note_pass_mirrored();
         self.payload_dirty = true;
         // Work instead of a verdict, or a cut-off pass: neither settles a goal.
         if out.interrupted || !out.calls.is_empty() {
