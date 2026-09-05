@@ -124,8 +124,11 @@ pub fn git_stats() -> Option<GitStats> {
 /// cached entry point.
 fn compute_git_stats() -> Option<GitStats> {
     let repo = git2::Repository::discover(".").ok()?;
-    // Tree-to-workdir-with-index: one diff covering both staged and unstaged
-    // work, so a file edited and then added is counted once, not twice.
+    diff_stats(&repo)
+}
+
+/// Core diff-stats logic, extracted so tests can pass a temp repo.
+fn diff_stats(repo: &git2::Repository) -> Option<GitStats> {
     let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
     let mut opts = git2::DiffOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
@@ -133,11 +136,33 @@ fn compute_git_stats() -> Option<GitStats> {
         .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
         .ok()?;
     let stats = diff.stats().ok()?;
-    Some(GitStats {
+    let mut result = GitStats {
         files: stats.files_changed(),
         added: stats.insertions(),
         deleted: stats.deletions(),
-    })
+    };
+    // libgit2 treats untracked files as binary blobs, so `stats.insertions()`
+    // reports 0 lines for them. Count their lines manually so the status bar
+    // shows `+N` for new files the agent just created but hasn't staged.
+    let cwd = repo.workdir()?;
+    diff.foreach(
+        &mut |delta, _| {
+            if delta.status() == git2::Delta::Untracked {
+                if let Some(path) = delta.new_file().path() {
+                    let full = cwd.join(path);
+                    if let Ok(content) = std::fs::read_to_string(&full) {
+                        result.added += content.lines().count();
+                    }
+                }
+            }
+            true
+        },
+        None,
+        None,
+        None,
+    )
+    .ok()?;
+    Some(result)
 }
 
 /// The git stat segment text, `📄 3 · +12 -4`, or `None` for a clean tree or
@@ -1888,6 +1913,66 @@ mod tests {
     fn no_download_adds_not_one_byte_to_the_bar() {
         let ctx = splice_download_segment("ctx 12%".to_string(), None, |s: &str| s.to_owned());
         assert_eq!(ctx, "ctx 12%");
+    }
+
+    #[test]
+    fn new_file_insertions_are_counted() {
+        // libgit2's DiffStats has historically reported 0 insertions for
+        // newly-added files (treated as binary). This test catches that
+        // regression by staging a 5-line file and checking the count.
+        let dir = std::env::temp_dir().join("plank_git2_newfile_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = git2::Repository::init(&dir).unwrap();
+        let sig = git2::Signature::now("t", "t@t").unwrap();
+        // Initial commit with an existing file.
+        std::fs::write(dir.join("existing.txt"), "existing line 1\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("existing.txt")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        // Stage a new 5-line file.
+        std::fs::write(
+            dir.join("newfile.txt"),
+            "new line 1\nnew line 2\nnew line 3\nnew line 4\nnew line 5\n",
+        )
+        .unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("newfile.txt")).unwrap();
+        idx.write().unwrap();
+        // Compute stats the same way compute_git_stats does.
+        let tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        let mut opts = git2::DiffOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let diff = repo
+            .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+            .unwrap();
+        let stats = diff.stats().unwrap();
+        eprintln!(
+            "staged: files: {} insertions: {} deletions: {}",
+            stats.files_changed(),
+            stats.insertions(),
+            stats.deletions()
+        );
+        assert_eq!(stats.files_changed(), 1);
+        assert_eq!(stats.insertions(), 5, "staged new file's 5 lines should count as insertions");
+
+        // Now test an UNTRACKED file (not staged): remove it from the index,
+        // leaving newfile.txt as untracked.
+        let mut idx = repo.index().unwrap();
+        idx.remove_path(std::path::Path::new("newfile.txt")).unwrap();
+        idx.write().unwrap();
+        let result = diff_stats(&repo).expect("diff_stats should return Some");
+        eprintln!(
+            "untracked: files: {} added: {} deleted: {}",
+            result.files, result.added, result.deleted
+        );
+        // This was the bug: untracked files showed 0 insertions because
+        // libgit2 treats them as binary. The manual line-count fix corrects it.
+        assert_eq!(result.added, 5, "untracked new file's 5 lines should count as added");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Elision drops the lowest-priority cells first and keeps the order.
