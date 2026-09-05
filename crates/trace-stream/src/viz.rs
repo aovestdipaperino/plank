@@ -644,6 +644,11 @@ pub struct StreamRenderer<S> {
     /// state) but never emitted to the sink. Gated by `ui.showThinking`;
     /// defaults true. See [`StreamRenderer::set_show_thinking`].
     show_thinking: bool,
+    /// When false, the dim content preview a `write` of a new file streams is
+    /// dropped too. Independent of `show_tool_calls` (the preview is normally
+    /// kept even with banners off); defaults true. See
+    /// [`StreamRenderer::set_show_write_preview`].
+    show_write_preview: bool,
     /// When true, a DSML stanza opened inside `<think>` is parsed and dispatched
     /// like any other. Defaults **false**, which is strict `refs/ds4` parity:
     /// the stanza is discarded with a `[tool call ignored: ...]` notice.
@@ -709,6 +714,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             preflight_error: None,
             show_tool_calls: true,
             show_thinking: true,
+            show_write_preview: true,
             thinking_tool_calls: false,
             replay: false,
         }
@@ -746,6 +752,13 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// emitted to the sink.
     pub fn set_show_thinking(&mut self, show: bool) {
         self.show_thinking = show;
+    }
+
+    /// Sets whether a new-file `write` streams its content as a dim preview
+    /// (default true). `/init` turns it off together with the banners so the
+    /// generated AGENTS.md draft never scrolls past.
+    pub fn set_show_write_preview(&mut self, show: bool) {
+        self.show_write_preview = show;
     }
 
     /// Sets whether a DSML error freezes all further output (default false).
@@ -975,9 +988,10 @@ impl<S: RenderSink> StreamRenderer<S> {
 
     /// Emits `write`-preview bytes in the thinking (dim) color. Independent of
     /// `show_tool_calls` and `show_thinking`, so a write's content is always
-    /// visible as a dim preview of what is being saved.
+    /// visible as a dim preview of what is being saved — unless
+    /// `show_write_preview` is off.
     fn emit_preview_bytes(&mut self, bytes: &[u8]) {
-        if bytes.is_empty() {
+        if bytes.is_empty() || !self.show_write_preview {
             return;
         }
         self.last_output_newline = bytes.last() == Some(&b'\n');
@@ -2114,6 +2128,32 @@ mod tests {
         assert!(
             !sr.sink().visible.contains("fn main()"),
             "content not on the visible channel: {:?}",
+            sr.sink().visible
+        );
+        assert_eq!(sr.finished().calls.len(), 1, "call still parsed");
+    }
+
+    #[test]
+    fn show_write_preview_false_drops_the_content_preview_entirely() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"write\">",
+            "<｜DSML｜parameter name=\"path\">src/foo.rs</｜DSML｜parameter>",
+            "<｜DSML｜parameter name=\"content\">fn main() {}\n</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        // The /init wiring: banners and preview both off. Nothing reaches any
+        // channel, but the call is still parsed so the file still gets written.
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_tool_calls(false);
+        sr.set_show_write_preview(false);
+        sr.push(stanza);
+        sr.finish();
+        assert!(sr.sink().think.is_empty(), "think: {:?}", sr.sink().think);
+        assert!(
+            !sr.sink().visible.contains("fn main()"),
+            "visible: {:?}",
             sr.sink().visible
         );
         assert_eq!(sr.finished().calls.len(), 1, "call still parsed");

@@ -803,6 +803,30 @@ fn edit_preflight_cwd(
 }
 
 /// One sub-agent sidechain in a parallel fan-out.
+/// The tool result a finished fan-out slot hands back, paired with the
+/// `/repro` sidecar dump of its sidechain.
+fn fanout_slot_result(
+    s: &FanoutSlot,
+    fork_at: usize,
+) -> ((String, String), crate::repro::SidechainDump) {
+    let report = last_assistant_text(&s.session.transcript);
+    let (out, outcome) = match (&s.error, report) {
+        (Some(e), _) => (
+            format!("Tool error: sub-agent failed: {e}\n"),
+            format!("failed: {e}"),
+        ),
+        (None, Some(r)) => (format!("Sub-agent report:\n{r}\n"), "report".to_owned()),
+        (None, None) => (
+            "Tool error: sub-agent produced no report\n".to_string(),
+            "no report".to_owned(),
+        ),
+    };
+    let mut dump =
+        crate::repro::SidechainDump::new(&s.label, &s.task, fork_at, &s.session.transcript);
+    dump.outcome = outcome;
+    (("agent".to_string(), out), dump)
+}
+
 struct FanoutSlot {
     /// Cache key, so the engine goes back where it came from.
     key: EngineKey,
@@ -957,12 +981,20 @@ pub fn render_transcript(session: &Session, system: &str) -> String {
 /// markers with small deltas.
 #[must_use]
 pub fn render_transcript_for_repro(session: &Session, system: &str) -> String {
+    render_messages_for_repro(&session.transcript, Some(system))
+}
+
+/// The body of [`render_transcript_for_repro`] over a bare message slice, with
+/// the `[system]` block optional so a sub-agent sidecar (whose system prompt
+/// is the parent's) can omit it.
+#[must_use]
+pub fn render_messages_for_repro(messages: &[Message], system: Option<&str>) -> String {
     use std::fmt::Write as _;
     const TIMESTAMP_INTERVAL: usize = 20;
-    let mut out = format!("[system]\n{system}\n");
+    let mut out = system.map_or_else(String::new, |system| format!("[system]\n{system}\n"));
     let mut first_ts: Option<u64> = None;
     let mut ts_count = 0usize; // messages with a non-zero `at` seen since last marker
-    for (i, m) in session.transcript.iter().enumerate() {
+    for (i, m) in messages.iter().enumerate() {
         // Emit a periodic timestamp marker before this message.
         if m.at != 0 {
             let is_due = ts_count >= TIMESTAMP_INTERVAL;
@@ -989,16 +1021,16 @@ pub fn render_transcript_for_repro(session: &Session, system: &str) -> String {
         let _ = write!(out, "[{tag}]\n{}\n", m.text);
     }
     // Final marker so the total duration is visible.
-    if let Some(f) = first_ts {
-        if let Some(last) = session.transcript.iter().rev().find(|m| m.at != 0) {
-            let elapsed = last.at.saturating_sub(f);
-            let _ = writeln!(
-                out,
-                "[timestamp] {} (end, {})",
-                crate::context::format_local_time(last.at),
-                format_elapsed(elapsed)
-            );
-        }
+    if let Some(f) = first_ts
+        && let Some(last) = messages.iter().rev().find(|m| m.at != 0)
+    {
+        let elapsed = last.at.saturating_sub(f);
+        let _ = writeln!(
+            out,
+            "[timestamp] {} (end, {})",
+            crate::context::format_local_time(last.at),
+            format_elapsed(elapsed)
+        );
     }
     out
 }
@@ -1297,10 +1329,7 @@ fn observe_calls(
 /// Appends any advisory lines from pre-computed nudges to the observations the
 /// model receives. Block nudges are handled by the caller (the call is refused
 /// before dispatch); this only formats the softer advisory tier.
-fn append_advisories(
-    nudges: &[crate::guard::Nudge],
-    mut observations: String,
-) -> String {
+fn append_advisories(nudges: &[crate::guard::Nudge], mut observations: String) -> String {
     use std::fmt::Write as _;
     for nudge in nudges {
         if let crate::guard::Nudge::Advisory(text) = nudge {
@@ -1460,6 +1489,10 @@ struct Agent<'a> {
     /// so nothing captured against it — payload, rung, micro-compaction — may
     /// be written as if it were the session's own (see [`Agent::in_sidechain`]).
     sidechain_depth: usize,
+    /// True while `/init` runs its generation turn: tool banners, the `write`
+    /// content preview and tool results are all suppressed regardless of the
+    /// `ui.show*` settings, so the AGENTS.md draft never scrolls past.
+    quiet_tools: bool,
     /// Image embeddings collected by `view_image` during the current
     /// `run_tool_calls` dispatch, drained by the caller when it pushes the
     /// tool-result message so they ride on that message into the transcript.
@@ -1568,6 +1601,11 @@ struct Agent<'a> {
     /// token zero. `None` entries are engines without KV support (Echo),
     /// where the restore no-ops.
     fork_kv: Vec<Option<crate::kvcache::KVCache>>,
+    /// The last few finished sub-agent sidechains, newest last, for the
+    /// `/repro` sidecars: a sidechain is truncated out of the transcript the
+    /// moment it ends, so without this the main dump could never show what a
+    /// sub-agent did before it was interrupted.
+    sidechain_dumps: std::collections::VecDeque<crate::repro::SidechainDump>,
     /// Engines for definitions that override the parent's (cross-provider
     /// sub-agents). Cached across dispatches so `discover_ctx_size`'s network
     /// probe happens at most once per key per session.
@@ -1947,11 +1985,7 @@ impl Agent<'_> {
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(sink);
         stream.set_freeze_on_error(true);
-        stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
-        stream.set_show_thinking(crate::settings::active().ui.show_thinking);
-        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
-        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
-        stream.set_preflight(edit_preflight(&self.tool_ctx));
+        self.configure_stream(&mut stream);
         // Defensive retry point: picks up a console that started after plank
         // did, or a setting change that raced this turn's start. A settings
         // change itself already reconciles immediately (`settings::reinstall`),
@@ -2302,7 +2336,7 @@ impl Agent<'_> {
             &label,
         )));
         self.emit_sub(crate::worker::UiEvent::SubStart {
-            label,
+            label: label.clone(),
             task: task.clone(),
         });
         self.tool_ctx.subagent_depth += 1;
@@ -2314,7 +2348,10 @@ impl Agent<'_> {
         let isolation_note = self.end_agent_isolation(isolation);
         self.emit_sub(crate::worker::UiEvent::SubEnd);
         // Extract the sidechain's final report before truncating it back out.
-        let report = self.end_subagent_fork(fork_at);
+        let report = self.end_subagent_fork(fork_at, &label, &task);
+        if let Err(e) = &result {
+            self.note_sidechain_outcome(&format!("failed: {e}"));
+        }
         match result {
             Err(e) => format!("Tool error: sub-agent failed: {e}\n"),
             Ok(()) => match report {
@@ -3386,11 +3423,10 @@ impl Agent<'_> {
     /// tokenizer; returns the number of results cleared.
     fn microcompact_with_budget(&mut self, budget_tokens: i32) -> usize {
         let engine = &mut self.engine;
-        let (cleared, _) = compact::microcompact(
-            &mut self.session.transcript,
-            budget_tokens,
-            &mut |s| engine.count_tokens(s),
-        );
+        let (cleared, _) =
+            compact::microcompact(&mut self.session.transcript, budget_tokens, &mut |s| {
+                engine.count_tokens(s)
+            });
         cleared
     }
 
@@ -4130,6 +4166,18 @@ impl Agent<'_> {
         println!("started a new session");
     }
 
+    /// Applies the `ui.show*` settings (and the `/init` quiet override) to a
+    /// live-turn renderer. Shared by the plain REPL and TUI turn paths.
+    fn configure_stream<S: crate::viz::RenderSink>(&self, stream: &mut StreamRenderer<S>) {
+        let settings = crate::settings::active();
+        stream.set_show_tool_calls(settings.ui.show_tool_calls && !self.quiet_tools);
+        stream.set_show_write_preview(!self.quiet_tools);
+        stream.set_show_thinking(settings.ui.show_thinking);
+        stream.set_thinking_tool_calls(settings.engine.thinking_tool_calls);
+        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
+        stream.set_preflight(edit_preflight(&self.tool_ctx));
+    }
+
     /// Runs the /init command: prompts the model to create AGENTS.md, then
     /// clears the session (the plain REPL never clears the screen) so the init
     /// exchange does not carry into later turns.
@@ -4138,7 +4186,10 @@ impl Agent<'_> {
         println!("The model will now analyze the codebase and generate documentation.\n");
 
         self.session.push(Message::user(Self::INIT_PROMPT));
-        if let Err(e) = self.run_turn() {
+        self.quiet_tools = true;
+        let result = self.run_turn();
+        self.quiet_tools = false;
+        if let Err(e) = result {
             println!("/init failed: {e}");
         }
         // The init prompt and the model's AGENTS.md draft are scaffolding for
@@ -4172,7 +4223,9 @@ impl Agent<'_> {
         // the turn footer) so it never stays in the TUI log. The file write
         // itself still happens during the turn.
         let mark = log.checkpoint();
+        self.quiet_tools = true;
         let result = self.tui_turn(terminal, log, view, input, btw, arcade, sub);
+        self.quiet_tools = false;
         log.truncate_to(mark);
         if let Err(e) = result {
             log.push_plain(format!("/init failed: {e}"));
@@ -4615,9 +4668,9 @@ impl Agent<'_> {
                 }
             }
             "/repro" => match self.write_repro(arg) {
-                Ok(path) => println!(
+                Ok((path, sidecars)) => println!(
                     "{}",
-                    self.debug_line(&format!("[repro written to {}]", path.display()))
+                    self.debug_line(&Self::repro_written_line(&path, sidecars))
                 ),
                 Err(e) => println!("repro failed: {e}"),
             },
@@ -6494,7 +6547,7 @@ the original is frozen and listed in /tree"
     /// as the live session goes; the only state it touches is the last-edited
     /// pointer, so a bare `/open` opens the dump that was just generated (the
     /// file the user most likely wants to read or annotate next).
-    fn write_repro(&mut self, note: &str) -> Result<std::path::PathBuf, String> {
+    fn write_repro(&mut self, note: &str) -> Result<(std::path::PathBuf, usize), String> {
         // `rendered` is the exact engine input (no timestamp markers) — used
         // for the token count so that figure stays accurate. `rendered_for_repro`
         // is the same transcript with periodic `[timestamp]` markers for the
@@ -6517,10 +6570,39 @@ the original is frozen and listed in /tree"
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
         let path = crate::repro::save(&self.tool_ctx.cwd, now_secs(), &report)?;
+        // Sub-agent sidechains are gone from the transcript by now; the
+        // remembered dumps go beside the main file, oldest first.
+        let main_file = path
+            .file_name()
+            .map(|f| f.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let mut sidecars = 0usize;
+        for (i, dump) in self.sidechain_dumps.iter().enumerate() {
+            let rendered = render_messages_for_repro(&dump.messages, None);
+            let side =
+                crate::repro::build_sidecar_report(&version, &main_file, i + 1, dump, &rendered);
+            crate::repro::save_sidecar(&path, i + 1, &side)?;
+            sidecars += 1;
+        }
         // `repro::save` builds its path from `$HOME` (or the already-absolute
         // cwd), so unlike `openfile::note_edited` there is nothing to resolve.
         self.last_edited = Some(path.clone());
-        Ok(path)
+        Ok((path, sidecars))
+    }
+
+    /// The `[repro written to …]` line, naming the sidecars when there are any.
+    fn repro_written_line(path: &std::path::Path, sidecars: usize) -> String {
+        match sidecars {
+            0 => format!("[repro written to {}]", path.display()),
+            1 => format!(
+                "[repro written to {} (+1 sub-agent sidecar .sub-1.md)]",
+                path.display()
+            ),
+            n => format!(
+                "[repro written to {} (+{n} sub-agent sidecars .sub-1..{n}.md)]",
+                path.display()
+            ),
+        }
     }
 
     /// Writes a `/export` transcript dump (issue #66). `arg` is
@@ -6787,13 +6869,43 @@ the original is frozen and listed in /tree"
     /// report, extracted before the truncate. Every fork-end path goes
     /// through here so the depth counter opened by
     /// [`begin_subagent_fork`](Self::begin_subagent_fork) always closes.
-    fn end_subagent_fork(&mut self, fork_at: usize) -> Option<String> {
+    fn end_subagent_fork(&mut self, fork_at: usize, label: &str, task: &str) -> Option<String> {
         let report = last_assistant_text(&self.session.transcript[fork_at..]);
+        let mut dump = crate::repro::SidechainDump::new(
+            label,
+            task,
+            fork_at,
+            &self.session.transcript[fork_at..],
+        );
+        dump.outcome = if report.is_some() {
+            "report".to_owned()
+        } else {
+            "no report".to_owned()
+        };
+        self.remember_sidechain(dump);
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
         self.sidechain_depth = self.sidechain_depth.saturating_sub(1);
         self.restore_fork_kv();
         report
+    }
+
+    /// Keeps a finished sidechain for the `/repro` sidecars, dropping the
+    /// oldest past [`crate::repro::SIDECHAIN_DUMPS_KEPT`].
+    fn remember_sidechain(&mut self, dump: crate::repro::SidechainDump) {
+        if self.sidechain_dumps.len() >= crate::repro::SIDECHAIN_DUMPS_KEPT {
+            self.sidechain_dumps.pop_front();
+        }
+        self.sidechain_dumps.push_back(dump);
+    }
+
+    /// Overwrites the outcome of the most recently remembered sidechain. The
+    /// fork end records `report`/`no report`; the caller that knows the loop
+    /// failed (interrupted, engine error) corrects it here.
+    fn note_sidechain_outcome(&mut self, outcome: &str) {
+        if let Some(d) = self.sidechain_dumps.back_mut() {
+            outcome.clone_into(&mut d.outcome);
+        }
     }
 
     /// Runs a whole block of remote-backed `agent` calls concurrently, or returns
@@ -6895,17 +7007,12 @@ the original is frozen and listed in /tree"
         self.run_fanout_rounds(&mut slots, width);
         self.tool_ctx.subagent_depth -= 1;
 
-        let results = slots
-            .iter()
-            .map(|s| {
-                let out = match (&s.error, last_assistant_text(&s.session.transcript)) {
-                    (Some(e), _) => format!("Tool error: sub-agent failed: {e}\n"),
-                    (None, Some(r)) => format!("Sub-agent report:\n{r}\n"),
-                    (None, None) => "Tool error: sub-agent produced no report\n".to_string(),
-                };
-                ("agent".to_string(), out)
-            })
-            .collect();
+        let fork_at = self.session.transcript.len();
+        let (results, dumps): (Vec<_>, Vec<_>) =
+            slots.iter().map(|s| fanout_slot_result(s, fork_at)).unzip();
+        for dump in dumps {
+            self.remember_sidechain(dump);
+        }
         self.flush_fanout_panes(&slots);
         self.return_slot_engines(slots);
         Some(results)
@@ -7330,7 +7437,7 @@ the original is frozen and listed in /tree"
     /// the sidechain produced no report (e.g. interrupted before any output);
     /// the transcript is still restored.
     fn finish_subagent_fork(&mut self, fork_at: usize, task: &str) -> bool {
-        match self.end_subagent_fork(fork_at) {
+        match self.end_subagent_fork(fork_at, "subagent", task) {
             Some(report) => {
                 self.session
                     .push(Message::user(crate::agents::report_message(task, &report)));
@@ -10535,7 +10642,7 @@ impl Agent<'_> {
                     Message::user(format!("<tool_result>{observations}</tool_result>"))
                         .with_images(images),
                 );
-                if crate::settings::active().ui.show_tool_results {
+                if crate::settings::active().ui.show_tool_results && !self.quiet_tools {
                     for line in observations.lines() {
                         let _ = tx.send(UiEvent::Dim(line.to_owned()));
                     }
@@ -10777,11 +10884,7 @@ impl Agent<'_> {
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_freeze_on_error(true);
-        stream.set_show_tool_calls(crate::settings::active().ui.show_tool_calls);
-        stream.set_show_thinking(crate::settings::active().ui.show_thinking);
-        stream.set_thinking_tool_calls(crate::settings::active().engine.thinking_tool_calls);
-        stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
-        stream.set_preflight(edit_preflight(&self.tool_ctx));
+        self.configure_stream(&mut stream);
         // See the matching comment in `stream_generation`: a defensive retry
         // point, cheap when already reconciled.
         crate::debugmirror::reconcile();
@@ -11736,7 +11839,7 @@ impl Agent<'_> {
                 }
             }
             "/repro" => match self.write_repro(arg) {
-                Ok(path) => log.push_dim(format!("[repro written to {}]", path.display())),
+                Ok((path, sidecars)) => log.push_dim(Self::repro_written_line(&path, sidecars)),
                 Err(e) => log.push_plain(format!("repro failed: {e}")),
             },
             c if crate::agents::is_subagent_command(c) => {
@@ -13350,6 +13453,7 @@ fn new_agent(
         payload_dirty: false,
         ladder: crate::kvladder::KvLadder::new(),
         sidechain_depth: 0,
+        quiet_tools: false,
         pending_images: Vec::new(),
         btw_diverged_engine: false,
         trusted_system_len,
@@ -13378,6 +13482,7 @@ fn new_agent(
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
+        sidechain_dumps: std::collections::VecDeque::new(),
         // A local engine handed in alongside a provider main agent lives in the
         // same cache as any other alternate: `provider: local` definitions take
         // it out for their sidechain and put it back afterwards, so the
@@ -13899,7 +14004,9 @@ mod tests {
         }
         let nudges = observe_calls(&mut guard, &call);
         assert!(
-            nudges.iter().any(|n| matches!(n, crate::guard::Nudge::Block(_))),
+            nudges
+                .iter()
+                .any(|n| matches!(n, crate::guard::Nudge::Block(_))),
             "6th identical call should be blocked"
         );
     }
@@ -14018,13 +14125,22 @@ mod tests {
         // Every 20 timestamped messages: a marker at msg 20 and msg 40.
         // Elapsed is from the first marker (msg 0 at t=1000), so msg 20 is
         // +1m40s (100s) and msg 40 is +3m20s (200s).
-        assert!(rendered.contains("(msg 20, +1m40s)"), "periodic marker at msg 20");
-        assert!(rendered.contains("(msg 40, +3m20s)"), "periodic marker at msg 40");
+        assert!(
+            rendered.contains("(msg 20, +1m40s)"),
+            "periodic marker at msg 20"
+        );
+        assert!(
+            rendered.contains("(msg 40, +3m20s)"),
+            "periodic marker at msg 40"
+        );
         // End marker.
         assert!(rendered.contains("(end,"), "should have an end marker");
         // The plain render_transcript has no timestamps.
         let plain = render_transcript(&s, "SYS");
-        assert!(!plain.contains("[timestamp]"), "plain render must not have timestamps");
+        assert!(
+            !plain.contains("[timestamp]"),
+            "plain render must not have timestamps"
+        );
     }
 
     #[test]
@@ -14040,7 +14156,10 @@ mod tests {
         let rendered = render_transcript_for_repro(&s, "SYS");
         // The first message was stamped by push(), so there should be a marker.
         // The zero-timestamp message should not produce a marker.
-        assert!(rendered.contains("[timestamp]"), "stamped message gets a marker");
+        assert!(
+            rendered.contains("[timestamp]"),
+            "stamped message gets a marker"
+        );
     }
 
     #[test]
@@ -15055,6 +15174,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -15082,6 +15202,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -15587,14 +15708,15 @@ mod tests {
         let rung = agent.capture_first_rung();
         assert_eq!(rung.spans, 2);
 
-        // Four tool results: only the first is a clearing candidate (the newest
-        // three are kept), and the kept three are bulky enough that the bytes
-        // the pass would reclaim are far below the floor per re-prefilled
-        // token, so the gate must refuse.
+        // An acted-on result then a bulky current batch: only the first is a
+        // clearing candidate, and the batch is bulky enough that the bytes the
+        // pass would reclaim are far below the floor per re-prefilled token,
+        // so the gate must refuse.
         agent.session.push(Message::user(format!(
             "<tool_result>{}</tool_result>",
             "a".repeat(5_000)
         )));
+        agent.session.push(Message::assistant("seen"));
         for _ in 0..3 {
             agent.session.push(Message::user(format!(
                 "<tool_result>{}</tool_result>",
@@ -15766,8 +15888,9 @@ mod tests {
             "<tool_result>{}</tool_result>",
             "a".repeat(10_000)
         )));
-        // Three more candidates (>256 bytes) so the big one falls outside the
-        // newest-3 keep window instead of being kept alive by it.
+        // An assistant turn then a newer batch, so the big one is acted-on
+        // history rather than part of the current batch.
+        agent.session.push(Message::assistant("seen"));
         for _ in 0..3 {
             agent.session.push(Message::user(format!(
                 "<tool_result>{}</tool_result>",
@@ -18411,6 +18534,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -18438,6 +18562,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -18519,6 +18644,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -18546,6 +18672,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -19093,7 +19220,9 @@ mod tests {
         assert_eq!(rung_files(&agent).len(), 2);
 
         assert_eq!(
-            agent.end_subagent_fork(fork_at).as_deref(),
+            agent
+                .end_subagent_fork(fork_at, "sub-agent", "t")
+                .as_deref(),
             Some("sidechain reply")
         );
         assert_eq!(agent.session.transcript.len(), fork_at);
@@ -19616,6 +19745,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -19643,6 +19773,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -19804,6 +19935,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -19831,6 +19963,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -19897,6 +20030,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -19924,6 +20058,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -19977,6 +20112,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -20004,6 +20140,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -20080,6 +20217,7 @@ mod tests {
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -20107,6 +20245,7 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -21653,6 +21792,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21680,6 +21820,7 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -21710,6 +21851,31 @@ or the user's next message aborts before its first token"
             "sidechain leaked: {}",
             tool_result.text
         );
+        // ... but it is remembered for the `/repro` sidecar, with the bash
+        // call the parent never saw and the outcome the parent was told.
+        assert_eq!(
+            agent.sidechain_dumps.len(),
+            1,
+            "one finished sidechain kept"
+        );
+        let dump = agent.sidechain_dumps.back().unwrap();
+        assert_eq!(dump.label, "sub-agent");
+        assert_eq!(dump.outcome, "report");
+        assert!(
+            dump.messages.iter().any(|m| m.text.contains("echo 42")),
+            "the sidechain's own tool call is in the dump"
+        );
+        assert!(
+            dump.messages
+                .iter()
+                .any(|m| m.text.contains("There are 42 tests."))
+        );
+        let rendered = render_messages_for_repro(&dump.messages, None);
+        assert!(
+            !rendered.starts_with("[system]"),
+            "sidecars do not repeat the system prompt"
+        );
+        assert!(rendered.contains("[user]\n"), "{rendered}");
         // The final assistant message concludes the main turn.
         let last = agent.session.transcript.last().unwrap();
         assert!(last.text.contains("Done: the sub-agent counted 42."));
@@ -21750,6 +21916,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21777,6 +21944,7 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -21906,6 +22074,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -21933,6 +22102,7 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,
@@ -21984,6 +22154,7 @@ or the user's next message aborts before its first token"
             payload_dirty: false,
             ladder: crate::kvladder::KvLadder::new(),
             sidechain_depth: 0,
+            quiet_tools: false,
             pending_images: Vec::new(),
             btw_diverged_engine: false,
             trusted_system_len: 0,
@@ -22011,6 +22182,7 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
             warm_note: None,

@@ -191,10 +191,16 @@ mod tests {
             assert_eq!(g.observe("read", d.clone()), Nudge::None);
         }
         for d in &cycle[..7] {
-            assert_eq!(g.observe("read", d.clone()), Nudge::None, "cycle not yet closed");
+            assert_eq!(
+                g.observe("read", d.clone()),
+                Nudge::None,
+                "cycle not yet closed"
+            );
         }
         let nudge = g.observe("read", cycle[7].clone());
-        let text = nudge.as_advisory().expect("the closed cycle is an advisory");
+        let text = nudge
+            .as_advisory()
+            .expect("the closed cycle is an advisory");
         assert!(text.contains("last 8 tool calls repeat"), "{text}");
     }
 

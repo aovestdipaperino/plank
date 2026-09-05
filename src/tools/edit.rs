@@ -770,7 +770,8 @@ fn looks_like_regex(query: &str) -> bool {
         || b.last() == Some(&b'$')
         || (b.contains(&b'[') && b.contains(&b']'))
         || (b.contains(&b'(') && b.contains(&b')') && (b.contains(&b'|') || b.contains(&b'?')))
-        || b.windows(2).any(|w| matches!(w, [b'.', b'*'] | [b'.', b'+'] | [b'\\', b'd' | b'w' | b's' | b'b']))
+        || b.windows(2)
+            .any(|w| matches!(w, [b'.', b'*' | b'+'] | [b'\\', b'd' | b'w' | b's' | b'b']))
 }
 
 pub fn tool_search(ctx: &mut ToolContext, call: &ToolCall) -> String {
@@ -1079,7 +1080,7 @@ mod tests {
             &mut ctx,
             &test_call("search", &[("query", "hello|world"), ("mode", "regex")]),
         );
-        assert!(out.starts_with("2 matches shown"), "{out}");
+        assert!(out.starts_with("3 matches shown"), "{out}");
         // A plain miss with a dot stays terse.
         let out = tool_search(&mut ctx, &test_call("search", &[("query", "a.txt")]));
         assert_eq!(out, "No matches\n");

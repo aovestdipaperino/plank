@@ -147,13 +147,11 @@ fn diff_stats(repo: &git2::Repository) -> Option<GitStats> {
     let cwd = repo.workdir()?;
     diff.foreach(
         &mut |delta, _| {
-            if delta.status() == git2::Delta::Untracked {
-                if let Some(path) = delta.new_file().path() {
-                    let full = cwd.join(path);
-                    if let Ok(content) = std::fs::read_to_string(&full) {
-                        result.added += content.lines().count();
-                    }
-                }
+            if delta.status() == git2::Delta::Untracked
+                && let Some(path) = delta.new_file().path()
+                && let Ok(content) = std::fs::read_to_string(cwd.join(path))
+            {
+                result.added += content.lines().count();
             }
             true
         },
@@ -1564,6 +1562,17 @@ pub fn progress_bar(done: i32, total: i32, tps: f64, color: bool) -> String {
     out
 }
 
+/// Time left for a prefill pass at the current throughput, as a
+/// [`format_elapsed`] string. `None` while the rate is unknown or nothing is
+/// left, so the readout never shows a bogus `~0s left` or a division by zero.
+fn prefill_eta(done: i32, total: i32, tps: f64) -> Option<String> {
+    let remaining = total.saturating_sub(done);
+    if remaining <= 0 || !tps.is_finite() || tps <= 0.0 {
+        return None;
+    }
+    Some(format_elapsed(f64::from(remaining) / tps))
+}
+
 /// The animated progress segment — throbber, spinner verb, and the
 /// elapsed/tokens/throughput readout — for the prefill and generating states.
 /// `None` in every other state. Split out so the TUI can render it on a line
@@ -1586,13 +1595,16 @@ pub fn progress_segment(st: &Status, color: bool) -> Option<String> {
             };
             let done = st.prefill_done.min(total);
             Some(format!(
-                "{} {}… ({} · ↑ {}/{} tokens · {:.1} t/s)",
+                "{} {}… ({} · ↑ {}/{} tokens · {:.1} t/s{})",
                 throbber(),
                 theme(prefill_label(st)),
                 format_elapsed(st.elapsed_secs),
                 format_ctx_size(done),
                 format_ctx_size(total),
-                st.prefill_tps
+                st.prefill_tps,
+                prefill_eta(done, total, st.prefill_tps)
+                    .map(|eta| format!(" · ~{eta} left"))
+                    .unwrap_or_default()
             ))
         }
         WorkerState::Generating => Some(format!(
@@ -1931,7 +1943,8 @@ mod tests {
         idx.add_path(std::path::Path::new("existing.txt")).unwrap();
         idx.write().unwrap();
         let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
         // Stage a new 5-line file.
         std::fs::write(
             dir.join("newfile.txt"),
@@ -1956,12 +1969,17 @@ mod tests {
             stats.deletions()
         );
         assert_eq!(stats.files_changed(), 1);
-        assert_eq!(stats.insertions(), 5, "staged new file's 5 lines should count as insertions");
+        assert_eq!(
+            stats.insertions(),
+            5,
+            "staged new file's 5 lines should count as insertions"
+        );
 
         // Now test an UNTRACKED file (not staged): remove it from the index,
         // leaving newfile.txt as untracked.
         let mut idx = repo.index().unwrap();
-        idx.remove_path(std::path::Path::new("newfile.txt")).unwrap();
+        idx.remove_path(std::path::Path::new("newfile.txt"))
+            .unwrap();
         idx.write().unwrap();
         let result = diff_stats(&repo).expect("diff_stats should return Some");
         eprintln!(
@@ -1970,7 +1988,10 @@ mod tests {
         );
         // This was the bug: untracked files showed 0 insertions because
         // libgit2 treats them as binary. The manual line-count fix corrects it.
-        assert_eq!(result.added, 5, "untracked new file's 5 lines should count as added");
+        assert_eq!(
+            result.added, 5,
+            "untracked new file's 5 lines should count as added"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2284,10 +2305,17 @@ mod tests {
         let line = build_status_text(&st, false, true);
         assert!(line.contains("ctx 19% | "), "{line}");
         assert!(
-            line.contains("(5s · ↑ 500/2k tokens · 120.0 t/s)"),
+            line.contains("(5s · ↑ 500/2k tokens · 120.0 t/s · ~12s left)"),
             "{line}"
         );
         assert!(line.contains(&format!("{}…", prefill_label(&st))), "{line}");
+    }
+
+    #[test]
+    fn prefill_eta_hidden_without_rate_or_remaining() {
+        assert_eq!(prefill_eta(500, 2000, 0.0), None);
+        assert_eq!(prefill_eta(2000, 2000, 120.0), None);
+        assert_eq!(prefill_eta(0, 42_000, 171.8).as_deref(), Some("4m 4s"));
     }
 
     /// Every pool, in phase order. Kept here rather than in the module so the

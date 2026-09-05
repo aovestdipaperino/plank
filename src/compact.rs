@@ -590,14 +590,19 @@ mod tests {
             t.push(big_tool_result(tag));
             t.push(Message::assistant("noted"));
         }
-        // Bytes as tokens: each body is ~600 bytes, so a 700-token budget
-        // needs exactly two.
+        // Bytes as tokens. One cleared body nets `body - stub`; a budget of one
+        // more than that needs exactly two.
         let mut count = |s: &str| i32::try_from(s.len()).unwrap();
-        let (cleared, _) = microcompact(&mut t, 700, &mut count);
+        let stub = count(&format!("<tool_result>{MICROCOMPACT_STUB}</tool_result>"));
+        let budget = count(&t[1].text) - stub + 1;
+        let (cleared, _) = microcompact(&mut t, budget, &mut count);
         assert_eq!(cleared, 2);
         assert!(t[1].text.contains(MICROCOMPACT_STUB), "oldest first");
         assert!(t[3].text.contains(MICROCOMPACT_STUB));
-        assert!(t[5].text.contains("third"), "budget met: newer results stay");
+        assert!(
+            t[5].text.contains("third"),
+            "budget met: newer results stay"
+        );
         assert!(t[9].text.contains("fifth"));
         // The next pass continues from where this one stopped.
         let (cleared, _) = microcompact(&mut t, 1, &mut count);
@@ -622,8 +627,8 @@ mod tests {
         let (cleared, _) = microcompact_all(&mut t);
         assert_eq!(cleared, 1);
         assert!(t[1].text.contains(MICROCOMPACT_STUB));
-        for i in 3..6 {
-            assert!(!t[i].text.contains(MICROCOMPACT_STUB), "batch member {i}");
+        for (i, m) in t.iter().enumerate().skip(3) {
+            assert!(!m.text.contains(MICROCOMPACT_STUB), "batch member {i}");
         }
         // With nothing but the current batch, nothing is clearable at all.
         let only_batch = vec![
@@ -640,7 +645,10 @@ mod tests {
     #[test]
     fn the_delete_budget_restores_the_window_below_the_threshold() {
         // Well under the threshold's excess: the floor applies.
-        assert_eq!(microcompact_delete_budget(1_000_000, 760_000), MICROCOMPACT_DELETE_TOKENS);
+        assert_eq!(
+            microcompact_delete_budget(1_000_000, 760_000),
+            MICROCOMPACT_DELETE_TOKENS
+        );
         // Far past it: enough to fall back to 75%.
         assert_eq!(microcompact_delete_budget(1_000_000, 900_000), 150_000);
         assert_eq!(microcompact_delete_budget(0, 0), MICROCOMPACT_DELETE_TOKENS);

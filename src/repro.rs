@@ -12,6 +12,11 @@
 //! Files land in `~/.plank/repro/` (or the working dir when `HOME` is unset),
 //! named `repro-<unix-seconds>[-<n>].md`. Nothing here touches the live
 //! session — it is a read-only snapshot.
+//!
+//! Sub-agent sidechains are folded out of the transcript the moment they end,
+//! so the main dump never shows what a sub-agent did. The agent keeps the last
+//! [`SIDECHAIN_DUMPS_KEPT`] finished sidechains ([`SidechainDump`]) and `/repro`
+//! writes each one beside the main file as `repro-<secs>.sub-<n>.md`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -43,6 +48,118 @@ pub struct Meta<'a> {
     pub session_tag: &'a str,
     /// Optional user note describing the bug.
     pub note: &'a str,
+}
+
+/// How many finished sub-agent sidechains the agent remembers for `/repro`.
+/// Oldest are dropped first; a fan-out of N slots contributes N entries.
+pub const SIDECHAIN_DUMPS_KEPT: usize = 8;
+
+/// One finished sub-agent sidechain, kept for the `/repro` sidecar. Images are
+/// stripped from the messages: the embeddings are large and cannot be shown in
+/// a text dump anyway.
+#[derive(Debug, Clone)]
+pub struct SidechainDump {
+    /// Roster label: the agent name, or `sub-agent`.
+    pub label: String,
+    /// The plain delegated task (not the framed envelope).
+    pub task: String,
+    /// How it ended: `report`, `no report`, or `failed: <error>`.
+    pub outcome: String,
+    /// Transcript index in the parent where the sidechain was forked, so the
+    /// sidecar can be lined up against the main dump.
+    pub fork_at: usize,
+    /// The sidechain's messages, framed task first, in order.
+    pub messages: Vec<crate::session::Message>,
+}
+
+impl SidechainDump {
+    /// Builds a dump from the sidechain's messages, dropping image payloads.
+    #[must_use]
+    pub fn new(
+        label: &str,
+        task: &str,
+        fork_at: usize,
+        messages: &[crate::session::Message],
+    ) -> Self {
+        Self {
+            label: label.to_owned(),
+            task: task.to_owned(),
+            outcome: "ended".to_owned(),
+            fork_at,
+            messages: messages
+                .iter()
+                .map(|m| crate::session::Message {
+                    role: m.role,
+                    text: m.text.clone(),
+                    at: m.at,
+                    images: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Builds a sidecar report for one sidechain: a header naming the main dump it
+/// belongs to, the sub-agent's label, task and outcome, and the sidechain's
+/// rendered messages between the same fences the main report uses. The system
+/// prompt is the parent's and is not repeated; the header says so.
+#[must_use]
+pub fn build_sidecar_report(
+    version: &str,
+    main_file: &str,
+    ordinal: usize,
+    dump: &SidechainDump,
+    rendered_messages: &str,
+) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# plank repro {version} — sub-agent sidecar {ordinal}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "- main repro: {main_file}");
+    let _ = writeln!(out, "- label: {}", dump.label);
+    let _ = writeln!(out, "- outcome: {}", dump.outcome);
+    let _ = writeln!(out, "- forked at parent message: {}", dump.fork_at);
+    let _ = writeln!(out, "- messages: {}", dump.messages.len());
+    let _ = writeln!(
+        out,
+        "- system prompt: identical to the main repro (not repeated)"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "## Task");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "{}", dump.task);
+    let _ = writeln!(out);
+    let _ = writeln!(
+        out,
+        "## Sidechain transcript (after the shared system prompt)"
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "----- BEGIN TRANSCRIPT -----");
+    out.push_str(rendered_messages);
+    if !rendered_messages.ends_with('\n') {
+        out.push('\n');
+    }
+    let _ = writeln!(out, "----- END TRANSCRIPT -----");
+    out
+}
+
+/// The path of sidecar `ordinal` for the main dump at `main`: the main file's
+/// stem plus `.sub-<ordinal>.md`, in the same directory.
+#[must_use]
+pub fn sidecar_path(main: &Path, ordinal: usize) -> PathBuf {
+    let stem = main
+        .file_stem()
+        .map_or_else(|| "repro".to_owned(), |s| s.to_string_lossy().into_owned());
+    main.with_file_name(format!("{stem}.sub-{ordinal}.md"))
+}
+
+/// Writes sidecar `ordinal` beside `main`.
+///
+/// # Errors
+/// Returns the OS error message when the file cannot be written.
+pub fn save_sidecar(main: &Path, ordinal: usize, report: &str) -> Result<PathBuf, String> {
+    let path = sidecar_path(main, ordinal);
+    std::fs::write(&path, report).map_err(|e| e.to_string())?;
+    Ok(path)
 }
 
 /// Directory repro files are written to (`~/.plank/repro`, or `<cwd>/.plank/
@@ -185,6 +302,63 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(body, transcript);
+    }
+
+    #[test]
+    fn sidecar_sits_beside_the_main_dump_and_names_it() {
+        let dir = std::env::temp_dir().join(format!("plank-repro-side-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let main = save_in(&dir, 2000, "main").unwrap();
+        assert_eq!(sidecar_path(&main, 1), dir.join("repro-2000.sub-1.md"));
+        let msgs = vec![
+            crate::session::Message::user("task"),
+            crate::session::Message::assistant("done"),
+        ];
+        let mut dump = SidechainDump::new("reviewer", "look at x", 7, &msgs);
+        dump.outcome = "failed: interrupted".to_owned();
+        let report = build_sidecar_report("9.9.9", "repro-2000.md", 1, &dump, "[user]\ntask\n");
+        let path = save_sidecar(&main, 1, &report).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("# plank repro 9.9.9 — sub-agent sidecar 1\n"));
+        assert!(text.contains("- main repro: repro-2000.md\n"));
+        assert!(text.contains("- label: reviewer\n"));
+        assert!(text.contains("- outcome: failed: interrupted\n"));
+        assert!(text.contains("- forked at parent message: 7\n"));
+        assert!(text.contains("look at x\n"));
+        assert!(
+            text.contains(
+                "----- BEGIN TRANSCRIPT -----\n[user]\ntask\n----- END TRANSCRIPT -----\n"
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_dump_strips_images_but_keeps_text_and_timestamps() {
+        let mut m = crate::session::Message::user("<tool_result>img</tool_result>");
+        m.at = 42;
+        m.images.push(crate::engine::VisionImage {
+            path: "img.png".to_string(),
+            embedding: crate::engine::VisionEmbedding {
+                data: vec![0.0; 4],
+                token_count: 1,
+                layout: 0,
+                grid_width: 1,
+                grid_height: 1,
+                width: 8,
+                height: 8,
+                content_width: 8,
+                content_height: 8,
+                fingerprint: [1; 32],
+            },
+        });
+        let dump = SidechainDump::new("sub-agent", "t", 0, &[m]);
+        assert_eq!(dump.messages.len(), 1);
+        assert!(dump.messages[0].images.is_empty());
+        assert_eq!(dump.messages[0].at, 42);
+        assert_eq!(dump.messages[0].text, "<tool_result>img</tool_result>");
+        assert_eq!(dump.outcome, "ended");
     }
 
     #[test]

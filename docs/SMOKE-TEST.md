@@ -290,10 +290,15 @@ session outruns a ten-minute patience budget before the policy has anything to d
   The threshold itself is pinned by
   `compact::tests::reclaimable_gates_the_opportunistic_pass`, which also asserts that
   `microcompact_reclaimable` predicts exactly the bytes the pass goes on to reclaim
-- the newest three result **messages** survive (`MICROCOMPACT_KEEP_RESULTS = 3`), **and**
-  any result body of 256 bytes or less survives (`MICROCOMPACT_MIN_BYTES`), **and** every
-  tool result that follows the last `# Task list` injection survives regardless of
-  position — that suffix is the currently active work
+- the pass is budgeted and oldest-first: it clears the oldest clearable results until it
+  has reclaimed `compact::microcompact_delete_budget` tokens (at least
+  `MICROCOMPACT_DELETE_TOKENS = 16384`, or enough to fall back under the 75% pressure
+  threshold) and then stops, **and** nothing fires below `MICROCOMPACT_PRESSURE_PERCENT = 75`
+  of the window, **and** the current tool-call batch (every result after the last
+  assistant turn that precedes a result) survives, **and** any result body of 256 bytes or
+  less survives (`MICROCOMPACT_MIN_BYTES`), **and** every tool result that follows the last
+  `# Task list` injection survives regardless of position — that suffix is the currently
+  active work
 
 > **Count messages, not tool calls.** Several tool calls emitted in one assistant turn
 > come back as a *single* transcript message holding `Tool result 1 (read):`,

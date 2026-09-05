@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`/repro` writes sub-agent sidecars.** A sub-agent sidechain is truncated
+  out of the transcript the moment it ends, so the main dump could never show
+  what a sub-agent did before it was interrupted. The agent now remembers the
+  last 8 finished sidechains (serial and fan-out alike) and `/repro` writes
+  each beside the main file as `repro-<time>.sub-<n>.md`, with the sub-agent's
+  label, task, outcome (`report`, `no report`, or `failed: <error>`), the
+  parent message it forked from, and the sidechain transcript. The
+  `[repro written to …]` line names how many sidecars went along.
+- **The prefill readout shows time left.** The status bar's
+  `↑ done/total tokens · N t/s` segment appends `~<eta> left` once the rate is
+  known and tokens remain.
+
+### Changed
+
+- **`/init` runs quietly.** Tool banners, the `write` content preview and
+  tool results are suppressed during the generation turn regardless of the
+  `ui.show*` settings, so the AGENTS.md draft no longer scrolls past on its
+  way to disk. The file is still written.
+
 ## [4.1.2] - 2026-09-05
 
 ### Fixed

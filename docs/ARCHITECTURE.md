@@ -306,7 +306,9 @@ built, snapshotted to `sysprompt.kv`, and invalidated across versions.
   default, pins in place when the user wheels back (also mid-generation),
   and shows a jump-to-bottom hint until End resumes following. `draw_config`
   renders the `/config` modal overlay.
-- `status.rs` — the compact footer text and the prefill progress bar. Also owns
+- `status.rs` — the compact footer text and the prefill progress bar (whose
+  readout appends `~<eta> left` from `prefill_eta` once the rate is known and
+  tokens remain, so it never shows a bogus `~0s left`). Also owns
   the rotating status-bar tips (`TIPS`/`rotating_tip`), shown in yellow at the
   tail of the bar and advanced off the animation clock. The git diff stat
   (`+N -M`) uses `git2`'s tree-to-workdir-with-index diff. libgit2 treats
@@ -434,7 +436,12 @@ own.
 CLI parsing, trace logging (`--trace`), the SIGINT flag for interrupting
 generation, the startup banner, and `/repro` — a read-only diagnostic dump of
 the exact rendered engine input plus generation knobs, written to
-`~/.plank/repro/` for bug reports.
+`~/.plank/repro/` for bug reports. Sub-agent sidechains are truncated out of
+the transcript the moment they end, so the agent keeps the last
+`repro::SIDECHAIN_DUMPS_KEPT` finished sidechains (`repro::SidechainDump`,
+captured in `end_subagent_fork` and after a fan-out) and `/repro` writes each
+beside the main file as `repro-<secs>.sub-<n>.md`, with the sub-agent's label,
+task and outcome (`report`, `no report`, or `failed: interrupted`).
 
 ### Settings (`settings.rs`)
 Persistent user preferences, read from `~/.plank/settings.json` then
