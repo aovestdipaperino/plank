@@ -1889,6 +1889,9 @@ impl Agent<'_> {
             None => crate::engine::Prompt::Flat(prompt_text),
         };
         self.sync_engine_images();
+        // A prompt that diverges behind the live KV end would rebuild from
+        // zero; restore the deepest ladder rung below the divergence first.
+        self.rescue_prefix_before_rebuild(prompt_text);
         let stats = self
             .engine
             .generate(
@@ -5071,6 +5074,14 @@ the original is frozen and listed in /tree"
             return None;
         }
         let rung = *self.ladder.select(edit_index, 0)?;
+        self.restore_rung(rung, &format!("edit at span {edit_index}"))
+    }
+
+    /// Loads `rung`'s blob under its capture-time fingerprint and hands it to
+    /// the engine. `why` names the caller in the KV debug log. Returns the
+    /// tokens the rung covers, or `None` when the blob is stale or unloadable
+    /// (in which case the rebuild simply happens).
+    fn restore_rung(&mut self, rung: crate::kvladder::Rung, why: &str) -> Option<i32> {
         let mut prefix = self.session.clone();
         prefix.transcript.truncate(rung.spans);
         let key = crate::session::KvKey::Rung {
@@ -5083,11 +5094,51 @@ the original is frozen and listed in /tree"
         self.engine.set_kv(&cache).ok()?;
         crate::engine::kv_debug(|| {
             format!(
-                "ladder restore: rung {} (spans={} tokens={}) for edit at span {edit_index}",
+                "ladder restore: rung {} (spans={} tokens={}) for {why}",
                 rung.index, rung.spans, rung.tokens
             )
         });
         Some(rung.tokens)
+    }
+
+    /// Before a generation, rescues the prefix a full rebuild would discard.
+    ///
+    /// `ds4_session_sync` reuses the live KV only when the prompt *extends* its
+    /// live end. A prompt that diverges even one token behind it — the KV ran
+    /// ahead of the transcript, an earlier message was rewritten — is rebuilt
+    /// from token zero, which on a long session is minutes of prefill (one
+    /// recorded session re-prefilled 117k tokens with a rung at 112k sitting
+    /// unused). Here the engine is asked how the prompt lines up first; when
+    /// it reports that shape, the deepest rung below the divergence is
+    /// restored, so the sync extends from the rung and prefills only the
+    /// tail. Returns the tokens the restored rung covers.
+    ///
+    /// Never inside a sidechain: the engine there may not be the session's,
+    /// and its rungs describe a transcript about to be truncated away.
+    fn rescue_prefix_before_rebuild(&mut self, prompt_text: &str) -> Option<i32> {
+        if self.session.id.is_empty() || self.in_sidechain() {
+            return None;
+        }
+        let probe = self.engine.kv_reuse_probe(prompt_text, self.think)?;
+        if !probe.rebuilds_from_zero() {
+            return None;
+        }
+        let Some(rung) = self.ladder.select_below_tokens(probe.common).copied() else {
+            crate::engine::kv_debug(|| {
+                format!(
+                    "ladder fallback: no rung below the divergence (live={} common={}); rebuilding",
+                    probe.live, probe.common
+                )
+            });
+            return None;
+        };
+        let why = format!(
+            "rebuild avoidance (live={} common={}, rung leaves {} to prefill)",
+            probe.live,
+            probe.common,
+            probe.common - rung.tokens
+        );
+        self.restore_rung(rung, &why)
     }
 
     /// On `/switch` / `/resume`, tries to restore the session's KV payload so
@@ -14399,6 +14450,9 @@ mod tests {
         /// letting fork tests assert the capture → sidechain → restore order.
         kv_events: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
         kv_captures: u8,
+        /// Scripted answer for `kv_reuse_probe`, so a test can stage the
+        /// "prompt diverges behind the live KV end" shape without a model.
+        kv_probe: Option<crate::engine::KvReuse>,
         /// Overrides the reported context size, so tests can stand on either
         /// side of `THINK_MAX_MIN_CONTEXT`. `None` reports the usual `100_000`.
         ctx_override: Option<i32>,
@@ -14535,6 +14589,16 @@ mod tests {
                 events.lock().unwrap().push(format!("restore:{tag}"));
             }
             Ok(())
+        }
+        fn kv_reuse_probe(
+            &mut self,
+            _transcript: &str,
+            _think: ThinkMode,
+        ) -> Option<crate::engine::KvReuse> {
+            if let Some(events) = &self.kv_events {
+                events.lock().unwrap().push("probe".to_string());
+            }
+            self.kv_probe
         }
         fn ctx_size(&self) -> i32 {
             self.ctx_override.unwrap_or(100_000)
@@ -18675,6 +18739,99 @@ mod tests {
     }
 
     /// The live ladder's rungs are active by definition, like the payload: a
+    /// A `kv_engine` whose reuse probe reports the recorded rebuild shape: the
+    /// live KV ran one token past the transcript, so the prompt diverges just
+    /// behind the live end and the sync would rebuild from zero.
+    fn rebuild_probe_engine(
+        live: i32,
+        common: i32,
+    ) -> (
+        ScriptedEngine,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine = ScriptedEngine {
+            kv_probe: Some(crate::engine::KvReuse { live, common }),
+            kv_events: Some(std::sync::Arc::clone(&events)),
+            ..ScriptedEngine::default()
+        };
+        (engine, events)
+    }
+
+    /// Regression for the 117k-token rebuild in `turbo-vision-debug.log`: with
+    /// a rung captured below the divergence, the pre-generation rescue restores
+    /// it instead of letting the sync start from token zero.
+    #[test]
+    fn a_prompt_diverging_behind_the_live_end_restores_the_rung_below_it() {
+        let dir = scratch_dir("ladder-rebuild-rescue");
+        let cfg = test_cfg();
+        // Divergence one token behind a live end far deeper than any rung.
+        let (engine, events) = rebuild_probe_engine(117_369, 117_368);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        agent.session.push(Message::user("two"));
+
+        let restored = agent.rescue_prefix_before_rebuild("prompt");
+        assert_eq!(
+            restored,
+            Some(rung.tokens),
+            "the rung below the divergence is restored"
+        );
+        let events = events.lock().unwrap().clone();
+        assert_eq!(
+            events.last().map(String::as_str),
+            Some("restore:1"),
+            "the rung blob reached the engine: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The rescue never touches a KV the sync would extend anyway, nor one
+    /// where every rung sits past the divergence — restoring there would
+    /// replace a longer valid prefix with a shorter one.
+    #[test]
+    fn the_rebuild_rescue_leaves_an_extendable_or_uncovered_kv_alone() {
+        let cfg = test_cfg();
+        // Extending at the live end: `common == live`.
+        let dir = scratch_dir("ladder-rescue-extend");
+        let (engine, events) = rebuild_probe_engine(500, 500);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        agent.capture_first_rung();
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        let events = events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("restore")),
+            "no restore for an extendable KV: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Diverging behind the live end, but below every rung.
+        let dir = scratch_dir("ladder-rescue-uncovered");
+        let (engine, events) = rebuild_probe_engine(400, 1);
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("reply"));
+        agent.store.save(&mut agent.session).unwrap();
+        let rung = agent.capture_first_rung();
+        assert!(
+            rung.tokens > 1,
+            "the rung must sit past the divergence for this case"
+        );
+        assert_eq!(agent.rescue_prefix_before_rebuild("prompt"), None);
+        let events = events.lock().unwrap().clone();
+        assert!(
+            !events.iter().any(|e| e.starts_with("restore")),
+            "no rung fits below the divergence: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `/kvcache gc` under a tight budget must not take the running session's
     /// own accelerators. Their fingerprints are over the transcript truncated
     /// to each rung's depth, exactly as `restore_rung_below` looks them up.

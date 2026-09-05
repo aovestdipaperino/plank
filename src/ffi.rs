@@ -381,6 +381,12 @@ unsafe extern "C" {
     ) -> c_int;
     pub fn ds4_session_ctx(s: *mut Ds4Session) -> c_int;
     pub fn ds4_session_pos(s: *mut Ds4Session) -> c_int;
+    /// Truncates the live checkpoint to `pos` tokens. Safe right after a
+    /// speculative block, whose tokens are still inside the raw window: it is
+    /// what the C agent does when a stop token lands mid-block
+    /// (`ds4_agent.c`, `ds4_session_rewind(w->session, block_start + ti)`),
+    /// so the KV never runs ahead of the transcript.
+    pub fn ds4_session_rewind(s: *mut Ds4Session, pos: c_int);
     pub fn ds4_session_common_prefix(s: *mut Ds4Session, prompt: *const Ds4Tokens) -> c_int;
     pub fn ds4_session_save_snapshot(
         s: *mut Ds4Session,

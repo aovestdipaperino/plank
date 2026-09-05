@@ -36,6 +36,22 @@ use crate::snapshot::{RestoreOnDrop, SessionSnapshot};
 /// is the ceiling the entry point itself is written against.
 const SPEC_ACCEPT_CAP: usize = 17;
 
+/// Where the live KV must be rewound to after a speculative block, or `None`
+/// when the block was consumed whole.
+///
+/// The engine commits all `committed` accepted tokens starting at
+/// `block_start`; the generate loop keeps only the `kept` tokens before a stop
+/// token or the token budget. Any committed token it did not keep is not in the
+/// transcript, so leaving it in the KV makes the next prompt diverge *behind*
+/// the live end and `ds4_session_sync` rebuilds from zero. Mirrors the C agent's
+/// `ds4_session_rewind(w->session, block_start + ti)`.
+fn spec_block_rewind_target(block_start: i32, committed: i32, kept: i32) -> Option<i32> {
+    if committed <= 0 || kept < 0 || kept >= committed {
+        return None;
+    }
+    Some(block_start.saturating_add(kept))
+}
+
 /// The immutable, shareable half of the ds4 engine: weights, tokenizer, and the
 /// Metal command queue. Cheap to share read-only, expensive to build, so it
 /// lives behind an `Arc` (design §3, §4). Frees the engine on drop; the last
@@ -1163,6 +1179,23 @@ impl Engine for Ds4Session {
         true
     }
 
+    /// Same tokens `generate` builds (the reconcile is idempotent for an
+    /// unchanged transcript, so calling both in a row costs one extra
+    /// tokenization and changes nothing), probed against the live checkpoint.
+    fn kv_reuse_probe(
+        &mut self,
+        transcript: &str,
+        think: ThinkMode,
+    ) -> Option<crate::engine::KvReuse> {
+        let tokens = self.build_prompt(transcript, think);
+        let session = self.ensure_session().ok()?;
+        // SAFETY: session and tokens are valid.
+        let common = unsafe { ffi::ds4_session_common_prefix(session, tokens.as_ptr()) };
+        // SAFETY: session valid.
+        let live = unsafe { ffi::ds4_session_pos(session) };
+        Some(crate::engine::KvReuse { live, common })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn generate(
         &mut self,
@@ -1354,6 +1387,13 @@ impl Engine for Ds4Session {
             if speculative {
                 let mut accepted = [0_i32; SPEC_ACCEPT_CAP];
                 let cap = i32::try_from(accepted.len()).unwrap_or(i32::MAX);
+                // Where this block starts in the live KV. The C commits every
+                // accepted token, EOS included, so whatever the walk below
+                // drops must be rewound, or the KV ends one token past the
+                // transcript and the next turn rebuilds from zero (a recorded
+                // session re-prefilled 117k tokens this way).
+                // SAFETY: session valid.
+                let block_start = unsafe { ffi::ds4_session_pos(session) };
                 // SAFETY: session valid; `accepted` is a valid out-buffer of
                 // `cap` ints; err buffer valid.
                 let n = unsafe {
@@ -1387,6 +1427,7 @@ impl Engine for Ds4Session {
                 spec.drafted = spec.drafted.saturating_add(draft_block);
                 on_event(EngineEvent::Spec(spec));
                 let mut hit_eos = false;
+                let mut kept: i32 = 0;
                 for &t in run {
                     if t == eos {
                         hit_eos = true;
@@ -1394,6 +1435,7 @@ impl Engine for Ds4Session {
                     }
                     let text = utf8.push(self.model.token_bytes(t));
                     reply_tokens.push(t);
+                    kept += 1;
                     // Feeds the status bar's expert-routing glyph; see `crate::experts`.
                     crate::status::note_routed_token(t);
                     if !text.is_empty() {
@@ -1404,6 +1446,12 @@ impl Engine for Ds4Session {
                     if generated >= max_tokens {
                         break;
                     }
+                }
+                if let Some(pos) = spec_block_rewind_target(block_start, n, kept) {
+                    // SAFETY: session valid; `pos` lies inside the block the
+                    // engine just committed, so the dropped tokens are still
+                    // in the raw window — the same call the C agent makes.
+                    unsafe { ffi::ds4_session_rewind(session, pos) };
                 }
                 if hit_eos {
                     break;
@@ -2426,7 +2474,31 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sections, strip_legacy};
+    use super::{parse_sections, spec_block_rewind_target, strip_legacy};
+
+    /// Regression for the recorded 117k-token rebuild: a speculative block
+    /// whose accepted run ends in EOS leaves the KV one token past the
+    /// transcript unless the loop rewinds to the tokens it actually kept.
+    #[test]
+    fn spec_block_rewind_drops_only_the_tokens_the_loop_did_not_keep() {
+        // Block of 4 committed at 117365; EOS was the 4th, so 3 were kept:
+        // the KV must end at 117368, not 117369.
+        assert_eq!(spec_block_rewind_target(117_365, 4, 3), Some(117_368));
+        // EOS as the very first accepted token: rewind to the block start.
+        assert_eq!(spec_block_rewind_target(100, 1, 0), Some(100));
+        // Token budget cut the walk short mid-block: same rule.
+        assert_eq!(spec_block_rewind_target(100, 5, 2), Some(102));
+    }
+
+    #[test]
+    fn spec_block_rewind_is_a_no_op_when_the_whole_block_was_kept() {
+        assert_eq!(spec_block_rewind_target(100, 5, 5), None);
+        assert_eq!(spec_block_rewind_target(100, 1, 1), None);
+        // Nothing committed (the caller breaks before reaching here anyway).
+        assert_eq!(spec_block_rewind_target(100, 0, 0), None);
+        // Defensive: a kept count past the block never rewinds forward.
+        assert_eq!(spec_block_rewind_target(100, 3, 7), None);
+    }
 
     #[test]
     fn strip_legacy_skips_replies_header_to_kv() {

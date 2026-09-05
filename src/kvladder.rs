@@ -126,6 +126,22 @@ impl KvLadder {
             .rev()
             .find(|r| r.spans <= max_spans && r.tokens > already_reused)
     }
+
+    /// The deepest rung whose covered tokens fit inside a prompt prefix of
+    /// `max_tokens` that is known to still match the live checkpoint.
+    ///
+    /// The rebuild fallback's selector: [`Self::select`] keys on a transcript
+    /// span index because an in-place edit is known by the message it hits,
+    /// but a prompt that diverges behind the live KV end is known only by the
+    /// token at which it diverges. A rung strictly below that token is a
+    /// prefix of the prompt as well as of the KV, so the engine can extend it.
+    #[must_use]
+    pub fn select_below_tokens(&self, max_tokens: i32) -> Option<&Rung> {
+        self.rungs
+            .iter()
+            .rev()
+            .find(|r| r.tokens > 0 && r.tokens <= max_tokens)
+    }
 }
 
 #[cfg(test)]
@@ -145,6 +161,34 @@ mod tests {
         // An edit *before* the rung is not covered by it at all: the spacing
         // rule must not suppress the only anchor that could ever help.
         assert!(l.wants_anchor(4, 100));
+    }
+
+    /// The rebuild fallback picks by token depth: the deepest rung that still
+    /// fits under the token where the prompt diverges from the live KV.
+    #[test]
+    fn select_below_tokens_takes_the_deepest_rung_under_the_divergence() {
+        let mut l = KvLadder::new();
+        l.push(3, 13_351);
+        l.push(11, 32_131);
+        l.push(35, 112_042);
+        // The recorded session: divergence at 117_368 with a rung at 112_042.
+        assert_eq!(
+            l.select_below_tokens(117_368).map(|r| r.tokens),
+            Some(112_042)
+        );
+        // A divergence inside the deepest rung falls back to the one below it.
+        assert_eq!(
+            l.select_below_tokens(100_000).map(|r| r.tokens),
+            Some(32_131)
+        );
+        // Exactly at a rung's depth is usable: the sync extends from its end.
+        assert_eq!(
+            l.select_below_tokens(13_351).map(|r| r.tokens),
+            Some(13_351)
+        );
+        // Nothing shallow enough.
+        assert_eq!(l.select_below_tokens(13_350), None);
+        assert_eq!(KvLadder::new().select_below_tokens(1_000_000), None);
     }
 
     #[test]

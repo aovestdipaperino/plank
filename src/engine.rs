@@ -311,6 +311,28 @@ pub fn reusable_prefix(pos: i32, common: i32) -> i32 {
     if pos > 0 && common == pos { pos } else { 0 }
 }
 
+/// What a local engine's live KV would do with the next prompt, as reported by
+/// [`Engine::kv_reuse_probe`] before the generation is issued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvReuse {
+    /// Tokens in the live checkpoint (`ds4_session_pos`).
+    pub live: i32,
+    /// Leading prompt tokens that match the live checkpoint
+    /// (`ds4_session_common_prefix`).
+    pub common: i32,
+}
+
+impl KvReuse {
+    /// True when the prompt diverges *behind* the live end, so the engine's
+    /// sync would rebuild from token zero (see [`reusable_prefix`]) even though
+    /// the first `common` tokens are still a valid prefix. This is the case a
+    /// ladder rung below `common` can rescue.
+    #[must_use]
+    pub fn rebuilds_from_zero(self) -> bool {
+        self.common > 0 && reusable_prefix(self.live, self.common) == 0
+    }
+}
+
 /// Appends a line to the file named by `PLANK_KV_DEBUG`, if set.
 ///
 /// KV prefix reuse is the one part of the engine whose failures are silent and
@@ -709,6 +731,18 @@ pub trait Engine: Debug + Send {
     /// `false`, so the agent keeps passing `Prompt::Flat` and byte parity holds.
     fn wants_structured(&self) -> bool {
         false
+    }
+
+    /// Reports how the live KV lines up with the prompt the next `generate`
+    /// call will build from `transcript`, without generating anything.
+    ///
+    /// The agent uses it to catch a prompt that diverges *behind* the live end
+    /// — the one shape `ds4_session_sync` cannot extend and instead rebuilds
+    /// from zero — and to restore a ladder rung below the divergence first, so
+    /// the rebuild prefills only the genuine remainder. Engines that hold no
+    /// local KV return `None` and the agent does nothing.
+    fn kv_reuse_probe(&mut self, _transcript: &str, _think: ThinkMode) -> Option<KvReuse> {
+        None
     }
 
     /// Sets the reasoning level for every prompt built from now on.
