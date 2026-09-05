@@ -113,6 +113,33 @@ static CONTROL_PORT: AtomicU16 = AtomicU16::new(if cfg!(test) {
     turbo_debug_client::CONTROL_PORT
 });
 
+/// The thread that installed a stand-in console via
+/// [`test_support::use_console`]. The suite runs tests in parallel while this
+/// module's registries are process-wide, so without this scoping a test
+/// holding a fake console would collect every *other* test's dials and
+/// mirrored bytes: `settings::install_for_test` reconciles, and any test that
+/// streams a generation pushes into whatever sits at
+/// [`MirrorId::PARENT`]. Tests that touch this state serialize on
+/// `test_support::TEST_LOCK`, so at most one owner is ever set.
+#[cfg(test)]
+static TEST_OWNER: Mutex<Option<std::thread::ThreadId>> = Mutex::new(None);
+
+/// Whether this thread may talk to the stand-in console. Always true in
+/// production and whenever no test has claimed one.
+#[cfg(test)]
+fn console_owned_by_this_thread() -> bool {
+    let owner = *TEST_OWNER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    owner.is_none_or(|t| t == std::thread::current().id())
+}
+
+/// Whether this thread may talk to the console: always, outside tests.
+#[cfg(not(test))]
+fn console_owned_by_this_thread() -> bool {
+    true
+}
+
 /// The session name to hand the console at the next connection, kept as
 /// `Option` so "no session minted yet" is distinguishable from "named the
 /// empty string" — the former falls back to [`FALLBACK_NAME`], deliberately,
@@ -300,6 +327,9 @@ pub fn reconcile() -> Reconciled {
 /// point `CONTROL_PORT` at their own `fake_console` listener, which holds no
 /// such lock, so any non-default port skips the marker and dials directly.
 fn console_port() -> Option<u16> {
+    if !console_owned_by_this_thread() {
+        return None;
+    }
     let port = CONTROL_PORT.load(Ordering::Relaxed);
     let marker_applies = port == turbo_debug_client::CONTROL_PORT;
     (!marker_applies || turbo_debug_client::is_console_running()).then_some(port)
@@ -356,6 +386,9 @@ pub fn is_connected(id: MirrorId) -> bool {
 /// [`push`] to a specific window, ignoring the thread's routing. Used by the
 /// backfill, which writes to windows it did not open on this thread.
 pub fn push_to(id: MirrorId, text: &str) {
+    if !console_owned_by_this_thread() {
+        return;
+    }
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -368,6 +401,9 @@ pub fn push_to(id: MirrorId, text: &str) {
 
 /// [`flush`] for a specific window.
 pub fn flush_to(id: MirrorId) {
+    if !console_owned_by_this_thread() {
+        return;
+    }
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -561,6 +597,24 @@ pub fn open_subagent() -> SubagentMirror {
     SubagentMirror { id }
 }
 
+/// Opens the window of an already-finished sub-agent under its original
+/// name, writes `payload`, and closes the socket again. Single attempt like
+/// everything else here; the sub-agent is gone, so there is nothing to keep
+/// the connection for.
+pub fn replay_finished_subagent(ordinal: usize, payload: &str) {
+    if crate::settings::active().ui.show_thinking {
+        return;
+    }
+    let Some(port) = console_port() else {
+        return;
+    };
+    let name = subagent_name(&raw_session_name(), ordinal);
+    if let Ok(mut stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &name) {
+        let _ = stream.write_all(payload.as_bytes());
+        let _ = stream.flush();
+    }
+}
+
 /// The current routing target. Production callers use this to know which
 /// window a thread is presently routed to (e.g. to backfill it explicitly via
 /// [`push_to`]/[`flush_to`] rather than relying on thread-local routing).
@@ -584,19 +638,37 @@ pub(crate) mod test_support {
     pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
 
     /// Takes the serialization lock shared by every test that touches this
-    /// module's process-wide state. Not yet called from this crate — kept for
-    /// `ui.rs`'s upcoming backfill tests, which need the same lock.
-    #[allow(dead_code)]
-    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// module's process-wide state: `ui.rs`'s backfill tests hold it too.
+    /// Releasing it also drops any stand-in console the test claimed, so a
+    /// panicking test cannot leave the next one talking to a dead listener.
+    pub fn lock() -> ConsoleTestGuard {
+        ConsoleTestGuard(
+            TEST_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
     }
 
-    /// Points `reconcile` at a listener; 0 means nothing listens. Not yet
-    /// called from this crate — kept for `ui.rs`'s upcoming backfill tests.
-    #[allow(dead_code)]
+    /// See [`lock`].
+    pub struct ConsoleTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for ConsoleTestGuard {
+        fn drop(&mut self) {
+            CONTROL_PORT.store(0, Ordering::Relaxed);
+            *TEST_OWNER
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Points `reconcile` at a listener; 0 means nothing listens. The calling
+    /// thread claims it, so tests running in parallel neither dial it nor
+    /// write into its windows (see `TEST_OWNER`).
     pub fn use_console(port: u16) {
+        *TEST_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (port != 0).then(|| std::thread::current().id());
         CONTROL_PORT.store(port, Ordering::Relaxed);
     }
 
@@ -607,6 +679,9 @@ pub(crate) mod test_support {
         NEXT_ORDINAL.store(1, Ordering::Relaxed);
         CURRENT.with(|c| c.set(MirrorId::PARENT));
         CONTROL_PORT.store(0, Ordering::Relaxed);
+        *TEST_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 
     /// Reads whatever plank has written so far (non-blocking after a short

@@ -1174,6 +1174,26 @@ fn generate_fanout_round(
         let mut chunk: Vec<Option<Result<QuietPass, String>>> =
             (0..slot_chunk.len()).map(|_| None).collect();
         let mut texts: Vec<(usize, String)> = Vec::new();
+        // A console that appeared mid-fan-out: each slot's window is dialed by
+        // reconcile and gets the slot's own passes so far. The parent window is
+        // backfilled by the parent's own next pass (this function has no
+        // `Agent`), and a slot is short-lived, so its mark is always zero.
+        let reconciled = crate::debugmirror::reconcile();
+        for slot in slot_chunk.iter() {
+            if reconciled.subagents_new.contains(&slot.mirror.id()) {
+                let texts: Vec<&str> = slot
+                    .session
+                    .transcript
+                    .iter()
+                    .filter(|m| m.role == crate::session::Role::Assistant)
+                    .map(|m| m.text.as_str())
+                    .collect();
+                if let Some(p) = crate::debugmirror::backfill_payload(texts, !ctx.think_off) {
+                    crate::debugmirror::push_to(slot.mirror.id(), &p);
+                    crate::debugmirror::flush_to(slot.mirror.id());
+                }
+            }
+        }
         std::thread::scope(|scope| {
             let mut handles = Vec::new();
             for (i, (slot, prep)) in slot_chunk.iter_mut().zip(prep_chunk.iter()).enumerate() {
@@ -1664,6 +1684,17 @@ struct Agent<'a> {
     /// token zero. `None` entries are engines without KV support (Echo),
     /// where the restore no-ops.
     fork_kv: Vec<Option<crate::kvcache::KVCache>>,
+    /// Transcript index of each open sub-agent fork, innermost last, parallel
+    /// to `fork_kv`. The console backfill needs the boundary: the parent window
+    /// gets the slice before the outermost fork, the live sub-agent's window
+    /// the slice after the innermost one.
+    fork_points: Vec<usize>,
+    /// Transcript length up to which the parent console window has already
+    /// received the assistant stream, live or by backfill. Only messages past
+    /// this mark are replayed to a window that connects late, so a
+    /// `showThinking` flip or a console restart never repeats what the console
+    /// already showed. Reset with the session; clamped by rollback.
+    console_seen: usize,
     /// The last few finished sub-agent sidechains, newest last, for the
     /// `/repro` sidecars: a sidechain is truncated out of the transcript the
     /// moment it ends, so without this the main dump could never show what a
@@ -2052,8 +2083,10 @@ impl Agent<'_> {
         // Defensive retry point: picks up a console that started after plank
         // did, or a setting change that raced this turn's start. A settings
         // change itself already reconciles immediately (`settings::reinstall`),
-        // so this is a cheap no-op in the common case.
-        crate::debugmirror::reconcile();
+        // so this is a cheap no-op in the common case. Whatever it newly
+        // dialed gets the session so far before this pass's live bytes.
+        let reconciled = crate::debugmirror::reconcile();
+        self.backfill_console(&reconciled);
         // With thinking enabled, the *local* chat template opens `<think>` in
         // the prefill prefix, so generation streams thinking content first
         // without a leading tag; start the renderer inside the think block so it
@@ -2653,6 +2686,10 @@ impl Agent<'_> {
         prompt_text: &str,
         _turn_start: Instant,
     ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
+        // A console that appeared since the last pass: pick it up here too, so
+        // a sub-agent's window is backfilled with its own slice.
+        let reconciled = crate::debugmirror::reconcile();
+        self.backfill_console(&reconciled);
         let sink = self.sub_sink_render_sink();
         let bufs = self
             .engine
@@ -2899,6 +2936,9 @@ impl Agent<'_> {
                 finished.ended_in_think && turn_continues,
             );
             self.session.push(Message::assistant(assistant_text));
+            // Streamed live to the parent window, so the console has seen it:
+            // it must not be replayed to a window that connects later.
+            self.note_pass_mirrored();
             self.payload_dirty = true;
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
@@ -4212,6 +4252,8 @@ impl Agent<'_> {
         // `new_agent` mints one at launch (see `SessionStore::mint_id`).
         self.session.id = self.store.mint_id();
         crate::debugmirror::set_session_id(&self.session.id);
+        // A new session name is a new console window: nothing has been shown there yet.
+        self.console_seen = 0;
         self.broadcast_session_reset(None);
         self.reminder = SystemPromptReminder::new();
         // Same merged roster the launch path advertises, so /clear
@@ -4936,6 +4978,8 @@ impl Agent<'_> {
         self.discard_ladder();
         self.session = session;
         crate::debugmirror::set_session_id(&self.session.id);
+        // A new session name is a new console window: nothing has been shown there yet.
+        self.console_seen = 0;
         self.last_ctx_used = 0;
         if let Some(note) = note {
             println!("{note}");
@@ -5068,6 +5112,7 @@ impl Agent<'_> {
         self.discard_ladder();
         self.payload_dirty = true;
         crate::checkpoint::restore_transcript(&mut self.session, &cp);
+        self.console_seen = self.console_seen.min(self.session.transcript.len());
         self.last_ctx_used = 0;
         let note = match &cp.kv {
             Some(cache) if self.engine.set_kv(cache).is_ok() => {
@@ -5731,6 +5776,8 @@ the original is frozen and listed in /tree"
         self.discard_ladder();
         self.session = s;
         crate::debugmirror::set_session_id(&self.session.id);
+        // A new session name is a new console window: nothing has been shown there yet.
+        self.console_seen = 0;
         self.broadcast_session_reset(Some(
             "[session replaced — its history is on the local screen only]",
         ));
@@ -6459,6 +6506,8 @@ the original is frozen and listed in /tree"
         self.discard_ladder();
         name.clone_into(&mut self.session.id);
         crate::debugmirror::set_session_id(&self.session.id);
+        // A new session name is a new console window: nothing has been shown there yet.
+        self.console_seen = 0;
         self.session.dirty = true;
         let mut msg = format!("renamed to {name}");
         if self.store.path_for_id(&old).exists() {
@@ -6976,6 +7025,7 @@ the original is frozen and listed in /tree"
             None
         });
         self.sidechain_depth += 1;
+        self.fork_points.push(fork_at);
         self.session.push(Message::user(crate::agents::task_message(
             instructions,
             task,
@@ -7015,8 +7065,88 @@ the original is frozen and listed in /tree"
         self.session.transcript.truncate(fork_at);
         self.truncate_ladder_to(fork_at);
         self.sidechain_depth = self.sidechain_depth.saturating_sub(1);
+        self.fork_points.pop();
+        // The sidechain's tail is gone from the transcript, so the parent
+        // window's mark must not point past the truncation.
+        self.console_seen = self.console_seen.min(fork_at);
         self.restore_fork_kv();
         report
+    }
+
+    /// Whether replayed passes need the `<think>` open re-injected: the same
+    /// guard `stream_generation` uses before calling `debugmirror::begin_in_think`.
+    fn console_reinjects_think(&self) -> bool {
+        !matches!(self.think, crate::engine::ThinkMode::Off) && !self.engine.wants_structured()
+    }
+
+    /// Records that the pass just finished was mirrored live to the parent
+    /// window, moving the backfill mark to the end of the transcript. Call at
+    /// the end of a parent-window pass, after the assistant message is pushed.
+    /// Inside a sidechain the mark is left alone: the tail belongs to the
+    /// sub-agent's window and is truncated out when the fork ends.
+    fn note_pass_mirrored(&mut self) {
+        if !self.in_sidechain() && crate::debugmirror::parent_connected() {
+            self.console_seen = self.session.transcript.len();
+        }
+    }
+
+    /// Backfills every window `reconcile` just connected: the parent window
+    /// with the assistant passes past `console_seen` (up to the outermost fork
+    /// while a sidechain is live), the innermost live sub-agent window with
+    /// its own slice, and, on a fresh parent dial, every finished sidechain in
+    /// the `/repro` ring whose window never connected.
+    fn backfill_console(&mut self, r: &crate::debugmirror::Reconciled) {
+        use crate::session::Role;
+        let reinject = self.console_reinjects_think();
+        let assistant_texts = |msgs: &[Message]| -> Vec<String> {
+            msgs.iter()
+                .filter(|m| m.role == Role::Assistant)
+                .map(|m| m.text.clone())
+                .collect()
+        };
+        if r.parent_new {
+            let limit = self
+                .fork_points
+                .first()
+                .copied()
+                .unwrap_or(self.session.transcript.len());
+            if self.console_seen < limit {
+                let texts = assistant_texts(&self.session.transcript[self.console_seen..limit]);
+                if let Some(p) =
+                    crate::debugmirror::backfill_payload(texts.iter().map(String::as_str), reinject)
+                {
+                    crate::debugmirror::push_to(crate::debugmirror::MirrorId::PARENT, &p);
+                    crate::debugmirror::flush_to(crate::debugmirror::MirrorId::PARENT);
+                }
+                self.console_seen = limit;
+            }
+            for dump in self.sidechain_dumps.iter_mut().filter(|d| !d.mirrored) {
+                if dump.ordinal != 0 {
+                    let texts = assistant_texts(&dump.messages);
+                    if let Some(p) = crate::debugmirror::backfill_payload(
+                        texts.iter().map(String::as_str),
+                        reinject,
+                    ) {
+                        crate::debugmirror::replay_finished_subagent(dump.ordinal, &p);
+                    }
+                }
+                dump.mirrored = true;
+            }
+        }
+        // Only the innermost live sidechain streams right now; its window is
+        // the current thread's routing target.
+        if let Some(&fork_at) = self.fork_points.last() {
+            let live = crate::debugmirror::current_id();
+            if r.subagents_new.contains(&live) {
+                let texts = assistant_texts(&self.session.transcript[fork_at..]);
+                if let Some(p) =
+                    crate::debugmirror::backfill_payload(texts.iter().map(String::as_str), reinject)
+                {
+                    crate::debugmirror::push_to(live, &p);
+                    crate::debugmirror::flush_to(live);
+                }
+            }
+        }
     }
 
     /// Keeps a finished sidechain for the `/repro` sidecars, dropping the
@@ -10737,6 +10867,9 @@ impl Agent<'_> {
             let turn_continues = !out.interrupted && (!out.calls.is_empty() || out.error.is_some());
             close_open_think(&mut assistant_text, out.ended_in_think && turn_continues);
             self.session.push(Message::assistant(assistant_text));
+            // Streamed live to the parent window, so the console has seen it:
+            // it must not be replayed to a window that connects later.
+            self.note_pass_mirrored();
             self.payload_dirty = true;
             let _ = tx.send(UiEvent::EndLine);
             // The looping text is in the transcript now: dump it before the
@@ -11039,8 +11172,10 @@ impl Agent<'_> {
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);
         // See the matching comment in `stream_generation`: a defensive retry
-        // point, cheap when already reconciled.
-        crate::debugmirror::reconcile();
+        // point, cheap when already reconciled, and the backfill for whatever
+        // it newly dialed.
+        let reconciled = crate::debugmirror::reconcile();
+        self.backfill_console(&reconciled);
         // Local engines open `<think>` implicitly in the prefill; provider
         // engines emit explicit tags, so only pre-open for local ones (see the
         // matching note in the plain-REPL path).
@@ -13639,6 +13774,8 @@ fn new_agent(
         session_start: std::time::Instant::now(),
         sub_sink: SubSinkTarget::default(),
         fork_kv: Vec::new(),
+        fork_points: Vec::new(),
+        console_seen: 0,
         sidechain_dumps: std::collections::VecDeque::new(),
         // A local engine handed in alongside a provider main agent lives in the
         // same cache as any other alternate: `provider: local` definitions take
@@ -15389,6 +15526,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -17664,6 +17803,193 @@ mod tests {
         assert!(live.output("/context-ish").is_none());
     }
 
+    /// A console that connects after two turns receives exactly those two
+    /// passes, framed, before the third turn's live bytes.
+    #[test]
+    fn a_late_console_is_backfilled_with_the_earlier_passes_once() {
+        use crate::debugmirror::test_support as dm;
+        let _g = crate::debugmirror::test_support::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("console-backfill");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("first answer"));
+        agent.session.push(Message::user("two"));
+        agent.session.push(Message::assistant("second answer"));
+
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        let r = crate::debugmirror::reconcile();
+        agent.backfill_console(&r);
+        let (_hello, mut sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let got = dm::read_available(&mut sock);
+        assert!(
+            got.contains("_plank backfill: 2 earlier passes_"),
+            "{got:?}"
+        );
+        assert!(got.contains("first answer\nsecond answer\n"), "{got:?}");
+        assert!(got.ends_with("_live from here_\n\n"), "{got:?}");
+        assert_eq!(agent.console_seen, 4);
+
+        // Nothing new: a second reconcile replays nothing.
+        let r = crate::debugmirror::reconcile();
+        agent.backfill_console(&r);
+        assert_eq!(dm::read_available(&mut sock), "");
+        dm::reset();
+    }
+
+    /// A showThinking off-on-off flip reconnects, but the passes were already
+    /// mirrored live, so nothing is replayed.
+    #[test]
+    fn a_toggle_flip_does_not_replay_passes_the_console_already_saw() {
+        use crate::debugmirror::test_support as dm;
+        let _g = dm::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("console-toggle");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        let r = crate::debugmirror::reconcile();
+        agent.backfill_console(&r);
+        let (_hello, mut sock) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            dm::read_available(&mut sock),
+            "",
+            "empty transcript: no backfill"
+        );
+
+        // A pass mirrored live, then the mark advances.
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("first answer"));
+        agent.note_pass_mirrored();
+        assert_eq!(agent.console_seen, 2);
+
+        // Flip: on drops the socket, off re-dials.
+        let mut on = crate::settings::Settings::default();
+        on.ui.show_thinking = true;
+        crate::settings::install_for_test(on);
+        crate::debugmirror::reconcile();
+        let mut off = crate::settings::Settings::default();
+        off.ui.show_thinking = false;
+        crate::settings::install_for_test(off);
+        let r = crate::debugmirror::reconcile();
+        assert!(r.parent_new);
+        agent.backfill_console(&r);
+        let (_hello, mut sock2) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            dm::read_available(&mut sock2),
+            "",
+            "already seen: nothing replayed"
+        );
+        dm::reset();
+    }
+
+    /// A finished sidechain whose window never connected is reopened under
+    /// its original name and replayed; one that was mirrored live is not.
+    #[test]
+    fn finished_subagents_are_replayed_under_their_original_window_names() {
+        use crate::debugmirror::test_support as dm;
+        let _g = dm::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("console-subdumps");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = "bouncy-phelps".to_owned();
+        crate::debugmirror::set_session_id("bouncy-phelps");
+        let unseen = crate::repro::SidechainDump::new(
+            "reviewer",
+            "look",
+            0,
+            &[Message::user("task"), Message::assistant("sub answer")],
+            2,
+            false,
+        );
+        let seen = crate::repro::SidechainDump::new(
+            "tester",
+            "run",
+            0,
+            &[Message::user("task"), Message::assistant("other answer")],
+            1,
+            true,
+        );
+        agent.remember_sidechain(seen);
+        agent.remember_sidechain(unseen);
+
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        let r = crate::debugmirror::reconcile();
+        agent.backfill_console(&r);
+
+        let (_parent_hello, _parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (hello, mut sub) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        assert!(
+            hello.contains("plank:bouncy-phelps:subagent-2"),
+            "{hello:?}"
+        );
+        let got = dm::read_available(&mut sub);
+        assert!(got.contains("sub answer\n"), "{got:?}");
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "the already-mirrored dump must not open a window"
+        );
+        assert!(agent.sidechain_dumps.iter().all(|d| d.mirrored));
+        dm::reset();
+    }
+
+    /// A console arriving inside a live sidechain: the parent window gets the
+    /// pre-fork slice, the sub-agent window the post-fork slice.
+    #[test]
+    fn a_live_sidechain_splits_the_backfill_at_the_fork_point() {
+        use crate::debugmirror::test_support as dm;
+        let _g = dm::lock();
+        dm::reset();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("console-live-sidechain");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.push(Message::user("one"));
+        agent.session.push(Message::assistant("parent answer"));
+        let fork_at = agent.begin_subagent_fork(None, "delegated", false);
+        assert_eq!(agent.fork_points, vec![fork_at]);
+        agent.session.push(Message::assistant("child answer"));
+        let mirror = crate::debugmirror::open_subagent();
+        let _active = mirror.activate();
+
+        let (port, rx) = dm::fake_console_keeping_sockets();
+        dm::use_console(port);
+        let r = crate::debugmirror::reconcile();
+        assert_eq!(r.subagents_new, vec![mirror.id()]);
+        agent.backfill_console(&r);
+
+        let (_h, mut parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let (_h, mut child) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let p = dm::read_available(&mut parent);
+        let c = dm::read_available(&mut child);
+        assert!(
+            p.contains("parent answer") && !p.contains("child answer"),
+            "{p:?}"
+        );
+        assert!(
+            c.contains("child answer") && !c.contains("parent answer"),
+            "{c:?}"
+        );
+        assert_eq!(agent.console_seen, fork_at);
+        dm::reset();
+    }
     #[test]
     fn replay_history_renders_markdown_and_thinking_not_plain() {
         // showThinking now defaults off; opt this thread in explicitly since
@@ -18749,6 +19075,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -18859,6 +19187,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -19968,6 +20298,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -20158,6 +20490,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -20253,6 +20587,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -20335,6 +20671,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -20440,6 +20778,8 @@ mod tests {
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22015,6 +22355,8 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22139,6 +22481,8 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22297,6 +22641,8 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
@@ -22377,6 +22723,8 @@ or the user's next message aborts before its first token"
             session_start: std::time::Instant::now(),
             sub_sink: SubSinkTarget::default(),
             fork_kv: Vec::new(),
+            fork_points: Vec::new(),
+            console_seen: 0,
             sidechain_dumps: std::collections::VecDeque::new(),
             alt_engines: std::collections::HashMap::new(),
             local_alt_warmed: false,
