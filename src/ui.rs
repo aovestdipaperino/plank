@@ -20924,7 +20924,7 @@ mod tests {
             let _active = sub.activate();
         }
         assert_eq!(
-            crate::debugmirror::current_for_test(),
+            crate::debugmirror::current_id(),
             crate::debugmirror::MirrorId::PARENT
         );
     }

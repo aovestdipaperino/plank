@@ -49,6 +49,12 @@ impl MirrorId {
     /// The main session's window — the thread-local default, so every
     /// pre-existing `push` call site keeps writing to it untouched.
     pub const PARENT: MirrorId = MirrorId(0);
+
+    /// The sub-agent ordinal this id was minted from (0 for the parent).
+    #[must_use]
+    pub fn ordinal(self) -> usize {
+        self.0
+    }
 }
 
 /// Every live console connection. Was a single `Option<TcpStream>`: one
@@ -59,6 +65,23 @@ impl MirrorId {
 // `HashMap::new` is not const (it seeds a `RandomState`), which would force a
 // `LazyLock` for a map that never holds more than a handful of entries.
 static MIRRORS: Mutex<BTreeMap<MirrorId, TcpStream>> = Mutex::new(BTreeMap::new());
+
+/// Every sub-agent window currently *open* (its `SubagentMirror` alive),
+/// connected or not, with the wire name it was opened under. `reconcile`
+/// dials the ones missing from `MIRRORS`, which is how a console that starts
+/// while a sub-agent is running gets that sub-agent's window.
+static LIVE: Mutex<BTreeMap<MirrorId, String>> = Mutex::new(BTreeMap::new());
+
+/// What one [`reconcile`] call newly connected. The agent backfills exactly
+/// these windows: a connection that already existed has been receiving the
+/// live stream all along.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Reconciled {
+    /// The parent window was dialed by this call.
+    pub parent_new: bool,
+    /// Live sub-agent windows dialed by this call.
+    pub subagents_new: Vec<MirrorId>,
+}
 
 thread_local! {
     /// Which connection this thread's [`push`] writes to. Defaults to the
@@ -140,6 +163,9 @@ pub fn set_session_id(id: &str) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clear();
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
     NEXT_ORDINAL.store(1, Ordering::Relaxed);
     reconcile();
 }
@@ -218,7 +244,8 @@ fn raw_session_name() -> String {
 /// `stream_generation` / `worker_generate_kind` in `ui.rs`) rather than an
 /// oversight: swapping a renderer's mode mid-stream would risk splitting a
 /// `<think>` block across two display modes.
-pub fn reconcile() {
+/// Returns what it newly connected so the caller can backfill those windows.
+pub fn reconcile() -> Reconciled {
     let want_mirror = !crate::settings::active().ui.show_thinking;
     let mut reg = MIRRORS
         .lock()
@@ -229,20 +256,40 @@ pub fn reconcile() {
         // sub-agent outliving the toggle would keep a window alive that the
         // user just asked to stop seeing.
         reg.clear();
-        return;
+        return Reconciled::default();
     }
-    if reg.contains_key(&MirrorId::PARENT) {
-        return; // Already connected; nothing to reconcile.
-    }
+    let mut out = Reconciled::default();
     // Best-effort, single attempt. No console running is the overwhelmingly
     // common case and must be silent and cheap: this is optional dev tooling,
     // not a required dependency.
     let Some(port) = console_port() else {
-        return;
+        return out;
     };
-    if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, &session_name()) {
-        reg.insert(MirrorId::PARENT, stream);
+    if let std::collections::btree_map::Entry::Vacant(e) = reg.entry(MirrorId::PARENT) {
+        if let Ok(stream) =
+            turbo_debug_client::connect_on(port, StreamKind::Tokens, &session_name())
+        {
+            e.insert(stream);
+            out.parent_new = true;
+        } else {
+            // The console answered the liveness check but refused the dial:
+            // do not go on to dial one socket per live sub-agent against it.
+            return out;
+        }
     }
+    let live = LIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (id, name) in live.iter() {
+        if reg.contains_key(id) {
+            continue;
+        }
+        if let Ok(stream) = turbo_debug_client::connect_on(port, StreamKind::Tokens, name) {
+            reg.insert(*id, stream);
+            out.subagents_new.push(*id);
+        }
+    }
+    out
 }
 
 /// The control port to dial, or `None` when no console is up.
@@ -282,7 +329,33 @@ pub fn begin_in_think() {
 /// console reachable). A write failure drops the connection rather than
 /// erroring or retrying — the turn that owns these bytes must never notice.
 pub fn push(text: &str) {
-    let id = current();
+    push_to(current(), text);
+}
+
+/// Flushes the mirror at the end of a turn. Best-effort like [`push`]: a
+/// failure here just drops the (already-dead) connection.
+pub fn flush() {
+    flush_to(current());
+}
+
+/// Whether the parent window is connected right now.
+#[must_use]
+pub fn parent_connected() -> bool {
+    is_connected(MirrorId::PARENT)
+}
+
+/// Whether `id`'s window is connected right now.
+#[must_use]
+pub fn is_connected(id: MirrorId) -> bool {
+    MIRRORS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains_key(&id)
+}
+
+/// [`push`] to a specific window, ignoring the thread's routing. Used by the
+/// backfill, which writes to windows it did not open on this thread.
+pub fn push_to(id: MirrorId, text: &str) {
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -293,10 +366,8 @@ pub fn push(text: &str) {
     }
 }
 
-/// Flushes the mirror at the end of a turn. Best-effort like [`push`]: a
-/// failure here just drops the (already-dead) connection.
-pub fn flush() {
-    let id = current();
+/// [`flush`] for a specific window.
+pub fn flush_to(id: MirrorId) {
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -372,6 +443,13 @@ impl SubagentMirror {
         self.id
     }
 
+    /// The ordinal in this window's name (`subagent-<ordinal>`), recorded in
+    /// the `/repro` dump so a backfill can reopen the same window.
+    #[must_use]
+    pub fn ordinal(&self) -> usize {
+        self.id.0
+    }
+
     /// Routes *this thread's* [`push`] and [`flush`] to this window until the
     /// returned guard drops.
     ///
@@ -391,6 +469,9 @@ impl Drop for SubagentMirror {
     fn drop(&mut self) {
         MIRRORS
             .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+        LIVE.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(&self.id);
     }
@@ -421,10 +502,13 @@ impl Drop for ActiveMirror {
 pub fn open_subagent() -> SubagentMirror {
     let ordinal = NEXT_ORDINAL.fetch_add(1, Ordering::Relaxed);
     let id = MirrorId(ordinal);
+    let name = subagent_name(&raw_session_name(), ordinal);
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(id, name.clone());
     if crate::settings::active().ui.show_thinking {
         return SubagentMirror { id };
     }
-    let name = subagent_name(&raw_session_name(), ordinal);
     let Some(port) = console_port() else {
         return SubagentMirror { id };
     };
@@ -437,12 +521,103 @@ pub fn open_subagent() -> SubagentMirror {
     SubagentMirror { id }
 }
 
-/// The current routing target. Test-only accessor: production code never needs
-/// to ask, it just calls [`push`].
-#[cfg(test)]
+/// The current routing target. Production callers use this to know which
+/// window a thread is presently routed to (e.g. to backfill it explicitly via
+/// [`push_to`]/[`flush_to`] rather than relying on thread-local routing).
 #[must_use]
-pub fn current_for_test() -> MirrorId {
+pub fn current_id() -> MirrorId {
     current()
+}
+
+/// Shared with `ui.rs` tests, which drive a real `Agent` against a stand-in
+/// console to check what gets backfilled.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    /// Tests share the process-wide MIRRORS/LIVE registries and settings'
+    /// process-wide ACTIVE slot, so they must not run concurrently with each
+    /// other or with anything else touching `settings::install_for_test` for
+    /// showThinking.
+    pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Takes the serialization lock shared by every test that touches this
+    /// module's process-wide state. Not yet called from this crate — kept for
+    /// `ui.rs`'s upcoming backfill tests, which need the same lock.
+    #[allow(dead_code)]
+    pub fn lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Points `reconcile` at a listener; 0 means nothing listens. Not yet
+    /// called from this crate — kept for `ui.rs`'s upcoming backfill tests.
+    #[allow(dead_code)]
+    pub fn use_console(port: u16) {
+        CONTROL_PORT.store(port, Ordering::Relaxed);
+    }
+
+    pub fn reset() {
+        MIRRORS.lock().unwrap().clear();
+        LIVE.lock().unwrap().clear();
+        *CURRENT_SESSION_NAME.lock().unwrap() = None;
+        NEXT_ORDINAL.store(1, Ordering::Relaxed);
+        CURRENT.with(|c| c.set(MirrorId::PARENT));
+        CONTROL_PORT.store(0, Ordering::Relaxed);
+    }
+
+    /// Reads whatever plank has written so far (non-blocking after a short
+    /// read timeout), so tests can assert on a socket plank keeps open.
+    pub fn read_available(sock: &mut TcpStream) -> String {
+        sock.set_read_timeout(Some(std::time::Duration::from_millis(300)))
+            .unwrap();
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match sock.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// Like `fake_console`, but hands back each accepted *data* socket so a
+    /// test can read what plank wrote to that particular connection. Needed
+    /// once there is more than one connection to tell apart.
+    pub fn fake_console_keeping_sockets() -> (u16, std::sync::mpsc::Receiver<(String, TcpStream)>) {
+        let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let control_port = control.local_addr().unwrap().port();
+        let data = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let data_port = data.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            loop {
+                let Ok((mut sock, _)) = control.accept() else {
+                    return;
+                };
+                let mut line = String::new();
+                if BufReader::new(sock.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .is_err()
+                {
+                    return;
+                }
+                let _ = writeln!(sock, "PORT {data_port}");
+                let Ok((data_sock, _)) = data.accept() else {
+                    return;
+                };
+                if tx.send((line, data_sock)).is_err() {
+                    return;
+                }
+            }
+        });
+        (control_port, rx)
+    }
 }
 
 #[cfg(test)]
@@ -508,26 +683,19 @@ mod tests {
         );
     }
 
+    use super::test_support::{TEST_LOCK, fake_console_keeping_sockets, reset};
     use super::*;
     use std::io::Read;
     use std::net::TcpListener;
 
-    // Tests share the process-wide MIRRORS registry and settings' process-wide
-    // ACTIVE slot, so they must not run concurrently with each other or with
-    // anything else touching `settings::install_for_test` for showThinking.
-    // `settings::install_for_test` is thread-local (see settings.rs), which
-    // is exactly what makes that safe across the suite; MIRRORS itself is not
-    // thread-local, so within *this* module's tests we serialize by taking a
-    // lock for the duration of each test.
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    fn reset() {
-        MIRRORS.lock().unwrap().clear();
-        *CURRENT_SESSION_NAME.lock().unwrap() = None;
-        NEXT_ORDINAL.store(1, Ordering::Relaxed);
-        CURRENT.with(|c| c.set(MirrorId::PARENT));
-        CONTROL_PORT.store(0, Ordering::Relaxed); // nothing listens on 0
-    }
+    // Tests share the process-wide MIRRORS/LIVE registries and settings'
+    // process-wide ACTIVE slot, so they must not run concurrently with each
+    // other or with anything else touching `settings::install_for_test` for
+    // showThinking. `settings::install_for_test` is thread-local (see
+    // settings.rs), which is exactly what makes that safe across the suite;
+    // MIRRORS itself is not thread-local, so within *this* module's tests we
+    // serialize by taking a lock (`TEST_LOCK`, in `test_support`) for the
+    // duration of each test.
 
     /// Spins up a stand-in for `turbo-debug-console`'s control port that
     /// accepts exactly one handshake, hands back the `HELLO` line it
@@ -555,40 +723,6 @@ mod tests {
                 let _ = writeln!(sock, "PORT {data_port}");
                 let _ = data.accept();
                 if tx.send(line).is_err() {
-                    return;
-                }
-            }
-        });
-        (control_port, rx)
-    }
-
-    /// Like [`fake_console`], but hands back each accepted *data* socket so a
-    /// test can read what plank wrote to that particular connection. Needed
-    /// once there is more than one connection to tell apart.
-    fn fake_console_keeping_sockets() -> (u16, std::sync::mpsc::Receiver<(String, TcpStream)>) {
-        let control = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let control_port = control.local_addr().unwrap().port();
-        let data = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let data_port = data.local_addr().unwrap().port();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            use std::io::{BufRead, BufReader};
-            loop {
-                let Ok((mut sock, _)) = control.accept() else {
-                    return;
-                };
-                let mut line = String::new();
-                if BufReader::new(sock.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .is_err()
-                {
-                    return;
-                }
-                let _ = writeln!(sock, "PORT {data_port}");
-                let Ok((data_sock, _)) = data.accept() else {
-                    return;
-                };
-                if tx.send((line, data_sock)).is_err() {
                     return;
                 }
             }
@@ -1119,6 +1253,102 @@ mod tests {
         let n = server_side.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"<think>");
 
+        reset();
+    }
+
+    /// A console that appears mid-session must be told apart from one that
+    /// was there already: the agent backfills only on a fresh dial.
+    #[test]
+    fn reconcile_reports_a_fresh_parent_dial_exactly_once() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, _rx) = fake_console_keeping_sockets();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        let first = reconcile();
+        assert!(first.parent_new, "the first dial is new");
+        let second = reconcile();
+        assert!(!second.parent_new, "already connected: nothing new");
+        assert!(parent_connected());
+        reset();
+    }
+
+    /// A sub-agent window that failed to connect when it opened (no console
+    /// yet) is dialed by the next reconcile under its original name, and
+    /// reported so the agent can backfill it.
+    #[test]
+    fn reconcile_dials_live_subagent_windows_that_never_connected() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        *CURRENT_SESSION_NAME.lock().unwrap() = Some("bouncy-phelps".to_owned());
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        // No console yet: the window opens unconnected.
+        let sub = open_subagent();
+        assert!(!is_connected(sub.id()));
+
+        let (control_port, rx) = fake_console_keeping_sockets();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let r = reconcile();
+        assert!(r.parent_new);
+        assert_eq!(r.subagents_new, vec![sub.id()]);
+        assert!(is_connected(sub.id()));
+
+        let mut hellos: Vec<String> = (0..2)
+            .map(|_| {
+                rx.recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap()
+                    .0
+            })
+            .collect();
+        hellos.sort();
+        assert!(hellos[0].contains("plank:bouncy-phelps\n"), "{hellos:?}");
+        assert!(
+            hellos[1].contains("plank:bouncy-phelps:subagent-1"),
+            "{hellos:?}"
+        );
+
+        // Dropping the mirror retires it from the live set too.
+        drop(sub);
+        assert!(reconcile().subagents_new.is_empty());
+        reset();
+    }
+
+    /// `push_to` writes to a named window regardless of the thread's routing.
+    #[test]
+    fn push_to_targets_a_window_by_id() {
+        let _g = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let (control_port, rx) = fake_console_keeping_sockets();
+        CONTROL_PORT.store(control_port, Ordering::Relaxed);
+        let mut s = crate::settings::Settings::default();
+        s.ui.show_thinking = false;
+        crate::settings::install_for_test(s);
+
+        reconcile();
+        let (_hello, mut parent) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        let sub = open_subagent();
+        let (_hello, mut child) = rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+
+        push_to(sub.id(), "to the child");
+        flush_to(sub.id());
+        push_to(MirrorId::PARENT, "to the parent");
+        flush_to(MirrorId::PARENT);
+
+        assert_eq!(test_support::read_available(&mut child), "to the child");
+        assert_eq!(test_support::read_available(&mut parent), "to the parent");
+        assert_eq!(sub.ordinal(), 1);
         reset();
     }
 }
