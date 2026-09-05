@@ -43,6 +43,7 @@ See [Sessions](06-sessions.md).
 | `/usage` | billed token counts for the session (hosted providers, including cache hit rate) |
 | `/rate [+\|-] [note]` | rate the last turn (thumbs up by default) with an optional note; works in the TUI and the plain REPL alike |
 | `/remember [user] <fact>` | append a dated entry to project memory (or user memory with `user`) |
+| `/memory` | open user and project memory as one buffer in the built-in editor; edits are split back to the right file on save |
 | `/init` | have the model read the repo and generate an `AGENTS.md` |
 
 See [Context](07-context.md).

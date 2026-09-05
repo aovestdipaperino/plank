@@ -158,7 +158,7 @@ One limitation: settings come from the directory plank launches in, so project s
 | `--top-p F` | nucleus threshold (0..1) |
 | `--min-p F` | minimum-probability threshold (0..1) |
 | `--seed N` | RNG seed |
-| `--think` / `--think-max` / `--nothink` | reasoning effort |
+| `--think-low` (default) / `--think` / `--think-max` / `--nothink` | reasoning effort |
 
 ### Session and mode
 

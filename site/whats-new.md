@@ -7,8 +7,60 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v3.6.0 is out**, and the beta channel is on 3.6.3. The patch number is still
+**v4.1.0 is out**, and the beta channel is on 4.1.1. The patch number is still
 the channel: `.0` is stable, anything above it is beta.
+
+**A turn can no longer spend an hour repeating one thought.** This release
+started from a measurement rather than a hunch. A small feature request that
+Claude Code finishes in a few minutes took plank two hours, and the saved
+transcript showed why: not a hundred tool calls, but one thinking block of 149K
+characters in which three paragraphs repeated 263 times until the token cap.
+The repetition guard that already protected `/insights` now watches the
+reasoning of every generation pass, and when the tail starts cycling the pass is
+stopped and the model is told to act on the plan it already has.
+
+The same request was then rerun against the same commit after each fix, and the
+numbers are in `FINDINGS.md`: from no result in two hours, to a finished and
+tested change in 23 minutes, to 16 minutes. Three things did most of that work.
+Reasoning now defaults to low effort, which turned a stuttering list of
+"maybe" thoughts into numbered plans and cut a third off the run; `--think`
+gives you the old medium level back. The `edit` tool understands CRLF files, so
+a Windows-style source file no longer fails every multi-line edit and quietly
+converts single lines to LF. And `search` skips build output, so a search over
+`.` no longer returns the `target/package/` copy of every file ahead of the
+real matches.
+
+**The system prompt has a working style.** A plank-owned section after the tool
+schemas, outside the byte-for-byte C parity base, tells the model to batch
+independent tool calls in one stanza, explore briefly and then act, pick the
+smaller of two plausible designs rather than deliberate, edit straight from
+search context, stay inside the requested scope, and review diffs one file at
+a time. Each line was earned by a specific turn wasted in those reruns.
+
+**`/memory` edits every memory file at once.** It builds one buffer from your
+user and project `MEMORY.md` files, each between markers naming its scope and
+path, and opens it in the built-in editor. On save the buffer is split back
+along the markers and only the files whose text changed are written. A note
+typed under the last section joins the section above it, and deleting a
+section's markers leaves that file alone.
+
+**`AGENTS.md` is the only instructions file plank reads.** `CLAUDE.md` is no
+longer a silent fallback. Instead, an interactive start in a project that has a
+`CLAUDE.md` and no `AGENTS.md` links the one to the other and says so, and a
+project with neither asks whether you want `/init` to write one. Headless runs
+do none of this; they also save their transcript now, so a slow run can be
+analysed afterwards, with `--no-session` to opt out.
+
+**From 4.0.0, the day before:** the prompt's idle/busy cursor is drawn into the
+frame instead of sent as an OSC 12 escape, so it finally shows up in Warp and
+the other terminals that ignored the recolouring; `--ctx` takes `128k` and `1m`;
+and model upgrades are driven by a versioned manifest that asks before
+downloading, verifies as it streams, and installs at the next launch rather than
+under a running session.
+
+## v3.6: vision, self-compacting turns, a codebase review
+
+**v3.6.0 shipped in early September**, with the beta channel on 3.6.3.
 
 **Long turns compact themselves now.** Plank asked whether the context needed
 compacting before a turn started, and then never asked again while that turn ran

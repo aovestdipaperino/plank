@@ -138,9 +138,64 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v3.6.0 is out</strong>, and the beta channel is on 3.6.3. The
+<p><strong>v4.1.0 is out</strong>, and the beta channel is on 4.1.1. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>A turn can no longer spend an hour repeating one
+thought.</strong> This release started from a measurement rather than a
+hunch. A small feature request that Claude Code finishes in a few
+minutes took plank two hours, and the saved transcript showed why: not a
+hundred tool calls, but one thinking block of 149K characters in which
+three paragraphs repeated 263 times until the token cap. The repetition
+guard that already protected <code>/insights</code> now watches the
+reasoning of every generation pass, and when the tail starts cycling the
+pass is stopped and the model is told to act on the plan it already
+has.</p>
+<p>The same request was then rerun against the same commit after each
+fix, and the numbers are in <code>FINDINGS.md</code>: from no result in
+two hours, to a finished and tested change in 23 minutes, to 16 minutes.
+Three things did most of that work. Reasoning now defaults to low
+effort, which turned a stuttering list of "maybe" thoughts into numbered
+plans and cut a third off the run; <code>--think</code> gives you the
+old medium level back. The <code>edit</code> tool understands CRLF
+files, so a Windows-style source file no longer fails every multi-line
+edit and quietly converts single lines to LF. And <code>search</code>
+skips build output, so a search over <code>.</code> no longer returns
+the <code>target/package/</code> copy of every file ahead of the real
+matches.</p>
+<p><strong>The system prompt has a working style.</strong> A plank-owned
+section after the tool schemas, outside the byte-for-byte C parity base,
+tells the model to batch independent tool calls in one stanza, explore
+briefly and then act, pick the smaller of two plausible designs rather
+than deliberate, edit straight from search context, stay inside the
+requested scope, and review diffs one file at a time. Each line was
+earned by a specific turn wasted in those reruns.</p>
+<p><strong><code>/memory</code> edits every memory file at
+once.</strong> It builds one buffer from your user and project
+<code>MEMORY.md</code> files, each between markers naming its scope and
+path, and opens it in the built-in editor. On save the buffer is split
+back along the markers and only the files whose text changed are
+written. A note typed under the last section joins the section above it,
+and deleting a section's markers leaves that file alone.</p>
+<p><strong><code>AGENTS.md</code> is the only instructions file plank
+reads.</strong> <code>CLAUDE.md</code> is no longer a silent fallback.
+Instead, an interactive start in a project that has a
+<code>CLAUDE.md</code> and no <code>AGENTS.md</code> links the one to
+the other and says so, and a project with neither asks whether you want
+<code>/init</code> to write one. Headless runs do none of this; they
+also save their transcript now, so a slow run can be analysed
+afterwards, with <code>--no-session</code> to opt out.</p>
+<p><strong>From 4.0.0, the day before:</strong> the prompt's idle/busy
+cursor is drawn into the frame instead of sent as an OSC 12 escape, so
+it finally shows up in Warp and the other terminals that ignored the
+recolouring; <code>--ctx</code> takes <code>128k</code> and
+<code>1m</code>; and model upgrades are driven by a versioned manifest
+that asks before downloading, verifies as it streams, and installs at
+the next launch rather than under a running session.</p>
+<h2 id="v36-vision-self-compacting-turns-a-codebase-review">v3.6:
+vision, self-compacting turns, a codebase review</h2>
+<p><strong>v3.6.0 shipped in early September</strong>, with the beta
+channel on 3.6.3.</p>
 <p><strong>Long turns compact themselves now.</strong> Plank asked
 whether the context needed compacting before a turn started, and then
 never asked again while that turn ran — but a turn appends a tool result

@@ -27,7 +27,7 @@ The system prompt is cached on disk as a fingerprinted snapshot, so restarts do 
 
 ## `AGENTS.md`
 
-The conventional place for "things anyone working in this repo needs to know": build commands, architecture, house style, gotchas. plank finds it and injects it at session start.
+The conventional place for "things anyone working in this repo needs to know": build commands, architecture, house style, gotchas. plank finds it and injects it at session start. It is the only instructions file plank reads: a project root that has a `CLAUDE.md` but no `AGENTS.md` gets an `AGENTS.md` symlink to it the first time you start plank there, and a project with neither is asked whether to generate one. Headless runs (`--non-interactive`) do neither.
 
 ```
 /init
@@ -50,6 +50,8 @@ Both load at session start. Append to them from the prompt:
 ```
 
 Without `user`, the entry goes to project memory. Entries are dated bullets.
+
+To edit them rather than append, `/memory` opens both files as one buffer in the built-in editor, each between markers naming its scope and path; on save the buffer is split back along those markers and only the files whose text changed are written.
 
 Four kinds of entry are worth keeping, and they share one test: **facts the model cannot re-derive from the repository.**
 
@@ -105,7 +107,7 @@ plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cp
 
 ## Thinking
 
-The model reasons before it answers. `--think` (the default), `--think-max`, and `--nothink` set the effort; `ui.showThinking` controls whether you see it. Hiding thinking does not stop it — the model still produces it, and it still occupies context.
+The model reasons before it answers. `--think-low` (the default), `--think`, `--think-max`, and `--nothink` set the effort; `ui.showThinking` controls whether you see it. Low is the default because on the same coding task it finished a third faster than medium with the same result, and its reasoning reads as a plan rather than a list of second thoughts. Hiding thinking does not stop it — the model still produces it, and it still occupies context.
 
 ## Token usage on hosted providers
 

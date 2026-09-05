@@ -163,7 +163,12 @@ restarts do not pay to re-read it.</p>
 <h2 id="agentsmd"><code>AGENTS.md</code></h2>
 <p>The conventional place for "things anyone working in this repo needs
 to know": build commands, architecture, house style, gotchas. plank
-finds it and injects it at session start.</p>
+finds it and injects it at session start. It is the only instructions
+file plank reads: a project root that has a <code>CLAUDE.md</code> but
+no <code>AGENTS.md</code> gets an <code>AGENTS.md</code> symlink to it
+the first time you start plank there, and a project with neither is
+asked whether to generate one. Headless runs
+(<code>--non-interactive</code>) do neither.</p>
 <pre><code>/init</code></pre>
 <p>has the model read your repository and write one. Review what it
 produces — it is a starting point, not a finished document.</p>
@@ -181,6 +186,10 @@ goals and constraints of this checkout.</li>
 /remember user I work in Rust and TypeScript, mostly on macOS</code></pre>
 <p>Without <code>user</code>, the entry goes to project memory. Entries
 are dated bullets.</p>
+<p>To edit them rather than append, <code>/memory</code> opens both
+files as one buffer in the built-in editor, each between markers naming
+its scope and path; on save the buffer is split back along those markers
+and only the files whose text changed are written.</p>
 <p>Four kinds of entry are worth keeping, and they share one test:
 <strong>facts the model cannot re-derive from the
 repository.</strong></p>
@@ -265,11 +274,14 @@ off Metal is otherwise invisible once the UI is up, so plank names what
 is in force:</p>
 <pre><code>plank: settings in effect (/path/to/.plank/settings.json): threads=3, backend=cpu, ctx=65536</code></pre>
 <h2 id="thinking">Thinking</h2>
-<p>The model reasons before it answers. <code>--think</code> (the
-default), <code>--think-max</code>, and <code>--nothink</code> set the
-effort; <code>ui.showThinking</code> controls whether you see it. Hiding
-thinking does not stop it — the model still produces it, and it still
-occupies context.</p>
+<p>The model reasons before it answers. <code>--think-low</code> (the
+default), <code>--think</code>, <code>--think-max</code>, and
+<code>--nothink</code> set the effort; <code>ui.showThinking</code>
+controls whether you see it. Low is the default because on the same
+coding task it finished a third faster than medium with the same result,
+and its reasoning reads as a plan rather than a list of second thoughts.
+Hiding thinking does not stop it — the model still produces it, and it
+still occupies context.</p>
 <h2 id="token-usage-on-hosted-providers">Token usage on hosted
 providers</h2>
 <pre><code>/usage</code></pre>
