@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [4.2.0] - 2026-09-06
+
 ### Fixed
 
 - **A blocked tool call could not end a loop.** Once the loop guard refused
