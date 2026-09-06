@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **Silent tool rounds get a status reminder.** A pass that emits tool calls
+  with no text outside its thinking now carries a `[status]` line on its
+  results asking for one or two sentences for the user before the next calls,
+  because the tool summary lines were otherwise all the user saw of a long
+  turn. The working-style prompt also asks the model to report what a round
+  did after it returns, rather than announcing it beforehand.
+- **Tool summary lines name single calls**: `Read src/main.rs`, `Ran cargo
+  test`, `Edited Cargo.toml` instead of `Read 1 file`; stanzas of several
+  calls keep the counted form. The lines are indented under the output block.
+
 ## [4.2.0] - 2026-09-06
 
 ### Fixed

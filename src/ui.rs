@@ -1314,6 +1314,11 @@ fn tool_activity_summary(calls: &[ToolCall]) -> String {
             format!("{n} {many}")
         }
     }
+    if let [call] = calls
+        && let Some(line) = single_call_activity(call)
+    {
+        return line;
+    }
     let (mut shell, mut reads, mut edits, mut searches, mut other) = (0, 0, 0, 0, 0);
     for c in calls {
         match c.name.as_str() {
@@ -1348,6 +1353,35 @@ fn tool_activity_summary(calls: &[ToolCall]) -> String {
         line.replace_range(..1, &first.to_ascii_uppercase());
     }
     line
+}
+
+/// The activity line for a stanza of exactly one familiar call, naming what
+/// it touched instead of counting it: "Read src/main.rs", "Ran cargo test",
+/// "Edited Cargo.toml". A shell command is cut to its first line and 72
+/// columns so the line stays a line. `None` for an unfamiliar tool or a call
+/// missing the expected argument, which fall back to the counted form.
+fn single_call_activity(call: &ToolCall) -> Option<String> {
+    let arg = |name: &str| {
+        call.arg_value(name)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
+    Some(match call.name.as_str() {
+        "bash" => {
+            let command = arg("command")?;
+            let first = command.lines().next().unwrap_or("").trim();
+            let mut shown: String = first.chars().take(72).collect();
+            if shown.chars().count() < first.chars().count() || command.lines().count() > 1 {
+                shown.push('…');
+            }
+            format!("Ran {shown}")
+        }
+        "read" | "more" | "view_image" => format!("Read {}", arg("path")?),
+        "edit" => format!("Edited {}", arg("path")?),
+        "write" => format!("Wrote {}", arg("path")?),
+        _ => return None,
+    })
 }
 
 /// Concatenates tool outputs into the model-facing result block, given
@@ -1434,6 +1468,40 @@ fn append_advisories(nudges: &[crate::guard::Nudge], mut observations: String) -
             let _ = writeln!(observations, "[loop guard] {text}");
         }
     }
+    observations
+}
+
+/// What the user actually saw of an assistant pass: the prose outside any
+/// thinking and before the tool-call markup. A local model's chat template
+/// pre-opens `<think>` without emitting the tag, so a pass may carry a bare
+/// `</think>`; everything up to the last one is thinking either way.
+fn narration(text: &str) -> String {
+    const CLOSE: &str = "</think>";
+    const CALLS: &str = "<｜DSML｜tool_calls>";
+    let stripped = strip_thinking(text);
+    let after_think = stripped
+        .rfind(CLOSE)
+        .map_or(stripped.as_str(), |i| &stripped[i + CLOSE.len()..]);
+    let before_calls = after_think
+        .find(CALLS)
+        .map_or(after_think, |i| &after_think[..i]);
+    before_calls.trim().to_owned()
+}
+
+/// Appended to a stanza's results when the pass that emitted it said nothing
+/// visible. The system prompt asks for a status line every round; a model
+/// that keeps everything inside its thinking needs the reminder where it is
+/// deciding what to write next, and the user needs it because the tool
+/// summary lines are otherwise all they see (a 16-round turn of "Ran 1 shell
+/// command" prompted this).
+const NARRATION_NUDGE: &str = "[status] Your last message had no text outside your thinking, so the user saw only a tool count. Before your next tool calls, write one or two plain sentences for the user: what these results told you and what you are doing now.";
+
+fn append_narration_nudge(mut observations: String) -> String {
+    if !observations.ends_with('\n') {
+        observations.push('\n');
+    }
+    observations.push_str(NARRATION_NUDGE);
+    observations.push('\n');
     observations
 }
 
@@ -2290,6 +2358,30 @@ impl Agent<'_> {
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
         let needs_engine =
             |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
+        // The pass that produced these calls is the last transcript message.
+        // If it said nothing outside its thinking, the user saw only a tool
+        // count; the reminder rides on the results, where the model reads it
+        // right before deciding what to write next.
+        let silent = self.session.transcript.last().is_some_and(|m| {
+            m.role == crate::session::Role::Assistant && narration(&m.text).is_empty()
+        });
+        let observations = self.dispatch_stanza(calls, &nudges, has_block, needs_engine);
+        if silent {
+            append_narration_nudge(observations)
+        } else {
+            observations
+        }
+    }
+
+    /// The dispatch half of [`Self::run_tool_calls`]: routes the stanza to
+    /// the right executor and frames the results.
+    fn dispatch_stanza(
+        &mut self,
+        calls: &[ToolCall],
+        nudges: &[crate::guard::Nudge],
+        has_block: bool,
+        needs_engine: impl Fn(&ToolCall) -> bool,
+    ) -> String {
         if has_block {
             // Per-call dispatch so blocked calls get hard error results instead
             // of running. Non-blocked calls in the same stanza still dispatch.
@@ -2309,13 +2401,13 @@ impl Agent<'_> {
                 };
                 results.push((call.name.clone(), out));
             }
-            append_advisories(&nudges, format_tool_results(&results))
+            append_advisories(nudges, format_tool_results(&results))
         } else if !calls.iter().any(needs_engine) {
-            append_advisories(&nudges, dispatch_all(calls, &mut self.tool_ctx))
+            append_advisories(nudges, dispatch_all(calls, &mut self.tool_ctx))
         } else if calls.is_empty() {
             "Tool error: empty tool call block\n".to_string()
         } else if let Some(results) = self.run_agent_fanout(calls) {
-            append_advisories(&nudges, format_tool_results(&results))
+            append_advisories(nudges, format_tool_results(&results))
         } else {
             // Mirror dispatch_all: clear any undrained previews so cards never leak.
             self.tool_ctx.edit_previews.clear();
@@ -2332,7 +2424,7 @@ impl Agent<'_> {
                 };
                 results.push((call.name.clone(), out));
             }
-            append_advisories(&nudges, format_tool_results(&results))
+            append_advisories(nudges, format_tool_results(&results))
         }
     }
 
@@ -14425,6 +14517,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_single_familiar_call_names_what_it_touched() {
+        let call = |name: &str, key: &str, value: &str| ToolCall {
+            name: name.to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: key.to_string(),
+                value: value.to_string(),
+                is_string: true,
+            }],
+        };
+        assert_eq!(
+            tool_activity_summary(&[call("read", "path", "src/main.rs")]),
+            "Read src/main.rs"
+        );
+        assert_eq!(
+            tool_activity_summary(&[call("bash", "command", "cargo test --lib")]),
+            "Ran cargo test --lib"
+        );
+        assert_eq!(
+            tool_activity_summary(&[call("edit", "path", "Cargo.toml")]),
+            "Edited Cargo.toml"
+        );
+        // Multi-line and long commands are cut to one short line.
+        let long = format!("{}\necho two", "x".repeat(100));
+        let line = tool_activity_summary(&[call("bash", "command", &long)]);
+        assert_eq!(line, format!("Ran {}…", "x".repeat(72)));
+        // Two calls, or a call without its argument, keep the counted form.
+        assert_eq!(
+            tool_activity_summary(&[call("read", "path", "a"), call("read", "path", "b")]),
+            "Read 2 files"
+        );
+        assert_eq!(
+            tool_activity_summary(&named_calls(&["read"])),
+            "Read 1 file"
+        );
+    }
+
     fn read_call(path: &str) -> ToolCall {
         ToolCall {
             name: "read".to_string(),
@@ -21590,6 +21719,47 @@ mod tests {
         );
         assert_eq!(strip_thinking("<think>only thinking"), "");
         assert_eq!(strip_thinking("plain prose"), "plain prose");
+    }
+
+    #[test]
+    fn narration_is_the_prose_between_thinking_and_the_calls() {
+        // Local template: bare `</think>` closes thinking the tag never opened.
+        assert_eq!(
+            narration("pondering</think>Reading the config.<｜DSML｜tool_calls>…"),
+            "Reading the config."
+        );
+        assert_eq!(narration("pondering</think><｜DSML｜tool_calls>…"), "");
+        assert_eq!(narration("<think>all thinking</think>"), "");
+        assert_eq!(
+            narration("<think>a</think>Two files matched.\n"),
+            "Two files matched."
+        );
+        assert_eq!(narration("Plain answer."), "Plain answer.");
+    }
+
+    #[test]
+    fn a_silent_pass_gets_the_narration_nudge_on_its_results() {
+        let dir = scratch_dir("narration-nudge");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        let call = ToolCall {
+            name: "bash".to_string(),
+            args: vec![crate::dsml::ToolArg {
+                name: "command".to_string(),
+                value: "echo hi".to_string(),
+                is_string: true,
+            }],
+        };
+        agent
+            .session
+            .push(Message::assistant("thinking</think><｜DSML｜tool_calls>…"));
+        let silent = agent.run_tool_calls(std::slice::from_ref(&call));
+        assert!(silent.contains(NARRATION_NUDGE), "{silent}");
+        agent.session.push(Message::assistant(
+            "thinking</think>Checking the echo.<｜DSML｜tool_calls>…",
+        ));
+        let spoken = agent.run_tool_calls(std::slice::from_ref(&call));
+        assert!(!spoken.contains(NARRATION_NUDGE), "{spoken}");
         assert_eq!(
             strip_thinking("<think>a</think>one<think>b</think>two"),
             "onetwo",
