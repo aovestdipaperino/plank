@@ -14,12 +14,18 @@
 
 const DSML_START: &[u8] = "<｜DSML｜tool_calls>".as_bytes();
 const SSML_START: &[u8] = "<｜SSML｜tool_calls>".as_bytes();
-/// The same openers with a trailing `｜` before `>`. Closing tags have always
-/// tolerated that bar; post-update weights emit it on the opener too, and
-/// without these forms the stanza never opens and the model only sees the
-/// downstream "DSML markup outside a valid `tool_calls` block" error.
-const DSML_START_BAR: &[u8] = "<｜DSML｜tool_calls｜>".as_bytes();
-const SSML_START_BAR: &[u8] = "<｜SSML｜tool_calls｜>".as_bytes();
+/// The same openers ending in a trailing `｜`, with the `>` optional.
+///
+/// Closing tags have always tolerated that bar; post-update weights emit it
+/// on the opener too, and newer ones drop the `>` after it altogether —
+/// `<｜DSML｜tool_calls｜` followed by a newline is what a local ds4 build
+/// writes. Both are accepted here: the opener is taken at the bar, and a `>`
+/// that does follow is swallowed rather than left to the structural parser,
+/// which would read it as a malformed tag. Without this the stanza never
+/// opens, the markup reaches the screen as if it were prose, and the tool
+/// never runs.
+const DSML_START_BAR: &[u8] = "<｜DSML｜tool_calls｜".as_bytes();
+const SSML_START_BAR: &[u8] = "<｜SSML｜tool_calls｜".as_bytes();
 /// Cheap scan filter used to locate candidate closing tags: any `</` byte
 /// pair, not just a validated close marker. Real validation happens in
 /// [`close_tag_at`], which requires a full [`tag_prefix_len`] match against
@@ -129,9 +135,12 @@ pub fn find_tool_start(s: &str) -> Option<usize> {
     let mut forms: Vec<String> = vec!["<tool_calls>".to_owned()];
     for m in MARKER_NAMES {
         forms.push(format!("<｜{m}｜tool_calls>"));
-        forms.push(format!("<｜{m}｜tool_calls｜>"));
+        // The bar spelling with the `>` dropped, which newer weights emit;
+        // it is also a prefix of the `｜>` form, so that one still matches at
+        // the same offset.
+        forms.push(format!("<｜{m}｜tool_calls｜"));
         forms.push(format!("<{m}｜tool_calls>"));
-        forms.push(format!("<{m}｜tool_calls｜>"));
+        forms.push(format!("<{m}｜tool_calls｜"));
     }
     forms.iter().filter_map(|f| s.find(f.as_str())).min()
 }
@@ -229,6 +238,9 @@ pub struct DsmlParser {
     param_scan_work: usize,
     calls: Vec<ToolCall>,
     error: String,
+    /// True just after an opener that ended at its `｜`, so a `>` arriving
+    /// next belongs to that opener and is not structural content.
+    swallow_gt: bool,
 }
 
 #[derive(Debug, Default)]
@@ -310,12 +322,24 @@ impl DsmlParser {
                     self.search_tail.remove(0);
                 }
                 self.search_tail.push(c);
-                if [DSML_START, SSML_START, DSML_START_BAR, SSML_START_BAR]
+                if [DSML_START, SSML_START]
                     .iter()
                     .any(|f| self.search_tail.ends_with(f))
                 {
                     self.start();
+                } else if [DSML_START_BAR, SSML_START_BAR]
+                    .iter()
+                    .any(|f| self.search_tail.ends_with(f))
+                {
+                    // Opened at the bar; a `>` may still follow.
+                    self.start();
+                    self.swallow_gt = true;
                 }
+                continue;
+            }
+
+            if std::mem::take(&mut self.swallow_gt) && c == b'>' {
+                // The bar-form opener's own `>`, when it has one.
                 continue;
             }
 
@@ -808,6 +832,56 @@ mod tests {
             assert_eq!(p.calls()[0].arg_value("path"), Some("src/main.rs"));
         }
         assert_eq!(super::find_tool_start(&stanza), Some(0));
+    }
+
+    /// The drift went one step further: newer weights end the opener at the
+    /// bar and drop the `>` entirely, writing `<｜DSML｜tool_calls｜` followed
+    /// by a newline. Verbatim from a local ds4 run, where the stanza reached
+    /// the chat window as prose and the tool never ran.
+    #[test]
+    fn opener_tolerates_a_missing_close_bracket() {
+        let stanza = concat!(
+            "<｜DSML｜tool_calls｜\n",
+            "<｜DSML｜invoke name=\"spend_by_category\">\n",
+            "\n",
+            "</｜DSML｜invoke>\n",
+            "</｜DSML｜tool_calls>",
+        );
+        for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+            let mut p = super::DsmlParser::new();
+            feed(&mut p, stanza);
+            assert_eq!(p.state(), super::DsmlState::Done, "{}", p.error());
+            assert_eq!(p.calls().len(), 1);
+            assert_eq!(p.calls()[0].name, "spend_by_category");
+            assert!(p.calls()[0].args.is_empty());
+        }
+        // And the streaming filter must withhold it, or the markup is shown
+        // before anyone knows it was a stanza.
+        assert_eq!(super::find_tool_start(stanza), Some(0));
+        assert_eq!(
+            super::find_tool_start("prose <｜SSML｜tool_calls｜\n"),
+            Some("prose ".len())
+        );
+    }
+
+    /// Whatever the opener's spelling, the `>` must not survive into the
+    /// structural stream as a tag of its own.
+    #[test]
+    fn every_opener_spelling_reaches_the_same_state() {
+        for opener in [
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜tool_calls｜>",
+            "<｜DSML｜tool_calls｜",
+        ] {
+            let stanza = STANZA.replacen("<｜DSML｜tool_calls>", opener, 1);
+            for feed in [feed_all as fn(&mut DsmlParser, &str), feed_bytewise] {
+                let mut p = super::DsmlParser::new();
+                feed(&mut p, &stanza);
+                assert_eq!(p.state(), super::DsmlState::Done, "{opener}: {}", p.error());
+                assert_eq!(p.calls().len(), 1, "{opener}");
+                assert_eq!(p.calls()[0].arg_value("offset"), Some("42"), "{opener}");
+            }
+        }
     }
 
     /// Post-update weights write the parameter name as the element name, and
