@@ -2201,3 +2201,41 @@ row refused in full end the turn (`LoopGuard::tripped`), after the automatic
 loop dump. The general lesson: a guard that only refuses an action leaves a
 deterministic model exactly where it was; something has to change the
 prompt materially or stop the turn.
+
+## A sub-agent that publishes no status looks hung
+
+`repro-1788690439`: a `fanout` sub-agent looped in its reasoning for ten
+minutes until the repeat guard stopped it, then generated for thirteen more
+with nothing on screen moving but the roster row's clock, and the user pressed
+Esc. Three separate gaps, each of which had to be closed at its own layer:
+
+- **Only the main pass published `Status`.** The roster row's live token count
+  comes from `UiEvent::Status` snapshots (`SubPane::note_status`), but those
+  were built only in `worker_turn`'s engine callback; the quiet sub-agent pass
+  (`generate_pass`) handled `EngineEvent::Text` alone. A row credited only by
+  the per-pass `SubTokens` tally froze for the whole pass, exactly the failure
+  the earlier "record_usage fires at pass completion" entry describes — that
+  fix wired the row to snapshots without making the sub-agent pass emit any.
+  Both passes now build their snapshots through one `LiveStatus`, so they
+  cannot drift apart again; the fan-out leaves it off (several passes, no
+  honest single row).
+- **The guard's error was fed back and nothing else changed.** Same lesson as
+  the refused-tool-call entry above: at temperature 0 the pass after
+  `REPEAT_LOOP_ERROR` is the same prompt plus one message, and the sub-agent
+  loop let that repeat for up to 40 rounds. Two stops in a row now push the
+  final-round reminder (`SUBAGENT_REPEAT_TRIP_CAP`), which changes the prompt
+  materially and turns the next pass into the report; a third loop fails the
+  sub-agent with `REPEAT_TRIPS_NOTICE` rather than retrying.
+- **The interrupted pass was discarded.** `generate_pass` returned a bare
+  `Err("interrupted")`, so the sidechain dump ended on the guard's tool result
+  and could not show what the model was doing for those thirteen minutes. The
+  abort now carries the partial text (`QuietAbort`), pushed into the sidechain
+  before the fork end truncates it out of the parent transcript. The main loop
+  had always kept its partial text; the sidechain path was written separately
+  and missed it.
+
+Guard stops are also red `UiEvent::Error` lines on the main window now
+(`Agent::report_guard`), naming the sub-agent (`ToolContext::subagent_label`,
+set around the delegated run so nesting restores the outer name). The sub-agent
+pane already showed the tool error, but nobody watching the parent could see
+it, which is the difference between "stuck" and "looping, being handled".

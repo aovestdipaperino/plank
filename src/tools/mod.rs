@@ -136,6 +136,10 @@ pub struct ToolContext {
     /// once it reaches [`SUBAGENT_DEPTH_CAP`], bounding agent-invokes-agent
     /// recursion the same way [`SKILL_DEPTH_CAP`] bounds skills.
     pub subagent_depth: usize,
+    /// Display label of the innermost running sub-agent (the agent
+    /// definition's name, or `sub-agent`), so a guard notice raised from inside
+    /// its sidechain can say whose pass it stopped. `None` in the main turn.
+    pub subagent_label: Option<String>,
     /// The worktree this session has moved into, if any. In-memory only: a
     /// resumed session always starts where it was launched, never inside a
     /// worktree a previous run happened to enter.
@@ -237,6 +241,7 @@ impl ToolContext {
             skills: Vec::new(),
             skill_invocations: 0,
             subagent_depth: 0,
+            subagent_label: None,
             worktree: None,
             plan_mode: false,
             hook_stop: None,

@@ -6,14 +6,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A sub-agent's pass now reports live progress.** The roster row and the
+  footer took their live token count from the main pass's status snapshots
+  only, so a long local sub-agent pass sat on a frozen `↓ n tokens` and a
+  climbing clock for its whole duration (13 minutes in `repro-1788690439`),
+  reading as a hang. The quiet pass publishes the same snapshots now.
+- **Guard stops are red lines on the main window.** When the repeat guard
+  stops a reasoning loop, or the loop guard ends a turn, the main log says so
+  in red (`guard: stopped a reasoning loop in sub-agent 'x'`), whichever pass
+  it happened in. Before, a sub-agent's stop was visible only as a tool error
+  inside its own pane.
+- **A sub-agent that loops twice in a row is asked for its report** instead
+  of retrying up to 40 rounds. At temperature 0 each retry was the same loop;
+  the final-round reminder changes the prompt enough to get an answer, and
+  if that pass loops too the sub-agent fails with a clear reason.
+- **An interrupted sub-agent keeps its partial text in the sidechain dump**,
+  so a `/repro` shows what it was generating when Esc landed. It used to be
+  dropped, leaving the dump ending on the previous tool result.
+
 ### Changed
 
-- **Silent tool rounds get a status reminder.** A pass that emits tool calls
-  with no text outside its thinking now carries a `[status]` line on its
-  results asking for one or two sentences for the user before the next calls,
-  because the tool summary lines were otherwise all the user saw of a long
-  turn. The working-style prompt also asks the model to report what a round
-  did after it returns, rather than announcing it beforehand.
+- **Hidden thinking shows its first sentence after a tool round.** With
+  `ui.showThinking` off, a pass that follows a tool result prints the first
+  sentence of its thinking as an output block of its own ("● The trait is
+  missing `idle`; adding it."), so a long tool-calling turn reads as progress
+  instead of a column of tool counts. One line per pass, capped at 160 characters;
+  nothing changes in the prompt or in what the model generates.
 - **Tool summary lines name single calls**: `Read src/main.rs`, `Ran cargo
   test`, `Edited Cargo.toml` instead of `Read 1 file`; stanzas of several
   calls keep the counted form. The lines are indented under the output block.

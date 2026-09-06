@@ -35,6 +35,41 @@ const DSML_BAR: &[u8] = "｜".as_bytes();
 const THINK_OPEN: &[u8] = b"<think>";
 const THINK_CLOSE: &[u8] = b"</think>";
 
+/// Longest status line taken from hidden thinking, in characters; a first
+/// "sentence" that runs past this is cut at a word boundary with an ellipsis.
+const THINK_STATUS_CAP: usize = 160;
+
+/// The first sentence of `text`: up to and including the first `.`, `!` or
+/// `?` that is followed by whitespace, or up to the first newline, whichever
+/// comes first. `None` while no such boundary has arrived and `force` is
+/// false (more text may still come); with `force`, whatever is there. Anything
+/// past [`THINK_STATUS_CAP`] characters is a sentence for this purpose too,
+/// cut at the last space before the cap.
+fn first_sentence(text: &str, force: bool) -> Option<String> {
+    let mut chars = text.char_indices().peekable();
+    let mut count = 0usize;
+    while let Some((i, c)) = chars.next() {
+        if c == '\n' {
+            return Some(text[..i].trim_end().to_owned());
+        }
+        if matches!(c, '.' | '!' | '?') {
+            match chars.peek() {
+                Some(&(_, next)) if next.is_whitespace() => {
+                    return Some(text[..i + c.len_utf8()].to_owned());
+                }
+                _ => {}
+            }
+        }
+        count += 1;
+        if count >= THINK_STATUS_CAP {
+            let head = &text[..i + c.len_utf8()];
+            let cut = head.rfind(' ').filter(|&at| at > 0).unwrap_or(head.len());
+            return Some(format!("{}…", head[..cut].trim_end()));
+        }
+    }
+    force.then(|| text.trim_end().to_owned())
+}
+
 /// Whether the opt-out env var permits logging. Split out from
 /// [`tool_error_logging_enabled`] so the decision is testable: the
 /// `cfg!(test)` half of that gate is always true inside a test binary.
@@ -644,6 +679,16 @@ pub struct StreamRenderer<S> {
     /// state) but never emitted to the sink. Gated by `ui.showThinking`;
     /// defaults true. See [`StreamRenderer::set_show_thinking`].
     show_thinking: bool,
+    /// When true and thinking is hidden, the first sentence of each `<think>`
+    /// block is still emitted, once, as a dim status line. See
+    /// [`StreamRenderer::set_think_status`].
+    think_status: bool,
+    /// Hidden thinking bytes held back while waiting for the first sentence
+    /// of the current block to complete.
+    think_status_peek: Vec<u8>,
+    /// Whether the current block's status line has been emitted (or given up
+    /// on), so a block yields at most one line.
+    think_status_done: bool,
     /// When false, the dim content preview a `write` of a new file streams is
     /// dropped too. Independent of `show_tool_calls` (the preview is normally
     /// kept even with banners off); defaults true. See
@@ -714,6 +759,9 @@ impl<S: RenderSink> StreamRenderer<S> {
             preflight_error: None,
             show_tool_calls: true,
             show_thinking: true,
+            think_status: false,
+            think_status_peek: Vec::new(),
+            think_status_done: false,
             show_write_preview: true,
             thinking_tool_calls: false,
             replay: false,
@@ -752,6 +800,19 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// emitted to the sink.
     pub fn set_show_thinking(&mut self, show: bool) {
         self.show_thinking = show;
+    }
+
+    /// Sets whether hidden thinking still yields a one-line status (default
+    /// false). Only meaningful with `set_show_thinking(false)`: the first
+    /// sentence of each `<think>` block — up to the first `.`, `!` or `?`
+    /// followed by whitespace, or the first newline, capped at
+    /// [`THINK_STATUS_CAP`] characters — is emitted once through
+    /// [`RenderSink::think_text`] as soon as it completes. The model's own
+    /// opening thought after a tool result is the best status line there is
+    /// ("The test still fails on the second case."), and it costs no prompt
+    /// text and no extra generation.
+    pub fn set_think_status(&mut self, on: bool) {
+        self.think_status = on;
     }
 
     /// Sets whether a new-file `write` streams its content as a dim preview
@@ -819,6 +880,7 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// opening tag of its own.
     pub fn begin_in_think(&mut self) {
         self.in_think = true;
+        self.think_status_reset();
     }
 
     /// Whether the stream is currently inside a `<think>` block.
@@ -844,6 +906,9 @@ impl<S: RenderSink> StreamRenderer<S> {
         self.stream_text(b"", true);
         self.flush_carry();
         self.flush_pseudo_tool();
+        // A block cut off before its first sentence ended still shows what
+        // there was of it.
+        self.think_status_flush(true);
     }
 
     /// Results after the stream ends: completed calls and error state.
@@ -978,8 +1043,39 @@ impl<S: RenderSink> StreamRenderer<S> {
         Self::flush_stream(write, &mut self.sink, &mut self.vis_carry);
     }
 
+    /// A new `<think>` block: its status line is not out yet.
+    fn think_status_reset(&mut self) {
+        self.think_status_peek.clear();
+        self.think_status_done = false;
+    }
+
+    /// Emits the current block's status line if its first sentence is
+    /// complete (or `force`, at block end or stream end), then marks the block
+    /// done so it never emits twice.
+    fn think_status_flush(&mut self, force: bool) {
+        if !self.think_status || self.think_status_done || self.show_thinking {
+            return;
+        }
+        let text = String::from_utf8_lossy(&self.think_status_peek);
+        let Some(line) = first_sentence(text.trim_start(), force) else {
+            return;
+        };
+        self.think_status_done = true;
+        self.think_status_peek.clear();
+        if line.is_empty() {
+            return;
+        }
+        self.viz_newline_if_open();
+        self.sink.think_text(&format!("{line}\n"));
+        self.last_output_newline = true;
+    }
+
     fn emit_think_bytes(&mut self, bytes: &[u8]) {
         if !self.show_thinking {
+            if self.think_status && !self.think_status_done {
+                self.think_status_peek.extend_from_slice(bytes);
+                self.think_status_flush(false);
+            }
             return;
         }
         self.think_carry.extend_from_slice(bytes);
@@ -1579,6 +1675,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             return;
         }
         self.in_think = false;
+        self.think_status_flush(true);
         // Same boundary bookkeeping as the control path in `stream_text`: the
         // answer region starts here even though no `\n` byte crossed it.
         self.pseudo_tool.reset_line();
@@ -1785,6 +1882,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 self.flush_start_tail();
                 self.post_think_gap = false;
                 self.in_think = true;
+                self.think_status_reset();
                 // The plain-DSML tail is not fed while thinking, so bytes from
                 // before the block must not glue onto bytes from after it and
                 // spell a marker that was never written.
@@ -1801,6 +1899,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                     // will accept it. The call is real after all, so start
                     // rendering it if the opener was held back.
                     self.in_think = false;
+                    self.think_status_flush(true);
                     if self.dsml_ignored {
                         self.dsml_ignored = false;
                         self.viz_start();
@@ -1808,6 +1907,7 @@ impl<S: RenderSink> StreamRenderer<S> {
                 } else {
                     self.flush_start_tail();
                     self.in_think = false;
+                    self.think_status_flush(true);
                     self.pseudo_tool.reset_line();
                     self.viz_newline_if_open();
                     self.emit_visible_bytes(b"\n");
@@ -2207,6 +2307,78 @@ mod tests {
         sr.finish();
         assert_eq!(sr.sink().think, "", "thinking suppressed");
         assert_eq!(sr.sink().visible.trim(), "visible answer", "prose kept");
+    }
+
+    #[test]
+    fn first_sentence_stops_at_a_terminator_or_newline_and_waits_otherwise() {
+        assert_eq!(
+            first_sentence("Tests pass. Now the docs.", false).as_deref(),
+            Some("Tests pass.")
+        );
+        assert_eq!(
+            first_sentence("Version 1.5 is fine? Yes", false).as_deref(),
+            Some("Version 1.5 is fine?")
+        );
+        assert_eq!(
+            first_sentence("Need to check group.rs\nthen", false).as_deref(),
+            Some("Need to check group.rs")
+        );
+        assert_eq!(first_sentence("still going", false), None);
+        assert_eq!(
+            first_sentence("still going", true).as_deref(),
+            Some("still going")
+        );
+        let long = "word ".repeat(60);
+        let cut = first_sentence(&long, false).unwrap();
+        assert!(
+            cut.ends_with('…') && cut.chars().count() <= THINK_STATUS_CAP + 1,
+            "{cut}"
+        );
+    }
+
+    #[test]
+    fn hidden_thinking_yields_one_status_line_per_block_when_asked() {
+        let text =
+            "<think>The read shows the trait is missing idle. I will add it.</think>\nAnswer";
+        // Off by default: hidden thinking stays hidden.
+        let mut quiet = StreamRenderer::new(Cap::default());
+        quiet.set_show_thinking(false);
+        quiet.push(text);
+        quiet.finish();
+        assert_eq!(quiet.sink().think, "");
+
+        // On: exactly the first sentence, once, dim, then the answer as usual.
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.set_show_thinking(false);
+        sr.set_think_status(true);
+        for ch in text.chars() {
+            sr.push(ch.to_string());
+        }
+        sr.finish();
+        assert_eq!(
+            sr.sink().think,
+            "The read shows the trait is missing idle.\n"
+        );
+        assert_eq!(sr.sink().visible.trim(), "Answer");
+
+        // A block that ends before any terminator shows what it had.
+        let mut cut = StreamRenderer::new(Cap::default());
+        cut.set_show_thinking(false);
+        cut.set_think_status(true);
+        cut.begin_in_think();
+        cut.push("Checking the fixture");
+        cut.finish();
+        assert_eq!(cut.sink().think, "Checking the fixture\n");
+
+        // With thinking shown, the status peek is inert: the full text streams.
+        let mut shown = StreamRenderer::new(Cap::default());
+        shown.set_think_status(true);
+        shown.push(text);
+        shown.finish();
+        assert_eq!(
+            shown.sink().think,
+            "The read shows the trait is missing idle. I will add it."
+        );
     }
 
     fn run_charwise(text: &str) -> StreamRenderer<Cap> {

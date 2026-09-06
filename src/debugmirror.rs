@@ -163,7 +163,13 @@ fn console_owned_by_this_thread() -> bool {
     let owner = *TEST_OWNER
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    owner.is_none_or(|t| t == std::thread::current().id())
+    // Unclaimed means nobody's: with `is_none_or` here, every test thread
+    // counted as the owner between one console test's `reset()` and its
+    // `use_console()`, so concurrent tests registered sub-agent windows and
+    // bumped the session ordinal under it (`LIVE` held ids 1, 3 and 4 that
+    // the console test never opened). A test that wants the registry claims
+    // the console first.
+    owner.is_some_and(|t| t == std::thread::current().id())
 }
 
 /// Whether this thread may talk to the console: always, outside tests.
@@ -585,6 +591,10 @@ impl SubagentMirror {
 
 impl Drop for SubagentMirror {
     fn drop(&mut self) {
+        // A detached test mirror (see `open_subagent`) owns no registry entry.
+        if !console_owned_by_this_thread() {
+            return;
+        }
         MIRRORS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -618,6 +628,20 @@ impl Drop for ActiveMirror {
 /// mirroring too.
 #[must_use]
 pub fn open_subagent() -> SubagentMirror {
+    // Hermeticity (compiles away outside `cfg(test)`): a test that has not
+    // claimed the fake console must not touch the shared registry or the
+    // session ordinal. Before this guard, such a test's sub-agent took the
+    // same ordinal a console test had just reset to, and its drop removed the
+    // console test's window from `LIVE`, so the console test's reconcile
+    // found nothing to dial — the long-standing "passes alone, fails in the
+    // full run" flake of the backfill tests. Detached ids start far above any
+    // real ordinal and are never registered, so their drop removes nothing.
+    if !console_owned_by_this_thread() {
+        static DETACHED: AtomicUsize = AtomicUsize::new(usize::MAX / 2);
+        return SubagentMirror {
+            id: MirrorId(DETACHED.fetch_add(1, Ordering::Relaxed)),
+        };
+    }
     let ordinal = NEXT_ORDINAL.fetch_add(1, Ordering::Relaxed);
     let id = MirrorId(ordinal);
     let name = subagent_name(&raw_session_name(), ordinal);
@@ -684,11 +708,21 @@ pub(crate) mod test_support {
     /// Releasing it also drops any stand-in console the test claimed, so a
     /// panicking test cannot leave the next one talking to a dead listener.
     pub fn lock() -> ConsoleTestGuard {
-        ConsoleTestGuard(
-            TEST_LOCK
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+        let guard = TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Holding the lock *is* owning the console: claim it here, so the
+        // registry is this thread's from the first line of the test, and no
+        // other thread's `open_subagent` or `set_session_id` reaches it in
+        // the gap before `use_console`.
+        claim();
+        ConsoleTestGuard(guard)
+    }
+
+    fn claim() {
+        *TEST_OWNER
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::thread::current().id());
     }
 
     /// See [`lock`].
@@ -707,10 +741,7 @@ pub(crate) mod test_support {
     /// thread claims it, so tests running in parallel neither dial it nor
     /// write into its windows (see `TEST_OWNER`).
     pub fn use_console(port: u16) {
-        *TEST_OWNER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            (port != 0).then(|| std::thread::current().id());
+        claim();
         CONTROL_PORT.store(port, Ordering::Relaxed);
     }
 
@@ -721,9 +752,9 @@ pub(crate) mod test_support {
         NEXT_ORDINAL.store(1, Ordering::Relaxed);
         CURRENT.with(|c| c.set(MirrorId::PARENT));
         CONTROL_PORT.store(0, Ordering::Relaxed);
-        *TEST_OWNER
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // The caller holds the lock (see `lock`), so the registry it just
+        // cleared stays its own; only the guard's drop releases ownership.
+        claim();
     }
 
     /// Reads whatever plank has written so far (non-blocking after a short

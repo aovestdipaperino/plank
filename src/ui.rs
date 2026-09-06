@@ -611,6 +611,39 @@ const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same re
 
 const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
 
+/// Consecutive repeat-guard stops a sub-agent may take before it is asked for
+/// its report instead of another attempt. At temperature 0 a pass is a pure
+/// function of the prompt, and the guard's error changes that prompt by one
+/// message, so a sidechain that has looped twice running will loop again
+/// (`repro-1788690439`: 23 minutes of it). The final-round reminder is a
+/// larger change of prompt than another error, and whatever it produces is
+/// the report, so the parent keeps the work done so far.
+const SUBAGENT_REPEAT_TRIP_CAP: usize = 2;
+
+/// Reported to the parent when the forced report pass looped as well.
+const REPEAT_TRIPS_NOTICE: &str =
+    "sub-agent stopped: its reasoning looped on every pass, including the final report pass";
+
+/// The red line the main window shows when a guard stops a pass: which guard
+/// did what, and whose pass it was. `label` names the sub-agent, or is `None`
+/// in the main turn.
+fn guard_notice(what: &str, label: Option<&str>) -> String {
+    match label {
+        Some(l) => format!("guard: {what} in sub-agent '{l}'"),
+        None => format!("guard: {what}"),
+    }
+}
+
+/// What the repeat guard did, worded for [`guard_notice`]: the count matters
+/// once it is more than one, because that is when the cap is closing in.
+fn repeat_trip_text(trips: usize) -> String {
+    if trips > 1 {
+        format!("stopped a reasoning loop ({trips} in a row)")
+    } else {
+        "stopped a reasoning loop".to_owned()
+    }
+}
+
 /// Per-chunk bookkeeping shared by every generation site: refreshes the
 /// greedy-sampling flag from the renderer, feeds the repetition guard while
 /// the model is thinking, and reports whether the pass must stop — because
@@ -867,6 +900,12 @@ struct FanoutSlot {
     pending_calls: Vec<ToolCall>,
     done: bool,
     error: Option<String>,
+    /// Consecutive passes the repeat guard stopped; see
+    /// [`SUBAGENT_REPEAT_TRIP_CAP`].
+    trips: usize,
+    /// The cap was reached and the final-round reminder is in the session: the
+    /// next pass is the report, whatever it asks for.
+    force_final: bool,
     /// This slot's console window. Opened on the main thread so ordinals
     /// follow block order, then borrowed by the slot's generation thread.
     mirror: crate::debugmirror::SubagentMirror,
@@ -1176,10 +1215,10 @@ fn generate_fanout_round(
     width: usize,
     ctx: &PassCtx<'_>,
     cwd: &std::path::Path,
-) -> Vec<Option<Result<QuietPass, String>>> {
-    let mut passes: Vec<Option<Result<QuietPass, String>>> = Vec::new();
+) -> Vec<Option<Result<QuietPass, QuietAbort>>> {
+    let mut passes: Vec<Option<Result<QuietPass, QuietAbort>>> = Vec::new();
     for (slot_chunk, prep_chunk) in slots.chunks_mut(width).zip(prepared.chunks(width)) {
-        let mut chunk: Vec<Option<Result<QuietPass, String>>> =
+        let mut chunk: Vec<Option<Result<QuietPass, QuietAbort>>> =
             (0..slot_chunk.len()).map(|_| None).collect();
         let mut texts: Vec<(usize, String)> = Vec::new();
         // A console that appeared mid-fan-out: each slot's window is dialed by
@@ -1243,7 +1282,7 @@ fn generate_fanout_round(
                 chunk[i] = Some(
                     handle
                         .join()
-                        .unwrap_or_else(|_| Err("sub-agent panicked".to_string())),
+                        .unwrap_or_else(|_| Err(QuietAbort::new("sub-agent panicked"))),
                 );
                 // Buffered here and applied after the scope: the spawned threads
                 // hold `&mut` on the slots until it ends.
@@ -1468,40 +1507,6 @@ fn append_advisories(nudges: &[crate::guard::Nudge], mut observations: String) -
             let _ = writeln!(observations, "[loop guard] {text}");
         }
     }
-    observations
-}
-
-/// What the user actually saw of an assistant pass: the prose outside any
-/// thinking and before the tool-call markup. A local model's chat template
-/// pre-opens `<think>` without emitting the tag, so a pass may carry a bare
-/// `</think>`; everything up to the last one is thinking either way.
-fn narration(text: &str) -> String {
-    const CLOSE: &str = "</think>";
-    const CALLS: &str = "<｜DSML｜tool_calls>";
-    let stripped = strip_thinking(text);
-    let after_think = stripped
-        .rfind(CLOSE)
-        .map_or(stripped.as_str(), |i| &stripped[i + CLOSE.len()..]);
-    let before_calls = after_think
-        .find(CALLS)
-        .map_or(after_think, |i| &after_think[..i]);
-    before_calls.trim().to_owned()
-}
-
-/// Appended to a stanza's results when the pass that emitted it said nothing
-/// visible. The system prompt asks for a status line every round; a model
-/// that keeps everything inside its thinking needs the reminder where it is
-/// deciding what to write next, and the user needs it because the tool
-/// summary lines are otherwise all they see (a 16-round turn of "Ran 1 shell
-/// command" prompted this).
-const NARRATION_NUDGE: &str = "[status] Your last message had no text outside your thinking, so the user saw only a tool count. Before your next tool calls, write one or two plain sentences for the user: what these results told you and what you are doing now.";
-
-fn append_narration_nudge(mut observations: String) -> String {
-    if !observations.ends_with('\n') {
-        observations.push('\n');
-    }
-    observations.push_str(NARRATION_NUDGE);
-    observations.push('\n');
     observations
 }
 
@@ -2109,6 +2114,43 @@ impl Agent<'_> {
         }
     }
 
+    /// `text` in the error colour for the plain REPL (bold red), or bare
+    /// without colour.
+    fn error_line(&self, text: &str) -> String {
+        if self.color {
+            format!("\x1b[1;31m{text}{ANSI_RESET}")
+        } else {
+            text.to_owned()
+        }
+    }
+
+    /// Puts a guard notice on the **main** window in red, whichever front end
+    /// is showing it, naming the running sub-agent when there is one. A guard
+    /// stop used to be visible only as a tool error inside the sidechain's
+    /// pane (or nowhere, on the plain REPL), so a parent waiting on a looping
+    /// sub-agent looked hung.
+    ///
+    /// The TUI gets an ordinary [`UiEvent::Error`], which lands in the main log
+    /// and on the remote bus rather than in the sub-agent pane; the plain REPL
+    /// prints it; the headless protocol path shows nothing, as it shows
+    /// nothing else.
+    fn report_guard(&self, what: &str) {
+        self.report_guard_for(self.tool_ctx.subagent_label.as_deref(), what);
+    }
+
+    /// [`report_guard`](Self::report_guard) for an explicitly named sub-agent —
+    /// a fan-out slot, which is not the innermost serial sub-agent.
+    fn report_guard_for(&self, label: Option<&str>, what: &str) {
+        let line = guard_notice(what, label);
+        match &self.sub_sink {
+            SubSinkTarget::Events(tx) => {
+                let _ = tx.send(UiEvent::Error(line));
+            }
+            SubSinkTarget::Stdout => println!("{}", self.error_line(&line)),
+            SubSinkTarget::Null => {}
+        }
+    }
+
     /// Collects image embeddings from the transcript and hands them to the
     /// engine via [`Engine::set_pending_images`], so the engine can append
     /// image tokens alongside the matching section text during `reconcile`.
@@ -2358,19 +2400,7 @@ impl Agent<'_> {
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
         let needs_engine =
             |c: &ToolCall| c.name == "agent" || c.name == "fanout" || c.name == "view_image";
-        // The pass that produced these calls is the last transcript message.
-        // If it said nothing outside its thinking, the user saw only a tool
-        // count; the reminder rides on the results, where the model reads it
-        // right before deciding what to write next.
-        let silent = self.session.transcript.last().is_some_and(|m| {
-            m.role == crate::session::Role::Assistant && narration(&m.text).is_empty()
-        });
-        let observations = self.dispatch_stanza(calls, &nudges, has_block, needs_engine);
-        if silent {
-            append_narration_nudge(observations)
-        } else {
-            observations
-        }
+        self.dispatch_stanza(calls, &nudges, has_block, needs_engine)
     }
 
     /// The dispatch half of [`Self::run_tool_calls`]: routes the stanza to
@@ -2565,10 +2595,12 @@ impl Agent<'_> {
             task: task.clone(),
         });
         self.tool_ctx.subagent_depth += 1;
+        let outer_label = self.tool_ctx.subagent_label.replace(label.clone());
         let (done, result) = match alt {
             None => self.run_subagent_loop(),
             Some((key, engine)) => self.run_sidechain_on(key, engine, Self::run_subagent_loop),
         };
+        self.tool_ctx.subagent_label = outer_label;
         self.tool_ctx.subagent_depth -= 1;
         let isolation_note = self.end_agent_isolation(isolation);
         self.emit_sub(crate::worker::UiEvent::SubEnd);
@@ -2747,33 +2779,67 @@ impl Agent<'_> {
     fn run_subagent_rounds(&mut self) -> Result<(), String> {
         const MAX_ROUNDS: usize = 40;
         let turn_start = Instant::now();
+        // Consecutive passes the repeat guard stopped, and whether the cap
+        // turned the next pass into the report.
+        let mut trips = 0usize;
+        let mut force_final = false;
         for round in 0..MAX_ROUNDS {
             // On the last permitted round, ask for the report instead of letting
             // the budget simply run out: a sub-agent that calls a tool on every
             // pass would otherwise hand the parent an error and throw away
             // everything it found.
             let last_round = round + 1 == MAX_ROUNDS;
-            if last_round {
+            if last_round && !force_final {
                 self.session
                     .push(Message::user(crate::agents::final_round_reminder()));
             }
             let prompt_text = render_transcript(&self.session, &self.system);
-            let (calls, assistant_text, err) = self.generate_quiet(&prompt_text, turn_start)?;
-            self.session.push(Message::assistant(assistant_text));
-            if last_round {
-                // Whatever it asked for, this text is the report.
-                return Ok(());
+            let pass = match self.generate_quiet(&prompt_text, turn_start) {
+                Ok(pass) => pass,
+                Err(abort) => {
+                    // What the model had said when it was stopped stays in the
+                    // sidechain for the dump; the fork end truncates it out of
+                    // the parent's transcript as usual.
+                    if !abort.partial.is_empty() {
+                        self.session.push(Message::assistant(abort.partial));
+                    }
+                    return Err(abort.error);
+                }
+            };
+            self.session.push(Message::assistant(pass.assistant_text));
+            if pass.looped {
+                trips += 1;
+                self.report_guard(&repeat_trip_text(trips));
+            } else {
+                trips = 0;
             }
-            if let Some(payload) = err {
+            if last_round || force_final {
+                // Whatever it asked for, this text is the report — unless the
+                // guard stopped this pass too, in which case there is none.
+                return if pass.looped {
+                    Err(REPEAT_TRIPS_NOTICE.to_owned())
+                } else {
+                    Ok(())
+                };
+            }
+            if let Some(payload) = pass.tool_error {
                 self.session.push(Message::user(format!(
                     "<tool_result>{payload}</tool_result>"
                 )));
+                if trips >= SUBAGENT_REPEAT_TRIP_CAP {
+                    self.report_guard(&format!(
+                        "asked for the report after {trips} loops in a row"
+                    ));
+                    self.session
+                        .push(Message::user(crate::agents::final_round_reminder()));
+                    force_final = true;
+                }
                 continue;
             }
-            if calls.is_empty() {
+            if pass.calls.is_empty() {
                 return Ok(());
             }
-            let observations = self.run_tool_calls(&calls);
+            let observations = self.run_tool_calls(&pass.calls);
             self.sync_tasks_after_dispatch();
             // The sidechain has no UI to drain these into; discard so they never
             // leak onto the parent turn's screen.
@@ -2788,6 +2854,7 @@ impl Agent<'_> {
             // Same circuit breaker as the main loops; the parent is told why
             // the sub-agent stopped rather than waiting out all 40 rounds.
             if self.loop_guard.tripped() {
+                self.report_guard(LOOP_TRIPPED_NOTICE);
                 return Err(LOOP_TRIPPED_NOTICE.to_owned());
             }
         }
@@ -2805,7 +2872,7 @@ impl Agent<'_> {
         &mut self,
         prompt_text: &str,
         _turn_start: Instant,
-    ) -> Result<(Vec<ToolCall>, String, Option<String>), String> {
+    ) -> Result<QuietPass, QuietAbort> {
         // A console that appeared since the last pass: pick it up here too, so
         // a sub-agent's window is backfilled with its own slice.
         let reconciled = crate::debugmirror::reconcile();
@@ -2822,6 +2889,9 @@ impl Agent<'_> {
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
+            // The serial path has exactly one sub-agent in flight, so its pass
+            // is the one the footer and its roster row describe.
+            status: self.pass_status_ctx(),
         };
         let preflight = edit_preflight(&self.tool_ctx);
         self.sync_engine_images();
@@ -2835,7 +2905,21 @@ impl Agent<'_> {
         )?;
         self.record_usage(&pass.stats);
         self.last_ctx_used = pass.stats.ctx_used;
-        Ok((pass.calls, pass.assistant_text, pass.tool_error))
+        Ok(pass)
+    }
+
+    /// The footer plumbing a quiet pass publishes live status through, when a
+    /// front end is listening: the TUI's worker→UI channel plus the figures a
+    /// [`Status`] carries that the pass cannot read for itself.
+    fn pass_status_ctx(&self) -> Option<PassStatusCtx> {
+        let SubSinkTarget::Events(tx) = &self.sub_sink else {
+            return None;
+        };
+        Some(PassStatusCtx {
+            tx: tx.clone(),
+            power_percent: self.power_percent,
+            think: self.think,
+        })
     }
 
     /// Builds the render sink a sub-agent pass writes through, per the current
@@ -2862,9 +2946,32 @@ struct QuietPass {
     assistant_text: String,
     /// A preflight or parse error to feed back as a tool result.
     tool_error: Option<String>,
+    /// The repetition guard stopped this pass ([`REPEAT_LOOP_ERROR`]); the
+    /// sub-agent loops count these to know when to stop retrying.
+    looped: bool,
     /// Returned rather than recorded, because usage accounting lives on the
     /// `Agent` and a pass may run on a thread that cannot touch it.
     stats: crate::engine::GenerationStats,
+}
+
+/// Why a quiet pass ended with nothing to feed back: the engine failed, or the
+/// user interrupted it. Carries whatever the model had said by then, so a
+/// sidechain dump can show what the sub-agent was doing when it was stopped —
+/// the main loop keeps its partial text on interrupt, and a sidechain that
+/// dropped it left the one question a `/repro` exists to answer unanswerable.
+#[derive(Debug)]
+struct QuietAbort {
+    error: String,
+    partial: String,
+}
+
+impl QuietAbort {
+    fn new(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+            partial: String::new(),
+        }
+    }
 }
 
 /// The `Agent`-derived inputs a quiet pass needs, gathered on the main thread so
@@ -2874,6 +2981,139 @@ struct PassCtx<'a> {
     think_off: bool,
     thinking_tool_calls: bool,
     tool_names: Vec<String>,
+    /// Where to publish live [`Status`] snapshots, or `None` to run silently.
+    /// Set for a lone sub-agent, whose pass is the one the footer and its
+    /// roster row describe; left `None` by the parallel fan-out, whose several
+    /// passes have no honest single row to land on (`SubPane::note_status`).
+    status: Option<PassStatusCtx>,
+}
+
+/// The footer plumbing for a quiet pass's live status: the channel and the
+/// figures a [`Status`] carries that the pass cannot read for itself.
+struct PassStatusCtx {
+    tx: Sender<UiEvent>,
+    power_percent: i32,
+    think: crate::engine::ThinkMode,
+}
+
+/// Builds the [`Status`] snapshots a generation pass publishes as it runs, from
+/// the engine's events. Shared by the TUI main pass and the sub-agent quiet
+/// pass so the progress line and a roster row say the same thing about the same
+/// pass — a sub-agent's pass used to publish nothing, and its row then sat on a
+/// frozen token count for the minutes a long local pass takes, which reads as a
+/// hang rather than as "still generating".
+struct LiveStatus {
+    /// Prompt tokens already in context; generated tokens add onto this so the
+    /// ctx gauge moves while the model streams.
+    prompt_tokens: i32,
+    gen_count: i32,
+    /// The first token out and the count then, so the live decode rate is
+    /// measured over the decode phase alone (`crate::engine::rate_since`).
+    gen_mark: Option<(Instant, i32)>,
+    /// Carried across events so every snapshot keeps the running figures, not
+    /// just the one built by a Spec event.
+    spec: crate::engine::SpecStats,
+    /// Stable spinner verb for this pass.
+    verb: u32,
+    started: Instant,
+    ctx_size: i32,
+    power_percent: i32,
+    think: crate::engine::ThinkMode,
+    model_name: String,
+}
+
+impl LiveStatus {
+    fn new(
+        prompt_tokens: i32,
+        started: Instant,
+        ctx_size: i32,
+        power_percent: i32,
+        think: crate::engine::ThinkMode,
+        model_name: String,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            gen_count: 0,
+            gen_mark: None,
+            spec: crate::engine::SpecStats::default(),
+            verb: status::random_verb_index(),
+            started,
+            ctx_size,
+            power_percent,
+            think,
+            model_name,
+        }
+    }
+
+    /// The snapshot for one engine event, or `None` for events that do not
+    /// warrant a repaint on their own. `thinking`, `greedy` and `looping` are
+    /// the stream renderer's and repeat guard's view *after* the event's text
+    /// was pushed through them.
+    fn on_event(
+        &mut self,
+        ev: &EngineEvent,
+        thinking: bool,
+        greedy: bool,
+        looping: bool,
+    ) -> Option<Status> {
+        match ev {
+            EngineEvent::Text(_) => {
+                self.gen_count += 1;
+                if self.gen_mark.is_none() {
+                    self.gen_mark = Some((Instant::now(), self.gen_count));
+                }
+                Some(Status {
+                    spec: self.spec,
+                    state: WorkerState::Generating,
+                    generated: self.gen_count,
+                    prefill_label: self.verb,
+                    thinking,
+                    gen_tps: crate::engine::rate_since(self.gen_mark, self.gen_count),
+                    elapsed_secs: self.started.elapsed().as_secs_f64(),
+                    ctx_used: self.prompt_tokens + self.gen_count,
+                    ctx_size: self.ctx_size,
+                    power_percent: self.power_percent,
+                    think: self.think,
+                    greedy_sampling: greedy,
+                    looping,
+                    ..Status::default()
+                })
+            }
+            EngineEvent::Prefill(p) => {
+                // Every sample feeds the totals; see the plain path.
+                crate::speeds::note_prefill_progress(&self.model_name, p.done, p.tps);
+                Some(Status {
+                    // A completed prefill is the sampling wait, not prefilling
+                    // (#64 follow-up).
+                    state: if p.is_complete() {
+                        WorkerState::Generating
+                    } else {
+                        WorkerState::Prefill
+                    },
+                    prefill_done: p.done,
+                    prefill_total: p.total,
+                    prefill_label: self.verb,
+                    thinking,
+                    prefill_tps: p.tps,
+                    elapsed_secs: self.started.elapsed().as_secs_f64(),
+                    ctx_used: self.prompt_tokens,
+                    ctx_size: self.ctx_size,
+                    power_percent: self.power_percent,
+                    think: self.think,
+                    ..Status::default()
+                })
+            }
+            // Warm-up-only signal; never emitted mid-turn.
+            EngineEvent::Notice(_) => None,
+            // Counters only: the footer picks them up on the next status a
+            // token produces, so a Spec event does not itself force a repaint
+            // on every speculative step.
+            EngineEvent::Spec(sp) => {
+                self.spec = *sp;
+                None
+            }
+        }
+    }
 }
 
 /// Runs one quiet generation against `engine`, with no stdout/TUI output beyond
@@ -2891,7 +3131,7 @@ fn generate_pass(
     ctx: &PassCtx<'_>,
     sink: Box<dyn crate::viz::RenderSink + Send>,
     preflight: impl FnMut(&ToolCall) -> Result<(), String> + 'static,
-) -> Result<QuietPass, String> {
+) -> Result<QuietPass, QuietAbort> {
     // Held for the whole pass, so the status bar's brain blinks while *this*
     // engine works — and stops when the pass ends, however it ends. A sidechain
     // on a `provider: local` definition swaps the engine before getting here, so
@@ -2913,6 +3153,18 @@ fn generate_pass(
     let preflight_stop = AtomicBool::new(false);
     let greedy = AtomicBool::new(false);
     let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+    // Counting the prompt only when someone is listening: it tokenizes the
+    // whole rendered transcript.
+    let mut live = ctx.status.as_ref().map(|sc| {
+        LiveStatus::new(
+            engine.count_tokens(prompt_text),
+            Instant::now(),
+            engine.ctx_size(),
+            sc.power_percent,
+            sc.think,
+            engine.model_name(),
+        )
+    });
     let st;
     let prompt = match bufs {
         Some(b) => {
@@ -2926,33 +3178,63 @@ fn generate_pass(
         }
         None => crate::engine::Prompt::Flat(prompt_text),
     };
-    let stats = engine
-        .generate(
-            prompt,
-            ctx.opts,
-            &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
-            &|| greedy.load(Ordering::Relaxed),
-            &mut |ev| {
-                if let EngineEvent::Text(t) = ev {
-                    assistant_text.push_str(&t);
-                    stream.push(&t);
-                    // Tee to whichever console window this thread is routed to
-                    // — a sub-agent's when a `SubagentMirror` guard is active,
-                    // the parent's otherwise.
-                    crate::debugmirror::push(&t);
-                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
-                        preflight_stop.store(true, Ordering::Relaxed);
-                    }
+    let stats = engine.generate(
+        prompt,
+        ctx.opts,
+        &|| preflight_stop.load(Ordering::Relaxed) || crate::interrupt::pending(),
+        &|| greedy.load(Ordering::Relaxed),
+        &mut |ev| {
+            if let EngineEvent::Text(t) = &ev {
+                assistant_text.push_str(t);
+                stream.push(t);
+                // Tee to whichever console window this thread is routed to
+                // — a sub-agent's when a `SubagentMirror` guard is active,
+                // the parent's otherwise.
+                crate::debugmirror::push(t);
+                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy) {
+                    preflight_stop.store(true, Ordering::Relaxed);
                 }
-            },
-        )
-        .map_err(|e| e.to_string())?;
+            }
+            if let (Some(live), Some(sc)) = (live.as_mut(), ctx.status.as_ref())
+                && let Some(status) = live.on_event(
+                    &ev,
+                    stream.in_think(),
+                    greedy.load(Ordering::Relaxed),
+                    repeat.repeating(),
+                )
+            {
+                let _ = sc.tx.send(UiEvent::Status(status));
+            }
+        },
+    );
+    let stats = match stats {
+        Ok(stats) => stats,
+        Err(e) => {
+            return Err(QuietAbort {
+                error: e.to_string(),
+                partial: assistant_text,
+            });
+        }
+    };
     stream.finish();
     crate::debugmirror::flush();
+    finish_quiet_pass(&stream, assistant_text, stats)
+}
+
+/// Shapes a finished quiet pass into what the sub-agent loops act on: an
+/// interrupt (with the partial text), a tool error to feed back, or the calls.
+fn finish_quiet_pass<S: RenderSink>(
+    stream: &StreamRenderer<S>,
+    mut assistant_text: String,
+    stats: crate::engine::GenerationStats,
+) -> Result<QuietPass, QuietAbort> {
     let preflight_error = stream.preflight_error().map(str::to_owned);
     if stats.interrupted && preflight_error.is_none() {
         crate::interrupt::clear();
-        return Err("interrupted".to_string());
+        return Err(QuietAbort {
+            error: "interrupted".to_string(),
+            partial: assistant_text,
+        });
     }
     let finished = stream.finished();
     let ended_in_think = finished.ended_in_think;
@@ -2966,6 +3248,7 @@ fn generate_pass(
             calls: Vec::new(),
             assistant_text,
             tool_error: Some(payload),
+            looped: preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR),
             stats,
         });
     }
@@ -2975,6 +3258,7 @@ fn generate_pass(
         calls,
         assistant_text,
         tool_error: None,
+        looped: false,
         stats,
     })
 }
@@ -3062,10 +3346,11 @@ impl Agent<'_> {
             self.payload_dirty = true;
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
-            if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR)
-                && let Some(line) = self.loop_repro_line()
-            {
-                println!("{}", self.debug_line(&line));
+            if preflight_error.as_deref() == Some(REPEAT_LOOP_ERROR) {
+                self.report_guard(&repeat_trip_text(1));
+                if let Some(line) = self.loop_repro_line() {
+                    println!("{}", self.debug_line(&line));
+                }
             }
             let st = Status {
                 state: if stats.interrupted {
@@ -3158,9 +3443,10 @@ impl Agent<'_> {
                     return Ok(());
                 }
                 if self.loop_guard.tripped() {
-                    for line in self.loop_tripped_lines() {
+                    if let Some(line) = self.loop_repro_line() {
                         println!("{}", self.debug_line(&line));
                     }
+                    self.report_guard(LOOP_TRIPPED_NOTICE);
                     return Ok(());
                 }
                 continue;
@@ -4438,6 +4724,13 @@ impl Agent<'_> {
         stream.set_show_tool_calls(settings.ui.show_tool_calls && !self.quiet_tools);
         stream.set_show_write_preview(!self.quiet_tools);
         stream.set_show_thinking(settings.ui.show_thinking);
+        // With thinking hidden, a pass that follows a tool result shows the
+        // first sentence of its thinking as a dim status line, so a long
+        // tool-calling turn reads as progress instead of a column of counts.
+        let after_tool_result = self.session.transcript.last().is_some_and(|m| {
+            m.role == crate::session::Role::User && m.text.starts_with("<tool_result>")
+        });
+        stream.set_think_status(!settings.ui.show_thinking && after_tool_result);
         stream.set_thinking_tool_calls(settings.engine.thinking_tool_calls);
         stream.set_tool_names(sysprompt::tool_names(&self.tool_ctx.mcp));
         stream.set_preflight(edit_preflight(&self.tool_ctx));
@@ -6918,20 +7211,6 @@ the original is frozen and listed in /tree"
         format!("{}; path copied to clipboard]", &line[..line.len() - 1])
     }
 
-    /// The line to show when the loop guard has tripped (three stanzas in a
-    /// row refused in full): the automatic loop dump, if one was written,
-    /// followed by why the turn is ending. The model's last pass and the
-    /// refusals are already in the transcript, so a `/resume` or a fresh
-    /// prompt continues from a consistent state.
-    fn loop_tripped_lines(&mut self) -> Vec<String> {
-        let mut lines = Vec::new();
-        if let Some(line) = self.loop_repro_line() {
-            lines.push(line);
-        }
-        lines.push(LOOP_TRIPPED_NOTICE.to_owned());
-        lines
-    }
-
     /// The `[repro written to …]` line, naming the sidecars when there are any.
     fn repro_written_line(path: &std::path::Path, sidecars: usize) -> String {
         match sidecars {
@@ -7452,6 +7731,8 @@ the original is frozen and listed in /tree"
                         pending_calls: Vec::new(),
                         done: false,
                         error: None,
+                        trips: 0,
+                        force_final: false,
                         mirror: crate::debugmirror::open_subagent(),
                     });
                 }
@@ -7526,6 +7807,8 @@ the original is frozen and listed in /tree"
             think_off: matches!(self.think, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
+            // Several passes in flight: no single row for a snapshot to land on.
+            status: None,
         };
         let cwd = self.tool_ctx.cwd.clone();
         for round in 0..MAX_ROUNDS {
@@ -7537,7 +7820,7 @@ the original is frozen and listed in /tree"
             // budget simply run out would discard all its work.
             let last_round = round + 1 == MAX_ROUNDS;
             if last_round {
-                for slot in slots.iter_mut().filter(|s| !s.done) {
+                for slot in slots.iter_mut().filter(|s| !s.done && !s.force_final) {
                     slot.session
                         .push(Message::user(crate::agents::final_round_reminder()));
                 }
@@ -7565,27 +7848,8 @@ the original is frozen and listed in /tree"
 
             // Phase 3, main thread only: fold results in, then dispatch tools.
             for (slot, pass) in slots.iter_mut().zip(passes) {
-                let Some(pass) = pass else { continue };
-                match pass {
-                    Err(e) => {
-                        slot.error = Some(e);
-                        slot.done = true;
-                    }
-                    Ok(pass) => {
-                        self.fold_fanout_usage(slot, pass.stats.usage);
-                        slot.session.push(Message::assistant(pass.assistant_text));
-                        if last_round {
-                            slot.done = true;
-                        } else if let Some(payload) = pass.tool_error {
-                            slot.session.push(Message::user(format!(
-                                "<tool_result>{payload}</tool_result>"
-                            )));
-                        } else if pass.calls.is_empty() {
-                            slot.done = true;
-                        } else {
-                            slot.pending_calls = pass.calls;
-                        }
-                    }
+                if let Some(pass) = pass {
+                    self.fold_fanout_pass(slot, pass, last_round);
                 }
             }
             // Collect the work first so no slot borrow is held across
@@ -7616,6 +7880,59 @@ the original is frozen and listed in /tree"
         // becomes its report — nothing is invented here.
         for slot in slots.iter_mut() {
             slot.done = true;
+        }
+    }
+
+    /// Folds one slot's pass into its session and state: the same rules as the
+    /// serial [`run_subagent_rounds`](Self::run_subagent_rounds), per slot.
+    fn fold_fanout_pass(
+        &mut self,
+        slot: &mut FanoutSlot,
+        pass: Result<QuietPass, QuietAbort>,
+        last_round: bool,
+    ) {
+        let pass = match pass {
+            Err(abort) => {
+                // Keep what it had said for the slot's dump.
+                if !abort.partial.is_empty() {
+                    slot.session.push(Message::assistant(abort.partial));
+                }
+                slot.error = Some(abort.error);
+                slot.done = true;
+                return;
+            }
+            Ok(pass) => pass,
+        };
+        self.fold_fanout_usage(slot, pass.stats.usage);
+        slot.session.push(Message::assistant(pass.assistant_text));
+        if pass.looped {
+            slot.trips += 1;
+            self.report_guard_for(Some(&slot.label), &repeat_trip_text(slot.trips));
+        } else {
+            slot.trips = 0;
+        }
+        if last_round || slot.force_final {
+            if pass.looped {
+                slot.error = Some(REPEAT_TRIPS_NOTICE.to_owned());
+            }
+            slot.done = true;
+        } else if let Some(payload) = pass.tool_error {
+            slot.session.push(Message::user(format!(
+                "<tool_result>{payload}</tool_result>"
+            )));
+            if slot.trips >= SUBAGENT_REPEAT_TRIP_CAP {
+                self.report_guard_for(
+                    Some(&slot.label),
+                    &format!("asked for the report after {} loops in a row", slot.trips),
+                );
+                slot.session
+                    .push(Message::user(crate::agents::final_round_reminder()));
+                slot.force_final = true;
+            }
+        } else if pass.calls.is_empty() {
+            slot.done = true;
+        } else {
+            slot.pending_calls = pass.calls;
         }
     }
 
@@ -11109,10 +11426,11 @@ impl Agent<'_> {
             let _ = tx.send(UiEvent::EndLine);
             // The looping text is in the transcript now: dump it before the
             // error goes back to the model and the turn moves on.
-            if out.error.as_ref().is_some_and(|e| e.looped)
-                && let Some(line) = self.loop_repro_line()
-            {
-                let _ = tx.send(UiEvent::Dim(line));
+            if out.error.as_ref().is_some_and(|e| e.looped) {
+                self.report_guard(&repeat_trip_text(1));
+                if let Some(line) = self.loop_repro_line() {
+                    let _ = tx.send(UiEvent::Dim(line));
+                }
             }
             if out.interrupted {
                 crate::interrupt::clear();
@@ -11174,9 +11492,10 @@ impl Agent<'_> {
                     return Ok(());
                 }
                 if self.loop_guard.tripped() {
-                    for line in self.loop_tripped_lines() {
+                    if let Some(line) = self.loop_repro_line() {
                         let _ = tx.send(UiEvent::Dim(line));
                     }
+                    self.report_guard(LOOP_TRIPPED_NOTICE);
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -11441,27 +11760,19 @@ impl Agent<'_> {
         // stream renderer is inside a DSML tool-call stanza.
         let greedy = AtomicBool::new(false);
         let mut repeat = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
-        let ctx_size = self.engine.ctx_size();
-        let power = self.power_percent;
-        let think = self.think;
         // Bound before the event closure, which cannot borrow `self` while
-        // `self.engine` is generating.
-        let model_name = self.engine.model_name();
-        // Prompt tokens already in context; generated tokens add onto this so
-        // the ctx gauge moves while the model streams.
-        let prompt_tokens = self.engine.count_tokens(prompt);
+        // `self.engine` is generating. The elapsed clock is the turn's, so the
+        // footer's seconds accumulate across the generate → tools → generate
+        // loop instead of restarting per pass.
+        let mut live = LiveStatus::new(
+            self.engine.count_tokens(prompt),
+            turn_start,
+            self.engine.ctx_size(),
+            self.power_percent,
+            self.think,
+            self.engine.model_name(),
+        );
         let mut assistant_text = String::new();
-        let mut gen_count = 0;
-        // Carried across events so every published status keeps showing the
-        // running figures, not just the one built by a Spec event.
-        let mut spec = crate::engine::SpecStats::default();
-        let verb = status::random_verb_index();
-        // Marks the first token out, so the live decode rate is measured over the
-        // decode phase alone. Anchoring it at the pass's start instead folded in
-        // the sync/prefill and the time-to-first-token, which on a long prompt
-        // showed a rate far below the real one that only crept up as the pass
-        // ran (`crate::engine::rate_since`).
-        let mut gen_mark: Option<(Instant, i32)> = None;
 
         let interrupt = || {
             shared.interrupt.load(Ordering::Relaxed)
@@ -11470,72 +11781,24 @@ impl Agent<'_> {
                 || crate::interrupt::pending()
         };
         let greedy_fn = || greedy.load(Ordering::Relaxed);
-        let mut on_event = |ev| {
-            let status = match ev {
-                EngineEvent::Text(t) => {
-                    assistant_text.push_str(&t);
-                    stream.push(&t);
-                    // See `stream_generation`: same tee, TUI side.
-                    crate::debugmirror::push(&t);
-                    if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
-                        preflight_stop.store(true, Ordering::Relaxed);
-                    }
-                    gen_count += 1;
-                    if gen_mark.is_none() {
-                        gen_mark = Some((Instant::now(), gen_count));
-                    }
-                    Status {
-                        spec,
-                        state: WorkerState::Generating,
-                        generated: gen_count,
-                        prefill_label: verb,
-                        thinking: stream.in_think(),
-                        gen_tps: crate::engine::rate_since(gen_mark, gen_count),
-                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                        ctx_used: prompt_tokens + gen_count,
-                        ctx_size,
-                        power_percent: power,
-                        think,
-                        greedy_sampling: greedy.load(Ordering::Relaxed),
-                        looping: repeat.repeating(),
-                        ..Status::default()
-                    }
+        let mut on_event = |ev: EngineEvent| {
+            if let EngineEvent::Text(t) = &ev {
+                assistant_text.push_str(t);
+                stream.push(t);
+                // See `stream_generation`: same tee, TUI side.
+                crate::debugmirror::push(t);
+                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy) {
+                    preflight_stop.store(true, Ordering::Relaxed);
                 }
-                EngineEvent::Prefill(p) => {
-                    // Every sample feeds the totals; see the plain path.
-                    crate::speeds::note_prefill_progress(&model_name, p.done, p.tps);
-                    Status {
-                        // See the plain-REPL path: a completed prefill is the
-                        // sampling wait, not prefilling (#64 follow-up).
-                        state: if p.is_complete() {
-                            WorkerState::Generating
-                        } else {
-                            WorkerState::Prefill
-                        },
-                        prefill_done: p.done,
-                        prefill_total: p.total,
-                        prefill_label: verb,
-                        thinking: stream.in_think(),
-                        prefill_tps: p.tps,
-                        elapsed_secs: turn_start.elapsed().as_secs_f64(),
-                        ctx_used: prompt_tokens,
-                        ctx_size,
-                        power_percent: power,
-                        think,
-                        ..Status::default()
-                    }
-                }
-                // Warm-up-only signal; never emitted mid-turn.
-                EngineEvent::Notice(_) => return,
-                // Counters only: the footer picks them up on the next status a
-                // token produces, so a Spec event does not itself force a
-                // repaint on every speculative step.
-                EngineEvent::Spec(s) => {
-                    spec = s;
-                    return;
-                }
-            };
-            let _ = tx.send(UiEvent::Status(status));
+            }
+            if let Some(status) = live.on_event(
+                &ev,
+                stream.in_think(),
+                greedy.load(Ordering::Relaxed),
+                repeat.repeating(),
+            ) {
+                let _ = tx.send(UiEvent::Status(status));
+            }
         };
         // Provider engines take a structured turn; local engines keep the flat
         // rendered transcript (byte parity, §4.4). `bufs`/`st` outlive the call.
@@ -21208,6 +21471,206 @@ mod tests {
         }
     }
 
+    /// A reply that is one short paragraph of reasoning repeated far past the
+    /// repeat guard's four cycles, never closing its `<think>`.
+    fn looping_reasoning() -> String {
+        "Now, `WindowLike::window(self).frame`? Yes.\n\n".repeat(400)
+    }
+
+    /// Runs `agent_call(task, None)` with the given sub-agent replies on a TUI
+    /// style events sink, returning the tool result and every event the UI saw.
+    fn run_sub_agent_on_events<'a>(
+        dir: &std::path::Path,
+        cfg: &'a crate::config::AgentConfig,
+        engine: ScriptedEngine,
+    ) -> (String, Vec<UiEvent>, Agent<'a>) {
+        let mut agent = test_agent(dir, engine, cfg);
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let out = agent.run_agent_tool(&agent_call("look into it", None));
+        agent.sub_sink = SubSinkTarget::Null;
+        (out, rx.try_iter().collect(), agent)
+    }
+
+    fn error_lines(events: &[UiEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::Error(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_lone_sub_agent_pass_publishes_live_status_snapshots() {
+        // `repro-1788690439`: a sub-agent generated for thirteen minutes while
+        // its roster row sat on a frozen token count, because only the main
+        // pass ever published `Status`. The quiet pass must publish too.
+        let dir = scratch_dir("subagent-live-status");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["A short report.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let (out, events, _agent) = run_sub_agent_on_events(&dir, &cfg, engine);
+        assert!(out.contains("A short report."), "{out}");
+
+        let start = events
+            .iter()
+            .position(|e| matches!(e, UiEvent::SubStart { .. }))
+            .expect("a SubStart");
+        let end = events
+            .iter()
+            .position(|e| matches!(e, UiEvent::SubEnd))
+            .expect("a SubEnd");
+        let generating = events[start..end]
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::Status(st) if st.state == WorkerState::Generating => Some(st.generated),
+                _ => None,
+            })
+            .max();
+        assert!(
+            generating.is_some_and(|n| n > 0),
+            "status snapshots with a climbing token count while the sub-agent ran: {events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_looping_sub_agent_is_flagged_in_red_and_asked_for_its_report() {
+        let dir = scratch_dir("subagent-repeat-cap");
+        let mut cfg = test_cfg();
+        // Reasoning is what the guard watches, so the pass has to be thinking.
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                looping_reasoning(),
+                looping_reasoning(),
+                "</think>What I found before looping.\n".to_string(),
+            ],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let (out, events, _agent) = run_sub_agent_on_events(&dir, &cfg, engine);
+
+        // The third pass was the forced report, and it is what the parent got.
+        // (The stray `</think>` is the local template's implicit open, which
+        // `strip_thinking` does not yet pair — a separate fix.)
+        assert!(out.starts_with("Sub-agent report:\n"), "{out}");
+        assert!(out.contains("What I found before looping."), "{out}");
+        let recorded = prompts.lock().unwrap();
+        assert_eq!(
+            recorded.len(),
+            3,
+            "two loops, then the report pass, no more"
+        );
+        assert!(
+            recorded[2].contains("This is your final turn"),
+            "the cap asks for the report: {}",
+            recorded[2]
+        );
+        assert!(
+            !recorded[1].contains("This is your final turn"),
+            "one loop is not yet the cap"
+        );
+
+        // Every guard stop was a red line on the main window, naming the agent.
+        let errors = error_lines(&events);
+        assert_eq!(
+            errors,
+            vec![
+                "guard: stopped a reasoning loop in sub-agent 'sub-agent'",
+                "guard: stopped a reasoning loop (2 in a row) in sub-agent 'sub-agent'",
+                "guard: asked for the report after 2 loops in a row in sub-agent 'sub-agent'",
+            ],
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_sub_agent_that_loops_on_its_report_pass_fails_instead_of_retrying() {
+        let dir = scratch_dir("subagent-repeat-fail");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let prompts: std::sync::Arc<std::sync::Mutex<Vec<String>>> = std::sync::Arc::default();
+        let engine = ScriptedEngine {
+            replies: vec![
+                looping_reasoning(),
+                looping_reasoning(),
+                looping_reasoning(),
+            ],
+            prompts: prompts.clone(),
+            ..ScriptedEngine::default()
+        };
+        let (out, _events, _agent) = run_sub_agent_on_events(&dir, &cfg, engine);
+        assert_eq!(
+            out,
+            format!("Tool error: sub-agent failed: {REPEAT_TRIPS_NOTICE}\n")
+        );
+        assert_eq!(
+            prompts.lock().unwrap().len(),
+            3,
+            "the report pass is the last one, however it ends"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_interrupted_sub_agent_keeps_its_partial_text_for_the_dump() {
+        let dir = scratch_dir("subagent-interrupt-partial");
+        let cfg = test_cfg();
+        let engine = ScriptedEngine {
+            replies: vec!["half a thought about the".to_string()],
+            interrupt_at: Some(0),
+            ..ScriptedEngine::default()
+        };
+        let (out, _events, agent) = run_sub_agent_on_events(&dir, &cfg, engine);
+        assert_eq!(out, "Tool error: sub-agent failed: interrupted\n");
+
+        let dump = agent
+            .sidechain_dumps
+            .back()
+            .expect("the sidechain was dumped");
+        assert_eq!(dump.outcome, "failed: interrupted");
+        let last = dump
+            .messages
+            .last()
+            .expect("the partial pass is in the dump");
+        assert_eq!(last.role, crate::session::Role::Assistant);
+        assert_eq!(last.text, "half a thought about the");
+        // And the parent's own transcript is still exactly as it was.
+        assert!(agent.session.transcript.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_looping_main_pass_is_flagged_in_red_without_naming_a_sub_agent() {
+        let dir = scratch_dir("main-repeat-red");
+        let mut cfg = test_cfg();
+        cfg.generation.think_mode = crate::engine::ThinkMode::Low;
+        let engine = ScriptedEngine {
+            replies: vec![looping_reasoning(), "</think>Done.\n".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.session.push(Message::user("do the task"));
+        let shared = TurnShared::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        agent.worker_turn(&tx, &shared).unwrap();
+        drop(tx);
+        let events: Vec<UiEvent> = rx.try_iter().collect();
+        assert_eq!(
+            error_lines(&events),
+            vec!["guard: stopped a reasoning loop"],
+            "{events:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     fn named_def(name: &str, auto: bool) -> crate::agents::AgentDef {
         crate::agents::AgentDef {
             name: name.to_string(),
@@ -21357,6 +21820,7 @@ mod tests {
             think_off: true,
             thinking_tool_calls: false,
             tool_names: Vec::new(),
+            status: None,
         };
         let pass = generate_pass(
             &mut engine,
@@ -21401,6 +21865,7 @@ mod tests {
             think_off: true,
             thinking_tool_calls: false,
             tool_names: Vec::new(),
+            status: None,
         };
         generate_pass(
             &mut engine,
@@ -21719,52 +22184,6 @@ mod tests {
         );
         assert_eq!(strip_thinking("<think>only thinking"), "");
         assert_eq!(strip_thinking("plain prose"), "plain prose");
-    }
-
-    #[test]
-    fn narration_is_the_prose_between_thinking_and_the_calls() {
-        // Local template: bare `</think>` closes thinking the tag never opened.
-        assert_eq!(
-            narration("pondering</think>Reading the config.<｜DSML｜tool_calls>…"),
-            "Reading the config."
-        );
-        assert_eq!(narration("pondering</think><｜DSML｜tool_calls>…"), "");
-        assert_eq!(narration("<think>all thinking</think>"), "");
-        assert_eq!(
-            narration("<think>a</think>Two files matched.\n"),
-            "Two files matched."
-        );
-        assert_eq!(narration("Plain answer."), "Plain answer.");
-    }
-
-    #[test]
-    fn a_silent_pass_gets_the_narration_nudge_on_its_results() {
-        let dir = scratch_dir("narration-nudge");
-        let cfg = test_cfg();
-        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
-        let call = ToolCall {
-            name: "bash".to_string(),
-            args: vec![crate::dsml::ToolArg {
-                name: "command".to_string(),
-                value: "echo hi".to_string(),
-                is_string: true,
-            }],
-        };
-        agent
-            .session
-            .push(Message::assistant("thinking</think><｜DSML｜tool_calls>…"));
-        let silent = agent.run_tool_calls(std::slice::from_ref(&call));
-        assert!(silent.contains(NARRATION_NUDGE), "{silent}");
-        agent.session.push(Message::assistant(
-            "thinking</think>Checking the echo.<｜DSML｜tool_calls>…",
-        ));
-        let spoken = agent.run_tool_calls(std::slice::from_ref(&call));
-        assert!(!spoken.contains(NARRATION_NUDGE), "{spoken}");
-        assert_eq!(
-            strip_thinking("<think>a</think>one<think>b</think>two"),
-            "onetwo",
-            "every block goes, not just the first"
-        );
     }
 
     #[test]
