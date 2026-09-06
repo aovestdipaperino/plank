@@ -141,8 +141,10 @@ fn render_markdown_at(
     src: &str,
 ) -> Vec<CodeBlockRegion> {
     static HIGHLIGHTER: OnceLock<Arc<TreeSitterHighlighter>> = OnceLock::new();
+    // Two columns are reserved for the output gutter added below.
     let width = ratatui::crossterm::terminal::size()
         .map_or(80, |(w, _)| w as usize)
+        .saturating_sub(usize::from(OUTPUT_GUTTER_WIDTH))
         .max(20);
     let hl = HIGHLIGHTER
         .get_or_init(|| Arc::new(TreeSitterHighlighter::new()))
@@ -164,7 +166,38 @@ fn render_markdown_at(
         })
         .collect();
     lines.extend(md.render(&blocks, &ThemeConfig::new()));
-    annotate_code_blocks(lines, start, &raw_codes)
+    let mut regions = annotate_code_blocks(lines, start, &raw_codes);
+    // The output gutter: a `●` on the first rendered row, two spaces under it
+    // on every other, so each assistant output reads as one hanging block
+    // (the Claude Code look). Applied after annotation so the header scan
+    // still sees the `╭` mark in column zero; the copy columns move with it.
+    // Blank rows stay blank: an indent there is invisible trailing whitespace
+    // that would only pollute a mouse selection.
+    for (i, line) in lines[start..].iter_mut().enumerate() {
+        let blank = line.spans.iter().all(|s| s.content.trim().is_empty());
+        if i > 0 && blank {
+            continue;
+        }
+        let gutter = if i == 0 { OUTPUT_BULLET } else { OUTPUT_INDENT };
+        line.spans
+            .insert(0, Span::styled(gutter, output_bullet_style()));
+    }
+    for r in &mut regions {
+        r.copy_cols.0 = r.copy_cols.0.saturating_add(OUTPUT_GUTTER_WIDTH);
+        r.copy_cols.1 = r.copy_cols.1.saturating_add(OUTPUT_GUTTER_WIDTH);
+    }
+    regions
+}
+
+/// First-row marker of every assistant output block.
+const OUTPUT_BULLET: &str = "\u{25cf} ";
+/// Continuation indent under [`OUTPUT_BULLET`], the same width.
+const OUTPUT_INDENT: &str = "  ";
+/// Display width of [`OUTPUT_BULLET`] / [`OUTPUT_INDENT`].
+const OUTPUT_GUTTER_WIDTH: u16 = 2;
+
+fn output_bullet_style() -> Style {
+    Style::default().fg(Color::White)
 }
 
 fn annotate_code_blocks(
@@ -823,6 +856,24 @@ impl OutputLog {
             self.newline();
         }
         self.lines.extend(user_echo_lines(text));
+    }
+
+    /// Appends the two-row notice that a skill was loaded by a slash command:
+    /// a green `●` bullet with `Skill(<name>)`, then an indented
+    /// `└ Successfully loaded skill` under it.
+    pub fn push_skill_loaded(&mut self, name: &str) {
+        self.md_close();
+        self.end_line();
+        self.lines.push(Line::from(vec![
+            Span::styled(OUTPUT_BULLET, Style::default().fg(THEME_GREEN)),
+            Span::styled("Skill", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!("({name})")),
+        ]));
+        self.lines.push(Line::from(vec![
+            Span::raw(OUTPUT_INDENT),
+            Span::styled("\u{2514} Successfully loaded skill", think_style()),
+        ]));
+        self.lines.push(Line::default());
     }
 
     /// Appends a plain system line.
@@ -4071,6 +4122,39 @@ mod tests {
     use unicode_width::UnicodeWidthStr;
 
     #[test]
+    fn a_skill_load_shows_a_green_bullet_and_an_indented_status() {
+        use super::{Line, OutputLog, THEME_GREEN};
+        let mut log = OutputLog::new();
+        log.push_skill_loaded("superpowers:brainstorming");
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(
+            rows,
+            vec![
+                "● Skill(superpowers:brainstorming)",
+                "  └ Successfully loaded skill",
+                "",
+            ]
+        );
+        assert_eq!(log.lines[0].spans[0].style.fg, Some(THEME_GREEN));
+    }
+
+    #[test]
+    fn continuation_rows_hang_two_columns_under_the_bullet() {
+        use super::{Line, OutputLog};
+        use crate::viz::RenderSink;
+        let mut log = OutputLog::new();
+        log.visible_text("one\n\ntwo");
+        log.flush_md();
+        let rows: Vec<String> = log.to_text().lines.iter().map(Line::to_string).collect();
+        assert_eq!(rows[0], "● one", "{rows:?}");
+        assert!(rows.iter().skip(1).any(|r| r == "  two"), "{rows:?}");
+        assert!(
+            rows.iter().any(String::is_empty),
+            "blank rows carry no indent: {rows:?}"
+        );
+    }
+
+    #[test]
     fn a_generation_does_not_open_with_a_blank_row() {
         use super::{Line, OutputLog};
         use crate::viz::RenderSink;
@@ -4085,14 +4169,14 @@ mod tests {
         log.visible_text("\n\nHello");
         log.visible_text(" world");
         log.flush_md();
-        assert_eq!(rows(&log), vec!["previous line", "Hello world"]);
+        assert_eq!(rows(&log), vec!["previous line", "● Hello world"]);
 
         // Newlines *within* a segment are the model's paragraphing and stay.
         let mut log = OutputLog::new();
         log.visible_text("one\n\ntwo");
         log.flush_md();
         let r = rows(&log);
-        assert!(r.len() > 1 && r[0] == "one", "{r:?}");
+        assert!(r.len() > 1 && r[0] == "● one", "{r:?}");
 
         // A chunk that is nothing but newlines opens no segment at all.
         let mut log = OutputLog::new();
@@ -5683,7 +5767,7 @@ mod tests {
         assert_eq!(region.code, "fn main() {}\nlet x = 1;");
         // The header carries the `⧉ copy` control after the language label.
         let header = line_text(&log.lines[region.header]);
-        assert!(header.starts_with("╭"), "header: {header:?}");
+        assert!(header.starts_with("● ╭"), "header: {header:?}");
         assert!(header.contains("rust"), "header: {header:?}");
         assert!(header.contains("copy"), "header: {header:?}");
     }

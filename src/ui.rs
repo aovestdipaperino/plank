@@ -4905,6 +4905,9 @@ impl Agent<'_> {
             _ => match self.slash_message(cmd, arg) {
                 Some(Ok(message)) => {
                     print!("{}", status::format_user_prompt_echo(input, self.color));
+                    if let Some(name) = self.skill_name(cmd) {
+                        print!("{}", status::format_skill_loaded(name, self.color));
+                    }
                     self.session.push(Message::user(message));
                     self.run_turn()?;
                 }
@@ -7770,9 +7773,16 @@ the original is frozen and listed in /tree"
     /// Resolves `/name args` against the loaded skills, rendering the
     /// user-turn preamble on a match.
     fn skill_message(&self, cmd: &str, arg: &str) -> Option<String> {
-        let name = cmd.strip_prefix('/')?;
+        let name = self.skill_name(cmd)?;
         let skill = self.skills.iter().find(|s| s.name == name)?;
         Some(crate::skills::render(skill, arg))
+    }
+
+    /// The skill `/name` names, if any — `None` for builtins and templates,
+    /// so the "loaded skill" notice is shown only for actual skills.
+    fn skill_name<'a>(&self, cmd: &'a str) -> Option<&'a str> {
+        let name = cmd.strip_prefix('/')?;
+        self.skills.iter().any(|s| s.name == name).then_some(name)
     }
 
     /// `/frame [id]`: lists openable frame components, or asks for one to be
@@ -12248,6 +12258,9 @@ impl Agent<'_> {
             _ => match self.slash_message(cmd, arg) {
                 Some(Ok(message)) => {
                     log.push_user_echo(line);
+                    if let Some(name) = self.skill_name(cmd) {
+                        log.push_skill_loaded(name);
+                    }
                     self.session.push(Message::user(message));
                     if let Err(e) = self.tui_turn(terminal, log, view, input, btw, arcade, sub) {
                         log.push_plain(format!("{cmd} failed: {e}"));

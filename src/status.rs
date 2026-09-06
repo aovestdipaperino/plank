@@ -1859,6 +1859,20 @@ pub fn format_user_prompt_echo(text: &str, color: bool) -> String {
     }
 }
 
+/// Formats the plain-REPL notice that a slash command loaded a skill: a green
+/// `●` bullet with `Skill(<name>)`, then an indented `└ Successfully loaded
+/// skill` in the dim gray, mirroring `OutputLog::push_skill_loaded` in the TUI.
+#[must_use]
+pub fn format_skill_loaded(name: &str, color: bool) -> String {
+    if color {
+        format!(
+            "\x1b[38;5;114m\u{25cf}\x1b[0m \x1b[1mSkill\x1b[0m({name})\n  \x1b[90m\u{2514} Successfully loaded skill\x1b[0m\n\n"
+        )
+    } else {
+        format!("\u{25cf} Skill({name})\n  \u{2514} Successfully loaded skill\n\n")
+    }
+}
+
 /// Formats a system status line, mirroring `agent_publish_system_status`:
 /// a `✦` bullet followed by the message in the theme green on TTYs, with any
 /// URL in the message lifted to white so the target stands out from the prose.
