@@ -49,6 +49,10 @@ pub struct Meta<'a> {
     pub session_id: &'a str,
     /// Session tag (empty when unset).
     pub session_tag: &'a str,
+    /// Where the session transcript lives on disk (`<kvcache>/<id>.kv`), so
+    /// a bug report names the file to attach or `/resume`. Empty when the
+    /// session has no id yet.
+    pub session_path: &'a str,
     /// Optional user note describing the bug.
     pub note: &'a str,
 }
@@ -208,6 +212,9 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     if !meta.session_id.is_empty() {
         let _ = writeln!(out, "- session: {}", meta.session_id);
     }
+    if !meta.session_path.is_empty() {
+        let _ = writeln!(out, "- session file: {}", meta.session_path);
+    }
     if !meta.session_tag.is_empty() {
         let _ = writeln!(out, "- tag: {}", meta.session_tag);
     }
@@ -305,6 +312,7 @@ mod tests {
             think: crate::engine::ThinkMode::Medium,
             session_id: "abc123",
             session_tag: "",
+            session_path: "/home/u/.plank/kvcache/abc123.kv",
             note: "model looped on edit",
         }
     }
@@ -317,6 +325,7 @@ mod tests {
         assert!(report.starts_with("# plank repro 9.9.9\n"));
         assert!(report.contains("note: model looped on edit"));
         assert!(report.contains("session: abc123"));
+        assert!(report.contains("session file: /home/u/.plank/kvcache/abc123.kv"));
         assert!(report.contains("think mode: medium"));
         // The transcript is embedded verbatim between the fences.
         let body = report

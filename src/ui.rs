@@ -605,6 +605,10 @@ const REPEAT_LOOP_WINDOW: usize = 8192;
 
 /// Model-facing text fed back when a pass is stopped for repeating itself.
 /// A single line on purpose: a `\`-continued literal would strip indentation.
+/// Shown when [`crate::guard::LoopGuard::tripped`] ends a turn: the model
+/// re-emitted the same refused tool calls three passes running.
+const LOOP_TRIPPED_NOTICE: &str = "turn stopped: the model re-issued the same refused tool calls three times in a row. Rephrase the request or give it what it is missing.";
+
 const REPEAT_LOOP_ERROR: &str = "generation stopped: the reasoning was repeating the same text over and over. Do not resume that reasoning. Decide now and act: emit the tool calls for the change you already planned, or answer the user.";
 
 /// Per-chunk bookkeeping shared by every generation site: refreshes the
@@ -1625,7 +1629,8 @@ struct Agent<'a> {
     /// never inherits a goal (`docs/superpowers/specs/2026-08-10-goal-command-design.md`).
     goal: Option<crate::goal::GoalLoop>,
     /// Detects repeated identical tool calls and nudges the model (M1 loop
-    /// guards). Owned by the turn loop; advisory only, never blocking.
+    /// guards). Owned by the turn loop: advisory, then a hard block of the
+    /// call, then `tripped()` ends the turn after three fully refused stanzas.
     loop_guard: crate::guard::LoopGuard,
     /// A framed `/btw` prompt waiting to be answered *alongside* the next main
     /// pass rather than in place of it (`docs/SESSION-CLONE-DESIGN.md` §6.2).
@@ -2224,7 +2229,9 @@ impl Agent<'_> {
         if crate::settings::active().ui.show_thinking || self.quiet_tools {
             return None;
         }
-        Some(tool_activity_summary(calls))
+        // Indented two columns so the line sits under the bulleted output
+        // blocks around it instead of flush with their bullets.
+        Some(format!("  {}", tool_activity_summary(calls)))
     }
 
     /// Executes one DSML block's tool calls, routing any `agent` call through
@@ -2270,6 +2277,14 @@ impl Agent<'_> {
         let has_block = nudges
             .iter()
             .any(|n| matches!(n, crate::guard::Nudge::Block(_)));
+        // A stanza refused in full is one the model answered a refusal with
+        // verbatim; the guard counts them and the turn loop ends the turn once
+        // there are three in a row (`LoopGuard::tripped`).
+        let all_blocked = !calls.is_empty()
+            && nudges
+                .iter()
+                .all(|n| matches!(n, crate::guard::Nudge::Block(_)));
+        self.loop_guard.note_stanza(all_blocked);
         // `view_image` needs the engine to encode the image, which `dispatch`
         // (taking only `&mut ToolContext`) cannot reach. Route it through the
         // per-call path alongside `agent`/`fanout`, which has `&mut self.engine`.
@@ -2678,6 +2693,11 @@ impl Agent<'_> {
                 Message::user(format!("<tool_result>{observations}</tool_result>"))
                     .with_images(images),
             );
+            // Same circuit breaker as the main loops; the parent is told why
+            // the sub-agent stopped rather than waiting out all 40 rounds.
+            if self.loop_guard.tripped() {
+                return Err(LOOP_TRIPPED_NOTICE.to_owned());
+            }
         }
         // Unreachable: the final iteration always returns above. `MAX_ROUNDS` is
         // a non-zero constant, so the loop cannot fall through without it.
@@ -3043,6 +3063,12 @@ impl Agent<'_> {
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
                     println!("{}", self.debug_line(&format!("halted: {reason}")));
+                    return Ok(());
+                }
+                if self.loop_guard.tripped() {
+                    for line in self.loop_tripped_lines() {
+                        println!("{}", self.debug_line(&line));
+                    }
                     return Ok(());
                 }
                 continue;
@@ -6746,6 +6772,14 @@ the original is frozen and listed in /tree"
         let rendered_for_repro = render_transcript_for_repro(&self.session, &self.system);
         let version = crate::logo::version_label();
         let date = crate::context::current_local_iso_date();
+        let session_path = if self.session.id.is_empty() {
+            String::new()
+        } else {
+            self.store
+                .path_for_id(&self.session.id)
+                .display()
+                .to_string()
+        };
         let meta = crate::repro::Meta {
             version: &version,
             date: &date,
@@ -6756,6 +6790,7 @@ the original is frozen and listed in /tree"
             think: self.think,
             session_id: &self.session.id,
             session_tag: &self.session.tag,
+            session_path: &session_path,
             note: note.trim(),
         };
         let report = crate::repro::build_report(&meta, self.cfg, &rendered_for_repro);
@@ -6789,6 +6824,20 @@ the original is frozen and listed in /tree"
         crate::tui::copy_to_clipboard(&path.display().to_string());
         let line = Self::repro_written_line(path, sidecars);
         format!("{}; path copied to clipboard]", &line[..line.len() - 1])
+    }
+
+    /// The line to show when the loop guard has tripped (three stanzas in a
+    /// row refused in full): the automatic loop dump, if one was written,
+    /// followed by why the turn is ending. The model's last pass and the
+    /// refusals are already in the transcript, so a `/resume` or a fresh
+    /// prompt continues from a consistent state.
+    fn loop_tripped_lines(&mut self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(line) = self.loop_repro_line() {
+            lines.push(line);
+        }
+        lines.push(LOOP_TRIPPED_NOTICE.to_owned());
+        lines
     }
 
     /// The `[repro written to …]` line, naming the sidecars when there are any.
@@ -11030,6 +11079,12 @@ impl Agent<'_> {
                 // A tool hook's `continue:false` envelope halts the turn.
                 if let Some(reason) = self.tool_ctx.hook_stop.take() {
                     let _ = tx.send(UiEvent::Dim(format!("halted: {reason}")));
+                    return Ok(());
+                }
+                if self.loop_guard.tripped() {
+                    for line in self.loop_tripped_lines() {
+                        let _ = tx.send(UiEvent::Dim(line));
+                    }
                     return Ok(());
                 }
                 self.drain_queued(shared, tx);
@@ -22326,6 +22381,45 @@ or the user's next message aborts before its first token"
         // out of rounds and hand the parent nothing at all.
         let dir = scratch_dir("round-budget");
         let cfg = test_cfg();
+        // A different command each pass: the same one every pass is a loop,
+        // which the guard now ends long before the round budget runs out
+        // (see `a_sub_agent_stuck_on_refused_calls_stops_and_says_so`).
+        let stanza = |i: usize| {
+            format!(
+                concat!(
+                    "Still working.\n",
+                    "<｜DSML｜tool_calls>",
+                    "<｜DSML｜invoke name=\"bash\">",
+                    "<｜DSML｜parameter name=\"command\" string=\"true\">echo {}</｜DSML｜parameter｜>",
+                    "</｜DSML｜invoke｜>",
+                    "</｜DSML｜tool_calls｜>",
+                ),
+                i
+            )
+        };
+        let mut agent = test_agent(
+            &dir,
+            ScriptedEngine {
+                replies: (0..64).map(stanza).collect(),
+                ..ScriptedEngine::default()
+            },
+            &cfg,
+        );
+        let out = agent.run_agent_tool(&agent_call("never finish", None));
+        assert!(
+            out.contains("Sub-agent report:"),
+            "exhaustion still yields a report: {out}"
+        );
+        assert!(!out.contains("produced no report"), "{out}");
+    }
+
+    #[test]
+    fn a_sub_agent_stuck_on_refused_calls_stops_and_says_so() {
+        // The 19-minute repro: the guard refused the call, the model re-emitted
+        // it verbatim every pass. Three refused stanzas in a row end the turn;
+        // the parent is told why instead of waiting out 40 rounds.
+        let dir = scratch_dir("loop-tripped");
+        let cfg = test_cfg();
         let stanza = concat!(
             "Still working.\n",
             "<｜DSML｜tool_calls>",
@@ -22343,11 +22437,15 @@ or the user's next message aborts before its first token"
             &cfg,
         );
         let out = agent.run_agent_tool(&agent_call("never finish", None));
-        assert!(
-            out.contains("Sub-agent report:"),
-            "exhaustion still yields a report: {out}"
-        );
-        assert!(!out.contains("produced no report"), "{out}");
+        assert!(out.contains(LOOP_TRIPPED_NOTICE), "{out}");
+        // 5 dispatched + 3 refused stanzas, then the stop: nowhere near 40 rounds.
+        let passes = agent
+            .session
+            .transcript
+            .iter()
+            .filter(|m| m.role == crate::session::Role::Assistant)
+            .count();
+        assert!(passes <= 12, "stopped after {passes} passes: {out}");
     }
 
     /// The roster is no longer in the tool schema at all: it moved to the

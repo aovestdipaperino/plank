@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **A blocked tool call could not end a loop.** Once the loop guard refused
+  a call, a deterministic model re-emitted the identical stanza every pass,
+  and the turn ran until interrupted (19 minutes in the repro). The guard
+  now ends the turn after three stanzas in a row refused in full, writing
+  the automatic loop repro first; a sub-agent in the same state reports the
+  stop to its parent. The refusal's count also stopped rising at 11 once the
+  32-call window was full, so every refusal read identically; refused calls
+  now stay out of the window and the count climbs by one per refusal.
+- **`/repro` names the session file** (`- session file: …/kvcache/<id>.kv`)
+  in its header.
+
 ### Changed
 
 - **The debug console mirror is opt-in with `--debug`.** plank no longer

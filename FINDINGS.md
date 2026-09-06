@@ -2183,3 +2183,21 @@ over-grant.
   uses (`debugmirror::needs_think_prefix`), or the console renders the
   reasoning in answer style. Provider engines emit both tags and must not get
   the prefix.
+
+## A refused tool call is not a stopped loop
+
+`repro-1788676865`: the loop guard blocked the model's three-read stanza at
+the sixth repeat, as designed, and the model then re-emitted the identical
+stanza every pass for six more minutes until the user pressed Ctrl-C. Two
+things conspired. At temperature 0 the pass is a pure function of the prompt,
+and a refusal changes the prompt by one digit, so the model has no reason to
+behave differently. And the digit stopped changing: refused calls were pushed
+into the 32-call window, so once it was full every new call aged out one
+identical old call, the per-signature count went down one and up one, and
+"11 times" was reported forever, making the prompt *exactly* identical across
+passes. The fix keeps refused calls out of the window with their own
+monotonic counter, and adds the rung the guard was missing: three stanzas in a
+row refused in full end the turn (`LoopGuard::tripped`), after the automatic
+loop dump. The general lesson: a guard that only refuses an action leaves a
+deterministic model exactly where it was; something has to change the
+prompt materially or stop the turn.

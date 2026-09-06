@@ -11,7 +11,12 @@
 //! call back to back, but the eight-call period is visible in the window —
 //! and nudges the model.
 //!
-//! The guard is **advisory only** — it never blocks. A legitimate poll of an
+//! The guard escalates: advisory, then a hard block of the call, then — when
+//! the model answers three blocked stanzas in a row with the identical stanza
+//! — [`LoopGuard::tripped`] tells the turn loop to end the turn. That last
+//! rung exists because a block alone changes nothing the model sees: at
+//! temperature 0 the same prompt yields the same pass forever, and a 19-minute
+//! repro of exactly that is what added it. A legitimate poll of an
 //! async bash job (`bash_status` with identical args) looks identical to a
 //! stuck loop, so the polling path is exempted explicitly by the caller.
 
@@ -25,6 +30,11 @@ const REPEAT_THRESHOLD: u32 = 3;
 /// `REPEAT_THRESHOLD..=BLOCK_THRESHOLD` advisory chances to self-correct
 /// before the circuit breaker trips.
 const BLOCK_THRESHOLD: u32 = 5;
+
+/// Consecutive stanzas in which *every* call was refused before the turn is
+/// ended. Each one is a full pass in which the model saw the refusal and
+/// re-emitted the identical calls; three is deterministic-loop territory.
+const STANZA_TRIP: u32 = 3;
 
 /// How many recent calls the guard remembers before aging out. Wide enough
 /// that a multi-call cycle (the two-hour repro had a period of eight) shows
@@ -58,8 +68,18 @@ pub enum Nudge {
 /// Detects repeated identical tool calls within a bounded window.
 #[derive(Debug, Clone)]
 pub struct LoopGuard {
+    /// Dispatched calls, oldest first. Refused calls never enter it: they
+    /// did not run, so they must not push real history out of the window,
+    /// and counting them here made the reported count plateau (one aged out
+    /// for each one added) at a number that then never changed.
     window: VecDeque<CallSig>,
     repeats: HashMap<CallSig, u32>,
+    /// Calls refused per signature; never ages, so the count the model is
+    /// shown keeps rising and every refusal reads differently.
+    refused: HashMap<CallSig, u32>,
+    /// Consecutive stanzas in which every call was refused (see
+    /// [`Self::note_stanza`]).
+    blocked_stanzas: u32,
 }
 
 impl LoopGuard {
@@ -69,6 +89,8 @@ impl LoopGuard {
         Self {
             window: VecDeque::new(),
             repeats: HashMap::new(),
+            refused: HashMap::new(),
+            blocked_stanzas: 0,
         }
     }
 
@@ -78,6 +100,17 @@ impl LoopGuard {
     /// window.
     pub fn observe(&mut self, tool: &str, args_digest: String) -> Nudge {
         let sig = CallSig(tool.to_string(), args_digest);
+        // Already at the block threshold: refuse without touching the window.
+        if let Some(&dispatched) = self.repeats.get(&sig)
+            && dispatched >= BLOCK_THRESHOLD
+        {
+            let refused = self.refused.entry(sig).or_insert(0);
+            *refused += 1;
+            let count = dispatched + *refused;
+            return Nudge::Block(format!(
+                "you have called this tool with these identical arguments {count} times. This call is refused. Do something different: act on what you already know, or tell the user what is missing"
+            ));
+        }
         // Age out the oldest call so a repeat long ago does not count forever.
         if self.window.len() >= MAX_WINDOW
             && let Some(oldest) = self.window.pop_front()
@@ -91,14 +124,9 @@ impl LoopGuard {
         self.window.push_back(sig.clone());
         let count = self.repeats.entry(sig).or_insert(0);
         *count += 1;
-        if *count > BLOCK_THRESHOLD {
-            return Nudge::Block(format!(
-                "you have called this tool with these arguments {count} times; the result has not changed. This call is refused. Do something different: act on what you already know, or tell the user what is missing"
-            ));
-        }
         if *count >= REPEAT_THRESHOLD {
             return Nudge::Advisory(format!(
-                "you have called this tool with these arguments {count} times; the result has not changed. Do not call it again: act on what you already know, or tell the user what is missing"
+                "you have called this tool with these identical arguments {count} times. Do not call it again: act on what you already know, or tell the user what is missing"
             ));
         }
         match self.repeated_period() {
@@ -107,6 +135,28 @@ impl LoopGuard {
             )),
             None => Nudge::None,
         }
+    }
+
+    /// Records whether the stanza just observed was refused in full. Call once
+    /// per stanza, after observing its calls; a stanza with even one call
+    /// that ran resets the run, so a model that is making *some* progress is
+    /// never cut off.
+    pub fn note_stanza(&mut self, all_blocked: bool) {
+        self.blocked_stanzas = if all_blocked {
+            self.blocked_stanzas + 1
+        } else {
+            0
+        };
+    }
+
+    /// Whether the turn should end: the last [`STANZA_TRIP`] stanzas were
+    /// each refused in full. A block feeds the model a prompt that differs
+    /// from the last one by a single digit, and a deterministic model answers
+    /// it identically, so past this point nothing but ending the turn changes
+    /// the outcome.
+    #[must_use]
+    pub fn tripped(&self) -> bool {
+        self.blocked_stanzas >= STANZA_TRIP
     }
 
     /// The period of the cycle the window ends in, if its last `2 * period`
@@ -154,6 +204,48 @@ mod tests {
 
     fn digest(s: &str) -> String {
         crate::session::sha1_hex(s.as_bytes())
+    }
+
+    #[test]
+    fn the_refused_count_keeps_rising_and_refusals_stay_out_of_the_window() {
+        let mut g = LoopGuard::new();
+        for _ in 0..BLOCK_THRESHOLD {
+            let _ = g.observe("read", digest("a"));
+        }
+        let n = |nudge: Nudge| -> u32 {
+            let text = nudge.as_block().expect("blocked").to_owned();
+            text.split("arguments ")
+                .nth(1)
+                .and_then(|t| t.split(' ').next())
+                .and_then(|d| d.parse().ok())
+                .expect("count")
+        };
+        assert_eq!(n(g.observe("read", digest("a"))), 6);
+        // Far past the window size: the count must still climb by one per call.
+        for _ in 0..(MAX_WINDOW * 2) {
+            let _ = g.observe("read", digest("a"));
+        }
+        assert_eq!(
+            n(g.observe("read", digest("a"))),
+            BLOCK_THRESHOLD + 1 + u32::try_from(MAX_WINDOW * 2).unwrap() + 1
+        );
+        // Refused calls never entered the window, so it holds just the dispatched ones.
+        assert_eq!(g.window.len(), BLOCK_THRESHOLD as usize);
+    }
+
+    #[test]
+    fn trips_after_three_fully_refused_stanzas_and_resets_on_progress() {
+        let mut g = LoopGuard::new();
+        assert!(!g.tripped());
+        g.note_stanza(true);
+        g.note_stanza(true);
+        assert!(!g.tripped());
+        g.note_stanza(false);
+        g.note_stanza(true);
+        g.note_stanza(true);
+        assert!(!g.tripped(), "progress in between resets the run");
+        g.note_stanza(true);
+        assert!(g.tripped());
     }
 
     #[test]
