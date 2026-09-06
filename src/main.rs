@@ -62,7 +62,7 @@ fn main() -> ExitCode {
     // plugin's `settings.json` can be layered in below the user file — but
     // building it needs `--plugin-dir`, which only the parsed config carries.
     // A throwaway provisional parse (base settings, no plugin layer) breaks
-    // that cycle: only its `plugin_dirs` and `chdir_path` are used (both pure
+    // that cycle: only its `plugin_dirs`, `chdir_path` and `debug` are used (all pure
     // CLI flags, unaffected by settings layering, so they agree with the real
     // parse below), and the real parse re-derives everything else with the
     // enriched settings.
@@ -118,6 +118,10 @@ fn main() -> ExitCode {
     }
     let settings =
         plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
+    // `--debug` is a pure CLI flag, so the provisional parse agrees with the
+    // real one; it must be set before `install`, whose reconcile is the first
+    // chance to dial the console.
+    plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &args) {
         Ok(cfg) => cfg,
@@ -642,6 +646,10 @@ fn run_serve(args: &[String]) -> ExitCode {
     }
     let settings =
         plank::settings::Settings::load_with_plugins(&plank::plugins::settings_paths(&plugins));
+    // `--debug` is a pure CLI flag, so the provisional parse agrees with the
+    // real one; it must be set before `install`, whose reconcile is the first
+    // chance to dial the console.
+    plank::debugmirror::set_enabled(provisional.debug);
     plank::settings::install(settings.clone());
     let cfg = match plank::config::parse_options_with(&settings, &passthrough) {
         Ok(cfg) => cfg,

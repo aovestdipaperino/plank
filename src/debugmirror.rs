@@ -13,6 +13,10 @@
 //!   (`generate_fanout_round` spawns a thread per slot) and each wants its own
 //!   named window: `plank:<session>:subagent-<ordinal>`, ordinal monotonic
 //!   within a session and reset when the session changes.
+//! - Nothing here runs unless plank was started with `--debug`
+//!   ([`set_enabled`], called from `main` before settings are installed).
+//!   Without the switch [`reconcile`] does not even probe for a console: a
+//!   user who never asked for the mirror gets no liveness check and no dial.
 //! - [`reconcile`] is the only thing that ever dials out, and it makes at most
 //!   one connection attempt per call — never a retry loop. It is called (a)
 //!   whenever the settings are swapped in (`settings::install`/`reinstall`),
@@ -45,7 +49,7 @@ use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::TcpStream;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 
 use turbo_debug_client::StreamKind;
 
@@ -101,6 +105,25 @@ thread_local! {
 
 fn current() -> MirrorId {
     CURRENT.with(Cell::get)
+}
+
+/// Whether `--debug` was given. Off, [`reconcile`] holds no connection and
+/// never probes for a console. Defaults to on under `cfg(test)` so the suite
+/// exercises the mirror against its `fake_console` listeners without every
+/// test having to opt in; production builds start off until `main` says so.
+static ENABLED: AtomicBool = AtomicBool::new(cfg!(test));
+
+/// Turns the console mirror on or off for the process (`--debug`). Called
+/// once from `main` before `settings::install`, so the install-time
+/// [`reconcile`] already sees the switch.
+pub fn set_enabled(on: bool) {
+    ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Whether `--debug` enabled the mirror.
+#[must_use]
+pub fn enabled() -> bool {
+    ENABLED.load(Ordering::Relaxed)
 }
 
 /// Ordinal for the next sub-agent window this session. Starts at 1 (so the
@@ -289,12 +312,13 @@ fn raw_session_name() -> String {
 /// `<think>` block across two display modes.
 /// Returns what it newly connected so the caller can backfill those windows.
 pub fn reconcile() -> Reconciled {
-    let want_mirror = !crate::settings::active().ui.show_thinking;
+    let want_mirror = enabled() && !crate::settings::active().ui.show_thinking;
     let mut reg = MIRRORS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if !want_mirror {
-        // showThinking is on: mirror nothing, hold no socket. Sub-agent
+        // No `--debug`, or showThinking is on: mirror nothing, hold no socket,
+        // and do not even probe for a console below. Sub-agent
         // connections go too — they are gated on the same setting, and a
         // sub-agent outliving the toggle would keep a window alive that the
         // user just asked to stop seeing.

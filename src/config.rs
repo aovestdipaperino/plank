@@ -52,6 +52,10 @@ pub struct AgentConfig {
     pub plugin_dirs: Vec<PathBuf>,
     /// True when `--non-interactive` was given.
     pub non_interactive: bool,
+    /// True when `--debug` was given: the only case in which plank looks for
+    /// a `turbo-debug-console` and mirrors the raw model stream to it (see
+    /// `debugmirror`). Off, plank never probes for a console at all.
+    pub debug: bool,
     /// False when `--no-session` was given: the headless run leaves no
     /// transcript under `~/.plank/kvcache`. Interactive runs always save.
     pub save_session: bool,
@@ -330,6 +334,7 @@ impl Default for AgentConfig {
             mcp_config_path: None,
             plugin_dirs: Vec::new(),
             non_interactive: false,
+            debug: false,
             save_session: true,
             minimal_prompt: false,
             ui_remote: None,
@@ -427,6 +432,8 @@ Usage: plank [options]
 Options:
   -h, --help [topic]       show this help and exit
   -V, --version            show the version and commit id, then exit
+      --debug              look for a running turbo-debug-console and mirror the
+                           raw model stream to it while ui.showThinking is off
   -m, --model PATH         load a ds4 GGUF model (real inference)
   -t, --threads N          worker thread count (backend default when unset)
       --backend NAME       select backend by name: metal, cuda, cpu
@@ -922,6 +929,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         desc: "write a reproducer bundle for the current session",
     },
     SlashCommand {
+        name: "/debug",
+        args: "[on|off]",
+        desc: "override --debug: mirror the raw stream to turbo-debug-console",
+    },
+    SlashCommand {
         name: "/remote-control",
         args: "[on|ask|off]",
         desc: "show the TUI remote-control endpoint",
@@ -1035,6 +1047,7 @@ pub fn slash_command_known_with(cmd: &str, easter_eggs: bool) -> bool {
         || crate::agents::is_subagent_command(first_token(cmd))
         || slash_command_with_args(cmd, "/remember")
         || slash_command_with_args(cmd, "/repro")
+        || slash_command_with_args(cmd, "/debug")
         || slash_command_with_args(cmd, "/export")
         || slash_command_with_args(cmd, "/open")
         || slash_command_with_args(cmd, "/insights")
@@ -1275,6 +1288,7 @@ pub fn parse_options_with(
                 };
             }
             "--non-interactive" => c.non_interactive = true,
+            "--debug" => c.debug = true,
             "--no-session" => c.save_session = false,
             "--dump-config" => c.dump_config = true,
             "--minimal-prompt" => c.minimal_prompt = true,
@@ -1553,6 +1567,12 @@ mod tests {
         // A flag that shadows no settings key records nothing.
         let c = parse_options(&args(&["--non-interactive"])).unwrap();
         assert!(c.cli_provenance.is_empty());
+    }
+
+    #[test]
+    fn debug_flag_is_parsed_and_off_by_default() {
+        assert!(!parse_options(&args(&[])).unwrap().debug);
+        assert!(parse_options(&args(&["--debug"])).unwrap().debug);
     }
 
     #[test]

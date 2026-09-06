@@ -142,10 +142,11 @@ pub struct UiSettings {
     /// default; the model always receives the results either way.
     pub show_tool_results: bool,
     /// Render the model's thinking text (dimmed) in the scrollback. Off by
-    /// default; when off, the raw model stream (thinking, answer, tool-call
-    /// markup) is instead mirrored to a `turbo-debug-console` listening on
-    /// port 7878, if one is up (see `debugmirror`), so the thinking is not
-    /// simply lost. When on, plank never connects to the console at all.
+    /// default; when off, and plank was started with `--debug` (or `/debug
+    /// on`), the raw model stream (thinking, answer, tool-call markup) is
+    /// instead mirrored to a `turbo-debug-console` listening on port 7878, if
+    /// one is up (see `debugmirror`), so the thinking is not simply lost. When
+    /// on, plank never connects to the console at all.
     pub show_thinking: bool,
     /// When native macOS desktop notifications fire at turn lifecycle points
     /// (turn complete/interrupted past the threshold, and awaiting input):

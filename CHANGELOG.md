@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **The debug console mirror is opt-in with `--debug`.** plank no longer
+  probes for a `turbo-debug-console` or sends it anything unless started with
+  `--debug`. `/debug on` and `/debug off` override the switch for the rest of
+  the session; turning it on while a console is up connects and replays the
+  passes so far immediately, before the next turn.
+- **`/repro` copies the dump's path to the clipboard** (`pbcopy` plus OSC 52,
+  so it works over SSH too) and says so on its `[repro written to …]` line.
+  The automatic loop dump does not touch the clipboard.
+
 ## [4.1.4] - 2026-09-06
 
 ### Added

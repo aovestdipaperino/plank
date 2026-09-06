@@ -78,6 +78,7 @@ See [Extending plank](09-extending.md).
 |---|---|
 | `/config` | open the interactive settings form |
 | `/config <section>.<key> <value>` | set one setting, e.g. `/config ui.showThinking false` |
+| `/debug [on\|off]` | override the `--debug` switch: mirror the raw model stream to a running `turbo-debug-console` (on connects and backfills at once); bare `/debug` reports the state |
 | `/power <1..100>` | cap GPU power draw for this run; shown as `(local ⚡60%)` in the status bar |
 | `/notify <mode>` | change notification mode for this session |
 | `/version` | the running version |
@@ -93,7 +94,7 @@ See [Extending plank](09-extending.md).
 | `/kvcache` | browse the KV cache as a tree: what each snapshot is, what it was built on, its size, how often it has been used, and when it expires |
 | `/kvcache gc\|pin\|unpin\|rm` | sweep expired entries now, or pin, unpin or delete one by fingerprint prefix |
 | `/insights [fast\|fresh]` | a usage report computed from every saved session, written to `~/.plank/usage-data/report.html` (`fast` skips the model-written prose, `fresh` forces it to be written again) |
-| `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report |
+| `/repro [note]` | dump the exact engine input and runtime knobs to `~/.plank/repro/` for a bug report; the file's path is copied to the clipboard |
 
 `/repro` is the one to reach for when you want to report a problem: it captures the rendered prompt the engine would see plus the model, backend, context size, sampling settings and think mode, in a single self-contained file. It never touches the live session.
 

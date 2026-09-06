@@ -4817,10 +4817,11 @@ impl Agent<'_> {
             "/repro" => match self.write_repro(arg) {
                 Ok((path, sidecars)) => println!(
                     "{}",
-                    self.debug_line(&Self::repro_written_line(&path, sidecars))
+                    self.debug_line(&Self::repro_copied_line(&path, sidecars))
                 ),
                 Err(e) => println!("repro failed: {e}"),
             },
+            "/debug" => println!("{}", self.debug_command(arg)),
             c if crate::agents::is_subagent_command(c) => {
                 // The name now rides on the command token (`/subagent:name`),
                 // so the whole argument is the task — no first-token guessing,
@@ -6779,6 +6780,17 @@ the original is frozen and listed in /tree"
         Ok((path, sidecars))
     }
 
+    /// The explicit `/repro` variant: copies the dump's path to the system
+    /// clipboard (`pbcopy` plus OSC 52, best-effort) so it can be pasted into
+    /// a bug report straight away, and says so on the line. The automatic
+    /// loop dump deliberately does not do this: overwriting the clipboard
+    /// unasked, mid-turn, would be a surprise rather than a convenience.
+    fn repro_copied_line(path: &std::path::Path, sidecars: usize) -> String {
+        crate::tui::copy_to_clipboard(&path.display().to_string());
+        let line = Self::repro_written_line(path, sidecars);
+        format!("{}; path copied to clipboard]", &line[..line.len() - 1])
+    }
+
     /// The `[repro written to …]` line, naming the sidecars when there are any.
     fn repro_written_line(path: &std::path::Path, sidecars: usize) -> String {
         match sidecars {
@@ -7109,6 +7121,48 @@ the original is frozen and listed in /tree"
     fn note_pass_mirrored(&mut self) {
         if !self.in_sidechain() && crate::debugmirror::parent_connected() {
             self.console_seen = self.session.transcript.len();
+        }
+    }
+
+    /// `/debug [on|off]`: overrides the `--debug` switch for the rest of the
+    /// process. Turning it on reconciles at once (dialing a running console and
+    /// backfilling the passes so far) instead of waiting for the next turn;
+    /// turning it off drops every connection through the same reconcile. With
+    /// no argument, reports the current state. Shared by both front-ends.
+    fn debug_command(&mut self, arg: &str) -> String {
+        let on = match arg {
+            "on" => true,
+            "off" => false,
+            "" => {
+                let state = if crate::debugmirror::enabled() {
+                    "on"
+                } else {
+                    "off"
+                };
+                let conn = if crate::debugmirror::parent_connected() {
+                    "connected"
+                } else {
+                    "not connected"
+                };
+                return format!("debug console mirror: {state} ({conn})\nusage: /debug on|off");
+            }
+            _ => return "usage: /debug on|off".to_owned(),
+        };
+        crate::debugmirror::set_enabled(on);
+        let reconciled = crate::debugmirror::reconcile();
+        self.backfill_console(&reconciled);
+        if !on {
+            return "debug console mirror off".to_owned();
+        }
+        if crate::settings::active().ui.show_thinking {
+            return "debug console mirror on (idle: ui.showThinking is on, nothing is mirrored)"
+                .to_owned();
+        }
+        if crate::debugmirror::parent_connected() {
+            "debug console mirror on (connected)".to_owned()
+        } else {
+            "debug console mirror on (no turbo-debug-console running; will connect when one is)"
+                .to_owned()
         }
     }
 
@@ -12179,9 +12233,10 @@ impl Agent<'_> {
                 }
             }
             "/repro" => match self.write_repro(arg) {
-                Ok((path, sidecars)) => log.push_dim(Self::repro_written_line(&path, sidecars)),
+                Ok((path, sidecars)) => log.push_dim(Self::repro_copied_line(&path, sidecars)),
                 Err(e) => log.push_plain(format!("repro failed: {e}")),
             },
+            "/debug" => log.push_dim(self.debug_command(arg)),
             c if crate::agents::is_subagent_command(c) => {
                 // See the plain-REPL arm: the name is part of the command
                 // token, so the whole argument is the task.
