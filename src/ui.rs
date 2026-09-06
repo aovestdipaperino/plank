@@ -11211,6 +11211,11 @@ impl Agent<'_> {
         // and fan-out passes, and this is the path every ordinary TUI turn (and
         // every `/subagent` sidechain) actually runs through.
         let _local = self.engine.is_local().then(crate::status::LocalPass::begin);
+        // Same rescue as the plain path (`stream_generation`): a prompt that
+        // diverges behind the live KV end would rebuild from zero, so restore
+        // the deepest ladder rung below the divergence first. This is the
+        // path every ordinary TUI turn runs through, so it needs its own call.
+        self.rescue_prefix_before_rebuild(prompt);
         let mut stream = StreamRenderer::new(ChannelSink(tx.clone()));
         stream.set_freeze_on_error(true);
         self.configure_stream(&mut stream);

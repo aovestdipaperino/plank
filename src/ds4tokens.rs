@@ -189,6 +189,27 @@ impl TokenTranscript {
         last.ntokens += tokens.len();
     }
 
+    /// Inserts `tokens` into the last span ahead of its final `keep_tail`
+    /// tokens, and appends `text` to its key.
+    ///
+    /// For the UI closing a `<think>` the model left open before a tool
+    /// continuation: the recorded assistant span ends in the EOS the reply
+    /// was recorded with, and the live KV holds everything before it. Splicing
+    /// the close *before* that EOS keeps the span's ids a strict extension of
+    /// the KV (`…reply, </think>, EOS`), so the next sync extends instead of
+    /// rebuilding. `keep_tail` larger than the span appends at the span start;
+    /// a no-op on an empty buffer.
+    pub fn splice_last_span(&mut self, text: &str, tokens: &[i32], keep_tail: usize) {
+        let Some(last) = self.spans.last_mut() else {
+            return;
+        };
+        let tail = keep_tail.min(last.ntokens);
+        let at = self.tokens.len() - tail;
+        self.tokens.splice(at..at, tokens.iter().copied());
+        last.text.push_str(text);
+        last.ntokens += tokens.len();
+    }
+
     /// Drops all spans (and their tokens) from index `keep` onward, so the
     /// buffer holds exactly the reconciled common prefix. The caller then
     /// re-appends the divergent sections via [`TokenTranscript::push_span`].
@@ -321,6 +342,28 @@ mod tests {
             role,
             text: text.to_string(),
         }
+    }
+
+    /// A think close spliced ahead of the recorded EOS leaves the ids the live
+    /// KV holds (everything before the EOS) untouched, so the buffer still
+    /// extends the KV; the span's key grows by the appended text.
+    #[test]
+    fn splicing_the_last_span_keeps_the_kv_prefix_and_moves_the_eos_back() {
+        let mut t = TokenTranscript::new();
+        t.push_span(SpanRole::User, 0, "q".into(), &[1, 2]);
+        t.push_span(SpanRole::Assistant, 1, "thinking".into(), &[10, 11, 99]);
+        t.splice_last_span("</think>", &[42], 1);
+        assert_eq!(t.tokens(), &[1, 2, 10, 11, 42, 99]);
+        let last = t.spans().last().unwrap();
+        assert_eq!(last.text, "thinking</think>");
+        assert_eq!(last.ntokens, 4);
+        // With no tail to protect the splice is a plain append.
+        t.splice_last_span("!", &[7], 0);
+        assert_eq!(t.tokens(), &[1, 2, 10, 11, 42, 99, 7]);
+        // Empty buffer: nothing to splice into.
+        let mut empty = TokenTranscript::new();
+        empty.splice_last_span("x", &[1], 1);
+        assert!(empty.tokens().is_empty());
     }
 
     /// The merge is a span-index change and nothing more: the ids and their

@@ -45,6 +45,16 @@ const SPEC_ACCEPT_CAP: usize = 17;
 /// transcript, so leaving it in the KV makes the next prompt diverge *behind*
 /// the live end and `ds4_session_sync` rebuilds from zero. Mirrors the C agent's
 /// `ds4_session_rewind(w->session, block_start + ti)`.
+/// The `</think>` the UI appended to a recorded assistant reply, when
+/// `incoming` is exactly `held` (compared trailing-trimmed, as
+/// [`TokenTranscript::common_prefix`] compares) followed by that close and
+/// nothing else. Any other difference is a genuine rewrite and returns `None`.
+fn think_close_suffix<'a>(held: &str, incoming: &'a str) -> Option<&'a str> {
+    const CLOSE: &str = "</think>";
+    let rest = incoming.strip_prefix(held.trim_end())?;
+    (rest == CLOSE).then_some(rest)
+}
+
 fn spec_block_rewind_target(block_start: i32, committed: i32, kept: i32) -> Option<i32> {
     if committed <= 0 || kept < 0 || kept >= committed {
         return None;
@@ -1006,6 +1016,30 @@ impl Ds4Session {
             .sum::<usize>();
         self.free_vision_spans_from(u32::try_from(kept_tokens).unwrap_or(0));
         self.transcript.truncate_spans(keep);
+        // The one divergence that is not a rewrite: the UI closed a `<think>`
+        // the model left open before a tool continuation (`close_open_think`),
+        // so the incoming assistant text is the recorded reply plus `</think>`.
+        // Retokenizing it from text would produce ids unrelated to the sampled
+        // ones and rebuild the whole KV from this span on (a recorded session
+        // lost a 56k-token prefix to exactly this). Keep the sampled ids and
+        // splice the close in ahead of the recorded EOS instead; the buffer
+        // stays a strict extension of the live KV.
+        let mut keep = keep;
+        if let (Some(held), Some(sec)) = (self.transcript.spans().get(keep), keys.get(keep))
+            && held.role == SpanRole::Assistant
+            && let Some(close) = think_close_suffix(&held.text, &sec.text)
+        {
+            self.transcript.truncate_spans(keep + 1);
+            let tokens = self.model.tokenize_rendered(close);
+            // SAFETY: engine valid.
+            let eos = unsafe { ffi::ds4_token_eos(self.model.engine) };
+            let tail = usize::from(self.transcript.tokens().last() == Some(&eos));
+            self.transcript.splice_last_span(close, &tokens, tail);
+            kv_debug(|| {
+                format!("reconcile: spliced {close:?} into the held assistant span {keep}")
+            });
+            keep += 1;
+        }
         for (role, text) in sections.iter().skip(keep) {
             let Some(span_role) = SpanRole::from_tag(role) else {
                 continue;
@@ -2474,7 +2508,28 @@ fn parse_sections(transcript: &str) -> Vec<(&str, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_sections, spec_block_rewind_target, strip_legacy};
+    use super::{parse_sections, spec_block_rewind_target, strip_legacy, think_close_suffix};
+
+    /// Regression for the 56k-token rebuild in `turbo-vision-debug-2.log`: the
+    /// incoming assistant section was the held reply plus exactly `</think>`
+    /// (18008 vs 18000 bytes). Only that shape is a splice; anything else is a
+    /// rewrite.
+    #[test]
+    fn only_an_appended_think_close_counts_as_a_splice() {
+        assert_eq!(
+            think_close_suffix("We have enough.", "We have enough.</think>"),
+            Some("</think>")
+        );
+        // The held text is stored raw and compared trimmed, like common_prefix.
+        assert_eq!(
+            think_close_suffix("reply\n\n", "reply</think>"),
+            Some("</think>")
+        );
+        assert_eq!(think_close_suffix("reply", "reply"), None);
+        assert_eq!(think_close_suffix("reply", "reply</think>\n\n"), None);
+        assert_eq!(think_close_suffix("reply", "other</think>"), None);
+        assert_eq!(think_close_suffix("reply", "reply more</think>"), None);
+    }
 
     /// Regression for the recorded 117k-token rebuild: a speculative block
     /// whose accepted run ends in EOS leaves the KV one token past the
