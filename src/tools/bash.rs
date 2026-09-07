@@ -608,6 +608,7 @@ fn plank_home_grant(ctx: &mut ToolContext) -> PlankHomeGrant {
             },
         ],
         multi: false,
+        allow_chat: false,
     };
     match asker.ask(req) {
         crate::tools::ask::AskOutcome::Answered(labels)

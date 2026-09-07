@@ -58,6 +58,31 @@ pub struct AskRequest {
     pub options: Vec<AskOption>,
     /// When true, more than one option may be selected.
     pub multi: bool,
+    /// When true the panel appends the built-in [`CHAT_LABEL`] row, letting the
+    /// user step out of the choice and talk it through instead. Set for the
+    /// model-driven `ask` tool; left false for internal confirmation panels,
+    /// where "chat about this" is not an answer the caller can act on.
+    pub allow_chat: bool,
+}
+
+/// Label of the built-in escape-hatch row appended when
+/// [`AskRequest::allow_chat`] is set. Not a model-supplied option, so it does
+/// not count against [`max_options`].
+pub const CHAT_LABEL: &str = "Chat about this";
+
+/// The rows the panel draws: the model's options, plus the [`CHAT_LABEL`] row
+/// when the request allows it. Every front end lists these, so the extra row
+/// is selectable by arrow keys and by number/label in the plain REPL.
+#[must_use]
+pub fn rows(req: &AskRequest) -> Vec<AskOption> {
+    let mut rows = req.options.clone();
+    if req.allow_chat {
+        rows.push(AskOption {
+            label: CHAT_LABEL.to_string(),
+            description: "None of these; discuss it with me first".to_string(),
+        });
+    }
+    rows
 }
 
 /// What the user did with a presented [`AskRequest`].
@@ -69,6 +94,9 @@ pub enum AskOutcome {
     Declined,
     /// The turn was interrupted (Ctrl-C) while the question was up.
     Interrupted,
+    /// The user picked the built-in [`CHAT_LABEL`] row: no option applies and
+    /// they want to talk it over before anything happens.
+    Chat,
 }
 
 /// A front-end capable of presenting a question and returning the user's choice.
@@ -106,6 +134,7 @@ pub fn tool_ask(asker: Option<&mut Box<dyn Asker>>, call: &ToolCall) -> String {
         header: header.to_string(),
         options,
         multi,
+        allow_chat: true,
     };
     // No interactive front end (`--non-interactive` / headless): there is no
     // user to ask, so tell the model to proceed rather than blocking forever.
@@ -187,6 +216,9 @@ pub fn format_result(outcome: &AskOutcome) -> String {
             "User declined to answer; proceed using your best judgment.\n".to_string()
         }
         AskOutcome::Interrupted => "The question was interrupted by the user.\n".to_string(),
+        AskOutcome::Chat => "User chose to chat about this instead of picking an option. \
+             Stop and wait for what they say; do not act on any of the options.\n"
+            .to_string(),
     }
 }
 
@@ -204,6 +236,9 @@ pub struct AskState {
     pub selected: Vec<bool>,
     /// Whether more than one option may be ticked.
     pub multi: bool,
+    /// Row index of the built-in [`CHAT_LABEL`] entry, when the request has
+    /// one. That row is never ticked and resolves to [`AskOutcome::Chat`].
+    pub chat_row: Option<usize>,
 }
 
 impl AskState {
@@ -214,7 +249,35 @@ impl AskState {
             cursor: 0,
             selected: vec![false; len],
             multi,
+            chat_row: None,
         }
+    }
+
+    /// State sized for `req`'s rows, remembering which row is the chat escape
+    /// hatch. The constructor every front end should use for an `ask` request.
+    #[must_use]
+    pub fn for_request(req: &AskRequest) -> Self {
+        let mut s = Self::new(rows(req).len(), req.multi);
+        if req.allow_chat {
+            s.chat_row = Some(req.options.len());
+        }
+        s
+    }
+
+    /// True when `i` is the built-in chat row.
+    #[must_use]
+    pub fn is_chat_row(&self, i: usize) -> bool {
+        self.chat_row == Some(i)
+    }
+
+    /// The outcome Enter commits: [`AskOutcome::Chat`] when the cursor rests on
+    /// the chat row, otherwise the selection [`accept`](Self::accept) resolves.
+    #[must_use]
+    pub fn resolve(&self, req: &AskRequest) -> AskOutcome {
+        if self.is_chat_row(self.cursor) {
+            return AskOutcome::Chat;
+        }
+        AskOutcome::Answered(self.accept(&req.options))
     }
 
     /// Number of options.
@@ -243,6 +306,10 @@ impl AskState {
 
     /// Toggles the option under the cursor (multi-select only; a no-op otherwise).
     pub fn toggle(&mut self) {
+        if self.is_chat_row(self.cursor) {
+            // The escape hatch is a decision, not a tickable option.
+            return;
+        }
         if self.multi
             && let Some(flag) = self.selected.get_mut(self.cursor)
         {
@@ -324,10 +391,15 @@ pub fn parse_repl_answer(req: &AskRequest, line: &str) -> AskOutcome {
     };
     let mut labels = Vec::new();
     for token in tokens {
-        if let Some(label) = resolve_token(req, token)
-            && !labels.contains(&label)
-        {
-            labels.push(label);
+        if let Some(label) = resolve_token(req, token) {
+            if label == CHAT_LABEL {
+                // Wanting to talk it over is exclusive: it cannot be combined
+                // with a pick, so it wins outright.
+                return AskOutcome::Chat;
+            }
+            if !labels.contains(&label) {
+                labels.push(label);
+            }
         }
     }
     if labels.is_empty() {
@@ -340,15 +412,15 @@ pub fn parse_repl_answer(req: &AskRequest, line: &str) -> AskOutcome {
 /// Resolves one answer token to an option label: a 1-based index first, then a
 /// unique case-insensitive label prefix.
 fn resolve_token(req: &AskRequest, token: &str) -> Option<String> {
+    let rows = rows(req);
     if let Ok(n) = token.parse::<usize>()
         && n >= 1
-        && n <= req.options.len()
+        && n <= rows.len()
     {
-        return Some(req.options[n - 1].label.clone());
+        return Some(rows[n - 1].label.clone());
     }
     let lower = token.to_ascii_lowercase();
-    let mut matches = req
-        .options
+    let mut matches = rows
         .iter()
         .filter(|o| o.label.to_ascii_lowercase().starts_with(&lower));
     let first = matches.next()?;
@@ -607,6 +679,7 @@ mod tests {
 
     fn req(multi: bool) -> AskRequest {
         AskRequest {
+            allow_chat: true,
             question: "q?".into(),
             header: "h".into(),
             options: vec![
@@ -675,12 +748,76 @@ mod tests {
     }
 
     #[test]
+    fn chat_row_is_appended_only_when_allowed() {
+        let mut r = req(false);
+        assert_eq!(rows(&r).len(), 4);
+        assert_eq!(rows(&r)[3].label, CHAT_LABEL);
+        r.allow_chat = false;
+        assert_eq!(rows(&r).len(), 3);
+    }
+
+    #[test]
+    fn chat_row_resolves_to_chat_and_never_ticks() {
+        let r = req(true);
+        let mut s = AskState::for_request(&r);
+        for _ in 0..10 {
+            s.move_down();
+        }
+        assert_eq!(s.cursor, 3);
+        assert!(s.is_chat_row(s.cursor));
+        s.toggle();
+        assert!(s.selected.iter().all(|on| !on), "chat row must not tick");
+        assert_eq!(s.resolve(&r), AskOutcome::Chat);
+        // Any other row still resolves to a normal answer.
+        s.move_up();
+        assert_eq!(
+            s.resolve(&r),
+            AskOutcome::Answered(vec!["Gamma".to_string()])
+        );
+    }
+
+    #[test]
+    fn chat_row_is_absent_from_state_without_it() {
+        let mut r = req(false);
+        r.allow_chat = false;
+        let s = AskState::for_request(&r);
+        assert_eq!(s.len(), 3);
+        assert!(s.chat_row.is_none());
+    }
+
+    #[test]
+    fn repl_answer_picks_chat_by_number_or_label() {
+        assert_eq!(parse_repl_answer(&req(false), "4"), AskOutcome::Chat);
+        assert_eq!(parse_repl_answer(&req(false), "chat"), AskOutcome::Chat);
+        // In multi mode it wins over anything picked alongside it.
+        assert_eq!(parse_repl_answer(&req(true), "1, 4"), AskOutcome::Chat);
+    }
+
+    #[test]
+    fn chat_result_tells_the_model_to_wait() {
+        let out = format_result(&AskOutcome::Chat);
+        assert!(out.contains("chat about this"), "{out}");
+        assert!(out.contains("wait"), "{out}");
+        assert!(!out.starts_with("Tool error:"));
+    }
+
+    #[test]
+    fn panel_rows_counts_the_chat_row() {
+        let r = req(false);
+        assert_eq!(
+            panel_rows(1, rows(&r).len()),
+            panel_rows(1, r.options.len()) + 1
+        );
+    }
+
+    #[test]
     fn bridge_round_trips_answer() {
         let bridge = AskBridge::new();
         let worker = bridge.clone();
         let handle = std::thread::spawn(move || {
             let mut asker = BridgeAsker(worker);
             asker.ask(AskRequest {
+                allow_chat: false,
                 question: "q?".into(),
                 header: "h".into(),
                 options: vec![AskOption {

@@ -313,7 +313,7 @@ Use google_search to find web pages. Use visit_page to read a known URL with a v
   "type": "function",
   "function": {
     "name": "ask",
-    "description": "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.",
+    "description": "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. The panel also offers a built-in 'Chat about this' row; if the user picks it, no option applies and you must stop and wait for what they say. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.",
     "parameters": {
       "type": "object",
       "properties": {

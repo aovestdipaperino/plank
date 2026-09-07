@@ -3996,7 +3996,7 @@ pub fn draw_ask(
     let area = frame.area();
     let panel_rows = crate::tools::ask::panel_rows(
         crate::tools::ask::question_lines(&req.question).len(),
-        req.options.len(),
+        crate::tools::ask::rows(req).len(),
     )
     // Never let the panel eat the whole screen: leave at least one output row.
     .min(area.height.saturating_sub(2));
@@ -4064,10 +4064,12 @@ fn render_ask_panel(
         lines.push(Line::from(spans));
     }
     lines.push(Line::raw(String::new()));
-    for (i, opt) in req.options.iter().enumerate() {
+    for (i, opt) in crate::tools::ask::rows(req).iter().enumerate() {
         let is_cursor = i == state.cursor;
         let ticked = state.selected.get(i).copied().unwrap_or(false);
-        let marker = if req.multi {
+        // The chat escape hatch is not tickable, so it keeps the single-select
+        // cursor marker even in a multi-select panel.
+        let marker = if req.multi && !state.is_chat_row(i) {
             if ticked { "[x] " } else { "[ ] " }
         } else if is_cursor {
             "> "
@@ -7538,6 +7540,61 @@ mod tests {
     }
 
     #[test]
+    fn ask_panel_draws_the_chat_escape_hatch_row() {
+        use crate::tools::ask::{AskOption, AskRequest, AskState, CHAT_LABEL};
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let req = AskRequest {
+            question: "Which one?".to_string(),
+            header: "Pick".to_string(),
+            options: vec![
+                AskOption {
+                    label: "Alpha".to_string(),
+                    description: String::new(),
+                },
+                AskOption {
+                    label: "Beta".to_string(),
+                    description: String::new(),
+                },
+            ],
+            multi: true,
+            allow_chat: true,
+        };
+        let state = AskState::for_request(&req);
+        let log = OutputLog::new();
+        let mut view = OutputView::default();
+        let mut term = Terminal::new(TestBackend::new(70, 12)).unwrap();
+        term.draw(|f| {
+            draw_ask(
+                f,
+                &log,
+                &req,
+                &state,
+                "idle",
+                &mut view,
+                &TaskView::default(),
+            );
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let chat = rows
+            .iter()
+            .find(|r| r.contains(CHAT_LABEL))
+            .unwrap_or_else(|| panic!("chat row missing: {rows:#?}"));
+        // Not a checkbox: it is a decision, not a tickable option.
+        assert!(!chat.contains("[ ]"), "{chat}");
+        assert!(rows.iter().any(|r| r.contains("[ ] Alpha")), "{rows:#?}");
+    }
+
+    #[test]
     fn ask_panel_keeps_a_multi_line_question_on_separate_rows() {
         use crate::tools::ask::{AskOption, AskRequest, AskState};
         use ratatui::Terminal;
@@ -7551,6 +7608,7 @@ mod tests {
                 description: String::new(),
             }],
             multi: false,
+            allow_chat: false,
         };
         let state = AskState::new(req.options.len(), req.multi);
         let mut log = OutputLog::new();

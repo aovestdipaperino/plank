@@ -275,6 +275,7 @@ fn ensure_allowed(ctx: &mut ToolContext) -> Result<(), String> {
                 },
             ],
             multi: false,
+            allow_chat: false,
         };
         return match asker.ask(req) {
             crate::tools::ask::AskOutcome::Answered(labels)

@@ -629,6 +629,7 @@ fn tool_exit_plan_mode(ctx: &mut ToolContext, call: &ToolCall) -> String {
             },
         ],
         multi: false,
+        allow_chat: false,
     };
     let outcome = match ctx.asker.as_mut() {
         Some(asker) => asker.ask(req),

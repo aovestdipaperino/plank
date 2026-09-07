@@ -230,7 +230,7 @@ pub fn provider_tool_registry(
     });
     specs.push(crate::engine::ToolSpec {
         name: "ask".to_string(),
-        description: "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.".to_string(),
+        description: "Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\"label\",\"description\"} choices. Set 'multi' to true to allow several selections. The panel also offers a built-in 'Chat about this' row; if the user picks it, no option applies and you must stop and wait for what they say. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.".to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -754,7 +754,7 @@ fn append_native_extra_schemas(out: &mut String) {
          \x20 \"type\": \"function\",\n\
          \x20 \"function\": {\n\
          \x20   \"name\": \"ask\",\n\
-         \x20   \"description\": \"Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\\\"label\\\",\\\"description\\\"} choices. Set 'multi' to true to allow several selections. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.\",\n\
+         \x20   \"description\": \"Ask the user a multiple-choice question and block until they answer. Use this instead of guessing when a turn is genuinely ambiguous. 'question' is the full question, 'header' a short (~12 char) label, 'options' a JSON array of 2 to 7 {\\\"label\\\",\\\"description\\\"} choices. Set 'multi' to true to allow several selections. The panel also offers a built-in 'Chat about this' row; if the user picks it, no option applies and you must stop and wait for what they say. Returns the selected label(s). In non-interactive mode it returns immediately telling you no user is available.\",\n\
          \x20   \"parameters\": {\n\
          \x20     \"type\": \"object\",\n\
          \x20     \"properties\": {\n\

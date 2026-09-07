@@ -13615,6 +13615,7 @@ fn run_yes_no_panel(
             },
         ],
         multi: false,
+        allow_chat: false,
     };
     // Cursor starts on the first option, so the safe answer is the one a stray
     // Enter picks.
@@ -13665,7 +13666,7 @@ fn run_ask_panel(
     let Some(req) = bridge.take_request() else {
         return Ok(());
     };
-    let mut state = AskState::new(req.options.len(), req.multi);
+    let mut state = AskState::for_request(&req);
     loop {
         terminal
             .draw(|f| tui::draw_ask(f, log, &req, &state, status, view, tasks))
@@ -13683,7 +13684,7 @@ fn run_ask_panel(
             KeyCode::Down => state.move_down(),
             KeyCode::Char(' ') if req.multi => state.toggle(),
             KeyCode::Enter => {
-                bridge.respond(AskOutcome::Answered(state.accept(&req.options)));
+                bridge.respond(state.resolve(&req));
                 return Ok(());
             }
             KeyCode::Esc => {
@@ -15113,7 +15114,7 @@ impl crate::tools::ask::Asker for StdinAsker {
         use crate::tools::ask::{AskOutcome, parse_repl_answer};
         let mut out = std::io::stdout();
         let _ = writeln!(out, "\n[{}] {}", req.header, req.question);
-        for (i, opt) in req.options.iter().enumerate() {
+        for (i, opt) in crate::tools::ask::rows(&req).iter().enumerate() {
             if opt.description.is_empty() {
                 let _ = writeln!(out, "  {}. {}", i + 1, opt.label);
             } else {
