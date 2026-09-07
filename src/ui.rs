@@ -11399,14 +11399,14 @@ impl Agent<'_> {
             if run_main {
                 // Capture both `run_worker_ui`'s own outer error and the
                 // worker's inner `Result` instead of `?`-propagating either
-                // immediately: `run_worker_ui` returns a UI-side error
-                // through that outer position too when the worker thread
-                // panics (`handle.join()` -> `ui?; out`), and that leaves the
-                // terminal alive with a row still stranded in `pending`. So
-                // reconcile before propagating either error, not just the
-                // inner one — otherwise a queued prompt is lost for good and
-                // the next commit mislabels whatever the user queues next
-                // (FINDINGS.md).
+                // immediately: `run_worker_ui`'s outer position carries either
+                // a UI-side error (terminal gone) or the worker's own panic
+                // surfacing through `handle.join()` (`ui?; out`), and either
+                // way that leaves the terminal alive with a row still
+                // stranded in `pending`. So reconcile before propagating
+                // either error, not just the inner one — otherwise a queued
+                // prompt is lost for good and the next commit mislabels
+                // whatever the user queues next (FINDINGS.md).
                 let run_result = run_worker_ui(
                     terminal,
                     log,
@@ -11431,8 +11431,7 @@ impl Agent<'_> {
                         // scrollback *and* push its text into the transcript
                         // so screen and session agree, instead of only
                         // moving the row and discarding what the user typed.
-                        self.absorb_leftover(log, shared.take_queued());
-                        return Err(outer_err);
+                        return Err(self.reconcile_and_fail(log, shared, outer_err));
                     }
                 };
                 if let Err(e) = worker_result {
@@ -11441,11 +11440,10 @@ impl Agent<'_> {
                     // above: commit each row and push its text, keeping
                     // `pending` and `shared.queued` empty together instead of
                     // losing the user's input.
-                    self.absorb_leftover(log, shared.take_queued());
-                    return Err(e);
+                    return Err(self.reconcile_and_fail(log, shared, e));
                 }
             } else {
-                run_worker_ui(
+                let drain_result = run_worker_ui(
                     terminal,
                     log,
                     view,
@@ -11461,7 +11459,16 @@ impl Agent<'_> {
                     |tx| {
                         self.drain_btw(&tx, shared);
                     },
-                )?;
+                );
+                if let Err(e) = drain_result {
+                    // A prompt typed during the btw-only drain lands in
+                    // `shared.queued` just as it would during a main turn —
+                    // `drain_btw` never touches it — so a terminal error or
+                    // panic here strands it exactly the same way the
+                    // `run_main` branch above does. Reconcile before
+                    // propagating.
+                    return Err(self.reconcile_and_fail(log, shared, e));
+                }
             }
             // Lines typed while busy that no tool round drained become the
             // next turn's user message(s), as if resubmitted by hand.
@@ -11518,8 +11525,14 @@ impl Agent<'_> {
                         .and_then(|inner| inner);
                         // Both the UI-side and worker-side errors land here;
                         // `tui_turn`'s wrapper clears the goal on any `Err` out
-                        // of this body, so `?` is safe.
-                        let adj = adj?;
+                        // of this body, so returning one is safe — but a line
+                        // queued during the adjudication generation would
+                        // otherwise be stranded exactly as in the main turn
+                        // above, so reconcile before propagating.
+                        let adj = match adj {
+                            Ok(adj) => adj,
+                            Err(e) => return Err(self.reconcile_and_fail(log, shared, e)),
+                        };
                         // Re-checked: an Esc pressed *during* the adjudication
                         // only makes it `keep_going`, which on the last
                         // iteration would otherwise read as a cap rather than
@@ -12239,6 +12252,31 @@ impl Agent<'_> {
             log.commit_pending();
             self.session.push(Message::user(line));
         }
+    }
+
+    /// Every error exit from `tui_turn_inner`'s body must reconcile
+    /// `shared.queued` before propagating, or a prompt typed while the model
+    /// streamed is stranded: its row stays indented in `log.pending` and its
+    /// text sits in `shared.queued`, where it is either lost (no bridge) or,
+    /// worse, joins a later turn's transcript out of step with the row it
+    /// once belonged to. `take_queued` drains `shared` to empty as its first
+    /// act, so calling this twice on the same exit is harmless — the second
+    /// call's `absorb_leftover` runs over an empty `Vec` and does nothing —
+    /// but each *should* run exactly once per exit; call it in the arm that
+    /// is about to `return`/`?` the error, not before.
+    ///
+    /// Takes `err` by value and hands it straight back so a call site can
+    /// write `return Err(self.reconcile_and_fail(log, shared, e));` or
+    /// `Err(self.reconcile_and_fail(log, shared, e))?` without re-threading
+    /// the error type.
+    fn reconcile_and_fail(
+        &mut self,
+        log: &mut OutputLog,
+        shared: &TurnShared,
+        err: String,
+    ) -> String {
+        self.absorb_leftover(log, shared.take_queued());
+        err
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -24711,6 +24749,60 @@ or the user's next message aborts before its first token"
         assert_eq!(agent.session.transcript.len(), before + 2);
         assert_eq!(agent.session.transcript[before].text, "check the docs");
         assert_eq!(agent.session.transcript[before + 1].text, "run the tests");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_and_fail_drains_queued_text_and_returns_the_error_unchanged() {
+        let dir = std::env::temp_dir().join(format!(
+            "plank-ui-reconcile-and-fail-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine::default();
+        let cfg = crate::config::AgentConfig::default();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let before = agent.session.transcript.len();
+
+        let mut log = OutputLog::new();
+        log.push_pending("check the docs");
+        log.push_pending("run the tests");
+
+        let shared = TurnShared::default();
+        shared.push_queued("check the docs".to_owned());
+        shared.push_queued("run the tests".to_owned());
+
+        let err = agent.reconcile_and_fail(&mut log, &shared, "terminal gone".to_owned());
+
+        // The error comes back unchanged.
+        assert_eq!(err, "terminal gone");
+
+        // Both pending rows committed into the scrollback (unindented).
+        let rows: Vec<String> = log
+            .to_text()
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rows, ["* check the docs", "* run the tests"], "{rows:?}");
+
+        // Both lines became transcript messages, in order.
+        assert_eq!(agent.session.transcript.len(), before + 2);
+        assert_eq!(agent.session.transcript[before].text, "check the docs");
+        assert_eq!(agent.session.transcript[before + 1].text, "run the tests");
+
+        // A second reconcile on the same exit must be a no-op: `take_queued`
+        // already drained `shared`, so a call site that (incorrectly) called
+        // this twice would not double-push into the transcript.
+        let err2 = agent.reconcile_and_fail(&mut log, &shared, "terminal gone".to_owned());
+        assert_eq!(err2, "terminal gone");
+        assert_eq!(agent.session.transcript.len(), before + 2);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
