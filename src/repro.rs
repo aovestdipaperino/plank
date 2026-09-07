@@ -45,6 +45,10 @@ pub struct Meta<'a> {
     /// Reasoning level in effect. Carried on the meta rather than read from
     /// the config because `/think` can change it after launch.
     pub think: crate::engine::ThinkMode,
+    /// Rendering settings in effect (`ui.showThinking`, `ui.showToolCalls`).
+    /// What the user was shown decides which bugs they can have noticed, and
+    /// a sub-agent pane honours the same switches as the main log.
+    pub render: crate::session::RenderState,
     /// Session identity SHA (empty when never saved).
     pub session_id: &'a str,
     /// Session tag (empty when unset).
@@ -227,6 +231,8 @@ pub fn build_report(meta: &Meta, cfg: &AgentConfig, rendered_transcript: &str) -
     let _ = writeln!(out, "## Generation");
     let _ = writeln!(out);
     let _ = writeln!(out, "- think mode: {}", meta.think.name());
+    let _ = writeln!(out, "- show thinking: {}", meta.render.show_thinking);
+    let _ = writeln!(out, "- show tool calls: {}", meta.render.show_tool_calls);
     let _ = writeln!(out, "- n_predict: {}", g.n_predict);
     let _ = writeln!(out, "- temperature: {}", g.temperature);
     let _ = writeln!(out, "- top_p: {}", g.top_p);
@@ -289,6 +295,10 @@ mod tests {
             last_ctx_used: 40,
             power_percent: 100,
             think: crate::engine::ThinkMode::Medium,
+            render: crate::session::RenderState {
+                show_thinking: true,
+                show_tool_calls: false,
+            },
             session_id: "abc123",
             session_tag: "",
             session_path: "/home/u/.plank/kvcache/abc123.kv",
@@ -306,6 +316,9 @@ mod tests {
         assert!(report.contains("session: abc123"));
         assert!(report.contains("session file: /home/u/.plank/kvcache/abc123.kv"));
         assert!(report.contains("think mode: medium"));
+        // The rendering switches sit with the other generation-time knobs.
+        assert!(report.contains("show thinking: true"));
+        assert!(report.contains("show tool calls: false"));
         // The transcript is embedded verbatim between the fences.
         let body = report
             .split_once("----- BEGIN TRANSCRIPT -----\n")

@@ -2988,6 +2988,7 @@ impl Agent<'_> {
             // Read here, not inside the pass: `settings::install_for_test` is
             // thread-local, so a spawned pass would silently see defaults.
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
+            show_thinking: crate::settings::active().ui.show_thinking,
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
             // The serial path has exactly one sub-agent in flight, so its pass
             // is the one the footer and its roster row describe.
@@ -3080,6 +3081,11 @@ struct PassCtx<'a> {
     opts: &'a crate::engine::GenerationOptions,
     think_off: bool,
     thinking_tool_calls: bool,
+    /// `ui.showThinking` at pass start. The renderer shows thinking unless
+    /// told otherwise, and a sub-agent pass builds its own renderer, so the
+    /// setting has to be carried here or the sidechain pane shows reasoning
+    /// the main log hides. Read on the main thread like the other fields.
+    show_thinking: bool,
     tool_names: Vec<String>,
     /// Where to publish live [`Status`] snapshots, or `None` to run silently.
     /// Set for a lone sub-agent, whose pass is the one the footer and its
@@ -3241,6 +3247,7 @@ fn generate_pass(
     stream.set_freeze_on_error(true);
     stream.set_preflight(preflight);
     stream.set_thinking_tool_calls(ctx.thinking_tool_calls);
+    stream.set_show_thinking(ctx.show_thinking);
     stream.set_tool_names(ctx.tool_names.clone());
     if !ctx.think_off && !engine.wants_structured() {
         stream.begin_in_think();
@@ -7005,6 +7012,10 @@ the original is frozen and listed in /tree"
     /// it (`/new`, `/resume`, `/clone`).
     fn save_session(&mut self) -> crate::session::Result<String> {
         self.session.cwd = self.tool_ctx.cwd.to_string_lossy().into_owned();
+        // The rendering settings in effect, for the same reason as `cwd`: a
+        // bug report against a saved session needs to know whether the user
+        // was looking at the thinking, and the transcript cannot say.
+        self.session.render = Some(crate::session::RenderState::active());
         self.store.save(&mut self.session)
     }
 
@@ -7280,6 +7291,7 @@ the original is frozen and listed in /tree"
             last_ctx_used: self.last_ctx_used,
             power_percent: self.power_percent,
             think: self.think,
+            render: crate::session::RenderState::active(),
             session_id: &self.session.id,
             session_tag: &self.session.tag,
             session_path: &session_path,
@@ -7913,6 +7925,7 @@ the original is frozen and listed in /tree"
             opts: &opts,
             think_off: matches!(self.think, crate::engine::ThinkMode::Off),
             thinking_tool_calls: crate::settings::active().engine.thinking_tool_calls,
+            show_thinking: crate::settings::active().ui.show_thinking,
             tool_names: sysprompt::tool_names(&self.tool_ctx.mcp),
             // Several passes in flight: no single row for a snapshot to land on.
             status: None,
@@ -22049,6 +22062,7 @@ mod tests {
             opts: &opts,
             think_off: true,
             thinking_tool_calls: false,
+            show_thinking: true,
             tool_names: Vec::new(),
             status: None,
         };
@@ -22094,6 +22108,7 @@ mod tests {
             opts: &opts,
             think_off: true,
             thinking_tool_calls: false,
+            show_thinking: true,
             tool_names: Vec::new(),
             status: None,
         };
@@ -22414,6 +22429,62 @@ mod tests {
         );
         assert_eq!(strip_thinking("<think>only thinking"), "");
         assert_eq!(strip_thinking("plain prose"), "plain prose");
+    }
+
+    /// A sub-agent pass builds its own renderer, and the renderer shows
+    /// thinking unless told otherwise, so the pane honours `ui.showThinking`
+    /// only if the pass is handed the setting: off hides the reasoning, on
+    /// shows it, exactly like the main log.
+    fn sub_think_events_under(show_thinking: bool) -> (usize, usize) {
+        let _dm = crate::debugmirror::test_support::lock();
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = show_thinking;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir(&format!("agent-tool-show-thinking-{show_thinking}"));
+        let cfg = test_cfg();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let engine = ScriptedEngine {
+            // Explicit tags: the test config runs with thinking off, so the
+            // template does not pre-open `<think>` for this pass.
+            replies: vec!["<think>pondering quietly</think>the answer".to_string()],
+            ..ScriptedEngine::default()
+        };
+        let mut agent = test_agent(&dir, engine, &cfg);
+        agent.sub_sink = SubSinkTarget::Events(tx);
+        let _ = agent.run_agent_tool(&agent_call("do a thing", None));
+        let mut think = 0usize;
+        let mut visible = 0usize;
+        for e in rx.try_iter() {
+            if let crate::worker::UiEvent::Sub(inner) = e {
+                match *inner {
+                    crate::worker::UiEvent::Think(_) => think += 1,
+                    crate::worker::UiEvent::Visible(_) => visible += 1,
+                    _ => {}
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+        (think, visible)
+    }
+
+    #[test]
+    fn a_subagent_pane_hides_thinking_when_the_setting_is_off() {
+        let (think, visible) = sub_think_events_under(false);
+        assert_eq!(
+            think, 0,
+            "thinking leaked into the pane with showThinking off"
+        );
+        assert!(visible > 0, "the answer still reaches the pane");
+    }
+
+    #[test]
+    fn a_subagent_pane_shows_thinking_when_the_setting_is_on() {
+        let (think, visible) = sub_think_events_under(true);
+        assert!(
+            think > 0,
+            "showThinking on renders the reasoning in the pane"
+        );
+        assert!(visible > 0, "and the answer");
     }
 
     #[test]

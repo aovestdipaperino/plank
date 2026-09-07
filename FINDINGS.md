@@ -2157,6 +2157,20 @@ reconstructed from the prompt text.
   reasoning in answer style. Provider engines emit both tags and must not get
   the prefix.
 
+## A new `StreamRenderer` shows thinking unless told not to
+
+`StreamRenderer::new` defaults `show_thinking` to true; the main turn paths
+apply `ui.showThinking` through `Agent::configure_stream`. The sub-agent quiet
+pass (`generate_pass`) built its own renderer and never applied the setting,
+so a sidechain pane rendered the model's reasoning while the main log hid it.
+The pass runs on a spawned thread in the fan-out, where `settings::active()`
+is not safe to read (thread-local in tests), so the flag rides on `PassCtx`
+like `thinking_tool_calls` does. Any further renderer construction outside
+`configure_stream` (`/btw` asides already do this) must set it explicitly.
+The switches in effect are now recorded in the `/repro` header (`show
+thinking`, `show tool calls`) and in the session file's `render` record, so a
+dump says what the user was actually looking at.
+
 ## Loops live in `docs/LOOP-FINDINGS.md`
 
 Every finding about the model repeating itself — the reasoning repeat guard,

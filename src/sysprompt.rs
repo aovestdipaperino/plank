@@ -143,7 +143,14 @@ instead of re-reading them.\n\
 - Stay in scope: change the code asked about and its tests; leave docs, changelogs, READMEs and \
 examples alone unless asked.\n\
 - Review changes per file (git diff -- <path>) or with git diff --stat; a whole-repository diff \
-is truncated.\n",
+is truncated.\n\
+- Use the purpose-built CLI, not a raw fetch: for anything on GitHub (an issue, a pull request, \
+a release, a file) run gh through bash (gh issue view <n> --repo <owner>/<repo>, gh pr view, \
+gh api) instead of wget or curl on a github.com page, whose HTML buries the text you want.\n\
+- Delegate isolatable work to a sub-agent: when part of a task has a result you need but steps \
+you do not (locate where X is handled, run a test suite and summarize the failures, audit a \
+module for Y), call the agent tool with a fully specified task and continue from its report; \
+for several independent parts use fanout. Your context then holds conclusions, not file dumps.\n",
     );
     if crate::settings::active().git.sign_commits {
         out.push('\n');
@@ -531,6 +538,8 @@ const WORKING_STYLE: &str = "# Working style
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
+- Use the purpose-built CLI, not a raw fetch. For anything on GitHub (an issue, a pull request, a release, a file) run gh through bash: gh issue view <n> --repo <owner>/<repo>, gh pr view, gh api. Do not wget or curl a github.com page: the HTML is mostly navigation and the useful text is buried, while gh returns it as clean text in one call.
+- Delegate isolatable work to a sub-agent. When part of a task has a result you need but steps you do not (locate where X is handled, run a test suite and summarize the failures, audit a module for Y), call the agent tool with a fully specified task and continue from its report; for several independent parts use fanout. Your own context then holds the conclusions, not the file dumps.
 ";
 
 fn append_working_style(out: &mut String) {

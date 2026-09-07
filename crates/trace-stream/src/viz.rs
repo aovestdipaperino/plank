@@ -1069,7 +1069,10 @@ impl<S: RenderSink> StreamRenderer<S> {
             return;
         }
         self.viz_newline_if_open();
-        self.sink.visible_text(&format!("{line}\n"));
+        // Bold, so the line reads as a title over the answer that follows
+        // rather than as a stray first paragraph of it. Visible text is
+        // markdown on every front end, so the emphasis is spelled as such.
+        self.sink.visible_text(&format!("**{line}**\n"));
         self.last_output_newline = true;
     }
 
@@ -2351,8 +2354,9 @@ mod tests {
         assert_eq!(quiet.sink().think, "");
 
         // On: exactly the first sentence, once, as ordinary visible output
-        // (so the TUI gives it the same bullet and indent as an answer), then
-        // the answer as usual. Nothing reaches the dim thinking channel.
+        // (so the TUI gives it the same bullet and indent as an answer) in
+        // markdown bold so it reads as a title, then the answer as usual.
+        // Nothing reaches the dim thinking channel.
         let mut sr = StreamRenderer::new(Cap::default());
         sr.set_show_thinking(false);
         sr.set_think_status(true);
@@ -2363,7 +2367,7 @@ mod tests {
         assert_eq!(sr.sink().think, "");
         assert_eq!(
             sr.sink().visible,
-            "The read shows the trait is missing idle.\n\nAnswer"
+            "**The read shows the trait is missing idle.**\n\nAnswer"
         );
 
         // A block that ends before any terminator shows what it had.
@@ -2374,7 +2378,7 @@ mod tests {
         cut.push("Checking the fixture");
         cut.finish();
         assert_eq!(cut.sink().think, "");
-        assert_eq!(cut.sink().visible, "Checking the fixture\n");
+        assert_eq!(cut.sink().visible, "**Checking the fixture**\n");
 
         // With thinking shown, the status peek is inert: the full text streams.
         let mut shown = StreamRenderer::new(Cap::default());

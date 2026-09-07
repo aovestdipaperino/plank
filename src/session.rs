@@ -296,8 +296,62 @@ pub struct Session {
     /// `None` when no goal is set. The field is the durable fact; the kickoff
     /// message in the transcript is the record of what was shown.
     pub goal: Option<crate::goal::GoalState>,
+    /// Rendering settings in effect at the last save (`ui.showThinking`,
+    /// `ui.showToolCalls`). Recorded so a saved session says what its user
+    /// was looking at; the transcript cannot. `None` when never recorded
+    /// (files written before the field existed), in which case nothing is
+    /// written and such a file re-saves byte-identically.
+    pub render: Option<RenderState>,
     /// True when the transcript has unsaved changes.
     pub dirty: bool,
+}
+
+/// The rendering switches that decide what a user sees of a pass: whether the
+/// model's thinking is shown and whether tool-call banners are. Carried on the
+/// session file (`render` record) and the `/repro` header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderState {
+    /// `ui.showThinking`.
+    pub show_thinking: bool,
+    /// `ui.showToolCalls`.
+    pub show_tool_calls: bool,
+}
+
+impl RenderState {
+    /// The switches currently in effect, from the active settings.
+    #[must_use]
+    pub fn active() -> Self {
+        let ui = &crate::settings::active().ui;
+        Self {
+            show_thinking: ui.show_thinking,
+            show_tool_calls: ui.show_tool_calls,
+        }
+    }
+
+    /// The `render` record's body: the two flags in a fixed order, so the
+    /// reader can be strict.
+    fn record(self) -> String {
+        format!(
+            "showThinking={} showToolCalls={}",
+            self.show_thinking, self.show_tool_calls
+        )
+    }
+
+    /// Parses a `render` record body written by [`RenderState::record`].
+    fn parse(body: &str) -> Option<Self> {
+        let (think, tools) = body.trim().split_once(' ')?;
+        let flag = |s: &str, key: &str| -> Option<bool> {
+            match s.strip_prefix(key)?.strip_prefix('=')? {
+                "true" => Some(true),
+                "false" => Some(false),
+                _ => None,
+            }
+        };
+        Some(Self {
+            show_thinking: flag(think, "showThinking")?,
+            show_tool_calls: flag(tools, "showToolCalls")?,
+        })
+    }
 }
 
 impl Session {
@@ -314,6 +368,7 @@ impl Session {
             branches: Vec::new(),
             tasks: crate::tasks::TaskList::new(),
             goal: None,
+            render: None,
             dirty: false,
         }
     }
@@ -1147,6 +1202,15 @@ impl SessionStore {
                 g.status.tag()
             );
             body.extend_from_slice(g.objective.as_bytes());
+            body.push(b'\n');
+        }
+        // Rendering switches at save time; omitted when never recorded so an
+        // older file round-trips byte-identically. Written before `cwd`
+        // because the listing reader expects `cwd` directly above `meta`.
+        if let Some(render) = session.render {
+            let record = render.record();
+            let _ = writeln!(body, "render {}", record.len());
+            body.extend_from_slice(record.as_bytes());
             body.push(b'\n');
         }
         // Project directory (issue: `/insights`): omitted when unset so a
@@ -2256,6 +2320,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
     let mut tasks_next_id: u32 = 0;
     let mut branches: Vec<crate::branch::OffNode> = Vec::new();
     let mut goal: Option<crate::goal::GoalState> = None;
+    let mut render: Option<RenderState> = None;
     while pos < data.len() {
         let header = line(&data, &mut pos).ok_or_else(corrupt)?;
         // Session-tree off-path nodes (issue #65); absent in linear sessions
@@ -2297,6 +2362,13 @@ fn read_session_file(path: &Path) -> Result<Session> {
         if let Some(rest) = header.strip_prefix("cwd ") {
             let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
             cwd = take(&data, &mut pos, len)?;
+            continue;
+        }
+        // Rendering switches at save time; absent in older files.
+        if let Some(rest) = header.strip_prefix("render ") {
+            let len: usize = rest.trim().parse().map_err(|_| corrupt())?;
+            let body = take(&data, &mut pos, len)?;
+            render = Some(RenderState::parse(&body).ok_or_else(corrupt)?);
             continue;
         }
         // Durable goal state (M7); absent in pre-goal files.
@@ -2358,6 +2430,7 @@ fn read_session_file(path: &Path) -> Result<Session> {
         branches,
         tasks: crate::tasks::TaskList::from_parts(tasks, tasks_next_id),
         goal,
+        render,
         dirty: false,
     })
 }
@@ -4179,6 +4252,7 @@ hello\n";
         // data.
         assert!(loaded.transcript.iter().all(|m| m.at == 0));
         assert!(loaded.cwd.is_empty());
+        assert!(loaded.render.is_none());
 
         store.save(&mut loaded).unwrap();
         let rewritten = fs::read_to_string(&path).unwrap();
@@ -4204,6 +4278,37 @@ hello\n";
         assert_eq!(again.transcript[1].at, 0);
         assert_eq!(again.cwd, "/work");
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_switches_round_trip_and_sit_above_cwd() {
+        let dir = temp_dir("render-record");
+        let store = SessionStore::open(&dir).unwrap();
+        let mut s = Session::new();
+        s.push(Message::user("hi"));
+        s.push(Message::assistant("yo"));
+        s.cwd = "/work".to_owned();
+        s.render = Some(RenderState {
+            show_thinking: true,
+            show_tool_calls: false,
+        });
+        let id = store.save(&mut s).unwrap();
+        let text = fs::read_to_string(store.path_for_id(&id)).unwrap();
+        assert!(
+            text.contains("render 37\nshowThinking=true showToolCalls=false\ncwd 5\n/work\nmeta "),
+            "{text}"
+        );
+        let loaded = store.load(&id).unwrap();
+        assert_eq!(loaded.render, s.render);
+        // The listing reader still finds `cwd` directly above `meta`.
+        let (_tag, _last, cwd) = read_meta_tail(&store.path_for_id(&id)).unwrap();
+        assert_eq!(cwd, "/work");
+
+        // A malformed record is corruption, not a silent default.
+        let bad = text.replace("showThinking=true", "showThinking=yes!");
+        fs::write(dir.join("bad-render.kv"), bad).unwrap();
+        assert!(store.load("bad-render").is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 
