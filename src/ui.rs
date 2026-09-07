@@ -11578,6 +11578,12 @@ impl Agent<'_> {
             }
             run_main = !leftover.is_empty();
             for line in leftover {
+                // The second join site. `drain_queued` handles lines a tool
+                // round absorbed by sending `QueuedJoined`; a line that
+                // survived to here joins as the follow-up turn's message
+                // instead, and has to leave the pending region the same way or
+                // it stays indented forever.
+                log.commit_pending();
                 self.session.push(Message::user(line));
             }
         }
@@ -14446,9 +14452,15 @@ fn busy_ui_loop(
                                 "[that command can't run mid-turn — wait for the model to finish]",
                             );
                         } else {
+                            // Not echoed into the scrollback: a queued prompt
+                            // is not in the conversation yet. It sits indented
+                            // below the status reporter line — the boundary
+                            // marker — until a tool round drains it, and
+                            // `commit_pending` moves it up. `follow` still
+                            // lands on it: the pending rows are part of the
+                            // log's tail height.
                             input.history.add(&line);
-                            log.push_user_echo(&line);
-                            log.push_dim("[queued — joins the conversation at the next step]");
+                            log.push_pending(&line);
                             shared.push_queued(line);
                             view.follow = true;
                             sub.follow_all();
