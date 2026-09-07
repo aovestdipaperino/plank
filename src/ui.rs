@@ -5854,6 +5854,16 @@ impl Agent<'_> {
             return None;
         }
         let mut out = crate::session::render_history(&self.session.transcript, 6, self.color);
+        // The plain history renderer shows every pass verbatim, so there is
+        // nothing to honour here; the mismatch is still worth saying, because
+        // the next live pass will look different from what is above.
+        if let Some(note) = self
+            .session
+            .render
+            .and_then(|saved| saved.diff_note(crate::session::RenderState::active()))
+        {
+            let _ = writeln!(out, "{}", self.debug_line(&note));
+        }
         let short = crate::session::display_id(&self.session.id);
         let _ = write!(
             out,
@@ -5882,8 +5892,13 @@ impl Agent<'_> {
         };
 
         log.push_dim("--- session history ---");
-        let show_tool_calls = crate::settings::active().ui.show_tool_calls;
-        let show_thinking = crate::settings::active().ui.show_thinking;
+        // Replay reproduces what the user was looking at, so it honours the
+        // settings recorded on the session file, not the ones in effect now.
+        // Only a file written before the `render` record existed falls back.
+        let now = crate::session::RenderState::active();
+        let saved = self.session.render.unwrap_or(now);
+        let show_tool_calls = saved.show_tool_calls;
+        let show_thinking = saved.show_thinking;
         let thinking_tool_calls = crate::settings::active().engine.thinking_tool_calls;
         let tool_names = sysprompt::tool_names(&self.tool_ctx.mcp);
         let pre_open_think =
@@ -5933,6 +5948,9 @@ impl Agent<'_> {
             }
         }
 
+        if let Some(note) = saved.diff_note(now) {
+            log.push_dim(note);
+        }
         let short = crate::session::display_id(&self.session.id);
         log.push_dim(format!("[resumed session {short}]"));
     }
@@ -19121,6 +19139,58 @@ mod tests {
         assert_eq!(agent.console_seen, 0);
         dm::reset();
     }
+    /// A resume replays under the settings the session was saved with, not the
+    /// ones in effect now, and says so once the history is on screen.
+    #[test]
+    fn replay_history_uses_the_saved_render_settings_and_warns_on_a_mismatch() {
+        let _dm = crate::debugmirror::test_support::lock();
+        // Current settings hide thinking; the saved session showed it.
+        let mut settings = crate::settings::Settings::default();
+        settings.ui.show_thinking = false;
+        let settings_show_tool_calls = settings.ui.show_tool_calls;
+        crate::settings::install_for_test(settings);
+        let dir = scratch_dir("resume-replay-saved-render");
+        let cfg = test_cfg();
+        let mut agent = test_agent(&dir, ScriptedEngine::default(), &cfg);
+        agent.session.id = "deadbeef".repeat(5);
+        agent.session.created_at = 1;
+        agent.session.render = Some(crate::session::RenderState {
+            show_thinking: true,
+            show_tool_calls: settings_show_tool_calls,
+        });
+        agent.session.push(Message::user("hi"));
+        agent
+            .session
+            .push(Message::assistant("<think>pondering</think>done\n"));
+
+        let mut log = OutputLog::new();
+        agent.replay_history_into_log(&mut log);
+        let text = log.to_text();
+        let line_text = |l: &ratatui::text::Line| -> String {
+            l.spans.iter().map(|s| s.content.as_ref()).collect()
+        };
+        let all: String = text
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            all.contains("pondering"),
+            "thinking should be replayed under the saved settings: {all}"
+        );
+        assert!(
+            all.contains("showThinking true"),
+            "the mismatch should be reported: {all}"
+        );
+        assert!(
+            !all.contains("showToolCalls"),
+            "only the flags that changed are named: {all}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn replay_history_renders_markdown_and_thinking_not_plain() {
         // Installing settings runs `debugmirror::reconcile`, and with

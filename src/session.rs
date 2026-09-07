@@ -337,6 +337,35 @@ impl RenderState {
         )
     }
 
+    /// Describes how `self` (the settings a session was saved with) differs
+    /// from `now` (the settings in effect), as a human-readable list. `None`
+    /// when they match. Used to warn after a resume has replayed history under
+    /// the saved settings, so the user knows the window is not showing what a
+    /// new pass would show.
+    #[must_use]
+    pub fn diff_note(self, now: Self) -> Option<String> {
+        let mut parts = Vec::new();
+        if self.show_thinking != now.show_thinking {
+            parts.push(format!(
+                "showThinking {} \u{2192} {}",
+                self.show_thinking, now.show_thinking
+            ));
+        }
+        if self.show_tool_calls != now.show_tool_calls {
+            parts.push(format!(
+                "showToolCalls {} \u{2192} {}",
+                self.show_tool_calls, now.show_tool_calls
+            ));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(format!(
+            "[history above was replayed with the settings this session was saved with; they differ from the current ones: {}]",
+            parts.join(", ")
+        ))
+    }
+
     /// Parses a `render` record body written by [`RenderState::record`].
     fn parse(body: &str) -> Option<Self> {
         let (think, tools) = body.trim().split_once(' ')?;
@@ -4279,6 +4308,31 @@ hello\n";
         assert_eq!(again.cwd, "/work");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn render_diff_note_lists_only_the_flags_that_changed() {
+        let saved = RenderState {
+            show_thinking: true,
+            show_tool_calls: false,
+        };
+        assert!(saved.diff_note(saved).is_none());
+        let note = saved
+            .diff_note(RenderState {
+                show_thinking: false,
+                show_tool_calls: false,
+            })
+            .expect("thinking differs");
+        assert!(note.contains("showThinking true \u{2192} false"), "{note}");
+        assert!(!note.contains("showToolCalls"), "{note}");
+        let both = saved
+            .diff_note(RenderState {
+                show_thinking: false,
+                show_tool_calls: true,
+            })
+            .expect("both differ");
+        assert!(both.contains("showThinking"), "{both}");
+        assert!(both.contains("showToolCalls false \u{2192} true"), "{both}");
     }
 
     #[test]
