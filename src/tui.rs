@@ -877,6 +877,12 @@ pub struct OutputLog {
     /// no text is streaming. Not part of the persistent `lines`; cleared when
     /// the turn ends.
     progress: Option<Line<'static>>,
+    /// Prompts typed while the worker is busy, rendered indented below
+    /// `progress` until a tool round drains them into the conversation. FIFO,
+    /// and deliberately not part of the persistent `lines`: a queued prompt is
+    /// not in the conversation yet, and the status line it sits under is the
+    /// boundary that says so.
+    pending: std::collections::VecDeque<String>,
 }
 
 /// Cached wrapped-row heights for [`OutputLog::lines`]; see the field.
@@ -1098,6 +1104,20 @@ impl OutputLog {
         self.progress = line;
     }
 
+    /// Shows `text` as a queued prompt below the pinned progress line.
+    pub fn push_pending(&mut self, text: &str) {
+        self.pending.push_back(text.to_owned());
+    }
+
+    /// Moves the oldest queued prompt into the scrollback as a committed user
+    /// echo — the prompt joining the conversation. A no-op when none is
+    /// queued, which is what an interrupted turn's drain looks like.
+    pub fn commit_pending(&mut self) {
+        if let Some(text) = self.pending.pop_front() {
+            self.push_user_echo(&text);
+        }
+    }
+
     /// Drops cached row heights for `lines[from..]`, which are about to change.
     /// Every truncation of `lines` must call this: a stale entry would leave
     /// the viewport scrolled to the wrong row.
@@ -1122,8 +1142,8 @@ impl OutputLog {
     }
 
     /// The uncommitted lines rendered after `lines`: the in-progress streamed
-    /// line and the pinned progress line. Not cached — they change every
-    /// frame, and there are at most two.
+    /// line, the pinned progress line, and the queued prompts indented below
+    /// it. Not cached — they change every frame, and there are few of them.
     fn tail_lines(&self) -> Vec<Line<'static>> {
         let mut tail = Vec::new();
         if !self.current.is_empty() {
@@ -1131,6 +1151,9 @@ impl OutputLog {
         }
         if let Some(progress) = &self.progress {
             tail.push(progress.clone());
+        }
+        for text in &self.pending {
+            tail.extend(pending_lines(text));
         }
         tail
     }
@@ -1186,17 +1209,12 @@ impl OutputLog {
         )
     }
 
-    /// Renders the log (including the in-progress line and any pinned progress
-    /// line) as ratatui text.
+    /// Renders the log (including the in-progress line, any pinned progress
+    /// line, and any queued prompts below it) as ratatui text.
     #[must_use]
     pub fn to_text(&self) -> Text<'static> {
         let mut lines = self.lines.clone();
-        if !self.current.is_empty() {
-            lines.push(Line::from(self.current.clone()));
-        }
-        if let Some(progress) = &self.progress {
-            lines.push(progress.clone());
-        }
+        lines.extend(self.tail_lines());
         Text::from(lines)
     }
 
@@ -1399,6 +1417,24 @@ pub fn user_echo_lines(text: &str) -> Vec<Line<'static>> {
                 Span::styled(if i == 0 { "* " } else { "  " }, bullet),
                 Span::styled(line.to_string(), body),
             ])
+        })
+        .collect()
+}
+
+/// The indent that marks a prompt as still queued: it sits below the status
+/// reporter line, two columns in from the committed conversation above it.
+const PENDING_INDENT: &str = "  ";
+
+/// A queued prompt's rows: exactly the rows [`user_echo_lines`] will commit,
+/// shifted right by [`PENDING_INDENT`]. Dequeuing is then a pure change of
+/// position — the same text, the same style, two columns left.
+fn pending_lines(text: &str) -> Vec<Line<'static>> {
+    user_echo_lines(text)
+        .into_iter()
+        .map(|line| {
+            let mut spans = vec![Span::raw(PENDING_INDENT)];
+            spans.extend(line.spans);
+            Line::from(spans)
         })
         .collect()
 }
@@ -6537,6 +6573,69 @@ mod tests {
         // Clearing removes it again.
         log.set_progress(None);
         assert_eq!(log.to_text().lines.len(), base);
+    }
+
+    /// A queued prompt is not in the conversation yet, so it renders below the
+    /// status reporter line, indented two columns in from the committed
+    /// conversation above it.
+    #[test]
+    fn queued_prompt_renders_indented_below_the_progress_line() {
+        let mut log = OutputLog::new();
+        log.push_plain("older conversation");
+        log.set_progress(Some(super::progress_line(
+            "⠹ Cooking… (2s · ↓ 5 tokens · 4.0 t/s)",
+        )));
+        log.push_pending("fix the parser\nand the lexer");
+
+        let text = log.to_text();
+        let rows: Vec<String> = text.lines.iter().map(line_text).collect();
+        // scrollback, then the progress line, then the two indented rows.
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[1].contains("Cooking…"), "{rows:?}");
+        assert_eq!(rows[2], "  * fix the parser");
+        assert_eq!(rows[3], "    and the lexer");
+    }
+
+    /// Dequeuing is a change of position, not of style: the same rows land in
+    /// the scrollback above the progress line, without the indent.
+    #[test]
+    fn commit_pending_moves_the_front_prompt_into_the_scrollback() {
+        let mut log = OutputLog::new();
+        log.push_pending("first");
+        log.push_pending("second");
+
+        log.commit_pending();
+
+        let committed: Vec<String> = log.lines.iter().map(line_text).collect();
+        assert_eq!(committed, ["* first"], "{committed:?}");
+        let rows: Vec<String> = log.to_text().lines.iter().map(line_text).collect();
+        assert_eq!(rows, ["* first", "  * second"], "{rows:?}");
+
+        log.commit_pending();
+        let rows: Vec<String> = log.to_text().lines.iter().map(line_text).collect();
+        assert_eq!(rows, ["* first", "* second"], "{rows:?}");
+    }
+
+    /// A queued line the worker never drained (an interrupted turn) leaves the
+    /// UI calling `commit_pending` with nothing to commit.
+    #[test]
+    fn commit_pending_with_nothing_queued_is_a_no_op() {
+        let mut log = OutputLog::new();
+        log.push_plain("only line");
+        log.commit_pending();
+        let rows: Vec<String> = log.to_text().lines.iter().map(line_text).collect();
+        assert_eq!(rows, ["only line"], "{rows:?}");
+    }
+
+    /// The scroll clamp reads `total_rows` every frame; pending rows are on
+    /// screen, so they have to be in that count or the viewport clips them.
+    #[test]
+    fn pending_rows_count_toward_total_rows() {
+        let mut log = OutputLog::new();
+        log.push_plain("older conversation");
+        let base = log.total_rows(80);
+        log.push_pending("fix the parser\nand the lexer");
+        assert_eq!(log.total_rows(80), base + 2);
     }
 
     #[test]
