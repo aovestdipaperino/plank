@@ -11596,15 +11596,7 @@ impl Agent<'_> {
                 return Ok(());
             }
             run_main = !leftover.is_empty();
-            for line in leftover {
-                // The second join site. `drain_queued` handles lines a tool
-                // round absorbed by sending `QueuedJoined`; a line that
-                // survived to here joins as the follow-up turn's message
-                // instead, and has to leave the pending region the same way or
-                // it stays indented forever.
-                log.commit_pending();
-                self.session.push(Message::user(line));
-            }
+            self.absorb_leftover(log, leftover);
         }
     }
 
@@ -12220,6 +12212,20 @@ impl Agent<'_> {
         shared.interrupt.store(false, Ordering::Relaxed);
         crate::interrupt::clear();
         let _ = tx.send(UiEvent::BtwEnd);
+    }
+
+    /// The second join site (the first is `drain_queued`, via `QueuedJoined`
+    /// on the worker thread). Lines a tool round didn't absorb survive to the
+    /// bottom of `tui_turn_inner`'s loop and join here, on the main thread, as
+    /// the next turn's message(s) instead. Each has to leave the pending
+    /// region the same way `drain_queued` does or it stays indented forever —
+    /// pulled out as its own method so the invariant ("every join site calls
+    /// `commit_pending`") has something narrow to test against.
+    fn absorb_leftover(&mut self, log: &mut OutputLog, leftover: Vec<String>) {
+        for line in leftover {
+            log.commit_pending();
+            self.session.push(Message::user(line));
+        }
     }
 
     /// Moves user lines queued during the turn into the transcript between
@@ -24647,6 +24653,51 @@ or the user's next message aborts before its first token"
             "the old prose notice must be gone"
         );
         assert!(events.iter().any(|e| matches!(e, UiEvent::Status(_))));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The second join site: lines a tool round never absorbed still have to
+    /// leave the log's pending region and land in the transcript. Pins that
+    /// `absorb_leftover` does both — the commit count and the pushed
+    /// messages — not just one or the other.
+    #[test]
+    fn absorb_leftover_commits_each_line_and_pushes_it_to_the_transcript() {
+        let dir =
+            std::env::temp_dir().join(format!("plank-ui-leftover-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let engine = ScriptedEngine::default();
+        let cfg = crate::config::AgentConfig::default();
+        let mut agent = test_agent(&dir, engine, &cfg);
+        let before = agent.session.transcript.len();
+
+        let mut log = OutputLog::new();
+        log.push_pending("check the docs");
+        log.push_pending("run the tests");
+
+        agent.absorb_leftover(
+            &mut log,
+            vec!["check the docs".to_owned(), "run the tests".to_owned()],
+        );
+
+        // Both queued rows moved into the scrollback (unindented) and nothing
+        // is left in the pending region.
+        let rows: Vec<String> = log
+            .to_text()
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rows, ["* check the docs", "* run the tests"], "{rows:?}");
+
+        // Both lines became transcript messages, in order.
+        assert_eq!(agent.session.transcript.len(), before + 2);
+        assert_eq!(agent.session.transcript[before].text, "check the docs");
+        assert_eq!(agent.session.transcript[before + 1].text, "run the tests");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -611,6 +611,35 @@ mod tests {
         assert_eq!(log.line_count(), before);
     }
 
+    /// Pins the single line joining `QueuedJoined` to `commit_pending` — the
+    /// worker thread's join site. Nothing else in the test suite exercises
+    /// this arm: `src/ui.rs` proves the event is *sent*, `src/tui.rs` proves
+    /// `commit_pending` works, but a refactor that moved this arm out from
+    /// under `apply` (e.g. into the no-op tail list right below it) would
+    /// leave every queued prompt stuck indented forever with the whole suite
+    /// still green.
+    #[test]
+    fn apply_queued_joined_commits_the_pending_prompt() {
+        let mut log = OutputLog::new();
+        log.push_pending("fix the parser");
+
+        apply(&mut log, UiEvent::QueuedJoined);
+
+        // Committed into the scrollback (unindented), not still pending.
+        let rows: Vec<String> = log
+            .to_text()
+            .lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(rows, ["* fix the parser"], "{rows:?}");
+    }
+
     #[test]
     fn btw_queue_is_fifo_and_drops_oldest_beyond_cap() {
         let shared = TurnShared::default();
