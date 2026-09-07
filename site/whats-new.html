@@ -138,9 +138,23 @@ href="https://github.com/aovestdipaperino/plank/blob/main/CHANGELOG.md">full
 changelog</a> has every last fix; this page has the ones you will
 actually notice.</p>
 <h2 id="just-landed">Just landed</h2>
-<p><strong>v4.1.0 is out</strong>, and the beta channel is on 4.1.2. The
+<p><strong>v4.3.0 is out</strong>, and the beta channel is on 4.3.1. The
 patch number is still the channel: <code>.0</code> is stable, anything
 above it is beta.</p>
+<p><strong>Looking at an image no longer sends the model hunting for a
+command-line flag.</strong> plank reads images through the model itself,
+in process — there is no separate viewer to run. But when the vision
+encoder was not loaded, the <code>view_image</code> tool answered with
+the wording plank's C reference uses, which names a
+<code>ds4-agent --vision</code> flag. plank has no such flag, so the
+model took the message as an instruction, tried to run it, failed, went
+looking through <code>plank --help</code>, and concluded that seeing
+images was broken. The refusal now says what is actually true and tells
+the model not to go shelling out. An encoder that fails to load is
+reported when plank starts, rather than several turns later as a
+confusing tool error, and an image observation that fails to reach the
+model is written to <code>~/.plank/errors.log</code> instead of passing
+silently as text that claims a picture is attached.</p>
 <p><strong>4.1.2 (beta) stops the sandbox asking about reads.</strong>
 Any bash command that so much as mentioned <code>~/.plank</code>,
 including <code>cat ~/.plank/settings.json</code>, used to raise "Allow

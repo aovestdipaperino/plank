@@ -7,8 +7,21 @@ has every last fix; this page has the ones you will actually notice.
 
 ## Just landed
 
-**v4.1.0 is out**, and the beta channel is on 4.1.2. The patch number is still
+**v4.3.0 is out**, and the beta channel is on 4.3.1. The patch number is still
 the channel: `.0` is stable, anything above it is beta.
+
+**Looking at an image no longer sends the model hunting for a command-line
+flag.** plank reads images through the model itself, in process — there is no
+separate viewer to run. But when the vision encoder was not loaded, the
+`view_image` tool answered with the wording plank's C reference uses, which
+names a `ds4-agent --vision` flag. plank has no such flag, so the model took
+the message as an instruction, tried to run it, failed, went looking through
+`plank --help`, and concluded that seeing images was broken. The refusal now
+says what is actually true and tells the model not to go shelling out. An
+encoder that fails to load is reported when plank starts, rather than several
+turns later as a confusing tool error, and an image observation that fails to
+reach the model is written to `~/.plank/errors.log` instead of passing silently
+as text that claims a picture is attached.
 
 **4.1.2 (beta) stops the sandbox asking about reads.** Any bash command that
 so much as mentioned `~/.plank`, including `cat ~/.plank/settings.json`, used to

@@ -369,6 +369,12 @@ instead.</p>
 <code>/config ui.showThinking false</code></td>
 </tr>
 <tr>
+<td><code>/debug [on|off]</code></td>
+<td>override the <code>--debug</code> switch: mirror the raw model
+stream to a running <code>turbo-debug-console</code> (on connects and
+backfills at once); bare <code>/debug</code> reports the state</td>
+</tr>
+<tr>
 <td><code>/power &lt;1..100&gt;</code></td>
 <td>cap GPU power draw for this run; shown as <code>(local ⚡60%)</code>
 in the status bar</td>
@@ -427,7 +433,8 @@ again)</td>
 <tr>
 <td><code>/repro [note]</code></td>
 <td>dump the exact engine input and runtime knobs to
-<code>~/.plank/repro/</code> for a bug report</td>
+<code>~/.plank/repro/</code> for a bug report; the file's path is copied
+to the clipboard</td>
 </tr>
 </tbody>
 </table>
