@@ -12198,10 +12198,12 @@ impl Agent<'_> {
     }
 
     /// Moves user lines queued during the turn into the transcript between
-    /// tool rounds, mirroring the C's `queued_user_drain`.
+    /// tool rounds, mirroring the C's `queued_user_drain`. Each line is
+    /// already on screen in the log's pending region, so the UI is told to
+    /// commit it rather than sent the text again.
     fn drain_queued(&mut self, shared: &TurnShared, tx: &Sender<UiEvent>) {
         for line in shared.take_queued() {
-            let _ = tx.send(UiEvent::Dim("[queued message joined the turn]".to_owned()));
+            let _ = tx.send(UiEvent::QueuedJoined);
             self.session.push(Message::user(line));
         }
     }
@@ -24562,58 +24564,7 @@ or the user's next message aborts before its first token"
         };
         let mut cfg = crate::config::AgentConfig::default();
         cfg.generation.think_mode = crate::engine::ThinkMode::Off;
-        let store = SessionStore::open(&dir).unwrap();
-        let mut agent = Agent {
-            engine: Box::new(engine),
-            cfg: &cfg,
-            session: Session::new(),
-            store,
-            pending_aside: None,
-            tool_ctx: ToolContext::new(std::env::current_dir().unwrap()),
-            isolation_seq: 0,
-            system: crate::sysprompt::build_system_prompt("", &[], true),
-            reminder: SystemPromptReminder::new(),
-            power_percent: 0,
-            payload_restored: false,
-            payload_dirty: false,
-            ladder: crate::kvladder::KvLadder::new(),
-            sidechain_depth: 0,
-            repro_dir: test_repro_dir(),
-            quiet_tools: false,
-            pending_images: Vec::new(),
-            btw_diverged_engine: false,
-            trusted_system_len: 0,
-            think: cfg.generation.think_mode,
-            trace: Trace::open(None).unwrap(),
-            color: false,
-            show_footer: false,
-            editor_owns_footer: false,
-            last_ctx_used: 0,
-            last_spec: crate::engine::SpecStats::default(),
-            last_turn_interrupted: false,
-            goal: None,
-            loop_guard: crate::guard::LoopGuard::new(),
-            context_content: crate::context::ContextContent::new(),
-            skills: Vec::new(),
-            templates: Vec::new(),
-            agents: Vec::new(),
-            checkpoints: crate::checkpoint::CheckpointStore::new(),
-            last_edited: None,
-            remote: None,
-            remote_server: None,
-            ui_remote: None,
-            usage: SessionUsage::default(),
-            stats: SessionStats::default(),
-            session_start: std::time::Instant::now(),
-            sub_sink: SubSinkTarget::default(),
-            fork_kv: Vec::new(),
-            fork_points: Vec::new(),
-            console_seen: 0,
-            sidechain_dumps: std::collections::VecDeque::new(),
-            alt_engines: std::collections::HashMap::new(),
-            local_alt_warmed: false,
-            warm_note: None,
-        };
+        let mut agent = test_agent(&dir, engine, &cfg);
         agent.session.push(Message::user("run echo"));
 
         // A line "typed while busy": queued before the turn, so the first
@@ -24636,7 +24587,7 @@ or the user's next message aborts before its first token"
         assert!(agent.session.transcript[4].text.contains("Done."));
         assert!(shared.take_queued().is_empty());
 
-        // The UI channel saw rendered text, the drain notice, and status
+        // The UI channel saw rendered text, the drain join, and status
         // snapshots from generation.
         let events: Vec<UiEvent> = rx.try_iter().collect();
         let visible: String = events
@@ -24647,10 +24598,22 @@ or the user's next message aborts before its first token"
             })
             .collect();
         assert!(visible.contains("Checking"), "got: {visible}");
-        assert!(
+        // The prompt itself is already on screen in the log's pending region,
+        // so the drain carries no text — only the instruction to move the
+        // oldest queued prompt up into the scrollback.
+        assert_eq!(
             events
                 .iter()
-                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("queued message joined")))
+                .filter(|e| matches!(e, UiEvent::QueuedJoined))
+                .count(),
+            1,
+            "one queued line drained, so exactly one join"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, UiEvent::Dim(t) if t.contains("queued message joined"))),
+            "the old prose notice must be gone"
         );
         assert!(events.iter().any(|e| matches!(e, UiEvent::Status(_))));
         std::fs::remove_dir_all(&dir).ok();

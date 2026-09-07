@@ -50,6 +50,14 @@ pub enum UiEvent {
     Plain(String),
     /// A user-echo line (queued prompts, `/btw` questions).
     UserEcho(String),
+    /// A queued prompt joined the conversation: the UI moves the oldest
+    /// indented prompt out of the log's pending region and into the scrollback
+    /// as a committed user echo.
+    ///
+    /// Payload-free on purpose. The queue is FIFO on both sides and the text
+    /// already sits in the pending region, so sending it along would create a
+    /// second copy free to disagree with the first.
+    QueuedJoined,
     /// The transcript was replaced — `/clear`, `/new`, `/switch`, `/resume`.
     /// Everything above it belongs to a session that no longer exists, so a
     /// remote front-end clears its log, and [`BroadcastBus::broadcast`] drops
@@ -140,7 +148,7 @@ pub enum UiEvent {
 impl UiEvent {
     /// Whether this event belongs to the local sub-agent pane only and must not
     /// go onto the [`BroadcastBus`]. A remote-side pane is out of scope, so
-    /// `ServerMsg::from_event` maps these three to `None` — broadcasting them
+    /// `ServerMsg::from_event` maps these to `None` — broadcasting them
     /// anyway would burn scrollback ring slots (one `Sub` per streamed chunk)
     /// and evict the real transcript a reconnecting client replays. The remote
     /// protocol does not require contiguous sequence ids, so simply not
@@ -154,6 +162,7 @@ impl UiEvent {
                 | Self::SubTokens { .. }
                 | Self::Sub(_)
                 | Self::Btw(_)
+                | Self::QueuedJoined
         )
     }
 }
@@ -475,6 +484,7 @@ pub fn apply(log: &mut OutputLog, ev: UiEvent) {
         UiEvent::Markdown(t) => log.push_markdown(&t),
         UiEvent::Plain(t) => log.push_plain(t),
         UiEvent::UserEcho(t) => log.push_user_echo(&t),
+        UiEvent::QueuedJoined => log.commit_pending(),
         UiEvent::EndLine => log.end_line(),
         // Both are for remote front-ends only: locally the desktop notification
         // has already fired, and the log was cleared at the `/clear` call site.

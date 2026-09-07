@@ -344,11 +344,15 @@ impl ServerMsg {
             // Sub-agent groundwork (not wired up yet): no remote frame exists
             // for the sub-agent buffer, so these don't cross the wire. A later
             // task adds dedicated frames once a remote client can view it.
+            // `QueuedJoined` is local pane state for a different reason: a
+            // remote client never saw the queued prompt, so a payload-free
+            // "it joined" would say nothing.
             UiEvent::SubStart { .. }
             | UiEvent::SubEnd
             | UiEvent::SubTokens { .. }
             | UiEvent::Sub(_)
-            | UiEvent::Btw(_) => {
+            | UiEvent::Btw(_)
+            | UiEvent::QueuedJoined => {
                 return None;
             }
         })
