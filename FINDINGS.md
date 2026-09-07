@@ -421,6 +421,49 @@ test` and review the diff before committing.
   in `src/viz.rs` (the streaming detector, which seeds the parser with canonical
   bytes) and `DSML_START*` / `find_tool_start` in `src/dsml.rs`.
 
+- **A `StreamRenderer` went deaf after its first stanza, and blamed the model
+  for it.** `DsmlParser::feed` is a no-op once the parser is `Done` or `Error`,
+  and `start_dsml` re-armed `dsml_active` without resetting it. So the *second*
+  stanza a renderer saw dissolved: its bytes reached a deaf parser,
+  `dsml_active` cleared on the first one, and the remainder streamed to the
+  screen as raw markup, where the loose-marker validator reported
+  `[invalid tool call: DSML markup outside a valid tool_calls block]` — about a
+  stanza that was byte-perfect, with its calls silently dropped. The visible
+  shape is unmistakable and is what a bug report will show: a bare
+  `<｜DSML｜`, the red banner, then a naked `parameter name="..."` line.
+  `~/.plank/tool-call-errors.log` is the tell that it is *not* the model's
+  mistake: the logged payload (`parser.raw()`) is a flawless stanza, because it
+  is the *previous*, completed one still sitting in the buffer.
+  Two renderers outlive a single stanza — the debug console keeps one per
+  *connection* (`viz.rs`'s "long-lived renderer" test says so explicitly), and
+  transcript replay streams a whole assistant message through one — and the
+  model itself emitted a second block after the first close in 9 of 1446
+  recorded assistant stanzas (~0.6%), so the per-pass renderers hit it too.
+  Fixed by resetting the parser in `start_dsml` when it is `Done`/`Error`,
+  which needed two supporting changes: calls are now *accumulated* into
+  `self.calls` rather than assigned (an assignment dropped the first stanza's
+  calls the moment a second arrived), and a parse error is hoisted into
+  `stream_error` where it is reported, because `finished()` used to read it
+  back off a parser that a later stanza now resets.
+
+- **plank generated past a tool call it had already finished; the C stops.** The
+  C worker sets `stop_block` the moment the parser reaches `AGENT_DSML_DONE` and
+  rewinds the accepted speculative run past that token (`ds4_agent.c`). plank
+  stopped only at EOS or the token cap, so the model kept sampling after a
+  complete stanza — waste at best, and in those 9 recorded cases it spent the
+  tokens on a second block. Fixed in two places that must both be there:
+  `StreamRenderer::tool_stanza_complete` reports an accepted stop token (never
+  one discarded for sitting inside `<think>`, which the model still has to
+  retry), `stream_chunk_must_stop` turns it into `PassStop::ToolCall`, and
+  `Ds4Engine::generate` polls `interrupt()` *per token inside* the accepted
+  speculative run rather than once per block, so the rest of the run is rewound
+  out of the KV instead of generated. The trap: that stop rides the same
+  `interrupt` closure a preflight failure does — the only stop channel
+  `Engine::generate` has — so it comes back as `stats.interrupted`, and every
+  site that asks "did the user stop this?" has to go through `stopped_by_user`
+  or the turn is abandoned with a parsed, complete tool call that never runs. A
+  genuine Ctrl-C still wins there, deliberately.
+
 - **Post-update weights also write the parameter name as the element name.**
   `<｜DSML｜command string="true">ls</｜DSML｜invoke>` in place of
   `<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>`. The C

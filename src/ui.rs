@@ -679,12 +679,48 @@ fn stream_chunk_must_stop<S: RenderSink>(
     stream: &mut StreamRenderer<S>,
     chunk: &str,
     greedy: &AtomicBool,
-) -> bool {
+) -> Option<PassStop> {
     greedy.store(stream.wants_greedy_sampling(), Ordering::Relaxed);
     if stream.in_think() && guard.feed(chunk) {
         stream.fail_preflight(REPEAT_LOOP_ERROR);
     }
-    stream.preflight_error().is_some()
+    if stream.preflight_error().is_some() {
+        return Some(PassStop::Failed);
+    }
+    // Ordered second so a preflight failure in the same chunk still wins: it
+    // has an error to feed back, and this does not.
+    stream.tool_stanza_complete().then_some(PassStop::ToolCall)
+}
+
+/// Why a pass stopped itself before the engine ran out of tokens.
+///
+/// Both reasons ride the same `interrupt` closure into the engine — that is
+/// the only stop channel [`crate::engine::Engine::generate`] has — so both
+/// come back with `stats.interrupted` set and the caller has to say which
+/// happened. [`PassStop::Failed`] is already told apart by the renderer's
+/// preflight error; [`PassStop::ToolCall`] has nothing to show for itself, so
+/// it is recorded explicitly and read back by [`stopped_by_user`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassStop {
+    /// A mid-stream preflight failed, or the repeat guard tripped. The
+    /// renderer carries the error to feed back to the model.
+    Failed,
+    /// A tool-call stanza reached its stop token, so the pass is finished:
+    /// mirrors the C worker's `stop_block` at `AGENT_DSML_DONE`. Not a
+    /// failure, and emphatically not a user interrupt.
+    ToolCall,
+}
+
+/// Whether a finished pass was really cut short by the user.
+///
+/// `interrupted` alone cannot answer it: a pass that stopped itself at a
+/// completed tool stanza travels out through the same interrupt closure, so
+/// it reports `interrupted` too (see [`PassStop`]). A genuine Ctrl-C still
+/// wins — `stopped` is only consulted when no user interrupt is pending —
+/// because the user asking to stop outranks a call that happens to have just
+/// finished streaming.
+fn stopped_by_user(interrupted: bool, user_interrupt: bool, stopped_at_tool_call: bool) -> bool {
+    interrupted && (user_interrupt || !stopped_at_tool_call)
 }
 
 /// Which [`PassError`] a finished pass represents.
@@ -2578,7 +2614,7 @@ impl Agent<'_> {
                         // debug console; a no-op unless showThinking is off
                         // and a console is connected.
                         crate::debugmirror::push(&t);
-                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy) {
+                        if stream_chunk_must_stop(&mut repeat, &mut stream, &t, &greedy).is_some() {
                             preflight_stop.store(true, Ordering::Relaxed);
                         }
                     }
@@ -3532,7 +3568,7 @@ fn generate_pass(
                 // — a sub-agent's when a `SubagentMirror` guard is active,
                 // the parent's otherwise.
                 crate::debugmirror::push(t);
-                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy) {
+                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy).is_some() {
                     preflight_stop.store(true, Ordering::Relaxed);
                 }
             }
@@ -3570,7 +3606,12 @@ fn finish_quiet_pass<S: RenderSink>(
     stats: crate::engine::GenerationStats,
 ) -> Result<QuietPass, QuietAbort> {
     let preflight_error = stream.preflight_error().map(str::to_owned);
-    if stats.interrupted && preflight_error.is_none() {
+    if stopped_by_user(
+        stats.interrupted,
+        crate::interrupt::pending(),
+        stream.tool_stanza_complete(),
+    ) && preflight_error.is_none()
+    {
         crate::interrupt::clear();
         return Err(QuietAbort {
             error: "interrupted".to_string(),
@@ -3669,7 +3710,11 @@ impl Agent<'_> {
             // error to feed back to the model, not a user abort.
             let preflight_error = stream.preflight_error().map(str::to_owned);
             let finished = stream.finished();
-            let real_interrupt = stats.interrupted && preflight_error.is_none();
+            let real_interrupt = stopped_by_user(
+                stats.interrupted,
+                crate::interrupt::pending(),
+                stream.tool_stanza_complete(),
+            ) && preflight_error.is_none();
             // A real interrupt lands regardless of what the parser made of
             // the partial stanza it cut off (often an "incomplete DSML tool
             // call" parse error): it never continues with a <tool_result>,
@@ -3699,7 +3744,11 @@ impl Agent<'_> {
                 repeat_trips = 0;
             }
             let st = Status {
-                state: if stats.interrupted {
+                // `real_interrupt`, not `stats.interrupted`: a pass that
+                // stopped itself at a completed tool stanza reports the latter
+                // (see `PassStop`) and is not stopped in any sense the footer
+                // should show.
+                state: if real_interrupt {
                     WorkerState::Stopped
                 } else {
                     WorkerState::Idle
@@ -12206,7 +12255,7 @@ impl Agent<'_> {
                 stream.push(t);
                 // See `stream_generation`: same tee, TUI side.
                 crate::debugmirror::push(t);
-                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy) {
+                if stream_chunk_must_stop(&mut repeat, &mut stream, t, &greedy).is_some() {
                     preflight_stop.store(true, Ordering::Relaxed);
                 }
             }
@@ -12325,8 +12374,12 @@ impl Agent<'_> {
         if preempted {
             shared.preempt.store(false, Ordering::Relaxed);
         }
-        let interrupted =
-            (stats.interrupted || user_interrupt) && !preempted && preflight_error.is_none();
+        let interrupted = stopped_by_user(
+            stats.interrupted || user_interrupt,
+            user_interrupt,
+            stream.tool_stanza_complete(),
+        ) && !preempted
+            && preflight_error.is_none();
         // Consume the interrupt so a queued follow-up turn starts clean.
         shared.interrupt.store(false, Ordering::Relaxed);
         Ok(TurnOutput {
@@ -21492,6 +21545,46 @@ mod tests {
             "got: {tool_result}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The pass must stop the moment a stanza reaches its stop token — the C
+    /// worker's `stop_block` at `AGENT_DSML_DONE`. Without it the model keeps
+    /// sampling past a call it already finished: pure waste, and in the
+    /// recorded sessions it sometimes spent those tokens on a second stanza.
+    #[test]
+    fn a_completed_stanza_stops_the_pass() {
+        const STANZA: &str = concat!(
+            "<｜DSML｜tool_calls>",
+            "<｜DSML｜invoke name=\"bash\">",
+            "<｜DSML｜parameter name=\"command\">ls</｜DSML｜parameter>",
+            "</｜DSML｜invoke>",
+            "</｜DSML｜tool_calls>",
+        );
+        let mut stream = StreamRenderer::new(NullSink);
+        let mut guard = crate::insights::RepeatGuard::with_window(REPEAT_LOOP_WINDOW);
+        let greedy = AtomicBool::new(false);
+        let mut feed = |stream: &mut StreamRenderer<NullSink>, chunk: &str| {
+            stream.push(chunk);
+            stream_chunk_must_stop(&mut guard, stream, chunk, &greedy)
+        };
+        assert_eq!(feed(&mut stream, "<think>looking</think>ok\n\n"), None);
+        assert_eq!(feed(&mut stream, STANZA), Some(PassStop::ToolCall));
+    }
+
+    /// The stop above rides the same interrupt closure a preflight failure
+    /// does, so the engine reports `interrupted` for it. Only a user really
+    /// stopping the pass may be read that way — otherwise the turn would be
+    /// abandoned with the model's tool call parsed, complete, and never run.
+    #[test]
+    fn a_self_stopped_pass_is_not_a_user_interrupt() {
+        // Stopped at a completed stanza, nothing pending from the user.
+        assert!(!stopped_by_user(true, false, true));
+        // A real Ctrl-C wins even when a stanza did just complete.
+        assert!(stopped_by_user(true, true, true));
+        // An ordinary interrupt mid-sentence, no stanza in sight.
+        assert!(stopped_by_user(true, false, false));
+        // A pass that ran to EOS was not stopped by anyone.
+        assert!(!stopped_by_user(false, false, false));
     }
 
     #[test]

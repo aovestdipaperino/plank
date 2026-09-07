@@ -660,6 +660,9 @@ pub struct StreamRenderer<S> {
     last_output_newline: bool,
     /// Calls snapshotted at parser `Done`, surviving later parser resets.
     calls: Vec<ToolCall>,
+    /// A stanza reached its stop token and was accepted (not discarded for
+    /// sitting inside `<think>`). See [`StreamRenderer::tool_stanza_complete`].
+    stanza_complete: bool,
     /// UTF-8 carry buffers so multi-byte characters split across pushes are
     /// never emitted partially.
     vis_carry: Vec<u8>,
@@ -753,6 +756,7 @@ impl<S: RenderSink> StreamRenderer<S> {
             stream_error: None,
             last_output_newline: true,
             calls: Vec::new(),
+            stanza_complete: false,
             vis_carry: Vec::new(),
             think_carry: Vec::new(),
             preflight: Preflight(None),
@@ -983,6 +987,21 @@ impl<S: RenderSink> StreamRenderer<S> {
             DsmlState::ParamValue => self.parser.param_close_prefix(),
             _ => false,
         }
+    }
+
+    /// True once a tool-call stanza has reached its stop token and been
+    /// accepted, mirroring the C worker's `stop_block` at `AGENT_DSML_DONE`
+    /// (`ds4_agent.c`): the turn's useful output is over, so the caller stops
+    /// the pass rather than letting the model sample past a call it already
+    /// finished. Everything after the close is waste at best — in ~0.6% of
+    /// recorded stanzas the model went on to emit a *second* block, whose
+    /// calls then had nowhere to go.
+    ///
+    /// False for a stanza discarded for sitting inside `<think>`: the model
+    /// gets an error and has to try again, so the pass must run on.
+    #[must_use]
+    pub fn tool_stanza_complete(&self) -> bool {
+        self.stanza_complete
     }
 
     /// Borrows the underlying sink.
@@ -1553,7 +1572,12 @@ impl<S: RenderSink> StreamRenderer<S> {
                         "tool calling is not allowed inside <think></think>",
                     );
                 } else {
-                    self.calls = self.parser.calls().to_vec();
+                    // Accumulated, not assigned: the parser is reset when a
+                    // later stanza opens (see `start_dsml`), so an assignment
+                    // would drop the first stanza's calls on the floor the
+                    // moment a second one arrived.
+                    self.calls.extend_from_slice(self.parser.calls());
+                    self.stanza_complete = true;
                     self.viz_finish(None);
                     self.dsml_active = false;
                 }
@@ -1570,9 +1594,18 @@ impl<S: RenderSink> StreamRenderer<S> {
                         "parse error"
                     } else {
                         self.parser.error()
-                    };
-                    log_tool_error(err, self.parser.raw());
+                    }
+                    .to_owned();
+                    log_tool_error(&err, self.parser.raw());
                     let status = format!("[invalid tool call: {err}]\n");
+                    // Held on the renderer rather than left to be read back off
+                    // the parser in `finished`, because a later stanza resets
+                    // the parser (`start_dsml`) and the verdict has to survive
+                    // that. `finished` already prefers `stream_error`, and the
+                    // text is the same, so what callers see is unchanged.
+                    if self.stream_error.is_none() {
+                        self.stream_error = Some(err);
+                    }
                     self.viz_drop_invalid_dsml();
                     self.viz_finish(Some(&status));
                     self.dsml_active = false;
@@ -1616,6 +1649,22 @@ impl<S: RenderSink> StreamRenderer<S> {
     /// banner for a call that never happens is worse than a late one. Rendering
     /// starts if and when `</think>` arrives with the stanza still open.
     fn start_dsml(&mut self) {
+        // `DsmlParser::feed` is a no-op once the parser is `Done` or `Error`,
+        // so a renderer that outlives one stanza went permanently deaf without
+        // this reset — and two of them do outlive it: the debug console keeps
+        // one renderer per *connection*, and transcript replay streams a whole
+        // message through one. The second stanza's bytes then reached a deaf
+        // parser, `dsml_active` cleared on the very first one, and the rest
+        // streamed out as raw markup that tripped the loose-marker validator:
+        // `[invalid tool call: DSML markup outside a valid tool_calls block]`
+        // about a stanza that was in fact flawless, with its calls silently
+        // dropped. Completed calls are accumulated in `self.calls`, which is
+        // what makes resetting the parser here safe (see its field docs); a
+        // parse error is hoisted into `stream_error` at the point it is
+        // reported, so resetting cannot lose the verdict either.
+        if matches!(self.parser.state(), DsmlState::Done | DsmlState::Error) {
+            self.parser.reset();
+        }
         self.dsml_active = true;
         self.dsml_ignored = self.rejects_in_think();
         if self.in_think {
@@ -3267,5 +3316,89 @@ mod tests {
         assert!(super::logging_enabled_for(None));
         // Only an exact "1" disables it; anything else is not an opt-out.
         assert!(super::logging_enabled_for(Some(OsStr::new("0"))));
+    }
+    /// One `StreamRenderer` must be able to parse more than one stanza.
+    /// `DsmlParser::feed` no-ops at `Done`, so before the reset in
+    /// `start_dsml` the *second* stanza dissolved: its calls were dropped and
+    /// its raw markup streamed to the screen, where the loose-marker validator
+    /// blamed the model for "DSML markup outside a valid `tool_calls` block" —
+    /// a stanza that was byte-perfect. Two renderers outlive a single stanza
+    /// (the debug-console mirror, one per connection, and transcript replay),
+    /// and the model itself emits a second block after the first close in
+    /// roughly 0.6% of recorded stanzas.
+    #[test]
+    fn a_second_stanza_in_one_renderer_still_parses() {
+        let stanza = |name: &str, path: &str| {
+            format!(
+                "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"{name}\">\n\
+                 <\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">{path}</\u{ff5c}DSML\u{ff5c}parameter>\n\
+                 </\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>"
+            )
+        };
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push(format!(
+            "<think>a</think>first.\n\n{}",
+            stanza("read", "A.md")
+        ));
+        sr.push(format!(
+            "<think>b</think>second.\n\n{}",
+            stanza("read", "B.md")
+        ));
+        sr.finish();
+        let vis = &sr.sink().visible;
+        assert_eq!(sr.finished().error, None, "{vis:?}");
+        let calls = sr.finished().calls.to_vec();
+        assert_eq!(calls.len(), 2, "both stanzas must dispatch: {calls:?}");
+        assert_eq!(calls[0].args[0].value, "A.md");
+        assert_eq!(calls[1].args[0].value, "B.md");
+        // And none of the second stanza's markup leaked to the screen.
+        assert!(!vis.contains("tool_calls"), "{vis:?}");
+        assert!(!vis.contains("parameter name="), "{vis:?}");
+    }
+
+    /// A parse error must survive the parser reset a later stanza performs,
+    /// which is why it is hoisted onto the renderer when it is reported.
+    #[test]
+    fn a_parse_error_survives_a_later_stanza_reset() {
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<think>a</think><\u{ff5c}DSML\u{ff5c}tool_calls><b>");
+        sr.push(
+            "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"read\">\n\
+             <\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">A.md</\u{ff5c}DSML\u{ff5c}parameter>\n\
+             </\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+        );
+        sr.finish();
+        assert_eq!(
+            sr.finished().error,
+            Some("unexpected DSML tag: <b>"),
+            "{:?}",
+            sr.sink().visible
+        );
+    }
+
+    /// The pass-stopping signal the agent reads: set at an accepted stop
+    /// token, and never by a stanza thrown away for sitting inside `<think>`,
+    /// which the model still has to retry.
+    #[test]
+    fn tool_stanza_complete_tracks_an_accepted_stop_token() {
+        let stanza = "<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"read\">\n\
+                      <\u{ff5c}DSML\u{ff5c}parameter name=\"path\" string=\"true\">A.md</\u{ff5c}DSML\u{ff5c}parameter>\n\
+                      </\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let mut sr = StreamRenderer::new(Cap::default());
+        sr.push("<think>still reasoning.");
+        assert!(!sr.tool_stanza_complete());
+        sr.push(format!("</think>ok\n\n{stanza}"));
+        assert!(sr.tool_stanza_complete());
+
+        // Strict parity mode: the same stanza inside thinking is discarded, so
+        // the pass must run on rather than stop on it.
+        let mut in_think = StreamRenderer::new(Cap::default());
+        in_think.push(format!("<think>{stanza}"));
+        in_think.finish();
+        assert!(
+            !in_think.tool_stanza_complete(),
+            "{:?}",
+            in_think.sink().visible
+        );
     }
 }

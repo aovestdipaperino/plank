@@ -1461,6 +1461,10 @@ impl Engine for Ds4Session {
                 spec.drafted = spec.drafted.saturating_add(draft_block);
                 on_event(EngineEvent::Spec(spec));
                 let mut hit_eos = false;
+                // The caller asked the pass to stop part-way through this
+                // block: a tool stanza reached its stop token, a mid-stream
+                // preflight failed, or the user interrupted.
+                let mut stopped = false;
                 let mut kept: i32 = 0;
                 for &t in run {
                     if t == eos {
@@ -1480,6 +1484,19 @@ impl Engine for Ds4Session {
                     if generated >= max_tokens {
                         break;
                     }
+                    // Polled per token, not per block, mirroring the C
+                    // worker's `stop_block` check inside the accepted run
+                    // (`ds4_agent.c`): `on_event` above has already handed the
+                    // token to the caller's stream renderer, so a stanza that
+                    // just closed is visible here. Everything left in the run
+                    // is then rewound out of the KV by the call below instead
+                    // of being generated for nothing — which is where the
+                    // model used to find room to emit a second stanza after
+                    // the first was already complete.
+                    if interrupt() {
+                        stopped = true;
+                        break;
+                    }
                 }
                 if let Some(pos) = spec_block_rewind_target(block_start, n, kept) {
                     // SAFETY: session valid; `pos` lies inside the block the
@@ -1487,7 +1504,7 @@ impl Engine for Ds4Session {
                     // in the raw window — the same call the C agent makes.
                     unsafe { ffi::ds4_session_rewind(session, pos) };
                 }
-                if hit_eos {
+                if hit_eos || stopped {
                     break;
                 }
             } else {
