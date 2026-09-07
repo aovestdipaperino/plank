@@ -144,14 +144,15 @@ instead of re-reading them.\n\
 examples alone unless asked.\n\
 - Review changes per file (git diff -- <path>) or with git diff --stat; a whole-repository diff \
 is truncated.\n\
-- Use the purpose-built CLI, not a raw fetch: for anything on GitHub (an issue, a pull request, \
-a release, a file) run gh through bash (gh issue view <n> --repo <owner>/<repo>, gh pr view, \
-gh api) instead of wget or curl on a github.com page, whose HTML buries the text you want.\n\
 - Delegate isolatable work to a sub-agent: when part of a task has a result you need but steps \
 you do not (locate where X is handled, run a test suite and summarize the failures, audit a \
 module for Y), call the agent tool with a fully specified task and continue from its report; \
 for several independent parts use fanout. Your context then holds conclusions, not file dumps.\n",
     );
+    out.push_str("\n## Shell\n\n");
+    out.push_str(SHELL_RULES);
+    out.push_str("\n## Git\n\n");
+    out.push_str(GIT_RULES);
     if crate::settings::active().git.sign_commits {
         out.push('\n');
         out.push_str(COMMIT_SIGNATURE_INSTRUCTION);
@@ -538,13 +539,54 @@ const WORKING_STYLE: &str = "# Working style
 - Edit from search output. Call search with context=5 to see the exact lines around a match, then edit directly from them; do not follow a search with a read of the same lines.
 - Stay in scope. Change the code the user asked about and its tests. Do not touch docs, changelogs, READMEs or examples unless the user asks.
 - Review changes per file with git diff -- <path>, or summarize with git diff --stat. A whole-repository diff is truncated and costs several turns to page through.
-- Use the purpose-built CLI, not a raw fetch. For anything on GitHub (an issue, a pull request, a release, a file) run gh through bash: gh issue view <n> --repo <owner>/<repo>, gh pr view, gh api. Do not wget or curl a github.com page: the HTML is mostly navigation and the useful text is buried, while gh returns it as clean text in one call.
 - Delegate isolatable work to a sub-agent. When part of a task has a result you need but steps you do not (locate where X is handled, run a test suite and summarize the failures, audit a module for Y), call the agent tool with a fully specified task and continue from its report; for several independent parts use fanout. Your own context then holds the conclusions, not the file dumps.
+";
+
+/// Which tool to reach for when a shell command would also do, and how to
+/// treat the shell itself. Body only: each caller supplies the heading at its
+/// own level, so the DSML and provider prompts share these bytes.
+///
+/// Earned by counting invokes across 30 `~/.plank/repro` dumps (FINDINGS.md,
+/// "The model reaches for grep three times as often as search"): bash `grep`
+/// 125 times against 45 native `search` calls, `cat`/`head`/`sed -n` 37 times,
+/// `find`/`ls` 18 times against 12 `glob`s, and 228 of 307 bash commands
+/// prefixed with `cd <cwd> &&`. The C tool table the model trained on
+/// describes `bash` as "Run a shell command." and never says what not to run
+/// through it, so the routing has to be taught here. Each line names the wrong
+/// command next to the right tool, the shape Claude Code's Bash description
+/// uses. Engine-neutral on purpose: no DSML, no tool-name placeholders.
+pub const SHELL_RULES: &str = "bash is for commands, builds, tests and git. For anything a native tool does, use the tool:
+- search for content (NOT grep, rg or ag). Its output is edit-ready; grep output is not.
+- read for file contents (NOT cat, head, tail or sed -n).
+- glob to find files by name (NOT find or ls -R). list for one directory (NOT ls).
+- edit to change a file (NOT sed -i, awk or perl -i). write for a new file (NOT cat <<EOF or echo >).
+- gh for everything on github.com: gh issue view <n> --repo <owner>/<repo>, gh pr view, gh api, gh release view, gh run view. NOT wget, curl or visit_page on a github.com URL: the HTML buries the text gh returns cleanly. For one file in a repository use gh api repos/<owner>/<repo>/contents/<path> or clone it.
+The shell already runs in the working directory: never prefix a command with cd <cwd> &&; use absolute paths instead of cd. Quote paths that contain spaces.
+Never pipe a downloaded script into sh. Download it, read it, then run it.
+Do not sleep between commands that can run immediately. To wait on a job, poll it with bash_status or a check command such as gh run view, not sleep.
+A refused tool call means the user declined it. Do not re-issue the same call; change approach or ask. Treat hook output as feedback from the user.
+";
+
+/// Git conduct the model is not otherwise told. Body only, see
+/// [`SHELL_RULES`] for why. Adapted from the Bash git safety protocol in the
+/// Claude Code system prompts; the model runs git in roughly a tenth of the
+/// bash calls in the repro dumps, with nothing telling it which commands lose
+/// work.
+pub const GIT_RULES: &str = "- Commit only when the user asks. Never push unless asked. Never force-push to main.
+- No destructive commands (reset --hard, checkout ., restore ., clean -f, branch -D, push --force) unless the user asked for that exact action.
+- Never skip hooks (--no-verify, --no-gpg-sign). If a hook fails the commit did not happen: fix the cause and make a NEW commit, never --amend.
+- Stage files by name, not git add -A or git add ., so secrets and build output stay out.
+- Pass the commit message through a heredoc: git commit -m \"$(cat <<'EOF' ... EOF)\".
+- Never use -i flags (rebase -i, add -i): there is no interactive input.
 ";
 
 fn append_working_style(out: &mut String) {
     out.push('\n');
     out.push_str(WORKING_STYLE);
+    out.push_str("\n# Shell\n\n");
+    out.push_str(SHELL_RULES);
+    out.push_str("\n# Git\n\n");
+    out.push_str(GIT_RULES);
 }
 
 /// Appends one function schema per WASM component tool, in the same shape the
@@ -1304,6 +1346,68 @@ mod tests {
         assert!(
             provider_system_prompt("").contains("--Co-Authored by Plank (https://plank-agent.dev)")
         );
+    }
+
+    /// The shell-routing and git sections are plank's, so they must sit after
+    /// the C base and inside the trusted span (they ride the reminder), and
+    /// the provider prompt must carry the very same bytes so the two engines
+    /// cannot drift apart the way the hand-copied gh line did.
+    #[test]
+    fn shell_and_git_rules_follow_working_style_in_both_prompts() {
+        let base = build_tools_prompt_base(true);
+        assert!(!base.contains("# Shell"), "the C base is untouched");
+        assert!(!base.contains("NOT grep"), "the C base is untouched");
+
+        let parts = build_system_prompt_parts("", &[], true);
+        let trusted = &parts.text[..parts.trusted_len];
+        let style = trusted.find("# Working style").expect("working style");
+        let shell = trusted.find("\n# Shell\n\n").expect("shell section");
+        let git = trusted.find("\n# Git\n\n").expect("git section");
+        assert!(style < shell && shell < git, "order: style, shell, git");
+        assert!(trusted[shell..git].contains(SHELL_RULES));
+        assert!(trusted[git..].contains(GIT_RULES));
+        // The gh rule moved into the shell section; it must not be duplicated.
+        assert_eq!(parts.text.matches("gh issue view").count(), 1);
+        assert_eq!(parts.text.matches("cd <cwd> &&").count(), 1);
+
+        let provider = provider_system_prompt("");
+        assert!(provider.contains(&format!("\n## Shell\n\n{SHELL_RULES}")));
+        assert!(provider.contains(&format!("\n## Git\n\n{GIT_RULES}")));
+        assert_eq!(provider.matches("gh issue view").count(), 1);
+
+        // The reminder re-injects the same guidance.
+        let reminder = build_system_prompt_reminder(&[], true);
+        assert!(reminder.contains(SHELL_RULES));
+        assert!(reminder.contains(GIT_RULES));
+    }
+
+    /// Both bodies are engine-neutral: nothing in them may teach DSML or name
+    /// a Claude Code tool the model does not have.
+    #[test]
+    fn shell_and_git_rules_are_engine_neutral() {
+        for body in [SHELL_RULES, GIT_RULES] {
+            assert!(!body.contains("DSML"));
+            assert!(!body.contains("${"));
+            assert!(
+                !body.contains('\t'),
+                "plain lines, never continued literals"
+            );
+            assert!(body.ends_with('\n'));
+        }
+        for tool in [
+            "search",
+            "read",
+            "glob",
+            "list",
+            "edit",
+            "write",
+            "bash_status",
+        ] {
+            assert!(
+                SHELL_RULES.contains(tool),
+                "shell rules must route to the native `{tool}` tool"
+            );
+        }
     }
 
     #[test]

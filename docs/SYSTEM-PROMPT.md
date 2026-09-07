@@ -26,7 +26,14 @@ session:
    whose initialize response carried an `instructions` field. The tail lives
    in a resource file included via `include_str!` because a `\`-continued
    Rust string literal would silently strip the JSON schemas' indentation
-   (see FINDINGS.md).
+   (see FINDINGS.md). Plank-owned guidance is layered on after the C text and
+   before the MCP schemas, still inside the trusted span: the `# Working
+   style` list, then `# Shell` (`sysprompt::SHELL_RULES`: which native tool to
+   use instead of `grep`, `cat`, `find`, `sed -i`, `wget`/`curl` on GitHub,
+   plus the no-`cd`, no-sleep and refused-call rules) and `# Git`
+   (`sysprompt::GIT_RULES`). The two bodies are engine-neutral and are the
+   very same bytes `provider_system_prompt` emits under `## Shell` and
+   `## Git`, so the two engines cannot drift.
 2. The user's `-sys`/`--system` text, appended after a blank line when
    non-empty.
 

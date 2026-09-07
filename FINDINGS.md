@@ -2171,6 +2171,38 @@ The switches in effect are now recorded in the `/repro` header (`show
 thinking`, `show tool calls`) and in the session file's `render` record, so a
 dump says what the user was actually looking at.
 
+## The model reaches for grep three times as often as search
+
+Counting DSML invokes across the 30 dumps in `~/.plank/repro` (sessions saved
+because something went wrong, so a biased but relevant sample):
+
+| native tool | calls | shell substitute through `bash` | calls |
+|---|---|---|---|
+| `search` | 45 | `grep` (bare or after `cd ... &&`) | 125 |
+| `read` | 472 | `cat`, `head`, `sed -n` | 37 |
+| `glob` | 12 | `find`, `ls` | 18 |
+
+228 of the 307 `bash` calls began with `cd /abs/path &&`, although the shell
+already runs in the working directory; the prefix is pure token cost and hides
+the real command from the containment check until after the `&&`. The C tool
+table the model trained on describes `bash` as "Run a shell command." and
+never says what not to run through it, and plank's additions only covered
+`find`/`ls` (in the `glob` description) and GitHub (`gh`, in the working-style
+list). The `gh` rule alone was two days old, so the dumps say nothing yet about
+whether it works.
+
+The fix is the `# Shell` and `# Git` sections appended after `# Working
+style` (`sysprompt::SHELL_RULES`, `sysprompt::GIT_RULES`): each line names the
+wrong shell command next to the right native tool, in the `X (NOT y)` shape
+Claude Code's Bash description uses. The bodies are engine-neutral and shared
+byte-for-byte by the DSML prompt and the provider prompt, replacing the
+hand-copied `gh` paraphrase that had already drifted between the two. They sit
+inside the trusted span, so they also ride the 50K-token reminder; the two
+sections add 1,903 bytes, roughly 480 tokens, to a ~5,100-token prompt.
+Method for measuring the effect: re-run the counts above on dumps recorded
+after the change and compare. Source and full proposal:
+`local/PROMPT-IMPROVEMENTS.md`.
+
 ## Loops live in `docs/LOOP-FINDINGS.md`
 
 Every finding about the model repeating itself — the reasoning repeat guard,
