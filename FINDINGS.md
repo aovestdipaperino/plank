@@ -2344,3 +2344,13 @@ the transcript, and both must call `commit_pending()`:
 Wire only the first and an interrupted turn leaves the prompt indented under
 the status line forever while its text is already in the transcript: the
 screen and the session disagree, with nothing logged.
+
+A third way the two can disagree, pre-existing in shape and not introduced by
+this feature: `MainRollback` (`log.truncate_to(main_checkpoint)`) discards
+scrollback lines above a checkpoint. If a tool round already drained a queued
+line — transcript push plus `commit_pending` — before a `/btw` preempts the
+pass, the committed row can fall inside the truncated range while the message
+it committed stays in the transcript: no row anywhere, screen and session
+disagree again. The old Enter-time echo had the same exposure (it also sat
+inside the rolled-back range), so this is not a regression and rollback
+behaviour is intentionally left alone here.

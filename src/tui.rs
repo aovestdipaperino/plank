@@ -6447,6 +6447,11 @@ mod tests {
                 "line {i} with enough words in it to wrap at this width"
             ));
         }
+        // A queued prompt in the pending region is part of `to_text()` too —
+        // exercise it here so the row cache is pinned against the indented
+        // region's rewrap across every width and truncation below, not just
+        // the fixed-width assertions elsewhere.
+        log.push_pending("a long queued prompt that wraps at this width");
         let check = |log: &OutputLog| {
             assert_eq!(log.total_rows(width), full(log, width));
             for top in [0usize, 1, 5, 37, full(log, width).saturating_sub(1)] {

@@ -57,6 +57,18 @@ pub enum UiEvent {
     /// Payload-free on purpose. The queue is FIFO on both sides and the text
     /// already sits in the pending region, so sending it along would create a
     /// second copy free to disagree with the first.
+    ///
+    /// "FIFO on both sides" is not quite literal: the remote control path
+    /// (`src/remote/control.rs`) pushes `Prompt`/`Command` frames straight
+    /// into `shared.queued` without a matching `push_pending`, so a remote
+    /// push can make `QueuedJoined` events outnumber `pending` entries. That
+    /// can transiently commit the wrong row — a local prompt typed between a
+    /// remote drain and this event's delivery gets committed in the remote
+    /// prompt's place — but it self-corrects on the local prompt's own drain
+    /// (the second commit is a no-op), so the end state is always right and
+    /// only the ordering is briefly wrong. Tolerated rather than fixed: making
+    /// the remote path push a pending row is a behaviour change beyond this
+    /// feature's scope.
     QueuedJoined,
     /// The transcript was replaced — `/clear`, `/new`, `/switch`, `/resume`.
     /// Everything above it belongs to a session that no longer exists, so a
@@ -146,7 +158,7 @@ pub enum UiEvent {
 }
 
 impl UiEvent {
-    /// Whether this event belongs to the local sub-agent pane only and must not
+    /// Whether this event belongs to the local pane only and must not
     /// go onto the [`BroadcastBus`]. A remote-side pane is out of scope, so
     /// `ServerMsg::from_event` maps these to `None` — broadcasting them
     /// anyway would burn scrollback ring slots (one `Sub` per streamed chunk)
